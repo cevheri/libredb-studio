@@ -2,8 +2,8 @@ apiVersion: v2
 name: libredb-studio
 description: Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, and Redis
 type: application
-version: 0.1.31
-appVersion: "0.10.0"
+version: 0.1.33
+appVersion: "0.11.0"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/libredb/libredb-studio
 icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
@@ -31,7 +31,7 @@ annotations:
   artifacthub.io/containsSecurityUpdates: "true"
   artifacthub.io/images: |
     - name: libredb-studio
-      image: ghcr.io/libredb/libredb-studio:0.10.0
+      image: ghcr.io/libredb/libredb-studio:0.11.0
       platforms:
         - linux/amd64
         - linux/arm64
@@ -43,15 +43,9 @@ annotations:
     - name: Source
       url: https://github.com/libredb/libredb-studio
   artifacthub.io/changes: |
-    - "Security release. This is the first published version carrying a four-phase security programme; every item below is new to a released artefact"
-    - "Security headers on every response, including an ENFORCED Content-Security-Policy, HSTS, Referrer-Policy, Permissions-Policy and frame-ancestors"
-    - "State-changing requests are checked against Origin, as a second cross-site-request-forgery layer behind SameSite=lax cookies"
-    - "Login, database and AI routes are rate limited; login failures are capped per client address and per submitted account, counted per process"
-    - "Every authentication transition emits one structured JSON audit line on stdout under the libredb.audit.v1 schema"
-    - "Stored database credentials are encrypted at rest with AES-256-GCM when STORAGE_PROVIDER is sqlite or postgres. Set STORAGE_ENCRYPTION_KEY from outside the mounted volume to protect a backup or snapshot as well as the database file"
-    - "Two cross-site-scripting sinks and an unauthenticated image proxy were removed, and the production build now type-checks"
-    - "ACTION MAY BE REQUIRED. An ingress that rewrites Host without setting x-forwarded-host must set ALLOWED_ORIGINS to this deployment public origin, or every state-changing request is refused with 403"
-    - "Track app release 0.10.0 (appVersion bump; default image tag follows)"
+    - "Documentation only. No default, template or image change, so an upgrade from 0.1.32 alters nothing a cluster runs"
+    - "Documented the optional agent runtime: it is off unless LIBREDB_AGENT_ENABLED is set, it reuses the existing AI configuration, and both of its variables are passed through extraEnv"
+    - "Documented the single-instance constraint the agent runtime adds. Its zero-config durable backend keeps run state on local disk behind file locks, so running agents above replicaCount 1 requires WORKFLOW_TARGET_WORLD set to the opt-in PostgreSQL backend, which is not yet reachable in the published image"
 dependencies:
   - name: postgresql
     version: "16.x.x"
