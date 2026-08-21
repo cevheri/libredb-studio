@@ -30,6 +30,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { operatorCopyViolations } from "../../scripts/sync-chart-version.mjs";
+import { AGENT_WORKFLOW_BUDGETS } from "@/lib/agent/execution-policy";
 
 const ROOT = path.resolve(import.meta.dir, "../..");
 const read = (relative: string): string => readFileSync(path.join(ROOT, relative), "utf8");
@@ -41,6 +42,8 @@ const ENV_EXAMPLE = read(".env.example");
 const BACKLOG = read("docs/BACKLOG.md");
 const AGENT_CONFIG = read("src/lib/agent/config.ts");
 const CHART_VALUES = read("charts/libredb-studio/values.yaml");
+/** The ledger directory the chart writes; the same path the image will also set. */
+const CHART_LEDGER_PATH = "/app/data/workflow";
 const CHART_README = read("charts/libredb-studio/README.md");
 
 describe("docs/AGENT.md is reachable from the architecture document", () => {
@@ -119,6 +122,225 @@ describe("the milestone's deferral record is complete in both directions", () =>
   });
 });
 
+describe("the two companion pages exist and are reachable", () => {
+  /**
+   * `docs/AGENT.md` is the behaviour document, and #331 T6 split two audiences out of
+   * it: the user guide and the data-flow page. A page nobody links is a page nobody
+   * reads — the same reason the architecture link above is asserted — and the data-flow
+   * page in particular is what `docs/SECURITY.md` now points at for egress, so it
+   * cannot quietly stop existing.
+   */
+  const COMPANIONS = ["docs/AGENT_GUIDE.md", "docs/AGENT_DATA_FLOW.md"];
+
+  test.each(COMPANIONS)("%s exists", (page) => {
+    expect(existsSync(path.join(ROOT, page))).toBe(true);
+  });
+
+  test.each(COMPANIONS)("%s is linked from docs/AGENT.md", (page) => {
+    expect(AGENT_DOC).toContain(`(./${path.basename(page)})`);
+  });
+
+  test("README.md links the user guide, which is where a reader starts", () => {
+    expect(read("README.md")).toContain("docs/AGENT_GUIDE.md");
+  });
+});
+
+/**
+ * The rail runs on MongoDB, Redis, Couchbase, Elasticsearch, OpenSearch, Druid,
+ * ClickHouse and Trino as well as on the two dialects the agent composes SQL for, and
+ * #414 took the SQL-and-tables vocabulary out of the surfaces themselves: the answer
+ * card lists identifiers it could not find as bare chips under a sentence about the
+ * inventory, `applyStatementName` builds its accessible name from `draft.noun.singular`,
+ * and the schema-capture entry renders the count in `noun.singular`/`noun.plural` — "17
+ * key patterns" on Redis, "3 datasources" on Druid.
+ *
+ * These pages are what the next change reads to learn what the panel is allowed to say,
+ * so prose describing those surfaces in tables and SQL is how the noun comes back. Each
+ * claim below is pinned against the code that decides the word, so the assertion fails
+ * whichever side drifts.
+ */
+describe("the panel's documentation describes the rail in the words it renders", () => {
+  const AGENT_GUIDE = read("docs/AGENT_GUIDE.md");
+  const ANSWER_CARD = read("src/components/agent/AnswerCard.tsx");
+  const RAIL_PARTS = read("src/components/agent/rail-parts.tsx");
+  const TIMELINE = read("src/components/agent/timeline.ts");
+
+  test("the answer card's identifier marking is documented in the noun the card uses", () => {
+    // What the card actually says about names the inventory does not hold, and where
+    // the control beside them takes its own noun from.
+    expect(ANSWER_CARD).toContain("These names are not in the inventory this run read");
+    expect(RAIL_PARTS).toContain("draft.noun.singular");
+
+    const row = AGENT_DOC.split("\n").find((line) => line.includes("One click that RAN the model's SQL"));
+    expect(row).toBeDefined();
+    // The first cell is about NL2SQL, which wrote SQL, so it says SQL. The cell that
+    // describes today's card is the second one, and the card names no engine's rows.
+    const instead = row?.split("|")[2] ?? "";
+    expect(instead).toContain("the inventory does not hold");
+    expect(instead).not.toMatch(/\btables?\b/i);
+  });
+
+  test("the one-hand-off rule is stated over the statement, not over SQL", () => {
+    // A plan run on MongoDB drafts an aggregation, so the general statement of the rule
+    // cannot be made about a language only some engines speak.
+    expect(AGENT_DOC).toContain("an unmarked control against the statement is the silent hand-off");
+    expect(AGENT_DOC).not.toContain("against the SQL");
+  });
+
+  test("the guide's Schema captured row states the engine's own noun, not a table count", () => {
+    // The renderer takes the word from the provider's labels, never from the shape the
+    // capture happens to be recorded in.
+    // A regex rather than the line, so a reflow of that ternary is not a doc failure.
+    expect(TIMELINE).toMatch(/tableCount === 1\s*\?\s*noun\.singular\s*:\s*noun\.plural/);
+
+    // The row, not the paragraph above it that also names the entry: the fingerprint is
+    // what only the row states.
+    const row = AGENT_GUIDE.split("\n").find(
+      (line) => line.includes("`Schema captured`") && line.includes("fingerprint"),
+    );
+    expect(row).toBeDefined();
+    expect(row).not.toContain("table count");
+    expect(row).toContain("the engine's own noun");
+  });
+});
+
+/**
+ * The egress table states ranges over the frozen decision table, and a range is the
+ * kind of figure that goes stale silently (#373 review): `maxModelTurns` still said
+ * "20-48" after `data-analysis` landed at 60, so the page that answers "how much can
+ * leave" understated a ceiling by a fifth of a run.
+ *
+ * Derived from `AGENT_WORKFLOW_BUDGETS` rather than listed here, so the row that fails
+ * is the row a workflow moved — the same shape as the route scan above.
+ */
+describe("docs/AGENT_DATA_FLOW.md states the frozen ceilings as they are", () => {
+  const DATA_FLOW = read("docs/AGENT_DATA_FLOW.md");
+  const rows = Object.values(AGENT_WORKFLOW_BUDGETS);
+
+  const range = (values: readonly number[]): string => `${Math.min(...values)}-${Math.max(...values)}`;
+
+  test.each([
+    ["maxModelTurns", range(rows.map((row) => row.maxModelTurns))],
+    ["maxStatementsPerRun", range(rows.map((row) => row.policy.budgets.maxStatementsPerRun))],
+  ])("the %s row states %s, by workflow", (bound, expected) => {
+    // The bound's own row, not the document: two rows could otherwise cover for each
+    // other while both were wrong.
+    const row = DATA_FLOW.split("\n").find((line) => line.includes(`\`${bound}\``));
+    expect(row).toBeDefined();
+    expect(row).toContain(`${expected}, by workflow`);
+  });
+});
+
+describe("the agent's HTTP surface is documented where a reader looks for a route", () => {
+  /**
+   * B19's own "done" text asked for this: nothing compared `docs/API_DOCS.md` against
+   * `src/app/api/`, so a route family could be absent from the API reference and every
+   * gate stayed green. The paths are DERIVED from the route tree rather than listed
+   * here, so a seventh agent path added tomorrow fails this test instead of being
+   * silently undocumented.
+   *
+   * Dynamic segments are compared in the reference's own notation (`{runId}`), which is
+   * what the rest of that document already uses for a path parameter.
+   */
+  const API_DOCS = read("docs/API_DOCS.md");
+
+  const routePaths = [...new Bun.Glob("src/app/api/agent/**/route.ts").scanSync(ROOT)]
+    .map((file) =>
+      file
+        .replace(/^src\/app/, "")
+        .replace(/\/route\.ts$/, "")
+        .replace(/\[(\w+)\]/g, "{$1}"),
+    )
+    .sort();
+
+  test("the scan found the agent route tree (an empty scan would pass everything below)", () => {
+    expect(routePaths).toContain("/api/agent/config");
+    expect(routePaths).toContain("/api/agent/drive");
+    expect(routePaths.length).toBeGreaterThanOrEqual(6);
+  });
+
+  test.each(routePaths)("%s appears in docs/API_DOCS.md", (routePath) => {
+    expect(API_DOCS).toContain(routePath);
+  });
+
+  test("the family is reachable from the table of contents", () => {
+    expect(API_DOCS).toContain("#agent-api");
+  });
+});
+
+describe("the removal's coverage map cites a measurement that exists (#331 T7)", () => {
+  /**
+   * `docs/AGENT.md` claims the removed NL2SQL and Autopilot panels' happy paths are
+   * measured as agent runs, and names the file that does it. A claim about a test file
+   * is worth exactly what the file's existence is worth: if the evals are renamed or
+   * deleted, the section stops being evidence and starts being a story about one.
+   */
+  const SECTION = "## What the removed AI panels did that a run does not";
+  const COVERAGE_EVAL = "tests/evals/legacy-surface-coverage.test.ts";
+
+  test("the section exists and names the eval that measures it", () => {
+    expect(AGENT_DOC).toContain(SECTION);
+    // Bounded at the next heading, so a mention somewhere else in the document
+    // cannot stand in for this section carrying its own evidence.
+    const section = AGENT_DOC.split(SECTION)[1]?.split(/^## /m)[0] ?? "";
+    expect(section).toContain(COVERAGE_EVAL);
+  });
+
+  test("the eval file it names is in the repository", () => {
+    expect(existsSync(path.join(ROOT, COVERAGE_EVAL))).toBe(true);
+  });
+
+  test("the two largest losses are IN the list, not only elsewhere in the document", () => {
+    // Review found the section flattering: it listed six losses and omitted the two
+    // biggest ones, both in our favour. The agent is standalone-only, so for an
+    // embedded user every "what a run does instead" cell is false; and a toolless
+    // model, which drove both panels, is refused outright. Both facts were stated in
+    // other sections, which made the record incomplete rather than concealed — and a
+    // section whose purpose is to say what a user lost has to carry them itself.
+    const section = AGENT_DOC.split(SECTION)[1]?.split(/^## /m)[0] ?? "";
+
+    expect(section).toContain("tests/unit/agent-package-boundary.test.ts");
+    expect(section).toContain("src/lib/agent/capability-gate.ts");
+  });
+});
+
+describe("the container image carries the ledger default a plain `docker run` cannot pass", () => {
+  /**
+   * The ratified T5 proposal says a plain `docker run` must carry the same ledger
+   * default `docker-compose.yml` sets. Compose can express it in a file the operator
+   * already edits; a bare `docker run -p 3000:3000 ghcr.io/...` cannot, and with no
+   * default in the image the SDK resolves `.workflow-data` against the working
+   * directory — `/app`, the container's writable layer, which survives a restart and
+   * is discarded on the next recreate or image upgrade. The image is the only place
+   * that reaches every one of those runs, so the default lives there.
+   */
+  const DOCKERFILE = read("Dockerfile");
+  const COMPOSE = read("docker-compose.yml");
+  const LEDGER_PATH = "/app/data/workflow";
+
+  test("the runtime stage sets WORKFLOW_LOCAL_DATA_DIR inside the data volume", () => {
+    const runner = DOCKERFILE.split(/^FROM .* AS runner$/m)[1] ?? "";
+    expect(runner).toContain(`ENV WORKFLOW_LOCAL_DATA_DIR=${LEDGER_PATH}`);
+  });
+
+  test("the image default is the path compose and the operator documentation already name", () => {
+    // Three files stating three paths would put the ledger somewhere no volume is
+    // mounted for two of them.
+    expect(COMPOSE).toContain(`WORKFLOW_LOCAL_DATA_DIR=\${WORKFLOW_LOCAL_DATA_DIR:-${LEDGER_PATH}}`);
+    expect(ENV_EXAMPLE).toContain(`WORKFLOW_LOCAL_DATA_DIR=${LEDGER_PATH}`);
+    expect(AGENT_DOC).toContain(LEDGER_PATH);
+  });
+
+  test("the default sits under the directory the entrypoint makes writable for the app user", () => {
+    // The runtime stage never issues `USER`: the container starts as root, the
+    // entrypoint chowns the data directory and drops to `nextjs` with gosu. A ledger
+    // default outside that directory would be unwritable under a mounted volume.
+    const entrypoint = read("docker-entrypoint.sh");
+    expect(entrypoint).toContain("/app/data");
+    expect(LEDGER_PATH.startsWith("/app/data/")).toBe(true);
+  });
+});
+
 describe("the chart says the zero-config durable backend is single-instance", () => {
   test("the replicaCount comment names the variable that lifts the constraint", () => {
     const comment =
@@ -138,10 +360,30 @@ describe("the chart says the zero-config durable backend is single-instance", ()
     expect(section).toContain("@workflow/world-postgres");
     expect(section).toMatch(/single-instance/i);
     expect(section).toMatch(/replicaCount[^.]*\b1\b/);
-    // The recipe has to work under the chart's own readOnlyRootFilesystem default:
-    // the local backend writes to WORKFLOW_LOCAL_DATA_DIR, which must be steered
-    // into the one writable volume or no run can start.
-    expect(section).toMatch(/WORKFLOW_LOCAL_DATA_DIR[\s\S]*\/app\/data/);
+    // The README must name the path the chart actually writes, so a reader who
+    // overrides it knows what they are replacing.
+    expect(section).toContain(`WORKFLOW_LOCAL_DATA_DIR=${CHART_LEDGER_PATH}`);
+  });
+
+  /**
+   * This assertion used to be `/WORKFLOW_LOCAL_DATA_DIR[\s\S]*\/app\/data/` on the
+   * README, guarding an `extraEnv` recipe. It survived the recipe's deletion — the
+   * two tokens still appeared in prose that said there was NO such variable to
+   * remember — and so it passed while a default install was broken. A documentation
+   * regex cannot check a deployment; the deployment can. What actually has to hold
+   * is that the packaged chart steers the ledger into the one writable volume,
+   * because `securityContext.readOnlyRootFilesystem: true` leaves the SDK's
+   * cwd-relative default (`.workflow-data` under `WORKDIR /app`) unwritable and no
+   * run can start. The image carries its own copy only from an app version later
+   * than the `appVersion` this chart deploys, so the chart is what makes a default
+   * install work today.
+   */
+  test("the chart itself writes the ledger into the writable volume", () => {
+    const deployment = read("charts/libredb-studio/templates/deployment.yaml");
+    expect(deployment).toMatch(new RegExp(`- name: WORKFLOW_LOCAL_DATA_DIR\\s*\\n\\s*value: ${CHART_LEDGER_PATH}\\b`));
+    // The volume that path lives in is mounted unconditionally, not only under
+    // persistence: an emptyDir still makes the agent work, it only makes it forget.
+    expect(deployment).toMatch(/mountPath: \/app\/data\b/);
   });
 
   test("the operator's verbatim chart copy still matches the source chart", () => {

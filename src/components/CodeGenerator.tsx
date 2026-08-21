@@ -31,6 +31,40 @@ export function toPascalCase(str: string): string {
     .replace(/s$/, ""); // Remove trailing 's' (pluralized table name)
 }
 
+/**
+ * A legal type identifier for every target language. Table names are not always
+ * identifiers: Redis "tables" are key-prefix groupings like `user:*` (#427), so
+ * `export interface User:*` was being emitted for every language. Punctuation
+ * runs become word boundaries, the segments PascalCase, and anything that cannot
+ * start an identifier is replaced rather than prefixed with `_`, because Prisma
+ * model names must begin with a letter and would reject a leading underscore.
+ * One shared rule for all six languages: their union constraint is a letter
+ * followed by letters and digits, so per-language variants would buy nothing.
+ *
+ * The classes are Unicode (`\p{L}` / `\p{N}`), never `A-Za-z0-9`: TypeScript,
+ * Zod, Go, Python and Java all accept Unicode letters in an identifier, so an
+ * ASCII-only strip DESTROYS names that were already legal in five of the six
+ * targets — `musteri` with its Turkish diacritics collapsed to `MTeri`, and a
+ * wholly non-Latin name such as a CJK one lost every character and fell back to
+ * `Record`, which made two different tables generate two files declaring ONE
+ * type (#427).
+ *
+ * Prisma is the exception: a model name is `[A-Za-z][A-Za-z0-9_]*`, so a Unicode
+ * name still yields a model Prisma would reject. Stripping to ASCII would not
+ * rescue it — the surviving stem names the wrong thing, or nothing — and it
+ * would break the other five, so the Unicode classes stand and the Prisma output
+ * for such a name is left where it already was before this function existed.
+ */
+export function toIdentifier(str: string): string {
+  // The trim is `^_|_$`, not `^_+|_+$`: the collapse above has already reduced
+  // every run of separators to ONE underscore, so a repeated quantifier here can
+  // never match more — it only adds the backtracking that makes the pattern
+  // super-linear on a long run of separators (SonarCloud S5852).
+  const result = toPascalCase(str.replace(/[^\p{L}\p{N}]+/gu, "_").replace(/^_|_$/g, ""));
+  if (!/^\p{L}/u.test(result)) return result ? `T${result}` : "Record";
+  return result;
+}
+
 export function toCamelCase(str: string): string {
   const pascal = toPascalCase(str);
   return pascal.charAt(0).toLowerCase() + pascal.slice(1);
@@ -141,7 +175,7 @@ export function mapSqlTypeToJava(sqlType: string): string {
 }
 
 export function generateCode(lang: Language, table: TableSchema): string {
-  const name = toPascalCase(table.name);
+  const name = toIdentifier(table.name);
   const columns = table.columns || [];
 
   switch (lang) {
@@ -235,30 +269,30 @@ export function CodeGenerator({ isOpen, onClose, tableName, tableSchema, databas
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      <div className="bg-[#111] border border-white/10 rounded-xl shadow-2xl w-full max-w-xl mx-4 overflow-hidden">
-        <div className="flex items-center justify-between px-5 py-3 border-b border-white/5">
+      <div className="bg-overlay border border-hairline-strong rounded-xl shadow-2xl w-full max-w-xl mx-4 overflow-hidden">
+        <div className="flex items-center justify-between px-5 py-3 border-b border-hairline">
           <div className="flex items-center gap-2">
             <Code strokeWidth={1.5} className="w-3.5 h-3.5 text-purple-400" />
-            <span className="text-xs font-medium text-zinc-200">Code Generator</span>
-            <span className="text-xs text-zinc-500 font-mono">{tableName}</span>
-            {databaseType && <span className="text-xs text-zinc-600 font-mono uppercase">{databaseType}</span>}
+            <span className="text-xs font-medium text-fg">Code Generator</span>
+            <span className="text-xs text-fg-muted font-mono">{tableName}</span>
+            {databaseType && <span className="text-xs text-fg-subtle font-mono uppercase">{databaseType}</span>}
           </div>
-          <button onClick={onClose} className="p-1 rounded hover:bg-white/5 text-zinc-500">
+          <button onClick={onClose} className="p-1 rounded hover:bg-fill text-fg-muted">
             <X strokeWidth={1.5} className="w-3.5 h-3.5" />
           </button>
         </div>
 
-        <div className="px-5 py-2 border-b border-white/5 bg-[#0a0a0a]">
+        <div className="px-5 py-2 border-b border-hairline bg-surface">
           <div className="relative">
             <button
               onClick={() => setShowLangDropdown(!showLangDropdown)}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-xs text-zinc-300 hover:bg-white/10 transition-colors"
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-fill border border-hairline-strong text-xs text-fg-secondary hover:bg-fill-strong transition-colors"
             >
               {currentLang.label}
-              <ChevronDown strokeWidth={1.5} className="w-3 h-3 text-zinc-500" />
+              <ChevronDown strokeWidth={1.5} className="w-3 h-3 text-fg-muted" />
             </button>
             {showLangDropdown && (
-              <div className="absolute top-full left-0 mt-1 bg-[#111] border border-white/10 rounded-lg shadow-xl z-10 py-1 w-48">
+              <div className="absolute top-full left-0 mt-1 bg-overlay border border-hairline-strong rounded-lg shadow-xl z-10 py-1 w-48">
                 {LANGUAGES.map((lang) => (
                   <button
                     key={lang.id}
@@ -267,8 +301,8 @@ export function CodeGenerator({ isOpen, onClose, tableName, tableSchema, databas
                       setShowLangDropdown(false);
                     }}
                     className={cn(
-                      "w-full text-left px-3 py-1.5 text-xs hover:bg-white/5 transition-colors",
-                      language === lang.id ? "text-purple-400" : "text-zinc-400",
+                      "w-full text-left px-3 py-1.5 text-xs hover:bg-fill transition-colors",
+                      language === lang.id ? "text-purple-400" : "text-fg-tertiary",
                     )}
                   >
                     {lang.label}
@@ -280,12 +314,12 @@ export function CodeGenerator({ isOpen, onClose, tableName, tableSchema, databas
         </div>
 
         <div className="relative">
-          <pre className="p-5 text-xs font-mono text-zinc-300 overflow-auto max-h-[50vh] bg-[#050505] leading-relaxed whitespace-pre">
+          <pre className="p-5 text-xs font-mono text-fg-secondary overflow-auto max-h-[50vh] bg-canvas leading-relaxed whitespace-pre">
             {code}
           </pre>
           <button
             onClick={handleCopy}
-            className="absolute top-3 right-3 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-xs text-zinc-400 transition-colors"
+            className="absolute top-3 right-3 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-fill-strong hover:bg-edge text-xs text-fg-tertiary transition-colors"
           >
             {copied && <Check strokeWidth={1.5} className="w-3 h-3 text-emerald-400" />}
             {!copied && <Copy strokeWidth={1.5} className="w-3 h-3" />}
@@ -293,9 +327,9 @@ export function CodeGenerator({ isOpen, onClose, tableName, tableSchema, databas
           </button>
         </div>
 
-        <div className="px-5 py-3 border-t border-white/5 bg-[#0a0a0a]">
-          <p className="text-xs text-zinc-600">
-            Generated from <span className="text-zinc-500">{tableName}</span> • {tableSchema?.columns?.length || 0}{" "}
+        <div className="px-5 py-3 border-t border-hairline bg-surface">
+          <p className="text-xs text-fg-subtle">
+            Generated from <span className="text-fg-muted">{tableName}</span> • {tableSchema?.columns?.length || 0}{" "}
             columns • {currentLang.ext} format
           </p>
         </div>

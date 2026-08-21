@@ -19,7 +19,7 @@ RUN bun install --frozen-lockfile
 # (lib/binding.js reads process.platform/arch and detects musl via
 # process.report), so neither the ABI nor the libc of the installing stage
 # constrains the stage that requires it.
-FROM node:24.16.0-trixie-slim AS builder
+FROM node:26.7.0-trixie-slim AS builder
 WORKDIR /usr/src/app
 COPY --from=deps /usr/src/app/node_modules ./node_modules
 COPY . .
@@ -40,7 +40,7 @@ RUN node scripts/copy-monaco.mjs && npx next build
 
 # Production image - use Node.js slim for lower memory footprint
 # trixie-slim: glibc must match the stage where native modules were built (see builder).
-FROM node:24.16.0-trixie-slim AS runner
+FROM node:26.7.0-trixie-slim AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
@@ -49,6 +49,18 @@ ENV NEXT_TELEMETRY_DISABLED=1
 # Memory optimization for low-memory environments (Render free tier)
 # V8 heap limit to prevent OOM on 512MB instances
 ENV NODE_OPTIONS="--max-old-space-size=384"
+
+# Where the agent's durable ledger lives, and half of what decides whether the
+# agent is available at all (docs/AGENT.md). The workflow SDK's own default is
+# ".workflow-data" resolved against the working directory — /app here, the
+# container's writable layer: writable, so nothing fails loudly, and discarded on
+# the next recreate or image upgrade. docker-compose.yml sets this; a plain
+# `docker run` cannot be given a default from outside the image, so it is set
+# here for every way this image is started. It sits under /app/data, the
+# directory the entrypoint chowns to the app user and the one operators mount a
+# volume on — without that volume the run history still dies with the container,
+# which is the documented trade, not a silent one.
+ENV WORKFLOW_LOCAL_DATA_DIR=/app/data/workflow
 
 COPY --from=builder /usr/src/app/public ./public
 
@@ -96,10 +108,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends gosu && \
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# The bind-address resolver the entrypoint runs (issue #432). It lives next to
+# the entrypoint, OUTSIDE /app, so a volume mounted on /app cannot hide it, and
+# outside the standalone payload so the native channels - which bind 127.0.0.1
+# by design (#134) - can never inherit container bind policy.
+COPY docker/bind-address.mjs /usr/local/lib/libredb-studio/bind-address.mjs
+
 # Render uses PORT env variable, default to 3000
 EXPOSE 3000/tcp
 ENV PORT=3000
-ENV HOSTNAME="0.0.0.0"
+# Empty is the "nobody chose" sentinel: an image-level empty ENV suppresses
+# Docker's HOSTNAME=<container-id> injection (which the resolver would otherwise
+# be unable to tell apart from an operator's own value), while leaving a
+# bypassed entrypoint on Next's own `process.env.HOSTNAME || '0.0.0.0'` default -
+# i.e. exactly this image's pre-#432 behaviour. Anything non-empty an operator
+# passes is honoured verbatim.
+ENV HOSTNAME=""
 
 # server.js is created by next build from the standalone output
 # https://nextjs.org/docs/pages/api-reference/next-config-js/output

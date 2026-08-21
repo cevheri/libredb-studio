@@ -26,6 +26,7 @@ charts/libredb-studio/
     ├── deployment.yaml        # App Deployment (checksum restart, emptyDir, probes)
     ├── service.yaml           # ClusterIP / NodePort / LoadBalancer
     ├── ingress.yaml           # Optional Ingress (nginx/traefik)
+    ├── route.yaml             # Optional Gateway API HTTPRoute (default off)
     ├── configmap.yaml         # Non-sensitive env vars (PORT, storage, LLM, OIDC)
     ├── seed-configmap.yaml    # Optional seed-connections config (rendered when enabled)
     ├── secret.yaml            # Sensitive env vars (JWT, passwords, API keys)
@@ -167,7 +168,7 @@ Most non-sensitive configuration flows through a ConfigMap (the seed-connection 
 |----------|--------|-------------|
 | `NODE_ENV` | Fixed `production` | Always |
 | `PORT` | `service.targetPort` | Always |
-| `HOSTNAME` | Fixed `0.0.0.0` | Always |
+| `HOSTNAME` | `config.bindAddress` — empty by default, which is the "let the image resolve it" sentinel; `extraEnv` overrides it | Always |
 | `NEXT_TELEMETRY_DISABLED` | Fixed `1` | Always |
 | `NODE_OPTIONS` | Fixed `--max-old-space-size=384` | Always |
 | `NEXT_PUBLIC_AUTH_PROVIDER` | `authProvider` | Always |
@@ -178,6 +179,15 @@ Most non-sensitive configuration flows through a ConfigMap (the seed-connection 
 | `SEED_CONFIG_PATH` / `SEED_CACHE_TTL_MS` | `seedConnections.*` — set **directly on the Deployment** (not via the ConfigMap) | When `seedConnections.enabled` |
 | `LLM_PROVIDER/MODEL/API_URL` | `config.llm*` | When set |
 | `OIDC_*` | `config.oidc*` | When `authProvider=oidc` |
+
+"Fixed" above describes what the ConfigMap writes, not what the container ends up with: the ConfigMap arrives through `envFrom`, `extraEnv` renders into the container's `env:` list, and an explicit `env` entry always wins over an `envFrom` key of the same name. Any row above can therefore be overridden through `extraEnv`, though only some are safe to: `PORT` is rendered from `service.targetPort` and also drives the container's named `http` port and all three probes, so overriding it through `extraEnv` alone moves the app off the port the probes still target and the pod never becomes Ready. `HOSTNAME` is the one row whose ConfigMap value is deliberately **empty**. Empty is a sentinel, not an omission: it means "nobody chose", and the container's entrypoint then resolves its own bind address, preferring `::` — which it proves is dual-stack by connecting an IPv4 client to a throwaway `::` listener, rather than inferring it from a sysctl. It falls back to `0.0.0.0` when the namespace has no IPv6, or when `::` really is IPv6-only while a non-loopback IPv4 address exists. The key is written rather than omitted so that a pod name injected as `HOSTNAME` by the runtime can never reach the server; `config.bindAddress` overrules the resolver:
+
+```yaml
+config:
+  bindAddress: "0.0.0.0"   # or "::" to force dual-stack; "" (default) resolves it
+```
+
+> **Dual-stack is one setting now, not two.** `service.ipFamilyPolicy` (`PreferDualStack` / `RequireDualStack`) and `service.ipFamilies` give the Service an IPv6 address, and that is all an operator has to set — the pod listens on both families by default. What an operator must *not* do is the inverse pairing: `config.bindAddress` (or an `extraEnv` `HOSTNAME`) pinned to an IPv4 literal alongside a dual-stack Service. Kubernetes never inspects what the container bound, so such a Service populates an IPv6 EndpointSlice from the pod's IPv6 address and kube-proxy routes IPv6 traffic to a socket that is not there — the client gets `connection refused`. It never self-heals and it is invisible to the probes, because the kubelet probes the pod's *primary* IP (IPv4 on a typical IPv4-primary cluster), so the pod reports Ready while its IPv6 path is dead. `NOTES.txt` warns on exactly that combination at install time. Values reference: the chart [`README.md`](../charts/libredb-studio/README.md#ipv6-and-dual-stack).
 
 **The chart follows the application's zero-config default** (`config.authBootstrap: ""` omits `AUTH_BOOTSTRAP`, so missing `JWT_SECRET`/`ADMIN_PASSWORD` are generated at first boot): a default-values install is fully working, which certified catalogs such as the Rancher partner-charts repository require. The architectural consequence for this document is that the deployment may only reference Secret keys that actually exist — the env entries for `JWT_SECRET`, `ADMIN_PASSWORD`, `USER_EMAIL`, `USER_PASSWORD` render only when their value is set or an `existingSecret` is used, and a mandatory `secretKeyRef` is reserved for the one combination where a missing key really is an error (strict mode with `authProvider=local`).
 
@@ -204,6 +214,15 @@ When `seedConnections.enabled=true`, the chart provisions a set of pre-defined d
 - You **must** supply the definitions via **either** inline `seedConnections.config` (rendered into `seed-configmap.yaml`) **or** an `existingConfigMap`. Enabling the feature with neither **fails the render** with an explicit message (a template guard in `deployment.yaml`) — previously the Deployment shipped mounting a ConfigMap that was never rendered, and the pods failed at startup instead.
 - The deployment mounts the ConfigMap at `/app/config/<key>`, where `<key>` is `seedConnections.configMapKey` (default `seed-connections.yaml`), and sets `SEED_CONFIG_PATH` to that path (plus `SEED_CACHE_TTL_MS` from `seedConnections.cacheTTL`). These two env vars are set on the Deployment directly, not through the app ConfigMap.
 - Credentials referenced by the seed config resolve from environment/secret at runtime, so secrets stay out of the ConfigMap.
+
+### 9. Agent Runtime
+
+The agent has no on-switch: the app derives whether it can run from a configured model plus a writable ledger (`docs/AGENT.md`), so the chart's job is to write **less**, not more.
+
+- `agent.enabled` unset — the default — writes no `LIBREDB_AGENT_ENABLED` at all, leaving the derivation intact; `false` writes the off-switch (quoted, because `EnvVar.value` is a string); `true` is accepted and explicit.
+- The chart **does** write one `WORKFLOW_*` variable: `WORKFLOW_LOCAL_DATA_DIR=/app/data/workflow`, inside the volume mounted on `/app/data` in every render. The reason is release topology, not preference. `image.tag` defaults to `.Chart.AppVersion`, and the Dockerfile's own default for that variable landed **after** the `0.11.0` tag this chart's `appVersion` names — so on the image a default install pulls, an unset variable resolves to `.workflow-data` under `WORKDIR /app`, `readOnlyRootFilesystem: true` makes it unwritable, and `resolveAgentLedgerDirectory`'s probe answers `LEDGER_UNAVAILABLE`. The chart reaches users before the image does. Both copies name the same path and `tests/unit/helm-chart-agent.test.ts` asserts they stay equal, so the duplication cannot drift; it is written before `extraEnv`, so an operator can still move the ledger.
+- A release where an agent could run **and** more than one replica is asked for **fails the render** (a template guard in `deployment.yaml`, same shape as the seed guard above). The zero-config ledger takes file locks and each pod mounts its own `/app/data`, so a run started on one pod is invisible to the next request; the only backend that lifts the constraint (`@workflow/world-postgres`) is not loadable in the published image (`B16` in `docs/BACKLOG.md`), which the message says rather than selling an opt-in that does not exist yet. "Could run" is read conservatively from these values: an inline `secrets.llmApiKey`, `config.llmProvider` set to one of the key-optional providers (`ollama`, `custom` — the app's `validateConfig` demands a key only for `gemini` and `openai`), or an explicit `agent.enabled=true`. So an existing multi-replica install that configures no AI keeps rendering. The guard's blind spots are `secrets.existingSecret`, `extraEnvFrom` **and** `extraEnv`, none of which a template can read a model out of; all three are listed in the chart README and in the helper's own comment.
+- Run history lives in that ledger, so `persistence.enabled=false` means an `emptyDir` and a history that goes with the pod. `values.yaml`, the chart README and `NOTES.txt` all say so.
 
 ## Release Pipeline
 
@@ -357,6 +376,33 @@ helm install libredb libredb/libredb-studio \
   --set autoscaling.enabled=true \
   --set podDisruptionBudget.enabled=true
 ```
+
+### Gateway API instead of an Ingress
+```bash
+helm install libredb libredb/libredb-studio \
+  --set secrets.jwtSecret=$(openssl rand -base64 32) \
+  --set secrets.adminPassword="$ADMIN_PASSWORD" \
+  --set route.main.enabled=true \
+  --set "route.main.parentRefs[0].name=traefik-gateway" \
+  --set "route.main.parentRefs[0].namespace=traefik" \
+  --set "route.main.parentRefs[0].sectionName=websecure" \
+  --set "route.main.hostnames[0]=libredb.example.com"
+```
+
+`route` is a map of route names, so several routes can attach the same Service to different
+Gateways or listeners; `main` renders as `<fullname>`, any other name as `<fullname>-<name>`.
+Two constraints are enforced rather than documented:
+
+- An enabled route **must** set `parentRefs` or the render fails, naming the route at fault. The
+  chart cannot default it - the Gateway to attach to is specific to each cluster's Gateway API
+  install - and an HTTPRoute attached to no Gateway is accepted by the API server while routing
+  nothing, so the failure replaces an install that succeeds with the app unreachable.
+- `kind` accepts only `HTTPRoute` (schema-enforced): only an HTTPRoute-shaped body is rendered,
+  so any other kind would emit a manifest the API server rejects.
+
+`route.labels` and `route.annotations` are shared across every enabled route, which makes
+`labels` and `annotations` reserved key names directly under `route` rather than route names. A
+per-route entry wins on a key collision; the chart's own labels win over both.
 
 ### External Secrets (Vault / ESO)
 ```bash

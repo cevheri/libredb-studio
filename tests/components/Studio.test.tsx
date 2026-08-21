@@ -28,6 +28,7 @@ let capturedQueryEditorProps: Record<string, unknown> = {};
 let capturedMobileNavProps: Record<string, unknown> = {};
 let capturedAgentRailProps: Record<string, unknown> = {};
 let originalFetch: typeof globalThis.fetch;
+let originalMatchMedia: typeof window.matchMedia;
 
 // ---- Trackable mock functions (shared across mocks + assertions) ----
 
@@ -50,6 +51,7 @@ const mockSetPlaygroundMode = mock(() => {});
 // Query Execution
 const mockExecuteQuery = mock(() => {});
 const mockForceExecuteQuery = mock(() => {});
+const mockExecuteHandedOverStatement = mock(() => {});
 const mockCancelQuery = mock(() => {});
 const mockSetSafetyCheckQuery = mock(() => {});
 const mockSetBottomPanelMode = mock(() => {});
@@ -99,7 +101,6 @@ mock.module("@/hooks/use-connection-manager", () => ({
     servedSeeds: [],
     activeConnection: null,
     schema: [],
-    tableNames: [],
     schemaContext: "[]",
     isLoadingSchema: false,
     connectionPulse: "none",
@@ -177,6 +178,7 @@ mock.module("@/hooks/use-query-execution", () => ({
     executeQuery: mockExecuteQuery,
     cancelQuery: mockCancelQuery,
     forceExecuteQuery: mockForceExecuteQuery,
+    executeHandedOverStatement: mockExecuteHandedOverStatement,
     safetyCheckQuery: null,
     setSafetyCheckQuery: mockSetSafetyCheckQuery,
     unlimitedWarningOpen: false,
@@ -416,6 +418,35 @@ mock.module("@/components/agent/AgentRail", () => ({
   },
 }));
 
+/**
+ * The prefill seam's shell half (#331 T1), stubbed to a value nothing else could
+ * produce.
+ *
+ * The T1 adversarial review found the wiring untested: the test below asserted only
+ * that the request starts null, which is also what a Studio that never called the hook
+ * and hard-coded `prefill={null}` would report. So the hook is replaced by one that
+ * always holds an ask, and what the rail is handed has to BE it. The hook's own
+ * behaviour — that nothing is asked for until a shortcut asks, and what an ask
+ * contains — is covered in tests/hooks/use-agent-prefill.test.ts, which runs in a
+ * different process: `mock.module` is process-wide, and Studio.test.tsx is its own
+ * isolation group (tests/run-components.sh Group 1), so no suite shares this stub.
+ */
+const PREFILL_SENTINEL = {
+  id: 7,
+  workflowType: "query-optimization",
+  objective: "why is checkout slow",
+} as const;
+
+/**
+ * Hoisted out of the factory (#331 T3) so what a shortcut ASKS FOR is observable.
+ * Left inside, every render minted a fresh mock and the calls were unreachable.
+ */
+const mockRequestPrefill = mock((_workflowType: string, _objective: string) => {});
+
+mock.module("@/components/agent/use-agent-prefill", () => ({
+  useAgentPrefill: () => ({ request: PREFILL_SENTINEL, requestPrefill: mockRequestPrefill }),
+}));
+
 mock.module("@/components/ui/resizable", () => {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const React = require("react");
@@ -507,6 +538,7 @@ describe("Studio", () => {
     mockSetPlaygroundMode.mockClear();
     mockExecuteQuery.mockClear();
     mockForceExecuteQuery.mockClear();
+    mockExecuteHandedOverStatement.mockClear();
     mockCancelQuery.mockClear();
     mockSetSafetyCheckQuery.mockClear();
     mockSetBottomPanelMode.mockClear();
@@ -526,9 +558,11 @@ describe("Studio", () => {
     mockCreateObjectURL.mockClear();
     mockRevokeObjectURL.mockClear();
     mockRouterPush.mockClear();
+    mockRequestPrefill.mockClear();
 
     // URL mocks (may not exist in happy-dom)
     originalFetch = globalThis.fetch;
+    originalMatchMedia = window.matchMedia;
     globalThis.URL.createObjectURL = mockCreateObjectURL as unknown as typeof URL.createObjectURL;
     globalThis.URL.revokeObjectURL = mockRevokeObjectURL as unknown as typeof URL.revokeObjectURL;
   });
@@ -536,6 +570,7 @@ describe("Studio", () => {
   afterEach(() => {
     cleanup();
     globalThis.fetch = originalFetch;
+    window.matchMedia = originalMatchMedia;
   });
 
   // =========================================================================
@@ -781,9 +816,33 @@ describe("Studio", () => {
     const exportFn = capturedBottomPanelProps.onExportResults as (format: string) => void;
     act(() => exportFn("csv"));
     expect(mockCreateObjectURL).toHaveBeenCalledTimes(1);
-    expect(mockRevokeObjectURL).toHaveBeenCalledTimes(1);
     const blob = (mockCreateObjectURL.mock.calls[0] as unknown[])[0] as Blob;
-    expect(blob.type).toBe("text/csv");
+    // The charset is stated on the type as well as written as a BOM in the bytes.
+    expect(blob.type).toBe("text/csv;charset=utf-8");
+  });
+
+  // The blob URL outlives the task that started the download: revoking it in the
+  // same task can pull the data out from under a read that has not begun.
+  test("exportResults revokes the blob URL only after the download is handed off", async () => {
+    tabMgrOverride = {
+      currentTab: {
+        id: "tab-1",
+        name: "Users",
+        query: "SELECT 1",
+        result: testResult,
+        isExecuting: false,
+        type: "sql",
+      },
+    };
+    render(<Studio />);
+    const exportFn = capturedBottomPanelProps.onExportResults as (format: string) => void;
+    act(() => exportFn("csv"));
+
+    expect(mockRevokeObjectURL).not.toHaveBeenCalled();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(mockRevokeObjectURL).toHaveBeenCalled();
   });
 
   test("exportResults JSON creates application/json blob", () => {
@@ -850,9 +909,33 @@ describe("Studio", () => {
     act(() => exportFn("sql-insert"));
 
     const blob = (mockCreateObjectURL.mock.calls[0] as unknown[])[0] as Blob;
+    // The column names are quoted the way the connected dialect spells an
+    // identifier, so an aliased column cannot end the list it sits in either.
     expect(await blob.text()).toBe(
-      "INSERT INTO Users (id, path) VALUES (1, 'C:\\\\Users\\\\''); DROP TABLE users; --');",
+      "INSERT INTO Users (`id`, `path`) VALUES (1, 'C:\\\\Users\\\\''); DROP TABLE users; --');",
     );
+  });
+
+  // The table name is GUESSED from the tab title, so it is never quoted — quoting
+  // would pin a case the database may not use. What a guess must not do is carry
+  // statement text, so a title that is not an identifier is refused outright.
+  test("exportResults sql-insert refuses a tab name that is not an identifier", async () => {
+    tabMgrOverride = {
+      currentTab: {
+        id: "tab-1",
+        name: "users; DROP TABLE secrets",
+        query: "SELECT 1",
+        result: { rows: [{ id: 1 }], fields: ["id"], rowCount: 1, executionTime: 1 },
+        isExecuting: false,
+        type: "sql",
+      },
+    };
+    render(<Studio />);
+    const exportFn = capturedBottomPanelProps.onExportResults as (format: string) => void;
+    act(() => exportFn("sql-insert"));
+
+    const blob = (mockCreateObjectURL.mock.calls[0] as unknown[])[0] as Blob;
+    expect(await blob.text()).toBe('INSERT INTO table_name ("id") VALUES (1);');
   });
 
   test("exportResults sql-ddl creates text/sql blob", () => {
@@ -905,11 +988,13 @@ describe("Studio", () => {
     expect(mockRouterPush).toHaveBeenCalledWith("/monitoring");
   });
 
-  test("CommandPalette onShowDiagram opens diagram", () => {
+  // Awaited because the diagram is code-split: opening it resolves a dynamic import
+  // before the component can mount.
+  test("CommandPalette onShowDiagram opens diagram", async () => {
     const { queryByTestId } = render(<Studio />);
     expect(queryByTestId("schemadiagram")).toBeNull();
     const fn = capturedCommandPaletteProps.onShowDiagram as () => void;
-    act(() => fn());
+    await act(async () => fn());
     expect(queryByTestId("schemadiagram")).not.toBeNull();
   });
 
@@ -1014,13 +1099,6 @@ describe("Studio", () => {
     expect(mockUpdateCurrentTab).toHaveBeenCalledWith({ query: "SELECT * FROM products" });
   });
 
-  test("BottomPanel onExecuteQuery delegates to executeQuery", () => {
-    render(<Studio />);
-    const fn = capturedBottomPanelProps.onExecuteQuery as (q: string) => void;
-    act(() => fn("SELECT 1"));
-    expect(mockExecuteQuery).toHaveBeenCalledWith("SELECT 1");
-  });
-
   // --- QuerySafetyDialog ---
   test("QuerySafetyDialog onProceed calls forceExecuteQuery", () => {
     queryExecOverride = { safetyCheckQuery: "DROP TABLE users" };
@@ -1079,11 +1157,11 @@ describe("Studio", () => {
     expect(queryByTestId("createtablemodal")).not.toBeNull();
   });
 
-  test("Sidebar onShowDiagram opens schema diagram", () => {
+  test("Sidebar onShowDiagram opens schema diagram", async () => {
     const { queryByTestId } = render(<Studio />);
     expect(queryByTestId("schemadiagram")).toBeNull();
     const fn = capturedSidebarProps.onShowDiagram as () => void;
-    act(() => fn());
+    await act(async () => fn());
     expect(queryByTestId("schemadiagram")).not.toBeNull();
   });
 
@@ -1171,17 +1249,6 @@ describe("Studio", () => {
     expect(mockExecuteQuery).toHaveBeenCalledWith(undefined, undefined, true);
   });
 
-  // --- CommandPalette onToggleAI ---
-  test("CommandPalette onToggleAI is wired", () => {
-    render(<Studio />);
-    const fn = capturedCommandPaletteProps.onToggleAI as () => void;
-    // The callback calls queryEditorRef.current?.toggleAi() — since the mock
-    // QueryEditor attaches a DOM element to the ref (not a QueryEditorRef),
-    // we just verify the callback is properly wired.
-    expect(fn).toBeDefined();
-    expect(typeof fn).toBe("function");
-  });
-
   // --- Connection-change effect: setTabs updater ---
   test("connection-change effect retypes existing tabs via setTabs updater", () => {
     connMgrOverride = { activeConnection: pgConn };
@@ -1193,6 +1260,19 @@ describe("Studio", () => {
     ]);
     expect(result).toHaveLength(1);
     expect(result[0].type).toBe("sql");
+  });
+
+  test("connection-change effect retypes tabs to redis when the provider declares that dialect (#427)", () => {
+    // Redis declares queryLanguage "json"; before #427 the json rung matched
+    // first and the redis arm below it was unreachable dead code.
+    connMgrOverride = { activeConnection: pgConn };
+    capabilitiesOverride = { queryLanguage: "json", queryDialect: "redis" };
+    render(<Studio />);
+    const updater = (mockSetTabs.mock.calls[0] as unknown[])[0] as (prev: unknown[]) => Array<{ type: string }>;
+    const result = updater([
+      { id: "tab-1", name: "Query 1", query: "GET k", result: null, isExecuting: false, type: "sql" },
+    ]);
+    expect(result[0].type).toBe("redis");
   });
 
   // --- exportResults sql-ddl type mapping ---
@@ -1218,8 +1298,8 @@ describe("Studio", () => {
     expect(mockCreateObjectURL).toHaveBeenCalledTimes(1);
     const blob = (mockCreateObjectURL.mock.calls[0] as unknown[])[0] as Blob;
     const content = await blob.text();
-    expect(content).toContain("active BOOLEAN");
-    expect(content).toContain("created TIMESTAMP");
+    expect(content).toContain('"active" BOOLEAN');
+    expect(content).toContain('"created" TIMESTAMP');
   });
 
   // --- Mobile: database tab ---
@@ -1307,6 +1387,30 @@ describe("Studio", () => {
     const fn = capturedQueryToolbarProps.onCancelQuery as () => void;
     act(() => fn());
     expect(mockCancelQuery).toHaveBeenCalled();
+  });
+
+  /*
+   * Both cancel handlers are wired straight to a button's `onClick`, and React
+   * hands a click handler its MouseEvent as the first argument. `cancelQuery`
+   * reads that first slot as a tab id, and an event object is truthy, so it
+   * names a tab that holds no run: the fetch is never aborted, `/api/db/cancel`
+   * is never sent, and the button reports nothing. TypeScript cannot catch it —
+   * an optional parameter still satisfies `() => void`.
+   *
+   * So what these call sites owe is ARITY, not merely delegation. Calling the
+   * captured prop with no arguments — as the delegation tests above do — passes
+   * either way; the argument has to be supplied here for the assertion to mean
+   * anything.
+   */
+  test("cancel handlers forward no arguments to cancelQuery", () => {
+    render(<Studio />);
+    const clickEvent = { type: "click", preventDefault: () => {} };
+
+    act(() => (capturedQueryToolbarProps.onCancelQuery as (e: unknown) => void)(clickEvent));
+    expect(mockCancelQuery.mock.calls.at(-1)).toEqual([]);
+
+    act(() => (capturedMobileHeaderProps.onCancelQuery as (e: unknown) => void)(clickEvent));
+    expect(mockCancelQuery.mock.calls.at(-1)).toEqual([]);
   });
 
   test("QueryToolbar transaction callbacks delegate to handleTransaction", () => {
@@ -1454,6 +1558,60 @@ describe("Studio", () => {
     expect(capturedAgentRailProps.connectionName).toBeNull();
   });
 
+  // What a long read costs is not the same fact on every engine, and the rail says
+  // SQLite's where a user consents to auto-execute — so the shell has to tell it
+  // which engine this connection speaks.
+  test("the rail is told which engine the connection speaks", async () => {
+    mockAgentConfig(true);
+    connMgrOverride = { activeConnection: managedConn, connections: [managedConn] };
+    const { findByTestId } = render(<Studio />);
+    await findByTestId("agent-rail");
+
+    expect(capturedAgentRailProps.connectionType).toBe("postgres");
+  });
+
+  test("with no connection selected the rail is told there is no engine either", async () => {
+    mockAgentConfig(true);
+    connMgrOverride = { activeConnection: null, connections: [] };
+    const { findByTestId } = render(<Studio />);
+    await findByTestId("agent-rail");
+
+    expect(capturedAgentRailProps.connectionType).toBeNull();
+  });
+
+  /**
+   * The handover the answer's `auto-executed` outcome names (§2.1 of
+   * `docs/AGENT_ANALYST_DESIGN.md`). The shell does both halves — the statement goes
+   * into the editor AND is run there — through the hook's own capped entry point,
+   * which is what keeps the run's answer off the tab's widened execution options.
+   */
+  test("a statement the run handed over is shown in the editor and run through the run's own route", async () => {
+    mockAgentConfig(true);
+    const { findByTestId } = render(<Studio />);
+    await findByTestId("agent-rail");
+
+    act(() => (capturedAgentRailProps.onRunStatement as (sql: string, runId: string) => void)("SELECT 1", "arun_1"));
+
+    expect(mockUpdateCurrentTab).toHaveBeenCalledWith({ query: "SELECT 1" });
+    // The RUN is what is executed against, not the text (#373 review): the text is
+    // put in the editor so the user can read what is running.
+    expect(mockExecuteHandedOverStatement).toHaveBeenCalledWith("arun_1", "SELECT 1");
+    // Never the general entry point: that one posts to the editor's read-WRITE route,
+    // which is the boundary this hand-over exists to keep.
+    expect(mockExecuteQuery).not.toHaveBeenCalled();
+  });
+
+  test("a statement the user applies is placed and not run", async () => {
+    mockAgentConfig(true);
+    const { findByTestId } = render(<Studio />);
+    await findByTestId("agent-rail");
+
+    act(() => (capturedAgentRailProps.onApplyStatement as (sql: string) => void)("SELECT 2"));
+
+    expect(mockUpdateCurrentTab).toHaveBeenCalledWith({ query: "SELECT 2" });
+    expect(mockExecuteHandedOverStatement).not.toHaveBeenCalled();
+  });
+
   test("below md the mobile nav opens the rail as a sheet", async () => {
     mockAgentConfig(true);
     const { findByTestId } = render(<Studio />);
@@ -1465,6 +1623,166 @@ describe("Studio", () => {
 
     act(() => (capturedAgentRailProps.onSheetOpenChange as (open: boolean) => void)(false));
     expect(capturedAgentRailProps.sheetOpen).toBe(false);
+  });
+
+  /**
+   * Who owns a prefill ask (#331 T1). The shell holds it because a shortcut can be
+   * anywhere in the shell while the rail is ONE instance behind both presentations,
+   * and the rail applies it as a prop — the direction `sheetOpen` already runs in.
+   *
+   * Asserted against the stubbed hook's sentinel rather than against null, because
+   * null is what a Studio that dropped the hook entirely would also hand over — the
+   * T1 adversarial review's point: deleting the import, the call and the prop kept
+   * the old assertion green. T2 and T3 hand `requestPrefill` to the legacy AI entry
+   * points; what this pins is that whatever the shell's holder says is what the one
+   * rail instance is given.
+   */
+  test("the shell owns the prefill request and hands it to the one rail instance", async () => {
+    mockAgentConfig(true);
+    const { findByTestId } = render(<Studio />);
+    await findByTestId("agent-rail");
+
+    expect(capturedAgentRailProps.prefill).toBe(PREFILL_SENTINEL);
+  });
+
+  // =========================================================================
+  // The two standalone AI entry points, rewired to the rail (#331 T3)
+  // =========================================================================
+
+  /**
+   * The in-editor chat is gone, and the command palette item and mobile header
+   * button that opened it now open the RAIL on the statement the editor holds.
+   *
+   * The statement is read from the tab the shell owns rather than from the editor
+   * handle, and that tab is keystroke-current: "QueryEditor onContentChange updates
+   * the owning tab by id" above pins the write, and `use-tab-manager` derives
+   * `currentTab` from the tabs that write lands in.
+   *
+   * The breakpoint is driven through `window.matchMedia` rather than by mocking
+   * `@/hooks/use-mobile`, because `isMobileViewport` reads the platform directly and
+   * a module mock here would be process-wide.
+   */
+  function setViewportMobile(matches: boolean) {
+    window.matchMedia = ((query: string) => ({
+      matches,
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia;
+  }
+
+  async function renderWithAgent(query: string) {
+    mockAgentConfig(true);
+    tabMgrOverride = {
+      currentTab: { id: "tab-1", name: "Query 1", query, result: null, isExecuting: false, type: "sql" },
+    };
+    const view = render(<Studio />);
+    await view.findByTestId("agent-rail");
+    return view;
+  }
+
+  test("the palette's agent shortcut asks the rail about the statement the editor holds", async () => {
+    await renderWithAgent("SELECT * FROM checkout");
+
+    act(() => (capturedCommandPaletteProps.onAskAgent as () => void)());
+
+    expect(mockRequestPrefill).toHaveBeenCalledTimes(1);
+    expect(mockRequestPrefill.mock.calls[0]).toEqual(["investigation", "SELECT * FROM checkout"]);
+  });
+
+  /**
+   * Investigation and NOT query-optimization, deliberately: the control being
+   * replaced was a general assistant, and the optimizer's verifier requires a plan
+   * comparison (`src/lib/agent/goal-verifier.ts`), so a run that perfectly explained
+   * what the statement does would be recorded as not having answered.
+   */
+  test("the ask names the general workflow, not the optimizer", async () => {
+    await renderWithAgent("SELECT 1");
+
+    act(() => (capturedCommandPaletteProps.onAskAgent as () => void)());
+
+    expect(mockRequestPrefill.mock.calls[0][0]).toBe("investigation");
+  });
+
+  test("the mobile header's agent shortcut makes the same ask", async () => {
+    await renderWithAgent("SELECT * FROM checkout");
+
+    act(() => (capturedMobileHeaderProps.onAskAgent as () => void)());
+
+    expect(mockRequestPrefill.mock.calls[0]).toEqual(["investigation", "SELECT * FROM checkout"]);
+  });
+
+  /** Nothing is composed on the user's behalf — the objective is the statement. */
+  test("the ask carries the statement and no prose invented around it", async () => {
+    await renderWithAgent("  SELECT 1  ");
+
+    act(() => (capturedMobileHeaderProps.onAskAgent as () => void)());
+
+    expect(mockRequestPrefill.mock.calls[0][1]).toBe("SELECT 1");
+  });
+
+  test("an empty editor mints no ask", async () => {
+    await renderWithAgent("   \n  ");
+
+    act(() => (capturedCommandPaletteProps.onAskAgent as () => void)());
+    act(() => (capturedMobileHeaderProps.onAskAgent as () => void)());
+
+    expect(mockRequestPrefill).toHaveBeenCalledTimes(0);
+  });
+
+  test("below md an empty editor still opens the sheet", async () => {
+    setViewportMobile(true);
+    await renderWithAgent("");
+
+    expect(capturedAgentRailProps.sheetOpen).toBe(false);
+    act(() => (capturedCommandPaletteProps.onAskAgent as () => void)());
+
+    expect(capturedAgentRailProps.sheetOpen).toBe(true);
+  });
+
+  test("below md the mobile header's shortcut opens the sheet too", async () => {
+    setViewportMobile(true);
+    await renderWithAgent("");
+
+    act(() => (capturedMobileHeaderProps.onAskAgent as () => void)());
+
+    expect(capturedAgentRailProps.sheetOpen).toBe(true);
+  });
+
+  /**
+   * Above `md` the rail IS the panel, so there is nothing to open — and setting the
+   * flag anyway would arm a sheet that pops open the first time the window narrows,
+   * the R1 defect `AgentRail`'s prefill comment records.
+   */
+  test("above md an empty editor opens no sheet", async () => {
+    setViewportMobile(false);
+    await renderWithAgent("");
+
+    act(() => (capturedCommandPaletteProps.onAskAgent as () => void)());
+
+    expect(capturedAgentRailProps.sheetOpen).toBe(false);
+  });
+
+  /** With an ask to apply, opening the sheet is the seam's job, not the shell's. */
+  test("an ask leaves the sheet to the seam that applies it", async () => {
+    setViewportMobile(true);
+    await renderWithAgent("SELECT 1");
+
+    act(() => (capturedMobileHeaderProps.onAskAgent as () => void)());
+
+    expect(mockRequestPrefill).toHaveBeenCalledTimes(1);
+    expect(capturedAgentRailProps.sheetOpen).toBe(false);
+  });
+
+  test("with the agent runtime off neither shortcut is offered", async () => {
+    const fetchMock = mockAgentConfig(false);
+    render(<Studio />);
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalled();
+    });
+
+    expect(capturedCommandPaletteProps.onAskAgent).toBeUndefined();
+    expect(capturedMobileHeaderProps.onAskAgent).toBeUndefined();
   });
 
   // =========================================================================
@@ -1524,6 +1842,31 @@ describe("Studio", () => {
     expect(hydrated.runId).toBe("arun_1");
     expect(hydrated.result.rows).toEqual([{ id: 7 }]);
     expect(mockSetBottomPanelMode).toHaveBeenCalledWith("results");
+  });
+
+  test("an answer composed as a chart opens the charts surface, carrying the run's own chart", async () => {
+    // The rail hands over the presentation the run RECORDED, and the shell switches
+    // to the surface the hydration named. Nothing in this path looks at the rows to
+    // decide that a chart would suit them.
+    const spec = { type: "bar", x: "id", y: ["total"], caption: "Total by id." };
+    mockAgentArtifactFetch(200, ARTIFACT_BODY);
+    const { findByTestId } = render(<Studio />);
+    await findByTestId("agent-rail");
+
+    await act(async () => {
+      await (
+        capturedAgentRailProps.onShowArtifact as (ref: {
+          runId: string;
+          correlationId: string;
+          chartSpec: unknown;
+        }) => Promise<void>
+      )({ runId: "arun_1", correlationId: "corr_9", chartSpec: spec });
+    });
+
+    expect(mockSetBottomPanelMode).toHaveBeenCalledWith("charts");
+    const hydrated = capturedBottomPanelProps.agentArtifact as { surface: string; chartSpec: unknown };
+    expect(hydrated.surface).toBe("charts");
+    expect(hydrated.chartSpec).toEqual(spec);
   });
 
   test("a released result is reported to the user rather than hydrated as empty", async () => {

@@ -85,6 +85,45 @@ describe("hydrateAgentArtifact", () => {
     expect(hydrated?.explainPlan).toBeNull();
   });
 
+  /**
+   * The chart surface is chosen the same way the explain surface is: from what the
+   * RUN recorded, never from what the rows look like. The run's `answer-composed`
+   * event says how its answer is to be drawn, and the timeline carries that decision
+   * to this function; a result nobody said to chart is a table however chartable it
+   * looks.
+   */
+  describe("the chart surface comes from the answer's presentation", () => {
+    const SPEC = { type: "bar", x: "id", y: ["total"], caption: "Total by id." } as const;
+
+    test("an answer recorded as a chart hydrates the charts surface, carrying its spec", () => {
+      const hydrated = hydrateAgentArtifact(payload(), "postgres-json", SPEC);
+
+      expect(hydrated?.surface).toBe("charts");
+      expect(hydrated?.chartSpec).toEqual(SPEC);
+      // A chart is drawn from rows, not from a plan, so nothing is sent to the
+      // explain view alongside it.
+      expect(hydrated?.explainPlan).toBeNull();
+    });
+
+    test("a chart-shaped result whose answer said table renders as a table", () => {
+      // The rows below are exactly what the inference in `DataCharts` would happily
+      // chart. The run said table, so the app shows a table: this is the rule that
+      // stops the surface being guessed from the data's shape.
+      const hydrated = hydrateAgentArtifact(payload(), "postgres-json");
+
+      expect(hydrated?.surface).toBe("results");
+      expect(hydrated?.chartSpec).toBeNull();
+    });
+
+    test("an artifact shown without any answer behind it is unaffected", () => {
+      // Every existing caller passes no spec, and asks for what it always got.
+      const hydrated = hydrateAgentArtifact(payload({ operationId: "sql.explain.estimate" }), undefined);
+
+      expect(hydrated?.surface).toBe("results");
+      expect(hydrated?.chartSpec).toBeNull();
+    });
+  });
+
   test("a payload without a readable result is refused rather than rendered empty", () => {
     expect(hydrateAgentArtifact(payload({ result: null }), "postgres-json")).toBeNull();
     expect(hydrateAgentArtifact(payload({ result: { rows: "nope", fields: [] } }), "postgres-json")).toBeNull();
@@ -107,7 +146,22 @@ describe("hydrateAgentArtifact", () => {
  */
 describe("the agent rail's module boundary", () => {
   const AGENT_DIR = path.join(process.cwd(), "src/components/agent");
-  const RAIL_MODULES = ["AgentRail.tsx", "hydration.ts", "timeline.ts", "use-agent-artifact.ts", "use-agent-run.ts"];
+  const RAIL_MODULES = [
+    "AgentRail.tsx",
+    // The three the 2026-08-21 redesign split out of `AgentRail.tsx`, plus the module
+    // holding what it and the answer card both render. They are listed for the same
+    // reason the rail is: what may not reach a rail module may not reach a module the
+    // rail renders, and a card that pulled in the grid would be a grid in the rail.
+    "AnswerCard.tsx",
+    "ConsentCard.tsx",
+    "SafetyStrip.tsx",
+    "hydration.ts",
+    "rail-parts.tsx",
+    "timeline.ts",
+    "use-agent-artifact.ts",
+    "use-agent-prefill.ts",
+    "use-agent-run.ts",
+  ];
   const FORBIDDEN = [
     "@/components/ResultsGrid",
     "@/components/QueryEditor",

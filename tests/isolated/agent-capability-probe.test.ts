@@ -145,15 +145,29 @@ describe("a model that cannot demonstrate a capability is refused", () => {
     expect(requests).toHaveLength(1);
   });
 
-  test("the refusal names the model, the provider and the features that do work", async () => {
+  test("the refusal names the model, the provider and the one action that answers it", async () => {
     const { result } = await probe(OPENAI_CONFIG, chatTextStream("no tools here"));
 
     const refusal = refusalOf(result);
     expect(refusal.provider).toBe("openai");
     expect(refusal.modelId).toBe("gpt-4o-mini");
     expect(refusal.message).toContain("gpt-4o-mini");
-    expect(refusal.message).toContain("AI Assistant");
-    expect(refusal.message).toContain("Natural Language Query");
+    expect(refusal.message).toContain("Configure a different model");
+  });
+
+  test("the refusal advertises no other AI surface", async () => {
+    // The message used to send the user to the NL2SQL panel and the AI Assistant.
+    // Neither can answer what was asked (#331 T2): an agent run needs tools, and a
+    // toolless surface cannot reach the database, so the most user-visible refusal
+    // in the product is the worst place to name one. Pinned by name so a future
+    // edit cannot reintroduce one without this going red.
+    const { result } = await probe(OPENAI_CONFIG, chatTextStream("no tools here"));
+
+    const { message } = refusalOf(result);
+    expect(message).not.toContain("AI Assistant");
+    expect(message).not.toContain("Natural Language Query");
+    expect(message).not.toContain("NL2SQL");
+    expect(message).not.toContain("Autopilot");
   });
 
   test("the message names what was not established, in words rather than field names", async () => {
@@ -293,6 +307,62 @@ describe("a model that cannot demonstrate a capability is refused", () => {
   });
 });
 
+// ─── what was DISPROVED, as against what was never seen ─────────────────────
+
+/**
+ * `missing` is what the probe could not establish, and that is two different facts
+ * wearing one name: a capability the endpoint's own answer contradicted, and one the
+ * probe never got to look at. Both are honest as a refusal for an agent run — neither
+ * is a demonstration — but they support opposite claims about anything ELSE the model
+ * might be asked to do, and a surface that offers a toolless mode is exactly such a
+ * claim.
+ *
+ * Driven, not argued (2026-08-13): an `ollama` endpoint serving `gemma3:270m` refused
+ * the tool request with HTTP 400 and then completed a planning run, because the refusal
+ * came before any stream existed. And a planning run over `chatBufferedCompletion`
+ * through the real run loop ends `succeeded` with empty text and no closing statement —
+ * the buffered body is dropped by the SDK's SSE parser, so the same "streaming not
+ * established" hides a mode that works and a mode that silently produces nothing.
+ *
+ * So the refusal records which of the two it is, and these tests pin the distinction.
+ */
+describe("a refusal separates what was disproved from what was never observed", () => {
+  test("an endpoint that refused the request disproves nothing", async () => {
+    // The status precedes the body: no answer was read, so `missing` here is the
+    // absence of an observation rather than a verdict about anything but tools.
+    const { result } = await probe(OPENAI_CONFIG, endpointError(400, "this model does not support tools"));
+
+    expect(refusalOf(result).disproved).toEqual([]);
+  });
+
+  test("an endpoint that answered without streaming disproves streaming, and only streaming", async () => {
+    // The SDK's SSE parser finds no frames in a buffered body, so nothing the MODEL
+    // did was readable — the endpoint's transport is the one thing this run observed.
+    const { result } = await probe(OPENAI_CONFIG, chatBufferedCompletion("here is your answer"));
+
+    expect(refusalOf(result).disproved).toEqual(["streaming"]);
+  });
+
+  test("a model that streamed prose instead of calling the tool disproves tool calling", async () => {
+    const { result } = await probe(OPENAI_CONFIG, chatTextStream("no tools here"));
+
+    const refusal = refusalOf(result);
+    expect(refusal.missing).toEqual(["toolCalling", "structuredOutput"]);
+    // Structured output was never exercised: a model that called nothing showed no
+    // arguments to validate, so it is unobserved rather than absent.
+    expect(refusal.disproved).toEqual(["toolCalling"]);
+  });
+
+  test("arguments the schema rejected are a disproof, because the probe watched them fail", async () => {
+    const { result } = await probe(
+      OPENAI_CONFIG,
+      chatToolCallStream(PROBE_TOOL_NAME, JSON.stringify({ acknowledged: "yes" })),
+    );
+
+    expect(refusalOf(result).disproved).toEqual(["structuredOutput"]);
+  });
+});
+
 // ─── a failure that says nothing about the model reaches no verdict ─────────
 
 describe("a failure that is not about the model is inconclusive, never a refusal", () => {
@@ -325,8 +395,8 @@ describe("a failure that is not about the model is inconclusive, never a refusal
 
   for (const { status, message, why } of NOT_ABOUT_THE_MODEL) {
     test(`HTTP ${status} (${why}) throws rather than blaming the model's capabilities`, async () => {
-      // Each of these breaks the AI Assistant identically, so a refusal telling
-      // the user to go and use the AI Assistant would be a dead end.
+      // None of these says anything about the model, so a refusal telling the user
+      // to configure a different one would send them to change what is not at fault.
       const error = await probeFailure(OPENAI_CONFIG, recordingFetch(endpointError(status, message)).fetch);
 
       expect(error).toBeInstanceOf(LLMStreamError);

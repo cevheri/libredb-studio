@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseConnection, ReadOnlyStatementBudget } from "@/lib/db/types";
 import { ExecutionProfileError } from "@/lib/db/errors";
+import { SHIPPED_DATABASE_TYPES } from "@/lib/db/compatibility";
 
 /** Enforcement caps for the sqlite agent-profile assertions below. */
 const AGENT_BUDGET: ReadOnlyStatementBudget = {
@@ -308,10 +309,14 @@ describe("createDatabaseProvider", () => {
   });
 
   test("the unknown-type error lists every supported type", async () => {
+    // The list inside that message is a hand-written string literal, not something
+    // TypeScript checks, so a new provider is only named there because a test pins it.
+    // Every SHIPPED type is pinned here rather than a sample of them: the surface that
+    // silently drifts is exactly the one nobody notices.
     const conn = makeConnection("unknown");
-    await expect(createDatabaseProvider(conn)).rejects.toThrow(/couchbase/);
-    await expect(createDatabaseProvider(conn)).rejects.toThrow(/clickhouse/);
-    await expect(createDatabaseProvider(conn)).rejects.toThrow(/druid/);
+    for (const type of SHIPPED_DATABASE_TYPES) {
+      await expect(createDatabaseProvider(conn)).rejects.toThrow(new RegExp(type));
+    }
   });
 
   test('creates provider for type "postgres"', async () => {
@@ -371,6 +376,24 @@ describe("createDatabaseProvider", () => {
     expect(provider.type).toBe("couchbase");
   });
 
+  test('creates provider for type "elasticsearch"', async () => {
+    // Two type-ids resolve to ONE module (`providers/sql/search/index`), which is the
+    // first time that happens here - so both cases are asserted, and each is asserted
+    // to produce its OWN class. A copy-paste that returned the same provider for both
+    // would otherwise pass every other test in the suite.
+    const conn = makeConnection("elasticsearch", { port: 9200 });
+    const provider = await createDatabaseProvider(conn);
+    expect(provider).toBeDefined();
+    expect(provider.type).toBe("elasticsearch");
+  });
+
+  test('creates provider for type "opensearch"', async () => {
+    const conn = makeConnection("opensearch", { port: 9200 });
+    const provider = await createDatabaseProvider(conn);
+    expect(provider).toBeDefined();
+    expect(provider.type).toBe("opensearch");
+  });
+
   test('creates provider for type "clickhouse"', async () => {
     const conn = makeConnection("clickhouse", { port: 8123, database: "demo" });
     const provider = await createDatabaseProvider(conn);
@@ -385,6 +408,24 @@ describe("createDatabaseProvider", () => {
     const provider = await createDatabaseProvider(conn);
     expect(provider).toBeDefined();
     expect(provider.type).toBe("druid");
+  });
+
+  test('creates provider for type "trino"', async () => {
+    // `database` carries the CATALOG, the way a PostgreSQL connection carries a
+    // database: a coordinator fronts many of them and a connection pins one.
+    const conn = makeConnection("trino", { port: 8080, database: "tpch" });
+    const provider = await createDatabaseProvider(conn);
+    expect(provider).toBeDefined();
+    expect(provider.type).toBe("trino");
+  });
+
+  test('creates provider for type "cassandra"', async () => {
+    // `database` carries the KEYSPACE and `localDataCenter` is required by the
+    // driver, so a connection missing it cannot be constructed at all.
+    const conn = makeConnection("cassandra", { port: 9042, database: "probe", localDataCenter: "datacenter1" });
+    const provider = await createDatabaseProvider(conn);
+    expect(provider).toBeDefined();
+    expect(provider.type).toBe("cassandra");
   });
 
   test('creates provider for type "libredb"', async () => {
@@ -839,6 +880,51 @@ describe("acquireExecutionProfileProvider", () => {
     expect(error).toBeInstanceOf(ExecutionProfileError);
     expect((error as InstanceType<typeof ExecutionProfileError>).reasonCode).toBe("PROFILE_UNSUPPORTED_BY_PROVIDER");
     expect(getExecutionProfileCacheStats().size).toBe(0);
+  });
+
+  test("serves the SAME engine under the operations profile, which needs no read-only statement path", async () => {
+    // Both directions of the workflow-aware engine gate, on one connection. The
+    // restriction is a property of the PROFILE, not of the factory: `agent-read-only`
+    // sends model-authored statements and is served only where the engine can bound
+    // one, while `agent-operations` sends none and calls the curated reporting methods
+    // every provider implements. Asserting them together is what keeps a later
+    // simplification from collapsing the two.
+    const connection = makeConnection("redis", { id: "redis-operations" });
+
+    const refused: unknown = await acquireExecutionProfileProvider(connection, "agent-read-only").catch(
+      (e: unknown) => e,
+    );
+    expect(refused).toBeInstanceOf(ExecutionProfileError);
+
+    const provider = await acquireExecutionProfileProvider(connection, "agent-operations");
+
+    expect(provider.isConnected()).toBe(true);
+    expect(typeof provider.queryReadOnly).not.toBe("function");
+    // It is still a PROFILED acquisition: the operations path may not be handed the
+    // editor's writable pool, which is the invariant the profiled cache carries.
+    expect(getExecutionProfileCacheStats().size).toBe(1);
+  });
+
+  test("the hand-over profile takes the same engine gate, and caches apart from the run's own", async () => {
+    // #373 review. `agent-handover` serves the editor replay of a statement a run
+    // already answered with, so it SENDS a statement and must be refused wherever the
+    // engine cannot bound one — the same rule as `agent-read-only`, from the same
+    // table. Its own key in the profiled cache is the other half: two profiles are two
+    // entries, so a later change to one path's lifecycle cannot reach the other, and
+    // neither is ever the editor's writable pool.
+    const refused: unknown = await acquireExecutionProfileProvider(
+      makeConnection("redis", { id: "redis-handover" }),
+      "agent-handover",
+    ).catch((e: unknown) => e);
+    expect(refused).toBeInstanceOf(ExecutionProfileError);
+    expect((refused as InstanceType<typeof ExecutionProfileError>).reasonCode).toBe("PROFILE_UNSUPPORTED_BY_PROVIDER");
+
+    const agent = await acquireExecutionProfileProvider(pgConn(), "agent-read-only");
+    const handover = await acquireExecutionProfileProvider(pgConn(), "agent-handover");
+
+    expect(typeof handover.queryReadOnly).toBe("function");
+    expect(handover).not.toBe(agent);
+    expect(getExecutionProfileCacheStats().size).toBe(2);
   });
 
   test("refuses to vend a PostgreSQL profile whose role is too privileged, and caches nothing", async () => {

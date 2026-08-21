@@ -984,9 +984,10 @@ $ SELECT COUNT(*) AS total, COUNT(DISTINCT __time) AS distinct_times FROM libred
 {"total":50,"distinct_times":30}
 ```
 
-Nothing in a Druid datasource is unique, and `isPrimary` is not a hint — three consumers state it as
-fact. `sql-completions.ts` appends `(PK)` in autocomplete, `use-ai-chat.ts` puts `, PK` into the
-schema context the model reasons from, and `schema-diff/diff-engine.ts` reports
+Nothing in a Druid datasource is unique, and `isPrimary` is not a hint — it is stated as fact
+wherever it is read. `sql-completions.ts` appends `(PK)` in autocomplete,
+`agent/context-snapshot.ts` and `DatabaseDocs.tsx` put ` PK` into the schema context a model reasons
+from, and `schema-diff/diff-engine.ts` reports
 `Primary key changed` — so two datasources differing only in this would diff as a key change. What
 `__time` actually is would need a partition/time-key concept distinct from a primary key, and
 `ColumnSchema` has no such field. It stays identifiable the honest way: by name, and by being the one
@@ -1173,6 +1174,17 @@ the declared operations where it is `true`, and none at all until the metadata h
 never Druid-specific: `libredb.ts` also sets `supportsMaintenance: false` and had exactly the same
 dead buttons, so the fix landed once in shared UI for every provider.
 
+**The same tab's *Vacuum* summary card reads `N/A` over *Not supported* here**, and that is a second,
+later reading of the same declaration. The card counted table rows whose bloat ratio exceeded 10 and
+labelled the count *Need* or *OK*; Druid publishes no bloat ratio, so the count was always `0` and the
+label always a green **OK** — a clean bill of health for an operation this provider refuses. Whether
+an engine has vacuum is a capability question, so the card is now gated on `supportsMaintenance`
+exactly as the controls are. Two per-row columns went the same way, because `getTableStats()` here
+sets neither field: *Bloat* shows a dash instead of a `0.0%` badge in the healthy variant, and *Last
+Vacuum* a dash instead of *Never*, which claimed a vacuum history for an engine with no vacuum. None
+of this touches the *Tables* and *Size* cards or the row and byte columns — those come from
+`sys.segments` and are measurements ([§7](#7-monitoring--health)).
+
 **The admin Operations tab closed the same gap (issue #282).** It rendered its global
 `Run Analyze` / `Run Vacuum` / `Run Reindex` controls and its per-table Analyze/Vacuum buttons
 without reading `getCapabilities()`, so all of them answered 400 here. `OperationsTab.tsx` now
@@ -1222,6 +1234,7 @@ Both halves of that are real constraints, not scope cuts made lightly:
 | `supportsExternalQueryLimiting` | `true` | `LIMIT n` / `LIMIT n OFFSET m` are both correct Druid SQL |
 | `supportsCreateTable` | **`false`** | `CREATE` is not in the grammar; a datasource is created by ingestion ([§3.11](#311-the-three-false-capabilities-are-each-impossible-not-merely-unimplemented)) |
 | `supportsInlineRowEdit` | **`false`** | `UPDATE t SET ...` answers `Unsupported SQL statement [UPDATE]`; Druid SQL has no row-level DML ([§5.5](#55-druid-sql-cannot-write-and-the-server-says-so-clearly)) |
+| `declaresForeignKeys` | **`false`** | Druid has no constraints — no primary key either — and a datasource cannot reference another, so an empty relations list is the engine and not the schema |
 | `supportsMaintenance` | **`false`** | Nothing in `MaintenanceType` is reachable from Druid SQL ([§8](#8-maintenance)) |
 | `maintenanceOperations` | `[]` | Consequence of the above |
 | `supportsConnectionString` | **`false`** | Druid has no URI convention, and `http(s)://` is ClickHouse's ([§4.2](#42-there-is-no-connection-string-and-that-is-deliberate)) |
@@ -1570,4 +1583,4 @@ cancellation as unsupported because the provider exposes no `cancelQuery`
 - Metadata tables (`INFORMATION_SCHEMA`, `sys`): <https://druid.apache.org/docs/latest/querying/sql-metadata-tables>
 - `EXPLAIN PLAN FOR`: <https://druid.apache.org/docs/latest/querying/sql-translation>
 - Native batch ingestion: <https://druid.apache.org/docs/latest/ingestion/native-batch>
-- Sibling provider docs: [PostgreSQL](./postgres.md) · [MySQL](./mysql.md) · [Oracle](./oracle.md) · [SQL Server](./mssql.md) · [SQLite](./sqlite.md) · [MongoDB](./mongodb.md) · [Couchbase](./couchbase.md) · [ClickHouse](./clickhouse.md) · [Redis](./redis.md) · [LibreDB](./libredb.md)
+- Sibling provider docs: [PostgreSQL](./postgres.md) · [MySQL](./mysql.md) · [Oracle](./oracle.md) · [SQL Server](./mssql.md) · [SQLite](./sqlite.md) · [MongoDB](./mongodb.md) · [Couchbase](./couchbase.md) · [ClickHouse](./clickhouse.md) · [Apache Trino](./trino.md) · [Redis](./redis.md) · [LibreDB](./libredb.md)

@@ -3,10 +3,21 @@
 import { useState, useEffect, useRef } from "react";
 import type { DatabaseConnection } from "@/lib/types";
 import type { ProviderCapabilities, ProviderLabels } from "@/lib/db/types";
+import { logger } from "@/lib/logger";
 
 export interface ProviderMetadata {
   capabilities: ProviderCapabilities;
-  labels: ProviderLabels;
+  /**
+   * Optional because one producer genuinely cannot supply it. `/api/db/provider-meta`
+   * always answers with both, but the embedded shell has no such route: the host
+   * declares each connection's metadata, and `WorkspaceConnection.labels` is
+   * optional there so a host that only knows the capabilities need not restate
+   * fifteen strings (#427). Every consumer already reads labels through `?.` with
+   * its own fallback wording, so this states what was already true rather than
+   * changing any behaviour — and it removes an `as ProviderLabels` cast that was
+   * laundering `undefined` into a field declared required.
+   */
+  labels?: ProviderLabels;
 }
 
 export function useProviderMetadata(connection: DatabaseConnection | null): {
@@ -61,7 +72,10 @@ export function useProviderMetadata(connection: DatabaseConnection | null): {
         if (lastConnectionId.current === requestedId) setMetadata(data);
       })
       .catch((err) => {
-        console.error("[useProviderMetadata]", err);
+        logger.warn("Provider metadata request failed", {
+          route: "use-provider-metadata",
+          error: err instanceof Error ? err.message : String(err),
+        });
         if (lastConnectionId.current === requestedId) setMetadata(null);
       })
       .finally(() => {

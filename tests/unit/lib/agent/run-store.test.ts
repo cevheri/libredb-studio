@@ -159,6 +159,81 @@ describe("AgentRunStore — opening a run", () => {
     expect(error.message).toContain(record.runId);
   });
 
+  test("opens with auto-execute off when nothing asked for it", async () => {
+    const { store } = storeAt();
+
+    const record = await store.openRun(OPEN_INPUT);
+
+    // Absent means off, which is the only safe reading: the setting gives away the
+    // editor's time limit, and a caller that said nothing has asked for nothing.
+    expect(record.autoExecute).toBe(false);
+  });
+
+  test("records the auto-execute setting on the run, where nothing later can widen it", async () => {
+    const dataDir = freshDataDir();
+    const { store } = storeAt(dataDir);
+
+    const record = await store.openRun({ ...OPEN_INPUT, autoExecute: true });
+
+    expect(record.autoExecute).toBe(true);
+    // Re-read through a second store over the same files: a resumed drive reads the
+    // value the drive that died was opened with, like `mode` and `workflowType`.
+    expect((await storeAt(dataDir).store.read(record.runId))?.record.autoExecute).toBe(true);
+  });
+
+  test("opens as an explicitly chosen workflow when nothing said where the workflow came from", async () => {
+    const { store } = storeAt();
+
+    const record = await store.openRun(OPEN_INPUT);
+
+    // Absent means chosen, and that is a reading rather than a fallback: a caller
+    // that sends a workflow without saying otherwise sent the one it was told.
+    expect(record.workflowSource).toBe("chosen");
+  });
+
+  test.each(["inferred", "chosen"] as const)(
+    "records the workflow source %p on the run, where a resumed drive reads it back",
+    async (workflowSource) => {
+      const dataDir = freshDataDir();
+      const { store } = storeAt(dataDir);
+
+      const record = await store.openRun({ ...OPEN_INPUT, workflowSource });
+
+      expect(record.workflowSource).toBe(workflowSource);
+      // Re-read through a second store over the same files: the "change" affordance
+      // is keyed on this, and it must survive the process that opened the run.
+      expect((await storeAt(dataDir).store.read(record.runId))?.record.workflowSource).toBe(workflowSource);
+    },
+  );
+
+  test("records no classifier outcome when nothing said how the workflow was read", async () => {
+    const { store } = storeAt();
+
+    const record = await store.openRun(OPEN_INPUT);
+
+    // `"unrecorded"` rather than either of the other two, and it is the only answer
+    // the header supports: a caller that named its own workflow ran no classifier, so
+    // there is no outcome — which is a different fact from one that ran and succeeded
+    // and from one that ran and fell back.
+    expect(record.workflowReading).toBe("unrecorded");
+  });
+
+  test.each(["classified", "unclassified", "unrecorded"] as const)(
+    "records the workflow reading %p on the run, where a resumed drive reads it back",
+    async (workflowReading) => {
+      const dataDir = freshDataDir();
+      const { store } = storeAt(dataDir);
+
+      const record = await store.openRun({ ...OPEN_INPUT, workflowReading });
+
+      expect(record.workflowReading).toBe(workflowReading);
+      // Re-read through a second store over the same files. This is the whole reason
+      // the field exists: the sentence the rail owes about a run it did not open is
+      // read from here, and a rail that reloaded has no other source for it.
+      expect((await storeAt(dataDir).store.read(record.runId))?.record.workflowReading).toBe(workflowReading);
+    },
+  );
+
   test("reads back nothing for a run that was never opened", async () => {
     const { store } = storeAt();
     expect(await store.read("arun_00000000000000000000000000000000")).toBeNull();
@@ -307,6 +382,31 @@ describe("AgentRunStore — durability", () => {
     expect(view?.record.status).toBe("running");
     expect(view?.record.objective).toBe(OPEN_INPUT.objective);
     expect(view?.unsettledStepIds).toEqual(["s1"]);
+  });
+
+  test("an answer survives the fold and a second store's re-read, presentation and all", async () => {
+    // The kind has to be in `EVENT_KINDS` or the line is refused as unknown on the
+    // way back in — the fold is where an event the writer knew about and the reader
+    // did not becomes a malformed ledger rather than a missing entry.
+    const { store, dataDir } = storeAt();
+    const { runId } = await store.openRun(OPEN_INPUT);
+    const answer = event("answer-composed", 4, {
+      sql: "SELECT region, SUM(net_total) AS net_total FROM orders GROUP BY region",
+      artifact: artifactFor(runId, "corr_answer"),
+      presentation: {
+        kind: "chart",
+        spec: { type: "bar", x: "id", y: ["net_total"], caption: "Net total by region." },
+      },
+      handover: "none",
+    });
+
+    await store.appendEvent(runId, event("run-started", 1, { mode: "agent" }));
+    await store.appendEvent(runId, answer);
+
+    const restarted = new AgentRunStore({ world: worldAt(dataDir) });
+    const view = await restarted.read(runId);
+
+    expect(view?.record.events).toEqual([event("run-started", 1, { mode: "agent" }), answer]);
   });
 
   test("two runs whose ids share a prefix never read each other's entries", async () => {
@@ -577,12 +677,23 @@ describe("AgentRunStore — the world seam", () => {
 
 // ─── binding to the backend T1 selected ─────────────────────────────────────
 
+// The LLM keys are in this list because #331 T5 derives availability from them:
+// `resolveAgentLedgerWorld` builds a world only when the agent is available, and
+// `bun` loads a checkout's `.env`, so leaving them alone would make this suite
+// answer one way locally and the other in CI.
 const WORLD_ENV_KEYS = [
   AGENT_ENABLED_ENV,
   AGENT_WORLD_TARGET_ENV,
   "WORKFLOW_LOCAL_DATA_DIR",
   "VERCEL_DEPLOYMENT_ID",
+  "LLM_PROVIDER",
+  "LLM_API_KEY",
+  "LLM_MODEL",
+  "LLM_API_URL",
 ] as const;
+
+/** The model configuration that makes the runtime available. */
+const MODEL_ENV = { LLM_PROVIDER: "gemini", LLM_API_KEY: "test-key" };
 
 /**
  * Restores both the environment and the SDK's process-global world cache. The
@@ -612,22 +723,22 @@ async function withWorldEnv(env: Record<string, string | undefined>, body: () =>
 }
 
 describe("resolveAgentLedgerWorld", () => {
-  test("refuses while the runtime is disabled — the default", async () => {
+  test("refuses when no model is configured, so an AI-less server builds no world", async () => {
     await withWorldEnv({}, async () => {
       const error = await captureStoreError(() => resolveAgentLedgerWorld());
       expect(error.reasonCode).toBe("RUNTIME_DISABLED");
     });
   });
 
-  test.each(["off", "false"])("refuses while the flag reads %p", async (flag) => {
-    await withWorldEnv({ [AGENT_ENABLED_ENV]: flag }, async () => {
+  test.each(["off", "false"])("refuses while the off-switch reads %p", async (flag) => {
+    await withWorldEnv({ ...MODEL_ENV, [AGENT_ENABLED_ENV]: flag }, async () => {
       expect((await captureStoreError(() => resolveAgentLedgerWorld())).reasonCode).toBe("RUNTIME_DISABLED");
     });
   });
 
   test("builds the zero-config local backend and a run written through it reads back", async () => {
     const dataDir = freshDataDir();
-    await withWorldEnv({ [AGENT_ENABLED_ENV]: "true", WORKFLOW_LOCAL_DATA_DIR: dataDir }, async () => {
+    await withWorldEnv({ ...MODEL_ENV, WORKFLOW_LOCAL_DATA_DIR: dataDir }, async () => {
       const world = await resolveAgentLedgerWorld();
       const store = new AgentRunStore({ world });
 
@@ -641,8 +752,29 @@ describe("resolveAgentLedgerWorld", () => {
   });
 
   test("refuses an unsanctioned backend before any world is built", async () => {
-    await withWorldEnv({ [AGENT_ENABLED_ENV]: "true", [AGENT_WORLD_TARGET_ENV]: "@evil/world" }, async () => {
+    await withWorldEnv({ ...MODEL_ENV, [AGENT_WORLD_TARGET_ENV]: "@evil/world" }, async () => {
       await expect(resolveAgentLedgerWorld()).rejects.toBeInstanceOf(AgentConfigError);
     });
+  });
+});
+
+describe("AgentRunStore — a closed run refuses further appends", () => {
+  test("an append after close is refused, never silently lost", async () => {
+    const { store } = storeAt();
+    const run = await store.openRun(OPEN_INPUT);
+    await store.close(run.runId);
+
+    const error = await captureStoreError(() =>
+      store.appendEvent(run.runId, event("tool-invoked", 2, { stepId: "s1", tool: "run_read_query" })),
+    );
+    expect(error.reasonCode).toBe("RUN_ALREADY_CLOSED");
+  });
+
+  test("the run is still readable after close; only appends are refused", async () => {
+    const { store } = storeAt();
+    const run = await store.openRun(OPEN_INPUT);
+    await store.close(run.runId);
+
+    expect((await store.read(run.runId))?.record.runId).toBe(run.runId);
   });
 });

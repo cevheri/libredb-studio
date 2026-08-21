@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { assertPersistableState } from "@/lib/agent/state-guard";
 import type {
   AgentArtifactReference,
+  AgentChartSpec,
   AgentContextSnapshot,
   AgentEvidenceReference,
   AgentReportClaim,
@@ -79,6 +80,9 @@ const EVENTS: Record<AgentRunEvent["kind"], AgentRunEvent> = {
     fingerprint: SNAPSHOT.fingerprint,
     tableCount: SNAPSHOT.tables.length,
     snapshot: SNAPSHOT,
+    // And the word the engine used for those rows (#414), which is two strings and
+    // therefore as inert as the rest of the entry.
+    noun: { singular: "key pattern", plural: "key patterns" },
   },
   "statement-drafted": {
     kind: "statement-drafted",
@@ -97,10 +101,86 @@ const EVENTS: Record<AgentRunEvent["kind"], AgentRunEvent> = {
   "tool-refused": { kind: "tool-refused", atMs: 5, stepId: "step-1", refusal: DATABASE_ERROR },
   "tool-completed": { kind: "tool-completed", atMs: 6, stepId: "step-2", artifact: ARTIFACT },
   "report-composed": { kind: "report-composed", atMs: 7, claims: [CLAIM] },
+  // The query-optimization template's own artifact. Both sides cite an estimating
+  // plan the run produced, and each summary is the SERVER's structural reading of
+  // it — no engine text, so nothing untrusted is carried in a durable record.
+  "plan-comparison": {
+    kind: "plan-comparison",
+    atMs: 6,
+    before: {
+      correlationId: ARTIFACT.correlationId,
+      sql: "SELECT * FROM orders WHERE customer_id = 42",
+      summary: { access: "full-scan", estimatedRows: 1000, estimatedCost: 210.5 },
+    },
+    after: {
+      correlationId: "4f2c9a10-0000-4000-8000-000000000002",
+      sql: "SELECT id, total FROM orders WHERE customer_id = 42",
+      summary: { access: "index", estimatedRows: 3, estimatedCost: 8.3 },
+    },
+  },
+  // A change the run proposes and does not make. `statement` is DDL that nothing in
+  // this runtime executes; it exists so the user can take it.
+  recommendation: {
+    kind: "recommendation",
+    atMs: 7,
+    change: "index",
+    statement: "CREATE INDEX orders_customer_id_idx ON orders (customer_id)",
+    rationale: "The filtered column has no index, so the plan reads the table whole.",
+    evidence: [ARTIFACT_EVIDENCE],
+  },
+  // The database-assessment template's own artifact: counts, and the findings the
+  // SERVER derived from them. Not one value out of any profiled column.
+  "table-profiled": {
+    kind: "table-profiled",
+    atMs: 8,
+    // The read that produced the counts, so a claim about the profile can cite it.
+    artifact: { ...ARTIFACT, operationId: "sql.table.profile" },
+    profile: {
+      table: "public.customers",
+      depth: "pattern",
+      rowCount: 4120,
+      columns: [{ column: "email", present: 4118, distinct: 4100, shaped: 4090 }],
+      findings: [
+        {
+          code: "suspected_pii",
+          column: "email",
+          detail:
+            "99% of the values are shaped like an email address. No value was read out of the database to establish this.",
+        },
+      ],
+    },
+  },
+  // The data-analysis face's own artifact: which result IS the answer, and how it
+  // is to be shown. The spec names columns of THAT result and carries no colours,
+  // no title and no aggregation — presentation is the app's, and an aggregation
+  // here would be one nothing recorded.
+  "answer-composed": {
+    kind: "answer-composed",
+    atMs: 9,
+    sql: "SELECT region, SUM(net_total) AS net_total FROM orders GROUP BY region",
+    artifact: ARTIFACT,
+    presentation: {
+      kind: "chart",
+      spec: { type: "bar", x: "customer", y: ["total"], caption: "Net total by region, largest first." },
+    },
+    handover: "none",
+  },
   // The uncited counterpart: what the model said when it did not compose a report.
   // A planning run's whole output is one of these, and it round-trips as plainly as
   // the rest — prose is already the most inert thing a ledger can hold.
   "closing-statement": { kind: "closing-statement", atMs: 8, text: "Start with the salary index." },
+  // A plan run's deliverable, and as inert as everything else here: the statement as
+  // text, the engine it was written for, and what the server could check about it
+  // without running it. `guardViolation` is absent because this draft is a read —
+  // the field is present exactly when `readOnly` is false.
+  "plan-statement-drafted": {
+    kind: "plan-statement-drafted",
+    atMs: 8,
+    sql: "SELECT total FROM orders",
+    dialect: "postgres",
+    readOnly: true,
+    identifiers: { kind: "checked", unknownTables: [] },
+  },
   "run-finished": { kind: "run-finished", atMs: 8, status: "succeeded" },
 };
 
@@ -111,6 +191,9 @@ const RUN: AgentRunRecord = {
   runId: "run_1",
   mode: "agent",
   workflowType: "query-optimization",
+  workflowSource: "chosen",
+  workflowReading: "unrecorded",
+  autoExecute: false,
   status: "succeeded",
   actor: { sessionId: "sess_1", role: "user" },
   connectionId: "conn_1",
@@ -190,6 +273,36 @@ describe("contract shapes", () => {
     expect(DATABASE_ERROR.class).toBe("database-error");
     expect("message" in DATABASE_ERROR).toBe(true);
     expect("statementFingerprint" in DATABASE_ERROR).toBe(true);
+  });
+
+  test("a chart spec cannot ask for a histogram, because the run has no bins to show", () => {
+    // A histogram is a client-side binning of raw values, so the picture would show
+    // something the artifact does not contain. A bucketing wanted is a bucketing the
+    // SQL should do — and then it is a bar chart of an aggregate the run can cite.
+    // @ts-expect-error — `histogram` is inexpressible, though `DataCharts` offers it.
+    const binned: AgentChartSpec = { type: "histogram", x: "total", y: ["total"], caption: "spread" };
+    expect(String(binned.type)).toBe("histogram");
+  });
+
+  test("a chart spec cannot be composed without a y column", () => {
+    // @ts-expect-error — an empty `y` is inexpressible: a chart with nothing on the
+    // value axis is a chart of nothing.
+    const axisless: AgentChartSpec = { type: "bar", x: "customer", y: [], caption: "nothing" };
+    expect(axisless.y).toHaveLength(0);
+  });
+
+  test("a chart spec carries no colour, no title, no size and no aggregation", () => {
+    const spec = (EVENTS["answer-composed"] as Extract<AgentRunEvent, { kind: "answer-composed" }>).presentation;
+    if (spec.kind !== "chart") throw new Error("expected the fixture to carry a chart");
+
+    expect(Object.keys(spec.spec).sort()).toEqual(["caption", "type", "x", "y"]);
+  });
+
+  test("a table answer carries no chart spec at all", () => {
+    const table: Extract<AgentRunEvent, { kind: "answer-composed" }>["presentation"] = { kind: "table" };
+    // @ts-expect-error — the table arm has no `spec`, so a chart cannot ride along
+    // on an answer that says it is a table.
+    expect(table.spec).toBeUndefined();
   });
 
   test("the persisted actor is a session and a role, never a policy mode", () => {

@@ -156,6 +156,96 @@ is sqlite. NOTES.txt warns when this happens.
 {{- end }}
 
 {{/*
+The explicit agent off-switch, when the operator set one. Empty means "unset":
+the chart then writes no LIBREDB_AGENT_ENABLED and the app derives availability
+itself (#331 T5), which is the whole point of the derived default and the one
+thing this chart must not undo by hard-coding a value.
+
+Absent, present-but-null and a key deleted by a user's `agent: null` all land on
+"unset", so the caller never has to tell those three apart.
+*/}}
+{{- define "libredb-studio.agentFlagSet" -}}
+{{- $agent := .Values.agent | default dict }}
+{{- if and (hasKey $agent "enabled") (not (kindIs "invalid" (get $agent "enabled"))) }}
+{{- true }}
+{{- end }}
+{{- end }}
+
+{{/*
+Whether an agent run could start in this deployment - the chart's own, deliberately
+conservative reading of the runtime's rule (a configured model plus a writable
+ledger). It answers "true" only for what this chart can see in its values:
+
+  - agent.enabled=true  -> the operator said so, model or not
+  - agent.enabled=false -> never, whatever else is set
+  - unset               -> true when the AI configuration in these values would
+                           validate: an inline llmApiKey, or one of the providers
+                           that needs no key at all
+
+KEY-OPTIONAL PROVIDERS are taken from the app, not guessed: validateConfig
+(src/lib/llm/utils/config.ts) requires an API key for "gemini" and "openai" only.
+"ollama" needs neither key nor URL, and "custom" needs LLM_API_URL rather than a
+key - so requiring an inline llmApiKey of either would miss a model that is fully
+configured, and a multi-replica install would render and then derive an available
+agent on every pod. Both therefore count on their own. Any provider added to the
+llmProvider enum in values.schema.json must be classified into this list or the
+one above it.
+
+BLIND SPOTS - the complete list, because a partial one tells the reader the rest
+were checked. This helper reads .Values and nothing else, so a model configured
+in any of these three places passes it unseen:
+
+  - secrets.existingSecret - a Secret the chart does not create and cannot read
+  - extraEnvFrom           - envFrom sources, whose keys are not visible here
+  - extraEnv               - rendered verbatim, and NOT inspected for LLM_API_KEY,
+                             LLM_API_URL or LLM_PROVIDER (the one entry it does
+                             look for is WORKFLOW_TARGET_WORLD, in
+                             agentPostgresWorld, which is a different question)
+
+None of the three is counted, and that is a deliberate trade rather than an
+oversight: counting what cannot be read would refuse to render every existing HA
+install that keeps a JWT secret in an existingSecret and configures no AI at all.
+The cost is that a multi-replica release configuring its model any of those ways
+needs agent.enabled=false set by hand.
+*/}}
+{{- define "libredb-studio.agentPossible" -}}
+{{- $agent := .Values.agent | default dict }}
+{{- $keyless := list "ollama" "custom" }}
+{{- if include "libredb-studio.agentFlagSet" . }}
+{{- if get $agent "enabled" }}{{- true }}{{- end }}
+{{- else if or .Values.secrets.llmApiKey (has (.Values.config.llmProvider | toString | trim | lower) $keyless) }}
+{{- true }}
+{{- end }}
+{{- end }}
+
+{{/*
+Whether this release can run more than one pod. The HPA governs when it is
+effectively enabled (the deployment then renders no replicas at all), so its
+ceiling is the number that matters there; otherwise replicaCount is.
+*/}}
+{{- define "libredb-studio.multiReplica" -}}
+{{- if include "libredb-studio.autoscalingEnabled" . }}
+{{- if gt (int .Values.autoscaling.maxReplicas) 1 }}{{- true }}{{- end }}
+{{- else if gt (int .Values.replicaCount) 1 }}
+{{- true }}
+{{- end }}
+{{- end }}
+
+{{/*
+Whether extraEnv selects the multi-replica durable backend. There is no values
+field for it on purpose: that backend also needs WORKFLOW_POSTGRES_URL, which
+belongs in a Secret and therefore in an extraEnv entry with valueFrom - so the
+chart reads the operator's own entry rather than adding a second way to say it.
+*/}}
+{{- define "libredb-studio.agentPostgresWorld" -}}
+{{- range .Values.extraEnv }}
+{{- if and (eq (.name | default "") "WORKFLOW_TARGET_WORLD") (eq (.value | default "" | toString) "@workflow/world-postgres") }}
+{{- true }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
 Whether the chart's fixed UID/GID fields must be dropped for OpenShift.
 OpenShift's restricted-v2 SCC assigns runAsUser/fsGroup from a per-namespace
 range, so a pod that hard-codes IDs outside that range is rejected at
@@ -184,6 +274,70 @@ execs directly when not running as root.
 {{- $psc = omit $psc "runAsUser" "runAsGroup" "fsGroup" }}
 {{- end }}
 {{- toYaml $psc }}
+{{- end }}
+
+{{/*
+The bind address this release pins the container to, or empty when it leaves
+the choice to the image. An explicit env entry beats the same key delivered by
+the ConfigMap through envFrom, so an extraEnv HOSTNAME wins over
+config.bindAddress; both are read here, value included, because the value is
+now what matters - empty means "the image resolves it and prefers a verified
+dual-stack ::".
+
+Blind spot, same as agentPossible: a HOSTNAME whose value the chart cannot read
+at template time is invisible here, so such a release is treated as unpinned and
+sees no warning. Two shapes reach that: extraEnvFrom, and an extraEnv entry using
+valueFrom (a secretKeyRef or configMapKeyRef - legal, since extraEnv items are
+free-form EnvVar objects). Neither is new; the key-presence check this replaced
+stayed silent on them too. It is left silent rather than warned on because the
+value may perfectly well be "::", and a warning aimed at a deliberate IPv4 pin
+should not fire at someone who supplied the right answer through a secret. An
+operator who does pin IPv4 that way keeps the diagnosis: the container prints the
+address it bound and why.
+*/}}
+{{- define "libredb-studio.effectiveBindAddress" -}}
+{{- $bind := .Values.config.bindAddress | default "" | toString | trim }}
+{{- range .Values.extraEnv }}
+{{- if eq (.name | default "" | toString) "HOSTNAME" }}
+{{- $bind = .value | default "" | toString | trim }}
+{{- end }}
+{{- end }}
+{{- $bind }}
+{{- end }}
+
+{{/*
+Whether this release pins the container to an IPv4-only listener. True when the
+effective bind address is set and carries no ":" - "0.0.0.0", "127.0.0.1" and
+any other IPv4 literal - which is the one combination a dual-stack Service must
+not be paired with. "::" and "::1" are IPv6 forms and are left alone, and empty
+is the image-resolved default, which is dual-stack wherever the namespace
+allows it.
+*/}}
+{{- define "libredb-studio.bindPinnedToIPv4" -}}
+{{- $bind := include "libredb-studio.effectiveBindAddress" . }}
+{{- if and $bind (not (contains ":" $bind)) }}
+{{- true }}
+{{- end }}
+{{- end }}
+
+{{/*
+Whether these values ask the Service for an IPv6 address: either a dual-stack
+policy, or an explicit IPv6 entry in service.ipFamilies (which needs no policy
+when it is the only family, so templates/service.yaml's guard never sees it).
+
+Kubernetes populates the IPv6 EndpointSlice from the pod's own IPv6 address
+without ever checking what the process bound, so this is the condition under
+which an IPv4-only listener turns into a silent misconfiguration: a green
+install whose IPv6 address refuses every connection, on a pod that - probed
+only on its primary IP - stays Ready. Since chart 0.1.42 the container resolves
+its own address and prefers a verified dual-stack "::", so this can only happen
+when the release pins IPv4 explicitly; NOTES.txt warns about exactly that
+pairing.
+*/}}
+{{- define "libredb-studio.serviceWantsIPv6" -}}
+{{- if or (has .Values.service.ipFamilyPolicy (list "PreferDualStack" "RequireDualStack")) (has "IPv6" (default (list) .Values.service.ipFamilies)) }}
+{{- true }}
+{{- end }}
 {{- end }}
 
 {{/*

@@ -4,8 +4,8 @@ Canonical listing content for LibreDB Studio in the SUSE Partner Certification &
 Solutions Catalog (PCSC), requested by SUSE as part of the SUSE Ready for Rancher
 certification (see rancher/partner-charts#1158 and tracking issue #166). This file is
 the single source for the catalog text; the partner-charts `app-readme.md` overlay is
-refreshed from it during the Phase-2 resubmission (see `E2E_VALIDATION_TASK.md` for the
-validation side).
+refreshed from it, most recently on 2026-08-18 (see the delivery note at the end).
+`E2E_VALIDATION_TASK.md` covers the validation side.
 
 The listing is live at https://www.suse.com/pcsc/viewVersionPage?versionID=26969 (SUSE
 published it on 2026-08-05 from an earlier revision of this file). Edits here do not
@@ -13,11 +13,45 @@ propagate automatically — SUSE owns the page, so any change has to be mailed t
 partner contact.
 
 > **Accuracy gate — engine count.** The wording below says ten engines. That is true
-> from the first release containing ClickHouse and Apache Druid onwards; both are merged
-> on `main` but unreleased as of **0.9.66**, which ships eight (PostgreSQL, MySQL,
-> Oracle, SQL Server, SQLite, MongoDB, Redis, Couchbase). The catalog entry is
-> version-scoped, so do not publish the ten-engine wording against a version older than
-> that — send the eight-engine variant instead, or cut the release first.
+> from **0.11.0** onwards, the first release shipping ClickHouse and Apache Druid
+> alongside the other eight (PostgreSQL, MySQL, Oracle, SQL Server, SQLite, MongoDB,
+> Redis, Couchbase); the provider registry in `src/lib/db/factory.ts` at that tag
+> resolves all ten. The catalog entry is version-scoped, so do not publish the
+> ten-engine wording against a version older than 0.11.0 — send the eight-engine
+> variant instead.
+>
+> **The count is now fourteen on `main`, and that wording waits for a release.**
+> Elasticsearch, OpenSearch and Apache Trino shipped on `main` with
+> [#424](https://github.com/libredb/libredb-studio/issues/424) Phases 1 and 2, and Apache
+> Cassandra with Phase 4; all four are in the `SHIPPED` record in
+> `src/lib/db/compatibility.ts`, but the catalog page describes a released version. So the
+> prose below stays at ten until a tag carries them, and then both the short and long
+> descriptions gain "Elasticsearch, OpenSearch, Apache Trino and Apache Cassandra" and the
+> feature bullet becomes fourteen. Read the number from `SHIPPED` (minus
+> the embedded `libredb`) rather than from this file, and state the scope with it: on the
+> two search engines LibreDB Studio queries and browses — their SQL has no `INSERT`,
+> `UPDATE` or `CREATE TABLE` — so "manage data across …" must not be extended to include
+> them.
+>
+> **The chart's own `description` is not release-coupled and does name Cassandra.** An
+> earlier revision of this note said it deliberately did not, on the reasoning that
+> `charts/libredb-studio/` is a packaged path and editing it drags in a `Chart.yaml` version
+> bump (#167's required check), the README `--version` examples and the `operator/helm-charts`
+> mirror. Those four edits are the cost, not a reason to defer: the chart has been carried
+> with the engine since [#438](https://github.com/libredb/libredb-studio/pull/438), which
+> moved the description to thirteen and 0.1.39 to 0.1.40 in the PR that added Trino. Cassandra
+> followed the same path at chart 0.1.43. So a PR that adds an engine updates all four files;
+> it does not hand them to whoever cuts the next chart. Note the mirror must stay
+> byte-identical — run `bun run chart:bump` rather than editing
+> `operator/helm-charts/libredb-studio/` by hand, or the sync guard fails the required check.
+>
+> What *is* release-coupled is every marketplace and packaging description that spells the
+> count: `deploy/azure`, `deploy/railway`, `deploy/caprover`, `packaging/winget`,
+> `packaging/chocolatey`, `packaging/homebrew` and `desktop/src-tauri/tauri.conf.json` all
+> still say thirteen, because each describes an artifact a user can already download and
+> 0.12.0 ships no Cassandra provider. Read the number from `SHIPPED` when a tag carries it.
+> (`packaging/linux/nfpm.yaml` and the operator CSVs are the exception: both are consumed at
+> release time from `main`, so they name fourteen now and the next tag publishes it.)
 
 ## Listing facts
 
@@ -77,14 +111,15 @@ versions are documented and validated for every release.
 
 ## Outstanding corrections to the published page
 
-Checked against the live page on 2026-08-07. These are deltas between what SUSE
-published and what is true today; batch them into one mail to the partner contact rather
-than sending them one at a time.
+Re-checked against the live page on 2026-08-18. Nothing has been applied since the page
+went live on 2026-08-05, so all of these are still open; batch them into one mail to the
+partner contact rather than sending them one at a time.
 
 | Field on the page | Published value | Should be |
 |---|---|---|
-| Version | LibreDB Studio 0.9.44 | the current release (0.9.66 or later), with the release link updated to match |
-| Key features | "Seven database engines" | see the accuracy gate above — eight today, ten once ClickHouse and Druid ship |
+| Version | LibreDB Studio 0.9.44 | 0.11.0, with the release link pointing at <https://github.com/libredb/libredb-studio/releases/tag/0.11.0> |
+| Key features | "Seven database engines" | ten — the accuracy gate above is satisfied as of 0.11.0 |
+| Short and long description | the pre-0.11.0 revision, which names seven engines | the text in this file |
 | Hardware Architecture | x86-64 | x86-64 and Arm64 (`ghcr.io/libredb/libredb-studio` is linux/amd64 + linux/arm64) |
 
 Two open questions for the same mail: whether the version field can track the latest
@@ -99,6 +134,13 @@ The content above was delivered to Troy Topnik (SUSE) and published on 2026-08-0
 fitted as much of the long description as the page template allows. This file stays the
 canonical wording: any future edit happens here first, then goes to SUSE by mail and to
 the partner-charts `app-readme.md` overlay.
+
+**2026-08-18.** rancher/partner-charts#1158 was rebased onto the current `main-source`
+and regenerated against chart 0.1.36 / appVersion 0.11.0. The original 0.1.3 submission
+was dropped rather than carried alongside: it pinned appVersion 0.9.44 and the
+pre-Couchbase app-readme, so merging it would have offered a months-old version in the
+Rancher catalog. The overlay in that PR now carries the ten-engine wording from this
+file. The corrections above have **not** been mailed to SUSE yet.
 
 Vendor naming, as settled: the page heads the partner as **Sekoya** (the legal entity,
 Sekoya Grup Bilisim ve Teknoloji Ltd. Sti.) with the product named **LibreDB Studio**.

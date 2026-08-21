@@ -1,6 +1,6 @@
 # LibreDB Studio API Documentation
 
-> **Version:** 0.9.41
+> **Version:** 0.11.0
 > **Base URL:** `https://your-domain.com` or `http://localhost:3000`
 > **Content-Type:** `application/json`
 
@@ -12,6 +12,7 @@
   - [Auth API](#auth-api)
   - [Database API](#database-api)
   - [AI API](#ai-api)
+  - [Agent API](#agent-api)
   - [Storage API](#storage-api)
   - [Connections API](#connections-api)
   - [Admin API](#admin-api)
@@ -25,13 +26,13 @@
 
 ## Overview
 
-LibreDB Studio provides a RESTful API for database management operations. The API supports PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, and Redis.
+LibreDB Studio provides a RESTful API for database management operations. The API supports PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, and Redis.
 
 ### Key Features
 
 - **JWT Authentication** - Secure token-based authentication stored in HTTP-only cookies
-- **Multi-Database Support** - PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Redis
-- **AI-Powered Queries** - Natural language to SQL with streaming responses
+- **Multi-Database Support** - PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Redis
+- **AI-Powered Insights** - EXPLAIN explanations, query-safety analysis and schema docs, streamed
 - **Real-time Health Monitoring** - Database metrics and performance insights
 
 ### Request Format
@@ -78,13 +79,15 @@ LibreDB Studio uses JWT (JSON Web Tokens) for authentication. Tokens are stored 
 
 ### Public Endpoints (No Auth Required)
 
-Authentication is enforced centrally by the middleware (`src/proxy.ts`), not by individual route handlers: every route requires a valid `auth-token` cookie **except** the routes below. (This is why handlers like `/api/ai/*` don't call `getSession()` themselves — the middleware has already gated them.)
+The middleware (`src/proxy.ts`) gates every route: all of them require a valid `auth-token` cookie **except** the routes below. It is an optimisation rather than the authorization boundary, though — every handler that reaches a database or a model provider verifies the session again itself, through `guardRoute` (`src/lib/api/require-session.ts`), which is also where the rate-limit bucket and the audit line come from.
 
 - `/api/auth/*` — login, logout, me, and OIDC login/callback
 - `/api/db/health` — excluded from the middleware for **both** methods; `GET` is fully public, while `POST` performs its own session check and returns JSON `401` if unauthenticated
 - `GET /api/storage/config` — storage-mode discovery (returns `{ provider, serverMode }`, no user data)
 
 Unauthenticated requests to any other (middleware-gated) route are redirected to `/login`. A few allowlisted handlers self-check instead and return JSON — e.g. `POST /api/db/health` (`401`) and `GET /api/auth/me` (`{ "authenticated": false }`).
+
+**One route is session-less without being public: `POST /api/agent/drive`.** It is deliberately *not* on the list above — a path-shaped exemption would admit anything that can reach the port. It carries a server-minted, single-purpose credential instead, verified by the middleware and again by the handler (see the [Agent API](#agent-api) below).
 
 ---
 
@@ -484,6 +487,116 @@ things differ from the other SQL providers:
 
 ---
 
+##### Apache Trino Query Format
+
+Trino speaks SQL over its own client protocol (`POST /v1/statement`, port `8080`), so the `sql` field
+carries a plain statement. Four things differ from the other SQL providers:
+
+- **`database` is the CATALOG.** Trino's hierarchy is catalog -> schema -> table, and a connection
+  pins one catalog exactly as a PostgreSQL connection pins one database. Schemas inside it are the
+  schema level, and every table is named `schema.table`. A statement may still name any other
+  catalog in full: `SELECT * FROM other_catalog.some_schema.t` runs unchanged. A connection with no
+  catalog runs fully qualified statements fine, but `GET /api/db/schema` refuses with the reason.
+- **There is no `connectionString`.** `jdbc:trino://host:port/catalog/schema` exists, but the shared
+  parser does not accept it, so a connection is `host` + `port` (+ optional `database`, `username`).
+  A **`password` requires `ssl: true`**: the coordinator answers `401 Password not allowed for
+  insecure authentication` over plain HTTP even with authentication switched off, so a password on
+  an `http://` connection is refused by the provider rather than sent and rejected.
+- **No positional parameters.** Trino binds through `PREPARE`/`EXECUTE` and a prepared-statement
+  header this client does not send, so a request carrying `params` is refused with that reason
+  rather than having its values spliced into the SQL.
+- **`OFFSET` comes before `LIMIT`.** Trino's grammar is `[ OFFSET count ] [ LIMIT count ]` and only
+  that way round, so the auto-limiter's output is transposed before it is sent. A trailing semicolon
+  is a syntax error and is never emitted.
+
+```json
+{
+  "connection": {
+    "type": "trino",
+    "host": "localhost",
+    "port": 8080,
+    "database": "tpch"
+  },
+  "sql": "SELECT nationkey, name FROM tpch.tiny.nation ORDER BY 1"
+}
+```
+
+**Notes:**
+- A **failed statement arrives as HTTP 200** from the coordinator, with the failure inside the
+  document. The provider classifies from the body, never from the status, and surfaces the engine's
+  own wording (`line 1:15: Table 'tpch.tiny.nope' does not exist`) without the Java stack that
+  travels beside it.
+- A duplicate output name is disambiguated rather than dropped: `fields` carries `id` and `id (2)`.
+- `columnTypes` are Trino's rendered type strings verbatim: `bigint`, `varchar(25)`,
+  `array(integer)`, `row(x integer, y varchar)`. Values are passed through as the wire encodes them
+  - `decimal` as a string, `varbinary` as base64, `timestamp` as `2020-01-01 10:00:00.000` in UTC.
+- `SET SESSION`, `USE`, `PREPARE` and `DEALLOCATE` succeed and then affect nothing: every statement
+  is its own stateless exchange. The response carries a `warning` saying so.
+- `POST /api/db/maintenance` accepts `kill` only, and its target is a query id from the sessions
+  panel. Nothing else has a Trino analogue: it owns no storage to reclaim, and `ANALYZE` is the
+  connector's decision rather than the engine's.
+- `POST /api/db/cancel` works: cancelling is `DELETE /v1/query/{id}` and abandoning a request does
+  **not** stop the work on the cluster.
+- Full reference: [`docs/providers/trino.md`](providers/trino.md).
+
+---
+
+##### Apache Cassandra Query Format
+
+Cassandra speaks CQL over the native protocol (port `9042`), so the `sql` field carries a plain CQL
+statement. Five things differ from the other SQL providers:
+
+- **A `localDataCenter` is REQUIRED on the connection.** No other engine here has such a field.
+  `cassandra-driver` refuses to construct a client without one (`'localDataCenter' is not defined in
+  Client options and also was not specified in constructor`), and names the data centres it did find
+  when the value is wrong. A stock single-node install reports `datacenter1`.
+- **`database` is the KEYSPACE**, pinned for the session exactly as a PostgreSQL connection pins one
+  database. Without it an unqualified table name resolves to nothing (`No keyspace has been
+  specified`), and a keyspace that does not exist fails the CONNECT rather than the first statement.
+- **There is no `connectionString`**: no URI convention carries `localDataCenter`, so one would parse
+  into a connection that cannot open.
+- **No positional parameters.** CQL binds `?` through a prepared statement this client does not send,
+  so a request carrying `params` is refused with that reason rather than having its values spliced
+  into the statement.
+- **`OFFSET` does not exist**, so a request with a non-zero `offset` is refused: there is no second
+  page to ask for. `ALLOW FILTERING` must stay the last clause, so the auto-limiter's `LIMIT n` is
+  moved in front of it, and a statement that would end inside a line comment is sent unrewritten
+  (CQL has `//` as well as `--`, and neither may be closed by end of input).
+
+```json
+{
+  "connection": {
+    "type": "cassandra",
+    "host": "localhost",
+    "port": 9042,
+    "database": "probe",
+    "localDataCenter": "datacenter1"
+  },
+  "sql": "SELECT id, name FROM probe.customers WHERE id = 1"
+}
+```
+
+**Notes:**
+- **No row count and no size are reported anywhere** - not in `GET /api/db/schema`, not in the
+  overview, and the table, index and storage panels answer `[]`. Cassandra publishes partition
+  estimates (measured at 143 for a 500-row clustered table) and whole mebibytes (`1 MiB` for 19,476
+  bytes), and neither is a number this API will pass on. See
+  [`docs/providers/cassandra.md`](providers/cassandra.md#32-there-is-no-honest-row-count-and-no-honest-size).
+- `columnTypes` are the wire's declared CQL types (`int`, `bigint`, `list<int>`, `map<varchar, int>`,
+  `duration`, `vector<float, 3>`). A `blob` is rendered as `0x…`, a `bigint`/`decimal`/`varint` as its
+  exact digits in a string (`Number()` would round them), a `vector` as an array of numbers and a
+  `duration` as its CQL literal (`1mo2d3h`).
+- A write answers no columns and no row count: the protocol reports neither, so `rowCount` is 0
+  rather than an invented figure.
+- `POST /api/db/maintenance` accepts NOTHING: every Cassandra maintenance operation (compaction,
+  repair, flush, cleanup) is a `nodetool` action on a node over JMX, not a statement.
+- `POST /api/db/cancel` answers "cancellation is not supported for this database type": the protocol
+  has no cancel frame and CQL has no `KILL`.
+- There is no EXPLAIN: the keyword is not in the grammar at all.
+- Full reference: [`docs/providers/cassandra.md`](providers/cassandra.md).
+
+---
+
 ##### Redis Query Format
 
 Redis is a key-value store, so the `sql` field carries a Redis command instead of SQL. Two interchangeable formats are accepted.
@@ -693,70 +806,44 @@ The handler validates against the target provider's capabilities: `type` is requ
 
 A `druid` connection fails the second check whatever the `type` is, with `{ "error": "Maintenance operations not supported for this database" }`: no maintenance operation is reachable from Druid SQL, so its supported set is empty by design. Compaction and retention are Coordinator and task concerns, and Druid publishes no catalog of running queries, so there is no id for `kill` to name.
 
+A `trino` connection passes it for `kill` and fails it for everything else, which is the difference between an empty supported set and a set of one: `CALL system.runtime.kill_query` really terminates a statement (verified end to end - the target then fails `ADMINISTRATIVELY_KILLED`), while vacuum, reindex, optimize, check and analyze all describe work that belongs to the connector behind a catalog rather than to the engine.
+
 ---
 
 ### AI API
 
-#### POST /api/ai/chat
+All AI endpoints are `POST`, auth-required (via middleware), and stream `text/plain` with chunked
+transfer encoding. They share the optional `schemaContext` and `databaseType` fields; the table lists
+each one's primary input and purpose.
 
-Generate SQL queries using AI with streaming response.
+| Endpoint | Key input | Purpose |
+|----------|-----------|---------|
+| `POST /api/ai/explain` | `query` (+ optional `explainPlan`) | Explain an EXPLAIN plan and suggest optimizations |
+| `POST /api/ai/query-safety` | `query` | Pre-execution risk analysis; streams a JSON verdict (`riskLevel`, `warnings[]`, `recommendation`) |
+| `POST /api/ai/describe-schema` | `schemaContext` (+ optional `mode`: `"table"`\|`"database"`) | Auto-generate schema documentation |
 
-**Authentication:** Required
+Each of the three validates its key field and returns a `400` with an `error` string if it's missing.
+The exact strings differ: `explain` and `query-safety` return `"Query is required"`,
+`describe-schema` returns `"Schema context required"` — treat the status code, not the message text,
+as the contract.
 
-**Request:**
+**Provider-surfaced errors**
+
+These come from the configured **LLM provider** (bad API key, quota, safety filter), not from session
+auth — session auth is already enforced by the middleware before the handler runs.
+
 ```json
-{
-  "prompt": "Show me all users who signed up in the last 30 days",
-  "databaseType": "postgres",
-  "schemaContext": "Table: users (id, email, name, created_at, status)"
-}
-```
-
-**Parameters:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `prompt` | string | Yes | Natural language query or question |
-| `databaseType` | string | No | Database type for syntax (default: postgres) |
-| `schemaContext` | string | No | Schema info for context-aware queries |
-| `queryLanguage` | string | No | `"sql"` (default) or `"json"` (MongoDB MQL) |
-| `conversationHistory` | array | No | Prior `{role, content}` messages for multi-turn context |
-
-**Response (200 OK - Streaming):**
-
-Returns `text/plain` with chunked transfer encoding. The response streams the generated SQL:
-
-```sql
-SELECT id, email, name, created_at
-FROM users
-WHERE created_at >= NOW() - INTERVAL '30 days'
-ORDER BY created_at DESC;
-```
-
-**Response (401 Unauthorized):**
-```json
-{
-  "error": "Invalid API key. Please check your configuration."
-}
-```
-
-**Response (429 Too Many Requests):**
-```json
-{
-  "error": "AI usage limit reached. Please try again later or check your billing status."
-}
-```
-
-**Response (400 Bad Request):**
-```json
-{
-  "error": "The prompt was blocked by safety filters."
-}
+// 401 Unauthorized
+{ "error": "Invalid API key. Please check your configuration." }
+// 429 Too Many Requests
+{ "error": "AI usage limit reached. Please try again later or check your billing status." }
+// 400 Bad Request
+{ "error": "The prompt was blocked by safety filters." }
 ```
 
 **LLM Configuration:**
 
-Configure AI provider via environment variables:
+Configure the AI provider via environment variables:
 
 ```env
 LLM_PROVIDER=gemini          # gemini, openai, ollama, custom
@@ -765,25 +852,235 @@ LLM_MODEL=gemini-2.5-flash   # Model name
 LLM_API_URL=http://localhost:11434/v1  # For ollama/custom
 ```
 
-> The `401`/`429`/`400` responses above are surfaced from the configured **LLM provider** (bad API key, quota, safety filter), not from session auth — session auth is already enforced by the middleware before the handler runs.
+---
+
+### Agent API
+
+Seven paths, eight handlers, under `src/app/api/agent/`. They drive the read-only agent runtime — full
+behaviour in [`docs/AGENT.md`](AGENT.md), the surface in [`docs/AGENT_GUIDE.md`](AGENT_GUIDE.md), and
+what a run sends to a model provider in [`docs/AGENT_DATA_FLOW.md`](AGENT_DATA_FLOW.md).
+
+Three properties hold across the whole family and are not repeated per route:
+
+- **Every handler verifies its own caller.** Middleware is an optimisation, not the authorization
+  boundary.
+- **A run belongs to the session that opened it.** Ownership is decided against the actor persisted
+  in the run's ledger, and an admin is not exempt. Somebody else's run, a run that does not exist and
+  a malformed run id all answer the same `404 { "error": "No such agent run" }` — a `403` would
+  confirm the id.
+- **When the server runs no agents, the run-reaching handlers answer `404`** — after the session
+  check, so an unauthenticated caller cannot learn whether an agent surface exists. `GET
+  /api/agent/config` is the deliberate exception: `{"enabled": false, …}` *is* its answer.
+
+#### GET /api/agent/config
+
+Whether this server runs agents. **Authentication:** required (`401 { "error": "Authentication
+required" }` without a session). Never `500`, and never names a key's value.
+
+```json
+// 200 — available
+{ "enabled": true, "ledgerVerified": true }
+
+// 200 — not available
+{ "enabled": false, "reason": "NO_MODEL_CONFIGURED", "detail": "…" }
+```
+
+| Field | Meaning |
+|-------|---------|
+| `enabled` | A literal boolean. The rail compares `=== true` |
+| `ledgerVerified` | `true` when the durable ledger's writable-path probe passed; `false` for the Postgres backend, which is accepted without being contacted |
+| `reason` | One code per operator action: `OPERATOR_DISABLED`, `NO_MODEL_CONFIGURED`, `LEDGER_UNAVAILABLE`, `UNSANCTIONED_WORLD_TARGET`, `IMPLICIT_HOSTED_WORLD`. Sent to every session |
+| `detail` | The underlying message. **Admin sessions only** — `LEDGER_UNAVAILABLE`'s carries an absolute server path and an OS error string. Every other session gets one stable sentence instead |
+
+This route is **not** metered out of the `ai` bucket: a visibility probe must not spend a run's
+budget. Its ledger half is memoised for a few seconds instead.
 
 ---
 
-#### Other AI endpoints
+#### POST /api/agent/classify
 
-All AI endpoints are `POST`, auth-required (via middleware), and stream `text/plain`. They share the optional `schemaContext` and `databaseType` fields; the table lists each one's primary input and purpose.
+Names the workflow an objective would open as, without opening anything. The surface calls it
+between the user pressing Start and the run being created, so that a run whose workflow nobody chose
+still opens as the right one.
 
-| Endpoint | Key input | Purpose |
-|----------|-----------|---------|
-| `POST /api/ai/nl2sql` | `question` (+ optional `queryLanguage`, `conversationHistory`) | Natural language → SQL/MongoDB query (multi-turn) |
-| `POST /api/ai/explain` | `query` (+ optional `explainPlan`) | Explain an EXPLAIN plan and suggest optimizations |
-| `POST /api/ai/query-safety` | `query` | Pre-execution risk analysis; streams a JSON verdict (`riskLevel`, `warnings[]`, `recommendation`) |
-| `POST /api/ai/impact` | `query` (a DDL statement) | Predict the impact of a schema change before running it |
-| `POST /api/ai/index-advisor` | `slowQueries` / `indexStats` / `tableStats` *(all optional)* | Recommend missing/unused/duplicate indexes |
-| `POST /api/ai/autopilot` | performance metrics — `slowQueries`, `indexStats`, `tableStats`, `performanceMetrics`, `overview` *(all optional)* | Full performance-optimization report |
-| `POST /api/ai/describe-schema` | `schemaContext` (+ optional `mode`: `"table"`\|`"database"`) | Auto-generate schema documentation |
+**Authentication:** Required.
 
-`nl2sql`, `explain`, `query-safety`, `impact`, and `describe-schema` validate their key field and return `400 { "error": "… is required" }` if it's missing. `index-advisor` and `autopilot` accept fully partial payloads (no required field) — they degrade to a best-effort analysis from whatever is provided.
+**Request:**
+
+```json
+{ "objective": "Why is the orders page slow?" }
+```
+
+`objective` is required, non-empty, and bounded by the same 4000 characters `POST /api/agent/runs`
+applies — an objective this route would classify but that one would refuse is a model call spent on
+a run that cannot open.
+
+**Response (200 OK):**
+
+```json
+{ "workflowType": "query-optimization", "outcome": "classified" }
+```
+
+| Field | Meaning |
+|-------|---------|
+| `workflowType` | One of the five ids `POST /api/agent/runs` accepts |
+| `outcome` | `"classified"` when the model named one of the five; `"unclassified"` when it did not |
+
+**There is no failure response for the classification itself.** A model error, a timeout, an empty
+reply and a reply that is not one of the five ids all answer `200 { "workflowType":
+"investigation", "outcome": "unclassified" }`. The run the user is starting has to open either way,
+so this route never blocks one; `outcome` is what stops a surface from presenting that fallback as a
+verdict.
+
+This route **decides nothing**. The caller remains free to send any workflow it likes to `POST
+/api/agent/runs`, which validates it there as it always has — so skipping this route, or ignoring
+its answer, reaches nothing a caller could not reach without it. It is metered out of the `ai`
+bucket like the run routes, because classification doubles the per-run request count against the
+model provider.
+
+**Refusals:** `400` for a missing, non-string, empty or oversized `objective`; `401` without a
+session; `404` when this server runs no agents.
+
+---
+
+#### POST /api/agent/runs
+
+Opens a run and returns immediately; the drive happens in the background.
+
+**Authentication:** Required.
+
+**Request:**
+
+```json
+{
+  "mode": "agent",
+  "workflowType": "investigation",
+  "objective": "Which department has the most employees?",
+  "connectionId": "seed:sample"
+}
+```
+
+**Parameters:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `mode` | string | Yes | `"planning"` or `"agent"`. A planning run's model is handed no tools and the run executes **no statement of yours and writes nothing**; it does not perform zero database operations — since 2026-08-15 the server reads the connection's schema — its catalog on PostgreSQL and SQLite, its provider's own inspection on every other engine — and the engine's estimated statistics where it holds any (PostgreSQL and SQLite), before the first turn, read-only and audited like every other agent read |
+| `workflowType` | string | No | `"investigation"` (the default), `"query-optimization"`, `"database-assessment"`, `"operations"` or `"data-analysis"`. An unrecognised value is **refused, not defaulted** |
+| `workflowSource` | string | No | How the workflow above was decided: `"inferred"` (a classifier read it off the objective) or `"chosen"` (a person picked it). Absent means `"chosen"`, which is what every request written before there was a classifier did. An unrecognised value is **refused, not defaulted**, because the surface reads this field back to decide whether to tell the user their workflow was inferred and offer to change it |
+| `workflowReading` | string | No | How that decision WENT, as against who made it: `"classified"` (a classifier named this workflow), `"unclassified"` (a classifier was asked and reached its fallback) or `"unrecorded"` (nothing classified anything — what a caller naming its own workflow sends). Absent means `"unrecorded"`. An unrecognised value is **refused, not defaulted**, for the reason `workflowSource` is: the surface reads this field back to choose which of three sentences it says about the run, and a fallback presented as a verdict is the one it may not say |
+| `objective` | string | Yes | Non-empty, at most 4000 characters |
+| `connectionId` | string | Yes | Must resolve **server-side**. An inline `connection` object in the body is refused |
+
+**Response (202 Accepted):**
+
+```json
+{
+  "runId": "arun_…",
+  "status": "queued",
+  "mode": "agent",
+  "workflowType": "investigation",
+  "workflowSource": "chosen",
+  "workflowReading": "unrecorded"
+}
+```
+
+The mode, workflow type, workflow source and workflow reading echoed back are the **persisted**
+ones, so a caller that omitted any of the workflow fields learns what its run actually opened as.
+All four are fixed for the life of the run: no other route accepts any of them. Changing a run's workflow therefore means
+cancelling it and opening a new one — there is deliberately no parameter through which a workflow
+could arrive twice.
+
+**Refusals:**
+
+```json
+// 400 Bad Request — one message per rule, e.g.
+{ "error": "mode must be \"planning\" or \"agent\"" }
+{ "error": "An agent run needs a server-resolvable connectionId; an inline connection cannot be resumed" }
+
+// 404 Not Found — this server runs no agents
+{ "error": "The agent runtime is not enabled on this server" }
+
+// 422 Unprocessable Entity — the configured model was ESTABLISHED as unable to drive an agent run
+{
+  "error": "The model \"gemma3:270m\" (ollama) cannot drive an agent run: …",
+  "missing": ["toolCalling", "structuredOutput", "streaming"],
+  "disproved": []
+}
+```
+
+> `422` rather than `400`: the request is well-formed and it is the server's configuration that
+> cannot honour it. Only a **positively established** incapability refuses this way — a bad key, a
+> quota or a 5xx start the run and are reported by the drive instead. `missing` is what this run
+> needed and did not get; `disproved` is the subset the probe watched fail. A `planning` run is never
+> probed at all.
+
+---
+
+#### GET /api/agent/runs/{runId}
+
+The run record, folded from its ledger: status, mode, workflow type, actor, events. `404` unless the
+run exists and belongs to the calling session.
+
+#### DELETE /api/agent/runs/{runId}
+
+Requests a stop, and returns the run's status report. Cancellation is enforced by the run loop's own
+persisted state rather than by a driver cancel propagating — so this means *asked to stop*, not *has
+stopped*.
+
+#### GET /api/agent/runs/{runId}/stream
+
+The ledger as NDJSON — `content-type: application/x-ndjson; charset=utf-8`, one entry per line, in
+order. This is what the rail folds into its timeline.
+
+#### GET /api/agent/runs/{runId}/artifacts/{correlationId}
+
+One stored result of that run, for hydration into the results grid.
+
+```json
+{ "runId": "arun_…", "correlationId": "…", "operationId": "sql.query.read", "result": { } }
+```
+
+`404 { "error": "No such artifact" }` when the run's ledger records no completed step with that
+correlation id. `410` when it does but the rows are gone:
+
+```json
+{ "error": "This result is no longer held: a run's results are released when it ends.", "reason": "released" }
+```
+
+#### POST /api/agent/runs/{runId}/handover
+
+Runs the statement that run answered with, in the user's editor, under the **engine's own read-only
+boundary** — `BEGIN READ ONLY` on PostgreSQL, `PRAGMA query_only` on SQLite — at the editor's default
+500-row limit and with no statement timeout. It exists because the alternative is the ordinary
+`POST /api/db/query`, a read-write session where a `SELECT` calling a VOLATILE function that writes
+succeeds; no inspection of the statement's text can tell the two apart.
+
+**The request carries no body.** The statement is read from the run's own `answer-composed` event and
+the connection from the run's persisted `connectionId`, resolved under the run's persisted actor — so
+this is not an endpoint that will run SQL it is handed, and nothing a user types can reach the
+profile it runs under.
+
+```json
+{ "runId": "arun_…", "sql": "SELECT …", "result": { "rows": [], "fields": [], "rowCount": 0 } }
+```
+
+`404 { "error": "This run composed no answer" }` when the run never presented one. `409` when it did
+and the auto-execute gate declined it (`handover` is `applied` or `none`), with the gate's own
+warning in the message — the statement belongs in the editor unrun, and this route will not do what
+the run decided against. A row or byte budget overrun **refuses** rather than truncating, exactly as
+the agent's own read path does.
+
+#### POST /api/agent/drive
+
+The machine-facing resume seam. **It carries no session.** The caller presents a short-lived
+(60-second), single-purpose credential this server minted, in the `x-libredb-agent-drive` header;
+it names one run, authorizes one thing — driving it — and its signing key is *derived* from
+`JWT_SECRET` rather than being it, so a drive token cannot be presented as a session cookie. Without
+one: `401 { "error": "A valid agent drive credential is required" }`, audited as a
+`permission_denied` event. `404` for an unknown run, `409` for a run that has already ended (the
+message is not retryable, so a queue should stop delivering it).
+
+Nothing in the product produces a drive delivery yet, so this route's callers today are its tests.
 
 ---
 
@@ -872,12 +1169,13 @@ interface DatabaseConnection {
   port?: number;           // Port number
   user?: string;           // Username
   password?: string;       // Password
-  database?: string;       // Database name (Couchbase: the bucket; Druid: unused, it has one catalog)
-  connectionString?: string; // Full connection string (alternative; Druid has no URI form, host + port only)
+  database?: string;       // Database name (Couchbase: the bucket; Druid: unused, it has one catalog; Trino: the CATALOG; Cassandra: the KEYSPACE)
+  connectionString?: string; // Full connection string (alternative; Druid has no URI form, host + port only; Cassandra has none either, no URI carries localDataCenter)
+  localDataCenter?: string; // Cassandra only, and REQUIRED there: the driver refuses to connect without it (`datacenter1` on a stock single node)
   createdAt: Date;         // Creation timestamp
 }
 
-type DatabaseType = 'postgres' | 'mysql' | 'sqlite' | 'mongodb' | 'redis' | 'oracle' | 'mssql' | 'libredb' | 'couchbase' | 'clickhouse' | 'druid';
+type DatabaseType = 'postgres' | 'mysql' | 'sqlite' | 'mongodb' | 'redis' | 'oracle' | 'mssql' | 'libredb' | 'couchbase' | 'clickhouse' | 'druid' | 'elasticsearch' | 'opensearch' | 'trino' | 'cassandra';
 ```
 
 ### TableSchema
@@ -1054,13 +1352,14 @@ spend the per-account budget, since that key comes from a body there was nothing
 
 ### Every session-guarded route
 
-Every route that reaches a database or an LLM provider - the 8 AI endpoints, the database-reaching
-routes under `/api/db/`, and `POST /api/admin/fleet-health` (25 routes today) - shares one of two
-rate-limit buckets, keyed on the signed-in session, not the client address:
+Every route that reaches a database or an LLM provider shares one of two rate-limit buckets, keyed
+on the signed-in session, not the client address. The families rather than a total, because a route
+can join a bucket two ways — through its session guard, or by spending the bucket directly — and a
+single number written here has gone stale every time it was updated:
 
 | Bucket | Applies to | Default |
 |--------|-----------|---------|
-| `ai` | All 8 `/api/ai/*` routes together | 20 requests / 60 seconds |
+| `ai` | The `/api/ai/*` routes, plus every `/api/agent/*` route except `GET /api/agent/config`: classifying an objective, starting a run, driving one, reading one, cancelling one, streaming one, and fetching an artifact | 20 requests / 60 seconds |
 | `query` | Every database-reaching `/api/db/*` route plus `/api/admin/fleet-health`, together | 120 requests / 60 seconds |
 
 Routing the same workload through a different endpoint does not multiply the budget - the bucket is
@@ -1161,13 +1460,14 @@ curl -X POST http://localhost:3000/api/db/schema \
   }'
 ```
 
-#### AI Query Generation
+#### AI Explanation of a Plan
 ```bash
-curl -X POST http://localhost:3000/api/ai/chat \
+curl -X POST http://localhost:3000/api/ai/explain \
   -H "Content-Type: application/json" \
   -b cookies.txt \
   -d '{
-    "prompt": "Count users by country",
+    "query": "SELECT country, count(*) FROM users GROUP BY country",
+    "explainPlan": "HashAggregate ... Seq Scan on users",
     "databaseType": "postgres",
     "schemaContext": "users(id, name, country, created_at)"
   }'
@@ -1235,14 +1535,15 @@ async function executeQuery(sql: string) {
   return response.json();
 }
 
-// Stream AI response
-async function streamAIQuery(prompt: string) {
-  const response = await fetch('/api/ai/chat', {
+// Stream an AI explanation of a plan
+async function streamAIExplanation(query: string, explainPlan: string) {
+  const response = await fetch('/api/ai/explain', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
     body: JSON.stringify({
-      prompt,
+      query,
+      explainPlan,
       databaseType: 'postgres',
       schemaContext: 'users(id, name, email)'
     })
@@ -1273,7 +1574,10 @@ async function streamAIQuery(prompt: string) {
 | `LLM_PROVIDER` | No | AI provider: gemini, openai, ollama, custom |
 | `LLM_API_KEY` | No | AI provider API key |
 | `LLM_MODEL` | No | AI model name |
-| `LLM_API_URL` | No | Custom AI endpoint URL |
+| `LLM_API_URL` | No | Custom AI endpoint URL. Read for the `openai`, `ollama` and `custom` kinds, on the chat surface and in the agent alike; **unread for `gemini`** ([`docs/BACKLOG.md`](BACKLOG.md) B20) |
+| `LIBREDB_AGENT_ENABLED` | No | The agent's explicit **off**-switch. Availability is otherwise derived from the AI configuration and a writable ledger — see [`docs/AGENT.md`](AGENT.md) |
+| `WORKFLOW_TARGET_WORLD` | No | Durable backend for agent run state: `local` (default, single instance) or `@workflow/world-postgres` |
+| `WORKFLOW_LOCAL_DATA_DIR` | No | Where the `local` backend keeps run state (`/app/data/workflow` in the container image) |
 
 ---
 
@@ -1285,4 +1589,4 @@ per-version changelog instead of a manually maintained copy here.
 
 ---
 
-**Last Updated:** 2026-07-04
+**Last Updated:** 2026-08-14

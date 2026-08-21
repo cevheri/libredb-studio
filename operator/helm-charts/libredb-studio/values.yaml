@@ -16,12 +16,14 @@ global:
       adaptSecurityContext: auto
 
 # -- Number of replicas. Note: SQLite storage mode only supports 1 replica.
-# The agent runtime (off by default) carries a second single-instance
-# constraint: its zero-config durable backend keeps run state on local disk
-# behind file locks, so running agents on more than one replica requires
-# WORKFLOW_TARGET_WORLD=@workflow/world-postgres. Enabling the agent here also
-# needs WORKFLOW_LOCAL_DATA_DIR pointed inside /app/data, because the root
-# filesystem is read-only. See "Agent Runtime" in the chart README.
+# The agent runtime carries a second single-instance constraint: its zero-config
+# durable backend keeps run state on local disk behind file locks, and each pod
+# gets its own copy, so a run started on one replica is invisible to the next
+# request. Lifting it needs WORKFLOW_TARGET_WORLD=@workflow/world-postgres,
+# which the published image cannot load yet - so the chart REFUSES TO RENDER
+# when an agent could run here and more than one replica is asked for. Set
+# agent.enabled=false to run Studio on many replicas without agents. See
+# "Agent Runtime" in the chart README.
 replicaCount: 1
 
 image:
@@ -92,6 +94,19 @@ authProvider: "local"
 config:
   # -- Log level
   logLevel: "info"
+  # -- Address the container listens on, written to HOSTNAME. Empty is the
+  # default and means "let the image choose": the container entrypoint binds a
+  # throwaway listener on "::", connects to it over IPv4, and keeps "::" only
+  # when that connection is accepted - a dual-stack listener it proved rather
+  # than assumed. It falls back to "0.0.0.0" when the namespace has no IPv6 at
+  # all, or when the "::" listener turns out to be IPv6-only while a
+  # non-loopback IPv4 address exists, and it logs one line naming the address
+  # it picked and the evidence for it. Set this only to overrule that: "::"
+  # forces a dual-stack listener, "0.0.0.0" pins the container to IPv4 and is
+  # what releases before chart 0.1.42 did unconditionally. A pinned IPv4
+  # literal alongside a dual-stack Service is the one combination that breaks,
+  # and NOTES.txt warns about it.
+  bindAddress: ""
   # -- Auth bootstrap mode: "" (default: AUTH_BOOTSTRAP is omitted and the app's zero-config
   # first run applies — missing JWT_SECRET / ADMIN_PASSWORD are auto-generated on first start,
   # printed once to the pod log, and stored in /app/data/auth-bootstrap.json), "on" (same,
@@ -117,6 +132,38 @@ config:
   oidcRoleClaim: ""
   # -- OIDC admin role values (comma-separated)
   oidcAdminRoles: "admin"
+
+# =============================================================================
+# Agent Runtime
+# =============================================================================
+# The read-only investigation agent is NOT a separate on-switch: the app derives
+# whether it can run from what is true at runtime - a model configured through
+# the AI settings above (there is no second place to enter a key) plus a writable
+# ledger directory - and GET /api/agent/config reports which of the two failed.
+# The chart sets WORKFLOW_LOCAL_DATA_DIR=/app/data/workflow itself, inside the
+# volume mounted on /app/data in every render, so the ledger is writable under
+# readOnlyRootFilesystem: true with nothing to configure. It sets it rather than
+# leaning on the image because image.tag defaults to this chart's appVersion, and
+# the container image gained its own default for that variable in a LATER app
+# version: on the image a default install pulls today, an unset variable resolves
+# to .workflow-data under WORKDIR /app, which is read-only, and every run refuses
+# with LEDGER_UNAVAILABLE. Both name the same path, so the two agree once such an
+# image ships. Override it through extraEnv (written after this, so it wins).
+#
+# WHERE RUN HISTORY LIVES: in that ledger, under /app/data. With
+# persistence.enabled=false that path is an emptyDir - the agent works, every run
+# is written, and the whole history goes with the pod. Set persistence.enabled=true
+# if a finished run should still be readable after a restart or a node drain.
+agent:
+  # -- Explicit off-switch, and nothing else. Leave it unset (the default) and the
+  # chart writes no LIBREDB_AGENT_ENABLED at all, so the runtime keeps deriving the
+  # answer. `false` writes LIBREDB_AGENT_ENABLED=false, which is the supported way
+  # to have AI configured and no agent - use it when upgrading a deployment that
+  # already has an LLM key and does not want an agent. `true` is accepted and
+  # explicit, but it cannot conjure a model: with no AI configuration the agent
+  # still reports itself absent. The value is rendered as a quoted string, so no
+  # --set-string is needed.
+  enabled: null
 
 # =============================================================================
 # Persistence — PVC for SQLite storage mode
@@ -229,6 +276,34 @@ service:
   nodePort: ""
   # -- Service annotations
   annotations: {}
+  # -- Address families the Service is allocated from: "SingleStack",
+  # "PreferDualStack" (two families on a dual-stack cluster, one on a
+  # single-stack cluster) or "RequireDualStack" (fails to create on a
+  # single-stack cluster). Empty renders no field at all, which is deliberate:
+  # Kubernetes does not treat an omitted policy as a static SingleStack default
+  # (on update it inherits the live Service's policy), and an explicit
+  # SingleStack is read as intent to TRUNCATE - it releases the secondary
+  # clusterIP of a Service that is already dual-stack.
+  # THE POD MUST LISTEN ON BOTH FAMILIES TOO, and since chart 0.1.42 it does
+  # without a second setting: config.bindAddress defaults to empty, the
+  # container proves a dual-stack listener at startup and binds "::". Nothing
+  # in Kubernetes checks what address the container bound - on a dual-stack
+  # cluster the IPv6 EndpointSlice is populated from the pod's own IPv6 address
+  # regardless, and kubelet probes only the primary podIP - so an IPv4-only
+  # listener here fails silently. That is now reachable only by pinning it:
+  # config.bindAddress="0.0.0.0", or an extraEnv HOSTNAME entry with an IPv4
+  # literal. Do not pair either with a dual-stack policy.
+  ipFamilyPolicy: ""
+  # -- Explicit family order, e.g. ["IPv4", "IPv6"]. Empty leaves the choice to
+  # the cluster's own default family. Entry 0 is the PRIMARY family: it is what
+  # spec.clusterIP (the address every IPv4-only client reads) is allocated from,
+  # and it is immutable - reordering the list on a live Service is rejected
+  # ("may not change once set"), so switching primaries needs the Service
+  # deleted and recreated. Two entries require service.ipFamilyPolicy to be
+  # PreferDualStack or RequireDualStack; the chart refuses to render otherwise.
+  # Naming a family the cluster does not have is rejected even under
+  # PreferDualStack, so leave this empty unless the order matters.
+  ipFamilies: []
 
 ingress:
   # -- Enable Ingress
@@ -248,6 +323,53 @@ ingress:
   #  - secretName: libredb-tls
   #    hosts:
   #      - libredb.local
+
+route:
+  # -- Labels added to every enabled route (a per-route `labels` entry with the
+  # same key wins). Because `labels` and `annotations` are read as shared
+  # settings here, they are reserved key names and cannot be used as route names.
+  labels: {}
+  # -- Annotations added to every enabled route (a per-route `annotations` entry
+  # with the same key wins). Reserved key name, as `labels` above.
+  annotations: {}
+
+  main:
+    # -- Enables or disables the route
+    enabled: false
+
+    # -- Set the route apiVersion, e.g. gateway.networking.k8s.io/v1 or gateway.networking.k8s.io/v1alpha2
+    apiVersion: gateway.networking.k8s.io/v1
+    # -- Set the route kind. `HTTPRoute` is the only accepted value (enforced by
+    # values.schema.json): only an HTTPRoute-shaped body is rendered, so any other
+    # kind would produce a manifest the API server rejects.
+    kind: HTTPRoute
+
+    annotations: {}
+    labels: {}
+
+    hostnames: []
+    # - libredb.local
+    # -- Required whenever this route is enabled: rendering fails without it. It
+    # cannot be defaulted because the Gateway to attach to is specific to each
+    # cluster's Gateway API install (name, namespace and listener).
+    parentRefs: []
+    # - name: traefik-gateway
+    #   namespace: traefik
+    #   sectionName: websecure
+
+    matches:
+      - path:
+          type: PathPrefix
+          value: /
+
+    ## Filters define the filters that are applied to requests that match this rule.
+    filters: []
+
+    ## Additional custom rules that can be added to the route
+    additionalRules: []
+
+    ## httpsRedirect adds a filter for redirecting to https (HTTP 301 Moved Permanently).
+    httpsRedirect: false
 
 networkPolicy:
   # -- Enable NetworkPolicy

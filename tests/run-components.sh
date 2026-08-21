@@ -25,8 +25,12 @@ PASS=0
 FAIL=0
 # Count the `run_group` CALLS below when adding one (not the definition) - this is the
 # number the final summary reports, and it had already drifted by one before Group 0e
-# was added.
-TOTAL_GROUPS=26
+# was added. Verify with `grep -c '^run_group ' tests/run-components.sh`, which is how
+# the third drift was caught (#331 T5): 26 was declared while 27 calls existed, so the
+# green summary line reported a group count no run had.
+# Drifted again before this line was touched: it read 30 while 32 `run_group` calls
+# existed, so every green run reported a group count no run had. 33 is the grep below.
+TOTAL_GROUPS=33
 EXTRA_BUN_ARGS=("$@")
 GROUP_INDEX=0
 COVERAGE_MODE=0
@@ -143,9 +147,22 @@ run_group "Group 0h: Agent end-to-end investigation" \
 run_group "Group 0i: Agent capability gate" \
   tests/isolated/agent-capability-gate.test.ts
 
+# Group 0j: The workflow classifier. Its own group, NOT part of 0f: it mocks
+# @/lib/agent/model-adapter and the `ai` package, and mock.module is process-wide
+# — 0f holds the model adapter's own suite, so sharing its process would hand that
+# suite the stub written here instead of the module it is testing.
+run_group "Group 0j: Agent workflow classifier" \
+  tests/isolated/agent-workflow-classifier.test.ts
+
 # Group 1: Studio (isolated — mocks almost every child component)
 run_group "Group 1/6: Studio" \
   tests/components/Studio.test.tsx
+
+# Group 1b: the palette-item-to-rail path (isolated — it must see the REAL
+# use-agent-prefill, use-tab-manager and CommandPalette, all three of which Group 1
+# replaces with mock.module stubs, and mock.module is process-wide).
+run_group "Group 1b/6: Studio agent ask" \
+  tests/components/studio-agent-ask.test.tsx
 
 # Group 2: Sidebar (isolated — mocks ConnectionsList, SchemaExplorer)
 run_group "Group 2/6: Sidebar" \
@@ -197,13 +214,15 @@ run_group "Group 10/12: PoolTab" \
 # Group 11: Smoke tests (isolated - mock globalThis.fetch + MonitoringEmbed)
 run_group "Group 11/12: Smoke tests" \
   tests/components/agent/AgentRail.test.tsx \
+  tests/components/agent/AnswerCard.test.tsx \
+  tests/components/agent/ConsentCard.test.tsx \
+  tests/components/agent/SafetyStrip.test.tsx \
+  tests/components/agent/use-agent-run.test.tsx \
   tests/components/admin/MonitoringEmbed.test.tsx \
   tests/components/VisualExplain.test.tsx \
-  tests/components/AIAutopilotPanel.test.tsx \
   tests/components/DatabaseDocs.test.tsx \
   tests/components/SnapshotTimeline.test.tsx \
   tests/components/PivotTable.test.tsx \
-  tests/components/NL2SQLPanel.test.tsx \
   tests/components/CodeGenerator.test.tsx \
   tests/components/TestDataGenerator.test.tsx \
   tests/components/CreateTableModal.test.tsx \
@@ -212,10 +231,13 @@ run_group "Group 11/12: Smoke tests" \
   tests/components/DataImportModal.test.tsx \
   tests/components/RootLayout.test.tsx \
   tests/components/AppErrorPages.test.tsx \
+  tests/components/LazyView.test.tsx \
   tests/components/Page.test.tsx \
   tests/components/LoginPage.test.tsx \
   tests/components/LoginPageOIDC.test.tsx \
   tests/components/CommunitySection.test.tsx \
+  tests/components/ConnectionSignature.test.tsx \
+  tests/components/GitHubRepoLink.test.tsx \
   tests/components/MonitoringPage.test.tsx \
   tests/components/monitoring/MetricChart.test.tsx
 
@@ -237,6 +259,8 @@ run_group "Group 14/16: DataCharts" \
 
 # Group 15: All remaining files (safe together)
 run_group "Group 15/16: Remaining components" \
+  tests/components/copy-button.test.tsx \
+  tests/components/rich-text.test.tsx \
   tests/components/QueryEditor.test.tsx \
   tests/components/QuerySafetyDialog.test.tsx \
   tests/components/QueryHistory.test.tsx \
@@ -261,12 +285,36 @@ run_group "Group 15/16: Remaining components" \
   tests/components/monitoring/PerformanceTab.test.tsx \
   tests/components/monitoring/OverviewTab.test.tsx
 
+# Group 18: ui/resizable (isolated — installs a global DOMRect that
+#           react-resizable-panels 4 needs, and is the one suite that renders
+#           the real library instead of mocking @/components/ui/resizable)
+run_group "Group 18: ui/resizable" \
+  tests/components/ui/resizable.test.tsx
+
 # Group 17: StudioWorkspace (isolated — mocks the same child families as Studio:
 #           sidebar, QueryEditor, studio/index, SchemaDiagram, DataProfiler,
 #           CodeGenerator, TestDataGenerator, SaveQueryModal, DataImportModal,
 #           QuerySafetyDialog, plus the workspace adapter hooks)
 run_group "Group 17: StudioWorkspace" \
   tests/components/StudioWorkspace.test.tsx
+
+# Groups 18 and 19: the two theme files. Each mocks `next-themes` — process-wide,
+# and with a DIFFERENT shape (one replaces `useTheme`, the other `ThemeProvider`),
+# so they cannot share a process with each other, nor with anything that reaches
+# the real next-themes through ui/sonner.
+run_group "Group 18: ThemeToggle" \
+  tests/components/ThemeToggle.test.tsx
+
+run_group "Group 19: ThemeProvider" \
+  tests/components/ThemeProvider.test.tsx
+
+# Group 20: WireCompatibilityHint. Its own group, and it had NO group at all until now:
+# the file shipped with #426 and was never added to this script, so its seven tests had
+# never run in CI once. It cannot join Group 11 or 15 either - it mocks
+# @/lib/db/compatibility, and mock.module is process-wide, so it would hand LoginPage's
+# engine-count assertions and ConnectionModal's own hint render a two-entry stub registry.
+run_group "Group 20: WireCompatibilityHint" \
+  tests/components/WireCompatibilityHint.test.tsx
 
 # Summary
 echo ""

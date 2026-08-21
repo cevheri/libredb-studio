@@ -7,7 +7,8 @@
  * flag is off.
  */
 
-import { describe, test, expect, mock, beforeEach } from "bun:test";
+import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
+import { configureAgentModel, restoreAgentModel } from "../../helpers/agent-model-env";
 import { createMockRequest, parseResponseJSON } from "../../helpers/mock-next";
 import { AGENT_ENABLED_ENV } from "@/lib/agent/config";
 import { AgentRunServiceError } from "@/lib/agent/run-service";
@@ -41,6 +42,9 @@ interface FakeRun {
   runId: string;
   mode: string;
   workflowType: string;
+  workflowSource: string;
+  workflowReading: string;
+  autoExecute: boolean;
   status: string;
   actor: { sessionId: string; role: string };
   connectionId: string;
@@ -55,6 +59,15 @@ function fakeRun(overrides: Partial<FakeRun> = {}): FakeRun {
     // The store's default, so a body naming no workflow still produces a record
     // carrying one — which is what the route echoes back.
     workflowType: "investigation",
+    // The store's default too: a header written by a body that named no source
+    // describes a workflow its caller sent explicitly.
+    workflowSource: "chosen",
+    // The store's default too: a header that carries no classifier outcome records
+    // none, which is neither a reading that succeeded nor one that failed.
+    workflowReading: "unrecorded",
+    // The store's default too: absent means off, so a body that asked for nothing
+    // opens a run that hands nothing anywhere.
+    autoExecute: false,
     status: "queued",
     actor: { sessionId: "ada", role: "user" },
     connectionId: "seed:sales",
@@ -70,6 +83,9 @@ const mockStart = mock(
   async (input: {
     mode: string;
     workflowType?: string;
+    workflowSource?: string;
+    workflowReading?: string;
+    autoExecute?: boolean;
     actor: FakeRun["actor"];
     connectionId: string;
     objective: string;
@@ -152,12 +168,20 @@ beforeEach(() => {
   clearRateLimitState();
   runs = new Map([["arun_1", fakeRun()]]);
   mockGetSession.mockResolvedValue({ role: "user", username: "ada" });
-  process.env[AGENT_ENABLED_ENV] = "true";
+  // A configured model is what makes the surface exist since #331 T5; the flag
+  // is only the off-switch, so it is deleted here and set to a negative value by
+  // the two tests that assert the surface is absent.
+  delete process.env[AGENT_ENABLED_ENV];
+  configureAgentModel();
   mockDriveAgentRun.mockClear();
   mockAdmitAgentModel.mockClear();
   mockAdmitAgentModel.mockImplementation(async () => ({ kind: "allowed" }));
   mockStart.mockClear();
   mockResolveConnection.mockClear();
+});
+
+afterEach(() => {
+  restoreAgentModel();
 });
 
 describe("POST /api/agent/runs", () => {
@@ -177,7 +201,8 @@ describe("POST /api/agent/runs", () => {
         modelId: "some-model",
         capabilities: { toolCalling: false, structuredOutput: false, streaming: true },
         missing: ["toolCalling"],
-        message: "This model does not call tools. Use the AI Assistant or Natural Language Query instead.",
+        disproved: ["toolCalling"],
+        message: "This model does not call tools. Configure a different model and start the run again.",
       },
     }));
 
@@ -191,12 +216,58 @@ describe("POST /api/agent/runs", () => {
     expect(mockDriveAgentRun).not.toHaveBeenCalled();
   });
 
+  /*
+    What the probe WATCHED fail travels too, because `missing` alone cannot answer the
+    question the rail asks of it. An endpoint that refused the tool request establishes
+    nothing about streaming; one that answered a streamed request with a buffered body
+    establishes that it does not stream, and a toolless run over the same endpoint would
+    produce silence. Both arrive here as `missing: [… "streaming"]`, so the browser
+    would have to guess which — and a browser that guesses wrong offers a mode that
+    cannot answer (#331 T4 review).
+  */
+  test("the refusal carries what was DISPROVED, not only what was unestablished", async () => {
+    mockAdmitAgentModel.mockImplementation(async () => ({
+      kind: "refused",
+      refusal: {
+        provider: "ollama",
+        modelId: "gemma3:270m",
+        capabilities: { toolCalling: false, structuredOutput: false, streaming: false },
+        missing: ["toolCalling", "structuredOutput", "streaming"],
+        disproved: ["streaming"],
+        message: "This endpoint ignored stream:true.",
+      },
+    }));
+
+    const body = await parseResponseJSON<{ missing: string[]; disproved: string[] }>(
+      await POST(startRequest(VALID_BODY)),
+    );
+
+    expect(body.missing).toEqual(["toolCalling", "structuredOutput", "streaming"]);
+    expect(body.disproved).toEqual(["streaming"]);
+  });
+
   test("opens a run for the session's own actor and reports it queued", async () => {
     const res = await POST(startRequest(VALID_BODY));
-    const body = await parseResponseJSON<{ runId: string; status: string; mode: string; workflowType: string }>(res);
+    const body = await parseResponseJSON<{
+      runId: string;
+      status: string;
+      mode: string;
+      workflowType: string;
+      workflowSource: string;
+      workflowReading: string;
+      autoExecute: boolean;
+    }>(res);
 
     expect(res.status).toBe(202);
-    expect(body).toEqual({ runId: "arun_new", status: "queued", mode: "agent", workflowType: "investigation" });
+    expect(body).toEqual({
+      runId: "arun_new",
+      status: "queued",
+      mode: "agent",
+      workflowType: "investigation",
+      workflowSource: "chosen",
+      workflowReading: "unrecorded",
+      autoExecute: false,
+    });
     // No `workflowType` reaches the service when the body named none: the store's
     // own default is the single place that answer is decided.
     expect(mockStart).toHaveBeenCalledWith({
@@ -223,10 +294,91 @@ describe("POST /api/agent/runs", () => {
   });
 
   test("every workflow type this server serves is accepted", async () => {
-    for (const workflowType of ["investigation", "query-optimization", "database-assessment"]) {
+    for (const workflowType of [
+      "investigation",
+      "query-optimization",
+      "database-assessment",
+      "operations",
+      "data-analysis",
+    ]) {
       const res = await POST(startRequest({ ...VALID_BODY, workflowType }));
       expect(res.status, workflowType).toBe(202);
     }
+  });
+
+  test("auto-execute is persisted when asked for, and the response echoes what was PERSISTED", async () => {
+    const res = await POST(startRequest({ ...VALID_BODY, workflowType: "data-analysis", autoExecute: true }));
+    const body = await parseResponseJSON<{ autoExecute: boolean }>(res);
+
+    expect(res.status).toBe(202);
+    expect(body.autoExecute).toBe(true);
+    expect(mockStart).toHaveBeenCalledWith({
+      mode: "agent",
+      workflowType: "data-analysis",
+      autoExecute: true,
+      actor: { sessionId: "ada", role: "user" },
+      connectionId: "seed:sales",
+      objective: "why is checkout slow",
+    });
+  });
+
+  test("auto-execute is refused on every workflow that cannot present an answer", async () => {
+    // The hand-over IS `present_answer`'s, and that tool is offered to `data-analysis`
+    // alone. Accepting the field elsewhere would persist a run record claiming a
+    // hand-over nothing could perform and would have the system prompt tell the model
+    // to inspect the plan of a presentation it has no tool to make — the #350/#356
+    // shape. Refused rather than normalised to `false`, because a silent downgrade is
+    // how a user comes to believe a feature ran.
+    for (const workflowType of ["investigation", "query-optimization", "database-assessment", "operations"]) {
+      const res = await POST(startRequest({ ...VALID_BODY, workflowType, autoExecute: true }));
+      expect(res.status, workflowType).toBe(400);
+      const body = await parseResponseJSON<{ error: string }>(res);
+      expect(body.error, workflowType).toContain("data-analysis");
+    }
+    // Absent workflow means an investigation, which is one of the four above — so the
+    // default must be refused too rather than slipping past the named cases.
+    expect((await POST(startRequest({ ...VALID_BODY, autoExecute: true }))).status).toBe(400);
+  });
+
+  test("auto-execute is refused in planning mode, which is offered no tools at all", async () => {
+    const res = await POST(
+      startRequest({ ...VALID_BODY, mode: "planning", workflowType: "data-analysis", autoExecute: true }),
+    );
+
+    expect(res.status).toBe(400);
+    expect((await parseResponseJSON<{ error: string }>(res)).error).toContain("agent mode");
+  });
+
+  test("auto-execute false is accepted anywhere, because it asks for nothing", async () => {
+    // Only `true` claims a hand-over. An explicit `false` is a client saying the
+    // setting is off, which every workflow can honour.
+    for (const workflowType of ["investigation", "operations", "data-analysis"]) {
+      const res = await POST(startRequest({ ...VALID_BODY, workflowType, autoExecute: false }));
+      expect(res.status, workflowType).toBe(202);
+    }
+  });
+
+  test("a body that names no auto-execute reaches the service without the field at all", async () => {
+    // The store's own default is the single place the answer is decided, exactly as
+    // for `workflowType`: two defaults are two things to keep equal.
+    await POST(startRequest(VALID_BODY));
+
+    expect(mockStart).toHaveBeenCalledWith({
+      mode: "agent",
+      actor: { sessionId: "ada", role: "user" },
+      connectionId: "seed:sales",
+      objective: "why is checkout slow",
+    });
+  });
+
+  test.each([["yes"], [1], [null], [{}]])("an auto-execute of %p is refused rather than defaulted", async (value) => {
+    // Not coerced: a caller whose serialiser turned a tick into "yes" has asked for
+    // something this route will not guess at, and guessing WRONG here gives away the
+    // editor's time limit on a statement nobody agreed to.
+    const res = await POST(startRequest({ ...VALID_BODY, autoExecute: value }));
+
+    expect(res.status).toBe(400);
+    expect(mockStart).not.toHaveBeenCalled();
   });
 
   test("an unknown workflow type is refused rather than defaulted", async () => {
@@ -244,6 +396,113 @@ describe("POST /api/agent/runs", () => {
     expect(res.status).toBe(400);
     expect(mockStart).not.toHaveBeenCalled();
   });
+
+  test("a body that names no workflow source reaches the service without the field at all", async () => {
+    // Same reason as `workflowType` and `autoExecute`: the store's default is the one
+    // place "nobody said" becomes an answer, and a request written before the field
+    // existed must still reach the store as exactly that request.
+    const res = await POST(startRequest(VALID_BODY));
+    const body = await parseResponseJSON<{ workflowSource: string }>(res);
+
+    expect(body.workflowSource).toBe("chosen");
+    expect(mockStart).toHaveBeenCalledWith({
+      mode: "agent",
+      actor: { sessionId: "ada", role: "user" },
+      connectionId: "seed:sales",
+      objective: "why is checkout slow",
+    });
+  });
+
+  test("an inferred workflow source is persisted, and the response echoes what was PERSISTED", async () => {
+    const res = await POST(startRequest({ ...VALID_BODY, workflowSource: "inferred" }));
+    const body = await parseResponseJSON<{ workflowSource: string }>(res);
+
+    expect(res.status).toBe(202);
+    expect(body.workflowSource).toBe("inferred");
+    expect(mockStart).toHaveBeenCalledWith({
+      mode: "agent",
+      workflowSource: "inferred",
+      actor: { sessionId: "ada", role: "user" },
+      connectionId: "seed:sales",
+      objective: "why is checkout slow",
+    });
+  });
+
+  test("both workflow sources this server records are accepted", async () => {
+    for (const workflowSource of ["inferred", "chosen"]) {
+      const res = await POST(startRequest({ ...VALID_BODY, workflowSource }));
+      expect(res.status, workflowSource).toBe(202);
+    }
+  });
+
+  test.each([["guessed"], [7], [null], [{}]])(
+    "a workflow source of %p is refused rather than defaulted",
+    async (value) => {
+      // The field is the record of how the run's workflow was decided, and the rail
+      // reads it back to decide whether to offer "change". A value this server does
+      // not record, quietly folded to `"chosen"`, would have the surface tell the user
+      // they picked a workflow they never saw.
+      const res = await POST(startRequest({ ...VALID_BODY, workflowSource: value }));
+
+      expect(res.status).toBe(400);
+      expect(mockStart).not.toHaveBeenCalled();
+    },
+  );
+
+  test("a body that names no workflow reading reaches the service without the field at all", async () => {
+    // The third field to follow this rule, and for the third time the same reason: the
+    // store's default is the one place "nobody said" becomes an answer.
+    const res = await POST(startRequest(VALID_BODY));
+    const body = await parseResponseJSON<{ workflowReading: string }>(res);
+
+    expect(body.workflowReading).toBe("unrecorded");
+    expect(mockStart).toHaveBeenCalledWith({
+      mode: "agent",
+      actor: { sessionId: "ada", role: "user" },
+      connectionId: "seed:sales",
+      objective: "why is checkout slow",
+    });
+  });
+
+  test("a failed reading is persisted as one, and the response echoes what was PERSISTED", async () => {
+    const res = await POST(
+      startRequest({ ...VALID_BODY, workflowSource: "inferred", workflowReading: "unclassified" }),
+    );
+    const body = await parseResponseJSON<{ workflowReading: string }>(res);
+
+    expect(res.status).toBe(202);
+    // The point of persisting it: a rail that reloads reads THIS back, and a fallback
+    // read back as a verdict is the one thing the "opened as" sentence may not do.
+    expect(body.workflowReading).toBe("unclassified");
+    expect(mockStart).toHaveBeenCalledWith({
+      mode: "agent",
+      workflowSource: "inferred",
+      workflowReading: "unclassified",
+      actor: { sessionId: "ada", role: "user" },
+      connectionId: "seed:sales",
+      objective: "why is checkout slow",
+    });
+  });
+
+  test("all three workflow readings this server records are accepted", async () => {
+    for (const workflowReading of ["classified", "unclassified", "unrecorded"]) {
+      const res = await POST(startRequest({ ...VALID_BODY, workflowReading }));
+      expect(res.status, workflowReading).toBe(202);
+    }
+  });
+
+  test.each([["read"], [7], [null], [{}]])(
+    "a workflow reading of %p is refused rather than defaulted",
+    async (value) => {
+      // Same rule as the source above: this field decides which of three sentences the
+      // surface says about the run, so an unrecognised value folded into one of them
+      // would have the UI report an outcome nobody recorded.
+      const res = await POST(startRequest({ ...VALID_BODY, workflowReading: value }));
+
+      expect(res.status).toBe(400);
+      expect(mockStart).not.toHaveBeenCalled();
+    },
+  );
 
   test("the run is driven without the caller waiting for it", async () => {
     await POST(startRequest(VALID_BODY));
@@ -268,8 +527,19 @@ describe("POST /api/agent/runs", () => {
     expect(mockStart).not.toHaveBeenCalled();
   });
 
-  test("the surface does not exist while the runtime flag is off", async () => {
-    delete process.env[AGENT_ENABLED_ENV];
+  test("the surface does not exist once the operator switches the agent off", async () => {
+    process.env[AGENT_ENABLED_ENV] = "false";
+
+    const res = await POST(startRequest(VALID_BODY));
+
+    expect(res.status).toBe(404);
+    expect(mockStart).not.toHaveBeenCalled();
+  });
+
+  test("the surface does not exist when no model is configured at all", async () => {
+    // The other half of the derived answer (#331 T5). A server with the AI
+    // configuration removed has no agent to route to, and says so the same way.
+    for (const key of ["LLM_PROVIDER", "LLM_API_KEY", "LLM_MODEL", "LLM_API_URL"]) delete process.env[key];
 
     const res = await POST(startRequest(VALID_BODY));
 
@@ -415,8 +685,8 @@ describe("GET /api/agent/runs/[runId]", () => {
     expect(res.status).toBe(401);
   });
 
-  test("the surface does not exist while the runtime flag is off", async () => {
-    delete process.env[AGENT_ENABLED_ENV];
+  test("the surface does not exist once the operator switches the agent off", async () => {
+    process.env[AGENT_ENABLED_ENV] = "false";
 
     const res = await GET(createMockRequest("/api/agent/runs/arun_1"), params("arun_1"));
 

@@ -31,7 +31,7 @@
 
 ```bash
 # Docker（推奨）
-docker run -d -p 3000:3000 ghcr.io/libredb/libredb-studio:latest
+docker run -p 3000:3000 ghcr.io/libredb/libredb-studio:latest
 
 # または Node.js 24+ で（Dockerなし）
 npx @libredb/studio
@@ -67,11 +67,11 @@ LibreDB Studioは逆向きです。**データをツールのところへ持っ�
 
 ## 主な機能
 
-### 10のエンジン、1つのインターフェース
+### 14のエンジン、1つのインターフェース
 
-PostgreSQL · MySQL · Oracle · SQL Server · SQLite · MongoDB · Redis · Couchbase · ClickHouse · Apache Druid
+PostgreSQL · MySQL · Oracle · SQL Server · SQLite · MongoDB · Redis · Couchbase · ClickHouse · Apache Druid · Elasticsearch · OpenSearch · Apache Trino · Apache Cassandra
 
-スキーマエクスプローラ、ER図、スキーマ差分、モニタリングは全SQLエンジンで共通です。MongoDBとRedisはSQLエンジンではないため、ER図とスキーマ差分はありません。DruidはHTTP SQL APIに貼り付けられるURIがないためhostとportで設定する二重の例外で、生成されるマイグレーションもDDLを出力せず制約を明示します（Couchbaseのスキーマレスなコレクションも同様）。
+スキーマエクスプローラ、ER図、スキーマ差分、モニタリングは全SQLエンジンで共通です。MongoDBとRedisはSQLエンジンではないため、ER図とスキーマ差分はありません。Druid、Elasticsearch、OpenSearch、TrinoはこのビルドがパースできるURI形式を持たないためhostとportで設定する二重の例外で、生成されるマイグレーションもDDLを出力せず制約を明示します（Couchbaseのスキーマレスなコレクションも同様）。検索クラスタのER図は箱だけで線がありません。インデックスは外部キーを宣言せず、エンジンのモデルにも宣言できる外部キーが存在しないためです。
 
 | データベース | ドライバ | 機能 |
 | :--- | :--- | :--- |
@@ -84,9 +84,13 @@ PostgreSQL · MySQL · Oracle · SQL Server · SQLite · MongoDB · Redis · Cou
 | **Couchbase** | ドライバなし、HTTPのみ（Query + 管理REST） | フルSQL++ IDE、EXPLAIN、bucket/scope/collectionエクスプローラ、`INFER`によるカラム推論 |
 | **ClickHouse** | ドライバなし、HTTPのみ（SQLインターフェース、8123） | フルSQL IDE、JSON EXPLAINツリー、システムテーブルからのスキーマ取得、`OPTIMIZE TABLE` |
 | **Apache Druid** | ドライバなし、HTTPのみ（`POST /druid/v2/sql`） | 読み取り専用SQL IDE、ネイティブクエリのEXPLAINツリー、`INFORMATION_SCHEMA`、`sys.*`監視 |
+| **Elasticsearch** | ドライバなし、HTTPのみ（`POST /_sql?format=json`、9200） | 読み取り専用SQL IDE、mappingベースのインデックス／フィールドエクスプローラ、クラスタヘルスとインデックスごとのドキュメント数・ストアサイズ。EXPLAINなし、メンテナンス操作なし、スロークエリ／セッションパネルなし。Elasticsearch SQLには`OFFSET`もないため、2ページ目以降は取得できません |
+| **OpenSearch** | ドライバなし、HTTPのみ（`POST /_plugins/_sql`、9200） | Elasticsearchと同じproviderモジュールによる、同じ読み取り専用SQL IDEとエクスプローラ。こちらは`LIMIT n OFFSET m`が使えるため、ページングも使えます |
+| **Apache Trino** | ドライバなし、HTTPのみ（クライアントプロトコル、`POST /v1/statement`、8080） | 設定済みの全カタログに対するフルSQL IDE、接続がピン留めしたカタログの`information_schema`スキーマツリー、`system.runtime`と`jmx`による監視、`SHOW STATS`による実際の行数、クエリキャンセルと`kill_query`メンテナンス。Trinoはクエリエンジンであり自身は何も保存しないため、主キー・外部キー・インデックスをどこにも宣言しません（ER図は箱だけで線がなく、インライン行編集は無効、サイズ系パネルはカタログ名を示します）。失敗したステートメントもHTTP 200で返り、認証を無効にしたクラスタでも平文HTTP上のパスワードは拒否されます |
+| **Apache Cassandra** | `cassandra-driver`（純JavaScript、ネイティブモジュールなし） | ネイティブプロトコル（9042）上のCQL IDE、パーティションキーとクラスタリングキーを明示するキースペースブラウザ、`system_views`によるオーバービュー・稼働時間・実行中ステートメント。接続には**`localDataCenter`が必須**です（ドライバがこれなしでは接続を拒否します）。EXPLAINはありません（CQLの文法にキーワードが存在しません）。クエリキャンセルもありません（プロトコルにキャンセルフレームがありません）。メンテナンス操作もありません（コンパクション・修復・フラッシュはいずれも`nodetool`のJMX操作です）。そして**行数もサイズも表示しません**：Cassandraが公開するのはフラッシュ済みファイルからのパーティション推定値（500行のクラスタリングテーブルで143と測定）と整数メビバイト（19,476バイトのテーブルで`1 MiB`）だけであり、誤った数値を出すより何も出さない方を選んでいます |
 | **Redis** | `ioredis` | コマンドエディタ、キーブラウザ、INFOベースの監視 |
 
-> **トランスポート層のセキュリティはエンジンごとではなく横断的な機能です。** SSHトンネルはproviderが接続する前に張られ、接続先はローカルのエンドポイントに書き換えられます。つまりエンジンに依存せず、hostとportが設定された接続であれば適用されます。接続文字列で入力した接続（MongoDB、Couchbase、ClickHouseで選択できます）はhostもportも持たないためトンネルされません。SQLiteも同様です。SSL/TLSパネルが実際に効くのはPostgreSQL、MySQL、SQL Server、Couchbase、ClickHouse、Druidです。Oracle、MongoDB、Redisはこの設定を無視するため、この3つで暗号化されるかどうかはダイアログの選択ではなく接続文字列の内容次第になります。
+> **トランスポート層のセキュリティはエンジンごとではなく横断的な機能です。** SSHトンネルはproviderが接続する前に張られ、接続先はローカルのエンドポイントに書き換えられます。つまりエンジンに依存せず、hostとportが設定された接続であれば適用されます。接続文字列で入力した接続（MongoDB、Couchbase、ClickHouseで選択できます）はhostもportも持たないためトンネルされません。SQLiteも同様です。SSL/TLSパネルが実際に効くのはPostgreSQL、MySQL、SQL Server、Couchbase、ClickHouse、Druid、Elasticsearch、OpenSearch、Trinoです。Trinoでは任意ではなく必須に近い意味を持ちます。コーディネータが平文HTTP上のパスワードを拒否するためです。Oracle、MongoDB、Redisはこの設定を無視するため、この3つで暗号化されるかどうかはダイアログの選択ではなく接続文字列の内容次第になります。
 
 > RedisがこのSQL指向のインターフェースに乗るのは規約によるものです。`getSchema()` はブロッキングしない `SCAN`（**`KEYS *` は使いません**）でキーのプレフィックスを「テーブル」としてまとめ、ヘルスとメトリクスは `INFO`、スロークエリとセッションは `SLOWLOG GET` / `CLIENT LIST` から取得します。
 
@@ -104,19 +108,57 @@ PostgreSQL · MySQL · Oracle · SQL Server · SQLite · MongoDB · Redis · Cou
   <img src="public/screenshots/erd-diagram.png" alt="ER図" width="100%" />
 </p>
 
-### AIアシスタント（任意・自分のモデルで）
+### データベースエージェント（読み取り専用）
 
-- **ベンダー非依存**：既定はGemini 2.5 Flash。OpenAI、Claude、**ローカルLLM**（Ollama / LM Studio）にも対応。
-- **NL2SQL**：スキーマを踏まえた文脈で、自然言語から複雑なクエリを生成。
+StudioのAIの中心は、エディタの隣にあるエージェントレールです（このほかに下記のモデル連携機能があります）。
+目的を一文で書き（「どの部署が一番人数が多い？」「このクエリはなぜ遅い？」）Startを押すと、接続中の
+データベースに対してSQLを起草し、返ってきた結果を読み、最後に**すべての主張がその根拠となった読み取りを
+引用する**レポートをまとめます。
+
+- **読み取り専用。しかもデータベース自身が保証する**：エージェントが実行するすべての文は、**エージェント
+  専用の監査付きパイプライン**を通ります。ドライバに触れる前にポリシー判定・監査イベント・予算計上が行われ
+  （`executeAuditedOperation`、`src/lib/db/operations/execution.ts:129`）、読み取り専用の実行プロファイルで
+  動きます（PostgreSQLでは読み取り専用トランザクション、SQLiteでは文ごとに`PRAGMA query_only`を再宣言）。
+  書き込みとDDLはデータベースに届く前に拒否され、`EXPLAIN ANALYZE`は文を実際に実行してしまうため既定で
+  不許可です。このパイプラインはエージェント専用です。あなたがエディタで自分で実行する文はプロバイダを直接
+  呼び出しており（`src/app/api/db/query/route.ts:44`）、ここでのポリシー判定も監査も受けません。
+- **Agentモードが対応するのはPostgreSQLとSQLiteだけ**：読み取り専用プロファイルはデータベース側の機能で
+  保証されるため、それを実装したプロバイダにしか存在しません。`postgres.ts:870`と`sqlite.ts:397`の
+  `queryReadOnly`のみで、他にはありません。それ以外のエンジンでは、Agentモードの実行は
+  `engine-unsupported`で終わります（`src/lib/agent/runtime.ts:199`）。**Plan**モードはツールを使わず、
+  データベースにまったくアクセスしないため、どの接続でも利用できます。
+- **3つのワークフロー**：**Investigate**（質問に答える）、**Optimize**（推定プランを比較し、インデックスや
+  書き換えを提案）、**Assess**（テーブルのプロファイリング。件数だけで、値は決して読み出しません）。
+- **勝手には動きません**：エージェントが自分でRunを開始することはなく、エディタに書き込むこともなく、
+  提案した文を実行することもありません。適用するかどうかはあなたのクリックです。
+- **根拠がなければ主張もない**：引用のない主張は記録できません。Runの最後には「Run answered」または
+  「Run did not answer」と明示されます。
+- **上限があり、画面に出ています**：1Runあたり20文、データベース時間60秒、1読み取り200行、実行時間5分。
+- **モデルは自分のもの**：Gemini（既定）、OpenAI、Ollama、またはOpenAI互換の任意のエンドポイント。
+  **Agent**モードにはツール呼び出しに対応したモデルが必要で、Ollamaではそれをベンダーの資料ではなく実際の
+  プローブで確かめます。**Plan**モードはツールを必要とせず、プローブも行われないため
+  （`src/lib/agent/capability-gate.ts:74`）、Agentモードで拒否されたモデルでもPlanモードでは使えます。
+  レール自身もそれを案内します。
+- **モデルを設定しなければAIもありません**：`LLM_*` を何も設定していなければレール自体が表示されず、
+  ネットワークの外へは何も出ません。スイッチはキーではない点に注意してください。Ollamaやカスタム
+  エンドポイントはキーなしでモデル設定として成立し、その場合AIは有効になります。何が外部に
+  出るかは[`docs/AGENT_DATA_FLOW.md`](docs/AGENT_DATA_FLOW.md)にあります。
+
+スタンドアロン版のみ：埋め込み用の`@libredb/studio`パッケージにエージェントのUIは含まれません。
+ガイド：[`docs/AGENT_GUIDE.md`](docs/AGENT_GUIDE.md) ·
+何が外部に出るか：[`docs/AGENT_DATA_FLOW.md`](docs/AGENT_DATA_FLOW.md) ·
+挙動と制限：[`docs/AGENT.md`](docs/AGENT.md)
+
+### その他のAI機能（任意・自分のモデルで）
+
+- **ベンダー非依存**：既定はGemini 2.5 Flash。OpenAI、**ローカル／OpenAI互換エンドポイント**（Ollama / LM Studio / LiteLLM）にも対応。
 - **クエリ安全性分析**：DELETE、DROP、TRUNCATEなど破壊的な操作を実行前に評価。
 - **実行計画の解説**：EXPLAINを平易な言葉に翻訳し、改善案を提示。
-- **スロークエリのAutopilot**：スロークエリを分析し、インデックスや書き換えを具体的に提案。
+- **データプロファイラの要約**：列ごとの統計を文章化。この文脈には各列の `min` / `max`（実際の値）が
+  含まれます。詳細は[`docs/AGENT_DATA_FLOW.md`](docs/AGENT_DATA_FLOW.md)。
 
-**キーを設定しなければ、AIは一切呼び出されません。** 既定では何もネットワークの外に出ません。
-
-<p align="center">
-  <img src="public/screenshots/nl2sql.png" alt="NL2SQL" width="100%" />
-</p>
+**モデルを設定しなければ、AIは一切呼び出されません。** `LLM_*` 未設定の既定状態では、何もネットワークの
+外に出ません。
 
 ### データ操作
 
@@ -148,7 +190,7 @@ PostgreSQL · MySQL · Oracle · SQL Server · SQLite · MongoDB · Redis · Cou
 
 | 方法 | コマンド |
 | :--- | :--- |
-| **Docker** | `docker run -d -p 3000:3000 ghcr.io/libredb/libredb-studio:latest` |
+| **Docker** | `docker run -p 3000:3000 ghcr.io/libredb/libredb-studio:latest` |
 | **npx** | `npx @libredb/studio` |
 | **Helm** | `helm install libredb oci://ghcr.io/libredb/charts/libredb-studio` |
 | **Homebrew** | `brew trust libredb/tap && brew install libredb/tap/libredb-studio` |
@@ -176,7 +218,7 @@ Studioはnpmパッケージとしても配布されているので、自分の�
 
 StudioがMITなのは、あらゆる場所に置ける必要があるからです。有料なのはlibredb-platformで、そこで売っているのは「運用の代行」、つまりホスティング、テナント管理、課金、サポートであって、有料の壁の向こうに移された機能ではありません。
 
-**アップグレードの理由を作るために線の向こう側へ移された機能は、1つもありません。** SSO、RBAC、クエリ監査ログ、ER図、AIアシスタント、NoSQLエンジン群、すべてMITビルドに入っています。
+**アップグレードの理由を作るために線の向こう側へ移された機能は、1つもありません。** SSO、RBAC、クエリ監査ログ、ER図、AI機能、NoSQLエンジン群、すべてMITビルドに入っています。
 
 ## テストと品質
 

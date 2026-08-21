@@ -34,6 +34,9 @@ export default defineConfig({
     "node:sqlite", // Node-runtime builtin (SQLite DB provider driver under Node)
     "oracledb",
     "mssql",
+    // Pure JS, but external for the same reason it is in `serverExternalPackages`:
+    // its optional `require('kerberos')` is unresolvable at build time.
+    "cassandra-driver",
     "mongodb",
     "ioredis",
     "@libredb/libredb",
@@ -56,7 +59,6 @@ export default defineConfig({
     "@tanstack/react-virtual",
     "react-resizable-panels",
     "react-hook-form",
-    "react-day-picker",
     "embla-carousel-react",
     "input-otp",
     "sonner",

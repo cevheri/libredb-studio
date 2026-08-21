@@ -3,12 +3,16 @@
 import React, { useMemo, useState, useRef, useCallback, useEffect } from "react";
 import { QueryResult } from "@/lib/types";
 import {
+  type ColumnDef,
+  type SortingState,
+  columnResizingFeature,
+  columnSizingFeature,
+  columnVisibilityFeature,
+  createSortedRowModel,
   flexRender,
-  getCoreRowModel,
-  useReactTable,
-  getSortedRowModel,
-  SortingState,
-  ColumnDef,
+  rowSortingFeature,
+  tableFeatures,
+  useTable,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
@@ -37,6 +41,29 @@ export interface CellChange {
 const CLEAR_FILTER_LABEL = "Clear filter";
 const EMPTY_RESULT_HINT = "The operation was successful, but the result set is currently empty.";
 const ENGINE_WARNINGS_LABEL = "The engine reported:";
+
+/**
+ * TanStack Table 9 does not ship every feature to every table: each one is
+ * opted into here, and only the opted-in features contribute code, state slices
+ * and typed options. That is the point of the v8 -> v9 redesign, so this grid
+ * declares exactly what it uses and nothing else:
+ *
+ * - `rowSortingFeature` + `sortedRowModel` - the sortable column headers
+ * - `columnSizingFeature` + `columnResizingFeature` - the drag-to-resize handles
+ *   (resizing builds on sizing, and the library validates that pairing)
+ * - `columnVisibilityFeature` - `row.getVisibleCells()` in the row renderer
+ *
+ * Declared at module scope rather than inside the component because the object
+ * is the table's static shape: rebuilding it per render would rebuild the
+ * feature set on every keystroke.
+ */
+const tableFeatureSet = tableFeatures({
+  columnResizingFeature,
+  columnSizingFeature,
+  columnVisibilityFeature,
+  rowSortingFeature,
+  sortedRowModel: createSortedRowModel(),
+});
 
 interface ResultsGridProps {
   result: QueryResult;
@@ -190,9 +217,22 @@ export function ResultsGrid({
     setActiveFilterCol(null);
   }, []);
 
-  const columns = useMemo<ColumnDef<Record<string, unknown>>[]>(() => {
+  const columns = useMemo<ColumnDef<typeof tableFeatureSet, Record<string, unknown>>[]>(() => {
     return result.fields.map((field) => ({
-      accessorKey: field,
+      // `id` + `accessorFn`, never `accessorKey`: TanStack reads a DOT in an
+      // accessorKey as a path into the row, so `shipping.city` was fetched as
+      // `row.shipping.city` while the row carries the flat key `"shipping.city"` -
+      // and the cell rendered NULL over a value the API had returned. Measured in
+      // the browser on 2026-08-19 against Elasticsearch 9.1.4, where every object
+      // field in a mapping flattens to exactly that shape, so most of a search
+      // cluster's columns were affected; the CSV export, which reads `row[column]`
+      // (`src/lib/export/csv.ts`), wrote the right value the whole time.
+      //
+      // `Object.hasOwn` for the same reason that export path has it: a column may
+      // legally be named `constructor`, and a bare lookup would answer with
+      // something off the prototype chain.
+      id: field,
+      accessorFn: (row: Record<string, unknown>) => (Object.hasOwn(row, field) ? row[field] : undefined),
       header: ({ column }) => {
         const hasFilter = columnFilters.has(field) && !!columnFilters.get(field);
         const isSensitive = effectiveMaskingEnabled && sensitiveColumns.has(field);
@@ -231,7 +271,7 @@ export function ResultsGrid({
                 "shrink-0 p-0.5 rounded transition-colors",
                 hasFilter
                   ? "text-blue-400"
-                  : "opacity-0 group-hover/header:opacity-100 text-zinc-500 hover:text-zinc-300",
+                  : "opacity-0 group-hover/header:opacity-100 text-fg-muted hover:text-fg-secondary",
               )}
               onClick={(e) => {
                 e.stopPropagation();
@@ -244,7 +284,7 @@ export function ResultsGrid({
             {activeFilterCol === field && (
               <div
                 role="presentation"
-                className="absolute top-full left-0 mt-1 z-30 bg-[#111] border border-white/10 rounded-lg shadow-xl p-2 w-48"
+                className="absolute top-full left-0 mt-1 z-30 bg-overlay border border-hairline-strong rounded-lg shadow-xl p-2 w-48"
                 onClick={(e) => e.stopPropagation()}
               >
                 <input
@@ -260,7 +300,7 @@ export function ResultsGrid({
                   onKeyDown={(e) => {
                     if (e.key === "Escape" || e.key === "Enter") setActiveFilterCol(null);
                   }}
-                  className="w-full bg-[#050505] border border-white/10 rounded px-2 py-1 text-xs text-zinc-200 outline-none focus:border-blue-500/30"
+                  className="w-full bg-canvas border border-hairline-strong rounded px-2 py-1 text-xs text-fg outline-none focus:border-blue-500/30"
                 />
                 {hasFilter && (
                   <button
@@ -290,7 +330,7 @@ export function ResultsGrid({
             <div role="presentation" className="flex items-center gap-1 w-full" onClick={(e) => e.stopPropagation()}>
               <input
                 autoFocus
-                className="w-full bg-zinc-800 border border-blue-500 rounded px-1 py-0.5 text-zinc-100 outline-none"
+                className="w-full bg-overlay border border-blue-500 rounded px-1 py-0.5 text-fg outline-none"
                 value={editValue}
                 onChange={(e) => setEditValue(e.target.value)}
                 onKeyDown={(e) => {
@@ -332,7 +372,7 @@ export function ResultsGrid({
           const masked = maskValueByPattern(val, sensitivePattern);
           return (
             <div className="truncate w-full h-full flex items-center gap-1 group/cell">
-              <span className="text-zinc-500 italic">{masked}</span>
+              <span className="text-fg-muted italic">{masked}</span>
               {userCanReveal && (
                 <button
                   className="opacity-0 group-hover/cell:opacity-100 transition-opacity p-0.5 rounded hover:bg-purple-500/10"
@@ -409,15 +449,14 @@ export function ResultsGrid({
     revealCell,
   ]);
 
-  const table = useReactTable({
+  const table = useTable({
+    features: tableFeatureSet,
     data: filteredRows,
     columns,
     state: {
       sorting,
     },
     onSortingChange: setSorting,
-    getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
     columnResizeMode: "onChange",
   });
 
@@ -454,11 +493,11 @@ export function ResultsGrid({
     // not rendered in this state - so the notices are shown outright.
     const emptyWarnings = result?.warnings ?? [];
     return (
-      <div className="h-full flex flex-col items-center justify-center p-8 text-center text-zinc-600 animate-in fade-in zoom-in-95 duration-500">
-        <div className="w-16 h-16 rounded-2xl bg-zinc-900/50 flex items-center justify-center mb-6 border border-white/5 shadow-2xl">
-          <span className="text-2xl text-zinc-500">&#x2205;</span>
+      <div className="h-full flex flex-col items-center justify-center p-8 text-center text-fg-subtle animate-in fade-in zoom-in-95 duration-500">
+        <div className="w-16 h-16 rounded-2xl bg-panel flex items-center justify-center mb-6 border border-hairline shadow-2xl">
+          <span className="text-2xl text-fg-muted">&#x2205;</span>
         </div>
-        <p className="text-xs font-medium text-zinc-400">Query returned no data</p>
+        <p className="text-xs font-medium text-fg-tertiary">Query returned no data</p>
         {emptyWarnings.length > 0 && (
           <div className="mt-3 max-w-[280px] text-xs text-amber-400 leading-relaxed">
             <p className="font-medium">{ENGINE_WARNINGS_LABEL}</p>
@@ -469,13 +508,13 @@ export function ResultsGrid({
             </ul>
           </div>
         )}
-        <p className="text-xs text-zinc-600 mt-2 max-w-[280px] leading-relaxed">{EMPTY_RESULT_HINT}</p>
+        <p className="text-xs text-fg-subtle mt-2 max-w-[280px] leading-relaxed">{EMPTY_RESULT_HINT}</p>
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col h-full bg-[#080808]">
+    <div className="flex flex-col h-full bg-sunken">
       <StatsBar
         result={result}
         filteredRowCount={filteredRows.length}
@@ -528,7 +567,7 @@ export function ResultsGrid({
         className={cn("flex-1 overflow-auto md:hidden", viewMode !== "table" && "hidden")}
       >
         <div className="min-w-max">
-          <div className="sticky top-0 z-20 bg-[#0d0d0d] flex">
+          <div className="sticky top-0 z-20 bg-raised flex">
             {result.fields.map((field, idx) => {
               const isSensitive = effectiveMaskingEnabled && sensitiveColumns.has(field);
               const declaredType = declaredTypeOf(result.columnTypes, field);
@@ -541,8 +580,8 @@ export function ResultsGrid({
                   // width and can afford the visible span.
                   title={declaredType}
                   className={cn(
-                    "h-10 px-4 flex items-center gap-1 border-r border-b border-white/5 text-xs uppercase font-mono text-zinc-500 bg-[#0d0d0d] whitespace-nowrap",
-                    idx === 0 && "sticky left-0 z-30 bg-[#0d0d0d] shadow-[2px_0_8px_rgba(0,0,0,0.3)]",
+                    "h-10 px-4 flex items-center gap-1 border-r border-b border-hairline text-xs uppercase font-mono text-fg-muted bg-raised whitespace-nowrap",
+                    idx === 0 && "sticky left-0 z-30 bg-raised shadow-[2px_0_8px_rgba(0,0,0,0.3)]",
                     "min-w-[120px]",
                   )}
                 >
@@ -577,7 +616,7 @@ export function ResultsGrid({
                     height: `${virtualRow.size}px`,
                     transform: `translateY(${virtualRow.start}px)`,
                   }}
-                  className="flex hover:bg-blue-500/[0.03] transition-colors border-b border-white/5 cursor-pointer text-left"
+                  className="flex hover:bg-blue-500/[0.03] transition-colors border-b border-hairline cursor-pointer text-left"
                   onClick={() => setSelectedRow({ row, index: virtualRow.index })}
                 >
                   {result.fields.map((field, idx) => {
@@ -587,14 +626,14 @@ export function ResultsGrid({
                     const displayValue = isMasked
                       ? maskValueByPattern(row[field], pattern)
                       : formatCellValue(row[field]).display;
-                    const className = isMasked ? "text-zinc-500 italic" : formatCellValue(row[field]).className;
+                    const className = isMasked ? "text-fg-muted italic" : formatCellValue(row[field]).className;
 
                     return (
                       <div
                         key={field}
                         className={cn(
-                          "h-full px-4 py-3 border-r border-white/5 text-xs font-mono whitespace-nowrap overflow-hidden flex items-center",
-                          idx === 0 && "sticky left-0 z-10 bg-[#080808] shadow-[2px_0_8px_rgba(0,0,0,0.3)]",
+                          "h-full px-4 py-3 border-r border-hairline text-xs font-mono whitespace-nowrap overflow-hidden flex items-center",
+                          idx === 0 && "sticky left-0 z-10 bg-sunken shadow-[2px_0_8px_rgba(0,0,0,0.3)]",
                           "min-w-[120px]",
                         )}
                       >
@@ -611,13 +650,13 @@ export function ResultsGrid({
 
       <div ref={tableContainerRef} className="hidden md:block flex-1 overflow-auto editor-scrollbar">
         <div className="min-w-max">
-          <div className="sticky top-0 z-20 bg-[#0d0d0d] flex">
+          <div className="sticky top-0 z-20 bg-raised flex">
             {table.getHeaderGroups().map((headerGroup) =>
               headerGroup.headers.map((header) => (
                 <div
                   key={header.id}
                   style={{ width: header.getSize(), minWidth: header.getSize() }}
-                  className="h-10 px-4 flex items-center border-r border-b border-white/5 text-xs uppercase font-mono text-zinc-500 bg-[#0d0d0d] relative group shrink-0"
+                  className="h-10 px-4 flex items-center border-r border-b border-hairline text-xs uppercase font-mono text-fg-muted bg-raised relative group shrink-0"
                 >
                   {header.isPlaceholder ? null : flexRender(header.column.columnDef.header, header.getContext())}
 
@@ -649,13 +688,13 @@ export function ResultsGrid({
                     top: 0,
                     left: 0,
                   }}
-                  className="flex group hover:bg-blue-500/[0.03] transition-colors border-b border-white/5"
+                  className="flex group hover:bg-blue-500/[0.03] transition-colors border-b border-hairline"
                 >
                   {row.getVisibleCells().map((cell) => (
                     <div
                       key={cell.id}
                       style={{ width: cell.column.getSize(), minWidth: cell.column.getSize() }}
-                      className="h-full px-4 py-2 border-r border-white/5 text-xs font-mono whitespace-nowrap overflow-hidden group-hover:border-white/10 flex items-center shrink-0"
+                      className="h-full px-4 py-2 border-r border-hairline text-xs font-mono whitespace-nowrap overflow-hidden group-hover:border-hairline-strong flex items-center shrink-0"
                     >
                       {flexRender(cell.column.columnDef.cell, cell.getContext())}
                     </div>

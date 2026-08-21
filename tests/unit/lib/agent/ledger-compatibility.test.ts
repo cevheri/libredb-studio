@@ -100,3 +100,54 @@ describe("the fixture is the real thing", () => {
 process.on("exit", () => {
   for (const dir of dataDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
+
+describe("a ledger written before autoExecute existed", () => {
+  test("reads as auto-execute off, because no run written then handed a statement anywhere", async () => {
+    // The same reading `workflowType` gets, and for a stronger reason: the setting
+    // gives away the editor's time limit, so a header that does not carry it must
+    // fold to the answer that gives nothing away.
+    const view = await foldFixture();
+
+    expect(view?.record.autoExecute).toBe(false);
+  });
+});
+
+describe("a ledger written before workflowSource existed", () => {
+  test("reads as a chosen workflow, because every run written then carried the workflow it was sent", async () => {
+    // The opposite reading to `autoExecute`'s, and deliberately so. Nothing inferred
+    // a workflow when this header was written — the client sent one on every open
+    // request — so `"inferred"` would be inventing a classification that never ran.
+    const view = await foldFixture();
+
+    expect(view?.record.workflowSource).toBe("chosen");
+  });
+});
+
+describe("a ledger written before workflowReading existed", () => {
+  test("records no classifier outcome, rather than being read as one that succeeded or one that failed", async () => {
+    // Both alternatives are claims this header cannot support. `"classified"` would
+    // present a fallback as a verdict — the defect the field was added to end — and
+    // `"unclassified"` asserts a failure nobody recorded, which can contradict the
+    // workflow beside it.
+    const view = await foldFixture();
+
+    expect(view?.record.workflowReading).toBe("unrecorded");
+  });
+});
+
+describe("a ledger written before goalVerdict existed", () => {
+  test("still folds, and its ending still reads as the ending it always was", async () => {
+    // B24's field is additive for the same reason `workflowType` was: an older
+    // ending carries no verdict, and its ABSENCE means exactly what is true of it —
+    // no verifier ran. Adding a fourth STATUS instead would have split `succeeded`
+    // by ledger generation, with nothing in a record like this one to say which
+    // meaning applied.
+    const view = await foldFixture();
+
+    const finished = view?.record.events.at(-1);
+    if (finished?.kind !== "run-finished") throw new Error("expected an ending");
+    expect(finished.goalVerdict).toBeUndefined();
+    expect(finished.status).toBe("failed");
+    expect(finished.reason).toBe("model-rate-limited");
+  });
+});

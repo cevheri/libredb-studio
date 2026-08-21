@@ -48,6 +48,7 @@ import { verifyRunGoal } from "./goal-verifier";
 import type { ExecutionArtifactStore } from "@/lib/db/operations/artifacts";
 import type { ExecutionBudgetTracker } from "@/lib/db/operations/budgets";
 import type { QueryResult } from "@/lib/types";
+import { AgentRunStoreError } from "./run-store";
 import type { AgentLedgerEntry, AgentRunLedgerView, AgentRunStore, AgentSettledStepEvent } from "./run-store";
 import type { AgentOperationId, AgentToolName } from "./tools";
 import type {
@@ -81,7 +82,25 @@ export interface AgentRunEnding {
  */
 export type AgentRunNarrativeEvent = Extract<
   AgentRunEvent,
-  { kind: "context-captured" | "statement-drafted" | "report-composed" | "closing-statement" }
+  {
+    kind:
+      | "context-captured"
+      | "statement-drafted"
+      | "report-composed"
+      // Both reach no database and settle no step: they record what the run has
+      // ALREADY established, which is exactly what a narrative entry is.
+      | "plan-comparison"
+      | "recommendation"
+      | "table-profiled"
+      // Which result IS the answer: a decision about a read already on the ledger,
+      // reaching nothing and settling no step, like the three above it.
+      | "answer-composed"
+      | "closing-statement"
+      // The plan run's own deliverable. It reaches no database and settles no step —
+      // a planning model holds no tool — so it is narrative in exactly the sense the
+      // entries above it are: what the run has already established, written down.
+      | "plan-statement-drafted";
+  }
 >;
 
 /** Distributes over the union, so each variant loses `atMs` rather than the union collapsing. */
@@ -108,6 +127,8 @@ export interface AgentRunStartInput {
   readonly mode: AgentRunMode;
   /** What the run is FOR. Defaults to `DEFAULT_AGENT_WORKFLOW_TYPE`. */
   readonly workflowType?: AgentRunWorkflowType;
+  /** Whether the run may hand its answer to the editor to run. Defaults to `false`. */
+  readonly autoExecute?: boolean;
   readonly actor: AgentRunActor;
   readonly connectionId: string;
   readonly objective: string;
@@ -166,7 +187,14 @@ export type AgentRunServiceReason =
   | "RUN_NOT_RUNNING"
   | "RUN_HAS_LIVE_EXECUTION"
   /** The caller's target scope is not the connection the run was opened for. */
-  | "RUN_CONNECTION_MISMATCH";
+  | "RUN_CONNECTION_MISMATCH"
+  /**
+   * Another drive already owns this run in THIS process. The durable ledger has no
+   * compare-and-append fence, so two drives on one run would both read a step as
+   * uninvoked and both execute it (`docs/BACKLOG.md` B5). This is the process-local
+   * half of that fence; the cross-process half still belongs to the durable backend.
+   */
+  | "RUN_ALREADY_DRIVEN";
 
 export class AgentRunServiceError extends Error {
   readonly reasonCode: AgentRunServiceReason;
@@ -183,6 +211,10 @@ function report(view: AgentRunLedgerView): AgentRunStatusReport {
   return { record: view.record, cancellationRequested: view.cancellationRequestedAtMs !== null };
 }
 
+/** The runs this process is currently driving. Process memory on purpose: the
+ * durable ledger's queue is the cross-process owner; this closes the in-process gap. */
+const activeDrives = new Set<string>();
+
 export class AgentRunService {
   private readonly store: AgentRunStore;
   private readonly resources: AgentRunResources;
@@ -196,6 +228,32 @@ export class AgentRunService {
     this.store = options.store;
     this.resources = options.resources;
     this.clock = options.clock ?? Date.now;
+  }
+
+  /**
+   * Claims the right to drive a run in THIS process. A second drive on the same run
+   * refuses rather than waits, because two drives would both pass `runStep`'s
+   * read-then-append check and execute the same step twice. The caller releases in a
+   * `finally`, so a drive that throws still leaves the run claimable by the next one.
+   *
+   * The claim has no expiry, and needs none inside one process: the drive's `finally`
+   * always releases it, a single drive is bounded by the run's own deadline, and a
+   * process death drops the whole set — the cross-process case belongs to the durable
+   * backend's queue (`docs/BACKLOG.md` B5).
+   */
+  claimDrive(runId: string): void {
+    if (activeDrives.has(runId)) {
+      throw new AgentRunServiceError(
+        "RUN_ALREADY_DRIVEN",
+        `agent run "${runId}" is already being driven in this process`,
+      );
+    }
+    activeDrives.add(runId);
+  }
+
+  /** Releases the drive claim taken by `claimDrive`. Idempotent. */
+  releaseDrive(runId: string): void {
+    activeDrives.delete(runId);
   }
 
   /**
@@ -274,13 +332,33 @@ export class AgentRunService {
    * belongs to T9.
    */
   async cancel(runId: string, by: AgentRunActor): Promise<AgentRunStatusReport> {
-    const view = await this.readOrThrow(runId);
-    if (view.terminal) return report(view);
-    if (view.record.status === "queued") {
-      return report(await this.finalize(runId, "cancelled", { stopReason: "cancelled" }));
+    try {
+      const view = await this.readOrThrow(runId);
+      if (view.terminal) return report(view);
+      if (view.record.status === "queued") {
+        return report(await this.finalize(runId, "cancelled", { stopReason: "cancelled" }));
+      }
+      await this.store.requestCancellation(runId, by);
+      return report(await this.readOrThrow(runId));
+    } catch (error) {
+      /*
+        A run closed between the read above and the write below was ended by another
+        writer, and `finalize` — the only caller of `close` — appends `run-finished`
+        BEFORE it closes. So the re-read settles it: a terminal view is the answer the
+        caller asked for, and returning it beats a refusal the route would turn into a
+        500 for a user who pressed stop on a run that had just ended.
+
+        The re-read is checked rather than trusted. A closed stream over a run the
+        ledger does not show as ended means the cancellation was genuinely lost, and
+        answering 200 on a run still queued or running would be exactly the silent loss
+        `RUN_ALREADY_CLOSED` exists to make loud — so that case rethrows.
+      */
+      if (error instanceof AgentRunStoreError && error.reasonCode === "RUN_ALREADY_CLOSED") {
+        const settled = await this.readOrThrow(runId);
+        if (settled.terminal) return report(settled);
+      }
+      throw error;
     }
-    await this.store.requestCancellation(runId, by);
-    return report(await this.readOrThrow(runId));
   }
 
   /**
@@ -420,6 +498,27 @@ export class AgentRunService {
         `agent run "${runId}" still has ${live} execution(s) in flight and cannot be ended`,
       );
     }
+    /*
+      The verdict is decided BEFORE the ending is written, from the run as it will
+      be: everything the run did, under the status it is about to take. That status
+      is passed explicitly rather than read back, because the verifier distinguishes
+      a run a user stopped from one that simply did not answer, and until this append
+      lands the ledger still reads `running`.
+
+      `run-finished` itself contributes nothing to the verdict — it is the ending, not
+      part of the work — so computing it from the events before the append is not a
+      simplification, it is the correct input.
+
+      A run that never entered the loop gets NO verdict. Its status is still `queued`
+      here — no `run-started` was ever appended — which is `runtime.ts`'s
+      `recordDriveFailure` path: the drive died before the run could try. Calling that
+      "did not answer" would read as a judgement on a run that was never given the
+      chance to, so the field is omitted and the failure reason speaks alone. Found by
+      review on #347.
+    */
+    const record = (await this.readOrThrow(runId)).record;
+    const verdict = record.status === "queued" ? null : verifyRunGoal({ ...record, status });
+
     // Spread rather than the fields outright: an ending that has neither writes the
     // entry it always wrote, so a ledger from before these fields and one after them
     // are the same bytes for the same event.
@@ -429,6 +528,16 @@ export class AgentRunService {
       status,
       ...(reason === undefined ? {} : { reason }),
       ...(stopReason === undefined ? {} : { stopReason }),
+      ...(verdict === null
+        ? {}
+        : {
+            goalVerdict: {
+              outcome: verdict.outcome,
+              verifier: verdict.verifier,
+              // Omitted when the run answered, so the two halves cannot disagree.
+              ...(verdict.unmet.length === 0 ? {} : { unmet: verdict.unmet }),
+            },
+          }),
     });
     try {
       releaseExecutionRun({ runId, tracker: this.resources.tracker, artifacts: this.resources.artifacts });
@@ -438,25 +547,25 @@ export class AgentRunService {
     const view = await this.readOrThrow(runId);
 
     /*
-      Whether the run ANSWERED, said where an operator actually looks.
+      Whether the run ANSWERED, said where an operator actually looks — as well as on
+      the ledger above, which is what a user reads.
 
       Here rather than in the run loop because every terminal path goes through this
-      method — the loop's own `conclude`, and the cancellation checkpoint inside
-      `runStep` that ends a run without returning to it. A log line at either of
-      those two sites would have covered one ending and quietly missed the other.
-
-      Reported, not persisted: writing the verdict into the ledger means spending the
-      terminal-status vocabulary, and that is the owner's decision (`docs/BACKLOG.md`
-      B24). The read costs nothing extra — this view was already being folded to
-      return.
+      method: the loop's own `conclude`, and the cancellation checkpoint inside
+      `runStep` that ends a run without returning to it. A log line at either of those
+      two sites would have covered one ending and quietly missed the other.
     */
-    const verdict = verifyRunGoal(view.record);
-    logger.info(
-      verdict.outcome === "answered"
-        ? `agent run ${runId} answered (${verdict.verifier})`
-        : `agent run ${runId} unanswered (${verdict.verifier}: ${verdict.unmet.join(", ")})`,
-      { runId, status, ...(stopReason === undefined ? {} : { stopReason }) },
-    );
+    const verdictSentence =
+      verdict === null
+        ? "ended before it began"
+        : verdict.outcome === "answered"
+          ? `answered (${verdict.verifier})`
+          : `unanswered (${verdict.verifier}: ${verdict.unmet.join(", ")})`;
+    logger.info(`agent run ${runId} ${verdictSentence}`, {
+      runId,
+      status,
+      ...(stopReason === undefined ? {} : { stopReason }),
+    });
     return view;
   }
 

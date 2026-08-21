@@ -127,7 +127,8 @@ As implemented (the first run surfaced ~1300 findings; the breakdown drove these
     warnings; disabling in oxlint avoids duplicate/contradictory reporting.
   - `no-shadow` (17) - same call as database; shadcn/ui vendored components shadow idiomatically.
   - `no-control-regex` (4) - intentional control-char matching in `logger.ts` log-injection sanitization.
-  - `react/no-unstable-nested-components` - the shadcn calendar + TanStack cell-renderer idiom.
+  - `react/no-unstable-nested-components` - the TanStack cell/header-renderer idiom
+    (`src/components/ResultsGrid.tsx`).
   - `import/no-named-as-default` - the monaco default+named export.
 - Scoped to tests via `overrides` (test idioms): `typescript/no-extraneous-class`, `no-useless-constructor`,
   `no-new` (constructor-throws assertions), `no-constant-binary-expression` (intentional falsy-class test data).
@@ -166,8 +167,8 @@ exact surface where types-resolution and CJS/ESM-masquerading bugs hide.
 
 ```jsonc
 // scripts
-"attw": "rm -rf .attw && bun pm pack --quiet --destination .attw && attw .attw/*.tgz --profile node16",
-"prepublishOnly": "tsup && bun run attw"
+"attw": "rm -rf .attw && bun pm pack --quiet --destination .attw && attw .attw/*.tgz --profile node16 --exclude-entrypoints styles.css",
+"prepublishOnly": "bun run build:lib && bun run attw"
 ```
 
 Notes:
@@ -181,8 +182,28 @@ Notes:
   `--ignore-rules no-resolution`, which could mask a real node16 failure.
 - `rm -rf .attw` runs FIRST (not trailing): a trailing `&& rm` would mask attw's exit code, and pre-cleaning
   drops a stale tarball from a previous version bump.
-- attw needs `dist/` from `build:lib` (tsup), so `prepublishOnly` runs `tsup` before `attw`. In CI use
-  `build:lib`, never `next build`, before attw.
+- attw needs `dist/` from `build:lib`, so `prepublishOnly` runs `build:lib` before `attw`. In CI use
+  `build:lib`, never `next build`, before attw. **`build:lib`, not bare `tsup`** — see the stylesheet note
+  below; a bare `tsup` here published a dist with the stylesheet missing.
+- `--exclude-entrypoints styles.css` is not a waiver, it is a statement of scope. attw resolves entry points
+  as *modules*; `./styles.css` is a plain file, so attw reports it as unresolvable no matter how correct the
+  export map is. Excluding it keeps the check green on a non-finding — and means attw is NOT what guards that
+  entry point. `tests/unit/packaging-theme-stylesheet.test.ts` is, and it exists precisely because nothing
+  else in the publish chain would have failed loudly.
+
+### The token stylesheet is part of the published surface
+
+`src/app/globals.css` is a Next.js concern and is not packaged. Everything under `src/exports/` colours
+itself through `var(--studio-*)`, so an embedding host that imports the components and not the tokens gets
+invalid computed values — grounds fall to transparent, hairlines to `currentColor`. The tokens ship as their
+own file for that reason:
+
+```ts
+import "@libredb/studio/styles.css"; // required once, before any studio component renders
+```
+
+`build:lib` is `tsup && node scripts/copy-theme.mjs`, and the order is load-bearing: tsup runs with
+`clean: true`, so anything staged into `dist/` before it is wiped. The copy has to come after.
 - Git-ignore `.attw/` and `*.tgz` (packaging scratch).
 - CI: the `lint-and-build` job runs `build:lib` then `attw` (plus a Biome format check) so the package
   surface is gated on every PR.
@@ -251,6 +272,21 @@ phase that can affect output.
 3. Oxlint React noise on the first run - expect minor rule tuning.
 4. attw must use `build:lib`, not `next build`.
 5. `mock.module()` test isolation is unaffected by these static tools.
+
+## `experimental.optimizePackageImports` — measured at zero, so not enabled (2026-08-18)
+
+Proposed in #422 for `lucide-react`, `recharts`, `@xyflow/react`, `framer-motion` and `date-fns`.
+Measured before merging, and it changed nothing: first-load JS for `/` was **6030 KiB across 37 files
+with the option, and 6030 KiB across 37 files without it** — identical, measured in Chrome against
+`bun run build` + `bun run start`, summing every JS response from `/login` through the studio being
+interactive.
+
+Two reasons it cannot help here. `lucide-react`, `recharts` and `date-fns` are already in Next's own
+default list (`next/dist/esm/server/config.js`), which is concatenated with whatever the config names,
+so three of the five entries were never doing anything. And the remaining two are not barrel-of-icons
+packages, which is the shape the transform exists for.
+
+Do not re-add it without a number. The measurement takes one build and one page load.
 
 ## Suggested package versions
 

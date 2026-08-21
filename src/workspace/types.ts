@@ -1,5 +1,6 @@
 // src/workspace/types.ts
 import type { DatabaseType, TableSchema, SavedQuery, QueryWarning } from "@/lib/types";
+import type { ProviderCapabilities, ProviderLabels } from "@/lib/db/types";
 
 // === Connection (platform → studio) ===
 
@@ -7,6 +8,25 @@ export interface WorkspaceConnection {
   id: string;
   name: string;
   type: DatabaseType;
+  /**
+   * What this connection's provider can do, as `getCapabilities()` reports it.
+   *
+   * The standalone shell reads the same object from `POST /api/db/provider-meta`;
+   * the embedded shell cannot — it has no route of its own, and the connection it
+   * is handed carries no credentials to describe, so the host is the only party
+   * that can answer. Both fields are therefore supplied per connection here.
+   *
+   * Everything capability-driven is off until they are: the tab's query dialect,
+   * so a Redis connection gets Redis commands instead of `SELECT * FROM user:*`
+   * (#427); the schema explorer's per-row actions; the provider's own wording.
+   *
+   * Additive and optional, like every field on this published interface. Absent
+   * reads exactly as it did before the field existed — studio treats the provider
+   * as unknown and falls back to SQL and to the base labels.
+   */
+  capabilities?: ProviderCapabilities;
+  /** This provider's UI wording, as `getLabels()` reports it. See `capabilities`. */
+  labels?: ProviderLabels;
 }
 
 // === User (platform → studio) ===
@@ -67,9 +87,21 @@ export interface WorkspaceQueryResult {
  * When the embedded shell does grow one, the flag arrives in the same change as
  * the code that reads it — additive and optional, like every field here, because
  * this interface is implemented outside this repository.
+ *
+ * There is also no `ai` flag any more (#331 T2). It gated exactly one thing — the
+ * NL2SQL panel's open state at the two `StudioWorkspace` call sites — and that
+ * panel is gone, so the field would have been read nowhere at all. That is a
+ * different case from the `inlineEditing` note below, which is kept: inlineEditing
+ * describes a capability that still exists in the standalone shell and is expected
+ * to become real in the embedded one (#279), so a host that sets it is describing
+ * something coherent. `ai` would have described a surface this package no longer
+ * contains — a published flag that gates nothing, which is worse than absent
+ * because a host cannot tell by reading it. Removing it is a breaking change for
+ * any consumer of the published `@libredb/studio` package that sets the flag, and
+ * this docblock is where that change is recorded; libredb-platform was checked on
+ * 2026-08-13 and never set it.
  */
 export interface WorkspaceFeatures {
-  ai?: boolean;
   charts?: boolean;
   codeGenerator?: boolean;
   testDataGenerator?: boolean;
@@ -98,7 +130,6 @@ export interface WorkspaceFeatures {
 }
 
 export const DEFAULT_WORKSPACE_FEATURES: Required<WorkspaceFeatures> = {
-  ai: false,
   charts: true,
   codeGenerator: true,
   testDataGenerator: true,

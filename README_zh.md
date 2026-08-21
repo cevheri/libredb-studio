@@ -31,7 +31,7 @@
 
 ```bash
 # Docker（推荐）
-docker run -d -p 3000:3000 ghcr.io/libredb/libredb-studio:latest
+docker run -p 3000:3000 ghcr.io/libredb/libredb-studio:latest
 
 # 或者用 Node.js 24+（不装 Docker）
 npx @libredb/studio
@@ -67,11 +67,11 @@ LibreDB Studio 走另一条路：**工具去找数据，而不是把数据搬来
 
 ## 核心能力
 
-### 十种引擎，一个界面
+### 十四种引擎，一个界面
 
-PostgreSQL · MySQL · Oracle · SQL Server · SQLite · MongoDB · Redis · Couchbase · ClickHouse · Apache Druid
+PostgreSQL · MySQL · Oracle · SQL Server · SQLite · MongoDB · Redis · Couchbase · ClickHouse · Apache Druid · Elasticsearch · OpenSearch · Apache Trino · Apache Cassandra
 
-所有 SQL 引擎共用同一套 schema 浏览器、ER 图、schema 对比和监控面板。MongoDB 和 Redis 不属于 SQL 引擎，没有 ER 图和 schema 对比；Druid 是双重例外：它的 HTTP SQL 接口没有可粘贴的 URI，只能按 host/port 配置，而且生成的迁移会直接说明限制，而不是对一个 SQL 里根本没有列变更语句的引擎硬输出 DDL；Couchbase 的 schemaless collection 同理。
+所有 SQL 引擎共用同一套 schema 浏览器、ER 图、schema 对比和监控面板。MongoDB 和 Redis 不属于 SQL 引擎，没有 ER 图和 schema 对比；Druid、Elasticsearch、OpenSearch 和 Trino 都是双重例外：它们的 HTTP SQL 接口没有本构建能解析的 URI 形式，只能按 host/port 配置，而且生成的迁移会直接说明限制，而不是对一个 SQL 里根本没有列变更语句的引擎硬输出 DDL；Couchbase 的 schemaless collection 同理。搜索集群的 ER 图只有方框没有连线：索引不声明外键，引擎模型里也没有外键可声明。
 
 | 数据库 | 驱动 | 能力 |
 | :--- | :--- | :--- |
@@ -84,9 +84,13 @@ PostgreSQL · MySQL · Oracle · SQL Server · SQLite · MongoDB · Redis · Cou
 | **Couchbase** | 无驱动，纯 HTTP（Query + 管理 REST） | 完整 SQL++ IDE、EXPLAIN、bucket/scope/collection 浏览器、`INFER` 字段推断 |
 | **ClickHouse** | 无驱动，纯 HTTP（SQL 接口，8123 端口） | 完整 SQL IDE、JSON EXPLAIN 树、系统表 schema 自省、`OPTIMIZE TABLE` |
 | **Apache Druid** | 无驱动，纯 HTTP（`POST /druid/v2/sql`） | 只读 SQL IDE、原生查询 EXPLAIN 树、`INFORMATION_SCHEMA` 自省、`sys.*` 监控 |
+| **Elasticsearch** | 无驱动，纯 HTTP（`POST /_sql?format=json`，9200 端口） | 只读 SQL IDE、基于 mapping 的索引/字段浏览器、集群健康与每个索引的文档数和存储大小。没有 EXPLAIN、没有维护操作、没有慢查询和会话面板；Elasticsearch SQL 也没有 `OFFSET`，因此无法请求第二页结果 |
+| **OpenSearch** | 无驱动，纯 HTTP（`POST /_plugins/_sql`，9200 端口） | 与 Elasticsearch 同一个 provider 模块，同样的只读 SQL IDE 与浏览器。这里 `LIMIT n OFFSET m` 可用，所以分页可用 |
+| **Apache Trino** | 无驱动，纯 HTTP（客户端协议，`POST /v1/statement`，8080 端口） | 面向全部已配置 catalog 的完整 SQL IDE、连接所固定 catalog 的 `information_schema` schema 树、`system.runtime` 与 `jmx` 监控、`SHOW STATS` 提供的真实行数、查询取消与 `kill_query` 维护。Trino 是查询引擎、自身不存储数据，因此在任何地方都不声明主键、外键和索引：ER 图只有方框没有连线，行内编辑被关闭，容量面板列出的是 catalog 而不是臆造的占用量。失败的语句同样以 HTTP 200 返回；即使集群关闭了认证，明文 HTTP 上的密码仍会被拒绝 |
+| **Apache Cassandra** | `cassandra-driver`（纯 JavaScript，无原生模块） | 基于原生协议（9042 端口）的 CQL IDE、标注分区键与聚簇键的 keyspace 浏览器、来自 `system_views` 的概览、运行时长与正在执行的语句。连接**必须填写 `localDataCenter`**：驱动没有它就拒绝连接。没有 EXPLAIN（CQL 文法中根本没有这个关键字），没有查询取消（协议没有取消帧），也没有维护操作（compaction、repair、flush 全是 `nodetool` 的 JMX 操作）。并且**不显示任何行数与容量**：Cassandra 能给出的只有基于已刷盘文件的分区估算（实测 500 行的聚簇表读作 143）和整数 MiB（19,476 字节的表读作 `1 MiB`），因此宁可不显示，也不显示错的数字 |
 | **Redis** | `ioredis` | 命令编辑器、键浏览器、基于 INFO 的监控 |
 
-> **传输层安全是横向能力，不是逐引擎的。** SSH 隧道在 provider 建连之前就已建立，连接会被改写到本地端点，因此与具体引擎无关：只要连接配置了 host 和 port 就适用。改用连接串填写的连接（MongoDB、Couchbase、ClickHouse 支持这种方式）没有 host/port，因此不会走隧道；SQLite 同样两者都没有。SSL/TLS 面板目前在 PostgreSQL、MySQL、SQL Server、Couchbase、ClickHouse 和 Druid 上生效。Oracle、MongoDB 和 Redis 会忽略这个设置，所以这三个引擎是否加密，取决于连接串本身怎么写，而不是对话框里选了什么。
+> **传输层安全是横向能力，不是逐引擎的。** SSH 隧道在 provider 建连之前就已建立，连接会被改写到本地端点，因此与具体引擎无关：只要连接配置了 host 和 port 就适用。改用连接串填写的连接（MongoDB、Couchbase、ClickHouse 支持这种方式）没有 host/port，因此不会走隧道；SQLite 同样两者都没有。SSL/TLS 面板目前在 PostgreSQL、MySQL、SQL Server、Couchbase、ClickHouse、Druid、Elasticsearch、OpenSearch 和 Trino 上生效；在 Trino 上它并非可选项，因为 coordinator 会拒绝明文 HTTP 上的密码。Oracle、MongoDB 和 Redis 会忽略这个设置，所以这三个引擎是否加密，取决于连接串本身怎么写，而不是对话框里选了什么。
 
 > Redis 之所以能套进这套面向 SQL 的接口，靠的是一层约定。`getSchema()` 用非阻塞的 `SCAN`（**绝不用 `KEYS *`**）把键前缀归类成“表”，健康与指标来自 `INFO`，慢查询和会话来自 `SLOWLOG GET` / `CLIENT LIST`。
 
@@ -104,19 +108,50 @@ PostgreSQL · MySQL · Oracle · SQL Server · SQLite · MongoDB · Redis · Cou
   <img src="public/screenshots/erd-diagram.png" alt="ER 图" width="100%" />
 </p>
 
-### AI 助手（可选，用你自己的模型）
+### 数据库 Agent（只读）
 
-- **不绑定厂商**：默认 Gemini 2.5 Flash，同样支持 OpenAI、Claude，或 **本地模型**（Ollama / LM Studio）。
-- **NL2SQL**：用自然语言生成复杂查询，带 schema 上下文。
+编辑器旁边的 Agent 面板是 Studio 最主要的 AI 界面（此外还有下面列出的模型辅助功能）。
+你写下一个目标（“哪个部门人最多？”“这条查询为什么慢？”）并按下 Start，这次运行就会针对已连接的数据库
+起草 SQL、读取结果，最后写出一份报告——其中每一条结论都引用它所依据的那次读取。
+
+- **只读，而且由数据库本身来保证**：Agent 执行的每条语句都走 **Agent 自己的受审计管线**——在碰到驱动
+  之前先做策略判定、写审计事件、记账预算（`executeAuditedOperation`，
+  `src/lib/db/operations/execution.ts:129`）——并使用只读执行档案（PostgreSQL 上是只读事务，SQLite 上
+  每条语句都重新声明 `PRAGMA query_only`）。写入和 DDL 在到达数据库之前就被拒绝，`EXPLAIN ANALYZE`
+  因为会真正执行语句而默认禁止。这条管线只属于 Agent：你自己在编辑器里执行的语句是直接调用 provider 的
+  （`src/app/api/db/query/route.ts:44`），不会经过这里的策略判定，也不会产生这类审计记录。
+- **Agent 模式只支持 PostgreSQL 和 SQLite**：只读档案由数据库原生保证，因此只在实现了它的 provider 上
+  存在——只有 `postgres.ts:870` 和 `sqlite.ts:397` 上的 `queryReadOnly`，别无其他。在其他引擎上，
+  Agent 模式的运行会以 `engine-unsupported` 结束（`src/lib/agent/runtime.ts:199`）。**Plan** 模式不使用
+  任何工具，完全不访问数据库，因此对所有连接都可用。
+- **三种工作流**：**Investigate**（回答问题）、**Optimize**（比较预估执行计划，提出索引或改写）、
+  **Assess**（做表画像——只有计数，永远不含具体值）。
+- **不会自己动手**：Agent 不会替你开始运行，不会写入编辑器，也不会执行它建议的语句。是否采用由你点击决定。
+- **有证据才有结论**：没有引用的结论无法被记录；运行结束时会明确给出 “Run answered” 或
+  “Run did not answer”。
+- **有上限，而且界面上就能看到**：每次运行 20 条语句、60 秒数据库时间、单次读取 200 行、整轮 5 分钟。
+- **用你自己的模型**：Gemini（默认）、OpenAI、Ollama，或任何兼容 OpenAI 的端点。**Agent** 模式需要一个
+  真正支持工具调用的模型——在 Ollama 上这要靠一次真实探测来确认，而不是照抄厂商文档。**Plan** 模式不需要
+  工具，也从不做探测（`src/lib/agent/capability-gate.ts:74`），所以被 Agent 模式拒绝的模型仍然可以用在
+  Plan 模式里，这也正是面板会向你提议的做法。
+- **不配置模型就没有 AI**：完全没有 `LLM_*` 配置时，面板根本不会出现，也不会有任何数据离开你的网络。
+  注意开关不是密钥：Ollama 和自定义端点无需密钥也算配置了模型，此时 AI 就是启用的。具体外发内容见
+  [`docs/AGENT_DATA_FLOW.md`](docs/AGENT_DATA_FLOW.md)。
+
+仅限独立部署：嵌入式 `@libredb/studio` 包不包含任何 Agent 界面。
+指南：[`docs/AGENT_GUIDE.md`](docs/AGENT_GUIDE.md) ·
+数据出网说明：[`docs/AGENT_DATA_FLOW.md`](docs/AGENT_DATA_FLOW.md) ·
+行为与限制：[`docs/AGENT.md`](docs/AGENT.md)
+
+### 其他 AI 功能（可选，用你自己的模型）
+
+- **不绑定厂商**：默认 Gemini 2.5 Flash，同样支持 OpenAI，或 **本地 / 兼容 OpenAI 的端点**（Ollama、LM Studio、LiteLLM）。
 - **查询安全分析**：执行前对 DELETE、DROP、TRUNCATE 这类破坏性语句做风险评估。
 - **执行计划翻译**：把 EXPLAIN 翻成人话，并给出优化建议。
-- **慢查询 Autopilot**：自动分析慢查询，给出可落地的索引和改写建议。
+- **数据画像摘要**：把逐列统计写成文字说明。该上下文包含每列的 `min` / `max`，也就是你数据里的真实值，
+  详见[`docs/AGENT_DATA_FLOW.md`](docs/AGENT_DATA_FLOW.md)。
 
-**不配置密钥，AI 就不会发起任何调用**，默认不会有任何数据离开你的网络。
-
-<p align="center">
-  <img src="public/screenshots/nl2sql.png" alt="NL2SQL" width="100%" />
-</p>
+**不配置模型，AI 就不会发起任何调用**：在没有任何 `LLM_*` 配置的默认状态下，不会有任何数据离开你的网络。
 
 ### 数据处理
 
@@ -148,7 +183,7 @@ PostgreSQL · MySQL · Oracle · SQL Server · SQLite · MongoDB · Redis · Cou
 
 | 方式 | 命令 |
 | :--- | :--- |
-| **Docker** | `docker run -d -p 3000:3000 ghcr.io/libredb/libredb-studio:latest` |
+| **Docker** | `docker run -p 3000:3000 ghcr.io/libredb/libredb-studio:latest` |
 | **npx** | `npx @libredb/studio` |
 | **Helm** | `helm install libredb oci://ghcr.io/libredb/charts/libredb-studio` |
 | **Homebrew** | `brew trust libredb/tap && brew install libredb/tap/libredb-studio` |
@@ -176,7 +211,7 @@ Studio 同时以 npm 包形式发布，可以直接嵌进你的应用。如果�
 
 Studio 是 MIT，因为它必须能去任何地方。付费的是 libredb-platform，它卖的是“别人替你运维”：托管、多租户、计费和支持，而不是某个被挪到付费墙后面的功能。
 
-**没有任何能力为了制造升级理由而被移到这条线的另一边。** 单点登录、RBAC、查询审计、ER 图、AI 助手、全部 NoSQL 引擎，都在 MIT 构建里。
+**没有任何能力为了制造升级理由而被移到这条线的另一边。** 单点登录、RBAC、查询审计、ER 图、AI 功能、全部 NoSQL 引擎，都在 MIT 构建里。
 
 ## 测试与质量
 

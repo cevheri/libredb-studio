@@ -1,19 +1,20 @@
 "use client";
 
-import React, { useRef, useEffect, useState, useMemo, forwardRef, useImperativeHandle, useCallback } from "react";
+import React, { useRef, useEffect, useState, useMemo, forwardRef, useImperativeHandle } from "react";
 import Editor, { useMonaco } from "@monaco-editor/react";
 import type * as Monaco from "monaco-editor";
-import { Zap, Sparkles, Send, X, Loader2, AlignLeft, Trash2, Copy, Play, Hash } from "lucide-react";
+import { Zap, Loader2, AlignLeft, Trash2, Copy, Play, Hash } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { motion, AnimatePresence } from "framer-motion";
 import { format } from "sql-formatter";
 import { registerSQLCompletionProvider } from "@/lib/editor/sql-completions";
 import type { SchemaCompletionCache, SchemaColumnItem } from "@/lib/editor/sql-completions";
 import { registerMongoDBCompletionProvider } from "@/lib/editor/mongodb-completions";
 import { registerLibreDBLanguage } from "@/lib/editor/libredb-language";
+import { registerRedisLanguage } from "@/lib/editor/redis-language";
 import { configureMonacoLoader } from "@/lib/editor/monaco-loader";
-import { useAiChat } from "@/hooks/use-ai-chat";
+import { useEffectiveTheme } from "@/hooks/use-effective-theme";
+import { logger } from "@/lib/logger";
 
 // Serve Monaco from our own origin rather than @monaco-editor/react's jsdelivr default.
 // Runs at module load so it is in place before the first <Editor> mounts.
@@ -31,7 +32,6 @@ export interface QueryEditorRef {
   setValue: (value: string) => void;
   focus: () => void;
   format: () => void;
-  toggleAi: () => void;
 }
 
 interface QueryEditorProps {
@@ -42,17 +42,9 @@ interface QueryEditorProps {
   /** Called when content changes in real-time. Use sparingly as it triggers on every keystroke. */
   onContentChange?: (val: string) => void;
   onExplain?: () => void;
-  language?: "sql" | "json" | "libredb";
-  tables?: string[];
-  databaseType?: string;
+  language?: "sql" | "json" | "libredb" | "redis";
   schemaContext?: string;
   capabilities?: import("@/lib/db/types").ProviderCapabilities;
-  /** Optional API adapter: when provided, bypasses the built-in /api/ai/chat fetch. */
-  onAiChat?: (params: {
-    prompt: string;
-    schemaContext: string;
-    history: { role: string; content: string }[];
-  }) => Promise<string>;
 }
 
 interface ParsedTable {
@@ -102,24 +94,14 @@ const getEditorOptions = (showLineNumbers: boolean) => ({
 });
 
 export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
-  (
-    {
-      value,
-      onChange,
-      onContentChange,
-      onExplain,
-      language = "sql",
-      tables = [],
-      databaseType,
-      schemaContext,
-      capabilities,
-      onAiChat,
-    },
-    ref,
-  ) => {
+  ({ value, onChange, onContentChange, onExplain, language = "sql", schemaContext, capabilities }, ref) => {
     const monaco = useMonaco();
     const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
     const [hasSelection, setHasSelection] = useState(false);
+
+    // Both themes are defined in `beforeMount`; this only picks which is applied.
+    // Monaco re-reads the `theme` prop on change, so the switch needs no remount.
+    const editorTheme = useEffectiveTheme() === "light" ? "db-light" : "db-dark";
 
     // Explain capability gate, shared by the toolbar button and the context-menu action.
     const canExplain = Boolean(onExplain) && Boolean(capabilities?.supportsExplain);
@@ -185,7 +167,10 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
       try {
         return JSON.parse(schemaContext);
       } catch (e) {
-        console.error("Failed to parse schema context for editor:", e);
+        logger.warn("Failed to parse the schema context; the editor completes without it", {
+          route: "QueryEditor",
+          error: e instanceof Error ? e.message : String(e),
+        });
         return [];
       }
     }, [schemaContext]);
@@ -256,7 +241,10 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
         lastSyncedValueRef.current = formatted;
         onChange?.(formatted);
       } catch (e) {
-        console.error("Formatting failed:", e);
+        logger.warn("Statement formatting failed; the editor text is left as written", {
+          route: "QueryEditor",
+          error: e instanceof Error ? e.message : String(e),
+        });
       }
     };
 
@@ -365,36 +353,6 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
       };
     }, []);
 
-    // AI Chat hook (must be before useImperativeHandle that references showAi/setShowAi)
-    const getEditorValue = useCallback(() => editorRef.current?.getValue() || "", []);
-    const setEditorValueForAi = useCallback((val: string) => {
-      if (editorRef.current) {
-        editorRef.current.setValue(val);
-        lastSyncedValueRef.current = val;
-      }
-    }, []);
-
-    const {
-      showAi,
-      setShowAi,
-      aiPrompt,
-      setAiPrompt,
-      isAiLoading,
-      aiError,
-      setAiError,
-      aiConversationHistory,
-      setAiConversationHistory,
-      handleAiSubmit,
-    } = useAiChat({
-      parsedSchema,
-      schemaContext,
-      databaseType,
-      getEditorValue,
-      setEditorValue: setEditorValueForAi,
-      onChange,
-      onAiChat,
-    });
-
     useImperativeHandle(ref, () => ({
       getSelectedText,
       getEffectiveQuery: () => getEffectiveQuery().query,
@@ -407,7 +365,6 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
       },
       focus: () => editorRef.current?.focus(),
       format: handleFormat,
-      toggleAi: () => setShowAi(!showAi),
     }));
 
     const handleCopy = () => {
@@ -437,9 +394,10 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
     }, []);
 
     const handleBeforeMount = (monacoInstance: typeof Monaco) => {
-      // Register the LibreDB command language (idempotent) so its tabs highlight
-      // correctly instead of being treated as JSON.
+      // Register the LibreDB and Redis command languages (both idempotent) so
+      // their tabs highlight correctly instead of being treated as JSON (#427).
       registerLibreDBLanguage(monacoInstance);
+      registerRedisLanguage(monacoInstance);
 
       // Suppress Monaco's "Canceled" errors in console (with cleanup tracking)
       if (!originalConsoleErrorRef.current) {
@@ -477,6 +435,40 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
           "editor.inactiveSelectionBackground": "#3a3d41",
           "editorIndentGuide.background": "#1a1a1a",
           "editorIndentGuide.activeBackground": "#333333",
+        },
+      });
+
+      /*
+       * Monaco paints its own canvas and knows nothing about the CSS token layer,
+       * so the editor is the one surface that needs the palette written twice.
+       * Same syntax hues either side — they are chosen for contrast against the
+       * CODE, not against the chrome — with only the ground and the guides moved.
+       * `editor.background` mirrors `--studio-canvas` in both themes so the pane
+       * sits flush with the shell it lives in.
+       */
+      monacoInstance.editor.defineTheme("db-light", {
+        base: "vs",
+        inherit: true,
+        rules: [
+          { token: "keyword", foreground: "0000ff", fontStyle: "bold" },
+          { token: "function", foreground: "795e26" },
+          { token: "string", foreground: "a31515" },
+          { token: "number", foreground: "098658" },
+          { token: "comment", foreground: "008000" },
+          { token: "operator", foreground: "3f3f46" },
+          { token: "identifier", foreground: "001080" },
+        ],
+        colors: {
+          "editor.background": "#f4f4f5",
+          "editor.foreground": "#27272a",
+          "editorCursor.foreground": "#0000ff",
+          "editor.lineHighlightBackground": "#e4e4e7",
+          "editorLineNumber.foreground": "#a1a1aa",
+          "editorLineNumber.activeForeground": "#52525b",
+          "editor.selectionBackground": "#add6ff",
+          "editor.inactiveSelectionBackground": "#e5ebf1",
+          "editorIndentGuide.background": "#e4e4e7",
+          "editorIndentGuide.activeBackground": "#a1a1aa",
         },
       });
     };
@@ -528,13 +520,15 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
     };
 
     return (
-      <div className="h-full w-full flex flex-col bg-[#050505] relative overflow-hidden group">
+      <div className="h-full w-full flex flex-col bg-canvas relative overflow-hidden group">
         {/* Dynamic Pro Toolbar - Hidden on mobile */}
-        <div className="hidden md:flex items-center gap-1 px-4 py-1.5 bg-[#0a0a0a] border-b border-white/5 overflow-x-auto no-scrollbar scroll-smooth">
+        <div className="hidden md:flex items-center gap-1 px-4 py-1.5 bg-surface border-b border-hairline overflow-x-auto no-scrollbar scroll-smooth">
           {hasSelection && (
             <Button
               variant="ghost"
               size="sm"
+              // `text-white` is the label ON a blue button, not the top of the
+              // text ramp: it must stay white in the light theme too.
               className="h-7 text-xs font-medium text-white bg-blue-600 hover:bg-blue-500 hover:text-white gap-2 shadow-[0_0_10px_rgba(37,99,235,0.3)] animate-in fade-in zoom-in duration-200"
               onClick={handleExecute}
             >
@@ -546,7 +540,7 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 text-xs font-medium text-zinc-500 hover:text-white gap-2"
+              className="h-7 text-xs font-medium text-fg-muted hover:text-fg-bright gap-2"
               onClick={handleFormat}
               title={language === "json" ? "Format JSON (Shift+Alt+F)" : "Format SQL (Shift+Alt+F)"}
             >
@@ -557,7 +551,7 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 text-xs font-medium text-zinc-500 hover:text-white gap-2"
+            className="h-7 text-xs font-medium text-fg-muted hover:text-fg-bright gap-2"
             onClick={handleCopy}
           >
             <Copy strokeWidth={1.5} className="w-3 h-3" /> {hasSelection ? "Copy Sel" : "Copy"}
@@ -566,39 +560,25 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 text-xs font-medium text-zinc-500 hover:text-red-400 gap-2"
+            className="h-7 text-xs font-medium text-fg-muted hover:text-red-400 gap-2"
             onClick={handleClear}
           >
             <Trash2 strokeWidth={1.5} className="w-3 h-3" /> Clear
           </Button>
 
-          <div className="h-4 w-px bg-white/5" />
+          <div className="h-4 w-px bg-fill" />
 
           <Button
             variant="ghost"
             size="sm"
             className={cn(
               "h-7 text-xs font-medium gap-2",
-              showLineNumbers ? "text-zinc-300" : "text-zinc-500 hover:text-white",
+              showLineNumbers ? "text-fg-secondary" : "text-fg-muted hover:text-fg-bright",
             )}
             onClick={() => setShowLineNumbers(!showLineNumbers)}
             title={showLineNumbers ? "Hide line numbers" : "Show line numbers"}
           >
             <Hash strokeWidth={1.5} className="w-3 h-3" /> Lines
-          </Button>
-
-          <Button
-            variant="ghost"
-            size="sm"
-            className={cn(
-              "h-7 text-xs font-medium gap-2",
-              showAi
-                ? "text-white bg-blue-600 hover:bg-blue-500 hover:text-white shadow-[0_0_10px_rgba(37,99,235,0.4)]"
-                : "text-zinc-500 hover:text-blue-400",
-            )}
-            onClick={() => setShowAi(!showAi)}
-          >
-            <Sparkles className={cn("w-3 h-3", showAi && "animate-pulse")} /> AI
           </Button>
 
           <div className="flex-1" />
@@ -614,128 +594,24 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
                 <Zap strokeWidth={1.5} className="w-3 h-3" /> Explain
               </Button>
             )}
-            <kbd className="px-1.5 py-0.5 rounded bg-zinc-900 border border-white/5 text-[0.5625rem] text-zinc-600 font-mono">
+            <kbd className="px-1.5 py-0.5 rounded bg-raised border border-hairline text-[0.5625rem] text-fg-subtle font-mono">
               ⌘+Enter
             </kbd>
           </div>
         </div>
-
-        {/* Floating AI Input */}
-        <AnimatePresence>
-          {showAi && (
-            <motion.div
-              initial={{ opacity: 0, y: -10, scale: 0.95 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: -10, scale: 0.95 }}
-              className="absolute top-2 md:top-12 left-1/2 -translate-x-1/2 w-full max-w-2xl z-50 px-2 md:px-4"
-            >
-              <form
-                onSubmit={handleAiSubmit}
-                className="bg-[#0f0f0f]/95 backdrop-blur-xl border border-blue-500/40 rounded-2xl shadow-[0_0_50px_rgba(37,99,235,0.25)] overflow-hidden flex flex-col p-1.5"
-              >
-                <div className="flex items-center justify-between px-3 py-1.5 border-b border-white/5 mb-1.5">
-                  <div className="flex items-center gap-2">
-                    <div className="p-1 rounded-md bg-blue-500/10">
-                      <Sparkles strokeWidth={1.5} className="w-3 h-3 text-blue-400" />
-                    </div>
-                    <span className="text-[0.625rem] font-black text-blue-400">Expert DBA Mode</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {aiConversationHistory.length > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => setAiConversationHistory([])}
-                        className="text-[0.625rem] text-zinc-500 hover:text-zinc-300 font-medium px-1.5 py-0.5 rounded bg-white/5 hover:bg-white/10 transition-colors"
-                        title="Clear conversation history"
-                      >
-                        {aiConversationHistory.length / 2} turns - Clear
-                      </button>
-                    )}
-                    <span className="text-[0.625rem] text-zinc-500 font-medium">Context: {tables.length} tables</span>
-                    <div className="w-1 h-1 rounded-full bg-emerald-500 animate-pulse" />
-                  </div>
-                </div>
-
-                <AnimatePresence>
-                  {aiError && (
-                    <motion.div
-                      initial={{ height: 0, opacity: 0 }}
-                      animate={{ height: "auto", opacity: 1 }}
-                      exit={{ height: 0, opacity: 0 }}
-                      className="px-3 pb-2"
-                    >
-                      <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-2.5 flex items-start gap-2.5">
-                        <div className="p-1 rounded bg-red-500/20 mt-0.5">
-                          <X strokeWidth={1.5} className="w-3 h-3 text-red-400" />
-                        </div>
-                        <div className="flex-1">
-                          <p className="text-xs font-medium text-red-400 mb-0.5">AI Error</p>
-                          <p className="text-xs text-red-300/90 leading-relaxed">{aiError}</p>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setAiError(null)}
-                          className="text-red-400/50 hover:text-red-400 transition-colors"
-                        >
-                          <X strokeWidth={1.5} className="w-3 h-3" />
-                        </button>
-                      </div>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-
-                <div className="flex items-center gap-2 px-3 pb-1.5">
-                  <input
-                    autoFocus
-                    value={aiPrompt}
-                    onChange={(e) => setAiPrompt(e.target.value)}
-                    placeholder="Describe the data you need in plain English... (e.g. 'Show me the revenue growth per month')"
-                    className="bg-transparent border-none outline-none text-xs text-zinc-100 w-full h-12 placeholder:text-zinc-600 font-medium"
-                  />
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => setShowAi(false)}
-                      className="p-2.5 rounded-xl hover:bg-white/5 text-zinc-500 transition-colors"
-                    >
-                      <X strokeWidth={1.5} className="w-3.5 h-3.5" />
-                    </button>
-                    <button
-                      type="submit"
-                      disabled={isAiLoading || !aiPrompt.trim()}
-                      className="bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:hover:bg-blue-600 px-4 py-2 rounded-xl text-white text-[0.625rem] font-medium transition-all shadow-lg shadow-blue-600/30 flex items-center gap-2"
-                    >
-                      {isAiLoading ? (
-                        <>
-                          <Loader2 strokeWidth={1.5} className="w-3 h-3 animate-spin" />
-                          <span>Thinking...</span>
-                        </>
-                      ) : (
-                        <>
-                          <span>Generate</span>
-                          <Send strokeWidth={1.5} className="w-3 h-3" />
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </div>
-              </form>
-            </motion.div>
-          )}
-        </AnimatePresence>
 
         {/* min-h-0: the flex item must shrink below Monaco's rendered height, else the editor can never shrink (#94) */}
         <div className="flex-1 relative min-h-0">
           <Editor
             height="100%"
             language={language}
-            theme="db-dark"
+            theme={editorTheme}
             value={value}
             beforeMount={handleBeforeMount}
             onChange={handleEditorChange}
             loading={
-              <div className="h-full w-full bg-[#050505] flex items-center justify-center">
-                <Loader2 strokeWidth={1.5} className="w-6 h-6 animate-spin text-zinc-800" />
+              <div className="h-full w-full bg-canvas flex items-center justify-center">
+                <Loader2 strokeWidth={1.5} className="w-6 h-6 animate-spin text-fg-subtle" />
               </div>
             }
             onMount={(editor, monaco) => {

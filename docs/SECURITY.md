@@ -26,7 +26,7 @@ Two consequences worth stating before the table:
 
 | ID | Control | Status | Enforced in | Verified by |
 |---|---|---|---|---|
-| 0.1 | LLM output never becomes an HTML string; the renderer builds React elements | Implemented | [`src/components/DatabaseDocs.tsx`](../src/components/DatabaseDocs.tsx), [`src/components/AIAutopilotPanel.tsx`](../src/components/AIAutopilotPanel.tsx) | [`tests/security/xss-sinks.test.tsx`](../tests/security/xss-sinks.test.tsx) |
+| 0.1 | LLM output never becomes an HTML string; the renderer builds React elements | Implemented | [`src/components/DatabaseDocs.tsx`](../src/components/DatabaseDocs.tsx) | [`tests/security/xss-sinks.test.tsx`](../tests/security/xss-sinks.test.tsx) |
 | 0.2 | No remote origin can be fetched through the image optimizer | Implemented | [`next.config.ts`](../next.config.ts) | [`tests/security/image-proxy.test.ts`](../tests/security/image-proxy.test.ts) |
 | 0.3 | Every route that reaches a database or an LLM verifies its caller in its own handler — a user session, or for the one machine callback a server-minted single-purpose credential | Implemented | [`src/lib/api/require-session.ts`](../src/lib/api/require-session.ts), [`src/lib/agent/drive-token.ts`](../src/lib/agent/drive-token.ts) | [`tests/security/route-auth.test.ts`](../tests/security/route-auth.test.ts), [`tests/api/agent/drive.test.ts`](../tests/api/agent/drive.test.ts) |
 | 0.4 | The security policy states only what the code does | Implemented | [`SECURITY.md`](../SECURITY.md) | [`tests/unit/security-check.test.ts`](../tests/unit/security-check.test.ts) |
@@ -42,7 +42,7 @@ Two consequences worth stating before the table:
 | 3.1 | Credentials are encrypted at rest in the server-side store | Implemented | [`src/lib/storage/encryption.ts`](../src/lib/storage/encryption.ts), [`src/lib/storage/connection-secrets.ts`](../src/lib/storage/connection-secrets.ts), [`src/lib/storage/encrypting-provider.ts`](../src/lib/storage/encrypting-provider.ts), [`src/lib/storage/factory.ts`](../src/lib/storage/factory.ts) | [`tests/security/credential-at-rest.test.ts`](../tests/security/credential-at-rest.test.ts), [`tests/isolated/factory-singleton.test.ts`](../tests/isolated/factory-singleton.test.ts), [`tests/integration/storage/sqlite-credential-encryption.test.ts`](../tests/integration/storage/sqlite-credential-encryption.test.ts) |
 | 3.2 | Every authoritative (server-generated) audit event is emitted as one structured JSON line on stdout | Implemented | [`src/lib/audit.ts`](../src/lib/audit.ts) | [`tests/security/audit-redaction.test.ts`](../tests/security/audit-redaction.test.ts), [`tests/security/audit-type-safety.test.ts`](../tests/security/audit-type-safety.test.ts) |
 | 3.3 | This page is checked against the repository on every build | Implemented | [`scripts/security-check.mjs`](../scripts/security-check.mjs) | [`tests/unit/security-check.test.ts`](../tests/unit/security-check.test.ts) |
-| 3.4 | A statement submitted on the agent execution path cannot write, change schema, reach another database, load code, or run the executing form of EXPLAIN | Partial | [`src/lib/db/operations/policy.ts`](../src/lib/db/operations/policy.ts), [`src/lib/db/operations/statement-guard.ts`](../src/lib/db/operations/statement-guard.ts), [`src/lib/agent/composed-sql.ts`](../src/lib/agent/composed-sql.ts), [`src/lib/agent/tools.ts`](../src/lib/agent/tools.ts), [`src/lib/db/providers/sql/postgres.ts`](../src/lib/db/providers/sql/postgres.ts), [`src/lib/db/providers/sql/sqlite.ts`](../src/lib/db/providers/sql/sqlite.ts), [`src/app/api/agent/runs/route.ts`](../src/app/api/agent/runs/route.ts), [`src/lib/agent/runtime.ts`](../src/lib/agent/runtime.ts) | [`tests/security/agent-statement-boundary.test.ts`](../tests/security/agent-statement-boundary.test.ts), [`tests/unit/lib/agent/composed-sql.test.ts`](../tests/unit/lib/agent/composed-sql.test.ts), [`tests/unit/lib/agent/tools.test.ts`](../tests/unit/lib/agent/tools.test.ts), [`tests/api/agent/runs.test.ts`](../tests/api/agent/runs.test.ts), [`tests/integration/db/postgres-provider.test.ts`](../tests/integration/db/postgres-provider.test.ts), [`tests/integration/db/sqlite-provider.test.ts`](../tests/integration/db/sqlite-provider.test.ts) |
+| 3.4 | A statement submitted on the agent execution path cannot write, change schema, reach another database, load code, or run the executing form of EXPLAIN | Partial | [`src/lib/db/operations/policy.ts`](../src/lib/db/operations/policy.ts), [`src/lib/db/operations/statement-guard.ts`](../src/lib/db/operations/statement-guard.ts), [`src/lib/agent/composed-sql.ts`](../src/lib/agent/composed-sql.ts), [`src/lib/agent/tools.ts`](../src/lib/agent/tools.ts), [`src/lib/db/providers/sql/postgres.ts`](../src/lib/db/providers/sql/postgres.ts), [`src/lib/db/providers/sql/sqlite.ts`](../src/lib/db/providers/sql/sqlite.ts), [`src/app/api/agent/runs/route.ts`](../src/app/api/agent/runs/route.ts), [`src/app/api/agent/runs/[runId]/handover/route.ts`](../src/app/api/agent/runs/[runId]/handover/route.ts), [`src/lib/agent/runtime.ts`](../src/lib/agent/runtime.ts) | [`tests/api/agent/handover.test.ts`](../tests/api/agent/handover.test.ts), [`tests/security/agent-statement-boundary.test.ts`](../tests/security/agent-statement-boundary.test.ts), [`tests/unit/lib/agent/composed-sql.test.ts`](../tests/unit/lib/agent/composed-sql.test.ts), [`tests/unit/lib/agent/tools.test.ts`](../tests/unit/lib/agent/tools.test.ts), [`tests/api/agent/runs.test.ts`](../tests/api/agent/runs.test.ts), [`tests/integration/db/postgres-provider.test.ts`](../tests/integration/db/postgres-provider.test.ts), [`tests/integration/db/sqlite-provider.test.ts`](../tests/integration/db/sqlite-provider.test.ts) |
 | 3.5 | Every agent-path operation — allowed, denied, or held for approval — is audited under one correlation id, and its result is released with the run | Partial | [`src/lib/db/operations/execution.ts`](../src/lib/db/operations/execution.ts), [`src/lib/db/operations/artifacts.ts`](../src/lib/db/operations/artifacts.ts), [`src/lib/agent/tools.ts`](../src/lib/agent/tools.ts), [`src/lib/audit.ts`](../src/lib/audit.ts), [`src/lib/api/agent-run-access.ts`](../src/lib/api/agent-run-access.ts), [`src/app/api/agent/drive/route.ts`](../src/app/api/agent/drive/route.ts), [`src/app/api/agent/runs/[runId]/artifacts/[correlationId]/route.ts`](../src/app/api/agent/runs/[runId]/artifacts/[correlationId]/route.ts) | [`tests/security/agent-execution-audit.test.ts`](../tests/security/agent-execution-audit.test.ts), [`tests/security/agent-tool-layer-audit.test.ts`](../tests/security/agent-tool-layer-audit.test.ts), [`tests/unit/db/operations/execution.test.ts`](../tests/unit/db/operations/execution.test.ts), [`tests/unit/db/operations/artifacts.test.ts`](../tests/unit/db/operations/artifacts.test.ts), [`tests/api/agent/drive.test.ts`](../tests/api/agent/drive.test.ts), [`tests/api/agent/artifacts.test.ts`](../tests/api/agent/artifacts.test.ts), [`tests/api/db/query.test.ts`](../tests/api/db/query.test.ts) |
 
 ## Notes on individual rows
@@ -96,7 +96,22 @@ separate SQLite read-only open with `PRAGMA query_only` re-asserted before every
 the SQL is defense in depth only, never the boundary. A route now reaches this layer: an agent run
 is opened at `POST /api/agent/runs` by a verified session, and every statement it sends passes
 through the operation pipeline above, on a provider acquired for the run's read-only execution
-profile rather than from the shared writable cache. Still **Partial**, for the one reason that
+profile rather than from the shared writable cache.
+
+**A second route reaches it, and it exists because the boundary above is the point.**
+`POST /api/agent/runs/{runId}/handover` replays the statement an auto-execute run answered with, in
+the user's editor. It used to be replayed through `POST /api/db/query` — the ordinary editor path, a
+read-WRITE session whose only protection is a syntactic read of the statement — which meant the same
+text was refused where the run proved it and executed where the user saw it: a `SELECT` invoking a
+VOLATILE function that performs an `INSERT` is refused by the read-only transaction (SQLSTATE 25006)
+and performed by a read-write one, and no reading of the SQL can tell the two apart. The replay now
+runs through `provider.queryReadOnly` under its own execution profile (`agent-handover`), so the
+same database-native control applies to it. Its request carries no SQL at all — the statement comes
+from the run's own `answer-composed` event and the connection from the run's persisted
+`connectionId` — so it is not a general endpoint for running a statement read-only, and nothing a
+user types reaches the profile.
+
+Still **Partial**, for the one reason that
 survives: out-of-scope READS have no database-native control on either provider — only the
 declared-target allowlist, the statement guard, and whatever the role's grants bound (see
 [`docs/BACKLOG.md`](./BACKLOG.md) A3).
@@ -144,6 +159,21 @@ These are real, current, and not oversights. Each is a decision with a reason.
   constant-time comparison (1.5) address the reachable part of the risk.
 - **Rate limiting is per process and every bucket is keyed on something the caller supplies.** See
   [`docs/BACKLOG.md`](./BACKLOG.md), entries H11 and H13.
+- **Configuring an AI model means database content leaves the machine.** Nothing here is telemetry
+  and nothing fires on its own, but an agent run sends the objective you typed, the schema
+  inventory, the relations graph and the rows of every read it performs to the model provider you
+  configured — and the three remaining AI routes send your statement and a schema context. The
+  agent fences everything database-derived before it reaches a prompt, and one path is **not**
+  fenced: an identifier the model quotes back into its own tool arguments
+  ([`docs/BACKLOG.md`](./BACKLOG.md) B29, open). What each surface sends, and what comes back, with
+  the call site for every claim, is [`docs/AGENT_DATA_FLOW.md`](./AGENT_DATA_FLOW.md). **A key is not
+  what decides whether any of this happens — a model configuration that validates is.**
+  `validateConfig` requires `LLM_API_KEY` for the `gemini` and `openai` kinds only
+  (`src/lib/llm/utils/config.ts:127-134`), so a keyless `LLM_PROVIDER=ollama` deployment, or a
+  `custom` one with `LLM_API_URL`, has the agent available and sends everything above to that
+  endpoint. What sends nothing is a deployment with **no `LLM_*` configuration at all**: the provider
+  defaults to `gemini` (`config.ts:12`), it is refused without a key, availability answers
+  `NO_MODEL_CONFIGURED`, no rail renders and no model call is made.
 - **A test linked from this table is checked to exist and to run — not to be true.** Nothing
   verifies that a linked test actually exercises the control it is linked from. That is the
   residual this page carries knowingly; the same limitation is recorded for the route-guard

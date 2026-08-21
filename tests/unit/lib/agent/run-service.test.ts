@@ -5,7 +5,7 @@ import path from "node:path";
 import { createLocalWorld } from "@workflow/world-local";
 import { AgentRunService, AgentRunServiceError } from "@/lib/agent/run-service";
 import type { AgentRunStepSettlement } from "@/lib/agent/run-service";
-import { AgentRunStore } from "@/lib/agent/run-store";
+import { AgentRunStore, AgentRunStoreError } from "@/lib/agent/run-store";
 import { logger } from "@/lib/logger";
 import type { AgentRunActor } from "@/lib/agent/types";
 import { ExecutionArtifactStore } from "@/lib/db/operations/artifacts";
@@ -328,6 +328,42 @@ describe("AgentRunService — finishing a run", () => {
     }
   });
 
+  test("a run that never entered the loop is given no verdict at all", async () => {
+    // `runtime.ts`'s `recordDriveFailure` shape: the drive died resolving the
+    // connection or building the model, so the run is still `queued` and finishes
+    // without a `run-started` ever having been written. Judging that run "did not
+    // answer" would judge one that was never given the chance to. Found by review
+    // on #347.
+    const h = harness();
+    const { runId } = await h.service.start(START_INPUT);
+
+    const record = await h.service.finish(runId, "failed", { reason: "connection-unresolvable" });
+
+    expect(record.status).toBe("failed");
+    const finished = (await h.service.status(runId))?.record.events.at(-1);
+    if (finished?.kind !== "run-finished") throw new Error("expected an ending");
+    expect(finished.goalVerdict).toBeUndefined();
+    // And the reason it DOES have is untouched — the verdict's absence replaces
+    // nothing the caller needs to see.
+    expect(finished.reason).toBe("connection-unresolvable");
+  });
+
+  test("the log says a run ended before it began, rather than that it failed to answer", async () => {
+    const info = spyOn(logger, "info").mockImplementation(() => {});
+    try {
+      const h = harness();
+      const { runId } = await h.service.start(START_INPUT);
+
+      await h.service.finish(runId, "failed", { reason: "internal" });
+
+      const line = info.mock.calls.map((call) => String(call[0])).join("\n");
+      expect(line).toContain("ended before it began");
+      expect(line).not.toContain("unanswered");
+    } finally {
+      info.mockRestore();
+    }
+  });
+
   test("refuses to finish a run that has already finished", async () => {
     const h = harness();
     const { runId } = await h.service.start(START_INPUT);
@@ -510,6 +546,41 @@ describe("AgentRunService — cancellation", () => {
   test("refuses to cancel a run that does not exist", async () => {
     const h = harness();
     expect((await captureServiceError(() => h.service.cancel("arun_ff", ACTOR))).reasonCode).toBe("RUN_NOT_FOUND");
+  });
+
+  test("cancelling a run another writer finished mid-cancel answers with its terminal view", async () => {
+    // The race `cancel` tolerates, built the way it actually happens: its read sees a
+    // live run, another writer finalizes it — `run-finished` appended, then the stream
+    // closed — and only then does `requestCancellation` reach `run-store`'s guard. The
+    // refusal must not escape as a 500: the run IS ended, which is what the caller
+    // asked for. The stubbed read hands `cancel` the stale view it would have won.
+    const h = harness();
+    const { runId } = await h.service.start(START_INPUT);
+    await h.service.markRunning(runId);
+
+    const read = h.store.read.bind(h.store);
+    spyOn(h.store, "read").mockImplementationOnce(async (id: string) => {
+      const stale = await read(id);
+      await h.service.finish(runId, "failed", { reason: "internal" });
+      return stale;
+    });
+
+    const cancelled = await h.service.cancel(runId, OTHER_ACTOR);
+    expect(cancelled.record.status).toBe("failed");
+  });
+
+  test("a closed stream over a run the ledger does not show as ended refuses rather than reporting success", async () => {
+    // The other side of the same guard. A closed stream is only ever produced by
+    // `finalize`, which appends `run-finished` first — so a closed stream over a run
+    // still queued means the cancellation was LOST. Answering with that view would be
+    // a 200 on a run nothing cancelled: the silent loss this whole change exists to
+    // make loud. It refuses instead.
+    const h = harness();
+    const { runId } = await h.service.start(START_INPUT);
+
+    await h.store.close(runId);
+
+    await expect(h.service.cancel(runId, OTHER_ACTOR)).rejects.toThrow(AgentRunStoreError);
   });
 });
 
@@ -805,5 +876,21 @@ describe("AgentRunService — timestamps", () => {
       1_700_000_050_000, 1_700_000_060_000, 1_700_000_060_000, 1_700_000_070_000,
     ]);
     expect(view?.record.createdAtMs).toBe(1_700_000_000_000);
+  });
+});
+
+// ─── one drive per run, in this process ────────────────────────────────────
+
+describe("AgentRunService — drive ownership", () => {
+  test("a second claim on a run already being driven refuses, and release makes it claimable again", async () => {
+    const h = harness();
+    const { runId } = await h.service.start(START_INPUT);
+
+    h.service.claimDrive(runId);
+    expect((await captureServiceError(async () => h.service.claimDrive(runId))).reasonCode).toBe("RUN_ALREADY_DRIVEN");
+
+    h.service.releaseDrive(runId);
+    h.service.claimDrive(runId);
+    h.service.releaseDrive(runId);
   });
 });

@@ -38,7 +38,7 @@ import { logger } from "@/lib/logger";
 import { resolveConnection, SeedConnectionError } from "@/lib/seed/resolve-connection";
 import type { QueryResult } from "@/lib/types";
 import { AgentRunDeadline } from "./deadline";
-import { AGENT_RUN_DEADLINE_MS } from "./execution-policy";
+import { AGENT_WORKFLOW_BUDGETS } from "./execution-policy";
 import { type AgentInvestigationResult, runInvestigation } from "./investigation";
 import { createAgentModel } from "./model-adapter";
 import { AgentRepairLedger } from "./repair-ledger";
@@ -47,13 +47,53 @@ import { AgentRunStore, resolveAgentLedgerWorld } from "./run-store";
 import type { AgentRunFailureReason } from "./types";
 
 /**
- * How long a run's results stay readable, and how many it may hold at once. Sized
- * against the run deadline rather than independently: an artifact that expired while
- * its own run was still allowed to cite it would turn a verified claim into a dead
- * reference, so the TTL is a comfortable multiple of the longest a run may live.
+ * How long a run's results stay readable. Sized against the run deadline rather than
+ * independently: an artifact that expired while its own run was still allowed to cite
+ * it would turn a verified claim into a dead reference, so the TTL is a comfortable
+ * multiple of the longest a run may live.
+ *
+ * The LONGEST deadline any workflow may take, not one workflow's — the store is
+ * process-wide and holds artifacts from every workflow at once, so a TTL derived from
+ * a shorter row would expire a `data-analysis` run's earliest evidence while
+ * that run was still going. A workflow with a shorter deadline simply gets more
+ * headroom than the multiple promises.
  */
-const AGENT_ARTIFACT_TTL_MS = AGENT_RUN_DEADLINE_MS * 4;
-const AGENT_MAX_ARTIFACTS = 64;
+const AGENT_ARTIFACT_TTL_MS =
+  Math.max(...Object.values(AGENT_WORKFLOW_BUDGETS).map((budget) => budget.runDeadlineMs)) * 4;
+
+/**
+ * The entry cap of the process-wide artifact store, computed rather than picked:
+ * `45 statements × 4 runs = 180`. 45 is the largest per-workflow statement
+ * ceiling the frozen decision table admits (`database-assessment`); 4 is the
+ * number of runs this single agent process is assumed to carry at once.
+ *
+ * What that product bounds is FOUR DRIVES, not four runs, and the distinction was
+ * stated wrongly here until #373: this comment said "a run cannot produce more
+ * artifacts than it is allowed statements", which is not true of a run. Every
+ * ceiling in `AGENT_WORKFLOW_BUDGETS` is per drive (`docs/BACKLOG.md` B6) — the
+ * budget tracker is built by the process that drives a run — while a resumed run
+ * keeps its `runId` and its artifacts are keyed by it. So a run that is driven
+ * three times may hold up to three times its statement ceiling in this store,
+ * and one long-lived run can pass 180 on its own.
+ *
+ * The behaviour when it does is worth knowing rather than guessing at. The cap is
+ * spent run-fairly (`ExecutionArtifactStore.put`): a store at the cap evicts the
+ * OLDEST ARTIFACT OF THE RUN THAT IS STORING, so a busy run cannot make "Show
+ * result" fail on a quieter one. Applied to a resumed run at the cap, that same
+ * rule means the run evicts its OWN earliest evidence — the results its first
+ * drive read, which its report may still cite. Nothing about the ledger is wrong
+ * afterwards: the claim and its citation are durable, and the artifact route
+ * already answers "the rows are not here" for the run-ended and TTL-expired cases
+ * (`docs/BACKLOG.md` B15). This just adds a third way to reach that answer while
+ * the run is still live. Recorded as `docs/BACKLOG.md` B35 rather than fixed
+ * here: a bound that holds ACROSS drives is the same missing mechanism B6 names,
+ * and inventing a second one for artifacts alone would be a second answer to one
+ * question.
+ *
+ * Sized for the ceiling rather than for what a policy enforces at any one moment,
+ * so a statement budget lower than 45 leaves the cap correct and merely slack.
+ */
+export const AGENT_MAX_ARTIFACTS = 180;
 
 /**
  * The process-wide pair. Lazily built so that merely importing this module — which
@@ -127,10 +167,14 @@ export async function driveAgentRun(runId: string): Promise<AgentInvestigationRe
     // connections are visible is the one recorded when the run was opened.
     const connection = await resolveConnection({ connectionId }, { role: actor.role, username: actor.sessionId });
 
-    // Capabilities are type-driven and read without connecting, the way
+    // Capabilities and labels are type-driven and read without connecting, the way
     // /api/db/provider-meta reads them. The live, read-only provider a statement
     // actually runs on is acquired per call through the execution-profile seam.
-    const capabilities = (await createDatabaseProvider(connection)).getCapabilities();
+    // One provider for both, so a run's declared behaviour and its declared
+    // vocabulary can never come from two different readings.
+    const provider = await createDatabaseProvider(connection);
+    const capabilities = provider.getCapabilities();
+    const labels = provider.getLabels();
 
     return await runInvestigation(runId, {
       service,
@@ -138,17 +182,27 @@ export async function driveAgentRun(runId: string): Promise<AgentInvestigationRe
       resources: {
         connection,
         capabilities,
+        labels,
         registry: createCanonicalOperationRegistry(),
         scope: createTargetScope(connectionId),
         tracker: runResources().tracker,
         artifacts: runResources().artifacts,
-        deadline: new AgentRunDeadline(AGENT_RUN_DEADLINE_MS),
+        // The run's own workflow decides its wall clock, the same way it decides its
+        // statement budget and its turn ceiling. Read from the record the ledger
+        // returned, so a resumed drive is bounded by what the run was opened as.
+        deadline: new AgentRunDeadline(AGENT_WORKFLOW_BUDGETS[report.record.workflowType].runDeadlineMs),
         repairs: new AgentRepairLedger(),
         acquireProvider: acquireExecutionProfileProvider,
       },
     });
   } catch (error) {
-    await recordDriveFailure(service, runId, error);
+    // A drive refused because another already owns the run is not a failure OF the
+    // run: it is healthy and in flight. Recording `failed` here would end the very
+    // run the first drive is still carrying, so the refusal is left to the caller
+    // (the drive route answers 409) and nothing is written to the ledger.
+    if (!(error instanceof AgentRunServiceError && error.reasonCode === "RUN_ALREADY_DRIVEN")) {
+      await recordDriveFailure(service, runId, error);
+    }
     throw error;
   }
 }

@@ -13,7 +13,6 @@ import { DataProfiler } from "@/components/DataProfiler";
 import { CodeGenerator } from "@/components/CodeGenerator";
 import { TestDataGenerator } from "@/components/TestDataGenerator";
 import { CreateTableModal } from "@/components/CreateTableModal";
-import { SchemaDiagram } from "@/components/SchemaDiagram";
 import { SaveQueryModal } from "@/components/SaveQueryModal";
 import {
   StudioMobileHeader,
@@ -24,10 +23,17 @@ import {
 } from "@/components/studio/index";
 import { AgentRail } from "@/components/agent/AgentRail";
 import { DatabaseConnection, SavedQuery } from "@/lib/types";
-import { quoteLiteral } from "@/lib/sql/values";
+import { ChunkBoundary, ViewLoading } from "@/components/LazyView";
+import { lazyRetry } from "@/lib/lazy";
+import { editorLanguageForTabType, resolveTabType } from "@/lib/editor/tab-language";
+import { buildResultExport, type ResultExportFormat } from "@/lib/export/result-export";
+import { downloadText } from "@/lib/export/download";
+import { newLocalId } from "@/lib/ids";
 import { resolveAgentRunConnectionId } from "@/hooks/use-connection-payload";
+import { isMobileViewport } from "@/hooks/use-mobile";
 import { useAgentCapability } from "@/hooks/use-agent-capability";
 import { useAgentArtifact } from "@/components/agent/use-agent-artifact";
+import { useAgentPrefill } from "@/components/agent/use-agent-prefill";
 import { useToast } from "@/hooks/use-toast";
 import { useProviderMetadata } from "@/hooks/use-provider-metadata";
 import { useAuth } from "@/hooks/use-auth";
@@ -61,6 +67,18 @@ import {
   AlertDialogDescription,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+
+/*
+  The ERD, split out of the first load.
+
+  It is the largest thing in this tree — `@xyflow/react`, the elk layout engine and the
+  snapdom capture used for its export — and it is mounted only while `showDiagram` is
+  true, which for most sessions is never. `React.lazy`, not `next/dynamic`, to keep the
+  same seam the bottom panel uses; the diagram is reached from the embeddable shell too.
+*/
+const SchemaDiagram = React.lazy(
+  lazyRetry(() => import("@/components/SchemaDiagram").then((m) => ({ default: m.SchemaDiagram }))),
+);
 
 export default function Studio() {
   const queryEditorRef = useRef<QueryEditorRef>(null);
@@ -130,14 +148,7 @@ export default function Studio() {
       editing.setEditingEnabled(false);
       editing.handleDiscardChanges();
       conn.fetchSchema(conn.activeConnection);
-      const tabType =
-        metadata?.capabilities.queryDialect === "libredb"
-          ? "libredb"
-          : metadata?.capabilities.queryLanguage === "json"
-            ? "mongodb"
-            : conn.activeConnection.type === "redis"
-              ? "redis"
-              : "sql";
+      const tabType = resolveTabType(metadata?.capabilities);
       tabMgr.setTabs((prev) =>
         prev.map((t) => {
           return {
@@ -161,7 +172,6 @@ export default function Studio() {
   const [savedKey, setSavedKey] = useState(0);
   const [activeMobileTab, setActiveMobileTab] = useState<"database" | "schema" | "editor">("editor");
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
-  const [isNL2SQLOpen, setIsNL2SQLOpen] = useState(false);
   const [profilerTable, setProfilerTable] = useState<string | null>(null);
   const [codeGenTable, setCodeGenTable] = useState<string | null>(null);
   const [testDataTable, setTestDataTable] = useState<string | null>(null);
@@ -173,10 +183,32 @@ export default function Studio() {
   const agentEnabled = useAgentCapability();
   const [isAgentSheetOpen, setIsAgentSheetOpen] = useState(false);
 
+  /*
+    The prefill seam (#331 T1). The shell owns the ask because a shortcut can be
+    anywhere in the shell — the command palette, the mobile header, a bottom-panel tab —
+    while the rail is ONE instance behind both of its presentations; the rail applies it
+    as a prop, the direction `isAgentSheetOpen` already runs in. T2 and T3 hand
+    `agentPrefill.requestPrefill` to those entry points; a prefill fills the rail and
+    starts nothing when they do.
+  */
+  const agentPrefill = useAgentPrefill();
+
   // Artifact hydration (#329 T11). The rail cites what a run stored; showing it puts
   // the rows into the bottom panel that already renders rows, and applying a drafted
   // statement puts it into the editor that already holds statements. There is no
-  // second grid and no second editor, and neither happens without a user action.
+  // second grid, no second chart component and no second editor. Which surface opens
+  // is the hydration's answer, and it comes from what the run recorded — the operation
+  // for a read or a plan, the composed answer for a chart — never from the shape of
+  // the rows.
+  //
+  // HYDRATION happens on a user action — a click on a citation. The HAND-OVER below
+  // does not, and this comment used to claim otherwise. The rail's handover effect
+  // calls `onApplyStatement` (for `handover: "applied"`) and `onRunStatement` (for
+  // `"auto-executed"`) from a `useEffect` over ledger entries, so an auto-execute run
+  // writes `currentTab.query` with no click at that moment. The consent was given
+  // once, when the run was opened with the checkbox ticked, and it is the whole of
+  // what makes this acceptable — so anything added here that would lose unsaved
+  // editor content must guard it rather than trusting a click to have happened.
   const agentArtifact = useAgentArtifact({
     explainFormat: metadata?.capabilities.explainFormat,
     onShown: (surface) => queryExec.setBottomPanelMode(surface),
@@ -209,6 +241,56 @@ export default function Studio() {
   const agentConnectionId =
     conn.activeConnection === null ? null : resolveAgentRunConnectionId(conn.activeConnection, conn.servedSeeds);
 
+  /*
+    What the two standalone AI entry points do now (#331 T3). The in-editor chat is
+    gone; the command palette's item and the mobile header's button open the RAIL on
+    the statement the editor is holding. Both go through this one handler, because a
+    decision made at each caller is a decision made twice.
+
+    The workflow is INVESTIGATION, not query-optimization, and that is deliberate.
+    The control being replaced was a general assistant, not an optimizer, so choosing
+    the optimizer would commit the user to a goal they never asked for: that
+    workflow's verifier requires the run to PROPOSE a change and back it with a plan
+    it read — a comparison, or an index citing the plan it diagnosed
+    (`src/lib/agent/goal-verifier.ts`) — and a run that perfectly explained what the
+    statement does proposes nothing, so it would still be recorded as "did not
+    answer". The workflow control is one click away in the rail, and investigation is
+    the general one.
+
+    The objective is the statement and nothing composed around it. Writing prose like
+    "why is this slow?" on the user's behalf would put words in a box that is theirs
+    and stays editable. It is read from the tab this shell already owns rather than
+    from the editor handle: `QueryEditor`'s `onContentChange` writes every keystroke
+    into that tab through `updateTabById` (see the mount below), and `use-tab-manager`
+    derives `currentTab` from the tabs it writes to — so the tab is current, and
+    `getEditorValue` was the AI hook's private callback rather than a second source of
+    truth. The seam bounds the length; nothing here has to.
+
+    An empty editor mints no ask. An objective saying nothing would still be recorded
+    as APPLIED by the rail, so it would clear a standing offer and overwrite nothing
+    to no purpose. The entry point still opens the rail — which below `md` means
+    opening the sheet here, since the seam only opens it when it has an ask to apply,
+    and above `md` means nothing at all: the rail is already the panel, and arming the
+    sheet flag there would pop a sheet open the first time the window narrows.
+  */
+  /*
+    The statement is passed as the user wrote it, minus the whitespace around it. That
+    trim is not a liberty taken with their text: the rail sends `objective.trim()` when
+    Start is pressed, so anything this kept would be dropped a moment later anyway, and
+    keeping it would only spend the seam's length budget on blanks. What is deliberately
+    NOT done is composing anything around the statement — no "Why is this query slow?"
+    written on the user's behalf. Raised in review on #351, where "verbatim" read as a
+    promise this makes about bytes rather than about authorship.
+  */
+  const askAgentAboutStatement = () => {
+    const statement = tabMgr.currentTab.query.trim();
+    if (statement.length === 0) {
+      if (isMobileViewport()) setIsAgentSheetOpen(true);
+      return;
+    }
+    agentPrefill.requestPrefill("investigation", statement);
+  };
+
   // Data Masking
   const [maskingConfig, setMaskingConfig] = useState<MaskingConfig>(() => loadMaskingConfig());
   const effectiveMasking = shouldMask(user?.role, maskingConfig);
@@ -225,7 +307,7 @@ export default function Studio() {
   const handleSaveQuery = (name: string, description: string, tags: string[]) => {
     if (!conn.activeConnection) return;
     const newSavedQuery: SavedQuery = {
-      id: Math.random().toString(36).substring(7),
+      id: newLocalId(),
       name,
       query: tabMgr.currentTab.query,
       description,
@@ -239,81 +321,28 @@ export default function Studio() {
     toast({ title: "Query Saved", description: `"${name}" has been added to your saved queries.` });
   };
 
-  const exportResults = (format: "csv" | "json" | "sql-insert" | "sql-ddl") => {
+  const exportResults = (format: ResultExportFormat) => {
     if (!tabMgr.currentTab.result) return;
-    const rawData = tabMgr.currentTab.result.rows;
-    const sensitiveColumns = detectSensitiveColumnsFromConfig(tabMgr.currentTab.result.fields, maskingConfig);
-    const data = effectiveMasking
-      ? applyMaskingToRows(rawData, tabMgr.currentTab.result.fields, sensitiveColumns)
-      : rawData;
-    let content = "";
-    let mimeType = "text/plain";
-    let ext: string = format;
+    // The columns the engine declared for THIS result. The writers read every row by
+    // these names rather than by whatever keys row 0 happens to carry, so a row with
+    // a different key order — or a document store's row missing a field entirely —
+    // lands in the right column instead of shifting the rest.
+    const fields = tabMgr.currentTab.result.fields;
+    const sensitiveColumns = detectSensitiveColumnsFromConfig(fields, maskingConfig);
+    const rows = effectiveMasking
+      ? applyMaskingToRows(tabMgr.currentTab.result.rows, fields, sensitiveColumns)
+      : tabMgr.currentTab.result.rows;
 
-    if (format === "csv") {
-      const headers = Object.keys(data[0] || {}).join(",");
-      const rows = data
-        .map((row) =>
-          Object.values(row)
-            .map((val) => `"${val}"`)
-            .join(","),
-        )
-        .join("\n");
-      content = `${headers}\n${rows}`;
-      mimeType = "text/csv";
-      ext = "csv";
-    } else if (format === "json") {
-      content = JSON.stringify(data, null, 2);
-      mimeType = "application/json";
-      ext = "json";
-    } else if (format === "sql-insert") {
-      const tableName = tabMgr.currentTab.name.replace(/^Query[:  ]*/, "") || "table_name";
-      const columns = Object.keys(data[0] || {});
-      const lines = data.map((row) => {
-        const values = columns.map((col) => {
-          const val = row[col];
-          if (val === null || val === undefined) return "NULL";
-          if (typeof val === "number" || typeof val === "boolean") return String(val);
-          // The exported file is SQL that runs somewhere later, usually unattended,
-          // and every value in it is data the table held. Quoting is therefore the
-          // connected engine's own: doubling the quote alone would let a value
-          // ending in a backslash close its literal and have the rest of the file
-          // read as statements (#290).
-          return quoteLiteral(String(val), conn.activeConnection?.type);
-        });
-        return `INSERT INTO ${tableName} (${columns.join(", ")}) VALUES (${values.join(", ")});`;
-      });
-      content = lines.join("\n");
-      mimeType = "text/sql";
-      ext = "sql";
-    } else if (format === "sql-ddl") {
-      const tableName = tabMgr.currentTab.name.replace(/^Query[:  ]*/, "") || "table_name";
-      const columns = Object.keys(data[0] || {});
-      const colDefs = columns.map((col) => {
-        const sampleVal = data[0]?.[col];
-        let sqlType = "TEXT";
-        if (typeof sampleVal === "number") {
-          sqlType = Number.isInteger(sampleVal) ? "INTEGER" : "NUMERIC";
-        } else if (typeof sampleVal === "boolean") {
-          sqlType = "BOOLEAN";
-        } else if (sampleVal instanceof Date) {
-          sqlType = "TIMESTAMP";
-        }
-        return `  ${col} ${sqlType}`;
-      });
-      content = `CREATE TABLE ${tableName} (\n${colDefs.join(",\n")}\n);`;
-      mimeType = "text/sql";
-      ext = "sql";
-    }
-
-    const fileName = `query_result_export.${ext}`;
-    const blob = new Blob([content], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = fileName;
-    link.click();
-    URL.revokeObjectURL(url);
+    const file = buildResultExport(format, {
+      rows,
+      fields,
+      tabName: tabMgr.currentTab.name,
+      dialect: conn.activeConnection?.type,
+      // The types the engine declared for THIS result, which is what the DDL form
+      // writes when they are there — the only source for a computed column.
+      columnTypes: tabMgr.currentTab.result.columnTypes,
+    });
+    downloadText(file.content, file.mimeType, `query_result_export.${file.extension}`);
   };
 
   const onTableClick = (tableName: string) => {
@@ -340,10 +369,13 @@ export default function Studio() {
   };
 
   return (
-    <div className="flex h-screen w-full bg-[#050505] text-zinc-100 overflow-hidden font-sans select-none">
-      <ResizablePanelGroup id="studio-main" direction="horizontal" className="h-full">
-        {/* `order` is required once a sibling panel is conditional (the agent rail). */}
-        <ResizablePanel order={1} defaultSize={22} minSize={15} maxSize={35} className="hidden md:block">
+    <div className="flex h-screen w-full bg-canvas text-fg overflow-hidden font-sans select-none">
+      <ResizablePanelGroup id="studio-main" orientation="horizontal" className="h-full">
+        {/* A stable `id` is what keeps the layout attached to the right panel once
+            a sibling is conditional (the agent rail); it replaces v3's `order`,
+            since v4 keys its layout by panel id. Sizes are strings on purpose:
+            v4 reads a bare number as pixels and a unitless string as a percentage. */}
+        <ResizablePanel id="studio-sidebar" defaultSize="22" minSize="15" maxSize="35" className="hidden md:block">
           <Sidebar
             connections={conn.connections}
             activeConnection={conn.activeConnection}
@@ -370,8 +402,8 @@ export default function Studio() {
           />
         </ResizablePanel>
         <ResizableHandle className="hidden md:flex w-1 bg-transparent hover:bg-blue-500/30 transition-colors" />
-        <ResizablePanel order={2} defaultSize={agentEnabled ? 54 : 78}>
-          <div className="flex-1 flex flex-col min-w-0 h-full bg-[#0a0a0a] pb-16 md:pb-0">
+        <ResizablePanel id="studio-body" defaultSize={agentEnabled ? "54" : "78"}>
+          <div className="flex-1 flex flex-col min-w-0 h-full bg-surface pb-16 md:pb-0">
             <StudioMobileHeader
               connections={conn.connections}
               activeConnection={conn.activeConnection}
@@ -391,7 +423,7 @@ export default function Studio() {
               onSaveQuery={() => setIsSaveQueryModalOpen(true)}
               onClearQuery={() => tabMgr.updateCurrentTab({ query: "" })}
               onExecuteQuery={() => queryExec.executeQuery()}
-              onCancelQuery={queryExec.cancelQuery}
+              onCancelQuery={() => queryExec.cancelQuery()}
               onBeginTransaction={() => txn.handleTransaction("begin")}
               onCommitTransaction={() => txn.handleTransaction("commit")}
               onRollbackTransaction={() => txn.handleTransaction("rollback")}
@@ -403,6 +435,9 @@ export default function Studio() {
                   ? () => queryExec.executeQuery(undefined, undefined, true)
                   : undefined
               }
+              // Absent while the runtime is off, so the header carries no control
+              // that would open a rail that does not exist.
+              onAskAgent={agentEnabled ? askAgentAboutStatement : undefined}
             />
 
             <StudioDesktopHeader
@@ -428,18 +463,32 @@ export default function Studio() {
 
             <main className="flex-1 overflow-hidden relative">
               <AnimatePresence>
-                {showDiagram && <SchemaDiagram schema={conn.schema} onClose={() => setShowDiagram(false)} />}
+                {showDiagram && (
+                  /*
+                    A visible fallback, not `null`: this is the heaviest chunk in the
+                    tree (`@xyflow/react` + elk + snapdom), so the wait is the one the
+                    user is most likely to see — and a click that shows nothing at all
+                    reads as a broken button, which is answered by clicking it again.
+                  */
+                  <ChunkBoundary label="The diagram">
+                    <React.Suspense
+                      fallback={<ViewLoading label="Loading the diagram" className="absolute inset-0 z-20" />}
+                    >
+                      <SchemaDiagram schema={conn.schema} onClose={() => setShowDiagram(false)} />
+                    </React.Suspense>
+                  </ChunkBoundary>
+                )}
               </AnimatePresence>
 
               {/* Mobile: Database Tab */}
               {activeMobileTab === "database" && (
-                <div className="md:hidden h-full bg-[#080808] overflow-auto p-4">
+                <div className="md:hidden h-full bg-sunken overflow-auto p-4">
                   <div className="mb-4 flex items-center justify-between">
-                    <h2 className="text-xs font-medium text-zinc-300">Connections</h2>
+                    <h2 className="text-xs font-medium text-fg-secondary">Connections</h2>
                     <Button
                       variant="outline"
                       size="sm"
-                      className="h-8 text-xs border-white/10 hover:bg-white/5"
+                      className="h-8 text-xs border-hairline-strong hover:bg-fill"
                       onClick={() => setIsConnectionModalOpen(true)}
                     >
                       <Plus strokeWidth={1.5} className="w-3 h-3 mr-1" /> Add
@@ -460,7 +509,7 @@ export default function Studio() {
 
               {/* Mobile: Schema Tab */}
               {activeMobileTab === "schema" && (
-                <div className="md:hidden h-full bg-[#080808] overflow-auto p-4">
+                <div className="md:hidden h-full bg-sunken overflow-auto p-4">
                   {conn.activeConnection ? (
                     <SchemaExplorer
                       schema={conn.schema}
@@ -483,7 +532,7 @@ export default function Studio() {
                       onGenerateTestData={(name) => setTestDataTable(name)}
                     />
                   ) : (
-                    <div className="flex flex-col items-center justify-center h-full text-zinc-500">
+                    <div className="flex flex-col items-center justify-center h-full text-fg-muted">
                       <Database strokeWidth={1.5} className="w-12 h-12 mb-4 opacity-30" />
                       <p className="text-xs">Select a connection first</p>
                     </div>
@@ -494,8 +543,8 @@ export default function Studio() {
               {/* Desktop & Mobile Editor Tab */}
               <div className={cn("h-full", activeMobileTab !== "editor" && "hidden md:block")}>
                 <div className="h-full">
-                  <ResizablePanelGroup id="studio-editor" direction="vertical">
-                    <ResizablePanel defaultSize={40} minSize={20}>
+                  <ResizablePanelGroup id="studio-editor" orientation="vertical">
+                    <ResizablePanel id="studio-editor-top" defaultSize="40" minSize="20">
                       <div className="h-full flex flex-col">
                         <QueryToolbar
                           activeConnection={conn.activeConnection}
@@ -506,7 +555,7 @@ export default function Studio() {
                           editingEnabled={editingEnabled}
                           onSaveQuery={() => setIsSaveQueryModalOpen(true)}
                           onExecuteQuery={() => queryExec.executeQuery()}
-                          onCancelQuery={queryExec.cancelQuery}
+                          onCancelQuery={() => queryExec.cancelQuery()}
                           onBeginTransaction={() => txn.handleTransaction("begin")}
                           onCommitTransaction={() => txn.handleTransaction("commit")}
                           onRollbackTransaction={() => txn.handleTransaction("rollback")}
@@ -525,23 +574,15 @@ export default function Studio() {
                                 ? () => queryExec.executeQuery(undefined, undefined, true)
                                 : undefined
                             }
-                            language={
-                              tabMgr.currentTab.type === "libredb"
-                                ? "libredb"
-                                : tabMgr.currentTab.type === "mongodb"
-                                  ? "json"
-                                  : "sql"
-                            }
-                            tables={conn.tableNames}
-                            databaseType={conn.activeConnection?.type}
+                            language={editorLanguageForTabType(tabMgr.currentTab.type)}
                             schemaContext={conn.schemaContext}
                             capabilities={metadata?.capabilities}
                           />
                         </div>
                       </div>
                     </ResizablePanel>
-                    <ResizableHandle className="h-1 bg-white/5 hover:bg-blue-500/20" />
-                    <ResizablePanel defaultSize={60} minSize={20}>
+                    <ResizableHandle className="h-1 bg-fill hover:bg-blue-500/20" />
+                    <ResizablePanel id="studio-editor-bottom" defaultSize="60" minSize="20">
                       <BottomPanel
                         mode={queryExec.bottomPanelMode}
                         onSetMode={queryExec.setBottomPanelMode}
@@ -552,8 +593,6 @@ export default function Studio() {
                         metadata={metadata}
                         historyKey={queryExec.historyKey}
                         savedKey={savedKey}
-                        isNL2SQLOpen={isNL2SQLOpen}
-                        onSetIsNL2SQLOpen={setIsNL2SQLOpen}
                         maskingEnabled={effectiveMasking}
                         onToggleMasking={
                           userCanToggle
@@ -573,7 +612,6 @@ export default function Studio() {
                         onCellChange={editing.handleCellChange}
                         onApplyChanges={editing.handleApplyChanges}
                         onDiscardChanges={editing.handleDiscardChanges}
-                        onExecuteQuery={(q) => queryExec.executeQuery(q)}
                         onLoadQuery={(q) => tabMgr.updateCurrentTab({ query: q })}
                         onLoadMore={
                           tabMgr.currentTab.result?.pagination?.hasMore ? queryExec.handleLoadMore : undefined
@@ -614,13 +652,34 @@ export default function Studio() {
         {agentEnabled && (
           <>
             <ResizableHandle className="hidden md:flex w-1 bg-transparent hover:bg-blue-500/30 transition-colors" />
-            <ResizablePanel order={3} defaultSize={24} minSize={18} maxSize={45} className="hidden md:block">
+            <ResizablePanel id="studio-agent" defaultSize="24" minSize="18" maxSize="45" className="hidden md:block">
               <AgentRail
                 connectionId={agentConnectionId}
                 connectionName={conn.activeConnection?.name ?? null}
                 sheetOpen={isAgentSheetOpen}
                 onSheetOpenChange={setIsAgentSheetOpen}
+                prefill={agentPrefill.request}
+                connectionType={conn.activeConnection?.type ?? null}
                 onApplyStatement={(sql) => tabMgr.updateCurrentTab({ query: sql })}
+                /*
+                  The handover a run's answer can record (§2.1): the statement goes
+                  into the editor AND is run there. Through the hook's own entry point
+                  rather than `executeQuery`, and the difference is the boundary
+                  (#373 review): `executeQuery` goes to the editor's read-WRITE route,
+                  where a `SELECT` calling a VOLATILE function that writes would
+                  succeed. `executeHandedOverStatement` asks the run's own hand-over
+                  route instead, which runs the ledger's statement under the engine's
+                  read-only session at the editor's default row limit and with no
+                  statement timeout.
+
+                  The statement is put in the editor first so the user reads what is
+                  running while it runs; the RUN is what is sent, because the text the
+                  server executes is the ledger's, not this component's copy of it.
+                */
+                onRunStatement={(sql, runId) => {
+                  tabMgr.updateCurrentTab({ query: sql });
+                  void queryExec.executeHandedOverStatement(runId, sql);
+                }}
                 onShowArtifact={agentArtifact.show}
               />
             </ResizablePanel>
@@ -703,24 +762,25 @@ export default function Studio() {
 
       {/* Unlimited Query Warning */}
       <AlertDialog open={queryExec.unlimitedWarningOpen} onOpenChange={queryExec.setUnlimitedWarningOpen}>
-        <AlertDialogContent className="bg-[#111] border-white/5 max-w-sm p-0 gap-0 overflow-hidden">
+        <AlertDialogContent className="bg-overlay border-hairline max-w-sm p-0 gap-0 overflow-hidden">
           <div className="px-6 pt-6 pb-4">
             <div className="flex items-start gap-3">
               <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-amber-500/20 to-red-500/10 flex items-center justify-center shrink-0">
                 <AlertTriangle strokeWidth={1.5} className="w-5 h-5 text-amber-400" />
               </div>
               <div className="flex-1 min-w-0">
-                <AlertDialogTitle className="text-[0.8125rem] font-medium text-zinc-100 mb-1">
+                <AlertDialogTitle className="text-[0.8125rem] font-medium text-fg mb-1">
                   Load all results?
                 </AlertDialogTitle>
-                <AlertDialogDescription className="text-xs text-zinc-500 leading-relaxed">
-                  This may slow down your browser. Max <span className="text-zinc-400">100K</span> rows will be loaded.
+                <AlertDialogDescription className="text-xs text-fg-muted leading-relaxed">
+                  This may slow down your browser. Max <span className="text-fg-tertiary">100K</span> rows will be
+                  loaded.
                 </AlertDialogDescription>
               </div>
             </div>
           </div>
           <div className="px-6 pb-6 flex gap-2">
-            <AlertDialogCancel className="flex-1 h-9 bg-white/5 border-0 text-zinc-400 text-xs font-medium hover:bg-white/10 hover:text-zinc-200">
+            <AlertDialogCancel className="flex-1 h-9 bg-fill border-0 text-fg-tertiary text-xs font-medium hover:bg-fill-strong hover:text-fg">
               Cancel
             </AlertDialogCancel>
             <AlertDialogAction
@@ -754,7 +814,7 @@ export default function Studio() {
         onShowDiagram={() => setShowDiagram(true)}
         onFormatQuery={() => queryEditorRef.current?.format()}
         onSaveQuery={() => setIsSaveQueryModalOpen(true)}
-        onToggleAI={() => queryEditorRef.current?.toggleAi()}
+        onAskAgent={agentEnabled ? askAgentAboutStatement : undefined}
         onLogout={handleLogout}
       />
 

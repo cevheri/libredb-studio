@@ -95,7 +95,8 @@ export type ExplainFormat =
   | "sqlite-queryplan"
   | "couchbase-json"
   | "clickhouse-json"
-  | "druid-native";
+  | "druid-native"
+  | "trino-json";
 
 export interface ProviderCapabilities {
   queryLanguage: "sql" | "json";
@@ -103,10 +104,13 @@ export interface ProviderCapabilities {
    * Optional client-side query dialect. `queryLanguage` only says SQL vs JSON;
    * for non-SQL providers the query generators otherwise assume MongoDB syntax.
    * A provider sets `queryDialect` to opt its tables into a custom client-side
-   * generator (see `query-generators.ts`). Left undefined by SQL/Mongo/Redis,
-   * so their generation is unchanged.
+   * generator (see `query-generators.ts`), and it is checked BEFORE
+   * `queryLanguage` everywhere. Left undefined by SQL and MongoDB, so their
+   * generation is unchanged; Redis declares `"redis"` because it too says
+   * `queryLanguage: "json"` while speaking neither MongoDB JSON nor SQL, and
+   * silently got MongoDB commands its own driver rejected (#427).
    */
-  queryDialect?: "libredb";
+  queryDialect?: "libredb" | "redis";
   supportsExplain: boolean;
   /**
    * Present iff supportsExplain is true (enforced by provider tests).
@@ -131,10 +135,100 @@ export interface ProviderCapabilities {
    * permissive default.
    */
   supportsInlineRowEdit?: boolean;
+  /**
+   * Whether this engine has foreign keys to declare at all — not whether any
+   * particular schema declares one, and not whether the current role can see them.
+   *
+   * It exists because an empty `TableSchema.foreignKeys` means two different things
+   * and the reader cannot tell them apart. On PostgreSQL an empty list means this
+   * schema declares none (or, per `docs/BACKLOG.md` B44, that this role cannot see
+   * them); on MongoDB, Redis, LibreDB, Druid, ClickHouse and Couchbase it means the
+   * engine has no such constraint in its model, so no reading of any kind could ever
+   * return one. A consumer that hedges between "the schema is like that" and "the
+   * application enforces them" is wrong in BOTH branches on those six, and #414 hit
+   * that when grounding reached them. Reading `connection.type` at the consumer was
+   * the alternative and is forbidden by `CLAUDE.md`: engine behaviour is declared by
+   * the provider that has it.
+   *
+   * Optional for the same published-interface reason as `supportsInlineRowEdit`
+   * (`src/exports/types.ts`): a required field added after the fact stops every
+   * external implementer compiling. Consumers therefore gate on `=== false`, so an
+   * absent flag reads as "this engine may declare foreign keys" — the weaker claim,
+   * which keeps the existing hedge rather than asserting an absence nobody declared.
+   */
+  declaresForeignKeys?: boolean;
+  /**
+   * Whether the rows of this provider's `getSchema()` are objects the engine holds,
+   * or groupings this server derived from a bounded scan of what it found.
+   *
+   * True on Redis and LibreDB and nowhere else. Neither engine has a schema to read:
+   * `getSchema()` scans a bounded slice of the keyspace — 1000 keys on Redis, 10000 on
+   * LibreDB — and collapses the real key names it found into one row per common
+   * prefix. So a row named `user:*` is not a key, was never named by anybody, and no
+   * command can be given it; and the set of rows is what that one scan happened to
+   * reach rather than everything the database holds.
+   *
+   * It exists because a consumer cannot tell the two apart from the inventory itself,
+   * and #414 measured what that costs: plan mode, grounded on a seeded Redis with 17
+   * real prefixes, drafted `KEYS user:*` and `ZCARD user:*` against rows it had been
+   * handed under the word "table". Both name a key that does not exist. The model was
+   * not wrong to treat them as addressable — nothing it was shown said they were not,
+   * and only this server knows, because the grouping is this server's own.
+   *
+   * Optional for the same published-interface reason as `declaresForeignKeys`
+   * (`src/exports/types.ts`): a required field added after the fact stops every
+   * external implementer compiling. Consumers therefore gate on `=== true`, so an
+   * absent flag reads as "these rows are real objects" — the ordinary case, and the
+   * one every SQL engine and every document engine is in. Reading `connection.type` at
+   * the consumer was the alternative and is forbidden by `CLAUDE.md` for the reason
+   * this pair of engines demonstrates: the two that answer true are not the two a
+   * reader would guess, and a third would be added to a provider and forgotten here.
+   */
+  tablesAreDerivedGroupings?: boolean;
   supportsMaintenance: boolean;
   maintenanceOperations: MaintenanceType[];
   supportsConnectionString: boolean;
   defaultPort: number | null;
+  /**
+   * How this engine quotes an identifier, when the port cannot say.
+   *
+   * `src/lib/query-generators.ts` has always derived the dialect from
+   * `defaultPort`, which worked only because every engine had a distinct one. That
+   * assumption broke with #424 Phase 1: Elasticsearch and OpenSearch BOTH ship on
+   * 9200 and they disagree about the quote character, so one port had to answer for
+   * two dialects. The consequence was measured, and it is the worst kind: on
+   * OpenSearch 3.8.0 a double-quoted identifier is a STRING LITERAL, so
+   * `SELECT customer FROM probe_orders WHERE "customer" = 'acme'` answers HTTP 200
+   * with `total: 0` - a generated query silently returning no rows instead of
+   * failing. Backticks return the row.
+   *
+   * Absent means "keep deriving it from the port", so no existing provider changes
+   * and nothing about the old behaviour moves. A provider sets this when the port
+   * is not a faithful proxy for its dialect - which is any engine that shares a
+   * default port with a differently-quoting one.
+   */
+  identifierQuoting?: "double" | "backtick";
+  /**
+   * Whether a statement this product runs may end with `;`.
+   *
+   * Absent means it may, which is every engine that shipped before #424 Phase 1 and
+   * is what `src/lib/query-generators.ts` has always emitted. `"none"` says the
+   * terminator is not in the grammar at all.
+   *
+   * Measured 2026-08-19 on Elasticsearch 9.1.4: the generator's own
+   * `SELECT * FROM orders LIMIT 50;` - the query behind "Select Top 50 Documents",
+   * the first thing a user clicks on an index - answered `parsing_exception`,
+   * "line 1:30: extraneous input ';' expecting <EOF>". The same shape without the
+   * `;` returns the rows. OpenSearch 3.8.0 accepts both spellings, so the two
+   * products need no separate answer: omitting it runs everywhere, and declaring it
+   * here keeps `query-generators.ts` from having to know which engine it is
+   * generating for.
+   *
+   * This bounds the GENERATORS only. A user who types a `;` still has it stripped
+   * by the editor's statement reader before the statement is sent, and the raw API
+   * passes text through untouched - neither of those is this field's business.
+   */
+  statementTerminator?: "none";
   schemaRefreshPattern: string;
 }
 
@@ -154,6 +248,24 @@ export interface ProviderLabels {
   vacuumGlobalLabel: string;
   vacuumGlobalTitle: string;
   vacuumGlobalDesc: string;
+  /**
+   * What a statement for this engine is WRITTEN IN, named for a model rather than
+   * for a person, and declared only where the engine's own name misleads one.
+   *
+   * Read by the agent's plan contract (`src/lib/agent/investigation.ts`). Every
+   * other engine leaves it absent: a connection stamped `postgres` needs nobody to
+   * add that its statements are PostgreSQL SQL, and a sentence saying so would spend
+   * prompt on a fact the dialect line already carries.
+   *
+   * It exists because `queryLanguage: "sql"` is not always believable from outside.
+   * Measured 2026-08-19: a plan run on an OpenSearch connection, asked for one
+   * runnable statement, produced a native aggregation body - correct for the
+   * product, unrunnable through a SQL endpoint - and the two search engines are the
+   * only shipped engines whose names carry a stronger prior than their capability.
+   * A provider sets this when a model asked for "a statement" would reasonably write
+   * the wrong language.
+   */
+  statementLanguage?: string;
 }
 
 /**
@@ -386,7 +498,17 @@ export interface DatabaseOverview {
   activeConnections: number;
   maxConnections: number;
   databaseSize: string;
-  databaseSizeBytes: number;
+  /**
+   * Total on-disk size in bytes, or absent when the engine publishes no byte figure
+   * at all.
+   *
+   * Optional because absence and zero are different facts: a 0 is a measurement, and
+   * the Storage tab formats whatever it is given. Apache Cassandra is the case - its
+   * `system_views.disk_usage` reports whole mebibytes (measured: "1 MiB" for a
+   * 19,476-byte table), so it omits this field rather than send a zero that renders
+   * as "0 B" and a 0.0% breakdown (#424).
+   */
+  databaseSizeBytes?: number;
   tableCount: number;
   indexCount: number;
 }

@@ -9,7 +9,30 @@ export type DatabaseType =
   | "libredb"
   | "couchbase"
   | "clickhouse"
-  | "druid";
+  | "druid"
+  // Two type-ids, ONE provider implementation (issue #424 Phase 1,
+  // `src/lib/db/providers/sql/search/index.ts`): the two products speak the same
+  // shape of SQL over HTTP and differ only in wire detail. They stay separate ids
+  // because a connection has to say which product is listening - the SQL endpoint
+  // path is product-specific and the wrong one never reaches a SQL engine - and
+  // because their grammars really do disagree (OFFSET, string escapes, `#`, `[…]`).
+  | "elasticsearch"
+  | "opensearch"
+  // Apache Cassandra (issue #424 Phase 4). A wide-column store whose CQL is
+  // SQL-SHAPED but not SQL: no JOIN, no OFFSET, no EXPLAIN and no subquery are in
+  // the grammar at all (each measured on 5.0.9). It is still a `SQLBaseProvider`
+  // dialect, because what the editor sends IS the statement text and the shared
+  // limiter's `LIMIT n` is correct CQL. The connection's `database` field pins one
+  // KEYSPACE, and `localDataCenter` is a field only this engine has - the driver
+  // refuses to connect without it.
+  | "cassandra"
+  // Apache Trino (issue #424 Phase 2). A QUERY ENGINE rather than a store: what the
+  // connection's `database` field pins is a Trino CATALOG (`tpch`, `hive`, `iceberg`),
+  // the way a PostgreSQL connection pins a database, and the schemas inside it are the
+  // schema level. PrestoDB is deliberately NOT this id - the transport builds its
+  // header names from a dialect descriptor's prefix, so that fork is a descriptor away
+  // rather than a rewrite.
+  | "trino";
 
 export type ConnectionEnvironment = "production" | "staging" | "development" | "local" | "other";
 
@@ -68,6 +91,17 @@ export interface DatabaseConnection {
   sshTunnel?: SSHTunnelConfig;
   serviceName?: string; // Oracle: service name (e.g. ORCL, XEPDB1)
   instanceName?: string; // MSSQL: named instance (e.g. SQLEXPRESS)
+  /**
+   * Cassandra: the local data centre the driver balances against (e.g. `datacenter1`).
+   *
+   * Not an optimisation and not an optional refinement: `cassandra-driver` REFUSES to
+   * connect without it ("'localDataCenter' is not defined in Client options and also
+   * was not specified in constructor", measured on 4.9.0), and names the data centres
+   * it did find when the value is wrong. No other engine here needs a topology answer
+   * from the connection, which is why it is a field of its own rather than a reuse of
+   * `serviceName`.
+   */
+  localDataCenter?: string;
   managed?: boolean; // true = admin-controlled, read-only in UI
   seedId?: string; // stable reference to seed config ID
   agentUser?: string; // optional least-privilege role for the agent read-only execution profile (#328)
@@ -142,6 +176,51 @@ export interface QueryWarning {
    * reports no identifier, rather than claiming a zero.
    */
   code?: number | string;
+}
+
+/**
+ * How one result is to be DRAWN. A specification, never a picture.
+ *
+ * Emitted by an agent run as its answer's presentation and re-exported from
+ * `src/lib/agent/types.ts` under this name, but declared HERE: `DataCharts` draws it
+ * and ships in the published package, and no agent module may be reachable from that
+ * package's declarations (`tests/unit/agent-package-boundary.test.ts`). One
+ * declaration both trees name beats two that can disagree.
+ *
+ * Every column it names is checked against the artifact's real columns before the
+ * event carrying it is written, and against the delivered rows again before it is
+ * drawn, because the component that renders it does not fail on a column holding no
+ * numbers: `Number(value) || 0` turns one into a confident flat line of zeros. A
+ * refused spec costs one turn; an unvalidated one puts this application's frame
+ * around a wrong picture.
+ *
+ * What is absent is as load-bearing as what is here:
+ *
+ * - **`histogram` is excluded**, though `DataCharts` offers it. It bins raw values
+ *   in the browser, so the picture would show something the artifact does not
+ *   contain. A histogram wanted is a bucketing the SQL should do — and then it is a
+ *   bar chart of an aggregate the run can cite.
+ * - **No aggregation field.** `DataCharts` can aggregate; doing it here would be a
+ *   second aggregation nobody recorded and nothing can check. Aggregation belongs in
+ *   the statement, where it is on the ledger.
+ * - **No colours, no titles, no sizes.** Presentation belongs to the app. `caption`
+ *   is the model's own prose and is rendered as quoted model prose, never as a
+ *   sentence the app is saying.
+ */
+export interface AgentChartSpec {
+  readonly type: "bar" | "line" | "area" | "pie" | "scatter" | "stacked-bar";
+  /** One column of the artifact, by the name the result actually carries. */
+  readonly x: string;
+  /** One or more columns of the artifact. Numeric in the delivered rows, or refused. */
+  readonly y: readonly [string, ...string[]];
+  /**
+   * No series split. `DataCharts` has none — several series ARE several `y` columns
+   * there — so a `series` field would be a field the contract invites, the server
+   * validates and the ledger records, and the renderer then silently discards. The
+   * multi-series shapes are reachable by naming several `y` columns instead.
+   */
+  /** The model's own words about what the chart shows. Rendered quoted. */
+  readonly caption: string;
 }
 
 export interface QueryResult {

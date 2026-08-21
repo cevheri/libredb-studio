@@ -22,7 +22,7 @@ import {
   ResponsiveContainer,
 } from "recharts";
 import { toast } from "sonner";
-import { QueryResult } from "@/lib/types";
+import { type AgentChartSpec, QueryResult } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import {
   BarChart3,
@@ -51,18 +51,10 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { storage } from "@/lib/storage";
-
-// Chart colors matching CSS variables
-const CHART_COLORS = [
-  "hsl(217, 91%, 60%)", // Blue
-  "hsl(142, 71%, 45%)", // Green
-  "hsl(38, 92%, 50%)", // Amber
-  "hsl(270, 91%, 65%)", // Purple
-  "hsl(330, 81%, 60%)", // Pink
-  "hsl(199, 89%, 48%)", // Cyan
-  "hsl(24, 95%, 53%)", // Orange
-  "hsl(162, 63%, 41%)", // Teal
-];
+import { chartTheme } from "@/lib/charts/palette";
+import { useEffectiveTheme } from "@/hooks/use-effective-theme";
+import { downloadBlob } from "@/lib/export/download";
+import { logger } from "@/lib/logger";
 
 type ChartType = "bar" | "line" | "pie" | "area" | "scatter" | "histogram" | "stacked-bar" | "stacked-area";
 
@@ -89,6 +81,39 @@ export interface DataAnalysis {
 
 interface DataChartsProps {
   result: QueryResult | null;
+  /**
+   * A chart somebody else chose — today, the one an agent run composed as its answer.
+   *
+   * Optional, and absent for every ordinary caller: a user who ran a query gets the
+   * inferred chart they always got. When it is present the TYPE and the AXES come
+   * from it rather than from `analyzeData`, because the specification's author knows
+   * what was asked and the inference only knows what the data looks like. The
+   * controls stay live: this seeds the view, it does not lock it.
+   */
+  spec?: AgentChartSpec | null;
+}
+
+/**
+ * Whether a specification can be drawn over the result that actually arrived.
+ *
+ * The server refused a specification whose columns the artifact did not have, and
+ * this asks the same question again of the delivered rows — two guards, because they
+ * are checking two different things and the failure mode is silent: `Number(value) || 0`
+ * below turns an absent or non-numeric column into a confident flat line of zeros
+ * rather than into an error. A specification that does not survive this is dropped,
+ * and the inference draws the chart instead.
+ *
+ * There is no series-split case to reject any more. This component draws several
+ * series as several `y` columns and never had another way, so `AgentChartSpec` no
+ * longer carries a `series` field for the contract to invite and this function to
+ * throw away — a disagreement between four layers is now a field that does not exist.
+ */
+function specApplies(spec: AgentChartSpec, analysis: DataAnalysis): boolean {
+  if (!analysis.fields.some((field) => field.name === spec.x)) return false;
+  if (!spec.y.every((column) => analysis.numericFields.includes(column))) return false;
+  // Scatter reads both axes as numbers, so a categorical x is the same failure.
+  if (spec.type === "scatter" && !analysis.numericFields.includes(spec.x)) return false;
+  return true;
 }
 
 export function analyzeField(name: string, values: unknown[]): FieldAnalysis {
@@ -222,16 +247,56 @@ const CustomTooltip = ({ active, payload, label }: TooltipProps) => {
   if (!active || !payload || !payload.length) return null;
 
   return (
-    <div className="bg-[#111] border border-white/10 rounded-lg px-3 py-2 shadow-xl">
-      <p className="text-zinc-400 text-xs mb-1">{label}</p>
+    <div className="bg-overlay border border-hairline-strong rounded-lg px-3 py-2 shadow-xl">
+      <p className="text-fg-tertiary text-xs mb-1">{label}</p>
       {payload.map((entry, index) => (
-        <p key={index} className="text-xs" style={{ color: entry.color }}>
-          {entry.name}: <span className="font-mono font-medium">{formatNumber(entry.value)}</span>
+        // The series colour rides a swatch, never the text. Some slots sit at
+        // 2.07:1 against the light surface — legible as a mark, unreadable as a
+        // label — and identity is carried by the swatch beside the name anyway.
+        <p key={index} className="text-xs flex items-center gap-1.5">
+          <span
+            aria-hidden="true"
+            className="w-2 h-2 rounded-[2px] shrink-0"
+            style={{ backgroundColor: entry.color }}
+          />
+          <span className="text-fg-secondary">{entry.name}:</span>
+          <span className="font-mono font-medium text-fg">{formatNumber(entry.value)}</span>
         </p>
       ))}
     </div>
   );
 };
+
+interface PieSliceLabelProps {
+  /** Text colour. Passed by the caller; everything else recharts injects. */
+  ink: string;
+  x?: number;
+  y?: number;
+  /** Recharts picks the anchor from which half of the pie the slice sits on. */
+  textAnchor?: React.SVGAttributes<SVGTextElement>["textAnchor"];
+  name?: string;
+  percent?: number;
+}
+
+/**
+ * The label on a pie slice.
+ *
+ * Handed to recharts as an ELEMENT (`label={<PieSliceLabel ink={…} />}`) rather
+ * than a render function: recharts clones it with the computed geometry, which
+ * keeps the component testable on its own and leaves no anonymous callback in the
+ * JSX that only a rendered chart could reach.
+ *
+ * Returning `<text>` rather than a string is the whole point — given a string,
+ * recharts paints the label in the SLICE's colour, and the low-contrast slots
+ * become unreadable words on the light ground.
+ */
+export function PieSliceLabel({ ink, x, y, textAnchor, name = "", percent = 0 }: PieSliceLabelProps) {
+  return (
+    <text x={x} y={y} textAnchor={textAnchor} dominantBaseline="central" fill={ink} fontSize={11}>
+      {`${name} (${(percent * 100).toFixed(0)}%)`}
+    </text>
+  );
+}
 
 // Histogram bin calculation
 export function computeHistogramBins(
@@ -326,9 +391,23 @@ export function groupByDate(dateStr: string, grouping: DateGrouping): string {
   }
 }
 
-export function DataCharts({ result }: DataChartsProps) {
+export function DataCharts({ result, spec = null }: DataChartsProps) {
   const chartRef = useRef<HTMLDivElement>(null);
   const analysis = useMemo(() => analyzeData(result), [result]);
+  /** The supplied specification, or null when there is none this result can carry. */
+  const appliedSpec = useMemo(() => (spec !== null && specApplies(spec, analysis) ? spec : null), [spec, analysis]);
+
+  // Recharts paints an SVG canvas from JS values and cannot read the CSS tokens,
+  // so the chart is the one surface that has to be handed its palette.
+  const viz = chartTheme(useEffectiveTheme());
+  const CHART_COLORS = viz.series;
+
+  // Recharts writes legend entries in the series colour. The coloured icon beside
+  // each entry already carries identity, so the word itself goes back to ink —
+  // otherwise the low-contrast slots become unreadable labels on the light ground.
+  const legendProps = {
+    formatter: (value: string) => <span style={{ color: viz.ink }}>{value}</span>,
+  };
 
   const [chartType, setChartType] = useState<ChartType>(analysis.suggestedChartType);
   const [xAxis, setXAxis] = useState<string>("");
@@ -374,6 +453,20 @@ export function DataCharts({ result }: DataChartsProps) {
   // Initialize axis selections when analysis changes
   React.useEffect(() => {
     if (analysis.isVisualizable) {
+      /*
+        A specification that survived validation seeds the view instead of the
+        inference: the type is the one its author chose, and the axes are the columns
+        it named. The controls are untouched, so the user can still take the chart
+        somewhere else from here.
+      */
+      if (appliedSpec !== null) {
+        setChartType(appliedSpec.type);
+        setXAxis(appliedSpec.x);
+        setYAxis([...appliedSpec.y]);
+        // Scatter draws x against ONE other column, held separately from `yAxis`.
+        if (appliedSpec.type === "scatter") setScatterY(appliedSpec.y[0]);
+        return;
+      }
       setChartType(analysis.suggestedChartType);
 
       const defaultX = analysis.categoricalFields[0] || analysis.dateFields[0] || analysis.fields[0]?.name || "";
@@ -386,7 +479,7 @@ export function DataCharts({ result }: DataChartsProps) {
         setScatterY(analysis.numericFields[1]);
       }
     }
-  }, [analysis]);
+  }, [analysis, appliedSpec]);
 
   const chartData = useMemo(() => {
     if (!result?.rows) return [];
@@ -487,50 +580,49 @@ export function DataCharts({ result }: DataChartsProps) {
     [savedCharts],
   );
 
-  const exportChart = useCallback(async (format: "png" | "svg") => {
-    if (!chartRef.current) return;
+  const exportChart = useCallback(
+    async (format: "png" | "svg") => {
+      if (!chartRef.current) return;
 
-    if (format === "png") {
-      try {
-        // snapdom lets the browser rasterize a DOM snapshot, so Tailwind 4's
-        // oklch() colors export correctly (html2canvas could not parse them
-        // and failed silently). Fonts stay unembedded: Monaco's cross-origin
-        // CDN stylesheet breaks webfont CSS collection (SecurityError).
-        const { snapdom } = await import("@zumer/snapdom");
-        const capture = await snapdom(chartRef.current, {
-          backgroundColor: "#080808",
-          scale: 2,
-          embedFonts: false,
-        });
-        const blob = await capture.toBlob({ type: "png" });
-        if (!blob) throw new Error("PNG encoding produced no data");
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.download = `chart_${Date.now()}.png`;
-        link.href = url;
-        link.click();
-        URL.revokeObjectURL(url);
-      } catch (error) {
-        console.error("Failed to export PNG:", error);
-        toast.error("PNG export failed", {
-          description: error instanceof Error ? error.message : String(error),
-        });
+      if (format === "png") {
+        try {
+          // snapdom lets the browser rasterize a DOM snapshot, so Tailwind 4's
+          // oklch() colors export correctly (html2canvas could not parse them
+          // and failed silently). Fonts stay unembedded: Monaco's cross-origin
+          // CDN stylesheet breaks webfont CSS collection (SecurityError).
+          const { snapdom } = await import("@zumer/snapdom");
+          const capture = await snapdom(chartRef.current, {
+            backgroundColor: viz.exportBackground,
+            scale: 2,
+            embedFonts: false,
+          });
+          const blob = await capture.toBlob({ type: "png" });
+          if (!blob) throw new Error("PNG encoding produced no data");
+          downloadBlob(blob, `chart_${Date.now()}.png`);
+        } catch (error) {
+          logger.warn("Chart PNG export failed", {
+            route: "DataCharts",
+            error: error instanceof Error ? error.message : String(error),
+          });
+          toast.error("PNG export failed", {
+            description: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } else {
+        // SVG export - find the SVG element
+        const svgElement = chartRef.current.querySelector("svg");
+        if (svgElement) {
+          const svgData = new XMLSerializer().serializeToString(svgElement);
+          downloadBlob(new Blob([svgData], { type: "image/svg+xml" }), `chart_${Date.now()}.svg`);
+        }
       }
-    } else {
-      // SVG export - find the SVG element
-      const svgElement = chartRef.current.querySelector("svg");
-      if (svgElement) {
-        const svgData = new XMLSerializer().serializeToString(svgElement);
-        const blob = new Blob([svgData], { type: "image/svg+xml" });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.download = `chart_${Date.now()}.svg`;
-        link.href = url;
-        link.click();
-        URL.revokeObjectURL(url);
-      }
-    }
-  }, []);
+    },
+    // `viz` is derived from the effective theme, and this list used to be empty:
+    // after a theme toggle the PNG was still painted on the ground the chart was
+    // first rendered on — a light chart exported onto near-black. Same defect the
+    // ERD export fixed in #384, in the surface that comment points at.
+    [viz.exportBackground],
+  );
 
   const toggleYAxis = (field: string) => {
     setYAxis((prev) => {
@@ -544,10 +636,10 @@ export function DataCharts({ result }: DataChartsProps) {
   // Empty state
   if (!analysis.isVisualizable) {
     return (
-      <div className="h-full flex flex-col items-center justify-center bg-[#080808] text-zinc-500">
+      <div className="h-full flex flex-col items-center justify-center bg-sunken text-fg-muted">
         <TrendingUp className="w-12 h-12 mb-4 opacity-30" />
         <p className="text-xs font-medium mb-1">Cannot Visualize Data</p>
-        <p className="text-xs text-zinc-600">{analysis.reason}</p>
+        <p className="text-xs text-fg-subtle">{analysis.reason}</p>
       </div>
     );
   }
@@ -577,18 +669,18 @@ export function DataCharts({ result }: DataChartsProps) {
   };
 
   return (
-    <div className="h-full flex flex-col bg-[#080808]">
+    <div className="h-full flex flex-col bg-sunken">
       {/* Config Bar */}
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-white/5 bg-[#0a0a0a] flex-wrap">
+      <div className="flex items-center gap-2 px-3 py-2 border-b border-hairline bg-surface flex-wrap">
         {/* Chart Type Selector */}
-        <div className="flex items-center gap-1 bg-white/5 rounded-lg p-0.5">
+        <div className="flex items-center gap-1 bg-fill rounded-lg p-0.5">
           {chartTypes.map(({ type, icon, label }) => (
             <button
               key={type}
               onClick={() => setChartType(type)}
               className={cn(
                 "flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium transition-all",
-                chartType === type ? "bg-blue-600 text-white" : "text-zinc-500 hover:text-zinc-300 hover:bg-white/5",
+                chartType === type ? "bg-blue-600 text-white" : "text-fg-muted hover:text-fg-secondary hover:bg-fill",
               )}
               title={label}
             >
@@ -598,17 +690,17 @@ export function DataCharts({ result }: DataChartsProps) {
           ))}
         </div>
 
-        <div className="h-4 w-px bg-white/10 hidden sm:block" />
+        <div className="h-4 w-px bg-fill-strong hidden sm:block" />
 
         {/* X-Axis Selector */}
         {chartType !== "pie" && (
           <div className="flex items-center gap-2">
-            <span className="text-xs text-zinc-600r">X-Axis</span>
+            <span className="text-xs text-fg-subtle">X-Axis</span>
             <Select value={xAxis} onValueChange={setXAxis}>
-              <SelectTrigger className="h-7 w-[140px] text-xs bg-white/5 border-white/10">
+              <SelectTrigger className="h-7 w-[140px] text-xs bg-fill border-hairline-strong">
                 <SelectValue placeholder="Select field" />
               </SelectTrigger>
-              <SelectContent className="bg-[#111] border-white/10">
+              <SelectContent className="bg-overlay border-hairline-strong">
                 {analysis.fields.map((field) => (
                   <SelectItem key={field.name} value={field.name} className="text-xs">
                     <div className="flex items-center gap-2">
@@ -624,15 +716,15 @@ export function DataCharts({ result }: DataChartsProps) {
 
         {/* Y-Axis Selector (for pie, this becomes the value field) */}
         <div className="flex items-center gap-2">
-          <span className="text-xs text-zinc-600r">{chartType === "pie" ? "Value" : "Y-Axis"}</span>
+          <span className="text-xs text-fg-subtle">{chartType === "pie" ? "Value" : "Y-Axis"}</span>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="sm" className="h-7 text-xs bg-white/5 border-white/10 gap-1">
+              <Button variant="outline" size="sm" className="h-7 text-xs bg-fill border-hairline-strong gap-1">
                 {yAxis.length > 0 ? yAxis.join(", ") : "Select fields"}
                 <Settings2 strokeWidth={1.5} className="w-3 h-3 ml-1" />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent className="bg-[#111] border-white/10">
+            <DropdownMenuContent className="bg-overlay border-hairline-strong">
               {analysis.numericFields.map((field) => (
                 <DropdownMenuItem
                   key={field}
@@ -651,12 +743,12 @@ export function DataCharts({ result }: DataChartsProps) {
         {/* Scatter Y-axis */}
         {chartType === "scatter" && (
           <div className="flex items-center gap-2">
-            <span className="text-xs text-zinc-600r">Y</span>
+            <span className="text-xs text-fg-subtle">Y</span>
             <Select value={scatterY} onValueChange={setScatterY}>
-              <SelectTrigger className="h-7 w-[120px] text-xs bg-white/5 border-white/10">
+              <SelectTrigger className="h-7 w-[120px] text-xs bg-fill border-hairline-strong">
                 <SelectValue placeholder="Y field" />
               </SelectTrigger>
-              <SelectContent className="bg-[#111] border-white/10">
+              <SelectContent className="bg-overlay border-hairline-strong">
                 {analysis.numericFields
                   .filter((f) => f !== xAxis)
                   .map((field) => (
@@ -672,12 +764,12 @@ export function DataCharts({ result }: DataChartsProps) {
         {/* Histogram buckets */}
         {chartType === "histogram" && (
           <div className="flex items-center gap-2">
-            <span className="text-xs text-zinc-600r">Buckets</span>
+            <span className="text-xs text-fg-subtle">Buckets</span>
             <Select value={String(histogramBuckets)} onValueChange={(v) => setHistogramBuckets(Number(v))}>
-              <SelectTrigger className="h-7 w-[70px] text-xs bg-white/5 border-white/10">
+              <SelectTrigger className="h-7 w-[70px] text-xs bg-fill border-hairline-strong">
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent className="bg-[#111] border-white/10">
+              <SelectContent className="bg-overlay border-hairline-strong">
                 {[5, 10, 20, 50].map((n) => (
                   <SelectItem key={n} value={String(n)} className="text-xs">
                     {n}
@@ -691,12 +783,12 @@ export function DataCharts({ result }: DataChartsProps) {
         {/* Aggregation */}
         {chartType !== "scatter" && chartType !== "histogram" && chartType !== "pie" && (
           <div className="flex items-center gap-2">
-            <span className="text-xs text-zinc-600r">Agg</span>
+            <span className="text-xs text-fg-subtle">Agg</span>
             <Select value={aggregation} onValueChange={(v) => setAggregation(v as AggregationType)}>
-              <SelectTrigger className="h-7 w-[80px] text-xs bg-white/5 border-white/10">
+              <SelectTrigger className="h-7 w-[80px] text-xs bg-fill border-hairline-strong">
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent className="bg-[#111] border-white/10">
+              <SelectContent className="bg-overlay border-hairline-strong">
                 {(["none", "sum", "avg", "count", "min", "max"] as const).map((a) => (
                   <SelectItem key={a} value={a} className="text-xs">
                     {a}
@@ -710,15 +802,15 @@ export function DataCharts({ result }: DataChartsProps) {
         {/* Date Grouping */}
         {analysis.dateFields.length > 0 && chartType !== "scatter" && chartType !== "histogram" && (
           <div className="flex items-center gap-2">
-            <span className="text-xs text-zinc-600r">Group</span>
+            <span className="text-xs text-fg-subtle">Group</span>
             <Select
               value={dateGrouping || "none"}
               onValueChange={(v) => setDateGrouping(v === "none" ? "" : (v as DateGrouping))}
             >
-              <SelectTrigger className="h-7 w-[80px] text-xs bg-white/5 border-white/10">
+              <SelectTrigger className="h-7 w-[80px] text-xs bg-fill border-hairline-strong">
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent className="bg-[#111] border-white/10">
+              <SelectContent className="bg-overlay border-hairline-strong">
                 <SelectItem value="none" className="text-xs">
                   None
                 </SelectItem>
@@ -744,7 +836,7 @@ export function DataCharts({ result }: DataChartsProps) {
               value={saveName}
               onChange={(e) => setSaveName(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleSaveChart()}
-              className="h-7 px-2 text-xs bg-white/5 border border-white/10 rounded text-zinc-300 focus:outline-none focus:border-blue-500"
+              className="h-7 px-2 text-xs bg-fill border border-hairline-strong rounded text-fg-secondary focus:outline-none focus:border-blue-500"
               autoFocus
             />
             <Button variant="ghost" size="sm" className="h-7 text-xs text-blue-400" onClick={handleSaveChart}>
@@ -753,7 +845,7 @@ export function DataCharts({ result }: DataChartsProps) {
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 text-xs text-zinc-500"
+              className="h-7 text-xs text-fg-muted"
               onClick={() => setShowSaveDialog(false)}
             >
               Cancel
@@ -764,7 +856,7 @@ export function DataCharts({ result }: DataChartsProps) {
             <Button
               variant="ghost"
               size="sm"
-              className="h-7 text-xs text-zinc-500 hover:text-white gap-1"
+              className="h-7 text-xs text-fg-muted hover:text-fg-bright gap-1"
               onClick={() => setShowSaveDialog(true)}
             >
               <Save strokeWidth={1.5} className="w-3 h-3" /> Save
@@ -772,11 +864,11 @@ export function DataCharts({ result }: DataChartsProps) {
             {savedCharts.length > 0 && (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="sm" className="h-7 text-xs text-zinc-500 hover:text-white gap-1">
+                  <Button variant="ghost" size="sm" className="h-7 text-xs text-fg-muted hover:text-fg-bright gap-1">
                     <FolderOpen strokeWidth={1.5} className="w-3 h-3" /> Saved ({savedCharts.length})
                   </Button>
                 </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="bg-[#111] border-white/10 max-h-48 overflow-auto">
+                <DropdownMenuContent align="end" className="bg-overlay border-hairline-strong max-h-48 overflow-auto">
                   {savedCharts.map((chart) => (
                     <DropdownMenuItem
                       key={chart.id}
@@ -784,14 +876,14 @@ export function DataCharts({ result }: DataChartsProps) {
                       className="text-xs cursor-pointer flex items-center justify-between gap-4"
                     >
                       <span>
-                        {chart.name} <span className="text-zinc-600">({chart.chartType})</span>
+                        {chart.name} <span className="text-fg-subtle">({chart.chartType})</span>
                       </span>
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
                           deleteSavedChart(chart.id);
                         }}
-                        className="text-zinc-600 hover:text-red-400"
+                        className="text-fg-subtle hover:text-red-400"
                       >
                         <X strokeWidth={1.5} className="w-3 h-3" />
                       </button>
@@ -806,11 +898,15 @@ export function DataCharts({ result }: DataChartsProps) {
         {/* Export Button */}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="sm" className="h-7 text-xs font-medium text-zinc-500 hover:text-white gap-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 text-xs font-medium text-fg-muted hover:text-fg-bright gap-1"
+            >
               <Download strokeWidth={1.5} className="w-3 h-3" /> Export
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="bg-[#111] border-white/10">
+          <DropdownMenuContent align="end" className="bg-overlay border-hairline-strong">
             <DropdownMenuItem onClick={() => exportChart("png")} className="text-xs cursor-pointer">
               Export as PNG
             </DropdownMenuItem>
@@ -824,18 +920,24 @@ export function DataCharts({ result }: DataChartsProps) {
       {/* Chart Area */}
       <div ref={chartRef} className="flex-1 p-4 min-h-0">
         {yAxis.length === 0 ? (
-          <div className="h-full flex items-center justify-center text-zinc-600 text-xs">
+          <div className="h-full flex items-center justify-center text-fg-subtle text-xs">
             Select at least one numeric field for the chart
           </div>
         ) : (
           <ResponsiveContainer width="100%" height="100%">
             {chartType === "bar" ? (
               <BarChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#222" />
-                <XAxis dataKey={xAxis} tick={{ fill: "#666", fontSize: 11 }} angle={-45} textAnchor="end" height={60} />
-                <YAxis tick={{ fill: "#666", fontSize: 11 }} tickFormatter={formatNumber} />
+                <CartesianGrid strokeDasharray="3 3" stroke={viz.grid} />
+                <XAxis
+                  dataKey={xAxis}
+                  tick={{ fill: viz.axis, fontSize: 11 }}
+                  angle={-45}
+                  textAnchor="end"
+                  height={60}
+                />
+                <YAxis tick={{ fill: viz.axis, fontSize: 11 }} tickFormatter={formatNumber} />
                 <Tooltip content={<CustomTooltip />} />
-                <Legend wrapperStyle={{ paddingTop: 20 }} />
+                <Legend wrapperStyle={{ paddingTop: 20 }} {...legendProps} />
                 {yAxis.map((field, index) => (
                   <Bar
                     key={field}
@@ -847,11 +949,17 @@ export function DataCharts({ result }: DataChartsProps) {
               </BarChart>
             ) : chartType === "line" ? (
               <LineChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#222" />
-                <XAxis dataKey={xAxis} tick={{ fill: "#666", fontSize: 11 }} angle={-45} textAnchor="end" height={60} />
-                <YAxis tick={{ fill: "#666", fontSize: 11 }} tickFormatter={formatNumber} />
+                <CartesianGrid strokeDasharray="3 3" stroke={viz.grid} />
+                <XAxis
+                  dataKey={xAxis}
+                  tick={{ fill: viz.axis, fontSize: 11 }}
+                  angle={-45}
+                  textAnchor="end"
+                  height={60}
+                />
+                <YAxis tick={{ fill: viz.axis, fontSize: 11 }} tickFormatter={formatNumber} />
                 <Tooltip content={<CustomTooltip />} />
-                <Legend wrapperStyle={{ paddingTop: 20 }} />
+                <Legend wrapperStyle={{ paddingTop: 20 }} {...legendProps} />
                 {yAxis.map((field, index) => (
                   <Line
                     key={field}
@@ -866,11 +974,17 @@ export function DataCharts({ result }: DataChartsProps) {
               </LineChart>
             ) : chartType === "area" ? (
               <AreaChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#222" />
-                <XAxis dataKey={xAxis} tick={{ fill: "#666", fontSize: 11 }} angle={-45} textAnchor="end" height={60} />
-                <YAxis tick={{ fill: "#666", fontSize: 11 }} tickFormatter={formatNumber} />
+                <CartesianGrid strokeDasharray="3 3" stroke={viz.grid} />
+                <XAxis
+                  dataKey={xAxis}
+                  tick={{ fill: viz.axis, fontSize: 11 }}
+                  angle={-45}
+                  textAnchor="end"
+                  height={60}
+                />
+                <YAxis tick={{ fill: viz.axis, fontSize: 11 }} tickFormatter={formatNumber} />
                 <Tooltip content={<CustomTooltip />} />
-                <Legend wrapperStyle={{ paddingTop: 20 }} />
+                <Legend wrapperStyle={{ paddingTop: 20 }} {...legendProps} />
                 {yAxis.map((field, index) => (
                   <Area
                     key={field}
@@ -885,20 +999,20 @@ export function DataCharts({ result }: DataChartsProps) {
               </AreaChart>
             ) : chartType === "scatter" ? (
               <ScatterChart margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#222" />
+                <CartesianGrid strokeDasharray="3 3" stroke={viz.grid} />
                 <XAxis
                   dataKey={xAxis}
                   type="number"
-                  tick={{ fill: "#666", fontSize: 11 }}
+                  tick={{ fill: viz.axis, fontSize: 11 }}
                   name={xAxis}
-                  label={{ value: xAxis, position: "bottom", fill: "#666", fontSize: 11 }}
+                  label={{ value: xAxis, position: "bottom", fill: viz.axis, fontSize: 11 }}
                 />
                 <YAxis
                   dataKey={scatterY}
                   type="number"
-                  tick={{ fill: "#666", fontSize: 11 }}
+                  tick={{ fill: viz.axis, fontSize: 11 }}
                   name={scatterY}
-                  label={{ value: scatterY, angle: -90, position: "insideLeft", fill: "#666", fontSize: 11 }}
+                  label={{ value: scatterY, angle: -90, position: "insideLeft", fill: viz.axis, fontSize: 11 }}
                 />
                 <ZAxis range={[40, 200]} />
                 <Tooltip content={<CustomTooltip />} cursor={{ strokeDasharray: "3 3" }} />
@@ -906,33 +1020,51 @@ export function DataCharts({ result }: DataChartsProps) {
               </ScatterChart>
             ) : chartType === "histogram" ? (
               <BarChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#222" />
-                <XAxis dataKey="range" tick={{ fill: "#666", fontSize: 10 }} angle={-45} textAnchor="end" height={60} />
+                <CartesianGrid strokeDasharray="3 3" stroke={viz.grid} />
+                <XAxis
+                  dataKey="range"
+                  tick={{ fill: viz.axis, fontSize: 10 }}
+                  angle={-45}
+                  textAnchor="end"
+                  height={60}
+                />
                 <YAxis
-                  tick={{ fill: "#666", fontSize: 11 }}
-                  label={{ value: "Count", angle: -90, position: "insideLeft", fill: "#666", fontSize: 11 }}
+                  tick={{ fill: viz.axis, fontSize: 11 }}
+                  label={{ value: "Count", angle: -90, position: "insideLeft", fill: viz.axis, fontSize: 11 }}
                 />
                 <Tooltip content={<CustomTooltip />} />
                 <Bar dataKey="count" fill={CHART_COLORS[0]} radius={[4, 4, 0, 0]} />
               </BarChart>
             ) : chartType === "stacked-bar" ? (
               <BarChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#222" />
-                <XAxis dataKey={xAxis} tick={{ fill: "#666", fontSize: 11 }} angle={-45} textAnchor="end" height={60} />
-                <YAxis tick={{ fill: "#666", fontSize: 11 }} tickFormatter={formatNumber} />
+                <CartesianGrid strokeDasharray="3 3" stroke={viz.grid} />
+                <XAxis
+                  dataKey={xAxis}
+                  tick={{ fill: viz.axis, fontSize: 11 }}
+                  angle={-45}
+                  textAnchor="end"
+                  height={60}
+                />
+                <YAxis tick={{ fill: viz.axis, fontSize: 11 }} tickFormatter={formatNumber} />
                 <Tooltip content={<CustomTooltip />} />
-                <Legend wrapperStyle={{ paddingTop: 20 }} />
+                <Legend wrapperStyle={{ paddingTop: 20 }} {...legendProps} />
                 {yAxis.map((field, index) => (
                   <Bar key={field} dataKey={field} stackId="stack" fill={CHART_COLORS[index % CHART_COLORS.length]} />
                 ))}
               </BarChart>
             ) : chartType === "stacked-area" ? (
               <AreaChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#222" />
-                <XAxis dataKey={xAxis} tick={{ fill: "#666", fontSize: 11 }} angle={-45} textAnchor="end" height={60} />
-                <YAxis tick={{ fill: "#666", fontSize: 11 }} tickFormatter={formatNumber} />
+                <CartesianGrid strokeDasharray="3 3" stroke={viz.grid} />
+                <XAxis
+                  dataKey={xAxis}
+                  tick={{ fill: viz.axis, fontSize: 11 }}
+                  angle={-45}
+                  textAnchor="end"
+                  height={60}
+                />
+                <YAxis tick={{ fill: viz.axis, fontSize: 11 }} tickFormatter={formatNumber} />
                 <Tooltip content={<CustomTooltip />} />
-                <Legend wrapperStyle={{ paddingTop: 20 }} />
+                <Legend wrapperStyle={{ paddingTop: 20 }} {...legendProps} />
                 {yAxis.map((field, index) => (
                   <Area
                     key={field}
@@ -954,15 +1086,18 @@ export function DataCharts({ result }: DataChartsProps) {
                   cx="50%"
                   cy="50%"
                   outerRadius="70%"
-                  label={({ name, percent }) => `${name} (${(percent * 100).toFixed(0)}%)`}
-                  labelLine={{ stroke: "#444" }}
+                  // `PieSliceLabel` defaults `percent` to 0, which is the same
+                  // guard recharts 3 made necessary by typing it optional — an
+                  // absent value would otherwise render the label "name (NaN%)".
+                  label={<PieSliceLabel ink={viz.ink} />}
+                  labelLine={{ stroke: viz.grid }}
                 >
                   {chartData.slice(0, 10).map((_entry, index) => (
                     <Cell key={`cell-${index}`} fill={CHART_COLORS[index % CHART_COLORS.length]} />
                   ))}
                 </Pie>
                 <Tooltip content={<CustomTooltip />} />
-                <Legend />
+                <Legend {...legendProps} />
               </PieChart>
             )}
           </ResponsiveContainer>
@@ -970,15 +1105,15 @@ export function DataCharts({ result }: DataChartsProps) {
       </div>
 
       {/* Footer Stats */}
-      <div className="px-3 py-2 border-t border-white/5 bg-[#0a0a0a] flex items-center gap-4 text-xs text-zinc-600">
+      <div className="px-3 py-2 border-t border-hairline bg-surface flex items-center gap-4 text-xs text-fg-subtle">
         <span>
-          Rows: <span className="text-zinc-400 font-mono">{result?.rows.length || 0}</span>
+          Rows: <span className="text-fg-tertiary font-mono">{result?.rows.length || 0}</span>
         </span>
         <span>
-          Fields: <span className="text-zinc-400 font-mono">{analysis.fields.length}</span>
+          Fields: <span className="text-fg-tertiary font-mono">{analysis.fields.length}</span>
         </span>
         <span>
-          Numeric: <span className="text-zinc-400 font-mono">{analysis.numericFields.length}</span>
+          Numeric: <span className="text-fg-tertiary font-mono">{analysis.numericFields.length}</span>
         </span>
         {chartType === "pie" && chartData.length > 10 && <span className="text-amber-500">Showing top 10 values</span>}
       </div>

@@ -25,17 +25,17 @@
  * Three deliberate boundaries, each of which a reader would otherwise have to
  * infer:
  *
- *  - **This module enforces no lifecycle policy.** `appendEvent` does not check
- *    that the run exists, is not terminal, or is allowed to emit that event. The
- *    run service reads the view before every operation and owns those decisions;
- *    keeping them out of here means one round trip per append rather than two.
- *    Two costs of the split, both real and both measured rather than assumed:
- *    appending to a run that was never opened produces a headerless ledger, which
- *    every later read then refuses; and appending AFTER `close` resolves
- *    successfully while `read` never returns the entry, because the backend stops
- *    a snapshot at the stream's end marker. Silent loss is the worse of the two,
- *    which is why the service refuses every operation on a terminal run rather
- *    than relying on this layer to notice.
+ *  - **This module enforces one lifecycle boundary, and only one.** `append`
+ *    refuses once the run's stream has been closed in this process
+ *    (`RUN_ALREADY_CLOSED`), because the backend reports success for a write to a
+ *    closed stream while `read` never returns the entry — silent loss, which is the
+ *    worse failure mode and the one this guard exists to make loud. Everything
+ *    else stays the run service's: whether the run exists, whether it is terminal,
+ *    and whether it is allowed to emit a given event are all decided there, from
+ *    the view it reads before every operation, and keeping them out of here means
+ *    one round trip per append rather than two. The remaining cost of the split is
+ *    real and measured rather than assumed: appending to a run that was never
+ *    opened produces a headerless ledger, which every later read then refuses.
  *  - **Opening a run is read-then-append with no fencing.** Two concurrent opens
  *    on one caller-supplied id therefore write two headers, and a second header is
  *    permanent corruption to the fold (below) rather than a race one side wins.
@@ -65,7 +65,11 @@ import {
   type AgentRunMode,
   type AgentRunRecord,
   type AgentRunStatus,
+  type AgentRunWorkflowReading,
+  type AgentRunWorkflowSource,
   type AgentRunWorkflowType,
+  DEFAULT_AGENT_WORKFLOW_READING,
+  DEFAULT_AGENT_WORKFLOW_SOURCE,
   DEFAULT_AGENT_WORKFLOW_TYPE,
 } from "./types";
 
@@ -99,7 +103,12 @@ const EVENT_KINDS: ReadonlySet<string> = new Set(
     "tool-completed": true,
     "tool-refused": true,
     "report-composed": true,
+    "table-profiled": true,
+    "plan-comparison": true,
+    recommendation: true,
     "closing-statement": true,
+    "plan-statement-drafted": true,
+    "answer-composed": true,
     "run-finished": true,
   } satisfies Record<AgentRunEvent["kind"], true>),
 );
@@ -124,6 +133,28 @@ export type AgentLedgerEntry =
        * asserts against a real pre-change ledger rather than a hand-written one.
        */
       readonly workflowType?: AgentRunWorkflowType;
+      /**
+       * Optional on the READ side for the same reason `workflowType` is: `openRun`
+       * always writes one, and a header written before this field existed folds to
+       * `DEFAULT_AGENT_WORKFLOW_SOURCE` — `"chosen"`, because there was no classifier
+       * then and every such run carried a workflow its caller sent explicitly.
+       */
+      readonly workflowSource?: AgentRunWorkflowSource;
+      /**
+       * Optional on the READ side for the same reason `workflowType` is: `openRun`
+       * always writes one, and a header written before this field existed folds to
+       * `DEFAULT_AGENT_WORKFLOW_READING` — `"unrecorded"`, which is the only reading
+       * such a header supports: it records no classifier outcome, and neither of the
+       * other two answers could be read out of its absence without inventing one.
+       */
+      readonly workflowReading?: AgentRunWorkflowReading;
+      /**
+       * Optional on the READ side for the same reason `workflowType` is: `openRun`
+       * always writes one, and a header written before this field existed folds to
+       * `false` — which is what was true of it, since nothing then handed a
+       * statement anywhere.
+       */
+      readonly autoExecute?: boolean;
       readonly actor: AgentRunActor;
       readonly connectionId: string;
       readonly objective: string;
@@ -154,7 +185,12 @@ export interface AgentRunLedgerView {
   readonly unsettledStepIds: readonly string[];
 }
 
-export type AgentRunStoreReason = "INVALID_RUN_ID" | "RUN_ALREADY_OPEN" | "MALFORMED_LEDGER" | "RUNTIME_DISABLED";
+export type AgentRunStoreReason =
+  | "INVALID_RUN_ID"
+  | "RUN_ALREADY_OPEN"
+  | "RUN_ALREADY_CLOSED"
+  | "MALFORMED_LEDGER"
+  | "RUNTIME_DISABLED";
 
 export class AgentRunStoreError extends Error {
   readonly reasonCode: AgentRunStoreReason;
@@ -195,6 +231,12 @@ export interface AgentRunOpenInput {
   readonly mode: AgentRunMode;
   /** Defaults to `DEFAULT_AGENT_WORKFLOW_TYPE`; see `AgentRunWorkflowType`. */
   readonly workflowType?: AgentRunWorkflowType;
+  /** Defaults to `DEFAULT_AGENT_WORKFLOW_SOURCE`; see `AgentRunWorkflowSource`. */
+  readonly workflowSource?: AgentRunWorkflowSource;
+  /** Defaults to `DEFAULT_AGENT_WORKFLOW_READING`; see `AgentRunWorkflowReading`. */
+  readonly workflowReading?: AgentRunWorkflowReading;
+  /** Defaults to `false`. Decided at start and never afterwards; see `AgentRunRecord`. */
+  readonly autoExecute?: boolean;
   readonly actor: AgentRunActor;
   readonly connectionId: string;
   readonly objective: string;
@@ -300,6 +342,9 @@ function foldLedger(runId: string, entries: readonly AgentLedgerEntry[]): AgentR
       runId,
       mode: header.mode,
       workflowType: header.workflowType ?? DEFAULT_AGENT_WORKFLOW_TYPE,
+      workflowSource: header.workflowSource ?? DEFAULT_AGENT_WORKFLOW_SOURCE,
+      workflowReading: header.workflowReading ?? DEFAULT_AGENT_WORKFLOW_READING,
+      autoExecute: header.autoExecute ?? false,
       status,
       actor: header.actor,
       connectionId: header.connectionId,
@@ -314,6 +359,15 @@ function foldLedger(runId: string, entries: readonly AgentLedgerEntry[]): AgentR
     unsettledStepIds: invokedStepIds.filter((stepId) => !settledSteps.has(stepId)),
   };
 }
+
+/**
+ * Runs whose stream has been closed in THIS process. Module-level and never pruned,
+ * on purpose: a run's ledger is append-only for the life of the process, so a closed
+ * stream never reopens, and sharing the set across every `AgentRunStore` instance is
+ * what makes a `close` on one instance refuse an `append` on another. Growth is
+ * bounded by the number of runs this process opens before it restarts.
+ */
+const closedStreams = new Set<string>();
 
 /**
  * The run ledger. One instance per process is enough: it holds no run state of
@@ -342,6 +396,20 @@ export class AgentRunStore {
       // run HAS a workflow type, so there is no "ending that has neither" case whose
       // bytes an omission would keep identical. The compatibility is on the read side.
       workflowType: input.workflowType ?? DEFAULT_AGENT_WORKFLOW_TYPE,
+      // Written unconditionally alongside the workflow it describes: a header that
+      // carried one without the other would leave a reader guessing which generation
+      // of writer produced it, which is the ambiguity the read-side fold exists to
+      // resolve once and for all headers.
+      workflowSource: input.workflowSource ?? DEFAULT_AGENT_WORKFLOW_SOURCE,
+      // And the outcome of the reading that produced it, written for the same reason:
+      // a header carrying a provenance without a reading is the one generation of
+      // writer whose runs a reader can say nothing certain about, and there is no
+      // reason to produce another.
+      workflowReading: input.workflowReading ?? DEFAULT_AGENT_WORKFLOW_READING,
+      // Written unconditionally too, and for the stronger reason: an omitted setting
+      // and a setting recorded as `false` must be the same run, so that no ledger
+      // generation can be read as having permitted something it did not.
+      autoExecute: input.autoExecute ?? false,
       actor: input.actor,
       connectionId: input.connectionId,
       objective: input.objective,
@@ -415,13 +483,27 @@ export class AgentRunStore {
     });
   }
 
-  /** Ends the run's stream, so every live reader of its timeline completes. */
+  /**
+   * Ends the run's stream, so every live reader of its timeline completes.
+   *
+   * The closed marker is recorded BEFORE the backend close so that an append that
+   * races this call fails loudly instead of resolving against a stream the backend
+   * has already cut short — the silent-loss mode `append` cannot detect, because a
+   * write to a closed stream reports success while `read` never returns the entry.
+   */
   async close(runId: string): Promise<void> {
     const id = assertRunId(runId);
+    closedStreams.add(id);
     await this.world.closeStream(ledgerStreamName(id), id);
   }
 
   private async append(runId: string, entry: AgentLedgerEntry): Promise<void> {
+    if (closedStreams.has(runId)) {
+      throw new AgentRunStoreError(
+        "RUN_ALREADY_CLOSED",
+        `agent run "${runId}" has ended; its ledger accepts no further entries`,
+      );
+    }
     assertPersistableState(entry, "agent.run.ledger");
     // One newline-terminated entry per write. Framing is on newlines rather than
     // on chunk boundaries because a backend is free to coalesce or split chunks;
@@ -456,8 +538,9 @@ export class AgentRunStore {
  * `WORKFLOW_TARGET_WORLD`, reached through the SDK's own resolution so the
  * ledger, the queue and the workflow runtime all share one instance.
  *
- * Refuses while the runtime is disabled — the default. Nothing may build a world
- * off a flag that is off, and the import is dynamic (mirroring
+ * Refuses while the runtime is unavailable — no model configured, or the operator
+ * switched it off. Nothing may build a world for a server that has no agent, and
+ * the import is dynamic (mirroring
  * `src/lib/llm/factory.ts` and `model-adapter.ts`) so the runtime stays out of
  * the static module graph of anything that merely imports this file.
  */

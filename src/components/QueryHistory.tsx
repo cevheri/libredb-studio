@@ -3,6 +3,8 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { storage } from "@/lib/storage";
 import { QueryHistoryItem } from "@/lib/types";
+import { csvRow } from "@/lib/export/csv";
+import { downloadText } from "@/lib/export/download";
 import {
   CheckCircle2,
   AlertCircle,
@@ -100,45 +102,42 @@ export function QueryHistory({ onSelectQuery, activeConnectionId, refreshTrigger
 
     if (format === "csv") {
       const headers = ["Executed At", "Status", "Connection", "Tab", "Execution Time (ms)", "Rows", "Query", "Error"];
+      // Every field goes through the shared writer. The query and the error message
+      // used to be the only two that were escaped, so a connection or tab name
+      // holding a comma shifted every column after it for that row.
       const rows = filteredHistory.map((item) =>
-        [
+        csvRow([
           item.executedAt,
           item.status,
           item.connectionName || item.connectionId,
           item.tabName || "",
           item.executionTime,
           item.rowCount || 0,
-          `"${item.query.replace(/"/g, '""')}"`,
-          `"${(item.errorMessage || "").replace(/"/g, '""')}"`,
-        ].join(","),
+          item.query,
+          item.errorMessage || "",
+        ]),
       );
-      content = [headers.join(","), ...rows].join("\n");
+      content = [csvRow(headers), ...rows].join("\n");
       mimeType = "text/csv";
     } else {
       content = JSON.stringify(filteredHistory, null, 2);
       mimeType = "application/json";
     }
 
-    const blob = new Blob([content], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = fileName;
-    link.click();
-    URL.revokeObjectURL(url);
+    downloadText(content, mimeType, fileName);
   };
 
   return (
-    <div className="h-full flex flex-col bg-[#080808]">
-      <div className="p-4 border-b border-white/5 bg-[#0a0a0a]/50 backdrop-blur-sm sticky top-0 z-10 space-y-4">
+    <div className="h-full flex flex-col bg-sunken">
+      <div className="p-4 border-b border-hairline bg-surface/50 backdrop-blur-sm sticky top-0 z-10 space-y-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
               <HistoryIcon strokeWidth={1.5} className="w-3.5 h-3.5 text-emerald-400" />
             </div>
             <div>
-              <h3 className="text-xs font-medium text-zinc-100 flex items-center gap-2">Query History</h3>
-              <p className="text-xs text-zinc-500 font-medium">Showing {filteredHistory.length} executions</p>
+              <h3 className="text-xs font-medium text-fg flex items-center gap-2">Query History</h3>
+              <p className="text-xs text-fg-muted font-medium">Showing {filteredHistory.length} executions</p>
             </div>
           </div>
 
@@ -148,12 +147,12 @@ export function QueryHistory({ onSelectQuery, activeConnectionId, refreshTrigger
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="h-8 text-xs font-medium text-zinc-400 hover:text-white gap-2"
+                  className="h-8 text-xs font-medium text-fg-tertiary hover:text-fg-bright gap-2"
                 >
                   <Download strokeWidth={1.5} className="w-3 h-3" /> Export
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="bg-[#0d0d0d] border-white/10 text-zinc-300">
+              <DropdownMenuContent align="end" className="bg-raised border-hairline-strong text-fg-secondary">
                 <DropdownMenuItem onClick={() => exportHistory("csv")} className="text-xs cursor-pointer">
                   <span>Export as CSV</span>
                 </DropdownMenuItem>
@@ -176,31 +175,31 @@ export function QueryHistory({ onSelectQuery, activeConnectionId, refreshTrigger
 
         <div className="flex flex-wrap items-center gap-3">
           <div className="relative flex-1 min-w-[240px]">
-            <Search strokeWidth={1.5} className="absolute left-3 top-1/2 -translate-y-1/2 w-3 h-3 text-zinc-500" />
+            <Search strokeWidth={1.5} className="absolute left-3 top-1/2 -translate-y-1/2 w-3 h-3 text-fg-muted" />
             <Input
               placeholder="Search by query, connection or tab..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="pl-9 h-9 bg-white/5 border-white/10 text-xs focus:ring-emerald-500/20 rounded-lg"
+              className="pl-9 h-9 bg-fill border-hairline-strong text-xs focus:ring-emerald-500/20 rounded-lg"
             />
             {search && (
               <button
                 onClick={() => setSearch("")}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-white"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-fg-muted hover:text-fg-bright"
               >
                 <X strokeWidth={1.5} className="w-3 h-3" />
               </button>
             )}
           </div>
 
-          <div className="flex items-center gap-2 bg-white/5 rounded-lg p-1 border border-white/10">
+          <div className="flex items-center gap-2 bg-fill rounded-lg p-1 border border-hairline-strong">
             <button
               onClick={() => setIsGlobal(false)}
               className={cn(
                 "px-3 py-1.5 text-xs font-medium rounded-md transition-all",
                 !isGlobal
                   ? "bg-emerald-600 text-white shadow-lg shadow-emerald-600/20"
-                  : "text-zinc-500 hover:text-zinc-300",
+                  : "text-fg-muted hover:text-fg-secondary",
               )}
             >
               <span>Active Conn</span>
@@ -211,21 +210,21 @@ export function QueryHistory({ onSelectQuery, activeConnectionId, refreshTrigger
                 "px-3 py-1.5 text-xs font-medium rounded-md transition-all",
                 isGlobal
                   ? "bg-emerald-600 text-white shadow-lg shadow-emerald-600/20"
-                  : "text-zinc-500 hover:text-zinc-300",
+                  : "text-fg-muted hover:text-fg-secondary",
               )}
             >
               <span>All Connections</span>
             </button>
           </div>
 
-          <div className="flex bg-white/5 rounded-lg p-1 border border-white/10">
+          <div className="flex bg-fill rounded-lg p-1 border border-hairline-strong">
             {(["all", "success", "error"] as const).map((status) => (
               <button
                 key={status}
                 onClick={() => setFilterStatus(status)}
                 className={cn(
                   "px-3 py-1.5 text-xs font-medium rounded-md transition-all",
-                  filterStatus === status ? "bg-white/10 text-white" : "text-zinc-500 hover:text-zinc-300",
+                  filterStatus === status ? "bg-fill-strong text-fg" : "text-fg-muted hover:text-fg-secondary",
                 )}
               >
                 {status}
@@ -238,19 +237,19 @@ export function QueryHistory({ onSelectQuery, activeConnectionId, refreshTrigger
       <div className="flex-1 overflow-auto custom-scrollbar">
         {filteredHistory.length === 0 && (
           <div className="h-full flex flex-col items-center justify-center opacity-20 p-8 text-center">
-            <HistoryIcon strokeWidth={1.5} className="w-16 h-16 mb-4 text-zinc-600" />
+            <HistoryIcon strokeWidth={1.5} className="w-16 h-16 mb-4 text-fg-subtle" />
             <p className="text-xs font-medium">No history items found</p>
-            <p className="text-xs text-zinc-500 mt-1">Run some queries to see them here</p>
+            <p className="text-xs text-fg-muted mt-1">Run some queries to see them here</p>
           </div>
         )}
         {filteredHistory.length > 0 && (
           <div className="min-w-[800px]">
             <table className="w-full text-left border-collapse">
               <thead>
-                <tr className="bg-white/[0.02] border-b border-white/5 text-xs font-medium text-zinc-500">
+                <tr className="bg-fill-subtle border-b border-hairline text-xs font-medium text-fg-muted">
                   <th className="px-4 py-3 w-10 text-center">Status</th>
                   <th
-                    className="px-4 py-3 cursor-pointer hover:text-zinc-300 transition-colors group"
+                    className="px-4 py-3 cursor-pointer hover:text-fg-secondary transition-colors group"
                     onClick={() => handleSort("executedAt")}
                   >
                     <div className="flex items-center gap-2">
@@ -268,7 +267,7 @@ export function QueryHistory({ onSelectQuery, activeConnectionId, refreshTrigger
                   <th className="px-4 py-3">Source</th>
                   <th className="px-4 py-3">SQL Query</th>
                   <th
-                    className="px-4 py-3 cursor-pointer hover:text-zinc-300 transition-colors group"
+                    className="px-4 py-3 cursor-pointer hover:text-fg-secondary transition-colors group"
                     onClick={() => handleSort("executionTime")}
                   >
                     <div className="flex items-center gap-2">
@@ -284,7 +283,7 @@ export function QueryHistory({ onSelectQuery, activeConnectionId, refreshTrigger
                     </div>
                   </th>
                   <th
-                    className="px-4 py-3 cursor-pointer hover:text-zinc-300 transition-colors group"
+                    className="px-4 py-3 cursor-pointer hover:text-fg-secondary transition-colors group"
                     onClick={() => handleSort("rowCount")}
                   >
                     <div className="flex items-center gap-2">
@@ -304,12 +303,9 @@ export function QueryHistory({ onSelectQuery, activeConnectionId, refreshTrigger
                   </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-white/5">
+              <tbody className="divide-y divide-hairline">
                 {filteredHistory.map((item) => (
-                  <tr
-                    key={item.id}
-                    className="hover:bg-white/[0.03] transition-colors group text-xs border-b border-white/5"
-                  >
+                  <tr key={item.id} className="hover:bg-fill transition-colors group text-xs border-b border-hairline">
                     <td className="px-4 py-4 text-center">
                       <div className="flex justify-center">
                         {item.status === "success" && (
@@ -327,10 +323,10 @@ export function QueryHistory({ onSelectQuery, activeConnectionId, refreshTrigger
                     {/* oxlint-disable-next-line jsx-a11y/control-has-associated-label -- cell text is dynamic; oxlint cannot see expressions through the wrapper div */}
                     <td className="px-4 py-4 whitespace-nowrap">
                       <div className="flex flex-col">
-                        <span className="text-zinc-200 font-medium">
+                        <span className="text-fg font-medium">
                           {item.executedAt ? format(new Date(item.executedAt), "MMM d, HH:mm:ss") : "-"}
                         </span>
-                        <span className="text-xs text-zinc-500 font-mono mt-0.5">
+                        <span className="text-xs text-fg-muted font-mono mt-0.5">
                           {item.executedAt ? format(new Date(item.executedAt), "yyyy") : ""}
                         </span>
                       </div>
@@ -338,19 +334,19 @@ export function QueryHistory({ onSelectQuery, activeConnectionId, refreshTrigger
                     {/* oxlint-disable-next-line jsx-a11y/control-has-associated-label -- cell text is dynamic; oxlint cannot see expressions through the wrapper div */}
                     <td className="px-4 py-4 whitespace-nowrap">
                       <div className="flex flex-col gap-1">
-                        <div className="flex items-center gap-1.5 text-zinc-300">
+                        <div className="flex items-center gap-1.5 text-fg-secondary">
                           <Database strokeWidth={1.5} className="w-3 h-3 text-blue-400" />
                           <span className="font-medium">{item.connectionName || "Unknown"}</span>
                         </div>
-                        <div className="flex items-center gap-1.5 text-zinc-500 text-xs">
+                        <div className="flex items-center gap-1.5 text-fg-muted text-xs">
                           <Hash strokeWidth={1.5} className="w-2.5 h-2.5" />
                           <span>{item.tabName || "Default Tab"}</span>
                         </div>
                       </div>
                     </td>
                     <td className="px-4 py-4 max-w-md">
-                      <div className="bg-[#050505] border border-white/5 rounded-md p-2 relative group-hover:border-white/10 transition-colors">
-                        <pre className="text-xs font-mono text-zinc-400 line-clamp-2 break-all whitespace-pre-wrap leading-relaxed">
+                      <div className="bg-canvas border border-hairline rounded-md p-2 relative group-hover:border-hairline-strong transition-colors">
+                        <pre className="text-xs font-mono text-fg-tertiary line-clamp-2 break-all whitespace-pre-wrap leading-relaxed">
                           {item.query}
                         </pre>
                         {item.errorMessage && (
@@ -364,14 +360,14 @@ export function QueryHistory({ onSelectQuery, activeConnectionId, refreshTrigger
                       <span
                         className={cn(
                           "px-2 py-0.5 rounded text-xs font-mono font-medium",
-                          item.executionTime > 500 ? "text-amber-400 bg-amber-400/10" : "text-zinc-400 bg-white/5",
+                          item.executionTime > 500 ? "text-amber-400 bg-amber-400/10" : "text-fg-tertiary bg-fill",
                         )}
                       >
                         {item.executionTime}ms
                       </span>
                     </td>
                     <td className="px-4 py-4 whitespace-nowrap">
-                      <span className="text-zinc-400 font-mono text-xs">
+                      <span className="text-fg-tertiary font-mono text-xs">
                         {item.rowCount != null ? item.rowCount.toLocaleString() : "-"}
                       </span>
                     </td>

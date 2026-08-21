@@ -13,8 +13,9 @@
  * the module, whatever order the runner loaded them in.
  */
 
-import { describe, test, expect, mock, beforeEach, spyOn } from "bun:test";
+import { describe, test, expect, mock, beforeEach, afterEach, spyOn } from "bun:test";
 import { SignJWT } from "jose";
+import { configureAgentModel, restoreAgentModel } from "../../helpers/agent-model-env";
 import { createMockRequest, parseResponseJSON } from "../../helpers/mock-next";
 import { AGENT_DRIVE_HEADER, mintAgentDriveToken } from "@/lib/agent/drive-token";
 import { AGENT_ENABLED_ENV } from "@/lib/agent/config";
@@ -56,7 +57,14 @@ beforeEach(() => {
   installMocks();
   clearRateLimitState();
   mockDriveAgentRun.mockClear();
-  process.env[AGENT_ENABLED_ENV] = "true";
+  // A configured model is what makes the surface exist since #331 T5; the flag is
+  // only the off-switch, so the absence test below sets it to a negative value.
+  delete process.env[AGENT_ENABLED_ENV];
+  configureAgentModel();
+});
+
+afterEach(() => {
+  restoreAgentModel();
 });
 
 describe("POST /api/agent/drive", () => {
@@ -123,8 +131,8 @@ describe("POST /api/agent/drive", () => {
     expect(mockDriveAgentRun).not.toHaveBeenCalled();
   });
 
-  test("the callback does not exist while the runtime flag is off", async () => {
-    delete process.env[AGENT_ENABLED_ENV];
+  test("the callback does not exist once the operator switches the agent off", async () => {
+    process.env[AGENT_ENABLED_ENV] = "false";
 
     const res = await POST(driveRequest({ token: await mintAgentDriveToken(RUN_ID) }));
 
@@ -142,6 +150,20 @@ describe("POST /api/agent/drive", () => {
 
   test("a run that has already ended is a conflict, not a failure", async () => {
     mockDriveAgentRun.mockRejectedValueOnce(new AgentRunServiceError("RUN_NOT_RESUMABLE", "already succeeded"));
+
+    const res = await POST(driveRequest({ token: await mintAgentDriveToken(RUN_ID) }));
+
+    expect(res.status).toBe(409);
+  });
+
+  test("a delivery for a run another drive is already carrying is a conflict, not a failure", async () => {
+    // The duplicate-delivery case, and the one place the distinction matters: the run
+    // is HEALTHY and in flight, so this must not read as a server fault the queue
+    // retries forever against a run someone else owns. 409 tells it to drop the
+    // delivery; the drive that holds the claim finishes the run.
+    mockDriveAgentRun.mockRejectedValueOnce(
+      new AgentRunServiceError("RUN_ALREADY_DRIVEN", "already being driven in this process"),
+    );
 
     const res = await POST(driveRequest({ token: await mintAgentDriveToken(RUN_ID) }));
 

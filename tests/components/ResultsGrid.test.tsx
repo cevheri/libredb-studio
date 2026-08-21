@@ -952,6 +952,48 @@ describe("ResultsGrid", () => {
       expect(getAllByRole("button", { name: "id, BIGINT" })[0].textContent).toContain("BIGINT");
     });
 
+    test("renders a dotted column name as one key, not as a path into the row", () => {
+      // TanStack reads a dotted `accessorKey` as a DEEP PATH, so `shipping.city`
+      // was looked up as `row.shipping.city` while the row carries the flat key
+      // `"shipping.city"` - and the cell rendered NULL over a value that was
+      // right there. Measured in the browser on 2026-08-19 against Elasticsearch
+      // 9.1.4: `SELECT order_id, shipping.city FROM orders` answered
+      // `{"order_id":"o-001","shipping.city":"İzmir"}` from the API and the grid
+      // showed NULL, while the CSV export - which reads `row[column]` - wrote
+      // İzmir. The screen was the only surface that lied.
+      //
+      // Not an Elasticsearch curiosity: every object field in a mapping flattens
+      // to a dotted leaf, so on a search cluster this is most columns a user has.
+      const result: QueryResult = {
+        ...mockResult,
+        rows: [{ order_id: "o-001", "shipping.city": "İzmir" }],
+        fields: ["order_id", "shipping.city"],
+        columnTypes: { "shipping.city": "keyword" },
+      };
+      const { container } = render(React.createElement(ResultsGrid, { result }));
+
+      expect(container.textContent).toContain("İzmir");
+      expect(container.textContent).not.toContain("NULL");
+    });
+
+    test("prefers the flat key when a row carries BOTH it and a nested object", () => {
+      // OpenSearch answers `SELECT *` with a nested `shipping` object while
+      // Elasticsearch flattens the same mapping to `shipping.city` (both measured
+      // 2026-08-19), so a row can hold either shape - and a hand-written
+      // `SELECT shipping, shipping.city` holds both at once. The declared column
+      // list is what the grid renders, and `"shipping.city"` names the flat key.
+      const result: QueryResult = {
+        ...mockResult,
+        rows: [{ shipping: { city: "Ankara" }, "shipping.city": "İzmir" }],
+        fields: ["shipping.city"],
+        columnTypes: {},
+      };
+      const { container } = render(React.createElement(ResultsGrid, { result }));
+
+      expect(container.textContent).toContain("İzmir");
+      expect(container.textContent).not.toContain("Ankara");
+    });
+
     test("makes the compact header's declared type reachable without a pointer", () => {
       // The compact table carries the type as a tooltip only, because visible
       // text there desyncs header and body widths. `title` on a non-focusable
@@ -999,6 +1041,42 @@ describe("ResultsGrid", () => {
 
     expect(container.textContent).toContain("Query returned no data");
     expect(container.querySelector("ul")).toBeNull();
+  });
+
+  // ── Sorting actually reorders rows ────────────────────────────────────────
+
+  /**
+   * TanStack Table 9 assembles a table from features that are opted into
+   * explicitly, and a row model that is not registered does not error - the
+   * table simply never applies it. So ResultsGrid dropping
+   * `sortedRowModel: createSortedRowModel()` from its feature set would leave
+   * every sort click updating the header's arrow and accessible name while the
+   * rows below stayed in source order, and every other test here would still
+   * pass: they assert the *indicator*, never the *order*.
+   *
+   * This test reads the rendered order back. Descending is the direction used
+   * because the fixture (Alice, Bob, Charlie) is already in ascending order -
+   * an ascending sort is indistinguishable from no sort at all.
+   */
+  test("sorting reorders the rendered rows, not just the header indicator", () => {
+    const { getAllByRole, container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+
+    // `:not([data-testid])` excludes the mocked ResultCard above, which also
+    // carries data-index; only the desktop table's rows come off the table
+    // instance, and they are the ones the row model orders.
+    const renderedRows = () =>
+      Array.from(container.querySelectorAll("[data-index]:not([data-testid])")).map((row) => row.textContent ?? "");
+
+    expect(renderedRows()).toHaveLength(3);
+    expect(renderedRows()[0]).toContain("Alice");
+
+    fireEvent.click(getAllByRole("button", { name: "name" })[0]);
+    fireEvent.click(getAllByRole("button", { name: "name, sorted ascending" })[0]);
+
+    const descending = renderedRows();
+    expect(descending[0]).toContain("Charlie");
+    expect(descending[1]).toContain("Bob");
+    expect(descending[2]).toContain("Alice");
   });
 
   // ── A11y semantics (#100): keyboard-reachable interactive elements ────────

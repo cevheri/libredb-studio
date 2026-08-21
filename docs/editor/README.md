@@ -5,7 +5,7 @@ execution pipeline behind it.
 
 | Doc | Covers |
 |-----|--------|
-| [Monaco Performance](monaco-performance.md) | Editor responsiveness — uncontrolled component pattern, RAF-buffered AI streaming, memoized schema props, completion caching |
+| [Monaco Performance](monaco-performance.md) | Editor responsiveness — uncontrolled component pattern, memoized schema props, completion caching, one-CTE schema fetch. A historical record of one optimization pass; passages about since-deleted code are marked as such |
 | [SQL Alias Completion](sql-alias-completion.md) | Context-aware autocompletion with table-alias resolution (`FROM`/`JOIN`/CTE), the completion provider, and the alias extractor |
 | [Query Optimization](query-optimization.md) | Query pagination, silent auto-limiting, Load More, result-level signals (engine warnings, declared column types), background `EXPLAIN`, and performance insights |
 
@@ -28,6 +28,8 @@ package, which does not ship `public/` — set `NEXT_PUBLIC_MONACO_VS_PATH`.
 | Monaco loader config | `src/lib/editor/monaco-loader.ts` |
 | Asset staging | `scripts/copy-monaco.mjs` |
 | Completion provider | `src/lib/editor/sql-completions.ts` |
+| Tab type / language ladder | `src/lib/editor/tab-language.ts` |
+| Non-SQL command languages | `src/lib/editor/libredb-language.ts`, `src/lib/editor/redis-language.ts` |
 | Alias extraction | `src/lib/sql/alias-extractor.ts` |
 | Query limiting | `src/lib/db/utils/query-limiter.ts` |
 | Visual EXPLAIN | `src/components/VisualExplain.tsx` |

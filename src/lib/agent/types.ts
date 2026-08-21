@@ -43,16 +43,26 @@
 
 import type { Role } from "@/lib/auth";
 import type { PolicyDenyCode } from "@/lib/db/operations/policy";
-import type { TableSchema } from "@/lib/types";
+import type { AgentStatementViolation } from "@/lib/db/operations/statement-guard";
+import type { AgentChartSpec, DatabaseType, TableSchema } from "@/lib/types";
+import type { AgentGoalShortfall, AgentGoalVerifierId } from "./goal-verifier";
+import type { AgentInventoryNoun } from "./inventory-noun";
+import type { PlanStatementIdentifiers } from "./plan-statement";
+import type { AgentPlanSummary } from "./plan-summary";
+import type { AgentTableProfile } from "./table-profile";
 
 /**
- * Which surface a run drives. Planning is toolless: it must perform zero database
- * operations, which is why it is NOT one of the policy layer's execution modes and
- * never reaches the pipeline.
+ * Which surface a run drives. Planning is TOOLLESS — the model is handed no tool at
+ * all — which is why it is not one of the policy layer's execution modes and why no
+ * statement of the model's ever reaches the pipeline.
  *
- * Stated as the obligation it is, not as something already enforced — the tool
- * layer that has to select an empty set for this mode does not exist at this
- * commit. It is the requirement that layer will be tested against.
+ * It used to say "zero database operations", and the grounding design of 2026-08-15
+ * made that false rather than merely imprecise: the SERVER now reads this connection's
+ * catalog and its estimated statistics before the first turn, because a plan mode
+ * that had seen no schema produced the plan it would have produced for any database
+ * in the world. What the mode still promises, unchanged, is the narrower and more
+ * useful claim — it runs no statement of the user's, writes nothing, and hands every
+ * statement it drafts to the user to run themselves.
  */
 export type AgentRunMode = "planning" | "agent";
 
@@ -70,7 +80,12 @@ export type AgentRunMode = "planning" | "agent";
  * later request cannot widen a run after it opens — not because a filter rejects one,
  * but because there is no parameter through which a workflow could arrive twice.
  */
-export type AgentRunWorkflowType = "investigation" | "query-optimization" | "database-assessment";
+export type AgentRunWorkflowType =
+  | "investigation"
+  | "query-optimization"
+  | "database-assessment"
+  | "operations"
+  | "data-analysis";
 
 /**
  * What a run is for when nothing said.
@@ -81,6 +96,112 @@ export type AgentRunWorkflowType = "investigation" | "query-optimization" | "dat
  * about a run nobody can go back and ask.
  */
 export const DEFAULT_AGENT_WORKFLOW_TYPE: AgentRunWorkflowType = "investigation";
+
+/**
+ * WHERE a run's workflow came from: the server classified the objective into it, or
+ * a person picked it.
+ *
+ * Not a second way to say what the workflow IS — nothing downstream branches on this,
+ * and `selectAgentTools` never sees it. It exists because the surface owes the user a
+ * different sentence in each case. A workflow the user chose needs no explanation; a
+ * workflow inferred from their objective needs both the claim ("opened as Optimize")
+ * and the way out of it ("change"), and that affordance has to survive a page reload,
+ * which is only possible if the provenance is on the run rather than in the rail's
+ * memory of the request it sent.
+ */
+export type AgentRunWorkflowSource = "inferred" | "chosen";
+
+/**
+ * Where a workflow came from when nothing said, and — like `DEFAULT_AGENT_WORKFLOW_TYPE`
+ * — a READING of history rather than a fallback.
+ *
+ * A header written before this field folds to `"chosen"` because there was no
+ * classifier then: the client sent an explicit `workflowType` on every open request,
+ * so those runs genuinely did carry a workflow somebody picked. Folding them to
+ * `"inferred"` would offer their readers a "change" affordance against a
+ * classification that never ran, and would credit a decision to a model that made
+ * none.
+ */
+export const DEFAULT_AGENT_WORKFLOW_SOURCE: AgentRunWorkflowSource = "chosen";
+
+/**
+ * What the READING of the objective produced, as against where the workflow came from.
+ *
+ * `workflowSource` says who decided; this says how that decision went. They are two
+ * facts because a classifier that fell back still produced an inferred workflow: the
+ * run genuinely was not asked for by anyone, and it genuinely was not read out of the
+ * objective either. Collapsing them would leave the surface stating one of those as
+ * the other, which is precisely what it may not do — the fallback must be said as a
+ * fallback and never presented as a verdict.
+ *
+ *  - `"classified"` — a classifier read the objective and named this workflow.
+ *  - `"unclassified"` — a classifier was asked and reached its documented fallback: a
+ *    model failure, a timeout, an empty reply, or a reply naming no workflow this
+ *    build serves (`workflow-classifier.ts`).
+ *  - `"unrecorded"` — no classifier outcome is recorded for this run. That is the
+ *    truth for every run somebody CHOSE the workflow of, since nothing classified
+ *    anything, and it is also the only honest answer for a header written before this
+ *    field existed.
+ *
+ * Nothing downstream branches on it; like `workflowSource` it exists so the surface can
+ * say a true sentence about a run it did not itself open.
+ */
+export type AgentRunWorkflowReading = "classified" | "unclassified" | "unrecorded";
+
+/**
+ * What a header that carries no reading means — and the reason it is `"unrecorded"`
+ * rather than either of the other two, which is the whole point of there being three.
+ *
+ * Both alternatives are claims the record cannot support. `"classified"` would present
+ * a fallback as a verdict on every run written by a writer that had a classifier and
+ * did not record its outcome — the exact defect this field was added to end, since a
+ * rail that reloads reads the record and nothing else. `"unclassified"` is the mirror
+ * error and is worse where it is visible: it asserts that a reading FAILED, and it can
+ * contradict the very workflow beside it, saying "your objective could not be
+ * classified, so the run investigates" over a run whose header says `operations`.
+ *
+ * So the absent case is folded to the one answer that is true of it: nothing here
+ * records how the workflow was read. A surface owes such a run a third sentence rather
+ * than one of the two it has, and `AgentRail` writes one.
+ *
+ * Note what this does NOT cost. A ledger written before the classifier existed folds
+ * its SOURCE to `"chosen"` (`DEFAULT_AGENT_WORKFLOW_SOURCE`), and a chosen run is owed
+ * no sentence at all — so on those runs this default is never read, and its whole
+ * reach is the generation of headers that carried a source without a reading.
+ */
+export const DEFAULT_AGENT_WORKFLOW_READING: AgentRunWorkflowReading = "unrecorded";
+
+/**
+ * Which workflows can hand a user an answer — and therefore which ones auto-execute
+ * is a meaningful setting for.
+ *
+ * ONE fact, read by four layers that would otherwise each decide for themselves: the
+ * rail decides whether to offer the checkbox, `POST /api/agent/runs` decides whether
+ * to accept the field, `investigation.ts` decides whether to state
+ * `AUTO_EXECUTE_RULE` to the model, and `tools.ts` decides whether to offer
+ * `present_answer` at all. It lives HERE rather than in `tools.ts` because the rail
+ * is a client component and `tools.ts` is the server's database seam; a total record
+ * of booleans is the part both sides can hold.
+ *
+ * The binding to the tool set is not left to prose. `tools.test.ts` asserts, over
+ * every workflow, that `selectAgentTools` offers `present_answer` exactly when this
+ * record says true — so a workflow that gains the tool without gaining the flag, or
+ * the reverse, fails rather than shipping the mismatch.
+ *
+ * The mismatch is worth naming because it shipped once: the checkbox rendered for
+ * every workflow while `present_answer` was offered to one, so ticking it on an
+ * Investigate run promised the user a hand-over that could not happen and told the
+ * model to `inspect_plan` before a presentation it had no tool to make. That is the
+ * #350/#356 shape — a rule stated to a model whose tool set cannot satisfy it — and
+ * a total record is what stops it recurring silently.
+ */
+export const AGENT_WORKFLOW_PRESENTS_ANSWER: Readonly<Record<AgentRunWorkflowType, boolean>> = Object.freeze({
+  investigation: false,
+  "query-optimization": false,
+  "database-assessment": false,
+  operations: false,
+  "data-analysis": true,
+} satisfies Record<AgentRunWorkflowType, boolean>);
 
 /** A run that has stopped, and why. Terminal states are never re-entered. */
 export type AgentRunTerminalStatus = "succeeded" | "failed" | "cancelled";
@@ -116,6 +237,32 @@ export type AgentRunFailureReason =
    * The connection's engine has no database-native read-only execution profile, so
    * this run could never have been permitted on it. A property of the connection the
    * user chose, not a fault of the server — which is why it is not `internal`.
+   *
+   * NARROWER for the `operations` workflow (#325), and narrower is all it is. That
+   * workflow's own reads go through the curated provider methods every engine
+   * implements, under `AGENT_OPERATIONS_PROFILE`, so it never asks for a read-only
+   * STATEMENT path; and since #411 it takes a server-side catalog capture before its
+   * first turn, which does acquire a profile. WHICH profile depends on the reading, and
+   * that is what keeps this reason out of an operations run (#414): the composed catalog
+   * read takes `agent-read-only` and is composed only for the two dialects that HAVE a
+   * read-only profile, while every other dialect asks its provider to describe its own
+   * schema under `agent-operations`, whose gate does not require `queryReadOnly`. An
+   * acquisition IS attempted on all nine — the sentence here used to say none was, which
+   * was true only until the second reading existed. What survives is the conclusion: the
+   * profile whose acquisition would be refused is never the profile that capture asks for
+   * on an engine that would refuse it.
+   *
+   * What can still reach it, and what this reason's text then misdescribes, is an
+   * acquisition refused for a reason that is not the engine at all:
+   * `resolveAgentCredential` throws `ExecutionProfileError` — which `runtime.ts`
+   * classifies here — for an agent credential that is half-configured, sealed under a
+   * key that no longer decrypts, or set alongside a connection string, and it throws on
+   * ANY engine before a provider exists. A PostgreSQL run then tells the user their
+   * engine offers no read-only execution profile when their real problem is a
+   * credential. That is true of every workflow and was true before #411, which only
+   * moved the moment it can happen earlier; it is a defect of this reason's granularity
+   * rather than of the workflow, and it is recorded in `docs/BACKLOG.md` (B47) rather
+   * than fixed inside a comment.
    */
   | "engine-unsupported"
   /** The run's persisted connection no longer resolves on the server. */
@@ -188,11 +335,40 @@ export type AgentEvidenceReference =
   | { readonly source: "artifact"; readonly correlationId: string; readonly locator?: string }
   | { readonly source: "context-snapshot"; readonly fingerprint: string; readonly locator?: string };
 
+/**
+ * One side of a before/after plan comparison (#330 T3).
+ *
+ * `summary` is derived on the SERVER from the artifact the run actually produced,
+ * never supplied by the model: a comparison the model describes about its own work
+ * is a claim, and this has to be a fact. It carries no engine text for the reason
+ * `plan-summary.ts` states — a plan names tables and indexes, and those names are
+ * untrusted input. What names the objects is `sql`, which the model wrote and
+ * therefore already knows.
+ */
+export interface AgentPlanSide {
+  /** The `sql.explain.estimate` artifact this side was read from. */
+  readonly correlationId: string;
+  /** The statement that was explained. */
+  readonly sql: string;
+  readonly summary: AgentPlanSummary;
+}
+
 export interface AgentReportClaim {
   readonly claim: string;
   /** Non-empty by type: at least one reference, or the claim cannot be built. */
   readonly evidence: readonly [AgentEvidenceReference, ...AgentEvidenceReference[]];
 }
+
+/**
+ * How one result is to be DRAWN — declared in `src/lib/types.ts`, and re-exported
+ * here under the name the run's own contract uses.
+ *
+ * It is declared OUTSIDE the agent tree for a mechanical reason: the component that
+ * draws it (`DataCharts`) ships in the published package, and no agent module may be
+ * reachable from that package's declarations (`tests/unit/agent-package-boundary.test.ts`).
+ * One declaration two trees can name beats two declarations that can disagree.
+ */
+export type { AgentChartSpec } from "@/lib/types";
 
 /**
  * The schema inventory a run reasons over, plus the fingerprint that decides
@@ -208,10 +384,44 @@ export interface AgentContextSnapshot {
   readonly fingerprint: string;
   readonly capturedAtMs: number;
   readonly tables: readonly TableSchema[];
+  /**
+   * WHICH of the two readings produced this inventory (#414).
+   *
+   * `"composed-catalog"` is a statement per catalog kind, written by the server for
+   * the dialect and audited line by line; `"provider-inventory"` is the engine's own
+   * schema inspection — one audited call, on the engines for which no catalog
+   * statement is composed. What a reader does with it is say how the inventory was
+   * obtained without claiming the wrong one, which the packing preface has to.
+   *
+   * Optional, and absent reads as `"composed-catalog"`: every snapshot written before
+   * this field existed came from that path, so a ledger recorded then stays readable
+   * and stays right. A required field would have made those ledgers say nothing where
+   * they can honestly say the one thing that was true.
+   *
+   * It is deliberately NOT in the fingerprint. The fingerprint is the INVENTORY's
+   * identity, and two runs that read the same tables two ways are looking at the same
+   * schema — folding the route into it would make a resumed run refuse its own
+   * recorded capture over a fact about how it was taken.
+   */
+  readonly readVia?: "composed-catalog" | "provider-inventory";
 }
 
 /**
- * Why a tool call produced no result. The three variants are distinct in TYPE,
+ * Why a curated reading that sends no statement was refused. Both are decided INSIDE
+ * the call, after the pipeline allowed it and the provider was acquired, which is
+ * exactly why they are refusals rather than "the run decided not to ask": a statement
+ * of the run's budget was charged and the execution was audited, so a settlement that
+ * said nothing happened would contradict the ledger.
+ *
+ * The grounding schema read (#414) adds no third code. A provider that cannot describe
+ * itself is not a state that exists — `getSchema()` is required on `DatabaseProvider`
+ * — and the reachable failure, a `getSchema()` that rejects, is a database error the
+ * reading path already reports as one.
+ */
+export type AgentReadingDenyCode = "KIND_UNSUPPORTED_BY_PROVIDER" | "READING_OVER_BUDGET";
+
+/**
+ * Why a tool call produced no result. The four variants are distinct in TYPE,
  * not merely in a string field, so the run loop cannot hand a policy denial to
  * the model as if the statement were malformed.
  *
@@ -219,11 +429,17 @@ export interface AgentContextSnapshot {
  * text — untrusted input, exactly like public issue text — and any prompt it
  * re-enters has to label and quote it. `statementFingerprint` is what a resumed
  * run reads to know it has already failed on that exact statement.
+ *
+ * `reading-refused` carries no message at all: nothing an engine wrote is in it. It
+ * is the server's own decision about a curated reading it will not deliver, and its
+ * reason code is a closed union rather than prose for the same reason the policy
+ * variant's is.
  */
 export type AgentToolRefusal =
   | { readonly class: "policy-denied"; readonly reasonCode: PolicyDenyCode }
   | { readonly class: "approval-required"; readonly operationId: string }
-  | { readonly class: "database-error"; readonly statementFingerprint: string; readonly message: string };
+  | { readonly class: "database-error"; readonly statementFingerprint: string; readonly message: string }
+  | { readonly class: "reading-refused"; readonly reasonCode: AgentReadingDenyCode };
 
 interface AgentRunEventBase {
   /** Epoch milliseconds. A number, not a Date: a Date does not round-trip. */
@@ -263,6 +479,28 @@ export type AgentRunEvent =
        * invariant instead of a second source of truth.
        */
       readonly snapshot?: AgentContextSnapshot;
+      /**
+       * What this engine called the rows of that inventory when they were READ
+       * (#414). Two plain strings, so the entry stays as inert as everything else
+       * here.
+       *
+       * On the ledger rather than re-derived by whatever renders the run later,
+       * because the two candidates are not the same fact. A surface that asks the
+       * connection for its labels answers with what the connection is called NOW —
+       * and the connection can be edited, retyped or deleted between a run and the
+       * reading of its history, while `useProviderMetadata` answers `null` for the
+       * whole of an in-flight fetch and for every failed one, which would render the
+       * default noun and then change it under the reader. The prompt this same
+       * capture produced already carries the word (`packContextForTask`), so
+       * recording it is what keeps the sentence the model was given and the sentence
+       * the user reads one decision instead of two that can disagree.
+       *
+       * Optional, and the absence is a reading rather than a hedge: every ledger
+       * written before #414 was rendered as "tables" whatever the engine, so folding
+       * one to `TABLE_INVENTORY_NOUN` shows exactly what it always showed instead of
+       * claiming a vocabulary nobody recorded.
+       */
+      readonly noun?: AgentInventoryNoun;
     })
   | (AgentRunEventBase & {
       readonly kind: "statement-drafted";
@@ -302,6 +540,179 @@ export type AgentRunEvent =
       readonly text: string;
     })
   | (AgentRunEventBase & {
+      /**
+       * The one statement a PLAN run drafted, and what could be checked about it
+       * without running it (the plan-mode SQL-generator design of 2026-08-15, item 5;
+       * `docs/BACKLOG.md` B44).
+       *
+       * Not `statement-drafted`, and the difference is not cosmetic. That entry
+       * belongs to a STEP: an agent run drafts through a tool, so its statement
+       * arrives with a `stepId` that ties it to the invocation and the outcome that
+       * followed, and a resumed run replays it. A plan run is toolless — its whole
+       * output is prose — so its statement has no step, was never invoked, and never
+       * will be by this runtime. Recording it under a kind that promises a step would
+       * make every reader of the ledger look for an invocation that cannot exist.
+       *
+       * It exists at all because the ledger is the only thing that outlives the drive.
+       * Until this kind, plan mode's deliverable was read out of a markdown fence in
+       * the BROWSER (#389): it worked when the model fenced its SQL, offered nothing
+       * when it did not, and left the verdict with nothing to tell a statement and a
+       * four-paragraph lecture apart.
+       *
+       * Everything here is what the SERVER established, never what the model said
+       * about its own work — the same rule `plan-comparison` and `answer-composed`
+       * follow. And two of the fields are deliberately narrow claims:
+       *
+       *  - `readOnly` is the shared statement guard's verdict, nothing more. A `false`
+       *    is a MARK and not a block — the owner ruled that the user is the one who
+       *    runs the statement — and a `true` is not a safety claim: that guard's own
+       *    docblock says it means only that that layer found nothing.
+       *  - `identifiers` distinguishes "checked, and these names are not in the
+       *    inventory" from "there was no inventory to check against" and, since #414,
+       *    from "no reader here can find a name in this engine's language", because an
+       *    empty unknown list is a claim. Even the checked form is not permission to
+       *    run: an inventory records what EXISTS, not what the user's role may select
+       *    from.
+       */
+      readonly kind: "plan-statement-drafted";
+      /** The statement as the model wrote it, verbatim, fence removed. */
+      readonly sql: string;
+      /** The engine it was written for — the connection this drive was given. */
+      readonly dialect: DatabaseType;
+      readonly readOnly: boolean;
+      /**
+       * Whether the guard could read this draft's language at all (#414).
+       *
+       * OPTIONAL on the event and required on `PlanStatementValidation`, which is not
+       * an inconsistency: the validation is written now and always carries it, while
+       * the event is also read back out of `.workflow-data` ledgers recorded before
+       * #414. An absent value reads as `true` there, and truthfully — plan mode was
+       * grounded on PostgreSQL and SQLite alone, so every draft those runs recorded
+       * was SQL and every one of them was examined. Widening `readOnly` or renaming
+       * anything here was the alternative, and it breaks those ledgers: the store's
+       * `parseEntry` establishes only that a line is JSON, is an object and carries a
+       * known event kind, then trusts the contract — so a field that changed meaning
+       * would be re-read under its new one with no tripwire between.
+       */
+      readonly guardApplicable?: boolean;
+      /** The guard's own reason, present exactly when `readOnly` is false AND the guard applied. */
+      readonly guardViolation?: AgentStatementViolation;
+      readonly identifiers: PlanStatementIdentifiers;
+    })
+  | (AgentRunEventBase & {
+      /**
+       * Two estimated plans of the same question, and what changed between them.
+       *
+       * The query-optimization template's own artifact, and the thing its goal
+       * verifier requires: a run that recommends a rewrite without having compared
+       * the plans has recommended it on the strength of its own opinion.
+       *
+       * Both sides cite an artifact THIS run produced under `sql.explain.estimate`,
+       * checked against the ledger the way a report's citations are, so a comparison
+       * of two plans the run never asked for is inexpressible.
+       */
+      readonly kind: "plan-comparison";
+      readonly before: AgentPlanSide;
+      readonly after: AgentPlanSide;
+    })
+  | (AgentRunEventBase & {
+      /**
+       * A change the run proposes and DOES NOT make.
+       *
+       * `statement` is DDL or SQL that is never executed by anything in this
+       * runtime — no tool maps onto a write, and this event reaches no database at
+       * all. It exists so the rail can offer it to the user, who owns the decision;
+       * "apply to editor" hands them the statement, and nothing else happens.
+       *
+       * `evidence` is non-empty by type for the same reason a claim's is: a
+       * recommendation nothing backs is a recommendation the run invented.
+       */
+      readonly kind: "recommendation";
+      readonly change: "index" | "rewrite";
+      readonly statement: string;
+      readonly rationale: string;
+      readonly evidence: readonly [AgentEvidenceReference, ...AgentEvidenceReference[]];
+    })
+  | (AgentRunEventBase & {
+      /**
+       * One table profiled, as COUNTS and the findings derived from them.
+       *
+       * The database-assessment template's own artifact. Nothing here is a value
+       * read out of a column — `table-profile.ts` states why, and it is the reason
+       * profiling a table of personal data is acceptable at all: the run records
+       * how many, never which.
+       *
+       * The findings are the SERVER's, derived from the numbers by predicates with
+       * stated thresholds. A model may interpret them; it cannot invent one.
+       */
+      readonly kind: "table-profiled";
+      /**
+       * The read that produced the counts, so a report can CITE the profile.
+       *
+       * Present because its absence was a defect: profiling does not settle a step,
+       * so it writes no `tool-completed`, and a claim about a profile was therefore
+       * uncitable — which made the assessment template's own goal verifier, which
+       * requires both a profile and a cited report, impossible to satisfy. Found by
+       * the scenario suite before any model met it.
+       */
+      readonly artifact: AgentArtifactReference;
+      readonly profile: AgentTableProfile;
+    })
+  | (AgentRunEventBase & {
+      /**
+       * This artifact IS the answer, and this is how it should be shown.
+       *
+       * The READ is already on the ledger — `tool-invoked` before it, `tool-completed`
+       * after — but the DECISION is not: "this result is the answer, and it should be
+       * drawn as a bar chart of region against net_total" is a fact about the run that
+       * no other event can express.
+       *
+       * `artifact` is required, not optional. An answer that names no artifact is a
+       * claim, and a claim belongs in the report with its citations attached.
+       *
+       * And a chart is never a substitute for a claim. The presentation SHOWS an
+       * artifact, the artifact is the evidence, and the claim is the answer; a run
+       * that drew a picture and reported nothing has drawn a picture.
+       */
+      readonly kind: "answer-composed";
+      /**
+       * The statement the answer rests on — what "Apply to editor" hands over.
+       *
+       * Read from this run's own ledger, never supplied by the model: a statement the
+       * model described about its own work could name a read that produced something
+       * else, which is the mislabelling `plan-comparison` also refuses to allow.
+       */
+      readonly sql: string;
+      /** The artifact this answer IS. Verified against this run's own ledger. */
+      readonly artifact: AgentArtifactReference;
+      /**
+       * How to render it. A table is a first-class outcome, not a fallback: a single
+       * scalar, a one-row result and a result with no numeric column are all answers,
+       * and a chart of any of them would render an empty state.
+       */
+      readonly presentation: { readonly kind: "table" } | { readonly kind: "chart"; readonly spec: AgentChartSpec };
+      /**
+       * Whether the run also sent the statement to the editor, and how far.
+       *
+       * The OUTCOME of the setting, not the setting: a run opened with auto-execute
+       * whose gate declined records `applied`, so a reader can see both that the
+       * setting was on and that the gate said no — which is exactly what someone
+       * asking "why didn't it run" needs. `none` is a run that was never opened with
+       * it at all.
+       *
+       * `auto-executed` records that the run HANDED THE STATEMENT OVER. What the
+       * editor then did with it is the editor's own business, against a route this
+       * runtime does not own, and it produces no ledger event because it cannot.
+       */
+      readonly handover: "none" | "applied" | "auto-executed";
+      /**
+       * Why the gate declined, in the run's own words. Present exactly when
+       * `handover` is `applied`: a refusal that says nothing is indistinguishable
+       * from the feature being broken.
+       */
+      readonly handoverWarning?: string;
+    })
+  | (AgentRunEventBase & {
       readonly kind: "run-finished";
       readonly status: AgentRunTerminalStatus;
       /**
@@ -314,6 +725,34 @@ export type AgentRunEvent =
        * reason visible only in the server log.
        */
       readonly reason?: AgentRunFailureReason;
+      /**
+       * Whether the run met the goal its workflow was opened for (`docs/BACKLOG.md`
+       * B24, ratified 2026-08-13).
+       *
+       * A field beside the status rather than a fourth status word, and the reason is
+       * an observation rather than a preference: the two axes are genuinely
+       * independent. A run can end `succeeded` having answered nothing (the model
+       * stopped), `failed` having answered nothing (the turn ceiling), or `failed`
+       * with no verdict meaningful at all (the drive died before the loop, so the run
+       * never got to try). One word cannot carry both how a run ended and whether it
+       * answered — both of the first two were observed on live runs on 2026-08-13.
+       *
+       * Optional, like `reason` and `stopReason` before it, and for the same reason:
+       * a ledger written before this field folds unchanged, and its ABSENCE means
+       * exactly what is true of it — no verifier ran. That absence is written on
+       * purpose for the third shape above: a run still `queued` at its ending never
+       * entered the loop, and calling it "did not answer" would judge a run that was
+       * never given the chance to. Adding a fourth status instead
+       * would have split `succeeded` by ledger generation, with nothing in an older
+       * record to say which meaning applied.
+       *
+       * `unmet` is omitted when the run answered, so the two halves cannot disagree.
+       */
+      readonly goalVerdict?: {
+        readonly outcome: "answered" | "unanswered";
+        readonly verifier: AgentGoalVerifierId;
+        readonly unmet?: readonly AgentGoalShortfall[];
+      };
       /**
        * How the loop itself ended, when the loop is what ended it. Absent on a run
        * the drive failed out of — those carry `reason` instead, and the two are
@@ -336,6 +775,47 @@ export interface AgentRunRecord {
    * value, and no reader has to know which generation of writer produced its run.
    */
   readonly workflowType: AgentRunWorkflowType;
+  /**
+   * Whether the workflow above was inferred from the objective or picked by a person.
+   *
+   * On the record for the reason `mode` and `workflowType` are — a reader that
+   * rehydrates after a reload must see what the run was opened with — though the
+   * consequence is narrower: nothing the run DOES depends on it, only what the
+   * surface says about it.
+   *
+   * Required here and optional on the ledger header, the same compatibility story the
+   * two fields above have. A header written before the field folds to `"chosen"`;
+   * `DEFAULT_AGENT_WORKFLOW_SOURCE` carries the reasoning.
+   */
+  readonly workflowSource: AgentRunWorkflowSource;
+  /**
+   * How the reading that produced that workflow went, when one was made.
+   *
+   * On the record for the reason `workflowSource` is, and it is the same reason twice:
+   * the sentence the surface owes has to survive a reload, and a rail that rehydrates
+   * from the ledger holds no memory of the classify request it never made. Without it
+   * the provenance was durable and its OUTCOME was not, so a reloaded rail read a
+   * fallback back to the user as a verdict.
+   *
+   * Required here and optional on the ledger header, the same compatibility story the
+   * three fields above have. A header written before the field folds to
+   * `"unrecorded"`; `DEFAULT_AGENT_WORKFLOW_READING` carries the reasoning.
+   */
+  readonly workflowReading: AgentRunWorkflowReading;
+  /**
+   * Whether this run may hand its answer's statement to the editor to be RUN there,
+   * subject to the gate in `auto-execute.ts`.
+   *
+   * On the RECORD, beside `mode` and `workflowType`, for the two reasons those are:
+   * a resumed drive must behave the same as the drive that died, and no later
+   * request may widen a run after it has opened. The route is the only place it is
+   * decided, and there is no route that changes it.
+   *
+   * Required here and optional on the ledger header, the same compatibility story
+   * `workflowType` has: a header written before the field existed folds to `false`,
+   * which is what was true of every run written then.
+   */
+  readonly autoExecute: boolean;
   readonly status: AgentRunStatus;
   readonly actor: AgentRunActor;
   /** The single connection this run may reach; the server builds the scope from it. */

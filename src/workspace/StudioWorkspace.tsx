@@ -9,7 +9,6 @@ import { QuerySafetyDialog } from "@/components/QuerySafetyDialog";
 import { DataProfiler } from "@/components/DataProfiler";
 import { CodeGenerator } from "@/components/CodeGenerator";
 import { TestDataGenerator } from "@/components/TestDataGenerator";
-import { SchemaDiagram } from "@/components/SchemaDiagram";
 import { SaveQueryModal } from "@/components/SaveQueryModal";
 import { StudioTabBar, QueryToolbar, BottomPanel } from "@/components/studio/index";
 import type { MaskingConfig } from "@/lib/data-masking";
@@ -19,18 +18,74 @@ import { useConnectionAdapter } from "@/workspace/hooks/use-connection-adapter";
 import { useQueryAdapter } from "@/workspace/hooks/use-query-adapter";
 import { type StudioWorkspaceProps, DEFAULT_WORKSPACE_FEATURES } from "@/workspace/types";
 import { cn } from "@/lib/utils";
-import { quoteLiteral } from "@/lib/sql/values";
+import { ChunkBoundary, ViewLoading } from "@/components/LazyView";
+import { lazyRetry } from "@/lib/lazy";
+import { editorLanguageForTabType } from "@/lib/editor/tab-language";
+import { buildResultExport, type ResultExportFormat } from "@/lib/export/result-export";
+import { downloadText } from "@/lib/export/download";
+
+// The ERD is the largest thing this shell can mount (`@xyflow/react` + the elk layout
+// engine + the snapdom capture), and it is mounted only while `showDiagram` is true.
+// Split for the same reason the bottom panel's heavy views are, and through the same
+// `React.lazy` seam — this shell imports nothing from `next` by construction.
+const SchemaDiagram = React.lazy(
+  lazyRetry(() => import("@/components/SchemaDiagram").then((m) => ({ default: m.SchemaDiagram }))),
+);
 
 /**
- * Scoped CSS for studio's dark theme.
- * When embedded in a host app that uses different CSS variable formats
- * (e.g. OKLCH instead of hex), studio injects its own scoped styles
- * to ensure correct rendering. Uses data-studio-workspace attribute
- * for high-specificity scoping without affecting the host app.
+ * Scoped CSS for the shadcn token set studio's primitives read.
+ *
+ * A host app may express these in a different format (OKLCH rather than hex), so
+ * studio restates them for its own subtree, scoped by `data-studio-workspace` to
+ * get the specificity without touching the host.
+ *
+ * BOTH palettes, keyed off the same `dark` class everything else here follows.
+ * Light is the base and dark overrides it, so a host that has not opted into dark
+ * gets a light studio — matching what `useEffectiveTheme()` reports and what the
+ * `--studio-*` tokens resolve to. Pinning this block to dark, as it used to be,
+ * produced the one thing worse than either theme: dark chrome around a light
+ * editor, light charts and a light diagram.
  */
 const STUDIO_SCOPED_CSS = `
 [data-studio-workspace] {
-  /* Dark theme — monochrome (black/white/gray) */
+  /* Light theme — monochrome (white/black/gray) */
+  --background: #ffffff;
+  --foreground: #09090b;
+  --card: #ffffff;
+  --card-foreground: #09090b;
+  --popover: #ffffff;
+  --popover-foreground: #09090b;
+  --primary: #18181b;
+  --primary-foreground: #fafafa;
+  --secondary: #f4f4f5;
+  --secondary-foreground: #18181b;
+  --muted: #f4f4f5;
+  --muted-foreground: #52525b;
+  --accent: #f4f4f5;
+  --accent-foreground: #18181b;
+  --destructive: #dc2626;
+  --destructive-foreground: #fafafa;
+  --border: #e4e4e7;
+  --input: #e4e4e7;
+  --ring: #71717a;
+  --radius: 0.5rem;
+  --chart-1: #18181b;
+  --chart-2: #3f3f46;
+  --chart-3: #52525b;
+  --chart-4: #71717a;
+  --chart-5: #a1a1aa;
+
+  /* Font — Geist (inherited from host or fallback to system) */
+  font-family: var(--font-geist-sans, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: "rlig" 1, "calt" 1;
+  letter-spacing: -0.011em;
+}
+/* Dark — the values this block carried before it learned a second palette.
+   Higher specificity than the base rule, so the class alone decides. */
+.dark [data-studio-workspace],
+[data-studio-workspace].dark {
   --background: #09090b;
   --foreground: #fafafa;
   --card: #09090b;
@@ -50,19 +105,11 @@ const STUDIO_SCOPED_CSS = `
   --border: #27272a;
   --input: #27272a;
   --ring: #d4d4d8;
-  --radius: 0.5rem;
   --chart-1: #e4e4e7;
   --chart-2: #a1a1aa;
   --chart-3: #71717a;
   --chart-4: #52525b;
   --chart-5: #3f3f46;
-
-  /* Font — Geist (inherited from host or fallback to system) */
-  font-family: var(--font-geist-sans, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif);
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  font-feature-settings: "rlig" 1, "calt" 1;
-  letter-spacing: -0.011em;
 }
 [data-studio-workspace] *,
 [data-studio-workspace] *::before,
@@ -137,7 +184,7 @@ export function StudioWorkspace({
   // 2. Tab Manager (pure UI state, reused as-is)
   const tabMgr = useTabManager({
     activeConnection: conn.activeConnection,
-    metadata: null,
+    metadata: conn.metadata,
     schema: conn.schema,
   });
 
@@ -171,7 +218,6 @@ export function StudioWorkspace({
   const [isSaveQueryModalOpen, setIsSaveQueryModalOpen] = useState(false);
   const [savedKey, setSavedKey] = useState(0);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
-  const [isNL2SQLOpen, setIsNL2SQLOpen] = useState(false);
   const [profilerTable, setProfilerTable] = useState<string | null>(null);
   const [codeGenTable, setCodeGenTable] = useState<string | null>(null);
   const [testDataTable, setTestDataTable] = useState<string | null>(null);
@@ -201,81 +247,25 @@ export function StudioWorkspace({
     [conn.activeConnection, tabMgr.currentTab.query, onSaveQueryProp, toast],
   );
 
-  // === Export results (simplified, no masking) ===
+  // === Export results (shared writers; this shell applies no masking) ===
   const exportResults = useCallback(
-    (format: "csv" | "json" | "sql-insert" | "sql-ddl") => {
+    (format: ResultExportFormat) => {
       if (!tabMgr.currentTab.result) return;
-      const data = tabMgr.currentTab.result.rows;
-      let content = "";
-      let mimeType = "text/plain";
-      let ext: string = format;
-
-      if (format === "csv") {
-        const headers = Object.keys(data[0] || {}).join(",");
-        const rows = data
-          .map((row) =>
-            Object.values(row)
-              .map((val) => `"${val}"`)
-              .join(","),
-          )
-          .join("\n");
-        content = `${headers}\n${rows}`;
-        mimeType = "text/csv";
-        ext = "csv";
-      } else if (format === "json") {
-        content = JSON.stringify(data, null, 2);
-        mimeType = "application/json";
-        ext = "json";
-      } else if (format === "sql-insert") {
-        const tableName = tabMgr.currentTab.name.replace(/^Query[: ]*/, "") || "table_name";
-        const columns = Object.keys(data[0] || {});
-        const lines = data.map((row) => {
-          const values = columns.map((col) => {
-            const val = row[col];
-            if (val === null || val === undefined) return "NULL";
-            if (typeof val === "number" || typeof val === "boolean") return String(val);
-            // The exported file is SQL that runs somewhere later, usually
-            // unattended, and every value in it is data the table held. Quoting is
-            // the connected engine's own: doubling the quote alone would let a
-            // value ending in a backslash close its literal and have the rest of
-            // the file read as statements (#290).
-            return quoteLiteral(String(val), conn.activeConnection?.type);
-          });
-          return `INSERT INTO ${tableName} (${columns.join(", ")}) VALUES (${values.join(", ")});`;
-        });
-        content = lines.join("\n");
-        mimeType = "text/sql";
-        ext = "sql";
-      } else if (format === "sql-ddl") {
-        const tableName = tabMgr.currentTab.name.replace(/^Query[: ]*/, "") || "table_name";
-        const columns = Object.keys(data[0] || {});
-        const colDefs = columns.map((col) => {
-          const sampleVal = data[0]?.[col];
-          let sqlType = "TEXT";
-          if (typeof sampleVal === "number") {
-            sqlType = Number.isInteger(sampleVal) ? "INTEGER" : "NUMERIC";
-          } else if (typeof sampleVal === "boolean") {
-            sqlType = "BOOLEAN";
-          } else if (sampleVal instanceof Date) {
-            sqlType = "TIMESTAMP";
-          }
-          return `  ${col} ${sqlType}`;
-        });
-        content = `CREATE TABLE ${tableName} (\n${colDefs.join(",\n")}\n);`;
-        mimeType = "text/sql";
-        ext = "sql";
-      }
-
-      const fileName = `query_result_export.${ext}`;
-      const blob = new Blob([content], { type: mimeType });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = fileName;
-      link.click();
-      URL.revokeObjectURL(url);
+      const file = buildResultExport(format, {
+        rows: tabMgr.currentTab.result.rows,
+        fields: tabMgr.currentTab.result.fields,
+        tabName: tabMgr.currentTab.name,
+        // Was missing from this callback's dependencies, so a SQL export written
+        // after the host switched connections quoted its literals for whichever
+        // engine happened to be active on the first render.
+        dialect: conn.activeConnection?.type,
+        // The host's own declared column types (`use-query-adapter` carries them),
+        // which the DDL form prefers over a type guessed from a value.
+        columnTypes: tabMgr.currentTab.result.columnTypes,
+      });
+      downloadText(file.content, file.mimeType, `query_result_export.${file.extension}`);
     },
-    [tabMgr.currentTab],
+    [tabMgr.currentTab, conn.activeConnection?.type],
   );
 
   // === Table click handler ===
@@ -292,13 +282,16 @@ export function StudioWorkspace({
   return (
     <div
       data-studio-workspace=""
-      className={cn(
-        "dark flex h-full w-full bg-[#050505] text-zinc-100 overflow-hidden font-sans select-none",
-        className,
-      )}
+      // No `dark` class here. The host owns the theme — its <html> carries the
+      // class, `useEffectiveTheme()` reads it, and the tokens resolve from it.
+      // Pinning it here made the chrome dark while everything that consults the
+      // host went light, in a light host only.
+      className={cn("flex h-full w-full bg-canvas text-fg overflow-hidden font-sans select-none", className)}
     >
-      <ResizablePanelGroup id="workspace-main" direction="horizontal" className="h-full">
-        <ResizablePanel defaultSize={22} minSize={15} maxSize={35} className="hidden md:block">
+      <ResizablePanelGroup id="workspace-main" orientation="horizontal" className="h-full">
+        {/* Sizes are strings on purpose: react-resizable-panels 4 reads a bare
+            number as pixels and a unitless string as a percentage. */}
+        <ResizablePanel id="workspace-sidebar" defaultSize="22" minSize="15" maxSize="35" className="hidden md:block">
           <Sidebar
             connections={conn.connections}
             activeConnection={conn.activeConnection}
@@ -315,15 +308,15 @@ export function StudioWorkspace({
             isAdmin={false}
             onOpenMaintenance={noop}
             databaseType={conn.activeConnection?.type}
-            metadata={null}
+            metadata={conn.metadata}
             onProfileTable={features.codeGenerator ? (name: string) => setProfilerTable(name) : undefined}
             onGenerateCode={features.codeGenerator ? (name: string) => setCodeGenTable(name) : undefined}
             onGenerateTestData={features.testDataGenerator ? (name: string) => setTestDataTable(name) : undefined}
           />
         </ResizablePanel>
         <ResizableHandle className="hidden md:flex w-1 bg-transparent hover:bg-blue-500/30 transition-colors" />
-        <ResizablePanel defaultSize={78}>
-          <div className="flex-1 flex flex-col min-w-0 h-full bg-[#0a0a0a]">
+        <ResizablePanel id="workspace-body" defaultSize="78">
+          <div className="flex-1 flex flex-col min-w-0 h-full bg-surface">
             {/* No desktop/mobile headers — platform provides its own */}
 
             <StudioTabBar
@@ -343,19 +336,31 @@ export function StudioWorkspace({
               {/* Schema Diagram overlay */}
               {features.schemaDiagram && (
                 <AnimatePresence>
-                  {showDiagram && <SchemaDiagram schema={conn.schema} onClose={() => setShowDiagram(false)} />}
+                  {showDiagram && (
+                    // A visible fallback and a boundary, for the reason spelled out at
+                    // the same mount in `src/components/Studio.tsx`: this is the
+                    // heaviest chunk, and it is fetched from whatever base the
+                    // embedding host serves the package's assets from.
+                    <ChunkBoundary label="The diagram">
+                      <React.Suspense
+                        fallback={<ViewLoading label="Loading the diagram" className="absolute inset-0 z-20" />}
+                      >
+                        <SchemaDiagram schema={conn.schema} onClose={() => setShowDiagram(false)} />
+                      </React.Suspense>
+                    </ChunkBoundary>
+                  )}
                 </AnimatePresence>
               )}
 
               {/* Editor area — no mobile database/schema tab panels in embedded mode (no MobileNav to switch to them) */}
               <div className="h-full">
                 <div className="h-full">
-                  <ResizablePanelGroup id="workspace-editor" direction="vertical">
-                    <ResizablePanel defaultSize={40} minSize={20}>
+                  <ResizablePanelGroup id="workspace-editor" orientation="vertical">
+                    <ResizablePanel id="workspace-editor-top" defaultSize="40" minSize="20">
                       <div className="h-full flex flex-col">
                         <QueryToolbar
                           activeConnection={conn.activeConnection}
-                          metadata={null}
+                          metadata={conn.metadata}
                           isExecuting={tabMgr.currentTab.isExecuting}
                           playgroundMode={false}
                           transactionActive={false}
@@ -363,12 +368,21 @@ export function StudioWorkspace({
                           onSaveQuery={onSaveQueryProp ? () => setIsSaveQueryModalOpen(true) : noop}
                           onExecuteQuery={() => queryExec.executeQuery()}
                           onCancelQuery={queryExec.cancelQuery}
-                          onBeginTransaction={noop}
-                          onCommitTransaction={noop}
-                          onRollbackTransaction={noop}
-                          onTogglePlayground={noop}
-                          onToggleEditing={noop}
-                          onImport={features.dataImport ? () => setIsImportModalOpen(true) : noop}
+                          // Withheld, not `noop`: this shell runs no transaction,
+                          // no sandbox and no inline editing — `transactionActive`
+                          // and `editingEnabled` are hardcoded false above and
+                          // nothing here can change them. While it passed
+                          // `metadata={null}` the group never rendered and `noop`
+                          // was invisible; passing the host's real metadata (#427)
+                          // would have put three dead buttons on any host that
+                          // declares `queryLanguage: "sql"`, with no disabled state
+                          // and no tooltip. A withheld callback hides its control.
+                          onBeginTransaction={undefined}
+                          onCommitTransaction={undefined}
+                          onRollbackTransaction={undefined}
+                          onTogglePlayground={undefined}
+                          onToggleEditing={undefined}
+                          onImport={features.dataImport ? () => setIsImportModalOpen(true) : undefined}
                         />
 
                         <div className="flex-1 relative min-h-0">
@@ -376,23 +390,15 @@ export function StudioWorkspace({
                             ref={queryEditorRef}
                             value={tabMgr.currentTab.query}
                             onContentChange={(val) => tabMgr.updateTabById(tabMgr.currentTab.id, { query: val })}
-                            language={
-                              tabMgr.currentTab.type === "libredb"
-                                ? "libredb"
-                                : tabMgr.currentTab.type === "mongodb"
-                                  ? "json"
-                                  : "sql"
-                            }
-                            tables={conn.tableNames}
-                            databaseType={conn.activeConnection?.type}
+                            language={editorLanguageForTabType(tabMgr.currentTab.type)}
                             schemaContext={conn.schemaContext}
-                            capabilities={undefined}
+                            capabilities={conn.metadata?.capabilities}
                           />
                         </div>
                       </div>
                     </ResizablePanel>
-                    <ResizableHandle className="h-1 bg-white/5 hover:bg-blue-500/20" />
-                    <ResizablePanel defaultSize={60} minSize={20}>
+                    <ResizableHandle className="h-1 bg-fill hover:bg-blue-500/20" />
+                    <ResizablePanel id="workspace-editor-bottom" defaultSize="60" minSize="20">
                       <BottomPanel
                         mode={queryExec.bottomPanelMode}
                         onSetMode={queryExec.setBottomPanelMode}
@@ -400,11 +406,9 @@ export function StudioWorkspace({
                         schema={conn.schema}
                         schemaContext={conn.schemaContext}
                         activeConnection={conn.activeConnection}
-                        metadata={null}
+                        metadata={conn.metadata}
                         historyKey={queryExec.historyKey}
                         savedKey={savedKey}
-                        isNL2SQLOpen={features.ai ? isNL2SQLOpen : false}
-                        onSetIsNL2SQLOpen={features.ai ? setIsNL2SQLOpen : noop}
                         maskingEnabled={false}
                         onToggleMasking={undefined}
                         userRole={currentUser?.role}
@@ -414,7 +418,6 @@ export function StudioWorkspace({
                         onCellChange={noop as never}
                         onApplyChanges={noop}
                         onDiscardChanges={noop}
-                        onExecuteQuery={(q) => queryExec.executeQuery(q)}
                         onLoadQuery={(q) => tabMgr.updateCurrentTab({ query: q })}
                         onLoadMore={
                           tabMgr.currentTab.result?.pagination?.hasMore ? queryExec.handleLoadMore : undefined
@@ -518,24 +521,23 @@ export function StudioWorkspace({
 
       {/* Unlimited Query Warning */}
       <AlertDialog open={queryExec.unlimitedWarningOpen} onOpenChange={queryExec.setUnlimitedWarningOpen}>
-        <AlertDialogContent className="bg-[#111] border-white/5 max-w-sm p-0 gap-0 overflow-hidden">
+        <AlertDialogContent className="bg-overlay border-hairline max-w-sm p-0 gap-0 overflow-hidden">
           <div className="px-6 pt-6 pb-4">
             <div className="flex items-start gap-3">
               <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-amber-500/20 to-red-500/10 flex items-center justify-center shrink-0">
                 <AlertTriangle strokeWidth={1.5} className="w-5 h-5 text-amber-400" />
               </div>
               <div className="flex-1 min-w-0">
-                <AlertDialogTitle className="text-xs font-medium text-zinc-100 mb-1">
-                  Load all results?
-                </AlertDialogTitle>
-                <AlertDialogDescription className="text-xs text-zinc-500 leading-relaxed">
-                  This may slow down your browser. Max <span className="text-zinc-400">100K</span> rows will be loaded.
+                <AlertDialogTitle className="text-xs font-medium text-fg mb-1">Load all results?</AlertDialogTitle>
+                <AlertDialogDescription className="text-xs text-fg-muted leading-relaxed">
+                  This may slow down your browser. Max <span className="text-fg-tertiary">100K</span> rows will be
+                  loaded.
                 </AlertDialogDescription>
               </div>
             </div>
           </div>
           <div className="px-6 pb-6 flex gap-2">
-            <AlertDialogCancel className="flex-1 h-9 bg-white/5 border-0 text-zinc-400 text-xs font-medium hover:bg-white/10 hover:text-zinc-200">
+            <AlertDialogCancel className="flex-1 h-9 bg-fill border-0 text-fg-tertiary text-xs font-medium hover:bg-fill-strong hover:text-fg">
               Cancel
             </AlertDialogCancel>
             <AlertDialogAction

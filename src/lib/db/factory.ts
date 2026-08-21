@@ -111,6 +111,36 @@ export async function createDatabaseProvider(
       return new DruidProvider(connection, options);
     }
 
+    case "trino": {
+      // The explicit /index specifier keeps this dynamic import statically
+      // analysable: a bare directory resolves only at runtime, which the bundler
+      // cannot trace into a chunk.
+      const { TrinoProvider } = await import("./providers/sql/trino/index");
+      return new TrinoProvider(connection, options);
+    }
+
+    case "cassandra": {
+      // The explicit /index specifier keeps this dynamic import statically
+      // analysable: a bare directory resolves only at runtime, which the bundler
+      // cannot trace into a chunk.
+      const { CassandraProvider } = await import("./providers/sql/cassandra/index");
+      return new CassandraProvider(connection, options);
+    }
+
+    // Search engines - two type-ids, ONE implementation module (issue #424 Phase 1).
+    // The explicit /index specifier keeps this dynamic import statically
+    // analysable: a bare directory resolves only at runtime, which the bundler
+    // cannot trace into a chunk.
+    case "elasticsearch": {
+      const { ElasticsearchProvider } = await import("./providers/sql/search/index");
+      return new ElasticsearchProvider(connection, options);
+    }
+
+    case "opensearch": {
+      const { OpenSearchProvider } = await import("./providers/sql/search/index");
+      return new OpenSearchProvider(connection, options);
+    }
+
     // Document Databases - dynamically imported
     case "mongodb": {
       const { MongoDBProvider } = await import("./providers/document/mongodb");
@@ -139,7 +169,10 @@ export async function createDatabaseProvider(
 
     default:
       throw new DatabaseConfigError(
-        `Unknown database type: ${connection.type}. Supported types: postgres, mysql, sqlite, oracle, mssql, clickhouse, druid, mongodb, couchbase, redis, libredb`,
+        // This list is NOT type-checked against the union - a new case above with no
+        // entry here is silent - so it is kept in the same order as the cases and
+        // tests/unit/db/factory.test.ts pins individual names in it by regex.
+        `Unknown database type: ${connection.type}. Supported types: postgres, mysql, sqlite, oracle, mssql, clickhouse, druid, trino, cassandra, elasticsearch, opensearch, mongodb, couchbase, redis, libredb`,
         connection.type,
       );
   }
@@ -330,21 +363,51 @@ export async function getOrCreateProvider(
 // ============================================================================
 
 /**
- * The execution profiles this factory can vend. Exactly one exists today; an
- * unknown profile string is refused, never defaulted (fail closed).
+ * The execution profiles this factory can vend. Three exist: `agent-read-only` for
+ * the paths that send a model-authored statement, `agent-operations` for the curated
+ * reading path that sends none, and `agent-handover` for the editor replay of an
+ * answer a run already produced. An unknown profile string is refused, never
+ * defaulted (fail closed), and what each one means is stated once in
+ * `PROFILE_ACQUISITION`.
  */
-export type ExecutionProfile = "agent-read-only";
+export type ExecutionProfile = "agent-read-only" | "agent-operations" | "agent-handover";
 
 /**
- * What each profile means to a provider that establishes its read-only
- * boundary at open time. Single source of truth for the profile list, so a new
- * profile cannot be accepted without stating the context it is opened under.
+ * What a profile means at acquisition: the context the provider is opened under,
+ * and whether the profile's calls go through `provider.queryReadOnly`.
+ *
+ * Single source of truth for the profile list, so a new profile cannot be accepted
+ * without stating both. The second field is the engine gate, and it is a PROPERTY OF
+ * THE PROFILE rather than of the factory: `agent-read-only` sends model-authored
+ * statements, so it is served only where the engine itself can bound one, and only
+ * `postgres.ts` and `sqlite.ts` implement that. `agent-operations` sends no statement
+ * at all — it calls the curated reporting methods every provider implements — so
+ * requiring a read-only STATEMENT path of it would refuse an engine over a capability
+ * the profile never uses. `agent-handover` sends a statement too — the one a run
+ * already answered with, replayed in the user's editor — so it takes the same gate as
+ * `agent-read-only`; it is a separate row because it carries a different BUDGET
+ * (`AGENT_HANDOVER_BUDGET`), and a shared row would have made a later change to one
+ * path silently move the other.
+ *
+ * What all three profiles share is everything that makes the acquisition safe: the
+ * same `readOnly: true` execution context (on PostgreSQL that still verifies the role
+ * is unprivileged at open), the same `agentUser` credential resolution, and the same
+ * profiled cache — so neither an operations run nor an editor replay is ever handed
+ * the editor's writable pool.
  */
-const PROFILE_EXECUTION_CONTEXT: Record<ExecutionProfile, ProviderExecutionContext> = {
-  "agent-read-only": { readOnly: true },
+interface ProfileAcquisition {
+  readonly context: ProviderExecutionContext;
+  /** Refuse the provider unless it exposes a database-native read-only statement path. */
+  readonly requiresReadOnlyStatements: boolean;
+}
+
+const PROFILE_ACQUISITION: Record<ExecutionProfile, ProfileAcquisition> = {
+  "agent-read-only": { context: { readOnly: true }, requiresReadOnlyStatements: true },
+  "agent-operations": { context: { readOnly: true }, requiresReadOnlyStatements: false },
+  "agent-handover": { context: { readOnly: true }, requiresReadOnlyStatements: true },
 };
 
-const EXECUTION_PROFILES: ReadonlySet<string> = new Set(Object.keys(PROFILE_EXECUTION_CONTEXT));
+const EXECUTION_PROFILES: ReadonlySet<string> = new Set(Object.keys(PROFILE_ACQUISITION));
 
 /**
  * Resolves the optional least-privilege agent credential from the connection
@@ -391,8 +454,13 @@ function resolveAgentCredential(connection: DatabaseConnection): { user: string;
  * the shared writable cache in either direction: the profiled provider has
  * its own keyed lifecycle, so an agent execution can never be handed the
  * editor's fully-privileged pool, and an editor request can never be handed a
- * read-only one. Providers whose type has no database-native read-only
- * wrapper are refused rather than silently served `query()` (fail closed).
+ * read-only one.
+ *
+ * Whether a provider without a database-native read-only wrapper is refused is the
+ * PROFILE's decision, not this function's: under `agent-read-only` it is refused
+ * rather than silently served `query()` (fail closed), and under `agent-operations`
+ * it is served, because that profile sends no statement for a read-only wrapper to
+ * bound. See `PROFILE_ACQUISITION` for the whole of that argument.
  */
 export async function acquireExecutionProfileProvider(
   connection: DatabaseConnection,
@@ -429,8 +497,9 @@ export async function acquireExecutionProfileProvider(
     if (tunnel && !tunnelPreexisted) await tunnel.close().catch(() => {});
   };
 
-  const provider = await createDatabaseProvider(effectiveConnection, options, PROFILE_EXECUTION_CONTEXT[profile]);
-  if (typeof provider.queryReadOnly !== "function") {
+  const acquisition = PROFILE_ACQUISITION[profile];
+  const provider = await createDatabaseProvider(effectiveConnection, options, acquisition.context);
+  if (acquisition.requiresReadOnlyStatements && typeof provider.queryReadOnly !== "function") {
     await closeFreshTunnel();
     throw new ExecutionProfileError(
       `Provider type "${connection.type}" has no database-native read-only execution profile`,

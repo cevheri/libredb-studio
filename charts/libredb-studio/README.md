@@ -2,7 +2,7 @@
 
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/libredb-studio)](https://artifacthub.io/packages/search?repo=libredb-studio)
 
-Web-based SQL IDE for cloud-native teams supporting PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, and Redis.
+Web-based SQL IDE for cloud-native teams supporting fourteen engines - PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino and Apache Cassandra.
 
 ## Prerequisites
 
@@ -40,7 +40,7 @@ helm install libredb libredb/libredb-studio \
 
 ```bash
 helm install libredb oci://ghcr.io/libredb/charts/libredb-studio \
-  --version 0.1.33 \
+  --version 0.1.44 \
   --set secrets.jwtSecret=$(openssl rand -base64 32) \
   --set secrets.adminPassword=MyAdmin123
 ```
@@ -150,50 +150,79 @@ helm install libredb libredb/libredb-studio \
   --set secrets.adminPassword=MyAdmin123
 ```
 
-## Agent Runtime (off by default)
+## Agent Runtime
 
-Studio can run a read-only investigation agent over a connected database. It is **off unless you turn
-it on**, it reuses the AI configuration above (there is no second place to enter a key), and it has no
-dedicated values fields, so its variables are passed through `extraEnv`:
+Studio can run a read-only investigation agent over a connected database, and **there is nothing to
+turn on**. The app derives whether the agent can run from what is true at runtime: a model configured
+through the AI settings above (there is no second place to enter a key) plus a writable ledger
+directory. Configuring a model IS the opt-in, so this install already has an agent:
 
 ```bash
 helm install libredb libredb/libredb-studio \
   --set config.llmProvider=gemini \
   --set secrets.llmApiKey=your-key \
-  --set 'extraEnv[0].name=LIBREDB_AGENT_ENABLED' \
-  --set-string 'extraEnv[0].value=true' \
-  --set 'extraEnv[1].name=WORKFLOW_LOCAL_DATA_DIR' \
-  --set 'extraEnv[1].value=/app/data/workflow' \
   --set secrets.jwtSecret=$(openssl rand -base64 32) \
   --set secrets.adminPassword=MyAdmin123
 ```
 
-`--set-string` on the flag is not decoration: plain `--set …value=true` renders an unquoted YAML
-`true`, and `EnvVar.value` is a string, so the API server rejects the manifest. The brackets are
-single-quoted because some shells (zsh) glob them.
+No `extraEnv` recipe and no `--set-string` trap: **the chart sets
+`WORKFLOW_LOCAL_DATA_DIR=/app/data/workflow` for you**, and `/app/data` is mounted in every render (an
+`emptyDir` by default, the PVC when `persistence.enabled`), so the ledger is writable under this
+chart's `readOnlyRootFilesystem: true`. Override it through `extraEnv` only to put the ledger
+somewhere else — the chart writes it before `extraEnv`, so your entry wins. When the agent cannot run,
+`GET /api/agent/config` says which of the two conditions failed rather than leaving a rail that fails
+on its first Start.
 
-**`WORKFLOW_LOCAL_DATA_DIR` is not optional in this chart.** Run state lives in an append-only ledger,
-and with `WORKFLOW_TARGET_WORLD` unset that ledger is a directory on local disk — by default
-`.workflow-data`, resolved against the container's working directory `/app`. This chart runs with
-`securityContext.readOnlyRootFilesystem: true`, so only `/app/data`, `/app/.next/cache` and `/tmp` are
-writable: without the override above the very first ledger write fails and no run can start. Point it
-inside `/app/data` and enable `persistence` (`persistence.enabled=true`) if you also want a run to
-survive a pod restart — an `emptyDir` loses the ledger with the pod.
+The chart sets it rather than leaning on the image because of when each one ships. `image.tag`
+defaults to the chart's `appVersion`, and the container image gained its own
+`WORKFLOW_LOCAL_DATA_DIR` default in an app version **later than `0.11.0`**, the version this chart
+deploys. On the image a default install actually pulls, an unset variable resolves to `.workflow-data`
+under the container's working directory `/app` — which `readOnlyRootFilesystem: true` makes
+unwritable, and every run would refuse with `LEDGER_UNAVAILABLE`. Once an image carrying the default is
+released the two agree on the same path, so nothing changes for you either way.
 
-**That backend is single-instance.** It takes file locks, which is correct for the default
-`replicaCount: 1` and a misconfiguration for anything above it.
+**Upgrading a deployment that already has `secrets.llmApiKey` set?** Then it has an agent now, whether
+or not you asked for one. Decline it explicitly:
 
-Running agents on more than one replica requires the opt-in PostgreSQL backend, pointed at **its own**
-database rather than one of the databases you connect Studio to:
+```bash
+helm upgrade libredb libredb/libredb-studio --reuse-values --set agent.enabled=false
+```
+
+`agent.enabled` is an off-switch and nothing more. Unset (the default) writes no
+`LIBREDB_AGENT_ENABLED` at all and leaves the runtime deriving its own answer; `false` writes
+`LIBREDB_AGENT_ENABLED=false`, which is the supported way to have AI configured and no agent; `true`
+is accepted and explicit but cannot conjure a model. The chart renders the value as a quoted string,
+which is why no `--set-string` is needed here.
+
+**Run history lives in that ledger, so `persistence` decides whether it survives.** With
+`persistence.enabled=false` the ledger is an `emptyDir`: every run is written, and the entire history
+goes with the pod — a restart of the container keeps it, a rescheduled or recreated pod does not. Set
+`persistence.enabled=true` if a finished run should still be readable tomorrow. The install notes say
+so at the end of a `helm install` that lands in this state.
+
+**The zero-config backend is single-instance, and the chart enforces it.** It keeps run state on each
+pod's own disk behind file locks, which is correct for the default `replicaCount: 1` and broken above
+it: a run started on one pod is simply not there when the browser's next request lands on another. So
+a release that could run agents and asks for more than one replica (or an HPA that can reach two)
+**fails to render**, with a message naming the three ways out. Two of them are real today:
+
+```bash
+# keep the agent, on one pod
+--set replicaCount=1
+# or keep many pods, with no agent anywhere
+--set agent.enabled=false
+```
+
+The third — `WORKFLOW_TARGET_WORLD=@workflow/world-postgres`, the opt-in PostgreSQL backend, pointed
+at **its own** database rather than one of the databases you connect Studio to — lifts the render
+guard when supplied through `extraEnv`:
 
 ```yaml
 # values.yaml — extraEnv is rendered verbatim, so valueFrom works for the URL.
-# Assumes secrets.jwtSecret (or secrets.existingSecret) is set: the chart refuses
-# to render above one replica under zero-config bootstrap, per the note above.
+# Assumes secrets.jwtSecret (or secrets.existingSecret) is set: the chart also
+# refuses to render above one replica under zero-config bootstrap.
 replicaCount: 3
 extraEnv:
-  - name: LIBREDB_AGENT_ENABLED
-    value: "true"
   - name: WORKFLOW_TARGET_WORLD
     value: "@workflow/world-postgres"
   - name: WORKFLOW_POSTGRES_URL
@@ -203,16 +232,32 @@ extraEnv:
         key: postgres-url
 ```
 
-`WORKFLOW_LOCAL_DATA_DIR` is irrelevant here — the PostgreSQL backend keeps nothing on disk — and
-`WORKFLOW_POSTGRES_URL` must be set: left unset, the backend falls back to a development default
-(`postgres://world:world@localhost:5432/world`) rather than refusing.
+…but it **does not work with the published image**: that world is absent from the container image and
+the npx payload (`B16` in the project's `docs/BACKLOG.md`), so multi-replica agent runs are
+unsupported today rather than merely unconfigured. The escape hatch exists because `image.repository`
+is overridable — use it only with an image that carries the world. Two further caveats if you do:
+`WORKFLOW_TARGET_WORLD` accepts only `local` and `@workflow/world-postgres`, and any other value is
+refused when a run is opened rather than defaulted (the workflow runtime would otherwise treat it as a
+module to load); and `WORKFLOW_POSTGRES_URL` must be set, because unset that backend falls back to a
+development default (`postgres://world:world@localhost:5432/world`) rather than refusing.
 
-Two caveats, stated because they decide whether this is usable for you. `WORKFLOW_TARGET_WORLD`
-accepts only `local` and `@workflow/world-postgres`; any other value is refused when a run is opened
-rather than defaulted, because the workflow runtime would otherwise treat it as a module to load. (The
-pod itself starts either way — the value is validated where a backend is actually built, not at boot.)
-And the PostgreSQL backend is **not reachable in the published container image yet** — see `B16` in
-the project's `docs/BACKLOG.md` — so multi-replica agent runs are not deployable from this chart today.
+**The guard's blind spots, completely.** It reads these values and nothing else, so a model configured
+in any of these three places passes it unseen and a multi-replica release renders without complaint:
+
+| Where the model is configured | Why the guard cannot see it |
+| --- | --- |
+| `secrets.existingSecret` | a Secret the chart does not create and cannot read |
+| `extraEnvFrom` | `envFrom` sources, whose keys are not visible to a template |
+| `extraEnv` | rendered verbatim and **not** inspected for `LLM_API_KEY`, `LLM_API_URL` or `LLM_PROVIDER` (the only entry it does look for is `WORKFLOW_TARGET_WORLD`, above) |
+
+Set `agent.enabled=false` by hand in any of those cases. The alternative — counting what cannot be
+read — would refuse to render every existing multi-replica install that keeps a JWT secret in an
+`existingSecret` and configures no AI at all, so the trade is deliberate.
+
+Which providers count as a configured model, when no `agent.enabled` is set: an inline
+`secrets.llmApiKey`, or `config.llmProvider` set to `ollama` or `custom`, both of which the app
+accepts without an API key (`custom` wants `LLM_API_URL` instead). `gemini` and `openai` require a key,
+so they count only when `secrets.llmApiKey` is also set.
 
 Full behaviour, the tool set and the honest limitations are in the project's `docs/AGENT.md`.
 
@@ -247,6 +292,73 @@ helm install libredb libredb/libredb-studio \
   --set "ingress.hosts[0].paths[0].pathType=Prefix" \
   # ... secrets omitted for brevity
 ```
+
+### IPv6 and dual-stack
+
+Dual-stack used to be two settings. Since chart **0.1.42** it is one: the address families the
+**Service** is allocated from. The address the **pod** listens on is no longer a values decision —
+the ConfigMap writes an empty `HOSTNAME`, and the container resolves its own address at startup,
+preferring `::`:
+
+```bash
+helm install libredb libredb/libredb-studio \
+  --set service.ipFamilyPolicy=PreferDualStack
+```
+
+The container does not assume `::` is dual-stack, it proves it: it binds a throwaway listener on
+`::` on an ephemeral port, connects to it over `127.0.0.1`, and keeps `::` only if that connection
+is accepted. It falls back to `0.0.0.0` in two cases — the namespace has no IPv6 at all, or the
+`::` listener really did turn out to be IPv6-only *and* a non-loopback IPv4 address exists that
+would otherwise lose reachability. One line in the pod log names the address it chose and why, so
+`kubectl logs` answers "what is it listening on" without a shell.
+
+`config.bindAddress` overrules the resolver when you would rather state it than leave it to the
+image:
+
+| `config.bindAddress` | Effect |
+|---|---|
+| `""` (default) | the container resolves it, preferring a verified dual-stack `::` |
+| `"::"` | force a dual-stack listener, no probe |
+| `"0.0.0.0"` | pin the container to IPv4 — what every chart before 0.1.42 did unconditionally |
+
+`extraEnv` still wins over `config.bindAddress`: it renders an explicit `env` entry, which
+overrides the ConfigMap key of the same name. As in the `extraEnv` examples further down, a second
+variable needs its own index — reusing `extraEnv[0]` overwrites this one.
+
+**The one pairing that breaks is now a deliberate one.** Kubernetes never checks what address the
+container bound: on a dual-stack cluster the pod has an IPv6 address either way, so the IPv6
+EndpointSlice is populated and kube-proxy routes to it, where an IPv4-only listener answers with a
+TCP RST. Kubelet probes only the primary podIP, so the pod stays `Ready` and the IPv6 path is
+silently dead. That is unreachable by default now; it needs an explicit IPv4 pin, through
+`config.bindAddress` or an `extraEnv` `HOSTNAME`. The install notes warn on exactly that
+combination.
+
+**Upgrading from 0.1.40 or earlier.** A release whose Service is single-stack IPv4 is unaffected in
+practice — the pod answers on IPv4 as before, through the same socket. A release with a dual-stack
+or IPv6 Service starts answering on its IPv6 address, which is the point of the change but is still
+a change: on a cluster where that address is reachable from further away than the IPv4 one, review
+your NetworkPolicy before upgrading, or set `config.bindAddress=0.0.0.0` to keep today's behaviour.
+Pinning `image.tag` to an older release is safe too: those images treat an empty `HOSTNAME` as
+unset and bind `0.0.0.0`, exactly as they do today.
+
+`service.ipFamilyPolicy` takes `SingleStack`, `PreferDualStack` or `RequireDualStack`;
+`service.ipFamilies` pins the order explicitly, e.g. `[IPv6, IPv4]`, and needs a dual-stack policy
+alongside it or the chart refuses to render. Both are empty by default, so the cluster's own
+default applies and existing installs upgrade to an unchanged Service. Three cluster-side rules are
+worth knowing before you set them:
+
+- `RequireDualStack` fails to create on a single-stack cluster, and naming a family the cluster
+  does not have in `service.ipFamilies` is rejected even under `PreferDualStack`.
+- The first entry of `service.ipFamilies` is the primary family — it is what `spec.clusterIP` is
+  allocated from — and it is immutable. Reordering the list on a live Service is rejected; the
+  Service has to be deleted and recreated.
+- A `PreferDualStack` Service is not retroactively upgraded when the cluster later gains
+  dual-stack. Adding the second family is a deliberate change, and removing it again requires
+  setting `service.ipFamilyPolicy=SingleStack` in the same upgrade.
+
+With `service.type: LoadBalancer` these fields govern the cluster IPs only. Whether the external
+address is dual-stack is up to the cloud load-balancer controller, several of which want their own
+annotation for it.
 
 ## Rate Limiting Across Replicas
 
@@ -387,15 +499,33 @@ helm uninstall libredb
 | `secrets.userEmail` | User email | `user@libredb.org` |
 | `secrets.userPassword` | User password (optional; enables the non-admin account) | `""` |
 | `secrets.existingSecret` | Use existing Secret | `""` |
+| `config.bindAddress` | Container bind address (`HOSTNAME`): empty lets the image resolve one, preferring a verified dual-stack `::`; `::` forces it; `0.0.0.0` pins IPv4 | `""` |
 | `config.storageProvider` | Storage: local, sqlite, postgres | `local` |
 | `config.llmProvider` | AI provider | `""` |
+| `agent.enabled` | Explicit off-switch for the agent runtime. Unset writes nothing and the app derives availability (a configured model plus a writable ledger); `false` writes `LIBREDB_AGENT_ENABLED=false`; `true` declines the off-switch but cannot conjure a model. Rendering fails when an agent could run above one replica | unset |
 | `persistence.enabled` | Enable PVC | `false` |
 | `persistence.size` | PVC size | `1Gi` |
 | `persistence.emptyDirSizeLimit` | Cap the `/app/data` emptyDir used when persistence is off (e.g. `512Mi`); empty means unlimited | `""` |
 | `persistence.fixPermissions` | Chown the mounted volume to `runAsUser:fsGroup` in a root init container (hostPath / static PVs the kubelet does not `fsGroup`). Rendering fails when the OpenShift security-context adaptation is active - restricted-v2 rejects a root container and the UID/GID come from the namespace range there | `false` |
 | `service.type` | Service type | `ClusterIP` |
 | `service.port` | Service port | `80` |
+| `service.ipFamilyPolicy` | Service address families: `SingleStack`, `PreferDualStack` or `RequireDualStack`; empty renders no field and leaves the cluster default in place | `""` |
+| `service.ipFamilies` | Explicit family order, e.g. `[IPv4, IPv6]`; entry 0 is the immutable primary family. Two entries require a dual-stack `service.ipFamilyPolicy` (the chart refuses to render otherwise) | `[]` |
 | `ingress.enabled` | Enable Ingress | `false` |
+| `route.labels` | Labels added to every enabled route (a per-route label with the same key wins); `labels` is therefore a reserved key name and cannot be a route name | `{}` |
+| `route.annotations` | Annotations added to every enabled route (a per-route annotation with the same key wins); reserved key name, as `route.labels` | `{}` |
+| `route.main.enabled` | Enables or disables the route | `false` |
+| `route.main.additionalRules` | Additional custom rules appended to `spec.rules` | `[]` |
+| `route.main.annotations` | Annotations for this route only | `{}` |
+| `route.main.apiVersion` | Route apiVersion, e.g. `gateway.networking.k8s.io/v1` or `gateway.networking.k8s.io/v1alpha2` | `gateway.networking.k8s.io/v1` |
+| `route.main.filters` | Filters applied to requests matching this rule | `[]` |
+| `route.main.hostnames` | Hostnames for the route | `[]` |
+| `route.main.httpsRedirect` | Redirect to HTTPS (HTTP 301) instead of routing to the Service | `false` |
+| `route.main.kind` | Route kind; only `HTTPRoute` is supported (schema-enforced) | `HTTPRoute` |
+| `route.main.labels` | Labels for this route only | `{}` |
+| `route.main.matches[0].path.type` | Path match type | `PathPrefix` |
+| `route.main.matches[0].path.value` | Path match value | `/` |
+| `route.main.parentRefs` | Gateways to attach to; required when the route is enabled (rendering fails without it, since it cannot be defaulted) | `[]` |
 | `autoscaling.enabled` | Enable HPA (ignored with SQLite storage: single-writer) | `false` |
 | `autoscaling.minReplicas` | Min replicas | `2` |
 | `autoscaling.maxReplicas` | Max replicas | `10` |

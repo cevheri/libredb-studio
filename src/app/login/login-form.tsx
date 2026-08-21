@@ -6,10 +6,20 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
-import { ExternalLink, Lock, Mail, ShieldCheck, Zap, Globe, Shield, Layers } from "lucide-react";
+import { ExternalLink, Lock, Mail, ShieldCheck, Shield } from "lucide-react";
 import { toast } from "sonner";
 import LibreDBLogo from "@/components/libredb-logo";
 import { CommunitySection } from "@/components/community-section";
+import { ConnectionSignature } from "@/components/login/connection-signature";
+import { DatabaseShowcase } from "@/components/login/database-showcase";
+import { HeroProof, HERO_CLAIMS } from "@/components/login/hero-proof";
+import { WireCompatibleLine } from "@/components/login/wire-compatible-line";
+
+/**
+ * The agent half of the mobile summary. Pulled from `HERO_CLAIMS` rather than retyped, so
+ * the mobile line states exactly what the desktop figure states about the two modes.
+ */
+const agentClaimDetail = HERO_CLAIMS.find((claim) => claim.key === "agent")?.detail ?? "";
 
 function LoginFormInner({ authProvider }: { authProvider: string }) {
   const isOIDC = authProvider === "oidc";
@@ -58,19 +68,19 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
     }
   };
 
-  const features = [
-    { icon: Globe, title: "7+ Database Engines", desc: "PostgreSQL, MySQL, MongoDB, Oracle, SQL Server" },
-    { icon: Zap, title: "AI-Native Queries", desc: "Natural language to SQL with multi-model LLM support" },
-    { icon: Shield, title: "Zero Install", desc: "Browser-based — deploy anywhere with Docker in seconds" },
-    { icon: Layers, title: "Real-Time Monitoring", desc: "Live metrics, schema explorer, and visual ERD diagrams" },
-  ];
-
   return (
     <div className="flex min-h-[100dvh] bg-background">
-      {/* Left Panel - Branding (hidden on mobile) */}
-      <div className="hidden lg:flex lg:w-1/2 xl:w-[55%] relative overflow-hidden">
-        {/* Base background matching app zinc-950 */}
-        <div className="absolute inset-0 bg-zinc-950" />
+      {/*
+        Left Panel - Branding (hidden on mobile).
+
+        Pinned dark with a nested `dark` class, which re-declares the token
+        variables for this subtree only: the panel is a designed dark hero — a
+        deep gradient, a dot grid at 4% white, a glow, and a heading that is
+        literally `text-white` — and following the theme would put white type on a
+        white ground. The sign-in half beside it follows the theme normally.
+      */}
+      <div className="dark hidden lg:flex lg:w-1/2 xl:w-[55%] relative overflow-hidden">
+        <div className="absolute inset-0 bg-surface" />
         <div className="absolute inset-0 bg-gradient-to-b from-blue-950/20 via-transparent to-cyan-950/10" />
 
         {/* Dot grid pattern */}
@@ -87,7 +97,7 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
         <div className="absolute bottom-1/3 right-10 w-64 h-64 bg-cyan-500/[0.05] rounded-full blur-3xl" />
 
         {/* Right edge separator */}
-        <div className="absolute right-0 top-0 bottom-0 w-px bg-white/[0.06]" />
+        <div className="absolute right-0 top-0 bottom-0 w-px bg-fill-strong" />
 
         {/* Content */}
         <div className="relative z-10 flex flex-col p-12 xl:p-16 w-full overflow-y-auto">
@@ -98,7 +108,7 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
             rel="noopener noreferrer"
             className="flex items-center gap-3 group w-fit"
           >
-            <div className="flex h-14 w-14 items-center justify-center rounded-xl bg-white/[0.06] border border-white/[0.08] group-hover:bg-white/[0.10] group-hover:border-white/[0.12] transition-all duration-200">
+            <div className="flex h-14 w-14 items-center justify-center rounded-xl bg-fill-strong border border-hairline-strong group-hover:bg-fill-strong group-hover:border-hairline-strong transition-all duration-200">
               <LibreDBLogo className="h-9 w-9 text-blue-400" />
             </div>
             <span className="text-xl font-semibold text-white tracking-tight group-hover:text-blue-400 transition-colors duration-200">
@@ -106,55 +116,58 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
             </span>
           </a>
 
-          {/* Middle: Hero text + Features */}
-          <div className="space-y-10 mt-auto">
-            <div className="space-y-4 max-w-lg">
-              <h1 className="text-4xl xl:text-5xl font-bold text-white tracking-tight leading-[1.1]">
-                The open-source SQL IDE for
+          {/*
+            Thesis, then evidence, then the proof numbers - three tiers of weight instead of
+            six blocks competing at one weight.
+
+            A single `mt-auto` here, and none below: with `mt-auto` on both the middle and
+            the bottom group the column split its free space in two, and once the content
+            grew past the viewport the two groups closed up against each other and the panel
+            simply overflowed the page (measured at 1294px tall in a 900px viewport, which
+            pushed the sign-in card itself below the fold). The content now ends with the
+            community row, so one auto margin above it is the whole layout.
+          */}
+          <div className="space-y-8 mt-auto">
+            <div className="space-y-4 max-w-xl">
+              <h1 className="text-4xl font-bold text-white tracking-tight leading-[1.1]">
+                The open-source SQL IDE that
                 <span className="bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent">
                   {" "}
-                  cloud-native teams
+                  deploys next to your data
                 </span>
               </h1>
-              <p className="text-lg text-zinc-400 leading-relaxed">
-                Query, explore, and manage all your databases from a single AI-powered interface. Zero install — deploy
-                with Docker in seconds.
+              {/*
+                No longer "deploy with Docker in seconds": Docker is one of two dozen live
+                channels (distribution/channels.yaml), and half of the rest are installers,
+                so the old line was both an undercount and a contradiction of the deb, rpm,
+                Snap, winget, Homebrew and AppImage packages this project ships.
+              */}
+              <p className="text-base text-fg-tertiary leading-relaxed">
+                Point it at a database you already run. Query, explore and manage every one of them from a single
+                workspace.
               </p>
             </div>
 
-            <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
-              {features.map((feature) => (
-                <div
-                  key={feature.title}
-                  className="flex gap-3 p-3 rounded-xl bg-white/[0.03] border border-white/[0.05] pointer-events-none select-none"
-                >
-                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-blue-500/10 border border-blue-500/10">
-                    <feature.icon className="h-4 w-4 text-blue-400" />
-                  </div>
-                  <div>
-                    <p className="text-sm font-medium text-zinc-200">{feature.title}</p>
-                    <p className="text-xs text-zinc-500 mt-0.5">{feature.desc}</p>
-                  </div>
-                </div>
-              ))}
+            <ConnectionSignature />
+
+            {/*
+              The pills and the relatives line are ONE block with a 12px gap, not two
+              siblings in the 32px rhythm above. Two reasons, and the second is a measurement:
+              the line is the second half of the engine list rather than a fourth claim, so it
+              belongs to the pills; and this column had no room to give. At 1280x800 the hero
+              measured exactly 800px before this change - zero slack - so every pixel added
+              here scrolls the page. Folding the two into one block buys back 20px of the 32
+              the standalone gap would have cost.
+            */}
+            <div className="space-y-3">
+              <DatabaseShowcase variant="desktop" />
+              <WireCompatibleLine variant="desktop" />
             </div>
+
+            <HeroProof />
           </div>
 
-          {/* Bottom: DB badges + Community */}
-          <div className="space-y-6 mt-auto">
-            <div className="space-y-3">
-              <p className="text-xs text-zinc-600 uppercase tracking-widest font-medium">Supported Databases</p>
-              <div className="flex flex-wrap gap-2">
-                {["PostgreSQL", "MySQL", "MongoDB", "Oracle", "SQL Server"].map((db) => (
-                  <span
-                    key={db}
-                    className="text-xs px-3 py-1.5 rounded-full bg-white/[0.04] text-zinc-500 border border-white/[0.05] font-medium"
-                  >
-                    {db}
-                  </span>
-                ))}
-              </div>
-            </div>
+          <div className="mt-8">
             <CommunitySection variant="desktop" />
           </div>
         </div>
@@ -173,7 +186,7 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
           >
             <div className="relative">
               <div className="absolute -inset-2 rounded-full bg-blue-500/20 blur-lg" />
-              <div className="relative flex h-20 w-20 items-center justify-center rounded-2xl bg-zinc-900 border border-white/[0.08] shadow-lg shadow-blue-500/10 group-hover:border-blue-500/20 transition-all duration-200">
+              <div className="relative flex h-20 w-20 items-center justify-center rounded-2xl bg-raised border border-hairline-strong shadow-lg shadow-blue-500/10 group-hover:border-blue-500/20 transition-all duration-200">
                 <LibreDBLogo className="h-12 w-12 text-blue-400" />
               </div>
             </div>
@@ -297,19 +310,26 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
             </CardFooter>
           </Card>
 
-          {/* Mobile community + DB pills */}
+          {/*
+            Mobile showcase: the same three derived sources as the hero, condensed. The
+            deploy block collapses to one line and the agent claim to its own paragraph -
+            these tokens follow the viewer's theme, unlike the pinned-dark hero above.
+          */}
           <div className="lg:hidden space-y-4">
+            <DatabaseShowcase variant="mobile" />
+            <WireCompatibleLine variant="mobile" />
+            {/*
+              The same three claims the desktop hero makes, joined into one line rather than
+              re-worded for mobile: `HERO_CLAIMS` is the single source, so a change to the
+              agent copy cannot land on one surface and miss the other.
+            */}
+            <p
+              data-testid="agent-claim"
+              className="text-[10px] text-center text-muted-foreground leading-relaxed select-none"
+            >
+              {HERO_CLAIMS.map((claim) => `${claim.value} ${claim.unit}`).join(" · ")} — {agentClaimDetail}
+            </p>
             <CommunitySection variant="mobile" />
-            <div className="flex flex-wrap justify-center gap-2">
-              {["PostgreSQL", "MySQL", "MongoDB", "Oracle", "SQL Server"].map((db) => (
-                <span
-                  key={db}
-                  className="text-[10px] px-2.5 py-1 rounded-full bg-muted text-muted-foreground font-medium"
-                >
-                  {db}
-                </span>
-              ))}
-            </div>
           </div>
         </div>
       </div>
