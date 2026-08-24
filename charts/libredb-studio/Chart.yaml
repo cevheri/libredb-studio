@@ -2,8 +2,8 @@ apiVersion: v2
 name: libredb-studio
 description: Web-based SQL IDE for cloud-native teams supporting fourteen engines - PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino and Apache Cassandra
 type: application
-version: 0.1.44
-appVersion: "0.13.0"
+version: 0.1.48
+appVersion: "0.13.3"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/libredb/libredb-studio
 icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
@@ -26,10 +26,10 @@ keywords:
   - elasticsearch
   - opensearch
   - trino
-  # Missing since Apache Cassandra shipped in 0.12.0 (#448). ArtifactHub search
-  # matches on keywords, so an engine absent here is an engine nobody finds - and
-  # #167 makes a keyword-only fix cost a chart version of its own, which is why it
-  # rides this release, where `version:` moves anyway.
+  # ArtifactHub search matches on keywords, so an engine absent here is an engine
+  # nobody finds. Added in 0.1.45, one chart version after Apache Cassandra
+  # shipped in 0.12.0 (#448) - #167 makes a keyword-only fix cost a chart version
+  # of its own, so a new engine's keyword belongs in the release that ships it.
   - cassandra
   - web-ide
 maintainers:
@@ -39,18 +39,18 @@ annotations:
   artifacthub.io/category: database
   artifacthub.io/license: MIT
   artifacthub.io/prerelease: "false"
-  # False for this chart version, and this one needs saying, because 0.13.0 does
-  # carry a dependency pin with a CVE attached: adm-zip is held at ^0.6.0 for
-  # CVE-2026-39244, outside what cassandra-driver's own range would resolve to.
-  # It arrives WITH cassandra-driver rather than fixing anything 0.12.0 shipped -
-  # 0.12.0 has no cassandra-driver, therefore no adm-zip - so upgrading removes
-  # no exposure a user of the previous release had. The app-level fixes are
-  # recorded on 0.1.37, which is the chart version that first shipped them, and
-  # the IPv6 bind behaviour is 0.1.42's, unchanged here.
+  # False: what 0.1.48 ADDS is a new optional ConfigMap and a read-only mount - no
+  # dependency moves and no security behaviour changes with it. The appVersion it
+  # carries, 0.13.3, is the one 0.1.47 already published, and 0.13.3's transport fixes
+  # (a rediss:// or couchbases:// URL landing on SSL mode disable, and Couchbase posting
+  # plain HTTP to the TLS management port) are recorded there with this flag set - which
+  # is where an operator looking for them will find them. The app-level security fixes of
+  # earlier releases remain recorded on 0.1.37, the chart version that first shipped
+  # them; the adm-zip pin note belongs to 0.1.44, unchanged.
   artifacthub.io/containsSecurityUpdates: "false"
   artifacthub.io/images: |
     - name: libredb-studio
-      image: ghcr.io/libredb/libredb-studio:0.13.0
+      image: ghcr.io/libredb/libredb-studio:0.13.3
       platforms:
         - linux/amd64
         - linux/arm64
@@ -62,15 +62,10 @@ annotations:
     - name: Source
       url: https://github.com/libredb/libredb-studio
   artifacthub.io/changes: |
-    - "Four more database engines, fourteen in all: Apache Cassandra over CQL, Apache Trino over its own client protocol with no runtime dependency added, and Elasticsearch and OpenSearch as two engines over one shared SQL transport"
-    - "Eighteen further engines are published as wire-compatible, each measured against a live instance rather than assumed from a protocol - MariaDB, TiDB, Vitess, StarRocks, OceanBase, SingleStore, Citus, TimescaleDB, YugabyteDB, AlloyDB Omni, Apache Cloudberry, CockroachDB, Materialize, RisingWave, Valkey, DragonflyDB, KeyDB and FerretDB - so fourteen drivers now reach thirty-two named products"
-    - "How much of the product each of those eighteen gives you differs per engine and is published per engine: full, partial, or SQL editor only. The connection dialog names the relatives a driver serves, and the docs table records the exact version probed and what was found broken"
-    - "Monitoring stops reporting an absent measurement as a measurement: five panels that printed a confident 0 for engines that keep no such counter now leave the field blank"
-    - "The schema explorer emits Redis commands for Redis instead of SQL it cannot run there, from a generator of its own"
-    - "OIDC logout resolves generic end-session URLs from the provider's discovery document rather than building one by hand"
-    - "The query agent enforces single-drive ownership and refuses appends once a run has closed, and its rail answers first instead of narrating its steps"
-    - "Chart 0.1.44 changes no template: its content is the appVersion move to 0.13.0 and the cassandra keyword that ArtifactHub search needs. The IPv6 bind behaviour is 0.1.42's, unchanged"
-    - "Track app release 0.13.0 (appVersion bump; default image tag follows)"
+    - "The query agent can be given settings for a model it has never measured, without a new release: agent.modelTuning mounts a JSON document of measured per-model settings and names it to the app"
+    - "Give agent.modelTuning.existingConfigMap a ConfigMap you created from a file, or agent.modelTuning.document the same content inline; there is no separate enable flag, because naming a source is what enables it"
+    - "A document that is missing, unreadable or off-schema is ignored and the settings the image ships with stand, so this cannot break a working agent - and GET /api/agent/config now tells an admin session which of the two happened"
+    - "Until this version the setting existed but could not be used on Kubernetes: it names a file, and the pod runs with a read-only root filesystem and nowhere to put one"
 dependencies:
   - name: postgresql
     version: "16.x.x"

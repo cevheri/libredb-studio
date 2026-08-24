@@ -117,7 +117,8 @@ Double-quoted identifiers are correct Trino SQL and `information_schema` is spel
 are all inherited unchanged. This is the case `docs/ADDING_A_PROVIDER.md` names ClickHouse for.
 
 Exactly one shared helper is wrong here, and it is overridden: `prepareQuery()`
-([§3.5](#35-offset-comes-before-limit)).
+([§3.5](#35-offset-comes-before-limit)). The transport absorbs the other grammar quirk a caller can
+trip over on its own, the trailing semicolon ([§3.13](#313-a-trailing-semicolon-is-a-syntax-error)).
 
 ### 2.4 Registration & lifecycle
 
@@ -367,15 +368,33 @@ Measured on 476, one statement:
 | Trino type | On the wire | Note |
 |---|---|---|
 | `decimal` | a **string** — `"1.23"` | Never a JS number: `JSON.parse` would round it |
+| `bigint` | an **unquoted number** | The one value this seam rewrites, because the server does not quote it and `JSON.parse` rounds it (below) |
 | `varbinary` | **base64** — `"AQI="` | |
 | `array(T)` | a JSON array | |
 | `map(K,V)` | a JSON object | |
 | `row(…)` | a JSON **array**, positionally | The field names live in the rendered type, not in the value |
 | `timestamp` | `"2020-01-01 10:00:00.000"` | Rendered in **UTC**, pinned by `X-Trino-Time-Zone` |
 
-Nothing is re-interpreted. The timezone pin is deliberate: the protocol's default is "the timezone of
-the Trino cluster, and not the timezone of the client", so leaving it unset makes the same statement
-produce different text depending on where the coordinator happens to run.
+Nothing is re-interpreted, with one declared exception: an integer too wide for a double. The
+timezone pin is deliberate: the protocol's default is "the timezone of the Trino cluster, and not the
+timezone of the client", so leaving it unset makes the same statement produce different text
+depending on where the coordinator happens to run.
+
+**A wide `bigint` is rewritten before the page is parsed.** Measured on 2026-08-22,
+`SELECT CAST(9223372036854775807 AS BIGINT)` puts the exact digits on the wire unquoted, and
+`JSON.parse` answers `9223372036854776000` with no error to catch. Written into `memory` and read
+back through this provider, a value the database held correctly reached the grid wrong. Trino has no
+counterpart to ClickHouse's `output_format_json_quote_64bit_integers` (#264), so the raw text is the
+only place left: `parseJson` runs `quoteUnsafeIntegers` (#265, shared with the Druid transport, which
+is in the same position) over the page first, and both endpoints of the range arrive as strings,
+`"9223372036854775807"` and `"-9223372036854775808"`. Anything a double holds exactly, `42`, is left
+a number, and a `decimal` was never at risk because the server already quotes it.
+
+The pass covers the whole envelope rather than `data` alone, because at that point the body is one
+JSON text and splitting it would mean parsing it twice. The cost is bounded and stated: a `stats`
+counter above 2^53 would arrive as a string and `numberField` would read it as absent, which needs
+`processedBytes` past 9 PB in a single statement. An absent statistic is recoverable, a rounded
+`bigint` in a result row is not, because nothing downstream can tell that it happened.
 
 Column labels are taken from the page's declaration and **de-duplicated** — a second column called
 `x` becomes `x (2)` — because the seam promises `fieldNames` is exactly the key set of every row.
@@ -402,11 +421,30 @@ Measured: `SELECT 1;` answers `line 1:9: mismatched input ';'`. That is what
 `statementTerminator: "none"` declares, and it is mandatory rather than cosmetic — without it the
 shared query generators emit statements this engine refuses.
 
-The transport does **not** strip one for you: the statement reaches the coordinator verbatim. Every
-caller inside the product has already had it removed, because `splitStatements()` consumes the
-semicolon as its delimiter, so this is only reachable by a consumer of the published package calling
-`query()` directly. Recorded as `docs/BACKLOG.md` D5 rather than silently absorbed, because the
-endpoint takes exactly one statement and a strip is a smaller change than it first looks.
+**The transport drops a single trailing semicolon before the statement leaves it**, so
+`query("SELECT 1;")` and `query("SELECT 1")` reach the coordinator as the same bytes. Trailing
+whitespace and a newline after the semicolon count as trailing, which is what a statement pasted out
+of a file carries. This is the second Trino grammar quirk the provider absorbs for the caller — the
+first is the `OFFSET`/`LIMIT` transposition ([§3.5](#35-offset-comes-before-limit)) — and absorbing
+one and not the other was the inconsistency (`docs/BACKLOG.md` D5). Nothing inside the product was
+affected either way: `splitStatements()` consumes the semicolon as its delimiter, so the caller who
+hit this was a consumer of the published package calling `query()` directly.
+
+It is a **strip, not a splitter**, and the difference is the point:
+
+| Statement | Reaches the wire as | Why |
+| --- | --- | --- |
+| `SELECT 1;` | `SELECT 1` | The terminator, dropped |
+| `SELECT 1 ;\n` | `SELECT 1` | Whitespace and a newline after it are trailing too |
+| `SELECT 1; SELECT 2` | unchanged | The endpoint takes exactly one statement, so this keeps failing |
+| `SELECT 1;;` | unchanged | A doubled terminator is a second, empty statement |
+| `SELECT ';';` | `SELECT ';'` | A semicolon inside a literal is data |
+| `SELECT 1 -- done;` | unchanged | A semicolon inside a comment is prose |
+| `SELECT 1; -- done` | unchanged | Declared limit: a terminator with a comment after it is left alone |
+
+Where the statement ends comes from `lib/sql/statement-end` — the same reader the query limiter uses
+(#280), which scans spans rather than matching `/;\s*$/` and refuses to cut a text whose literal or
+comment never closes.
 
 `identifierQuoting: "double"` is declared explicitly for the neighbouring reason (#424 Phase 1's
 lesson): the generators otherwise derive the quote character from `defaultPort`, and `8080` is a
@@ -480,7 +518,8 @@ See [§3.11](#311-values-are-passed-through-exactly-as-the-wire-encodes-them).
 
 ### 5.4 Dialect traps a user will hit
 
-- **No trailing semicolon** ([§3.13](#313-a-trailing-semicolon-is-a-syntax-error)).
+- **No trailing semicolon** in the grammar — one written anyway is dropped by the transport
+  ([§3.13](#313-a-trailing-semicolon-is-a-syntax-error)).
 - **`OFFSET` before `LIMIT`** ([§3.5](#35-offset-comes-before-limit)).
 - **Identifiers are double-quoted**; a backtick is not a quote character.
 - **`SET SESSION` and `USE` do not persist** ([§3.12](#312-statelessness-is-a-warning-not-a-silent-surprise)).
@@ -633,6 +672,7 @@ it. A button that always fails is worse than a stated reason.
 | `supportsExternalQueryLimiting` | `true` | `LIMIT` is injected by the shared limiter, transposed ([§3.5](#35-offset-comes-before-limit)) |
 | `supportsCreateTable` | `true` | In the grammar, live-verified on `memory` ([§5.5](#55-writes-belong-to-the-connector-not-to-the-engine)) |
 | `supportsInlineRowEdit` | `false` | No primary key exists to build a one-row `WHERE` ([§3.8](#38-no-keys-no-indexes--and-why-that-is-a-fact-about-the-engine)) |
+| `supportsTransactions` | `false` | Trino has `START TRANSACTION`, but a transaction lives in an HTTP session header this provider does not carry between statements, so the trio and SANDBOX are not offered (#U13) |
 | `declaresForeignKeys` | `false` | Not in the model at all ([§3.8](#38-no-keys-no-indexes--and-why-that-is-a-fact-about-the-engine)) |
 | `supportsMaintenance` | `true` | |
 | `maintenanceOperations` | `["kill"]` | The only operation the engine itself can promise ([§8](#8-maintenance)) |
@@ -655,6 +695,11 @@ nor the storage.
 | `analyzeGlobalDesc` | *Trino reads the statistics its connectors publish and computes none of its own. Whether a catalog supports ANALYZE is that connector's answer, so nothing runs from here.* |
 | `vacuumGlobalTitle` | *Trino Owns No Storage* |
 | `vacuumGlobalDesc` | *Trino is a query engine: the bytes live in the systems its connectors reach, and reclaiming them is done there. Nothing runs from here.* |
+| `slowQueriesEmptyState` | *Query stats come from system.runtime.queries, which holds only what this coordinator still remembers.* |
+
+The last one is about the monitoring tab rather than maintenance: the Queries panel's empty state was
+hardcoded to PostgreSQL's `pg_stat_statements` advice on every engine (`docs/BACKLOG.md` U12), and
+what Trino has instead is the coordinator's own bounded history ([§7](#7-monitoring--health)).
 
 ---
 
@@ -722,8 +767,8 @@ The integration file's `describe` blocks, in order: metadata · validation · li
 cancellation · error mapping · query preparation · schema · monitoring · maintenance. Between them
 they pin the five measured behaviours the docstring lists — the 200-with-a-failure (asserted against
 the real 3.3 KB / 19-frame `failureInfo`, so "no Java stack is surfaced" is proved against the thing
-it must not surface), `FINISHED` arriving with a `nextUri` still attached, the rejected trailing
-semicolon, the `OFFSET`-before-`LIMIT` transposition, and the 204 that a cancellation of a
+it must not surface), `FINISHED` arriving with a `nextUri` still attached, the trailing semicolon the
+transport drops before the engine can reject it, the `OFFSET`-before-`LIMIT` transposition, and the 204 that a cancellation of a
 never-existent id still returns.
 
 ### 11.3 Run it

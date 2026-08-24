@@ -48,7 +48,7 @@ The config file is YAML (`.yaml`, `.yml`) or JSON (`.json`). Format is auto-dete
 ```yaml
 version: "1"
 
-defaults:                    # Optional — merged into every connection
+defaults:                    # Optional — merges managed/environment/ssl only
   managed: true
   environment: production
   ssl:
@@ -75,6 +75,7 @@ connections:
     # serviceName: "ORCL"     # Oracle only
     # instanceName: "MSSQL$"  # SQL Server only
     # localDataCenter: "datacenter1"  # Cassandra only - REQUIRED there
+    # authSource: "admin"     # MongoDB only - the database the user was created in
 
   - id: "dev-mysql"
     name: "Dev MySQL"
@@ -137,7 +138,7 @@ connections:
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `version` | Yes | — | Must be `"1"` |
-| `defaults` | No | — | Merged into all connections (connection values override) |
+| `defaults` | No | — | Supplies `managed`, `environment` and `ssl` where a connection omits them. No other field is merged |
 | `defaults.managed` | No | `true` | Default managed state |
 | `defaults.environment` | No | — | Default environment label |
 | `defaults.ssl` | No | — | Default SSL config |
@@ -160,6 +161,7 @@ connections:
 | `connections[].serviceName` | No | — | Oracle service name |
 | `connections[].instanceName` | No | — | SQL Server instance name |
 | `connections[].localDataCenter` | No¹ | — | Cassandra local data centre (`datacenter1`). ¹Optional in the schema because no other engine has it, and **required by the Cassandra provider**: the driver refuses to connect without one |
+| `connections[].authSource` | No | — | MongoDB: the database its credentials live in (`admin` in the ordinary deployment). Without it the driver checks the user against the database being opened, which reports a credentials error |
 
 ---
 

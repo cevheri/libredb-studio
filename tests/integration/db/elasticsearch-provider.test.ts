@@ -661,6 +661,7 @@ describe("ElasticsearchProvider metadata", () => {
       supportsExternalQueryLimiting: true,
       supportsCreateTable: false,
       supportsInlineRowEdit: false,
+      supportsTransactions: false,
       declaresForeignKeys: false,
       supportsMaintenance: false,
       maintenanceOperations: [],
@@ -775,6 +776,18 @@ describe("ElasticsearchProvider metadata", () => {
 
     expect(labels.analyzeAction).toBe("Index Statistics");
     expect(labels.vacuumAction).toBe("Merge Segments");
+  });
+
+  test("the empty slow-query panel says the slow log is a node file, not a missing extension", () => {
+    // Measured 2026-08-19 in Chrome on an OpenSearch connection: the monitoring Queries
+    // tab told a search cluster to enable `pg_stat_statements` (#U12). `getSlowQueries()`
+    // is empty by design on both products, so this panel is ALWAYS empty here, and the
+    // sentence is the one §7 of the provider doc already used.
+    const { slowQueriesEmptyState } = new ElasticsearchProvider(makeConnection()).getLabels();
+
+    expect(slowQueriesEmptyState).toContain("slow log");
+    expect(slowQueriesEmptyState).toContain("log file");
+    expect(slowQueriesEmptyState).not.toContain("pg_stat_statements");
   });
 });
 
@@ -2094,7 +2107,7 @@ describe("ElasticsearchProvider monitoring", () => {
 
     const data = await provider.getMonitoringData();
 
-    expect(data.overview.version).toBe("Elasticsearch 9.1.4");
+    expect(data.overview?.version).toBe("Elasticsearch 9.1.4");
     expect(data.tables).toHaveLength(3);
     expect(data.storage).toHaveLength(1);
     expect(data.performance).toEqual({});

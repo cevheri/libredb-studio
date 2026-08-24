@@ -390,6 +390,164 @@ describe("useConnectionForm", () => {
     expect(result.current.testResult!.success).toBe(false);
   });
 
+  /*
+    ── A connectable server whose health surface does not answer ──
+
+    `handleConnect` used to save only `if (result.success)`, and the route answered
+    `success: false` whenever `provider.getHealth()` threw for ANY reason. That is one
+    gate serving two different facts, and three published engines fell through it: on
+    ScyllaDB the health read asked for Cassandra's `system_views` keyspace, which the
+    build does not have (measured 2026-08-24: `Keyspace system_views does not exist`,
+    code 8704), and StarRocks and SingleStore fail health for reasons of their own
+    (the prepared-statement
+    protocol, fixed 2026-08-24). All three connect and run statements fine, and none of them could be
+    created in the dialog at all.
+
+    A connection that `connect()`s is usable, so the route now separates the two facts
+    and the save follows the connect. It is NOT silent: the first click reports what the
+    server refused and saves nothing, and only a second click saves - which is why both
+    arms are asserted here.
+  */
+  const DEGRADED_BODY = {
+    success: true,
+    degraded: true,
+    message: "Connected, but this server answered no health data: Keyspace system_views does not exist",
+  };
+
+  test("a health surface that does not answer no longer refuses the save outright", async () => {
+    mockGlobalFetch({ "/api/db/test-connection": { ok: true, json: DEGRADED_BODY } });
+
+    const onConnect = mock(() => {});
+    const { result } = renderHook(() => useConnectionForm({ ...defaultProps, onConnect }));
+
+    await act(async () => {
+      await result.current.handleConnect();
+    });
+
+    // Nothing saved yet - but the user is told what was found, in the server's words.
+    expect(onConnect).not.toHaveBeenCalled();
+    expect(result.current.testResult!.message).toContain("Keyspace system_views does not exist");
+    expect(result.current.testResult!.message).toContain("again");
+
+    await act(async () => {
+      await result.current.handleConnect();
+    });
+
+    expect(onConnect).toHaveBeenCalledTimes(1);
+  });
+
+  test("the sentence names the button that is actually on screen", async () => {
+    // The dialog renders "Save Changes" when editing and "Establish Connection" when
+    // creating; telling the user to click a button that is not there is worse than
+    // telling them to click none.
+    mockGlobalFetch({ "/api/db/test-connection": { ok: true, json: DEGRADED_BODY } });
+
+    const existing: DatabaseConnection = {
+      id: "edit-degraded",
+      name: "Scylla ring",
+      type: "cassandra",
+      host: "127.0.0.1",
+      port: 9042,
+      database: "probe",
+      createdAt: new Date(0),
+    };
+    const { result } = renderHook(() => useConnectionForm({ ...defaultProps, editConnection: existing }));
+
+    await act(async () => {
+      await result.current.handleConnect();
+    });
+
+    expect(result.current.testResult!.message).toContain("Click Save Changes again");
+  });
+
+  test("a hard connect failure is still refused however many times it is clicked", async () => {
+    // The distinction the fix rests on: `success: false` is a connection that does not
+    // exist, and no number of clicks may save one.
+    mockGlobalFetch({
+      "/api/db/test-connection": { ok: true, json: { success: false, error: "ECONNREFUSED" } },
+    });
+
+    const onConnect = mock(() => {});
+    const { result } = renderHook(() => useConnectionForm({ ...defaultProps, onConnect }));
+
+    await act(async () => {
+      await result.current.handleConnect();
+    });
+    await act(async () => {
+      await result.current.handleConnect();
+    });
+
+    expect(onConnect).not.toHaveBeenCalled();
+    expect(result.current.testResult!.success).toBe(false);
+  });
+
+  test("Test Connection reports the degradation rather than a bare success", async () => {
+    mockGlobalFetch({ "/api/db/test-connection": { ok: true, json: DEGRADED_BODY } });
+
+    const { result } = renderHook(() => useConnectionForm(defaultProps));
+
+    await act(async () => {
+      await result.current.handleTestConnection();
+    });
+
+    // It connected, so the result is a success - and the sentence says what is missing
+    // instead of the "Connected successfully" that hid it.
+    expect(result.current.testResult!.success).toBe(true);
+    expect(result.current.testResult!.message).toContain("no health data");
+  });
+
+  test("closing the dialog withdraws the acknowledgement", async () => {
+    // Otherwise a second connection typed into the same reopened dialog would be saved
+    // on its first click, having reported nothing.
+    mockGlobalFetch({ "/api/db/test-connection": { ok: true, json: DEGRADED_BODY } });
+
+    const onConnect = mock(() => {});
+    const { result, rerender } = renderHook(
+      (props: { isOpen: boolean }) => useConnectionForm({ ...defaultProps, onConnect, isOpen: props.isOpen }),
+      { initialProps: { isOpen: true } },
+    );
+
+    await act(async () => {
+      await result.current.handleConnect();
+    });
+    expect(onConnect).not.toHaveBeenCalled();
+
+    act(() => {
+      rerender({ isOpen: false });
+    });
+    act(() => {
+      rerender({ isOpen: true });
+    });
+
+    await act(async () => {
+      await result.current.handleConnect();
+    });
+
+    expect(onConnect).not.toHaveBeenCalled();
+  });
+
+  test("the platform adapter carries the same two facts", async () => {
+    // The embedded surface passes `onTestConnection` instead of reaching the route, and
+    // a fix that only reached the fetch path would leave the platform dialog refusing.
+    const onTestConnection = mock(async () => ({ success: true, degraded: true, error: "no monitoring here" }));
+    const onConnect = mock(() => {});
+    const { result } = renderHook(() =>
+      useConnectionForm({ ...defaultProps, onConnect, onTestConnection: onTestConnection as never }),
+    );
+
+    await act(async () => {
+      await result.current.handleConnect();
+    });
+    expect(onConnect).not.toHaveBeenCalled();
+    expect(result.current.testResult!.message).toContain("no monitoring here");
+
+    await act(async () => {
+      await result.current.handleConnect();
+    });
+
+    expect(onConnect).toHaveBeenCalledTimes(1);
+  });
+
   // ── handlePasteConnectionString parses and fills form ──────────────────────
 
   test("handlePasteConnectionString parses and fills form fields", () => {
@@ -1045,6 +1203,108 @@ describe("useConnectionForm", () => {
     rerender({ ...defaultProps, editConnection: withoutDC });
 
     expect(result.current.localDataCenter).toBe("");
+  });
+
+  // ── buildConnection with the MongoDB authSource ────────────────────────
+
+  test("buildConnection includes the MongoDB authSource", async () => {
+    const fetchMock = mockGlobalFetch({
+      "/api/db/test-connection": { ok: true, json: { success: true, latency: 20 } },
+    });
+
+    const { result } = renderHook(() => useConnectionForm(defaultProps));
+
+    act(() => {
+      result.current.setType("mongodb");
+      result.current.setAuthSource("admin");
+    });
+
+    await act(async () => {
+      await result.current.handleTestConnection();
+    });
+
+    const testCall = fetchMock.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("/api/db/test-connection"),
+    );
+    const body = JSON.parse(testCall![1]!.body as string);
+    expect(body.authSource).toBe("admin");
+  });
+
+  test("an authSource typed for another engine is not sent", async () => {
+    // MongoDB is the only engine here that keeps its users in a database of their
+    // own, so the field stays on it, exactly as `serviceName` stays on Oracle.
+    const fetchMock = mockGlobalFetch({
+      "/api/db/test-connection": { ok: true, json: { success: true, latency: 20 } },
+    });
+
+    const { result } = renderHook(() => useConnectionForm(defaultProps));
+
+    act(() => {
+      result.current.setType("postgres");
+      result.current.setAuthSource("admin");
+    });
+
+    await act(async () => {
+      await result.current.handleTestConnection();
+    });
+
+    const testCall = fetchMock.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("/api/db/test-connection"),
+    );
+    const body = JSON.parse(testCall![1]!.body as string);
+    expect(body.authSource).toBeUndefined();
+  });
+
+  test("populates the MongoDB authSource in edit mode, and clears it when there is none", () => {
+    // The edit effect OVERWRITES: a connection whose credentials live in the database
+    // it opens must show an empty field, otherwise the last connection's `admin` is
+    // saved onto it and the driver looks for the user in the wrong place.
+    const withAuthDb: DatabaseConnection = {
+      id: "m1",
+      name: "Shop",
+      type: "mongodb",
+      host: "mongo.internal",
+      port: 27017,
+      database: "shop",
+      authSource: "admin",
+      createdAt: new Date(),
+    };
+    const withoutAuthDb: DatabaseConnection = {
+      id: "m2",
+      name: "Other",
+      type: "mongodb",
+      host: "mongo-2.internal",
+      port: 27017,
+      database: "shop",
+      createdAt: new Date(),
+    };
+
+    const { result, rerender } = renderHook((props) => useConnectionForm(props), {
+      initialProps: { ...defaultProps, editConnection: withAuthDb },
+    });
+
+    expect(result.current.authSource).toBe("admin");
+
+    rerender({ ...defaultProps, editConnection: withoutAuthDb });
+
+    expect(result.current.authSource).toBe("");
+  });
+
+  test("clearing the modal clears the authSource before the next new connection", () => {
+    const { result, rerender } = renderHook((props) => useConnectionForm(props), {
+      initialProps: { ...defaultProps, isOpen: true },
+    });
+
+    act(() => {
+      result.current.setType("mongodb");
+      result.current.setAuthSource("admin");
+    });
+
+    expect(result.current.authSource).toBe("admin");
+
+    rerender({ ...defaultProps, isOpen: false });
+
+    expect(result.current.authSource).toBe("");
   });
 
   // ── buildConnection with MSSQL instanceName ────────────────────────────

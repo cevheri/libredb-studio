@@ -85,6 +85,7 @@ Two companion pages carry what this one deliberately does not:
 - [Durability and resume](#durability-and-resume)
 - [The tool set](#the-tool-set)
 - [What bounds a run](#what-bounds-a-run)
+- [Supported models](#supported-models)
 - [The model side](#the-model-side)
 - [Whether the run answered](#whether-the-run-answered)
 - [What the removed AI panels did that a run does not](#what-the-removed-ai-panels-did-that-a-run-does-not)
@@ -130,6 +131,8 @@ run by asking `GET /api/agent/config`, the same way it discovers the storage mod
 | --- | --- | --- |
 | `LIBREDB_AGENT_ENABLED` | unset (derive) | The explicit **off**-switch. `false`/`off`/`0` mean no agent even with AI configured — the supported way to keep the AI configuration and decline the agent. `true`/`on`/`1` are still accepted and mean the default; they cannot conjure a model, because an override that renders a rail whose Start must fail is the outcome deriving exists to prevent. An unrecognized value warns and is ignored. |
 | `WORKFLOW_TARGET_WORLD` | unset (`local`) | Durable backend for run state. Exactly two values are accepted: `local` (zero-config, on-disk, **single instance**) and `@workflow/world-postgres` (opt-in, multi-replica, needs `WORKFLOW_POSTGRES_URL`). Anything else is **refused**, not defaulted. |
+| `AGENT_MODEL_TURN_TIMEOUT_MS` | unset (`90000`) | How long **one** model call may take before the drive stops waiting for it. Raise it for a LOCAL model: the default was chosen against hosted APIs, where a turn lands in seconds and a 90-second wait only ever means a request that is not coming back. Measured across 25 Ollama models on six surfaces, **nine** runs ended `model-timeout` with the model still working — one of them a reasoning model in plan mode, which holds no tools at all, cut 92 s into its **first** turn with a zero-event ledger. Those runs are scored as having answered nothing, which is a fact about this ceiling and not about the model. A value that is not a positive whole number is **ignored** and the default stands; a value is capped just under half the smallest workflow deadline, because a run has to be able to take two turns to finish. |
+| `AGENT_MODEL_TUNING_PATH` | unset | A JSON document of measured per-model settings, layered over the ones Studio ships with. Studio carries a document recording what specific models were measured under — turn limit, how many readings before it is asked to report, whether an empty turn is asked again — and a model not named in it is driven with the defaults, which is the honest treatment of a model nobody has measured. This is how a model Studio has never measured gets settings somebody else measured: mount a file in the same shape and restart, with no Studio release and no code change. Merged **per model and whole** — an entry here replaces the shipped entry for that model rather than contributing one field to it, because half of one measurement beside half of another is a configuration nobody has run. A file that is missing, unreadable or off-schema is **ignored** and the shipped measurements stand — which is the one setting here that fails **open**, so it is also the one that reports itself: `GET /api/agent/config` tells an **admin** session what became of the document (`{"modelTuning":{"state":"applied"\|"ignored"\|"unset",…}}`, with the path and the parser's reason), because an operator who mounts a file and is told nothing will believe it is in force. It carries numbers and switches only: the sentences the drive says to a model stay in Studio, so supplying this file cannot change what Studio tells a model. On Kubernetes the chart mounts it for you — see `agent.modelTuning.*` in [`charts/libredb-studio/README.md`](../charts/libredb-studio/README.md). The document's own contract — every setting, its bounds, what happens to a key this build does not implement, and the example to start from — is [`docs/llms/model-tuning.md`](llms/model-tuning.md). |
 | `WORKFLOW_LOCAL_DATA_DIR` | unset — but the packaged artifacts set it: `/app/data/workflow` from the Helm chart and (from an app version later than `0.11.0`) the container image, `~/.libredb-studio/workflow-data` under `npx`. The SDK's own fallback, which those replace, is `.workflow-data` relative to the working directory. | Where the `local` backend keeps run state, and therefore the second condition above. See [Deployment](#deployment) — the SDK's fallback is wrong in a container and wrong under `npx`, so no artifact leaves it in force. |
 
 The refusal is not pedantry. The workflow runtime reads that variable itself and treats any value
@@ -270,7 +273,7 @@ from *answered* — a run that stopped because the model composed a cited report
 because the model had nothing more to say are both `succeeded`, and only this says which. The rail
 reads it and states the difference. The STATUS word is deliberately not the thing that carries it —
 [Whether the run answered](#whether-the-run-answered) is the field that does, beside the status
-rather than instead of it (B24).
+rather than instead of it.
 
 `stopReason` sits beside `reason`, which says why a drive died before or outside the loop. They
 answer different questions and are mutually exclusive in practice; when both are present, `reason`
@@ -1385,6 +1388,16 @@ error message all come from whoever can write to the database, so everything cro
 is fenced first: a header naming what the content is and where it came from, and a stated boundary
 the content cannot forge. This is the same firewall the maintainer loop applies to public issue text.
 
+**A binary cell reaches the model as hex, not as its wire JSON** (2026-08-24). A `bytea`, `BLOB` or
+`blob` value used to be put in the prompt by a plain `JSON.stringify`, so the model was handed
+`{"type":"Buffer","data":[1,2,171]}` — roughly four characters of context per byte of data, and a
+shape it had to interpret — while every other surface in the product showed `\x0102ab`. `renderRows`
+now reads the same `asBytes`/`binaryText` module the grid, the row detail sheet and the CSV read.
+Measured on a 160-byte value: 556 characters before, 322 after. The model gets the FULL hex rather
+than the grid's 32-byte compact-cell preview, because that cutoff exists for a one-line cell and a
+model asked to compare two values needs the whole one. `state-guard.ts` is unaffected either way:
+`RESULT_PAYLOAD_KEYS` refuses a raw result set wholesale, so no row value reaches run state.
+
 **A notation the server writes needs more than a fence** (`er-diagram.ts`). The relations block turns
 the inventory's foreign keys into a graph, and a fence around it says only where the server stopped
 talking — it does nothing about a table literally named `orders -> secrets`, which would produce a
@@ -1395,9 +1408,27 @@ on. It is a relation list rather than Mermaid for the same reason — `||--o{` i
 than a quoted pair, and a diagram drawing a relation the database does not have is worse than none.
 Two further rules follow from the same principle rather than from formatting: a pairing this
 inventory cannot know is **not invented** (several edges between one pair of tables may be separate
-keys or one composite key returned as a cross product, B8, so the group is one line that names the
-columns and says the pairing is unknown), and the block is bounded in **characters**, because a
+single-column keys or the columns of one composite key: the composed read is one row per referencing
+column and carries no constraint identity, so nothing downstream can group them — the group is one
+line that names the columns and says the pairing is unknown), and the block is bounded in **characters**, because a
 count of edges is not a bound on a prompt.
+
+**An empty relations read is three facts, and the block says which one it has**
+(`er-diagram.ts`). A zero-row read cannot tell a schema that declares no foreign key from a role that
+cannot see the ones it declares, and a run that treats those as the same thing states a falsehood
+with a citation attached: measured on the seeded dvdrental, the `SELECT`-only role
+[`docs/AGENT_DEMO.md`](./AGENT_DEMO.md) prescribes read 0 rows where `pg_constraint` holds 18, and an
+investigation answered "there are no declared foreign key constraints between tables in the
+database" — cited, confident and wrong. The read is fixed at its source (`composePostgresRelations`
+reads `pg_constraint`, which needs only `USAGE` on the schema), and that fix does not settle the
+general case, since any role can be narrower than its database. So the block distinguishes three
+cases: an engine with no such construct is told nothing could have been found (from
+`ProviderCapabilities.declaresForeignKeys`, never from the connection's type); a read that returned
+rows gets the rows; and a read that returned none on an engine that has them is told what was not
+seen — the limit of the reading, plus an instruction not to report that this database has no foreign
+keys and to treat any join the run relies on as inferred from names rather than declared. It is the
+same rule the inventory's omission notice follows: what was not read is said, because silence gets
+read as absence.
 
 ## What bounds a run
 
@@ -1516,6 +1547,32 @@ database* may be repaired. **A policy denial does not consume a repair attempt**
 boundary decision is not a defect in a statement, and a denial travels to the model as its own kind
 of outcome — the refusal union has no readable engine-text field for the policy variant at all, so a
 denial cannot be re-fed to the model as though the SQL were malformed.
+
+## Supported models
+
+Ten models run every agent surface. Each cleared all six — Investigate, Optimize, Assess, Operate,
+Analyze and Plan — five consecutive times, at the turn limit the product ships, which is 30 of 30
+runs. Each has a page of its own with its measured durations and whatever it needs that the others
+do not.
+
+| Model | Served through | Median run | Slowest run |
+| --- | --- | --- | --- |
+| [`gemini-3.5-flash-lite`](models/gemini-3-5-flash-lite.md) | Gemini API | 10 s | 24 s |
+| [`granite4.1:8b`](models/granite4-1-8b.md) | Ollama | 10 s | 21 s |
+| [`ornith:9b`](models/ornith-9b.md) | Ollama | 25 s | 82 s |
+| [`qwen3.5:9b`](models/qwen3-5-9b.md) | Ollama | 25 s | 98 s |
+| [`granite4.1:30b`](models/granite4-1-30b.md) | Ollama | 26 s | 46 s |
+| [`qwen3:8b`](models/qwen3-8b.md) | Ollama | 32 s | 132 s |
+| [`qwen3:14b`](models/qwen3-14b.md) | Ollama | 39 s | 151 s |
+| [`gemma4:26b`](models/gemma4-26b.md) | Ollama | 46 s | 180 s |
+| [`qwen3.8:latest`](models/qwen3-8-latest.md) | Ollama | 62 s | 347 s |
+| [`qwen3:4b`](models/qwen3-4b.md) | Ollama | 75 s | 139 s |
+
+The durations are from one machine and are comparable with each other rather than portable: every
+figure was taken the same way, on the same database, through the same six surfaces.
+
+Nothing prevents another model from being configured — the capability probe below decides what any
+given endpoint can do, and there is no allow-list in the code. What the ten have is a measurement.
 
 ## The model side
 
@@ -1698,7 +1755,7 @@ Two honest limits, both deliberate:
   own words to decide whether the model answered would be grading the answer with the
   answer. What is checked is what the claims **rested on**, which is a fact about the run.
   A citation the ledger cannot resolve is skipped rather than assumed empty.
-- **The verdict is on the ledger, beside the status rather than instead of it** (B24, ratified
+- **The verdict is on the ledger, beside the status rather than instead of it** (ratified
   2026-08-13). `run-finished` carries an optional `goalVerdict`, written by
   `AgentRunService.finalize` — the one method every terminal path goes through, including the
   cancellation checkpoint that ends a run without returning to the loop. The status vocabulary is
@@ -2235,11 +2292,11 @@ They are listed here so the honest boundary is visible from the behaviour docume
 from the tracker.
 
 **Inherited from the enforcement layer** — `docs/BACKLOG.md`, section "Agent M1 deferrals (#328)",
-entries A1-A3 (that file carries a second, unrelated A-series under its security section). These bound
-what any agent statement can be promised: a SQLite statement is not preempted, so its timeout is post-execution and
-an overrunning statement blocks the runtime (A1); `VACUUM INTO` can create an empty file at a chosen
-path (A2); out-of-scope **reads** have no database-native control on either provider — the
-declared-target allowlist, the statement guard and the role's own grants are the whole boundary (A3).
+entries A1-A3. These bound what any agent statement can be promised: a SQLite statement is not
+preempted, so its timeout is post-execution and an overrunning statement blocks the runtime (A1);
+`VACUUM INTO` can create an empty file at a chosen path (A2); out-of-scope **reads** have no
+database-native control on either provider — the declared-target allowlist, the statement guard and
+the role's own grants are the whole boundary (A3).
 
 **From this milestone:**
 
@@ -2251,8 +2308,6 @@ declared-target allowlist, the statement guard and the role's own grants are the
   cancel.
 - **B5** — the ledger assumes one writer per run and cannot enforce it.
 - **B6** — every cost ceiling is per-drive, so N resumes can cost up to N times one drive's budget.
-- **B7** — a PostgreSQL expression index is absent from the schema inventory.
-- **B8** — the composed foreign-key read cannot pair a composite key's columns.
 - **B9** — nothing enqueues a drive, so an interrupted run is resumable but never resumed.
 - **B10** — no token budget is enforced, so the meter reports none.
 - **B11** — the rail can stop a run but cannot pause or resume one.
@@ -2287,12 +2342,13 @@ declared-target allowlist, the statement guard and the role's own grants are the
 - **B34** — a hydrated result cannot be exported: the Export menu serializes the tab's own rows, so it
   is hidden while a run's result is shown.
 
-The next six were found by driving the product against a live model in a browser, which is the only
-way any of them could have been found: every one of them passes every gate. The one after them was
-found later, by another route, and is listed here because it is the same kind of thing — a defect
-no gate in this repository objects to. The last three came from repeating that exercise against the
-inference surface (#407) — twenty-six runs over `docs/AGENT_DEMO.md`, which is also where the
-classifier's real-world agreement rate was measured — and they are the same kind of thing again.
+The entries below were found by driving the product against a live model in a browser, which is the
+only way any of them could have been found: every one of them passes every gate. A few were found
+later and by other routes, and are listed here because they are the same kind of thing — a defect no
+gate in this repository objects to. Several came from repeating that exercise against the inference
+surface (#407) — twenty-six runs over `docs/AGENT_DEMO.md`, which is also where the classifier's
+real-world agreement rate was measured. The count is deliberately not stated: entries leave this list
+as they are fixed, and a numeral here goes stale silently.
 
 - **B36** — a follow-up question is answered as if it were the first. Runs carry no memory of each
   other, and neither the surface nor the model says so — the model picks a plausible referent and
@@ -2306,23 +2362,6 @@ classifier's real-world agreement rate was measured — and they are the same ki
 - **B39** — a data-analysis run has no honest way to conclude that the question is not about this
   database. Its only route to `answered` is a reading of the data, so a run that establishes the
   question is unanswerable fabricates one — the #356 shape again, in a new place.
-- **B40** — `bun dev` cannot log in: the CSP omits `unsafe-eval` in every environment and React's
-  development build needs it, so the login page never hydrates. Production is unaffected.
-- **B41** — `defaults` in a seed config does not merge `roles`, though the documentation says the
-  block is merged into every connection.
-- **B43** — every copy control outside the agent rail reaches `navigator.clipboard` unguarded, and it
-  is a secure-context API: nine call sites across seven components, four of which claim success — by
-  a label or a toast — in the same statement that starts a write nobody observed.
-- **B44** — the composed foreign-key read returns nothing under the least-privilege role this
-  repository's own demo script prescribes, and the run then asserts the negative. PostgreSQL
-  restricts the `information_schema` constraint views to constraints on tables the role owns or
-  holds a privilege other than `SELECT` on, so a `SELECT`-only agent role reads an empty relations
-  graph — measured on the seeded dvdrental as 0 rows where `pg_constraint` holds 18 — and an
-  investigation answers "there are no declared foreign key constraints between tables in the
-  database", confidently, citing a snapshot that genuinely contained nothing. It makes B8's
-  `pg_constraint` rewrite a correctness fix rather than a precision one, and leaves a second half
-  standing behind it: an empty read cannot tell "none exist" from "none visible to this role", and
-  should license neither.
 - **B45** — every query-optimization run is scored `unanswered / empty-evidence`, including one that
   compared two plans, priced both and wrote the correct `CREATE INDEX`. A `sql.explain.estimate`
   artifact records `rowCount: 0` because a plan arrives in a single column, and
@@ -2331,19 +2370,12 @@ classifier's real-world agreement rate was measured — and they are the same ki
   an operational reading to the emptiness rule is "precisely backwards" — and that argument applies
   to a plan artifact verbatim. The #356 shape a third time: a rule stated in terms of an artifact
   only one valid answer can produce.
-- **B47** — `engine-unsupported` — *"The agent cannot run on this database engine: it offers no
-  read-only execution profile"* — is also what a user is shown when their AGENT CREDENTIAL cannot be
-  resolved, on an engine that is fully supported. `resolveAgentCredential` throws the same
-  `ExecutionProfileError` that a missing `queryReadOnly` throws, before any provider exists and on
-  every engine, and `classifyDriveFailure` cannot tell the two apart though the reason codes already
-  do. Pre-existing for every workflow; #411 only lets an `operations` run reach it during its
-  grounding capture, before the first turn, which is the least explicable moment for it to arrive.
 - **B48** — the two grounding paths fail differently. Since #414 a plan run on one of the nine
   provider-path engines survives an unreachable host, a wrong password or a half-configured
   `agentUser`: `captureFromProvider` converts a `DatabaseError` or an `ExecutionProfileError` raised
   before the reading leaves into an unavailable capture, and the run answers ungrounded with that
   diagnosis. The composed path — PostgreSQL and SQLite — still lets the same failure out, ending the
-  run `internal` or, on the profile error, `engine-unsupported` (B47). Deliberate at #414, which had
+  run `internal` or, on the profile error, `agent-credential-unusable`. Deliberate at #414, which had
   no business changing how the two engines it did not touch fail, and an asymmetry a reader will
   trip over until it is resolved.
 - **B49** — a **LibreDB** connection can never be grounded, and the reason is not the agent's.
@@ -2354,15 +2386,6 @@ classifier's real-world agreement rate was measured — and they are the same ki
   is already open by another process"*, converted by `captureFromProvider` into an honest ungrounded
   run with no `context-captured` event. The same lock is what makes the connection-test modal report a
   failed connection (`docs/BACKLOG.md` D3), so the two close together.
-- **B50** — a grounded Redis plan run drafts `KEYS user:*`, the blocking O(N) command this product's
-  own provider refuses to use: the schema read is a non-blocking `SCAN` and never `KEYS *`. Measured
-  on two runs after #414's vocabulary work, both grounded on the same 17 real key prefixes — one
-  refused correctly with `NO STATEMENT:` and the other drafted `KEYS`, naming a whole key for the
-  lookup half exactly as the new rule intends. Grounding is working; this is draft QUALITY. Nothing
-  runs — plan mode executes nothing — so the hazard needs the user to apply the draft and run it. The
-  open question is whether one sentence about operational cost belongs in the rules, against the
-  owner's deferral of per-engine knowledge files and the argument that banning a command by name is
-  engine trivia that goes stale. Recorded, not decided.
 - **B51** — the loop delivers three notices to a model (the reserve warning, the report reminder of
   #416, the present-before-report notice of #417) and records none of them. `recordEvent` is called
   for what the RUN did and never for what the server said to it, so a rescued run and a run that never
@@ -2418,6 +2441,44 @@ classifier's real-world agreement rate was measured — and they are the same ki
   not in the server log either. So the only trace is the model's own sentence, and this repo has
   already recorded why that is dangerous - a missing event reads as work that was not needed rather
   than knowledge that was lost.
+- **B55** — a grounded LibreDB plan run drafts `GET users:*`, and `get` is an exact-key lookup with no
+  glob: the key does not exist, so the command answers zero rows and no error. The inventory's rows are
+  NAMED `users:*`, which reads as a glob the grammar does not have, and LibreDB declares no
+  `statementLanguage`, so the five verbs (`get`, `put`, `delete`, `prefix`, `range`) are left to be
+  guessed. MongoDB and Redis were fixed the same way in 0.13.1 - each declares the sentence its
+  statement form needs - and LibreDB's turn was deferred by the owner on 2026-08-22 until the other
+  providers are done.
+- **B56** — a planning run's grounding is HELD for the process lifetime, so a schema that changes is
+  invisible to plan mode until a restart. `holdSnapshotForConnection` keeps one inventory per
+  connection identity with no expiry, and it is consulted before any capture. Measured twice on
+  2026-08-22: after MongoDB's inference began expanding subdocuments, `schema/list` returned
+  `shipping.city` at once and the schema tree showed it, while two plan runs still grouped by
+  `$shipping.region` and recorded no `context-captured` event at all; a restart fixed it on the first
+  run. Redis showed the same shape, refusing an objective about keys that had just been seeded. The
+  design intent - a run reasons over the inventory its claims cite - is not the problem; a NEW run
+  inheriting it indefinitely is, and B54's gap means the ledger cannot tell "held, hours old" from
+  "captured just now".
+- **B57** — an operator's tuning document is refused WHOLE when any part of it fails. The argument
+  behind that is about merging (half of one measurement beside half of another is a configuration
+  nobody has run), and it justifies whole-**entry** replacement rather than whole-**document**
+  rejection: fifty models would be lost to a typo in the thirty-seventh.
+- **B58** — a run records the model it used and nothing about where that model's settings came from,
+  so once a document can arrive from outside Studio, "these settings were measured" is no longer
+  checkable from the run itself. `GET /api/agent/config` answers it for the server at the moment
+  somebody asks, which is not when the question is normally asked.
+- **B59** — per-model WORDING has nowhere to go. A sentence is a measured value here (twice a shared
+  change won cells and lost others, and had to be reverted whole), and the per-model override is
+  gone: the document refuses wording and nothing else can populate it. Refusing unsigned prompt text
+  is right; refusing it forever is a decision that has not been taken, and the two objections behind
+  it — marker drift and authorship — come apart.
+- **B60** — every bundled entry carries a `summary` that Studio never reads, duplicating the family
+  pages under `docs/llms/`. It is optional now, so it no longer stands between an operator and a
+  working measurement, but roughly half the shipped document is prose nothing renders.
+- **B62** — `schemaVersion` is a literal on both schemas, so the first bump to 2 refuses every
+  document in the field and reverts every model in it to the defaults. Deliberately not fixed while
+  only one version exists: an accepted range with one member is a knob nothing turns, and the
+  tolerant operator schema removes the pressure by letting Studio add settings without moving it.
+
 
 ## Related documentation
 

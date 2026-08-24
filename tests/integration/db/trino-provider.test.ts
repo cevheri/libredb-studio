@@ -530,6 +530,9 @@ describe("TrinoProvider metadata", () => {
 
     expect(capabilities.declaresForeignKeys).toBe(false);
     expect(capabilities.supportsInlineRowEdit).toBe(false);
+    // Trino has START TRANSACTION, but a transaction lives in an HTTP session header
+    // this provider does not carry between statements, so the trio is withheld (#U13).
+    expect(capabilities.supportsTransactions).toBe(false);
     // These rows are real tables, not groupings this server derived.
     expect(capabilities.tablesAreDerivedGroupings).toBeUndefined();
   });
@@ -570,6 +573,16 @@ describe("TrinoProvider metadata", () => {
     expect(labels.rowNamePlural).toBe("rows");
     expect(labels.analyzeGlobalDesc).toContain("connector");
     expect(labels.vacuumGlobalDesc).toContain("query engine");
+  });
+
+  // Until #U12 the monitoring Queries panel told a Trino operator to install a
+  // PostgreSQL extension. `getSlowQueries()` reads system.runtime.queries, which is the
+  // coordinator's own bounded history rather than a persisted store.
+  test("names system.runtime.queries, not a Postgres extension, as where query stats come from", () => {
+    const { slowQueriesEmptyState } = new TrinoProvider(makeConnection()).getLabels();
+
+    expect(slowQueriesEmptyState).toContain("system.runtime.queries");
+    expect(slowQueriesEmptyState).not.toContain("pg_stat_statements");
   });
 });
 
@@ -694,6 +707,57 @@ describe("TrinoProvider query", () => {
 
     expect(result.fields).toEqual(["c", "c (2)"]);
     expect(result.rows).toEqual([{ c: 1, "c (2)": 2 }]);
+  });
+
+  /**
+   * The one value the transport rewrites, proved through the PROVIDER rather than
+   * through the seam alone, because this is the layer a caller actually reads.
+   *
+   * The page is verbatim TEXT and not a `page()` call, and that is the whole point:
+   * `JSON.stringify` would round both endpoints while building the fixture, so a
+   * test written the ordinary way here would pass while proving nothing at all.
+   *
+   * Captured 2026-08-22 from `memory.fix.t`, written through this provider and read
+   * back. Before the rewrite the max returned 9223372036854776000, so a row the
+   * database held correctly reached the caller wrong, with nothing to catch.
+   */
+  test("hands a 64-bit id back exactly as the database holds it", async () => {
+    const provider = await connectProvider();
+    overrideSurface("memory.fix.t", (id) => ({
+      body:
+        `{"id":"${id}","infoUri":"${ORIGIN}/ui/query.html?${id}",` +
+        '"columns":[{"name":"id","type":"bigint"},{"name":"note","type":"varchar"}],' +
+        '"data":[[9223372036854775807,"max"],[-9223372036854775808,"min"],[42,"safe"]],' +
+        `"stats":${JSON.stringify(STATS)},"warnings":[]}`,
+    }));
+    const result = await provider.query("SELECT id, note FROM memory.fix.t ORDER BY note");
+
+    expect(result.rows).toEqual([
+      { id: "9223372036854775807", note: "max" },
+      { id: "-9223372036854775808", note: "min" },
+      // A double holds 42 exactly, so nothing touches it: the rewrite is keyed on
+      // the digits, not on the column's declared type.
+      { id: 42, note: "safe" },
+    ]);
+    expect(result.columnTypes).toEqual({ id: "bigint", note: "varchar" });
+  });
+
+  /**
+   * D5, proved through the PROVIDER because that is the surface it is reachable
+   * from: nothing typed in the editor carries a terminator to a provider
+   * (`splitStatements()` eats it), so the caller who hits this is a library consumer
+   * calling `query()` with the statement they wrote. Measured on 476, `SELECT 1;` is
+   * `SYNTAX_ERROR, line 1:9: mismatched input ';'` - the one engine here that
+   * refuses what every other one accepts.
+   */
+  test("runs a statement a library caller terminated with a semicolon", async () => {
+    const provider = await connectProvider();
+    const result = await provider.query("SELECT nationkey, name FROM tpch.tiny.nation;\n");
+
+    expect(sqlWith("nationkey")).toBe("SELECT nationkey, name FROM tpch.tiny.nation");
+    expect(result.rowCount).toBe(2);
+    // Not just this statement: no request in the exchange carried a terminator.
+    expect(sentAnything(";")).toBe(false);
   });
 
   test("counts the rows a statement changed when it returned none", async () => {

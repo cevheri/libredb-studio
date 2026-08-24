@@ -18,6 +18,12 @@ let mockCollections: { name: string; type: string }[] = [
   { name: "orders", type: "collection" },
 ];
 let mockCurrentOps: Record<string, unknown>[] = [];
+// The URI `buildConnectionString()` composed, as the driver received it. The only
+// place the query string is observable: `MongoClient` is where it goes.
+let lastMongoUri = "";
+// The options object the driver received. TLS is observable nowhere else: the
+// `MongoClient` constructor is the only place it is stated.
+let lastMongoOptions: Record<string, unknown> = {};
 
 const createMockCursor = (data: Record<string, unknown>[]) => {
   const cursor = {
@@ -87,6 +93,29 @@ const createMockCollection = (name = "users") => ({
 
 const mockCommandResults: Record<string, unknown> = {};
 
+/**
+ * What `serverStatus` answers, as a function rather than a literal: the metric
+ * paths have to be driven on a server that publishes NO `wiredTiger` section
+ * (mongos, the in-memory storage engine, an API-compatible service) and on one
+ * where the command fails outright. Both used to reach the panel as a cache hit
+ * ratio of 99%.
+ */
+const defaultServerStatus = () => ({
+  connections: { current: 5, available: 95 },
+  uptime: 86400,
+  wiredTiger: {
+    cache: {
+      "pages read into cache": 10,
+      "pages requested from the cache": 1000,
+      "bytes currently in the cache": 5000000,
+      "maximum bytes configured": 10000000,
+    },
+  },
+  opcounters: { query: 100, insert: 50, update: 30, delete: 20 },
+});
+
+let mockServerStatus: () => Record<string, unknown> = defaultServerStatus;
+
 const createMockDb = () => ({
   command: async (cmd: Record<string, unknown>) => {
     if (cmd.ping) return { ok: 1 };
@@ -110,19 +139,7 @@ const createMockDb = () => ({
     objects: 100,
   }),
   admin: () => ({
-    serverStatus: async () => ({
-      connections: { current: 5, available: 95 },
-      uptime: 86400,
-      wiredTiger: {
-        cache: {
-          "pages read into cache": 10,
-          "pages requested from the cache": 1000,
-          "bytes currently in the cache": 5000000,
-          "maximum bytes configured": 10000000,
-        },
-      },
-      opcounters: { query: 100, insert: 50, update: 30, delete: 20 },
-    }),
+    serverStatus: async () => mockServerStatus(),
     command: async (cmd: Record<string, unknown>) => {
       if (cmd.currentOp) return { inprog: mockCurrentOps };
       if (cmd.buildInfo) return { version: "7.0.0" };
@@ -169,6 +186,8 @@ mock.module("mongodb", () => ({
     constructor(uri: string, opts?: unknown) {
       this._uri = uri;
       this._opts = opts;
+      lastMongoUri = uri;
+      lastMongoOptions = (opts ?? {}) as Record<string, unknown>;
     }
 
     async connect() {
@@ -226,6 +245,7 @@ describe("MongoDBProvider", () => {
       { name: "orders", type: "collection" },
     ];
     mockCurrentOps = [];
+    mockServerStatus = defaultServerStatus;
     provider = new MongoDBProvider({ ...baseConfig });
   });
 
@@ -278,6 +298,103 @@ describe("MongoDBProvider", () => {
   });
 
   // --------------------------------------------------------------------------
+  // URI composition
+  // --------------------------------------------------------------------------
+
+  describe("the composed URI", () => {
+    test("carries no query string when no auth database is named", async () => {
+      await provider.connect();
+      expect(lastMongoUri).toBe("mongodb://localhost:27017/testdb");
+    });
+
+    test("names the auth database as ?authSource, and percent-encodes it", async () => {
+      // MongoDB keeps users in one database and the data in another, and the driver
+      // authenticates against the database in the URI when nothing says otherwise. So
+      // the ordinary deployment - users in `admin`, data elsewhere - could not be
+      // reached through the form fields at all: it failed as a credentials error.
+      provider = new MongoDBProvider({ ...baseConfig, user: "app", password: "s3cret", authSource: "admin db" });
+      await provider.connect();
+      expect(lastMongoUri).toBe("mongodb://app:s3cret@localhost:27017/testdb?authSource=admin%20db");
+    });
+
+    test("a pasted connection string is passed through verbatim, authSource and all", async () => {
+      // The URI the user typed is the whole answer. Re-composing it would drop the
+      // options only they know about (replica set, TLS, read preference), so an
+      // `authSource` field alongside it is ignored rather than appended twice.
+      provider = new MongoDBProvider({
+        ...baseConfig,
+        authSource: "admin",
+        connectionString: "mongodb://app:s3cret@remote:27017/shop?authSource=users&replicaSet=rs0",
+      });
+      await provider.connect();
+      expect(lastMongoUri).toBe("mongodb://app:s3cret@remote:27017/shop?authSource=users&replicaSet=rs0");
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // TLS
+  // --------------------------------------------------------------------------
+
+  describe("the TLS options handed to the driver", () => {
+    const connectWithSSL = async (ssl: DatabaseConnection["ssl"], extra: Partial<DatabaseConnection> = {}) => {
+      provider = new MongoDBProvider({ ...baseConfig, ...extra, ssl });
+      await provider.connect();
+      return lastMongoOptions;
+    };
+
+    test("carries no tls option when the connection names no SSL config", async () => {
+      await provider.connect();
+      expect("tls" in lastMongoOptions).toBe(false);
+    });
+
+    test("carries no tls option in mode disable", async () => {
+      expect("tls" in (await connectWithSSL({ mode: "disable" }))).toBe(false);
+    });
+
+    test("mode require encrypts without checking the chain", async () => {
+      const options = await connectWithSSL({ mode: "require" });
+      expect(options.tls).toBe(true);
+      expect(options.rejectUnauthorized).toBe(false);
+    });
+
+    test("mode verify-ca and verify-full check the chain", async () => {
+      expect(await connectWithSSL({ mode: "verify-ca" })).toMatchObject({ tls: true, rejectUnauthorized: true });
+      expect(await connectWithSSL({ mode: "verify-full" })).toMatchObject({ tls: true, rejectUnauthorized: true });
+    });
+
+    test("an explicit rejectUnauthorized wins over the mode", async () => {
+      const options = await connectWithSSL({ mode: "verify-full", rejectUnauthorized: false });
+      expect(options.rejectUnauthorized).toBe(false);
+    });
+
+    test("the CA and client certificate bundle reaches the driver under Node's own names", async () => {
+      const options = await connectWithSSL({
+        mode: "verify-full",
+        caCert: "-----BEGIN CERTIFICATE-----ca-----END CERTIFICATE-----",
+        clientCert: "-----BEGIN CERTIFICATE-----client-----END CERTIFICATE-----",
+        // Deliberately not a PEM header: `-----BEGIN PRIVATE KEY-----` alone, with no material
+        // after it, is enough for gitleaks' `private-key` rule, so the realistic string fails the
+        // Secret Scan gate for a secret that does not exist (the same reason
+        // tests/unit/db/cassandra/wire.test.ts uses this literal). These assertions are about which
+        // option name carries the value, not what the value looks like.
+        clientKey: "client-key-pem",
+      });
+      expect(options.ca).toBe("-----BEGIN CERTIFICATE-----ca-----END CERTIFICATE-----");
+      expect(options.cert).toBe("-----BEGIN CERTIFICATE-----client-----END CERTIFICATE-----");
+      expect(options.key).toBe("client-key-pem");
+    });
+
+    test("is honoured alongside a pasted connection string, unlike authSource", async () => {
+      // The URI is passed through verbatim, so a `tls=` it does not carry cannot be
+      // appended to it - but the options object is a second, independent channel the
+      // driver reads, and the form shows the SSL panel in connection-string mode too.
+      const options = await connectWithSSL({ mode: "require" }, { connectionString: "mongodb://remote:27017/shop" });
+      expect(lastMongoUri).toBe("mongodb://remote:27017/shop");
+      expect(options.tls).toBe(true);
+    });
+  });
+
+  // --------------------------------------------------------------------------
   // Connection lifecycle
   // --------------------------------------------------------------------------
 
@@ -313,6 +430,9 @@ describe("MongoDBProvider", () => {
       // No SQL at all here: the query language is JSON commands, so the inline row
       // editor's `UPDATE ... SET` has nothing to run against (#269).
       expect(caps.supportsInlineRowEdit).toBe(false);
+      // Multi-document transactions need a client session this provider does not
+      // hold, so the trio and the sandbox toggle are withheld (#U13).
+      expect(caps.supportsTransactions).toBe(false);
       // MongoDB has no foreign key constraint, so an empty `foreignKeys` here is the
       // engine's model and not this database's shape (#414).
       expect(caps.declaresForeignKeys).toBe(false);
@@ -333,6 +453,41 @@ describe("MongoDBProvider", () => {
       expect(labels.entityName).toBe("Collection");
       expect(labels.rowName).toBe("document");
       expect(labels.selectAction).toBe("Find Documents");
+    });
+
+    // Until #U12 the monitoring Queries panel told a MongoDB operator to install a
+    // PostgreSQL extension. `getSlowQueries()` reads `system.profile`, which does not
+    // exist until the profiler is on, so that is the switch the sentence must name.
+    test("names the profiler, not a Postgres extension, as where query stats come from", () => {
+      const { slowQueriesEmptyState } = provider.getLabels();
+
+      expect(slowQueriesEmptyState).toContain("profiler");
+      expect(slowQueriesEmptyState).toContain("system.profile");
+      expect(slowQueriesEmptyState).not.toContain("pg_stat_statements");
+    });
+
+    // `statementLanguage` is the sentence the agent's plan contract states verbatim
+    // (`ProviderLabels.statementLanguage`), and this engine needs one for the reason
+    // the search products did: asked for "one runnable statement in this MongoDB
+    // database's own query language", a live plan run on 2026-08-22 answered with
+    // mongosh shell syntax - `db.orders.aggregate([{ $group: ... }])` - which is
+    // correct MongoDB and unrunnable here, because `query()` takes the JSON command
+    // object and nothing else. So the sentence has to name the envelope AND rule out
+    // the shell by name; naming only what the language is did not survive contact
+    // with the model's prior on Elasticsearch and does not here either.
+    test("declares the JSON command envelope as the statement language and rules out mongosh", () => {
+      const { statementLanguage } = provider.getLabels();
+
+      expect(statementLanguage).toBeString();
+      // The keys a runnable command is built from - the ones `parseQuery` reads.
+      // `field` is here because a model that cannot see it writes a `distinct` with no
+      // field, which is now refused rather than answered with `_id`.
+      for (const key of ["collection", "operation", "filter", "pipeline", "field"]) {
+        expect(statementLanguage).toContain(key);
+      }
+      // The two forms a model reaches for instead, named so they are excluded.
+      expect(statementLanguage).toContain("mongosh");
+      expect(statementLanguage).toContain("db.");
     });
   });
 
@@ -475,6 +630,83 @@ describe("MongoDBProvider", () => {
       // user actually noticed.
       expect(schemas.find((s) => s.name === "orders")!.rowCount).toBe(42);
     });
+
+    // Why nested fields are listed at all: the inventory this schema feeds is what
+    // grounds an agent plan run, and a document field recorded only as
+    // `shipping: object` tells a model that something is nested there and nothing
+    // about what. A live plan run on 2026-08-22 grouped by `$shipping.region` - a
+    // path that does not exist in the database it was handed - and MongoDB answers
+    // that with one null group rather than an error, so the plan looked runnable and
+    // was silently wrong. `shipping.city` is a first-class field name in MQL, so the
+    // fix is to name it.
+    test("lists nested object fields as dotted paths, down to the depth limit", async () => {
+      mockCollectionData = [
+        {
+          _id: new MockObjectId("aaa"),
+          total: 10,
+          shipping: { city: "Istanbul", method: "express", geo: { lat: 41, deep: { tooFar: 1 } } },
+        },
+      ];
+
+      const schemas = await provider.getSchema();
+      const names = schemas.find((s) => s.name === "users")!.columns.map((c) => c.name);
+
+      // The container is still listed - a query may address the whole subdocument.
+      expect(names).toContain("shipping");
+      expect(names).toContain("shipping.city");
+      expect(names).toContain("shipping.method");
+      // Depth 3 is reached and named.
+      expect(names).toContain("shipping.geo.lat");
+      // Depth 4 is not: an unbounded walk turns one deeply nested document into
+      // hundreds of rows in the schema tree and hundreds of lines in a model's
+      // context window. The container at the boundary is still named, so the reader
+      // knows the nesting continues.
+      expect(names).toContain("shipping.geo.deep");
+      expect(names).not.toContain("shipping.geo.deep.tooFar");
+    });
+
+    test("does not descend into arrays, and keeps _id first after nesting", async () => {
+      mockCollectionData = [
+        {
+          _id: new MockObjectId("aaa"),
+          items: [{ sku: "A-1", qty: 2 }],
+          tags: ["seed"],
+          createdAt: new Date("2026-01-01T00:00:00Z"),
+        },
+      ];
+
+      const schemas = await provider.getSchema();
+      const columns = schemas.find((s) => s.name === "users")!.columns;
+      const names = columns.map((c) => c.name);
+
+      expect(names[0]).toBe("_id");
+      expect(names).toContain("items");
+      expect(names).toContain("tags");
+      // An array element's fields are NOT dotted paths of the same kind: `items.sku`
+      // reads a value per array entry, so grouping or sorting on it does not mean
+      // what the same syntax means on a subdocument. Naming it in a flat field list
+      // would invite exactly that confusion, so the array is named and left closed.
+      expect(names).not.toContain("items.sku");
+      // A Date is an object to `typeof` and has no fields worth listing.
+      expect(names).not.toContain("createdAt.getTime");
+    });
+
+    test("caps the number of inferred fields so one wide document cannot flood the tree", async () => {
+      const wide: Record<string, unknown> = { _id: new MockObjectId("aaa") };
+      for (let i = 0; i < 60; i++) {
+        wide[`group${i}`] = Object.fromEntries(Array.from({ length: 10 }, (_, j) => [`f${j}`, j]));
+      }
+      mockCollectionData = [wide];
+
+      const schemas = await provider.getSchema();
+      const columns = schemas.find((s) => s.name === "users")!.columns;
+
+      // 60 containers + 600 leaves + _id would be 661 rows for one document.
+      expect(columns.length).toBeLessThanOrEqual(200);
+      // The cap keeps a deterministic prefix rather than an arbitrary slice, and _id
+      // survives it: it is the field every generated statement addresses.
+      expect(columns[0].name).toBe("_id");
+    });
   });
 
   // --------------------------------------------------------------------------
@@ -490,7 +722,36 @@ describe("MongoDBProvider", () => {
       const health = await provider.getHealth();
       expect(health.activeConnections).toBe(5);
       expect(typeof health.databaseSize).toBe("string");
-      expect(typeof health.cacheHitRatio).toBe("string");
+      // 10 of 1000 requested pages came from disk: a measured 99.0%.
+      expect(health.cacheHitRatio).toBe("99.0%");
+    });
+
+    test("a server with no wiredTiger section reports the cache hit ratio as unavailable", async () => {
+      mockServerStatus = () => ({ connections: { current: 5, available: 95 }, uptime: 86400 });
+      const health = await provider.getHealth();
+      expect(health.cacheHitRatio).toBe("N/A");
+    });
+
+    test("a cache nothing has been requested from yet reports the ratio as unavailable", async () => {
+      mockServerStatus = () => ({
+        connections: { current: 5, available: 95 },
+        uptime: 86400,
+        wiredTiger: { cache: { "pages read into cache": 0, "pages requested from the cache": 0 } },
+      });
+      const health = await provider.getHealth();
+      // No requests means no hits and no misses - there is no ratio, not a 100%.
+      expect(health.cacheHitRatio).toBe("N/A");
+    });
+
+    test("a cache that served nothing from memory reports a measured zero", async () => {
+      mockServerStatus = () => ({
+        connections: { current: 5, available: 95 },
+        uptime: 86400,
+        wiredTiger: { cache: { "pages read into cache": 400, "pages requested from the cache": 400 } },
+      });
+      const health = await provider.getHealth();
+      // A cold cache measures 0 and that is a measurement, not an absence.
+      expect(health.cacheHitRatio).toBe("0.0%");
     });
 
     test("maps in-progress operations to active sessions", async () => {
@@ -568,6 +829,28 @@ describe("MongoDBProvider", () => {
       expect(typeof overview.tableCount).toBe("number");
       expect(typeof overview.indexCount).toBe("number");
     });
+
+    test("connections.available present makes the limit the sum, and a 0 available is a real zero", async () => {
+      const overview = await provider.getOverview();
+      expect(overview.maxConnections).toBe(100);
+
+      mockServerStatus = () => ({ connections: { current: 5, available: 0 }, uptime: 1 });
+      // A pool with nothing left is a limit of 5, not the fabricated 100.
+      expect((await provider.getOverview()).maxConnections).toBe(5);
+    });
+
+    test("a server publishing no connection headroom publishes no limit", async () => {
+      mockServerStatus = () => ({ connections: { current: 5 }, uptime: 1 });
+      // 0 is how every provider spells "no limit published"; 100 was invented.
+      expect((await provider.getOverview()).maxConnections).toBe(0);
+    });
+
+    test("a failing serverStatus publishes no connection limit either", async () => {
+      mockServerStatus = () => {
+        throw new Error("not authorized on admin to execute command { serverStatus: 1 }");
+      };
+      expect((await provider.getOverview()).maxConnections).toBe(0);
+    });
   });
 
   // --------------------------------------------------------------------------
@@ -581,8 +864,50 @@ describe("MongoDBProvider", () => {
 
     test("returns cache hit ratio and connection pool metrics", async () => {
       const metrics = await provider.getPerformanceMetrics();
-      expect(typeof metrics.cacheHitRatio).toBe("number");
-      expect(metrics.cacheHitRatio).toBeGreaterThanOrEqual(0);
+      expect(metrics.cacheHitRatio).toBe(99);
+      expect(metrics.bufferPoolUsage).toBe(50);
+    });
+
+    test("omits the cache metrics on a server with no wiredTiger section", async () => {
+      mockServerStatus = () => ({ uptime: 100, opcounters: { query: 100 } });
+      const metrics = await provider.getPerformanceMetrics();
+      expect("cacheHitRatio" in metrics).toBe(false);
+      expect("bufferPoolUsage" in metrics).toBe(false);
+      // What IS measurable still arrives: 100 ops over 100 seconds.
+      expect(metrics.queriesPerSecond).toBe(1);
+    });
+
+    test("omits the ratio when nothing has been requested from the cache", async () => {
+      mockServerStatus = () => ({
+        uptime: 100,
+        wiredTiger: { cache: { "pages read into cache": 0, "pages requested from the cache": 0 } },
+      });
+      expect("cacheHitRatio" in (await provider.getPerformanceMetrics())).toBe(false);
+    });
+
+    test("reports a measured zero rather than dropping it", async () => {
+      mockServerStatus = () => ({
+        uptime: 100,
+        wiredTiger: {
+          cache: {
+            "pages read into cache": 400,
+            "pages requested from the cache": 400,
+            "bytes currently in the cache": 0,
+            "maximum bytes configured": 10,
+          },
+        },
+      });
+      const metrics = await provider.getPerformanceMetrics();
+      expect(metrics.cacheHitRatio).toBe(0);
+      expect(metrics.bufferPoolUsage).toBe(0);
+    });
+
+    test("measures nothing and reports nothing when serverStatus fails", async () => {
+      mockServerStatus = () => {
+        throw new Error("not authorized on admin to execute command { serverStatus: 1 }");
+      };
+      // The whole point of the change: this used to answer the panel with 99% cache hit.
+      expect(await provider.getPerformanceMetrics()).toEqual({});
     });
   });
 
@@ -687,6 +1012,14 @@ describe("MongoDBProvider", () => {
     test("returns collection stats", async () => {
       const stats = await provider.getTableStats();
       expect(stats).toBeArray();
+    });
+
+    test("carries the index bytes the server measured, not only their formatted form", async () => {
+      // `collStats.totalIndexSize` was formatted for display and then dropped, so the storage
+      // panel had no per-collection index total to add up and reported it as unavailable.
+      const stats = await provider.getTableStats();
+      expect(stats.length).toBeGreaterThan(0);
+      expect(stats[0].indexSizeBytes).toBe(512);
     });
   });
 
@@ -802,15 +1135,51 @@ describe("MongoDBProvider", () => {
       expect(result.rowCount).toBe(1);
     });
 
-    test("distinct returns values", async () => {
+    test("distinct collects the values of the named field", async () => {
       const result = await provider.query(
         JSON.stringify({
           collection: "users",
           operation: "distinct",
-          filter: "name",
+          filter: {},
+          field: "name",
         }),
       );
-      expect(result.rows).toBeArray();
+      expect(result.rows).toEqual([{ name: "Alice" }, { name: "Bob" }]);
+      expect(result.fields).toEqual(["name"]);
+    });
+
+    test("distinct with no field is an error naming the key it wanted", async () => {
+      // Measured 2026-08-22 on live mongo:latest, 120 products in five categories:
+      // this used to answer 120 rows of `_id`, because the field came from the first
+      // key of `options.projection` and defaulted to `_id`. A plausible list of ids
+      // reads as "120 distinct categories"; an error does not.
+      await expect(
+        provider.query(JSON.stringify({ collection: "users", operation: "distinct", filter: {} })),
+      ).rejects.toThrow(/distinct requires a "field"/);
+    });
+
+    test("distinct does not take its field from options.projection", async () => {
+      // The former spelling. It is gone rather than kept as an alias: nothing in the
+      // product generates a `distinct`, so there is no caller to be compatible with,
+      // and one accepted key is one thing to document.
+      await expect(
+        provider.query(
+          JSON.stringify({
+            collection: "users",
+            operation: "distinct",
+            options: { projection: { name: 1 } },
+          }),
+        ),
+      ).rejects.toThrow(/distinct requires a "field"/);
+    });
+
+    test("distinct rejects a field that is not a field name", async () => {
+      await expect(
+        provider.query(JSON.stringify({ collection: "users", operation: "distinct", field: "" })),
+      ).rejects.toThrow(/distinct requires a "field"/);
+      await expect(
+        provider.query(JSON.stringify({ collection: "users", operation: "distinct", field: { name: 1 } })),
+      ).rejects.toThrow(/distinct requires a "field"/);
     });
   });
 

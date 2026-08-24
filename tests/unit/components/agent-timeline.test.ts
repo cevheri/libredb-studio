@@ -146,6 +146,44 @@ describe("foldLedgerEntries", () => {
   });
 
   /*
+    The two causes of one profile refusal, each pinned to the sentence a user reads
+    (docs/BACKLOG.md B47). Both used to render the engine sentence, so a PostgreSQL
+    run whose agent credential no longer decrypted was told its engine offers no
+    read-only execution profile.
+  */
+  test("an engine with no read-only profile is described as the engine's limit", () => {
+    const view = foldLedgerEntries([
+      OPENED,
+      event({
+        kind: "event",
+        event: { kind: "run-finished", atMs: 9, status: "failed", reason: "engine-unsupported" },
+      }),
+    ]);
+
+    expect(view.items.at(-1)?.detail).toBe(
+      "The agent cannot run on this database engine: it offers no read-only execution profile.",
+    );
+  });
+
+  test("a misconfigured agent credential is described as the credential, and says nothing about the engine", () => {
+    const view = foldLedgerEntries([
+      OPENED,
+      event({
+        kind: "event",
+        event: { kind: "run-finished", atMs: 9, status: "failed", reason: "agent-credential-unusable" },
+      }),
+    ]);
+
+    const detail = view.items.at(-1)?.detail ?? "";
+    expect(detail).toBe(
+      "This connection's agent credential cannot be used: check that both the agent user and password are set, that the password still decrypts under the current secret key, and that no connection string is set beside it.",
+    );
+    // The whole point of the second reason: the sentence must not send the reader
+    // after their engine, which is not what refused the run.
+    expect(detail).not.toContain("engine");
+  });
+
+  /*
     The prose a run ends on used to be returned to the caller and dropped. These pin
     the two halves of showing it: the entry that carries the words, and the ending
     that says the run stopped without a cited report — which is the difference
@@ -2448,6 +2486,79 @@ describe("an answer reads as the app's decision, with the model's caption quoted
 
     expect(view.items[1]?.detail).toContain("The statement is in your editor and was not run");
     expect(view.items[1]?.detail).not.toContain("handed the statement");
+  });
+
+  describe("the four entries a run writes about being turned back", () => {
+    /*
+      Each of these exists because a run that was corrected reads as a run that never tried.
+      A held call, a declined one, the prose a model stopped on and the notice the drive sent
+      are the difference between "it answered nothing" and "it tried, was asked for something
+      else, and tried again" — so all four are rendered, and all four are pinned here.
+    */
+    test("a held call is shown as the server turning it back, with what it asked for instead", () => {
+      const view = foldLedgerEntries([
+        OPENED,
+        event({
+          kind: "event",
+          event: {
+            kind: "call-held",
+            atMs: 3_000,
+            tool: "compose_report",
+            reason: "This workflow answers by presenting a result you have read.",
+          },
+        }),
+      ]);
+
+      expect(view.items[1]?.tone).toBe("refused");
+      expect(view.items[1]?.headline).toContain("compose_report");
+      expect(view.items[1]?.detail).toContain("presenting a result");
+    });
+
+    test("a declined call names the reason CODE, which is the word the server used", () => {
+      const view = foldLedgerEntries([
+        OPENED,
+        event({
+          kind: "event",
+          event: {
+            kind: "call-declined",
+            atMs: 4_000,
+            tool: "present_answer",
+            reasonCode: "ANSWER_NOT_A_DATA_READ",
+          },
+        }),
+      ]);
+
+      expect(view.items[1]?.tone).toBe("refused");
+      // The code rather than a paraphrase: it is what a search of this repository finds.
+      expect(`${view.items[1]?.headline} ${view.items[1]?.detail}`).toContain("ANSWER_NOT_A_DATA_READ");
+    });
+
+    test("what a model said as it stopped is carried as quoted text, not as the app speaking", () => {
+      const view = foldLedgerEntries([
+        OPENED,
+        event({
+          kind: "event",
+          event: { kind: "model-stopped-saying", atMs: 5_000, text: "I have finished looking at the tables." },
+        }),
+      ]);
+
+      // The model's own words go in `prose`, not in `detail`: `detail` is the field for this
+      // application's sentences, and a model's paragraph put there renders as one run of
+      // literal characters. Neutral rather than refused — nothing was turned back here.
+      expect(view.items[1]?.tone).toBe("neutral");
+      expect(view.items[1]?.prose).toContain("finished looking at the tables");
+      expect(view.items[1]?.detail ?? "").not.toContain("finished looking at the tables");
+    });
+
+    test("a notice the drive issued is shown, so a reminded run does not read as an idle one", () => {
+      const view = foldLedgerEntries([
+        OPENED,
+        event({ kind: "event", event: { kind: "guidance-issued", atMs: 6_000, notice: "report-reminder" } }),
+      ]);
+
+      expect(view.items).toHaveLength(2);
+      expect(`${view.items[1]?.headline} ${view.items[1]?.detail}`.length).toBeGreaterThan(0);
+    });
   });
 
   test("the columns the chart names never reach the app's own sentence", () => {

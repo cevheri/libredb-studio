@@ -1,12 +1,13 @@
 "use client";
 
 import React, { useState, useEffect, useCallback } from "react";
-import { Server, Activity, Clock, Loader2, RefreshCw } from "lucide-react";
+import { Server, Activity, Clock, LoaderCircle, RefreshCw } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
 import type { DatabaseConnection } from "@/lib/types";
+import { buildConnectionPayload } from "@/hooks/use-connection-payload";
 
 interface PoolStats {
   total: number;
@@ -32,7 +33,10 @@ export function PoolTab({ connection }: PoolTabProps) {
       const res = await fetch("/api/db/pool-stats", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ connection }),
+        // The seed id, not the object: a managed connection arrives here with its
+        // password and connection string stripped, so the object cannot be resolved
+        // to a database once the provider cache is cold.
+        body: JSON.stringify(buildConnectionPayload(connection)),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to fetch pool stats");
@@ -60,7 +64,7 @@ export function PoolTab({ connection }: PoolTabProps) {
   if (loading && !stats) {
     return (
       <div className="flex items-center justify-center h-full gap-2 text-muted-foreground">
-        <Loader2 strokeWidth={1.5} className="h-4 w-4 animate-spin" />
+        <LoaderCircle strokeWidth={1.5} className="h-4 w-4 animate-spin" />
         Loading pool statistics...
       </div>
     );

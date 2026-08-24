@@ -61,7 +61,21 @@ export interface ActiveSession {
 }
 
 export interface HealthInfo {
-  activeConnections: number;
+  /**
+   * The count of connections currently open, or absent when the engine cannot
+   * measure it at all.
+   *
+   * Optional for the same reason `DatabaseOverview.activeConnections` is: absence
+   * and zero are different facts, and a provider that cannot read the figure must
+   * omit the key rather than send a fabricated 0. This is the field the agent's
+   * curated "health" reading forwards to the model (`src/lib/agent/tools.ts`), so a
+   * fabricated 0 here is not a display quirk - it is telling the model a fact about
+   * a server it could not measure. Most providers compose this straight from
+   * `DatabaseOverview.activeConnections`, which is where the absence already comes
+   * from (ScyllaDB has no `system_views` keyspace; a Cassandra role can be denied
+   * the grant); no `?? 0` fallback belongs at that seam.
+   */
+  activeConnections?: number;
   databaseSize: string;
   cacheHitRatio: string;
   slowQueries: SlowQuery[];
@@ -136,13 +150,37 @@ export interface ProviderCapabilities {
    */
   supportsInlineRowEdit?: boolean;
   /**
+   * Whether THIS PROVIDER implements the interactive transaction session that
+   * `POST /api/db/transaction` drives — `beginTransaction()` / `commitTransaction()`
+   * / `rollbackTransaction()` over one held connection. It is a statement about the
+   * provider's surface, not about whether the engine has a transaction concept
+   * somewhere: SQLite has `BEGIN`, and this provider still declares `false`, because
+   * it holds no session for one and the route refuses the call.
+   *
+   * It exists because the route's own gate is `isTransactionProvider(provider)`, a
+   * runtime shape check no client can read. `Studio.tsx` therefore supplied
+   * BEGIN/COMMIT/ROLLBACK — and SANDBOX, which auto-rolls-back through the same
+   * route — on every connection. Measured 2026-08-19 on OpenSearch: HTTP 400,
+   * "Transaction control is not supported for this database type", for both `begin`
+   * and `rollback`. Elasticsearch, Druid, Couchbase, MongoDB, Redis, Trino,
+   * Cassandra, SQLite and LibreDB were all in that position.
+   *
+   * Optional for the same published-interface reason as `supportsInlineRowEdit`
+   * (`src/exports/types.ts`): a required field added after the fact stops every
+   * external implementer compiling. Every provider in this repo declares it, and the
+   * UI gates on `=== true`, so an absent flag — and an unresolved `metadata` — reads
+   * as no transactions rather than inheriting a permissive default.
+   */
+  supportsTransactions?: boolean;
+  /**
    * Whether this engine has foreign keys to declare at all — not whether any
    * particular schema declares one, and not whether the current role can see them.
    *
    * It exists because an empty `TableSchema.foreignKeys` means two different things
    * and the reader cannot tell them apart. On PostgreSQL an empty list means this
-   * schema declares none (or, per `docs/BACKLOG.md` B44, that this role cannot see
-   * them); on MongoDB, Redis, LibreDB, Druid, ClickHouse and Couchbase it means the
+   * schema declares none, or that the role this connection reads with cannot see the
+   * ones it declares — an empty read cannot tell those two apart, which is why the
+   * agent's relations block reports neither of them as fact; on MongoDB, Redis, LibreDB, Druid, ClickHouse and Couchbase it means the
    * engine has no such constraint in its model, so no reading of any kind could ever
    * return one. A consumer that hedges between "the schema is like that" and "the
    * application enforces them" is wrong in BOTH branches on those six, and #414 hit
@@ -249,6 +287,27 @@ export interface ProviderLabels {
   vacuumGlobalTitle: string;
   vacuumGlobalDesc: string;
   /**
+   * The Operations tab's global Reindex card, in this engine's own terms.
+   *
+   * The analyze and vacuum cards have carried per-provider wording since #427; the
+   * reindex card stayed hardcoded to PostgreSQL's "Run Reindex" / "Rebuild Indexes" /
+   * "Reconstructs all indexes in the database." Three providers declare the `reindex`
+   * maintenance operation — Postgres, SQLite and Couchbase — and on Couchbase that
+   * copy is wrong the way the analyze copy was wrong for Redis: its reindex builds
+   * deferred GSI indexes, which is not a table reindex.
+   *
+   * Optional, unlike the `analyzeGlobal*` and `vacuumGlobal*` triads above, because
+   * `ProviderLabels` is published (`src/exports/types.ts`) and a required field added
+   * after the fact stops every external implementer compiling — the rule
+   * `supportsInlineRowEdit` records, and the one the newer `statementLanguage` and
+   * `slowQueriesEmptyState` follow. `OperationsTab` keeps the hardcoded strings as
+   * its fallback, which it needs anyway: `metadata` may carry capabilities with no
+   * labels at all.
+   */
+  reindexGlobalLabel?: string;
+  reindexGlobalTitle?: string;
+  reindexGlobalDesc?: string;
+  /**
    * What a statement for this engine is WRITTEN IN, named for a model rather than
    * for a person, and declared only where the engine's own name misleads one.
    *
@@ -266,6 +325,24 @@ export interface ProviderLabels {
    * the wrong language.
    */
   statementLanguage?: string;
+  /**
+   * Why the monitoring Queries tab's "Slowest Queries" panel is empty on this
+   * engine, in that engine's own terms.
+   *
+   * Read by `QueriesTab`, which defaults to PostgreSQL's "Enable
+   * pg_stat_statements extension to see query stats." — the sentence it hardcoded
+   * for every engine until #U12, measured 2026-08-19 in Chrome telling an
+   * OpenSearch cluster to install a PostgreSQL extension. `postgres` therefore
+   * declares nothing, and so does any engine whose statement store really is an
+   * extension away.
+   *
+   * A provider sets this when the Postgres sentence is actively false for it:
+   * either the engine keeps no aggregate of finished statements at all, or the
+   * one it keeps is switched on somewhere else entirely. One field, not one per
+   * sentence — the panel's badge names an extension rather than a category, so it
+   * is dropped where this label is set instead of being re-worded from it.
+   */
+  slowQueriesEmptyState?: string;
 }
 
 /**
@@ -495,7 +572,26 @@ export interface DatabaseOverview {
   version: string;
   uptime: string;
   startTime?: Date;
-  activeConnections: number;
+  /**
+   * The count of connections currently open, or absent when the engine cannot
+   * measure it at all.
+   *
+   * Optional for the same reason `databaseSizeBytes` below is: absence and zero are
+   * different facts, and a provider that cannot read the figure must omit the key
+   * rather than send a fabricated 0. ScyllaDB is the case that forced this - the
+   * count lives in Cassandra's `system_views` keyspace, which ScyllaDB does not
+   * have - and a Cassandra role denied that same grant has answered a fabricated 0
+   * since the provider shipped (docs/BACKLOG.md D17). `HealthInfo.activeConnections`
+   * stays a required `number`: a provider composing it from this field falls back to
+   * `?? 0` at that one seam, the number this field has always answered with.
+   */
+  activeConnections?: number;
+  /**
+   * The published ceiling, where `0` MEANS "no limit published" rather than "no
+   * capacity" - unlike `activeConnections` above, `0` and absence are the SAME fact
+   * here, so this field stays a required number. See `OverviewTab.tsx`'s
+   * `connectionLimit`.
+   */
   maxConnections: number;
   databaseSize: string;
   /**
@@ -587,8 +683,20 @@ export interface TableStats {
   rowCount: number;
   liveRowCount?: number;
   deadRowCount?: number;
-  tableSize: string;
-  tableSizeBytes: number;
+  /**
+   * The table's own bytes, and its formatted spelling. BOTH are omitted when the engine
+   * publishes no per-table size at all: SQLite's per-object page counts live in the
+   * `dbstat` virtual table, which is a compile-time option - present on node:sqlite and
+   * absent on bun:sqlite ("no such table: dbstat", measured 2026-08-24 on Bun 1.3.14 /
+   * SQLite 3.53.0) - so under Bun there is nothing to read. The field used to be
+   * required, and what filled it was `rowCount * 100` ("Assume 100 bytes average per
+   * row"), which the Storage tab then summed into the Data figure it draws beside the
+   * measured database size: a guess presented as a measurement. A `0` would be the
+   * same lie in a different digit, so absence is the answer, and every consumer of the
+   * aggregate gates on it - see `StorageTab`'s `tableSizeKnown`.
+   */
+  tableSize?: string;
+  tableSizeBytes?: number;
   indexSize?: string;
   indexSizeBytes?: number;
   totalSize: string;
@@ -610,7 +718,12 @@ export interface IndexStats {
   isUnique: boolean;
   isPrimary: boolean;
   indexSize: string;
-  indexSizeBytes: number;
+  /**
+   * Omitted when the engine publishes no size for this index. MySQL keeps per-index sizes in
+   * `mysql.innodb_index_stats`, which a restricted user cannot read and which holds no row for a
+   * MyISAM table, so a `0` there would be a fabricated measurement rather than a small index.
+   */
+  indexSizeBytes?: number;
   scans: number;
   usageRatio?: number;
 }
@@ -633,13 +746,36 @@ export interface StorageStats {
  */
 export interface MonitoringData {
   timestamp: Date;
-  overview: DatabaseOverview;
-  performance: PerformanceMetrics;
-  slowQueries: SlowQueryStats[];
-  activeSessions: ActiveSessionDetails[];
+  /**
+   * Every panel is optional, and ABSENCE is not ZERO here - the same distinction the
+   * `activeConnections` comment above draws for a single field, applied to a whole panel.
+   * `getMonitoringData` reads the seven panels independently, so one read failing costs
+   * only its own panel: the field it would have filled is left absent and its own message
+   * is recorded under `errors`. An absent panel means "this engine could not answer",
+   * which is a different fact from an empty array or a zero - StarRocks 3.3 has no
+   * `information_schema.PROCESSLIST`, so `activeSessions` is absent there while an idle
+   * PostgreSQL answers `[]`. Rendering the first as the second would claim a measurement
+   * the engine refused to make (the very error QueriesTab.tsx:68 documents for
+   * `slowQueries`). A consumer therefore gates on the field being present, and shows the
+   * `errors` entry in place of that panel.
+   */
+  overview?: DatabaseOverview;
+  performance?: PerformanceMetrics;
+  slowQueries?: SlowQueryStats[];
+  activeSessions?: ActiveSessionDetails[];
   tables?: TableStats[];
   indexes?: IndexStats[];
   storage?: StorageStats[];
+  /**
+   * Per-panel failure messages, keyed by the panel whose read rejected. The value is the
+   * ENGINE's own sentence (`Error.message`, not a generic stand-in), because it is the only
+   * text that tells the user what the database actually refused. Absence of a panel plus its
+   * entry here is how a partial read is reported; a panel that is absent with no entry here
+   * was simply not requested (`includeTables` and friends).
+   */
+  errors?: Partial<
+    Record<"overview" | "performance" | "slowQueries" | "activeSessions" | "tables" | "indexes" | "storage", string>
+  >;
 }
 
 /**

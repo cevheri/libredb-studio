@@ -19,6 +19,7 @@
 | **Connection string** | ✅ Supported and used directly (`mongodb://` / `mongodb+srv://`) |
 | **Transactions** | ❌ no explicit begin/commit/rollback API |
 | **Query cancellation** | ❌ no `cancelQuery` (operations can be killed via maintenance `killOp`) |
+| **SSL** | Yes — `connection.ssl` → `tls` + Node's `ca`/`cert`/`key` ([§4.1](#41-ssl--tls)) |
 | **Source** | [`src/lib/db/providers/document/mongodb.ts`](../../src/lib/db/providers/document/mongodb.ts) |
 | **Tests** | [`tests/integration/db/mongodb-provider.test.ts`](../../tests/integration/db/mongodb-provider.test.ts) |
 
@@ -81,8 +82,16 @@ requires `collection` and `operation`:
 ```json
 { "collection": "users", "operation": "find", "filter": {"age": {"$gt": 18}}, "options": {"limit": 10} }
 { "collection": "orders", "operation": "aggregate", "pipeline": [{"$group": {"_id": "$status", "count": {"$sum": 1}}}] }
+{ "collection": "products", "operation": "distinct", "field": "category", "filter": {"active": true} }
 { "collection": "users", "operation": "insertOne", "documents": [{"name": "John"}] }
 ```
+
+`distinct` is the one operation with a key of its own: `field`, the driver's own parameter name, and
+it is **required**. The example above answers one row per category, shaped `{ "category": <value> }`.
+A missing or non-string `field` is a `QueryError` naming the key it wanted — it used to read the
+field from the first key of `options.projection` and fall back to `_id`, so
+`{"operation": "distinct", "field": "category"}` answered 120 rows of `_id` (measured 2026-08-22 on
+`mongo:latest`, 120 products in five categories). `options.projection` is **not** an alias for it.
 
 Supported operations: `find`, `findOne`, `aggregate`, `count`, `distinct`, `insertOne`, `insertMany`,
 `updateOne`, `updateMany`, `deleteOne`, `deleteMany`. See the
@@ -98,15 +107,28 @@ nested objects/arrays are walked recursively. **Only these types are special-cas
 types (`Long`, `Timestamp`, `UUID`, `RegExp`, `Code`, `DBRef`) fall through as generic objects and
 may render poorly ([Known limitations](#13-known-limitations--future-work)).
 
-### 3.3 Sampling-based, flat schema inference
+### 3.3 Sampling-based schema inference, nested to three levels
 
 MongoDB has no fixed schema, so `getSchema()` ([mongodb.ts:476](../../src/lib/db/providers/document/mongodb.ts))
 **infers** one: it lists collections (skipping `system.*`, capped at 200), and for each samples the
 first **100 documents** to derive field types ([mongodb.ts:510](../../src/lib/db/providers/document/mongodb.ts)).
 Caveats baked into this approach:
 - Fields absent from the sample (or appearing only in unsampled documents) won't show.
-- Inference is **flat** — nested object fields are reported as type `object`, not expanded into
-  dotted sub-fields (the recursion is intentionally disabled).
+- **Subdocuments are expanded into dotted paths**, to `MAX_NESTED_FIELD_DEPTH = 3` counting the top
+  level as 1 — so `shipping`, `shipping.city` and `shipping.geo.lat` are all listed, and
+  `shipping.geo.deep.tooFar` is not. The container at the boundary is still named, so a reader can
+  see that the nesting continues. `shipping.city` is a field name in MQL, and a schema that stopped
+  at `shipping: object` did not name it: a plan run on 2026-08-22 grouped by `$shipping.region`, a
+  path the database does not have, and MongoDB answers that with one null group rather than an
+  error — so the plan read as runnable and was silently wrong.
+- **Arrays are named and left closed.** `items.sku` addresses one value *per array entry*, so it
+  does not mean on an array what the same syntax means on a subdocument; listing it in a flat field
+  list would invite exactly that confusion. Date/ObjectId/Binary/Decimal128 are scalars here and
+  are never descended into.
+- **The field list is capped at `MAX_INFERRED_FIELDS = 200` per collection**, applied after the
+  sort, so what survives is a deterministic prefix and `_id` always survives. Nesting multiplies:
+  60 subdocuments of 10 fields each is 661 rows in the schema tree and 661 lines in an agent run's
+  context window, for one collection.
 - A field with multiple observed types is reported as `mixed(a|b)`. `_id` is marked primary.
 
 ### 3.4 `find` is capped at 100; `aggregate` is not
@@ -129,8 +151,17 @@ unchanged), but it is **not** a true no-op: it returns `limit: options.limit || 
 `connectionString` is used **directly** (this is a genuine connection-string provider, unlike
 SQL Server). `buildConnectionString()` ([mongodb.ts:189](../../src/lib/db/providers/document/mongodb.ts))
 returns `config.connectionString` if present, else assembles
-`mongodb://<user>:<password>@<host>:<port>/<database>` (credentials are URL-encoded; the
-`<user>:<password>@` segment is omitted when no credentials are set).
+`mongodb://<user>:<password>@<host>:<port>/<database>[?authSource=<authSource>]` (credentials and
+the auth database are URL-encoded; the `<user>:<password>@` segment is omitted when no credentials
+are set, and the query string when no `authSource` is).
+
+**`authSource` is the database the credentials live in, and it is not always the one being opened.**
+MongoDB creates users inside a database, and the driver checks them against whichever database the
+URI names when nothing says otherwise — so the ordinary deployment, users in `admin` and data
+elsewhere, could not be reached through the discrete fields at all: it failed as a credentials
+error, which is what it looks like and is not what it is. Leave the field empty when the user
+was created in the database being opened. A pasted `connectionString` is used verbatim and carries
+its own `?authSource=`, so the form offers no separate input in that mode.
 
 ```ts
 // Connection string (SRV or standard)
@@ -141,6 +172,11 @@ const a = { id: 'mg-1', name: 'App', type: 'mongodb',
 const b = { id: 'mg-1', name: 'App', type: 'mongodb',
   host: 'localhost', port: 27017, database: 'app',
   user: 'admin', password: 'secret', createdAt: new Date() };
+
+// Discrete fields, user created in `admin` — the ordinary deployment
+const c = { id: 'mg-1', name: 'App', type: 'mongodb',
+  host: 'localhost', port: 27017, database: 'shop',
+  user: 'app', password: 'secret', authSource: 'admin', createdAt: new Date() };
 ```
 
 `validate()` ([mongodb.ts:123](../../src/lib/db/providers/document/mongodb.ts)) requires either a
@@ -157,6 +193,35 @@ pool is configured from `ProviderOptions.pool`:
 
 The database name comes from `config.database`, else it is parsed out of the connection string, else
 defaults to `test`. After connecting, a `{ ping: 1 }` command validates the connection.
+
+### 4.1 SSL / TLS
+
+`buildTLSOptions()` ([mongodb.ts:275](../../src/lib/db/providers/document/mongodb.ts)) maps
+`connection.ssl` onto the driver's TLS options. `tls`, `ca`, `cert`, `key` and `rejectUnauthorized`
+are all on the driver's own allow-list (`LEGAL_TLS_SOCKET_OPTIONS` in `mongodb/lib/cmap/connect.js`)
+and reach `tls.connect` under Node's names, so the material maps exactly as it does for PostgreSQL,
+MySQL and Couchbase:
+
+| `ssl.mode` | Options added |
+|------------|---------------|
+| absent / `disable` | none — the client is built as before |
+| `require` | `tls: true`, `rejectUnauthorized: false` |
+| `verify-ca` / `verify-full` | `tls: true`, `rejectUnauthorized: true` |
+
+`caCert` / `clientCert` / `clientKey` become `ca` / `cert` / `key` when set, each independently — a
+cluster can demand mutual TLS while presenting a self-signed certificate itself. An explicit
+`ssl.rejectUnauthorized` always wins over the mode. `require` does not check the chain because a
+self-hosted replica set presents a self-signed certificate by default.
+
+Measured against a TLS-only server on 2026-08-23 (`mongo:latest --tlsMode requireTLS`): `disable` is
+refused - the server logs *"The server is configured to only allow SSL connections"* - and `require`
+connects in 20ms, with *"Ingress TLS handshake complete"* on the server side. Both arms matter, since
+before the mode reached the driver `require` failed the same way `disable` does.
+
+> Unlike `authSource`, this **is** applied alongside a pasted `connectionString`. The URI is returned
+> verbatim, so a `tls=` cannot be appended to it, but the options object is a second channel the
+> driver reads — and the connection dialog shows the SSL panel in connection-string mode too, so a
+> selection made there has to mean something.
 
 ---
 
@@ -178,10 +243,10 @@ injection, no transactions, and no `cancelQuery`. `EXPLAIN` is not supported
   (so `{ "operation": "findOne", "options": { "sort": { "_id": -1 } } }` does *not* return the
   latest document).
 - **`aggregate`** ignores `options` entirely (bound it with a `$limit` stage in the pipeline).
-- **`distinct`** has **no dedicated field parameter**: the field is taken from the **first key of
-  `options.projection`**, e.g. `{ "collection": "users", "operation": "distinct",
-  "options": { "projection": { "country": 1 } } }` returns distinct `country` values (output shape
-  `{ "country": <value> }`). With no projection it defaults to `_id`.
+- **`distinct`** ignores `options` entirely and takes its field from the top-level **`field`** key,
+  e.g. `{ "collection": "users", "operation": "distinct", "field": "country" }` returns distinct
+  `country` values (output shape `{ "country": <value> }`). The key is required: a missing or
+  non-string one is a `QueryError`, never a silent `_id`.
 
 ---
 
@@ -194,7 +259,7 @@ injection, no transactions, and no `cancelQuery`. `EXPLAIN` is not supported
 | Collections | `listCollections()` (skip `system.*`, cap 200) — **views included**, see below |
 | Row count | `estimatedDocumentCount()` — **not asked of a view**; absent there |
 | Size | `collStats` command (`size`) — **not asked of a view**; absent there |
-| Columns | inferred from a 100-document sample ([§3.3](#33-sampling-based-flat-schema-inference)), on a view exactly as on a collection |
+| Columns | inferred from a 100-document sample ([§3.3](#33-sampling-based-schema-inference-nested-to-three-levels)), on a view exactly as on a collection |
 | Indexes | `collection.indexes()` (`unique` flag, key fields) — **not asked of a view**; `[]` there |
 | Foreign keys | always `[]` — MongoDB has none to declare, which the provider states as `declaresForeignKeys: false` ([§9](#9-capabilities--labels)) rather than leaving a reader to guess whether the read simply found none |
 
@@ -218,18 +283,44 @@ the collection underneath it.
 ## 7. Monitoring & health
 
 Rich, from `admin().serverStatus()`, `db.stats()`, `currentOp`, `$indexStats`, and the profiler.
-Every method is wrapped in try/catch and degrades to a sensible default on permission errors.
+Every method is wrapped in try/catch. Degradation reports the absence rather than filling it in — see
+[§7.1](#71-what-the-panel-shows-when-the-cache-cannot-be-measured).
 
 | Method | Source | Notes |
 |--------|--------|-------|
-| `getHealth()` | `serverStatus`, `dbStats`, `currentOp`, `system.profile` | connections, data size, WiredTiger cache-hit %, current ops; slow queries need the profiler (placeholder row if disabled) |
-| `getOverview()` | `serverStatus`, `buildInfo`, `dbStats`, `listCollections` | version, uptime, connections, collection/index counts |
-| `getPerformanceMetrics()` | `serverStatus` (WiredTiger + opcounters) | cache-hit %, **ops/sec** (`query`+`insert`+`update`+`delete` opcounters ÷ uptime — *total operations, not just queries*), buffer-pool % (cache bytes), `deadlocks: 0` |
+| `getHealth()` | `serverStatus`, `dbStats`, `currentOp`, `system.profile` | connections, data size, WiredTiger cache-hit % (`"N/A"` when unmeasurable, [§7.1](#71-what-the-panel-shows-when-the-cache-cannot-be-measured)), current ops; slow queries need the profiler (placeholder row if disabled) |
+| `getOverview()` | `serverStatus`, `buildInfo`, `dbStats`, `listCollections` | version, uptime, connections, collection/index counts. `maxConnections` is `connections.current + connections.available`, or `0` — the repo's spelling of *no limit published* — when the server publishes no headroom |
+| `getPerformanceMetrics()` | `serverStatus` (WiredTiger + opcounters) | cache-hit %, **ops/sec** (`query`+`insert`+`update`+`delete` opcounters ÷ uptime — *total operations, not just queries*), buffer-pool % (cache bytes), `deadlocks: 0`. **Every field is optional**: each one is present only if its reading was, and a failed `serverStatus` reports `{}` ([§7.1](#71-what-the-panel-shows-when-the-cache-cannot-be-measured)) |
 | `getSlowQueries()` | `system.profile` | per-op time/returned; **`[]` if the profiler isn't enabled** (`db.setProfilingLevel(1)`); sorted by `millis` (slowest) — note `getHealth()`'s slow-query block instead sorts by `ts` (most recent) and emits a placeholder row when disabled |
 | `getActiveSessions()` | `currentOp` | opid, ns, lock waits, duration — ⚠️ the **`user` field is populated from `op.client`** (the client `host:port`), **not** an authenticated user |
-| `getTableStats()` | `collStats` per collection | row count + data/index/total sizes |
+| `getTableStats()` | `collStats` per collection | row count + data/index/total sizes, `totalIndexSize` carried as the byte figure `indexSizeBytes` and not only as formatted text |
 | `getIndexStats()` | `$indexStats` + `indexes()` | **real `scans`** (`accesses.ops`); `indexSize` `N/A`; **`indexType` only distinguishes `text` vs `btree`** — `hashed`/`2dsphere`/`2d`/wildcard/clustered are all mislabelled `btree` |
 | `getStorageStats()` | `dbStats` + WiredTiger | Data / Indexes / Storage / WiredTiger cache (with usage %) |
+
+### 7.1 What the panel shows when the cache cannot be measured
+
+The cache hit ratio is computed from `serverStatus.wiredTiger.cache` — `pages read into cache` over
+`pages requested from the cache`. Three things can make that unmeasurable, and none of them is a
+number:
+
+- the deployment publishes no `wiredTiger` section at all (`mongos`, the in-memory storage engine,
+  the wire-compatible services);
+- the section is there but `pages requested from the cache` is `0`, on a server that has served
+  nothing yet — no hits and no misses, which is not a perfect hit rate;
+- `serverStatus` fails outright, which is what an unprivileged user gets (`clusterMonitor` is the
+  role it wants).
+
+In all three the field is **omitted** from `getPerformanceMetrics()` and `getHealth()` reports the
+string `"N/A"`; the Overview and Performance tabs then render *Cache Hit* as `N/A` beside *Not
+measured*, and the card border stays neutral instead of being rated. `bufferPoolUsage` follows the
+same rule for the same section. A **measured** `0` — a genuinely cold cache — is kept and rendered as
+`0.0%`, because it is a fact the server reported.
+
+This replaces a hardcoded `cacheHitRatio: 99` that both the no-`wiredTiger` path and the failed-
+`serverStatus` path used to return: a figure the provider invented, indistinguishable at the panel
+from a measurement (the rule [#424](https://github.com/libredb/libredb-studio/issues/424) exists to
+enforce, and [#452](https://github.com/libredb/libredb-studio/pull/452) built the *unavailable*
+rendering for).
 
 ---
 
@@ -262,6 +353,7 @@ three, though `runMaintenance` also accepts `optimize`/`kill`/`reindex` when inv
 | `supportsExternalQueryLimiting` | `false` |
 | `supportsCreateTable` | `false` |
 | `supportsInlineRowEdit` | `false` — the query language is JSON commands, so there is no `UPDATE ... SET` for the results grid's inline editor to emit |
+| `supportsTransactions` | `false` — multi-document transactions need a client session this provider does not hold, so BEGIN/COMMIT/ROLLBACK and SANDBOX are not offered; they used to be, and answered HTTP 400 (#U13) |
 | `declaresForeignKeys` | `false` — MongoDB has no foreign key constraint at all, so an empty `foreignKeys` list here is the engine's model and not this database's shape |
 | `supportsMaintenance` | `true` |
 | `maintenanceOperations` | `['vacuum', 'analyze', 'check']` |
@@ -276,6 +368,20 @@ after inserts/updates/deletes.
 
 Document vocabulary: entity → *Collection*, row → *document*, select → *Find Documents*, analyze →
 *Validate Collection*, vacuum → *Compact Collection*, search → *Search collections or fields…*.
+
+`statementLanguage` is the one label a person never sees: the agent's plan contract states it
+verbatim to the model. It carries the JSON envelope of [§3.1](#31-json--mql-query-format) and names
+**mongosh** as the form that is excluded. It exists for the reason the search products' does — told
+to write "one runnable statement in this MongoDB database's own query language", a plan run on
+2026-08-22 answered `db.orders.aggregate([{ $group: … }])`, which is correct MongoDB and unrunnable
+here, because `query()` parses the JSON command object and nothing else. Naming only what the
+language *is* did not survive contact with the model's prior; naming what it is not did.
+
+`slowQueriesEmptyState` (*"Query stats come from the database profiler - run db.setProfilingLevel()
+to start recording into system.profile."*) is the monitoring Queries panel's empty state. That
+sentence was hardcoded to PostgreSQL's `pg_stat_statements` advice on every engine
+(`docs/BACKLOG.md` U12); here `getSlowQueries()` reads `system.profile`
+([§7](#7-monitoring--health)), which does not exist until the profiler is switched on.
 
 ---
 
@@ -316,7 +422,8 @@ serialization, schema inference, monitoring, and maintenance.
 Validation, connect/disconnect, capabilities, labels, `prepareQuery`, every `query` operation
 (find/aggregate/count/distinct/insert/update/delete), `getSchema` inference, health, maintenance,
 overview, performance, slow queries, active sessions, table/index/storage stats, **BSON
-serialization** (ObjectId/Binary/Decimal128/Date/nested), and `getMonitoringData`.
+serialization** (ObjectId/Binary/Decimal128/Date/nested), `getMonitoringData`, and **every `ssl.mode`
+branch** asserted against the options object the `MongoClient` constructor received.
 
 ```bash
 bun test tests/integration/db/mongodb-provider.test.ts   # just this file
@@ -354,9 +461,9 @@ Over the API: `POST /api/db/query` (JSON MQL in the `sql` field) and `POST /api/
 
 ## 13. Known limitations & future work
 
-- **Schema is inferred from a 100-document sample, flat.** Fields outside the sample don't appear,
-  and nested object fields are shown as `object` rather than expanded into sub-fields
-  ([§3.3](#33-sampling-based-flat-schema-inference)).
+- **Schema is inferred from a 100-document sample.** Fields outside the sample don't appear;
+  subdocuments are expanded only to depth 3 and only up to 200 fields per collection, and array
+  elements' fields are never expanded ([§3.3](#33-sampling-based-schema-inference-nested-to-three-levels)).
 - **`aggregate` results are unbounded.** Only `find` gets a default 100-document cap; an `aggregate`
   pipeline without `$limit` can return a very large result set
   ([§3.4](#34-find-is-capped-at-100-aggregate-is-not)). *Future:* inject a safety `$limit` / cap
@@ -374,14 +481,12 @@ Over the API: `POST /api/db/query` (JSON MQL in the `sql` field) and `POST /api/
 - **`collStats` is deprecated** in MongoDB 6.2+ (in favour of the `$collStats` aggregation stage);
   size/stats calls may warn or change on newer servers.
 - **Monitoring needs privileges.** `serverStatus`/`currentOp`/`$indexStats` and the profiler require
-  appropriate roles (`clusterMonitor`, etc.); without them fields degrade to `N/A`/`0`/`[]`, and slow
-  queries require the profiler to be enabled.
+  appropriate roles (`clusterMonitor`, etc.); without them the affected metrics are reported as
+  *unavailable* rather than as numbers ([§7.1](#71-what-the-panel-shows-when-the-cache-cannot-be-measured)),
+  and slow queries require the profiler to be enabled.
 - **`Binary` values are shown as a placeholder** (`<Binary: N bytes>`), not the raw bytes, and only
   a subset of BSON types are normalised (`Long`/`Timestamp`/`UUID`/`RegExp`/`Code`/`DBRef` render as
   generic objects).
-- **`distinct` has no dedicated field parameter.** The field is derived from the first key of
-  `options.projection` — an overload of `projection` (which normally means field inclusion). Users
-  must know this incantation; *Future:* add an explicit `options.field`.
 - **`findOne` silently ignores `sort`/`skip`/`limit`** (only `projection` is honoured), so it cannot
   be used to fetch "the latest" document by sort.
 - **`aggregate` ignores `options.limit`/`skip`** and has no safety cap — only an in-pipeline

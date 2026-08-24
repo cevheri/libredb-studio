@@ -76,12 +76,20 @@ const mockCallResults: Record<string, unknown> = {
  */
 const capturedCalls: Array<{ command: string; args: string[] }> = [];
 
+/**
+ * Every options object the provider handed the `Redis` constructor. The TLS
+ * selection is observable nowhere else: ioredis takes it at construction time and
+ * never exposes it again.
+ */
+const capturedRedisOptions: Record<string, unknown>[] = [];
+
 mock.module("ioredis", () => {
   class MockRedis {
     private _config: unknown;
 
     constructor(config?: unknown) {
       this._config = config;
+      capturedRedisOptions.push((config ?? {}) as Record<string, unknown>);
     }
 
     async connect() {
@@ -203,6 +211,66 @@ describe("RedisProvider", () => {
   });
 
   // --------------------------------------------------------------------------
+  // TLS
+  // --------------------------------------------------------------------------
+
+  describe("the TLS options handed to ioredis", () => {
+    /** The options object of the connection this test just opened. */
+    const lastOptions = (): Record<string, unknown> => capturedRedisOptions[capturedRedisOptions.length - 1];
+
+    const connectWithSSL = async (ssl: DatabaseConnection["ssl"]) => {
+      provider = new RedisProvider({ ...baseConfig, ssl });
+      await provider.connect();
+      return lastOptions();
+    };
+
+    test("carries no tls option when the connection names no SSL config", async () => {
+      await provider.connect();
+      expect("tls" in lastOptions()).toBe(false);
+    });
+
+    test("carries no tls option in mode disable", async () => {
+      const options = await connectWithSSL({ mode: "disable" });
+      expect("tls" in options).toBe(false);
+    });
+
+    test("mode require encrypts without checking the chain", async () => {
+      const options = await connectWithSSL({ mode: "require" });
+      expect(options.tls).toEqual({ rejectUnauthorized: false });
+    });
+
+    test("mode verify-ca and verify-full check the chain", async () => {
+      expect(await connectWithSSL({ mode: "verify-ca" })).toMatchObject({ tls: { rejectUnauthorized: true } });
+      expect(await connectWithSSL({ mode: "verify-full" })).toMatchObject({ tls: { rejectUnauthorized: true } });
+    });
+
+    test("an explicit rejectUnauthorized wins over the mode", async () => {
+      const options = await connectWithSSL({ mode: "verify-full", rejectUnauthorized: false });
+      expect(options.tls).toEqual({ rejectUnauthorized: false });
+    });
+
+    test("the CA and client certificate bundle reaches the driver under Node's own names", async () => {
+      const options = await connectWithSSL({
+        mode: "verify-full",
+        caCert: "-----BEGIN CERTIFICATE-----ca-----END CERTIFICATE-----",
+        clientCert: "-----BEGIN CERTIFICATE-----client-----END CERTIFICATE-----",
+        // Deliberately not a PEM header: `-----BEGIN PRIVATE KEY-----` alone, with no material
+        // after it, is enough for gitleaks' `private-key` rule, so the realistic string fails the
+        // Secret Scan gate for a secret that does not exist (the same reason
+        // tests/unit/db/cassandra/wire.test.ts uses this literal). These assertions are about which
+        // option name carries the value, not what the value looks like.
+        clientKey: "client-key-pem",
+      });
+      expect(options.tls).toEqual({
+        rejectUnauthorized: true,
+        ca: "-----BEGIN CERTIFICATE-----ca-----END CERTIFICATE-----",
+        cert: "-----BEGIN CERTIFICATE-----client-----END CERTIFICATE-----",
+        key: "client-key-pem",
+      });
+    });
+  });
+
+  // --------------------------------------------------------------------------
   // getCapabilities()
   // --------------------------------------------------------------------------
 
@@ -216,6 +284,8 @@ describe("RedisProvider", () => {
       // Redis commands are not SQL, so the inline row editor's `UPDATE ... SET`
       // has nothing to run against (#269).
       expect(caps.supportsInlineRowEdit).toBe(false);
+      // MULTI/EXEC exists in Redis and is not exposed through this provider (#U13).
+      expect(caps.supportsTransactions).toBe(false);
       // Redis has no constraints at all, and its "tables" are key prefixes this
       // provider grouped rather than objects anyone declared (#414).
       expect(caps.declaresForeignKeys).toBe(false);
@@ -247,6 +317,41 @@ describe("RedisProvider", () => {
       expect(labels.entityName).toBe("Key Pattern");
       expect(labels.rowName).toBe("key");
       expect(labels.selectAction).toBe("Scan Keys");
+    });
+
+    // Until #U12 the monitoring Queries panel told a Redis server to enable a
+    // PostgreSQL extension. `getSlowQueries()` maps SLOWLOG GET, so the empty panel
+    // means the log is empty - and that is what the sentence must say.
+    test("names SLOWLOG, not a Postgres extension, as where query stats come from", () => {
+      const { slowQueriesEmptyState } = provider.getLabels();
+
+      expect(slowQueriesEmptyState).toContain("SLOWLOG");
+      expect(slowQueriesEmptyState).toContain("slowlog-log-slower-than");
+      expect(slowQueriesEmptyState).not.toContain("pg_stat_statements");
+    });
+
+    // `statementLanguage` is stated verbatim in the agent's plan contract, and this
+    // engine needs one for a reason the MongoDB case does not cover: told to write
+    // "one runnable statement in this Redis database's own query language", a live
+    // plan run on 2026-08-22 answered with the right LANGUAGE in the wrong SHAPE —
+    //
+    //   1) KEYS session:*
+    //   2) GET session:1
+    //
+    // `executeRedisCommand` reads the whole body as ONE command, so the server
+    // answered `ERR unknown command '1)'`. The two failures the sentence has to rule
+    // out are therefore the list numbering and the second command, not the verbs.
+    test("declares the one-command statement shape as the statement language", () => {
+      const { statementLanguage } = provider.getLabels();
+
+      expect(statementLanguage).toBeString();
+      // Both accepted forms are named, because the lossless JSON form is what the
+      // generators fall back to for an argument the plain tokenizer cannot carry.
+      expect(statementLanguage).toContain("one");
+      expect(statementLanguage).toContain('"command"');
+      // And the shapes that are not runnable here, named so they are excluded.
+      expect(statementLanguage).toContain("numbering");
+      expect(statementLanguage).toContain("redis-cli");
     });
   });
 

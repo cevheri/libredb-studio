@@ -38,8 +38,11 @@ const SHIPPED: Readonly<Record<DatabaseType, true>> = Object.freeze({
   druid: true,
   trino: true,
   // Apache Cassandra (#424 Phase 4). ScyllaDB speaks the same CQL wire and is
-  // deliberately NOT recorded as a relative here: that claim needs its own gate-4
-  // probe, and this registry holds nothing that was not measured.
+  // recorded as a relative below: the gate-4 probe ran on 2026-08-21/22 and measured
+  // eight of this provider's thirteen surfaces answering, with the five that read
+  // Cassandra's `system_views` virtual tables failing because ScyllaDB has no such
+  // keyspace. All thirteen answer since 2026-08-24 - re-probed then - but the five
+  // answer EMPTY, which is why the tier below is still `partial`.
   cassandra: true,
   // Two ids served by ONE provider module (`providers/sql/search/`), which is the
   // first time "shipped" here does not mean one provider file per id. They are still
@@ -70,7 +73,7 @@ export const SHIPPED_DATABASE_TYPES: readonly DatabaseType[] = Object.freeze(Obj
  * `libredb` is the embedded store this app carries with it; the other fourteen are
  * external engines you point the product at. Everything published as a database
  * count means the external fourteen - README.md's "fourteen drivers reach
- * thirty-two named engines", the login hero's engine claim - so the split needs a
+ * thirty-three named engines", the login hero's engine claim - so the split needs a
  * definition somewhere, and it belongs beside `SHIPPED` rather than in the UI that
  * prints it. That is the same reason `SHIPPED` itself lives here.
  *
@@ -138,8 +141,9 @@ export interface WireCompatibleEngine {
  * Verified relatives, each measured by a live gate-4 probe on 2026-08-18, with
  * TimescaleDB, YugabyteDB, TiDB and StarRocks added from a second probe run on
  * 2026-08-20, Apache Cloudberry and Vitess from a third run the same day,
- * AlloyDB Omni from a fourth run the same day, and OceanBase Community Edition
- * and SingleStore from a fifth run the same day.
+ * AlloyDB Omni from a fourth run the same day, OceanBase Community Edition
+ * and SingleStore from a fifth run the same day, and ScyllaDB from a sixth run on
+ * 2026-08-21/22.
  * Names still awaiting an instance are tracked in issue #424, never here: there
  * is no "pending" state on purpose, because a reader cannot tell a pending entry
  * from a probed one. A name that WAS probed and did not earn an entry has no
@@ -252,6 +256,7 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     probedVersion: "12.3.2-MariaDB-ubu2404",
     caveats: [
       "The version shown is MariaDB's full build string, including its OS suffix, not a MySQL-style number.",
+      "performance_schema ships OFF (@@performance_schema = 0), so the cache-hit, queries-per-second and buffer-pool figures are absent and the slow-query list is empty until the server is started with performance_schema=ON. Everything the schema tree, sizes, sessions and EXPLAIN need comes from information_schema and is unaffected.",
       "Verified on MariaDB 12.3 only; the 10.x information_schema surface was not probed.",
     ],
   },
@@ -376,6 +381,24 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
       "FerretDB needs its own PostgreSQL backend, so it is a two-container deployment rather than one image.",
     ],
   },
+  {
+    name: "ScyllaDB",
+    via: "cassandra",
+    tier: "partial",
+    probedVersion: "ScyllaDB 2026.2.4-0.20260810.e54224b8cebb (advertises Cassandra 3.0.8)",
+    caveats: [
+      "Every surface answers since 2026-08-24, but five answer EMPTY: the connection count, the cache hit ratio and the active-session list all read Cassandra's system_views virtual tables, which ScyllaDB does not have, so they degrade the way a denied grant does instead of failing the connection.",
+      'Connections reads 0 rather than N/A on the monitoring dashboard, and that zero is the one number here the server did not measure: there is no field on the overview to say "not published", so a build with no system_views keyspace reports the same 0 a permission-denied role does.',
+      "The overview, health, performance-metrics, active-session and monitoring surfaces used to throw, and Test Connection with them; the connection dialog gates its save on that request, so before 2026-08-24 a ScyllaDB connection could not be created in the dialog at all and had to arrive as a seeded or admin-managed one.",
+      "The SQL editor and the object browser work in full: statements run, and every one of 18 CQL types read back byte-identically to Apache Cassandra 5.0.9 probed in the same pass.",
+      "The version reads Apache Cassandra 3.0.8 - the compatibility number system.local publishes - not ScyllaDB 2026.2.4, which lives in system.versions where the provider does not look. Uptime is real: gossip_generation exists here and answers.",
+      "The object browser lists one extra object per secondary index, and the tree and the overview disagree about it: ScyllaDB backs an index with a MATERIALIZED VIEW, so customers_country_idx_index appears in system_schema.views and the tree lists it, while the Tables count comes from system_schema.tables and does not (measured: 4 objects in the tree against tableCount 3). Cassandra lists neither.",
+      'Error classes are identical to Cassandra even though the server\'s wording is not - a missing table is "unconfigured table" rather than "table ... does not exist" - because the provider classifies on the driver\'s error code rather than on the message text.',
+      "Row counts and sizes are blank for the same reason as on Cassandra, and the panels read N/A rather than a fabricated zero.",
+      'Creating a keyspace needs NetworkTopologyStrategy on the 2026.2 line: SimpleStrategy is refused outright with "SimpleStrategy doesn\'t support tablet replication", so the setup recipe in the Cassandra provider doc does not run unchanged.',
+      "ScyllaDB 2025.1.14-0.20260612.103b84070f3b was probed in the 2026-08-21/22 pass and behaved identically on every surface, including the same verbatim refusal the fix keys on, so this entry describes both the 2025.1 and the 2026.2 line - but only these two builds, only a single-node container, and only 2026.2.4 was re-probed after the fix.",
+    ],
+  },
 ];
 
 /** The verified relatives served by one shipped driver, in registry order. */
@@ -399,7 +422,7 @@ export function compatibleEnginesFor(type: DatabaseType): readonly WireCompatibl
  *
  * Still no runtime consumer: README.md and the docs table are markdown and quote the
  * number as prose, and the login hero prints the two halves separately - fourteen in
- * the proof row, eighteen in the relatives line - rather than their sum. This exists
+ * the proof row, nineteen in the relatives line - rather than their sum. This exists
  * so the arithmetic has one definition, and the unit test pins it.
  */
 export function connectableProductCount(): number {

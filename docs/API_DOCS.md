@@ -369,7 +369,10 @@ For MongoDB connections, the `sql` field should contain a JSON query:
 - `deleteMany` - Delete multiple documents
 - `aggregate` - Aggregation pipeline
 - `count` - Count documents matching a filter (runs `countDocuments` internally)
-- `distinct` - Distinct values for a field (the field is taken from the first key of `options.projection`)
+- `distinct` - Distinct values for a field. Takes a **required** top-level `field` key (the driver's
+  own parameter name); a missing or non-string one is a `QUERY_ERROR` rather than a silent `_id`, and
+  `options.projection` is not an alias for it:
+  `{"collection":"products","operation":"distinct","field":"category","filter":{"active":true}}`
 
 ##### Couchbase Query Format
 
@@ -583,7 +586,9 @@ statement. Five things differ from the other SQL providers:
   bytes), and neither is a number this API will pass on. See
   [`docs/providers/cassandra.md`](providers/cassandra.md#32-there-is-no-honest-row-count-and-no-honest-size).
 - `columnTypes` are the wire's declared CQL types (`int`, `bigint`, `list<int>`, `map<varchar, int>`,
-  `duration`, `vector<float, 3>`). A `blob` is rendered as `0x…`, a `bigint`/`decimal`/`varint` as its
+  `duration`, `vector<float, 3>`). A `blob` reaches the client as the JSON shape a `Buffer`
+  serializes to and is rendered `\x…` there, the same as every other engine's binary value since
+  2026-08-24; a `bigint`/`decimal`/`varint` arrives as its
   exact digits in a string (`Number()` would round them), a `vector` as an array of numbers and a
   `duration` as its CQL literal (`1mo2d3h`).
 - A write answers no columns and no row count: the protocol reports neither, so `rowCount` is 0
@@ -1172,6 +1177,7 @@ interface DatabaseConnection {
   database?: string;       // Database name (Couchbase: the bucket; Druid: unused, it has one catalog; Trino: the CATALOG; Cassandra: the KEYSPACE)
   connectionString?: string; // Full connection string (alternative; Druid has no URI form, host + port only; Cassandra has none either, no URI carries localDataCenter)
   localDataCenter?: string; // Cassandra only, and REQUIRED there: the driver refuses to connect without it (`datacenter1` on a stock single node)
+  authSource?: string; // MongoDB only: the database the credentials live in (`?authSource=admin`). Not the database being opened - without it the driver checks the user against that one, which fails as a credentials error
   createdAt: Date;         // Creation timestamp
 }
 

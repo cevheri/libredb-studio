@@ -30,6 +30,7 @@ import {
 } from "../../types";
 import { DatabaseConfigError, ConnectionError, QueryError, mapDatabaseError } from "../../errors";
 import { formatBytes } from "../../utils/pool-manager";
+import { CACHE_HIT_RATIO_UNAVAILABLE, formatCacheHitRatio, measuredNumber } from "@/lib/monitoring-cache-ratio";
 
 // ============================================================================
 // Types
@@ -53,6 +54,10 @@ interface MongoQuery {
   pipeline?: Document[];
   update?: Document;
   documents?: Document[];
+  // `distinct` only, and the driver's own parameter name. Typed as unknown because
+  // parseQuery() casts unvalidated JSON: the dispatch re-checks it the way it
+  // re-checks `operation`.
+  field?: unknown;
   options?: {
     limit?: number;
     skip?: number;
@@ -76,6 +81,56 @@ const SUPPORTED_OPERATIONS: ReadonlySet<MongoQuery["operation"]> = new Set([
   "deleteOne",
   "deleteMany",
 ]);
+
+/**
+ * How deep `inferSchemaFromDocuments` walks a subdocument, counting the top level as
+ * 1 — so `shipping.geo.lat` is named and `shipping.geo.deep.tooFar` is not. Three
+ * levels is where the dotted paths a query actually groups or filters on live; past
+ * that the tree stops describing the collection and starts transcribing one document.
+ * The container at the boundary is still listed, so the nesting continuing is visible.
+ */
+const MAX_NESTED_FIELD_DEPTH = 3;
+
+/**
+ * Upper bound on the fields one collection reports. Nesting multiplies, and both
+ * consumers of this list are bounded surfaces: the schema tree a person scrolls and
+ * the inventory an agent run is given.
+ */
+const MAX_INFERRED_FIELDS = 200;
+
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+/**
+ * The WiredTiger cache hit ratio, or `undefined` when there is nothing to compute
+ * one from.
+ *
+ * Two different absences, and neither is a number: a deployment can publish no
+ * `wiredTiger` section at all (mongos, the in-memory storage engine, the
+ * wire-compatible services), and a freshly opened one publishes the section with a
+ * request count of 0, where there are no hits and no misses rather than perfect
+ * hits. Both used to reach the panel as 99% - a figure this provider invented, not
+ * one the server ever reported (#424, and the rule #448/#452 settled).
+ */
+function wiredTigerCacheHitRatio(cache: Document | undefined): number | undefined {
+  const requested = measuredNumber(cache?.["pages requested from the cache"]);
+  const read = measuredNumber(cache?.["pages read into cache"]);
+  if (requested === undefined || read === undefined || requested === 0) return undefined;
+  return round2(Math.max(0, Math.min(100, (1 - read / requested) * 100)));
+}
+
+/**
+ * How much of the configured WiredTiger cache currently holds data, or `undefined`
+ * when the section is absent. A measured 0 is kept: an untouched cache really does
+ * hold nothing.
+ */
+function wiredTigerCacheUsage(cache: Document | undefined): number | undefined {
+  const bytes = measuredNumber(cache?.["bytes currently in the cache"]);
+  const maxBytes = measuredNumber(cache?.["maximum bytes configured"]);
+  if (bytes === undefined || maxBytes === undefined || maxBytes === 0) return undefined;
+  return round2(Math.max(0, Math.min(100, (bytes / maxBytes) * 100)));
+}
 
 // Maintenance operations runMaintenance() accepts; validated the same way.
 const SUPPORTED_MAINTENANCE_TYPES: ReadonlySet<MaintenanceType> = new Set([
@@ -113,6 +168,8 @@ export class MongoDBProvider extends BaseDatabaseProvider {
       // The query language is JSON commands, not SQL, so the inline row editor's
       // `UPDATE ... SET` has nothing here to run against (issue #269).
       supportsInlineRowEdit: false,
+      // Multi-document transactions need a client session this provider does not hold.
+      supportsTransactions: false,
       // MongoDB has no foreign key constraint at all, so `getSchema()`'s empty
       // `foreignKeys` is the engine's model rather than this database's shape. A
       // reader told only "none were found" would hedge over causes that do not apply
@@ -143,6 +200,22 @@ export class MongoDBProvider extends BaseDatabaseProvider {
       vacuumGlobalLabel: "Run Compact",
       vacuumGlobalTitle: "Compact Storage",
       vacuumGlobalDesc: "Defragments and compacts collection storage to reclaim disk space.",
+      // Stated verbatim in the agent's plan contract, and needed for the reason the
+      // search products needed theirs: told to write "one runnable statement in this
+      // MongoDB database's own query language", a live plan run on 2026-08-22 wrote
+      // mongosh - `db.orders.aggregate([{ $group: ... }])`. That is correct MongoDB
+      // and unrunnable here, because `query()` parses the JSON command object and
+      // nothing else, so what the user was handed was a plan they could not execute.
+      // The sentence therefore carries the envelope itself and names the shell form
+      // it excludes: naming only what the language IS did not survive contact with
+      // the model's prior on Elasticsearch, and does not here either.
+      statementLanguage:
+        'the JSON command object this editor executes - {"collection": "<name>", "operation": "find" | "findOne" | "aggregate" | "count" | "distinct", "filter": {...}, "pipeline": [...], "field": "<name>" (distinct only), "options": {"limit": 50}} - and NOT mongosh shell syntax: a statement that starts with `db.` cannot be run here',
+      // `getSlowQueries()` reads `system.profile`, which does not exist until the
+      // profiler is switched on - so the empty panel is the ordinary case here, and it
+      // used to name a PostgreSQL extension (#U12).
+      slowQueriesEmptyState:
+        "Query stats come from the database profiler - run db.setProfilingLevel() to start recording into system.profile.",
     };
   }
 
@@ -184,6 +257,7 @@ export class MongoDBProvider extends BaseDatabaseProvider {
         maxIdleTimeMS: this.poolConfig.idleTimeout,
         connectTimeoutMS: this.poolConfig.acquireTimeout,
         serverSelectionTimeoutMS: this.poolConfig.acquireTimeout,
+        ...this.buildTLSOptions(),
       };
 
       this.client = new MongoClient(connectionString, options);
@@ -220,6 +294,33 @@ export class MongoDBProvider extends BaseDatabaseProvider {
     }
   }
 
+  /**
+   * `tls`, `ca`, `cert`, `key` and `rejectUnauthorized` are all on the driver's own
+   * allow-list of TLS options (`LEGAL_TLS_SOCKET_OPTIONS` in mongodb/lib/cmap/connect.js)
+   * and reach `tls.connect` under Node's names, so the connection form's material maps
+   * the same way it does for PostgreSQL, MySQL and Couchbase. `require` encrypts
+   * without checking the chain, because a self-hosted replica set presents a
+   * self-signed certificate; the verifying modes check it. An explicit flag wins.
+   *
+   * Unlike `authSource`, this is applied with a pasted `connectionString` as well: the
+   * URI is returned verbatim so a `tls=` cannot be appended to it, but the options
+   * object is a second channel the driver reads, and the dialog shows the SSL panel in
+   * connection-string mode too.
+   */
+  private buildTLSOptions(): MongoClientOptions {
+    const ssl = this.config.ssl;
+    if (!ssl || ssl.mode === "disable") return {};
+
+    const options: MongoClientOptions = {
+      tls: true,
+      rejectUnauthorized: ssl.rejectUnauthorized ?? (ssl.mode === "verify-ca" || ssl.mode === "verify-full"),
+    };
+    if (ssl.caCert) options.ca = ssl.caCert;
+    if (ssl.clientCert) options.cert = ssl.clientCert;
+    if (ssl.clientKey) options.key = ssl.clientKey;
+    return options;
+  }
+
   private buildConnectionString(): string {
     if (this.config.connectionString) {
       return this.config.connectionString;
@@ -234,7 +335,13 @@ export class MongoDBProvider extends BaseDatabaseProvider {
     const port = this.config.port || 27017;
     const database = this.config.database || "test";
 
-    return `mongodb://${auth}${host}:${port}/${database}`;
+    // The database the credentials live in, which is not always the one being opened:
+    // without it the driver authenticates against the database in the path, so users
+    // in `admin` and data elsewhere - the ordinary deployment - failed as a
+    // credentials error. A pasted connection string returned above carries its own.
+    const authSource = this.config.authSource ? `?authSource=${encodeURIComponent(this.config.authSource)}` : "";
+
+    return `mongodb://${auth}${host}:${port}/${database}${authSource}`;
   }
 
   private getDatabaseName(): string {
@@ -320,11 +427,25 @@ export class MongoDBProvider extends BaseDatabaseProvider {
               rows = [{ count }];
               break;
 
-            case "distinct":
-              const field = query.options?.projection ? Object.keys(query.options.projection)[0] : "_id";
+            case "distinct": {
+              // Named, and required. The field used to be the FIRST KEY of
+              // `options.projection` with `_id` as the fallback, which meant
+              // `{"operation":"distinct","field":"category"}` - the driver's own
+              // spelling - answered 120 rows of `_id` on a live probe (2026-08-22,
+              // 120 products in five categories). A plausible list is worse than an
+              // error, so the projection spelling is gone rather than aliased:
+              // nothing in the product generates a `distinct`.
+              const field = query.field;
+              if (typeof field !== "string" || field.length === 0) {
+                throw new QueryError(
+                  'distinct requires a "field": the name of the field to collect values of',
+                  "mongodb",
+                );
+              }
               const values = await collection.distinct(field, query.filter || {});
               rows = values.map((v) => ({ [field]: v }));
               break;
+            }
 
             case "insertOne":
               if (!query.documents || query.documents.length === 0) {
@@ -561,10 +682,16 @@ export class MongoDBProvider extends BaseDatabaseProvider {
       return a.name.localeCompare(b.name);
     });
 
-    return columns;
+    // Bounded AFTER sorting, so what survives is a deterministic prefix rather than
+    // whichever fields the sampled documents happened to mention first - and `_id`,
+    // the field every generated statement addresses, always survives. The bound
+    // exists because nesting multiplies: a document with 60 subdocuments of 10 fields
+    // each is 661 rows in the schema tree and 661 lines in a model's context window,
+    // for one collection. Same reason `getSchema` already stops at 200 collections.
+    return columns.slice(0, MAX_INFERRED_FIELDS);
   }
 
-  private extractFieldTypes(doc: Document, prefix: string, fieldTypes: Map<string, Set<string>>): void {
+  private extractFieldTypes(doc: Document, prefix: string, fieldTypes: Map<string, Set<string>>, depth = 1): void {
     for (const [key, value] of Object.entries(doc)) {
       const fieldName = prefix ? `${prefix}.${key}` : key;
 
@@ -575,11 +702,22 @@ export class MongoDBProvider extends BaseDatabaseProvider {
       const type = this.getMongoType(value);
       fieldTypes.get(fieldName)!.add(type);
 
-      // Don't recurse into nested objects for now (keep it flat)
-      // Uncomment below to include nested fields
-      // if (type === 'object' && value !== null && !Array.isArray(value)) {
-      //   this.extractFieldTypes(value as Document, fieldName, fieldTypes);
-      // }
+      // Descend into subdocuments, because `shipping.city` is a field name in this
+      // engine's own query language and a schema that stops at `shipping: object`
+      // does not name it. That absence is not only cosmetic: the same inventory
+      // grounds an agent plan run, and a run on 2026-08-22 grouped by
+      // `$shipping.region` - a path the database does not have - which MongoDB
+      // answers with a single null group rather than an error, so the plan read as
+      // runnable and was silently wrong.
+      //
+      // `getMongoType` has already ruled out every object that is really a scalar
+      // (Date, ObjectId, Binary, Decimal128) and arrays, which are deliberately left
+      // closed: `items.sku` addresses one value PER ARRAY ENTRY, so it does not mean
+      // on an array what the same syntax means on a subdocument, and listing it
+      // beside the others would invite exactly that confusion.
+      if (type === "object" && depth < MAX_NESTED_FIELD_DEPTH) {
+        this.extractFieldTypes(value as Document, fieldName, fieldTypes, depth + 1);
+      }
     }
   }
 
@@ -644,17 +782,15 @@ export class MongoDBProvider extends BaseDatabaseProvider {
         });
       }
 
+      const healthCacheHitRatio = wiredTigerCacheHitRatio(serverStatus.wiredTiger?.cache);
+
       return {
         activeConnections: serverStatus.connections?.current || 0,
         databaseSize: formatBytes(dbStats.dataSize || 0),
-        cacheHitRatio: serverStatus.wiredTiger?.cache
-          ? `${(
-              (1 -
-                (serverStatus.wiredTiger.cache["pages read into cache"] || 0) /
-                  Math.max(1, serverStatus.wiredTiger.cache["pages requested from the cache"] || 1)) *
-                100
-            ).toFixed(1)}%`
-          : "N/A",
+        cacheHitRatio:
+          healthCacheHitRatio === undefined
+            ? CACHE_HIT_RATIO_UNAVAILABLE
+            : `${formatCacheHitRatio(healthCacheHitRatio)}%`,
         slowQueries,
         activeSessions,
       };
@@ -774,6 +910,15 @@ export class MongoDBProvider extends BaseDatabaseProvider {
       // Get collection count
       const collections = await this.db!.listCollections().toArray();
 
+      // The limit is what the server has plus what it is still willing to hand out.
+      // A truthiness test read an exhausted pool (`available: 0`) as "not published"
+      // and substituted 100 - a limit no server stated, which the Overview card then
+      // divided the live connection count by. 0 is how every provider in this repo
+      // spells "no limit published", and the card renders it as exactly that.
+      const current = measuredNumber(serverStatus.connections?.current);
+      const available = measuredNumber(serverStatus.connections?.available);
+      const maxConnections = current === undefined || available === undefined ? undefined : current + available;
+
       // Get index count
       let indexCount = 0;
       for (const coll of collections) {
@@ -790,9 +935,7 @@ export class MongoDBProvider extends BaseDatabaseProvider {
         uptime,
         startTime: new Date(Date.now() - uptimeSeconds * 1000),
         activeConnections: serverStatus.connections?.current || 0,
-        maxConnections: serverStatus.connections?.available
-          ? serverStatus.connections.current + serverStatus.connections.available
-          : 100,
+        maxConnections: maxConnections ?? 0,
         databaseSize: formatBytes(dbStats.dataSize || 0),
         databaseSizeBytes: dbStats.dataSize || 0,
         tableCount: collections.length,
@@ -804,7 +947,8 @@ export class MongoDBProvider extends BaseDatabaseProvider {
         version: "MongoDB Unknown",
         uptime: "N/A",
         activeConnections: 0,
-        maxConnections: 100,
+        // Nothing was read, so no limit is published (see the success path above).
+        maxConnections: 0,
         databaseSize: "N/A",
         databaseSizeBytes: 0,
         tableCount: 0,
@@ -819,43 +963,39 @@ export class MongoDBProvider extends BaseDatabaseProvider {
     try {
       const serverStatus = await this.db!.admin().serverStatus();
 
-      // Calculate cache hit ratio from WiredTiger
-      let cacheHitRatio = 99;
-      if (serverStatus.wiredTiger?.cache) {
-        const pagesRead = serverStatus.wiredTiger.cache["pages read into cache"] || 0;
-        const pagesRequested = serverStatus.wiredTiger.cache["pages requested from the cache"] || 1;
-        cacheHitRatio = Math.max(0, Math.min(100, (1 - pagesRead / Math.max(1, pagesRequested)) * 100));
-      }
+      // Every reading below is optional on purpose: a metric nobody measured must
+      // stay absent rather than arrive as a number the panels would then rate.
+      const cache = serverStatus.wiredTiger?.cache;
+      const cacheHitRatio = wiredTigerCacheHitRatio(cache);
+      const bufferPoolUsage = wiredTigerCacheUsage(cache);
 
-      // Calculate queries per second from opcounters
-      const opcounters = serverStatus.opcounters || {};
-      const uptimeSeconds = serverStatus.uptime || 1;
+      // Queries per second from opcounters. A server that publishes no opcounters
+      // has not counted zero operations, it has counted nothing.
+      const opcounters = serverStatus.opcounters;
+      const uptimeSeconds = measuredNumber(serverStatus.uptime);
       const totalOps =
-        (opcounters.query || 0) + (opcounters.insert || 0) + (opcounters.update || 0) + (opcounters.delete || 0);
-      const queriesPerSecond = totalOps / uptimeSeconds;
-
-      // Get buffer pool usage (WiredTiger cache usage)
-      let bufferPoolUsage = 0;
-      if (serverStatus.wiredTiger?.cache) {
-        const bytesInCache = serverStatus.wiredTiger.cache["bytes currently in the cache"] || 0;
-        const maxCacheBytes = serverStatus.wiredTiger.cache["maximum bytes configured"] || 1;
-        bufferPoolUsage = (bytesInCache / maxCacheBytes) * 100;
-      }
+        opcounters === undefined
+          ? undefined
+          : (measuredNumber(opcounters.query) ?? 0) +
+            (measuredNumber(opcounters.insert) ?? 0) +
+            (measuredNumber(opcounters.update) ?? 0) +
+            (measuredNumber(opcounters.delete) ?? 0);
 
       return {
-        cacheHitRatio: Math.round(cacheHitRatio * 100) / 100,
-        queriesPerSecond: Math.round(queriesPerSecond * 100) / 100,
-        bufferPoolUsage: Math.round(bufferPoolUsage * 100) / 100,
-        deadlocks: 0, // MongoDB doesn't have traditional deadlocks
+        ...(cacheHitRatio === undefined ? {} : { cacheHitRatio }),
+        ...(totalOps === undefined || !uptimeSeconds ? {} : { queriesPerSecond: round2(totalOps / uptimeSeconds) }),
+        ...(bufferPoolUsage === undefined ? {} : { bufferPoolUsage }),
+        // MongoDB has no deadlocks to count: WiredTiger aborts and retries a write
+        // conflict instead of holding two waiters. The 0 is a statement about the
+        // engine, and it is only made when serverStatus answered at all.
+        deadlocks: 0,
       };
     } catch (error) {
       this.logError("getPerformanceMetrics", error);
-      return {
-        cacheHitRatio: 99,
-        queriesPerSecond: 0,
-        bufferPoolUsage: 0,
-        deadlocks: 0,
-      };
+      // serverStatus failed - an unprivileged user, a proxied deployment - so
+      // nothing was measured and nothing is reported. This branch used to answer
+      // the panel with a 99% cache hit ratio and three zeroes.
+      return {};
     }
   }
 
@@ -934,6 +1074,9 @@ export class MongoDBProvider extends BaseDatabaseProvider {
           tableSize: formatBytes(collStats.size || 0),
           tableSizeBytes: collStats.size || 0,
           indexSize: formatBytes(collStats.totalIndexSize || 0),
+          // `collStats.totalIndexSize` is a byte count the server measured; it was formatted for
+          // display and then dropped, leaving the storage panel with no index total to add up.
+          indexSizeBytes: collStats.totalIndexSize || 0,
           totalSize: formatBytes((collStats.size || 0) + (collStats.totalIndexSize || 0)),
           totalSizeBytes: (collStats.size || 0) + (collStats.totalIndexSize || 0),
         });

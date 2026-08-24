@@ -55,6 +55,7 @@ const FIELD_OWNERSHIP: Record<keyof DatabaseConnection, FieldOwnership> = {
   serviceName: "edited",
   instanceName: "edited",
   localDataCenter: "edited",
+  authSource: "edited",
   group: "preserved",
   managed: "preserved",
   seedId: "preserved",
@@ -82,10 +83,36 @@ interface UseConnectionFormProps {
   onClose: () => void;
   onConnect: (conn: DatabaseConnection) => void;
   editConnection?: DatabaseConnection | null;
-  /** Optional API adapter: when provided, bypasses the built-in /api/db/test-connection fetch. */
+  /**
+   * Optional API adapter: when provided, bypasses the built-in /api/db/test-connection fetch.
+   *
+   * `degraded` carries the same distinction the route makes: the server accepted the
+   * connection and refused the health read. An adapter that does not report it keeps
+   * the old two-outcome behaviour.
+   */
   onTestConnection?: (
     connection: DatabaseConnection,
-  ) => Promise<{ success: boolean; latency?: number; error?: string }>;
+  ) => Promise<{ success: boolean; latency?: number; error?: string; degraded?: boolean; message?: string }>;
+}
+
+/** What the test route answered, in the shape both call sites read. */
+interface TestOutcome {
+  success: boolean;
+  latency?: number;
+  error?: string;
+  degraded?: boolean;
+  message?: string;
+}
+
+/**
+ * What to show for a connection that exists and answers no health data.
+ *
+ * The server's own sentence, because it is the only thing that says which surface
+ * refused - `Keyspace system_views does not exist` on ScyllaDB - and a house phrasing
+ * would replace it with something less specific.
+ */
+function degradedSentence(result: TestOutcome): string {
+  return result.message ?? result.error ?? "Connected, but this server answered no health data.";
 }
 
 export function useConnectionForm({ isOpen, onConnect, editConnection, onTestConnection }: UseConnectionFormProps) {
@@ -103,6 +130,8 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
   const [testResult, setTestResult] = useState<{ success: boolean; message: string; latency?: number } | null>(null);
   const [pasteInput, setPasteInput] = useState("");
   const [showPasteInput, setShowPasteInput] = useState(false);
+  /** Whether the user has been shown, and clicked past, a connection with no health surface. */
+  const [degradedSaveAcknowledged, setDegradedSaveAcknowledged] = useState(false);
 
   // SSL/TLS
   const [showSSL, setShowSSL] = useState(false);
@@ -119,6 +148,9 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
   // the two above: `cassandra-driver` refuses to connect without it, so a hidden
   // field would be a connection nobody could open.
   const [localDataCenter, setLocalDataCenter] = useState("");
+  // MongoDB's auth database. In the open for the same reason as the field above: it is
+  // what the ordinary deployment (users in `admin`) cannot connect without.
+  const [authSource, setAuthSource] = useState("");
 
   // SSH Tunnel
   const [showSSH, setShowSSH] = useState(false);
@@ -161,6 +193,9 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
       // connection that carries no data centre must show an empty field, or the
       // previously edited ring's name gets saved onto this one.
       setLocalDataCenter(editConnection.localDataCenter || "");
+      // Overwritten for the same reason: a connection that names no auth database must
+      // show an empty field, not the last one edited.
+      setAuthSource(editConnection.authSource || "");
       // SSL
       if (editConnection.ssl) {
         setSSLMode(editConnection.ssl.mode);
@@ -190,6 +225,8 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
       setTestResult(null);
       setShowPasteInput(false);
       setPasteInput("");
+      // The next connection typed into this dialog has not been warned about anything.
+      setDegradedSaveAcknowledged(false);
       if (!editConnection) {
         setName("");
         setUser("");
@@ -205,6 +242,9 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
         // either refuses or - when the name exists on both rings - accepts as a
         // silently wrong topology.
         setLocalDataCenter("");
+        // A leftover auth database sends the next connection's credentials to a
+        // database that may not hold them, which reads as a wrong password.
+        setAuthSource("");
       }
     }
   }, [isOpen, editConnection]);
@@ -272,6 +312,7 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
       ...(type === "oracle" && serviceName ? { serviceName } : {}),
       ...(type === "mssql" && instanceName ? { instanceName } : {}),
       ...(type === "cassandra" && localDataCenter ? { localDataCenter } : {}),
+      ...(type === "mongodb" && authSource ? { authSource } : {}),
     };
   }, [
     sslMode,
@@ -300,48 +341,58 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
     serviceName,
     instanceName,
     localDataCenter,
+    authSource,
   ]);
+
+  /**
+   * The one place the connection is probed, for both buttons.
+   *
+   * The two call sites had a copy each of the adapter/fetch branch, and the copies
+   * had already diverged: the save path read only `success` and threw the rest of the
+   * answer away, which is how a degraded outcome became indistinguishable from a
+   * refusal.
+   */
+  const probeConnection = useCallback(
+    async (conn: DatabaseConnection): Promise<TestOutcome> => {
+      // Platform adapter: use callback instead of fetch
+      if (onTestConnection) return await onTestConnection(conn);
+
+      const response = await fetch("/api/db/test-connection", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(conn),
+      });
+
+      return await response.json();
+    },
+    [onTestConnection],
+  );
 
   const handleTestConnection = useCallback(async () => {
     setIsTesting(true);
     setTestResult(null);
 
     try {
-      const conn = buildConnection();
+      const result = await probeConnection(buildConnection());
 
-      if (onTestConnection) {
-        // Platform adapter: use callback instead of fetch
-        const result = await onTestConnection(conn);
-        setTestResult({
-          success: result.success,
-          message: result.success
-            ? `Connected successfully${result.latency ? ` (${result.latency}ms)` : ""}`
-            : result.error || "Connection failed",
-          latency: result.latency,
-        });
-      } else {
-        // Default: existing fetch behavior
-        const response = await fetch("/api/db/test-connection", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(conn),
-        });
-
-        const result = await response.json();
-        setTestResult({
-          success: result.success,
-          message: result.success
-            ? `Connected successfully${result.latency ? ` (${result.latency}ms)` : ""}`
-            : result.error || "Connection failed",
-          latency: result.latency,
-        });
-      }
+      setTestResult({
+        success: result.success,
+        message: result.success
+          ? // A degraded connection IS connected, so it stays a success - but saying
+            // "Connected successfully" and nothing else is what hid the missing
+            // monitoring surface until the dashboard showed an error page.
+            result.degraded
+            ? degradedSentence(result)
+            : `Connected successfully${result.latency ? ` (${result.latency}ms)` : ""}`
+          : result.error || "Connection failed",
+        latency: result.latency,
+      });
     } catch {
       setTestResult({ success: false, message: "Network error - could not reach server" });
     } finally {
       setIsTesting(false);
     }
-  }, [buildConnection, onTestConnection]);
+  }, [buildConnection, probeConnection]);
 
   const handleConnect = useCallback(async () => {
     setIsTesting(true);
@@ -349,40 +400,55 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
 
     try {
       const conn = buildConnection();
+      const result = await probeConnection(conn);
 
-      let result: { success: boolean; error?: string };
-      if (onTestConnection) {
-        // Platform adapter: use callback instead of fetch
-        result = await onTestConnection(conn);
-      } else {
-        // Default: existing fetch behavior
-        const response = await fetch("/api/db/test-connection", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(conn),
-        });
-        result = await response.json();
-      }
-
-      if (result.success) {
-        onConnect(conn);
-        // Reset form
-        setName("");
-        setUser("");
-        setPassword("");
-        setDatabase("");
-        setConnectionString("");
-        setMongoConnectionMode("host");
-        setTestResult(null);
-      } else {
+      if (!result.success) {
         setTestResult({ success: false, message: result.error || "Connection failed" });
+        return;
       }
+
+      /*
+        A server that connects and runs statements is usable, so the save no longer
+        depends on its health surface answering. Three published engines
+        were unsaveable on that gate alone - ScyllaDB, whose health read asks for a
+        `system_views` keyspace the build does not have, plus StarRocks and SingleStore
+        (whose health reads died on the prepared-statement protocol until 2026-08-24) -
+        while the editor and the object browser worked in full.
+
+        What the save may NOT become is silent. The first click reports what the server
+        refused, in its own words, and saves nothing; only a second one saves. The
+        acknowledgement is withdrawn when the dialog closes, so the next connection
+        typed here gets told too.
+      */
+      if (result.degraded === true && !degradedSaveAcknowledged) {
+        setDegradedSaveAcknowledged(true);
+        setTestResult({
+          success: true,
+          // The button's own label, because the dialog renders two of them: "Save
+          // Changes" when editing and "Establish Connection" when creating, and naming
+          // a button that is not on screen is worse than naming none.
+          message: `${degradedSentence(result)} Click ${
+            isEditMode ? "Save Changes" : "Establish Connection"
+          } again to save it anyway.`,
+        });
+        return;
+      }
+
+      onConnect(conn);
+      // Reset form
+      setName("");
+      setUser("");
+      setPassword("");
+      setDatabase("");
+      setConnectionString("");
+      setMongoConnectionMode("host");
+      setTestResult(null);
     } catch {
       setTestResult({ success: false, message: "Network error - could not reach server" });
     } finally {
       setIsTesting(false);
     }
-  }, [buildConnection, type, onConnect, onTestConnection]);
+  }, [buildConnection, degradedSaveAcknowledged, isEditMode, onConnect, probeConnection]);
 
   const handlePasteConnectionString = useCallback(() => {
     const trimmed = pasteInput.trim();
@@ -513,6 +579,8 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
     setInstanceName,
     localDataCenter,
     setLocalDataCenter,
+    authSource,
+    setAuthSource,
 
     // SSH Tunnel
     showSSH,

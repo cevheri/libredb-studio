@@ -1,6 +1,7 @@
 import { access, constants, mkdir, unlink, writeFile } from "fs/promises";
 import * as path from "path";
 import { resolveConfig, validateConfig } from "@/lib/llm/utils/config";
+import { AGENT_MODEL_TURN_TIMEOUT_MS, AGENT_WORKFLOW_BUDGETS } from "./execution-policy";
 
 /**
  * Server-side configuration for the agent runtime (#329, epic #325; availability
@@ -58,6 +59,79 @@ export const AGENT_ENABLED_ENV = "LIBREDB_AGENT_ENABLED";
  * there is exactly one value in play and no way for the two to disagree.
  */
 export const AGENT_WORLD_TARGET_ENV = "WORKFLOW_TARGET_WORLD";
+
+/**
+ * How long ONE model call may take before the drive stops waiting for it.
+ *
+ * Lives here rather than beside the constant it overrides, because this module is the one
+ * place in the agent tree that reads the environment — `tests/unit/agent-documentation.test.ts`
+ * asserts exactly that, and it caught this read in the wrong file.
+ */
+const AGENT_TURN_TIMEOUT_ENV = "AGENT_MODEL_TURN_TIMEOUT_MS";
+
+/** Exported like the other variable names this file owns, so a test names it rather than spelling it. */
+export const AGENT_MODEL_TUNING_ENV = "AGENT_MODEL_TUNING_PATH";
+
+/**
+ * A file of measured per-model settings to layer over the ones Studio ships with, if any.
+ *
+ * This is how a model Studio has never measured gets settings somebody else measured: mount a
+ * file, name it here, restart. No release, no code change, no settings screen — which is how
+ * everything else in this product is configured.
+ *
+ * A path rather than a URL, deliberately. It works with no egress, it needs no cache and no
+ * story about what a run should do while a fetch is in flight, and a file an operator put on
+ * their own disk needs no provenance argument that a remote document would.
+ *
+ * Blank is the same as unset, because an empty variable is what a template renders when nobody
+ * filled it in, and reading it as "load the file called ''" would turn an unconfigured install
+ * into a warning on every boot. Whether the file parses is not decided here: see
+ * `model-tuning/index.ts`, which ignores a document it cannot read and keeps the bundled one.
+ *
+ * Resolved to an absolute path, so a relative value is reported as the file that was actually
+ * opened. The working directory is a different place in each way this ships — `/app` in the
+ * container, wherever the user stood under `npx`, the checkout in development — so `models.json`
+ * is really a question about which directory, and the answer belongs in the diagnosis rather than
+ * in whoever is guessing. Resolved rather than refused: refusing would add a failure mode, and an
+ * absolute path in the report says everything the refusal would have.
+ */
+export function agentModelTuningPath(): string | undefined {
+  const raw = process.env[AGENT_MODEL_TUNING_ENV]?.trim();
+  return raw === undefined || raw === "" ? undefined : path.resolve(raw);
+}
+
+/**
+ * The configured per-turn ceiling, or `undefined` when nothing usable was set.
+ *
+ * Measured across 25 local Ollama models on six agent surfaces: NINE runs ended
+ * `stopReason=model-timeout` with the model still working, six of them recorded as the
+ * `no-report` shortfall. One was a reasoning model in PLAN mode — which holds no tools, so
+ * thinking time is the only thing that can fail — cut 92 seconds into its first turn with a
+ * zero-event ledger. Those runs are scored as having answered nothing, which is a fact about
+ * the ceiling and not about the model.
+ *
+ * A value that is not a positive whole number is ignored rather than clamped or thrown on: a
+ * mistyped variable must not end every turn instantly, which is worse than the value the
+ * operator meant to set.
+ *
+ * What it IS bounded against is the workflow deadlines, which live in `execution-policy.ts`.
+ * The import goes THIS way for a reason the build caught: `execution-policy.ts` is reachable
+ * from the browser (`Studio.tsx` -> `use-agent-prefill.ts`) and this module imports
+ * `fs/promises`, so a read placed there would have pulled Node's filesystem into the client
+ * bundle. The dependency has to point from the server-only module to the client-safe one.
+ *
+ * `AGENT_WORKFLOW_BUDGETS` guarantees every workflow can take at least two turns — an
+ * invariant that file's own test asserts — so a ceiling past half the smallest deadline would
+ * configure a run that cannot finish. Capped rather than obeyed into incoherence.
+ */
+export function agentModelTurnTimeoutMs(): number {
+  const raw = process.env[AGENT_TURN_TIMEOUT_ENV];
+  if (raw === undefined) return AGENT_MODEL_TURN_TIMEOUT_MS;
+  const asked = Number(raw.trim());
+  if (!Number.isSafeInteger(asked) || asked <= 0) return AGENT_MODEL_TURN_TIMEOUT_MS;
+  const smallestDeadline = Math.min(...Object.values(AGENT_WORKFLOW_BUDGETS).map((budget) => budget.runDeadlineMs));
+  return Math.min(asked, Math.floor(smallestDeadline / 2) - 1);
+}
 
 /**
  * Set by the hosted platform the runtime targets by default. Read here only to

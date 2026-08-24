@@ -1,6 +1,6 @@
 import { describe, test, expect, spyOn } from "bun:test";
 import { BaseDatabaseProvider } from "@/lib/db/base-provider";
-import { ConnectionError, DatabaseConfigError, DatabaseError } from "@/lib/db/errors";
+import { AuthenticationError, ConnectionError, DatabaseConfigError, DatabaseError } from "@/lib/db/errors";
 import type {
   DatabaseConnection,
   QueryResult,
@@ -17,6 +17,7 @@ import type {
   IndexStats,
   StorageStats,
   ProviderCapabilities,
+  ProviderLabels,
 } from "@/lib/db/types";
 
 // ============================================================================
@@ -224,6 +225,11 @@ describe("BaseDatabaseProvider", () => {
       expect(caps.supportsExternalQueryLimiting).toBe(true);
       expect(caps.supportsCreateTable).toBe(true);
       expect(caps.supportsInlineRowEdit).toBe(true);
+      // The opposite default to the line above, and deliberately: this class
+      // implements no transaction methods, so a subclass that does not add them has
+      // none and POST /api/db/transaction refuses the call. Only the four providers
+      // that hold a session for one declare `true` (#U13).
+      expect(caps.supportsTransactions).toBe(false);
       // Compile-time pin, checked by `bun run typecheck`: `ProviderCapabilities` is
       // published (`src/exports/types.ts`), so a capability added later must be
       // OPTIONAL or every external implementer of the type stops compiling. Omitting
@@ -241,6 +247,7 @@ describe("BaseDatabaseProvider", () => {
         schemaRefreshPattern: "",
       };
       expect(externalImplementer.supportsInlineRowEdit).toBeUndefined();
+      expect(externalImplementer.supportsTransactions).toBeUndefined();
       expect(externalImplementer.declaresForeignKeys).toBeUndefined();
       // The SQL default: a relational engine HAS foreign keys whether or not a given
       // schema uses any. The six engines that have none override it, so the strong
@@ -280,6 +287,38 @@ describe("BaseDatabaseProvider", () => {
       expect(labels.rowNamePlural).toBe("rows");
       expect(labels.selectAction).toBe("Select Top 50");
       expect(labels.searchPlaceholder).toBe("Search tables or columns...");
+    });
+
+    test("declares no global reindex wording, so the Operations card keeps its fallback", () => {
+      // The `reindexGlobal*` triad is OPTIONAL on the published `ProviderLabels`
+      // (`src/exports/types.ts`), unlike the analyze and vacuum triads beside it: a
+      // required field added after the fact stops every external implementer of the
+      // type compiling. Only the three providers that declare the `reindex`
+      // maintenance operation set it, and `OperationsTab` falls back to the wording
+      // the card had (#U6). The literal below is the compile-time half of that,
+      // checked by `bun run typecheck`.
+      const externalImplementer: ProviderLabels = {
+        entityName: "Node",
+        entityNamePlural: "Nodes",
+        rowName: "record",
+        rowNamePlural: "records",
+        selectAction: "Read",
+        generateAction: "Generate",
+        analyzeAction: "Analyze",
+        vacuumAction: "Vacuum",
+        searchPlaceholder: "Search...",
+        analyzeGlobalLabel: "Analyze",
+        analyzeGlobalTitle: "Analyze",
+        analyzeGlobalDesc: "Analyze.",
+        vacuumGlobalLabel: "Vacuum",
+        vacuumGlobalTitle: "Vacuum",
+        vacuumGlobalDesc: "Vacuum.",
+      };
+
+      expect(externalImplementer.reindexGlobalLabel).toBeUndefined();
+      expect(externalImplementer.reindexGlobalTitle).toBeUndefined();
+      expect(externalImplementer.reindexGlobalDesc).toBeUndefined();
+      expect(new TestProvider(makeConfig()).getLabels().reindexGlobalLabel).toBeUndefined();
     });
   });
 
@@ -595,5 +634,145 @@ describe("BaseDatabaseProvider", () => {
       expect(provider.callFormatDuration(1500)).toBe("1.50s");
       expect(provider.callFormatDuration(90000)).toBe("1.50m");
     });
+  });
+});
+
+// ─── getMonitoringData: one failing read costs its own panel (2026-08-24) ───
+//
+// Measured 2026-08-24 against StarRocks 3.3 (127.0.0.1:19030) through the MySQL
+// provider: six panels answered and `getActiveSessions` rejected with
+// "Getting analyzing error. Detail message: Unknown table
+// 'information_schema.PROCESSLIST'." - which under Promise.all discarded all six.
+
+describe("getMonitoringData partial failures", () => {
+  const STARROCKS = "Getting analyzing error. Detail message: Unknown table 'information_schema.PROCESSLIST'.";
+
+  test("a rejected core read costs its own panel and records the engine's own sentence", async () => {
+    const provider = new TestProvider(makeConfig());
+    await provider.connect();
+    provider.getActiveSessions = async () => {
+      throw new Error(STARROCKS);
+    };
+
+    const data = await provider.getMonitoringData();
+
+    expect(data.overview).toBeDefined();
+    expect(data.performance).toBeDefined();
+    expect(data.slowQueries).toBeArray();
+    expect(data.tables).toBeArray();
+    expect(data.indexes).toBeArray();
+    expect(data.storage).toBeArray();
+    expect(data.activeSessions).toBeUndefined();
+    expect(data.errors).toEqual({ activeSessions: STARROCKS });
+  });
+
+  test("a rejected optional read costs its own panel only", async () => {
+    const provider = new TestProvider(makeConfig());
+    await provider.connect();
+    provider.getStorageStats = async () => {
+      throw new Error("permission denied for function pg_tablespace_size");
+    };
+
+    const data = await provider.getMonitoringData();
+
+    expect(data.storage).toBeUndefined();
+    expect(data.tables).toBeArray();
+    expect(data.errors?.storage).toBe("permission denied for function pg_tablespace_size");
+  });
+
+  test("a rejected tables read is recorded, and indexes is recorded independently", async () => {
+    const provider = new TestProvider(makeConfig());
+    await provider.connect();
+    provider.getTableStats = async () => {
+      throw new Error("tables denied");
+    };
+    provider.getIndexStats = async () => {
+      throw new Error("indexes denied");
+    };
+
+    const data = await provider.getMonitoringData();
+
+    expect(data.tables).toBeUndefined();
+    expect(data.indexes).toBeUndefined();
+    expect(data.storage).toBeArray();
+    expect(data.errors).toEqual({ tables: "tables denied", indexes: "indexes denied" });
+  });
+
+  test("a panel that was not requested is absent with no error entry", async () => {
+    const provider = new TestProvider(makeConfig());
+    await provider.connect();
+
+    const data = await provider.getMonitoringData({
+      includeTables: false,
+      includeIndexes: false,
+      includeStorage: false,
+    });
+
+    expect(data.tables).toBeUndefined();
+    expect(data.indexes).toBeUndefined();
+    expect(data.storage).toBeUndefined();
+    expect(data.errors).toBeUndefined();
+  });
+
+  test("a fully successful read carries no errors key at all", async () => {
+    const provider = new TestProvider(makeConfig());
+    await provider.connect();
+
+    const data = await provider.getMonitoringData();
+
+    expect(data.errors).toBeUndefined();
+  });
+
+  test("throws when ALL FOUR core reads reject, carrying every distinct sentence", async () => {
+    const provider = new TestProvider(makeConfig());
+    await provider.connect();
+    provider.getOverview = async () => {
+      throw new Error("connection lost");
+    };
+    provider.getPerformanceMetrics = async () => {
+      throw new Error("connection lost");
+    };
+    provider.getSlowQueries = async () => {
+      throw new Error("no slow log");
+    };
+    provider.getActiveSessions = async () => {
+      throw new Error(STARROCKS);
+    };
+
+    // Duplicated sentences appear once: four reads against one dead socket say the
+    // same thing, and repeating it three times is noise, not information.
+    await expect(provider.getMonitoringData()).rejects.toThrow(`connection lost; no slow log; ${STARROCKS}`);
+  });
+
+  test("one sentence for all four rethrows the original error, keeping its class", async () => {
+    const provider = new TestProvider(makeConfig());
+    await provider.connect();
+    // A dead connection answers the same sentence four times. The first rejection is
+    // already a mapped provider error, so it must reach the route as itself: re-wrapping
+    // it would re-classify from the text and cost /api/db/monitoring the status code it
+    // answered before per-panel degradation landed.
+    const refused = new AuthenticationError("Authentication failed: password authentication failed", "postgres");
+    const throwRefused = async () => {
+      throw refused;
+    };
+    provider.getOverview = throwRefused;
+    provider.getPerformanceMetrics = throwRefused;
+    provider.getSlowQueries = throwRefused;
+    provider.getActiveSessions = throwRefused;
+
+    await expect(provider.getMonitoringData()).rejects.toBe(refused);
+  });
+
+  test("a non-Error rejection reason is stringified rather than dropped", async () => {
+    const provider = new TestProvider(makeConfig());
+    await provider.connect();
+    provider.getSlowQueries = async () => {
+      throw "slow log unavailable";
+    };
+
+    const data = await provider.getMonitoringData();
+
+    expect(data.slowQueries).toBeUndefined();
+    expect(data.errors?.slowQueries).toBe("slow log unavailable");
   });
 });

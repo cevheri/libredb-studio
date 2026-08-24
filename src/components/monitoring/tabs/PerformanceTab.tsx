@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { Activity, Gauge, Zap, AlertTriangle } from "lucide-react";
+import { Activity, Gauge, Zap, TriangleAlert } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -11,6 +11,7 @@ import type { TimeSeriesPoint } from "@/lib/time-series-buffer";
 import { evaluateThreshold, getThresholdColor, DEFAULT_THRESHOLDS } from "@/lib/monitoring-thresholds";
 import { CACHE_HIT_RATIO_UNAVAILABLE } from "@/lib/monitoring-cache-ratio";
 import { MetricChart } from "./MetricChart";
+import { PanelUnavailable } from "../PanelUnavailable";
 
 /**
  * The spelling every card in this panel uses for a figure the engine never reported.
@@ -97,6 +98,19 @@ export function PerformanceTab({ data, loading, history = [] }: PerformanceTabPr
   }
 
   const performance = data?.performance;
+
+  // A panel whose read failed is absent from the payload with its own message under
+  // `errors`, and that is a different fact from an empty answer: rendering it as data
+  // would claim a measurement the engine refused to make. The whole-dashboard error state
+  // is not right either - the other panels answered - so this panel alone carries the
+  // engine's own sentence. See MonitoringData in src/lib/db/types.ts.
+  if (performance === undefined && data?.errors?.performance) {
+    return (
+      <div className="p-3 sm:p-6">
+        <PanelUnavailable message={data.errors.performance} />
+      </div>
+    );
+  }
 
   const getHealthStatus = (ratio: number) => {
     if (ratio >= 95) return { label: "Excellent", color: "text-green-500", bg: "bg-green-500" };
@@ -223,7 +237,7 @@ export function PerformanceTab({ data, loading, history = [] }: PerformanceTabPr
         <Card className={`p-0 border-2 transition-colors ${getThresholdColor(deadlockThreshold)}`}>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 p-2 sm:p-4 pb-1 sm:pb-2">
             <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Deadlocks</CardTitle>
-            <AlertTriangle className={`h-3 w-3 sm:h-4 sm:w-4 ${deadlockIconClass(deadlocks)}`} />
+            <TriangleAlert className={`h-3 w-3 sm:h-4 sm:w-4 ${deadlockIconClass(deadlocks)}`} />
           </CardHeader>
           <CardContent className="p-2 sm:p-4 pt-0">
             {deadlocks === undefined ? (
@@ -299,7 +313,7 @@ export function PerformanceTab({ data, loading, history = [] }: PerformanceTabPr
                 nothing to advise about a cache nobody measured. */}
             {cacheHitRatio !== undefined && cacheHitRatio < 90 && (
               <div className="flex items-start gap-2 p-2 bg-yellow-500/10 rounded-md">
-                <AlertTriangle
+                <TriangleAlert
                   strokeWidth={1.5}
                   className="h-3 w-3 sm:h-4 sm:w-4 text-yellow-500 mt-0.5 flex-shrink-0"
                 />
@@ -311,7 +325,7 @@ export function PerformanceTab({ data, loading, history = [] }: PerformanceTabPr
             )}
             {(performance?.deadlocks ?? 0) > 0 && (
               <div className="flex items-start gap-2 p-2 bg-red-500/10 rounded-md">
-                <AlertTriangle strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-red-500 mt-0.5 flex-shrink-0" />
+                <TriangleAlert strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-red-500 mt-0.5 flex-shrink-0" />
                 <div>
                   <p className="text-xs sm:text-xs font-medium">Deadlocks</p>
                   <p className="text-xs sm:text-xs text-muted-foreground hidden sm:block">Review lock ordering</p>

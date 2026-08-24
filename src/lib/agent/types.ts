@@ -46,6 +46,7 @@ import type { PolicyDenyCode } from "@/lib/db/operations/policy";
 import type { AgentStatementViolation } from "@/lib/db/operations/statement-guard";
 import type { AgentChartSpec, DatabaseType, TableSchema } from "@/lib/types";
 import type { AgentGoalShortfall, AgentGoalVerifierId } from "./goal-verifier";
+import type { AgentToolName } from "./tools";
 import type { AgentInventoryNoun } from "./inventory-noun";
 import type { PlanStatementIdentifiers } from "./plan-statement";
 import type { AgentPlanSummary } from "./plan-summary";
@@ -206,6 +207,16 @@ export const AGENT_WORKFLOW_PRESENTS_ANSWER: Readonly<Record<AgentRunWorkflowTyp
 /** A run that has stopped, and why. Terminal states are never re-entered. */
 export type AgentRunTerminalStatus = "succeeded" | "failed" | "cancelled";
 
+/**
+ * How a run asks its model for a tool call.
+ *
+ * `native` is the OpenAI tool-call format the SDK speaks. `prompted` is the fallback for
+ * a model that cannot speak it: the tools are described in prose and the reply is read
+ * back for one action (`prompted-tools.ts`). Both end at the same schema and the same
+ * audited pipeline — the protocol decides how the model is ASKED, never what it may do.
+ */
+export type AgentToolProtocol = "native" | "prompted";
+
 export type AgentRunStatus = "queued" | "running" | AgentRunTerminalStatus;
 
 /**
@@ -252,19 +263,24 @@ export type AgentRunFailureReason =
    * profile whose acquisition would be refused is never the profile that capture asks for
    * on an engine that would refuse it.
    *
-   * What can still reach it, and what this reason's text then misdescribes, is an
-   * acquisition refused for a reason that is not the engine at all:
-   * `resolveAgentCredential` throws `ExecutionProfileError` — which `runtime.ts`
-   * classifies here — for an agent credential that is half-configured, sealed under a
-   * key that no longer decrypts, or set alongside a connection string, and it throws on
-   * ANY engine before a provider exists. A PostgreSQL run then tells the user their
-   * engine offers no read-only execution profile when their real problem is a
-   * credential. That is true of every workflow and was true before #411, which only
-   * moved the moment it can happen earlier; it is a defect of this reason's granularity
-   * rather than of the workflow, and it is recorded in `docs/BACKLOG.md` (B47) rather
-   * than fixed inside a comment.
+   * ONLY the engine's own refusal, since B47: the other cause of the same error type
+   * is `agent-credential-unusable` below.
    */
   | "engine-unsupported"
+  /**
+   * The connection's agent credential could not be applied, so the profile was
+   * refused before any provider existed — on ANY engine, including the two the agent
+   * executes on.
+   *
+   * Split out of `engine-unsupported` (B47) because `resolveAgentCredential` raises the
+   * same `ExecutionProfileError` for a credential that is half-configured, sealed under
+   * a key that no longer decrypts, or set alongside a connection string. Told the engine
+   * sentence, an operator who had rotated the secret key read something false about
+   * their PostgreSQL and nothing about the one field they could fix. The error's reason
+   * codes (`AGENT_CREDENTIAL_UNRESOLVABLE`, `AGENT_CREDENTIAL_WITH_CONNECTION_STRING`)
+   * already carried the distinction; this is where it becomes visible.
+   */
+  | "agent-credential-unusable"
   /** The run's persisted connection no longer resolves on the server. */
   | "connection-unresolvable"
   /** Anything else. Deliberately unspecific; the log carries the detail. */
@@ -524,6 +540,115 @@ export type AgentRunEvent =
   | (AgentRunEventBase & { readonly kind: "report-composed"; readonly claims: readonly AgentReportClaim[] })
   | (AgentRunEventBase & {
       /**
+       * A call the server held back, and what it asked for instead.
+       *
+       * The drive can refuse to RUN a `compose_report` and answer the model with a notice —
+       * cite a reading you took, compare the two plans you hold, profile a table before you
+       * report. Every one of those decisions was invisible: a held call performs no effect,
+       * so it settles no step and wrote nothing at all. A reader of the ledger saw a run
+       * that reported once, when what happened was that it tried, was turned back, and
+       * tried again.
+       *
+       * That is a gap in the thing this ledger exists to be. It also cost real time: a
+       * notice measured as having no effect on `qwen3.5:9b` and `qwen3:8b` could not be
+       * told apart from a notice that never fired, because neither leaves a trace.
+       *
+       * `shortfall` is the verifier's own name for what was missing where the notice came
+       * from the verdict preview, and absent for the purpose-written ones, which answer
+       * conditions the verifier has no vocabulary for.
+       */
+      readonly kind: "call-held";
+      readonly tool: AgentToolName;
+      readonly reason: string;
+      readonly shortfall?: AgentGoalShortfall;
+    })
+  | (AgentRunEventBase & {
+      /**
+       * A ledger-only tool that DECLINED the call, and the code it declined under.
+       *
+       * The sibling of `call-held`, written for the same reason and against the same gap:
+       * `present_answer`, `compose_report`, `compare_plans`, `recommend_change` and
+       * `profile_table` perform no effect, so a refusal from one of them settles no step and
+       * used to write nothing at all. A database tool that declines writes `tool-refused`; a
+       * ledger tool that declines wrote silence.
+       *
+       * Measured cost of that silence, twice in one evening. One evaluated model loses
+       * data-analysis on `no-answer`, and its ledger holds no hold and no answer — because
+       * `present_answer` was called and refused, which sets `answerAttempted` and disables
+       * the hold that would have asked again, invisibly. Five different refusals produce that
+       * same trace, each implying a different fix, and the ledger could not say which.
+       *
+       * The CODE only, never the model's arguments and never the prose sent back: the codes
+       * are this server's own vocabulary, so an entry cannot carry a model's text into the
+       * record under the server's name. `stepId` is absent because no step exists — that is
+       * what makes these tools ledger-only.
+       */
+      readonly kind: "call-declined";
+      readonly tool: AgentToolName;
+      readonly reasonCode: string;
+      /**
+       * Which FIELDS failed, when the refusal was about the shape of the call.
+       *
+       * The code alone turned out not to be diagnosable. `INVALID_TOOL_INPUT` is the largest
+       * refusal family on record — a hundred and fifty across every model measured — and
+       * One model produced eight of them in one run, holding the same tool, without
+       * the record saying which part of the object was wrong even once.
+       *
+       * Still the server's own vocabulary and nothing else: these are the schema's field
+       * paths and the types it expected, written by the validator. The model's arguments stay
+       * out, as the code-only rule above intends — what is added is what THIS server said no
+       * about, not what it was sent.
+       */
+      readonly detail?: string;
+    })
+  | (AgentRunEventBase & {
+      /**
+       * What the model said on the turn it stopped, when it called nothing and reported nothing.
+       *
+       * The largest unexplained group in this whole effort. Of 277 runs that scored
+       * `no-report`, 190 ended `model-stopped` — not out of time, not out of turns, not refused
+       * — and 122 of those had USED their tools first. The work was done and unfiled, and what
+       * the model said as it stopped was nowhere: `closing-statement` is only written when the
+       * drive concludes with prose it keeps, and these runs are exactly the ones whose prose the
+       * verdict then discards.
+       *
+       * So a reader could not tell apart the three things this shape can be, each needing a
+       * different fix: a model that wrote its report as prose and thought it had filed it, a
+       * model that said it was finished, and a model that asked a question and waited for an
+       * answer that was never coming.
+       *
+       * Bounded, because a stopping turn can carry a whole essay and this is a diagnostic and
+       * not a transcript. Written at the moment of stopping rather than derived afterwards: the
+       * turn's messages do not survive the drive.
+       */
+      readonly kind: "model-stopped-saying";
+      readonly text: string;
+    })
+  | (AgentRunEventBase & {
+      /**
+       * A sentence the drive told the run, on a turn it did not refuse anything.
+       *
+       * The last invisible thing in the loop. `call-held` covers the notices attached to a
+       * REFUSED call, and every other one — the report reminder, the plan-statement ask, the
+       * reserve warning — was pushed into the conversation and left no trace, so a ledger could
+       * not distinguish a run that ignored a reminder from a run that never got one.
+       *
+       * It cost a diagnosis to lack. One model was held on one plan, did exactly what
+       * the hold asked (an index recommendation citing that plan), then stopped without
+       * reporting — and whether the drive had told it to report was unanswerable from the
+       * record, which is the difference between a model that declines and a mechanism that
+       * never fired.
+       *
+       * `notice` names WHICH sentence rather than carrying it. The wording lives in
+       * `models/notices.ts` — one baseline every model is told, since the per-model copies went
+       * with the settings that became data — and a ledger repeating a paragraph in full would age
+       * badly and read as this server's own prose.
+       */
+      readonly kind: "guidance-issued";
+      readonly notice: "report-reminder" | "plan-statement" | "report-reserve";
+    })
+  | (AgentRunEventBase & {
+      /**
        * The model's closing prose, recorded because it is otherwise lost.
        *
        * Deliberately NOT a report: it carries no citations and claims none, which is
@@ -542,8 +667,7 @@ export type AgentRunEvent =
   | (AgentRunEventBase & {
       /**
        * The one statement a PLAN run drafted, and what could be checked about it
-       * without running it (the plan-mode SQL-generator design of 2026-08-15, item 5;
-       * `docs/BACKLOG.md` B44).
+       * without running it (the plan-mode SQL-generator design of 2026-08-15, item 5).
        *
        * Not `statement-drafted`, and the difference is not cosmetic. That entry
        * belongs to a STEP: an agent run drafts through a tool, so its statement
@@ -816,6 +940,18 @@ export interface AgentRunRecord {
    * which is what was true of every run written then.
    */
   readonly autoExecute: boolean;
+  /**
+   * How this run asks its model for a tool call.
+   *
+   * Decided once, by the capability gate on the start path, and carried here for the
+   * reason `autoExecute` is: a resumed drive must ask the same way the drive that died
+   * asked, and a model's answer to "can you call tools" is not something a later turn
+   * should re-decide mid-run.
+   *
+   * Optional, and absent folds to `native` — what was true of every run written before
+   * the prose path existed, and of every model that can call a tool.
+   */
+  readonly toolProtocol?: AgentToolProtocol;
   readonly status: AgentRunStatus;
   readonly actor: AgentRunActor;
   /** The single connection this run may reach; the server builds the scope from it. */

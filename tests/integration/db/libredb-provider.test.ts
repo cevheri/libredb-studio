@@ -117,6 +117,8 @@ describe("LibreDBProvider — lifecycle & metadata", () => {
     // The query language is a small JSON command grammar, not SQL, so the inline
     // row editor's `UPDATE ... SET` cannot be expressed here (#269).
     expect(caps.supportsInlineRowEdit).toBe(false);
+    // The command grammar has no transaction verb at all (#U13).
+    expect(caps.supportsTransactions).toBe(false);
     // The catalog declares namespaces and columns and nothing that references
     // another namespace, so there is no foreign key to read (#414).
     expect(caps.declaresForeignKeys).toBe(false);
@@ -133,6 +135,16 @@ describe("LibreDBProvider — lifecycle & metadata", () => {
   test("getLabels() uses key-oriented labels", () => {
     const provider = new LibreDBProvider(makeConn(tmpFile));
     expect(provider.getLabels().rowNamePlural).toBe("keys");
+  });
+
+  // The monitoring Queries panel is ALWAYS empty here - `getSlowQueries()` answers
+  // `[]` unconditionally - and until #U12 it told the reader to enable a PostgreSQL
+  // extension on the embedded engine.
+  test("getLabels() says the embedded engine keeps no statement statistics", () => {
+    const { slowQueriesEmptyState } = new LibreDBProvider(makeConn(tmpFile)).getLabels();
+
+    expect(slowQueriesEmptyState).toContain("LibreDB keeps no statistics");
+    expect(slowQueriesEmptyState).not.toContain("pg_stat_statements");
   });
 });
 
@@ -494,16 +506,20 @@ describe("LibreDBProvider — monitoring", () => {
     const health = await provider.getHealth();
     expect(health.activeConnections).toBe(1);
     expect(health.databaseSize).toMatch(/\d/); // human-formatted, e.g. "12.0 KB"
-    expect(health.cacheHitRatio).toBe("100.0");
+    // The kernel publishes no cache statistics, so there is no ratio to report.
+    expect(health.cacheHitRatio).toBe("N/A");
     expect(health.slowQueries).toEqual([]);
     expect(health.activeSessions).toEqual([]);
     await provider.disconnect();
   });
 
-  test("getPerformanceMetrics reports a full cache hit ratio (in-process file)", async () => {
+  test("getPerformanceMetrics measures nothing, so it reports nothing", async () => {
     const provider = new LibreDBProvider(makeConn(tmpFile));
     await provider.connect();
-    expect(await provider.getPerformanceMetrics()).toEqual({ cacheHitRatio: 100 });
+    // The embedded kernel's whole public surface is open/kv/doc/table/catalog: there
+    // is no counter of cache hits or misses anywhere in it, so the panel must show
+    // "Not measured" rather than the 100% this used to assert.
+    expect(await provider.getPerformanceMetrics()).toEqual({});
     await provider.disconnect();
   });
 

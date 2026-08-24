@@ -164,4 +164,31 @@ export class CassandraTransportError extends Error {
   isMonitoringUnavailable(): boolean {
     return this.category === "permission";
   }
+
+  /*
+   * WHY THERE IS NO `absentKeyspace()` HERE ANY MORE (2026-08-24).
+   *
+   * There used to be one, reading the refused keyspace's NAME out of the server's
+   * sentence, because the refusal carries nothing else: measured 2026-08-24 through
+   * `cassandra-driver` 4.9.0 against cassandra:5.0.9 and scylladb/scylla:2026.2.4, all
+   * four of these arrive as `ResponseError` with `code === 8704` and `keyspace`/`table`
+   * both `undefined`:
+   *
+   * | Sent | Server | Message |
+   * |---|---|---|
+   * | `system_views.clients` | ScyllaDB | `Keyspace system_views does not exist` |
+   * | `system_views.cliets` | 5.0.9 | `table cliets does not exist` |
+   * | `system_views.caches` with a wrong column | 5.0.9 | `Undefined column name hit_ratioo in table system_views.caches` |
+   * | `system_viewz.clients` | 5.0.9 | `keyspace system_viewz does not exist` |
+   *
+   * That is still true, and it is exactly why the discriminator moved OUT of the
+   * refusal: a build that rephrases any of those sentences would have stopped matching
+   * and taken five monitoring panels with it. The degradation now keys on a property
+   * of the server asked once per connection - whether
+   * `system_virtual_schema.keyspaces` lists `system_views`
+   * ([`introspect.ts`](./introspect.ts)) - and the four spellings above are kept as a
+   * regression pin in `tests/integration/db/cassandra-provider.test.ts` rather than as
+   * a discriminator. Nothing in this provider reads a server's sentence to decide
+   * anything.
+   */
 }

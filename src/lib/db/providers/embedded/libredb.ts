@@ -42,6 +42,7 @@ import {
 } from "../../types";
 import { DatabaseConfigError, ConnectionError, QueryError } from "../../errors";
 import { formatBytes } from "../../utils/pool-manager";
+import { CACHE_HIT_RATIO_UNAVAILABLE } from "@/lib/monitoring-cache-ratio";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -103,6 +104,8 @@ export class LibreDBProvider extends BaseDatabaseProvider {
       // (get/put/delete/prefix/range), so there is no `UPDATE ... SET` for the
       // inline row editor to emit (issue #269).
       supportsInlineRowEdit: false,
+      // The command grammar has no transaction verb.
+      supportsTransactions: false,
       // The embedded engine's catalog declares namespaces and columns, and nothing
       // that references another namespace. There is no foreign key to read (#414).
       declaresForeignKeys: false,
@@ -135,6 +138,9 @@ export class LibreDBProvider extends BaseDatabaseProvider {
       vacuumGlobalLabel: "Compact",
       vacuumGlobalTitle: "Compact",
       vacuumGlobalDesc: "Not supported for LibreDB in this version.",
+      // `getSlowQueries()` answers `[]` unconditionally, so the monitoring Queries
+      // panel is ALWAYS empty here - and it used to name a PostgreSQL extension (#U12).
+      slowQueriesEmptyState: "LibreDB keeps no statistics about finished statements in this version.",
     };
   }
 
@@ -501,7 +507,7 @@ export class LibreDBProvider extends BaseDatabaseProvider {
     return {
       activeConnections: 1,
       databaseSize: this.fileSizeHuman(),
-      cacheHitRatio: "100.0",
+      cacheHitRatio: CACHE_HIT_RATIO_UNAVAILABLE,
       slowQueries: [],
       activeSessions: [],
     };
@@ -521,9 +527,19 @@ export class LibreDBProvider extends BaseDatabaseProvider {
     };
   }
 
+  /**
+   * Nothing, and permanently so.
+   *
+   * The embedded kernel keeps no cache counters to read: its whole public surface
+   * is `open` / `kv` / `doc` / `table` / `catalog` (`@libredb/libredb` 0.2.2), with
+   * no statistics call of any kind, and the store it reads from is the process's own
+   * memory rather than a buffer pool with hits and misses. A cache hit ratio here
+   * would be a number this provider made up - it used to say 100% - so the panel is
+   * told there is none and renders "Not measured".
+   */
   public async getPerformanceMetrics(): Promise<PerformanceMetrics> {
     this.ensureConnected();
-    return { cacheHitRatio: 100 };
+    return {};
   }
 
   public async getSlowQueries(): Promise<SlowQueryStats[]> {

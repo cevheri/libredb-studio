@@ -279,6 +279,8 @@ describe("CouchbaseProvider metadata", () => {
       supportsExternalQueryLimiting: true,
       supportsCreateTable: false,
       supportsInlineRowEdit: false,
+      // The HTTP query service is stateless per request; no session spans two of them.
+      supportsTransactions: false,
       declaresForeignKeys: false,
       supportsMaintenance: true,
       maintenanceOperations: ["analyze", "reindex", "kill"],
@@ -314,6 +316,29 @@ describe("CouchbaseProvider metadata", () => {
     expect(labels.rowName).toBe("document");
     expect(labels.rowNamePlural).toBe("documents");
     expect(labels.analyzeGlobalDesc).toContain("Enterprise");
+  });
+
+  // The Operations tab's global Reindex card was hardcoded to PostgreSQL's "Run
+  // Reindex / Rebuild Indexes / Reconstructs all indexes in the database." Couchbase's
+  // `reindex` is `BUILD INDEX` over the DEFERRED GSI indexes of one keyspace
+  // (`buildDeferredIndexes()`), so none of those three strings described it (#U6).
+  test("names the deferred GSI build, not a table reindex, in the global reindex card", () => {
+    const labels = new CouchbaseProvider(makeConnection()).getLabels();
+
+    expect(labels.reindexGlobalLabel).toBe("Build Indexes");
+    expect(labels.reindexGlobalTitle).toContain("GSI");
+    expect(labels.reindexGlobalDesc).toContain("BUILD INDEX");
+    expect(labels.reindexGlobalDesc).not.toContain("REINDEX");
+  });
+
+  // Until #U12 the monitoring Queries panel told a Couchbase operator to install a
+  // PostgreSQL extension. `getSlowQueries()` reads system:completed_requests, which
+  // keeps only requests over the query service's threshold.
+  test("names system:completed_requests, not a Postgres extension, as the source of query stats", () => {
+    const { slowQueriesEmptyState } = new CouchbaseProvider(makeConnection()).getLabels();
+
+    expect(slowQueriesEmptyState).toContain("system:completed_requests");
+    expect(slowQueriesEmptyState).not.toContain("pg_stat_statements");
   });
 });
 
@@ -695,15 +720,63 @@ describe("CouchbaseProvider monitoring", () => {
     expect(performance.bufferPoolUsage).toBe(14.6);
   });
 
-  test("getPerformanceMetrics reports zero rather than a perfect score when denied", async () => {
+  // This test used to be named "reports zero rather than a perfect score when
+  // denied" and asserted three zeroes - it is what protected the fabrication. A
+  // denied stats read measures nothing, and 0 is not nothing: the cache-ratio
+  // threshold rates 0% as red-critical, so the panel invented an incident on a
+  // healthy cluster whose statistics the user simply may not read.
+  test("getPerformanceMetrics omits every metric when the stats read is denied", async () => {
     const provider = await connectProvider();
     stubManage(`/pools/default/buckets/${BUCKET}`, {}, 403);
 
     const performance = await provider.getPerformanceMetrics();
 
-    expect(performance.cacheHitRatio).toBe(0);
+    expect("cacheHitRatio" in performance).toBe(false);
+    expect("queriesPerSecond" in performance).toBe(false);
+    expect("bufferPoolUsage" in performance).toBe(false);
+  });
+
+  test("getPerformanceMetrics keeps a measured zero, which is a real reading", async () => {
+    const provider = await connectProvider();
+    // A cluster nobody has touched: no misses (so a perfect hit ratio), no
+    // operations in the last sample, and an empty quota.
+    // Bucket info first: `stubManage` unshifts and the matcher is a substring, so
+    // the narrower `/stats` stub has to be registered last to win.
+    stubManage(`/pools/default/buckets/${BUCKET}`, { ...BUCKET_INFO, basicStats: { quotaPercentUsed: 0 } });
+    stubManage(`/pools/default/buckets/${BUCKET}/stats`, {
+      op: { samples: { ep_cache_miss_rate: [0, 0, 0], cmd_get: [0], cmd_set: [0] } },
+    });
+
+    const performance = await provider.getPerformanceMetrics();
+
+    expect(performance.cacheHitRatio).toBe(100);
     expect(performance.queriesPerSecond).toBe(0);
     expect(performance.bufferPoolUsage).toBe(0);
+  });
+
+  test("getPerformanceMetrics omits only what the sample set is missing", async () => {
+    const provider = await connectProvider();
+    // A bucket whose KV series are absent (a memcached bucket publishes no `ep_*`
+    // stats at all) while the quota the bucket endpoint reports is still readable.
+    stubManage(`/pools/default/buckets/${BUCKET}/stats`, { op: { samples: { curr_connections: [55] } } });
+
+    const performance = await provider.getPerformanceMetrics();
+
+    expect("cacheHitRatio" in performance).toBe(false);
+    expect("queriesPerSecond" in performance).toBe(false);
+    expect(performance.bufferPoolUsage).toBe(14.6);
+  });
+
+  test("getPerformanceMetrics counts a half-published operation pair", async () => {
+    const provider = await connectProvider();
+    stubManage(`/pools/default/buckets/${BUCKET}/stats`, {
+      op: { samples: { ep_cache_miss_rate: [1.5], cmd_get: [7] } },
+    });
+
+    const performance = await provider.getPerformanceMetrics();
+
+    expect(performance.cacheHitRatio).toBe(98.5);
+    expect(performance.queriesPerSecond).toBe(7);
   });
 
   test("getSlowQueries reads system:completed_requests", async () => {
@@ -782,8 +855,9 @@ describe("CouchbaseProvider monitoring", () => {
       columns: [],
       isUnique: true,
       isPrimary: true,
-      indexSize: "0 B",
-      indexSizeBytes: 0,
+      // The index service publishes no `data_size` series for this index, and
+      // "0 B" claimed an empty index where nothing was measured at all.
+      indexSize: "N/A",
       scans: 0,
     });
     expect(stats[1].columns).toEqual(["city"]);
@@ -846,7 +920,9 @@ describe("CouchbaseProvider monitoring", () => {
     expect(data.tables).toEqual([]);
     expect(data.indexes).toEqual([]);
     expect(data.storage).toEqual([]);
-    expect(data.performance.cacheHitRatio).toBe(0);
+    // Nothing was readable, so the panel is told there is no ratio and renders
+    // "Not measured" instead of a red 0%.
+    expect("cacheHitRatio" in data.performance!).toBe(false);
   });
 });
 

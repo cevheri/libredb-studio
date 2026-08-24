@@ -6,7 +6,7 @@ import React from "react";
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { QueriesTab } from "@/components/monitoring/tabs/QueriesTab";
-import type { MonitoringData } from "@/lib/db/types";
+import type { MonitoringData, ProviderLabels } from "@/lib/db/types";
 
 mock.module("@/components/ui/tooltip", () => ({
   TooltipProvider: ({ children }: { children: React.ReactNode }) => React.createElement("div", {}, children),
@@ -56,6 +56,47 @@ describe("QueriesTab", () => {
     expect(queryByText("pg_stat_statements required")).not.toBeNull();
   });
 
+  test("keeps the pg_stat_statements advice when the provider declares no wording of its own", () => {
+    // The component default IS Postgres's sentence, so `postgres` - which declares no
+    // label - renders exactly what it rendered before #U12. Labels can also be absent
+    // because /api/db/provider-meta is still in flight or failed, and the extension
+    // advice is the right guess for the engine the tab was written against.
+    const { queryByText } = render(
+      <QueriesTab data={{ ...makeData(), slowQueries: [] } as MonitoringData} loading={false} labels={undefined} />,
+    );
+    expect(queryByText("Enable pg_stat_statements extension to see query stats.")).not.toBeNull();
+    expect(queryByText("pg_stat_statements required")).not.toBeNull();
+  });
+
+  test("an engine that declares its own empty-state wording gets that instead of Postgres's", () => {
+    // The #427 defect in another panel: the copy was written for one engine and shown to
+    // all fourteen. Measured 2026-08-19 in Chrome on an OpenSearch connection, this tab
+    // told a search cluster to install a PostgreSQL extension. The wording is the
+    // provider's, read off `ProviderLabels` exactly as the Operations tab reads the
+    // analyze/vacuum triads.
+    const labels = {
+      slowQueriesEmptyState: "The slow log is a node log file that no API returns, so SQL cannot reach it.",
+    } as ProviderLabels;
+
+    const { queryByText } = render(
+      <QueriesTab data={{ ...makeData(), slowQueries: [] } as MonitoringData} loading={false} labels={labels} />,
+    );
+
+    expect(queryByText("The slow log is a node log file that no API returns, so SQL cannot reach it.")).not.toBeNull();
+    expect(queryByText("Enable pg_stat_statements extension to see query stats.")).toBeNull();
+    // The badge names a PostgreSQL extension rather than a category, so it cannot be
+    // re-worded from one label without a second one. It is dropped where the engine has
+    // its own answer, and the sentence below carries that answer.
+    expect(queryByText("pg_stat_statements required")).toBeNull();
+  });
+
+  test("the provider's wording is irrelevant once statistics exist", () => {
+    // The label answers "why is this empty", so it must not leak into a populated panel.
+    const labels = { slowQueriesEmptyState: "Cassandra keeps no aggregate of finished statements." } as ProviderLabels;
+    const { queryByText } = render(<QueriesTab data={makeData()} loading={false} labels={labels} />);
+    expect(queryByText("Cassandra keeps no aggregate of finished statements.")).toBeNull();
+  });
+
   test("renders stats cards and slow query rows", () => {
     const { queryByText, queryAllByText } = render(<QueriesTab data={makeData()} loading={false} />);
 
@@ -93,7 +134,7 @@ describe("QueriesTab", () => {
     const data = {
       ...makeData(),
       slowQueries: [
-        ...makeData().slowQueries,
+        ...makeData().slowQueries!,
         { queryId: "q4", query: "SELECT count(*) FROM logs", calls: 2500000, totalTime: 500000, avgTime: 0.2, rows: 1 },
       ],
     } as MonitoringData;
@@ -135,5 +176,40 @@ describe("QueriesTab", () => {
     expect(queryAllByText("0.00ms").length).toBe(3);
     expect(queryAllByText("0").length).toBe(4);
     expect(queryByText("No query statistics available.")).toBeNull();
+  });
+});
+
+// A refused slowQueries read is not an empty list, so it must not be told to
+// install a PostgreSQL extension.
+describe("a refused slowQueries read", () => {
+  // Scoped here as well as in the block above: bun:test registers a hook on the
+  // enclosing describe only, so without this the first render in this block leaks into
+  // the second and the control arm queries the previous test's DOM.
+  afterEach(() => {
+    cleanup();
+  });
+
+  const REFUSAL = "Unknown table 'information_schema.STATEMENTS_SUMMARY'.";
+
+  function refused(): MonitoringData {
+    const rest: MonitoringData = makeData();
+    delete rest.slowQueries;
+    return { ...rest, errors: { slowQueries: REFUSAL } };
+  }
+
+  test("shows the engine's own sentence and drops the extension advice", () => {
+    const { getByTestId, queryByText } = render(<QueriesTab data={refused()} loading={false} />);
+
+    expect(getByTestId("panel-unavailable-message").textContent).toBe(REFUSAL);
+    expect(queryByText("pg_stat_statements required")).toBeNull();
+    expect(queryByText("No query statistics available.")).toBeNull();
+  });
+
+  test("an empty list keeps the extension advice", () => {
+    const data = { ...makeData(), slowQueries: [] };
+    const { queryByTestId, queryByText } = render(<QueriesTab data={data} loading={false} />);
+
+    expect(queryByTestId("panel-unavailable")).toBeNull();
+    expect(queryByText("pg_stat_statements required")).not.toBeNull();
   });
 });

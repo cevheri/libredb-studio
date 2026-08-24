@@ -110,6 +110,32 @@ const DEFAULT_SESSION_LIMIT = 50;
 export const CASSANDRA_IDENTITY_CQL =
   "SELECT release_version, cluster_name, data_center, gossip_generation, toTimestamp(now()) AS server_now FROM system.local";
 
+/**
+ * Whether this build has the virtual-table keyspace the monitoring reads need.
+ *
+ * Asked ONCE per connection, and it is the whole discriminator behind the degradation
+ * below: a build that does not list `system_views` here is not asked for
+ * `system_views` at all. That is a property of the server rather than of the wording
+ * of a refusal - which is what this replaced (2026-08-24).
+ *
+ * `system_virtual_schema` and NOT `system_schema` is the load-bearing part, measured
+ * 2026-08-24 through `cassandra-driver` 4.9.0:
+ *
+ * | Statement | cassandra:5.0.9 | scylladb/scylla:2026.2.4 |
+ * |---|---|---|
+ * | `SELECT keyspace_name FROM system_schema.keyspaces` | `probe, system, system_auth, system_distributed, system_schema, system_traces` - NO `system_views` | 9 rows, no `system_views` either |
+ * | `SELECT keyspace_name FROM system_virtual_schema.keyspaces` | `system_views, system_virtual_schema` | 8704 `Keyspace system_virtual_schema does not exist` |
+ *
+ * A virtual keyspace is not in `system_schema` on either engine, so keying on that
+ * catalog - which the backlog entry behind this change proposed - would have emptied all five panels on the
+ * engine that answers them.
+ *
+ * COST: one extra statement per successful `connect()`, measured at 1.5 ms against
+ * 5.0.9 over loopback. Nothing re-reads it: a keyspace cannot appear inside a
+ * session's lifetime without a node restart, and a restart drops the session.
+ */
+export const CASSANDRA_VIRTUAL_KEYSPACE_CQL = "SELECT keyspace_name FROM system_virtual_schema.keyspaces";
+
 /** How many clients are connected to THIS node. Permission-gated (measured: 8448). */
 export const CASSANDRA_CLIENT_COUNT_CQL = "SELECT COUNT(*) AS count FROM system_views.clients";
 
@@ -217,16 +243,95 @@ function round2(value: number): number {
 }
 
 /**
- * One read, or no rows when the connected role may not perform it.
+ * The one keyspace a monitoring read may find missing on a wire-compatible build.
  *
- * `permission` and nothing else, which is the measured shape of the problem: a
- * least-privilege role reads all of `system_schema` and is refused
- * `system_views.clients` with code 8448, so a denied monitoring surface is the
- * ORDINARY case for a restricted user and must not break the connection. Every other
- * failure propagates - including `invalid`, which is what a typo in one of the
- * statements above would produce.
+ * `system_views` and nothing else. It is Cassandra's virtual-table keyspace, added in
+ * 4.0, and ScyllaDB does not have it at all: measured 2026-08-24 against
+ * scylladb/scylla:2026.2.4, every one of the three reads above answers
+ * `Keyspace system_views does not exist` (8704) while `system.local`,
+ * `system_schema.*` and `system.size_estimates` all answer normally.
+ *
+ * One NAME rather than "any absent keyspace", because the two are different facts: a
+ * server without `system_views` is a dialect difference, a server without
+ * `system_schema` is a fault the tree must not hide - and `system_viewz`, the shape of
+ * a typo in this file, is neither.
  */
-async function readRows(transport: CassandraTransport, cql: string): Promise<CassandraRow[]> {
+const CASSANDRA_VIRTUAL_KEYSPACE = "system_views";
+
+/** A read that cannot work on a build with no virtual tables. Matched on THIS file's own CQL. */
+const READS_VIRTUAL_KEYSPACE = new RegExp(`\\bFROM\\s+${CASSANDRA_VIRTUAL_KEYSPACE}\\.`, "i");
+
+/**
+ * What this connection established about the server once, at connect time.
+ *
+ * One field today, and it is here rather than re-derived per read because the answer
+ * cannot change while the session lives (see `CASSANDRA_VIRTUAL_KEYSPACE_CQL`).
+ */
+export interface CassandraServerFacts {
+  /** Whether `system_virtual_schema.keyspaces` lists `system_views` on this build. */
+  readonly hasVirtualTables: boolean;
+}
+
+/**
+ * Ask the server which virtual keyspaces it has. Never throws.
+ *
+ * Three outcomes, and none of them reads a sentence:
+ *
+ * - the catalog answered -> the NAME is either in it or it is not;
+ * - the catalog was refused as `invalid` (8704) -> there is no virtual-schema catalog,
+ *   so there are no virtual tables. This is ScyllaDB, measured: the probe itself is
+ *   `Keyspace system_virtual_schema does not exist`, and the CODE is what is read;
+ * - the catalog was refused as `permission` (8448) -> a role that may not read the
+ *   virtual schema is the role that may not read `system_views` either, which the
+ *   per-read permission arm below already answers empty for.
+ *
+ * Anything else - a client timeout, an unreachable host - says nothing about which
+ * keyspaces exist, so it claims no absence: the reads go out and their own failure is
+ * what the caller sees, exactly as before this probe existed. That is also why this
+ * cannot fail a `connect()`.
+ */
+export async function readServerFacts(transport: CassandraTransport): Promise<CassandraServerFacts> {
+  try {
+    const { rows } = await transport.execute(CASSANDRA_VIRTUAL_KEYSPACE_CQL);
+
+    return { hasVirtualTables: rows.some((row) => readText(row.keyspace_name) === CASSANDRA_VIRTUAL_KEYSPACE) };
+  } catch (error) {
+    const refused =
+      error instanceof CassandraTransportError && (error.category === "invalid" || error.isMonitoringUnavailable());
+
+    return { hasVirtualTables: !refused };
+  }
+}
+
+/**
+ * One read, or no rows when this server cannot answer it at all.
+ *
+ * Two conditions, and both are narrow on purpose - an empty panel that hides a typo
+ * in the statements above hides it forever:
+ *
+ * 1. The read needs `system_views` and this build measurably has no such keyspace,
+ *    which is every ScyllaDB build. The statement is then NOT SENT: the fact was
+ *    established at connect time, so there is nothing to learn from asking, and three
+ *    round trips per monitoring refresh are saved. A typo in a TABLE or COLUMN name
+ *    inside `system_views` is unaffected on a build that has the keyspace - the read
+ *    goes out and the refusal propagates - and on a build that does NOT have it the
+ *    typo is unreachable, which is the one case the old text match could not separate
+ *    either.
+ * 2. `permission`, the measured shape of a restricted role: it reads all of
+ *    `system_schema` and is refused `system_views.clients` with code 8448, so a denied
+ *    monitoring surface is the ORDINARY case rather than a broken connection.
+ *
+ * Everything else propagates: a missing table, a missing column, a misspelled
+ * keyspace (`system_viewz` names nothing this provider knows is optional) and every
+ * fault that is not a refusal at all.
+ */
+async function readRows(
+  transport: CassandraTransport,
+  cql: string,
+  facts: CassandraServerFacts,
+): Promise<CassandraRow[]> {
+  if (!facts.hasVirtualTables && READS_VIRTUAL_KEYSPACE.test(cql)) return [];
+
   try {
     return (await transport.execute(cql)).rows;
   } catch (error) {
@@ -368,12 +473,16 @@ export async function getSchema(transport: CassandraTransport, keyspace: string)
  * server that answers the statement with no row at all - which no measured version
  * does - and they cost nothing to keep honest.
  */
-export async function getOverview(transport: CassandraTransport, keyspace: string): Promise<DatabaseOverview> {
+export async function getOverview(
+  transport: CassandraTransport,
+  keyspace: string,
+  facts: CassandraServerFacts,
+): Promise<DatabaseOverview> {
   const [identity, clients, tables, indexes] = await Promise.all([
     transport.execute(CASSANDRA_IDENTITY_CQL),
-    readRows(transport, CASSANDRA_CLIENT_COUNT_CQL),
-    readRows(transport, cassandraTableCountCql(keyspace)),
-    readRows(transport, cassandraIndexCountCql(keyspace)),
+    readRows(transport, CASSANDRA_CLIENT_COUNT_CQL, facts),
+    readRows(transport, cassandraTableCountCql(keyspace), facts),
+    readRows(transport, cassandraIndexCountCql(keyspace), facts),
   ]);
 
   const row = identity.rows[0];
@@ -390,7 +499,12 @@ export async function getOverview(transport: CassandraTransport, keyspace: strin
     version: version === "" ? CASSANDRA_UNKNOWN_TEXT : `${CASSANDRA_PRODUCT} ${version}`,
     uptime: upFor < 0 ? CASSANDRA_UNKNOWN_TEXT : formatDuration(upFor),
     ...(startTime === undefined ? {} : { startTime }),
-    activeConnections: readCount(clients),
+    // OMITTED, not zeroed, when `clients` came back empty: a successful
+    // `SELECT COUNT(*)` always answers exactly one row (a table with nothing to
+    // count still reports `count: 0`), so no row at all is the signature of the
+    // degradation `readRows` catches - a denied grant or, on ScyllaDB, a
+    // `system_views` keyspace that does not exist. A real 0 keeps this key.
+    ...(clients.length === 0 ? {} : { activeConnections: readCount(clients) }),
     // Zero means "no ceiling published", which is the truth: Cassandra's
     // `native_transport_max_concurrent_connections` defaults to unlimited and is a
     // configuration reading rather than a live capacity. The Connections card treats
@@ -423,8 +537,11 @@ export async function getOverview(transport: CassandraTransport, keyspace: strin
  * "below"` with `critical: 80`, so substituting a zero would paint an idle cluster
  * red.
  */
-export async function getPerformanceMetrics(transport: CassandraTransport): Promise<PerformanceMetrics> {
-  const rows = await readRows(transport, CASSANDRA_CACHE_CQL);
+export async function getPerformanceMetrics(
+  transport: CassandraTransport,
+  facts: CassandraServerFacts,
+): Promise<PerformanceMetrics> {
+  const rows = await readRows(transport, CASSANDRA_CACHE_CQL, facts);
   const ratio = rows.find((row) => readText(row.name) === KEY_CACHE_NAME)?.hit_ratio;
 
   return typeof ratio === "number" ? { cacheHitRatio: round2(ratio * 100) } : {};
@@ -454,10 +571,11 @@ export function getSlowQueries(): SlowQueryStats[] {
  */
 export async function getActiveSessions(
   transport: CassandraTransport,
+  facts: CassandraServerFacts,
   options: { limit?: number } = {},
 ): Promise<ActiveSessionDetails[]> {
   const limit = Math.trunc(options.limit ?? DEFAULT_SESSION_LIMIT);
-  const rows = await readRows(transport, CASSANDRA_RUNNING_QUERY_CQL);
+  const rows = await readRows(transport, CASSANDRA_RUNNING_QUERY_CQL, facts);
 
   // A zero is honoured, a negative is not. The three SQL siblings that take this option
   // all pass a zero straight through - PostgreSQL to `LIMIT $2`, MSSQL to `SELECT TOP`,
@@ -530,11 +648,15 @@ export function getStorageStats(): StorageStats[] {
  * the summary needs the narrower `SlowQuery` shape, and a mapper over a list that is
  * always empty would be a body no test could reach.
  */
-export async function getHealth(transport: CassandraTransport, keyspace: string): Promise<HealthInfo> {
+export async function getHealth(
+  transport: CassandraTransport,
+  keyspace: string,
+  facts: CassandraServerFacts,
+): Promise<HealthInfo> {
   const [overview, performance, sessions] = await Promise.all([
-    getOverview(transport, keyspace),
-    getPerformanceMetrics(transport),
-    getActiveSessions(transport),
+    getOverview(transport, keyspace, facts),
+    getPerformanceMetrics(transport, facts),
+    getActiveSessions(transport, facts),
   ]);
 
   const activeSessions: ActiveSession[] = sessions.map((session) => ({
@@ -547,6 +669,9 @@ export async function getHealth(transport: CassandraTransport, keyspace: string)
   }));
 
   return {
+    // `HealthInfo.activeConnections` is optional too, so a denied grant or a
+    // build with no `system_views` keyspace stays an omission all the way to the
+    // agent's curated health reading rather than becoming a fabricated 0 here.
     activeConnections: overview.activeConnections,
     databaseSize: overview.databaseSize,
     cacheHitRatio:

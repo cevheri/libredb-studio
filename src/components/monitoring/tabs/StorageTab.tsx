@@ -8,6 +8,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Progress } from "@/components/ui/progress";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import type { MonitoringData } from "@/lib/db/types";
+import { PanelUnavailable } from "../PanelUnavailable";
 
 interface StorageTabProps {
   data: MonitoringData | null;
@@ -22,11 +23,40 @@ export function StorageTab({ data, loading }: StorageTabProps) {
   const overview = data?.overview;
   const storage = data?.storage ?? [];
   const tables = data?.tables ?? [];
-  const indexes = data?.indexes ?? [];
+
+  // A panel whose read failed is absent from the payload with its own message under
+  // `errors`, and that is a different fact from an empty answer: rendering it as data
+  // would claim a measurement the engine refused to make. The whole-dashboard error state
+  // is not right either - the other panels answered - so this panel alone carries the
+  // engine's own sentence. See MonitoringData in src/lib/db/types.ts.
+  const storageUnavailable = data?.storage === undefined ? data?.errors?.storage : undefined;
 
   // Calculate totals
-  const totalTableSize = tables.reduce((sum, t) => sum + t.tableSizeBytes, 0);
-  const totalIndexSize = indexes.reduce((sum, i) => sum + i.indexSizeBytes, 0);
+  //
+  // Same shape as the index total below, for the same reason: a provider may report a table
+  // it has no byte figure for. SQLite is the case - per-object page counts live in the
+  // `dbstat` virtual table, compiled into node:sqlite and out of bun:sqlite ("no such table:
+  // dbstat", measured 2026-08-24 on Bun 1.3.14 / SQLite 3.53.0) - and until this it filled
+  // the field with `rowCount * 100`, which this line summed into the figure drawn beside the
+  // measured database size. A partial sum would read as a measurement just as badly, so the
+  // total is shown only when every table carries a figure; `every()` keeps a genuine
+  // "no tables" answer at 0 B.
+  const totalTableSize = tables.reduce((sum, t) => sum + (t.tableSizeBytes ?? 0), 0);
+  const tableSizeKnown = tables.every((t) => t.tableSizeBytes !== undefined);
+  // The index total comes from the per-TABLE figure, not from summing the per-index rows.
+  // InnoDB has no separate primary-key index: the clustered index IS the table, so
+  // `mysql.innodb_index_stats` reports the PRIMARY row's size as the row data, and summing every
+  // index row counts that data twice. Measured against MySQL 26.7.0 on a 144 KB database: the
+  // per-index sum reads 147,456 B (= 49,152 data + 98,304 indexes), which drew "Indexes" as 100%
+  // of the database and left the remainder at "-49152 B". Each provider's per-table
+  // `indexSizeBytes` is what its own engine calls index bytes (MySQL `INDEX_LENGTH`, Postgres
+  // `pg_indexes_size`), so it agrees with the DB size it is subtracted from.
+  //
+  // A provider may report a table without one, so a partial sum would read as a measurement:
+  // the total is shown only when every table carries a figure - `every()` also keeps a genuine
+  // "no tables" answer at 0 B.
+  const totalIndexSize = tables.reduce((sum, t) => sum + (t.indexSizeBytes ?? 0), 0);
+  const indexSizeKnown = tables.every((t) => t.indexSizeBytes !== undefined);
   const walStorage = storage.find((s) => s.name === "WAL");
 
   const formatBytes = (bytes: number) => {
@@ -45,9 +75,12 @@ export function StorageTab({ data, loading }: StorageTabProps) {
   // arithmetic below unchanged.
   const sizeKnown = overview?.databaseSizeBytes !== undefined;
   const totalSize = overview?.databaseSizeBytes ?? 0;
-  const tablePercent = totalSize > 0 ? (totalTableSize / totalSize) * 100 : 0;
-  const indexPercent = totalSize > 0 ? (totalIndexSize / totalSize) * 100 : 0;
-  const otherPercent = Math.max(0, 100 - tablePercent - indexPercent);
+  const tablePercent = totalSize > 0 && tableSizeKnown ? (totalTableSize / totalSize) * 100 : 0;
+  const indexPercent = totalSize > 0 && indexSizeKnown ? (totalIndexSize / totalSize) * 100 : 0;
+  // Without the table or the index bytes the remainder is not computable either, so its bar
+  // stays empty instead of absorbing the unknown share.
+  const breakdownKnown = tableSizeKnown && indexSizeKnown;
+  const otherPercent = breakdownKnown ? Math.max(0, 100 - tablePercent - indexPercent) : 0;
 
   return (
     <div className="p-3 sm:p-6 space-y-4 sm:space-y-6">
@@ -70,9 +103,11 @@ export function StorageTab({ data, loading }: StorageTabProps) {
           </CardHeader>
           <CardContent className="p-2 sm:p-4 pt-0">
             <div className="text-lg sm:text-2xl font-medium truncate">
-              {sizeKnown ? formatBytes(totalTableSize) : "N/A"}
+              {sizeKnown && tableSizeKnown ? formatBytes(totalTableSize) : "N/A"}
             </div>
-            {sizeKnown && <p className="text-xs sm:text-xs text-muted-foreground mt-1">{tablePercent.toFixed(1)}%</p>}
+            {sizeKnown && tableSizeKnown && (
+              <p className="text-xs sm:text-xs text-muted-foreground mt-1">{tablePercent.toFixed(1)}%</p>
+            )}
           </CardContent>
         </Card>
 
@@ -83,9 +118,11 @@ export function StorageTab({ data, loading }: StorageTabProps) {
           </CardHeader>
           <CardContent className="p-2 sm:p-4 pt-0">
             <div className="text-lg sm:text-2xl font-medium truncate">
-              {sizeKnown ? formatBytes(totalIndexSize) : "N/A"}
+              {sizeKnown && indexSizeKnown ? formatBytes(totalIndexSize) : "N/A"}
             </div>
-            {sizeKnown && <p className="text-xs sm:text-xs text-muted-foreground mt-1">{indexPercent.toFixed(1)}%</p>}
+            {sizeKnown && indexSizeKnown && (
+              <p className="text-xs sm:text-xs text-muted-foreground mt-1">{indexPercent.toFixed(1)}%</p>
+            )}
           </CardContent>
         </Card>
 
@@ -119,7 +156,7 @@ export function StorageTab({ data, loading }: StorageTabProps) {
                     <div className="w-2 h-2 sm:w-3 sm:h-3 rounded-sm bg-green-500" />
                     Tables
                   </span>
-                  <span className="font-medium">{formatBytes(totalTableSize)}</span>
+                  <span className="font-medium">{tableSizeKnown ? formatBytes(totalTableSize) : "N/A"}</span>
                 </div>
                 <Progress value={tablePercent} className="h-1.5 sm:h-2" />
               </div>
@@ -130,7 +167,7 @@ export function StorageTab({ data, loading }: StorageTabProps) {
                     <div className="w-2 h-2 sm:w-3 sm:h-3 rounded-sm bg-purple-500" />
                     Indexes
                   </span>
-                  <span className="font-medium">{formatBytes(totalIndexSize)}</span>
+                  <span className="font-medium">{indexSizeKnown ? formatBytes(totalIndexSize) : "N/A"}</span>
                 </div>
                 <Progress value={indexPercent} className="h-1.5 sm:h-2 [&>div]:bg-purple-500" />
               </div>
@@ -142,7 +179,9 @@ export function StorageTab({ data, loading }: StorageTabProps) {
                     <span className="hidden sm:inline">Other (TOAST, FSM)</span>
                     <span className="sm:hidden">Other</span>
                   </span>
-                  <span className="font-medium">{formatBytes(totalSize - totalTableSize - totalIndexSize)}</span>
+                  <span className="font-medium">
+                    {breakdownKnown ? formatBytes(totalSize - totalTableSize - totalIndexSize) : "N/A"}
+                  </span>
                 </div>
                 <Progress value={otherPercent} className="h-1.5 sm:h-2 [&>div]:bg-muted-foreground" />
               </div>
@@ -165,7 +204,9 @@ export function StorageTab({ data, loading }: StorageTabProps) {
           </CardTitle>
         </CardHeader>
         <CardContent className="p-0 sm:p-4 sm:pt-0">
-          {storage.length === 0 ? (
+          {storageUnavailable ? (
+            <PanelUnavailable message={storageUnavailable} />
+          ) : storage.length === 0 ? (
             <div className="text-center py-8 text-muted-foreground">
               <FolderOpen strokeWidth={1.5} className="h-8 w-8 mx-auto mb-2 opacity-50" />
               <p className="text-xs">No tablespace information available.</p>
@@ -258,7 +299,13 @@ export function StorageTab({ data, loading }: StorageTabProps) {
                     .sort((a, b) => b.totalSizeBytes - a.totalSizeBytes)
                     .slice(0, 10)
                     .map((table) => {
-                      const percent = totalSize > 0 ? (table.totalSizeBytes / totalSize) * 100 : 0;
+                      // `tableSizeBytes` is what says whether this engine publishes per-table
+                      // bytes at all: a total is the table's own pages plus its indexes, so an
+                      // engine that cannot measure the first cannot have measured the sum. When
+                      // it is absent the share is left as "-" rather than drawn from the
+                      // placeholder the required `totalSizeBytes` field still has to carry.
+                      const bytesReported = table.tableSizeBytes !== undefined;
+                      const percent = totalSize > 0 && bytesReported ? (table.totalSizeBytes / totalSize) * 100 : 0;
                       return (
                         <TableRow key={`${table.schemaName}.${table.tableName}`}>
                           <TableCell className="py-2">
@@ -271,10 +318,14 @@ export function StorageTab({ data, loading }: StorageTabProps) {
                           </TableCell>
                           <TableCell className="text-right text-xs py-2">{table.totalSize}</TableCell>
                           <TableCell className="text-right hidden sm:table-cell py-2">
-                            <div className="flex items-center justify-end gap-1 sm:gap-2">
-                              <Progress value={percent} className="w-12 sm:w-16 h-1.5 sm:h-2" />
-                              <span className="text-xs w-10 sm:w-12">{percent.toFixed(1)}%</span>
-                            </div>
+                            {bytesReported ? (
+                              <div className="flex items-center justify-end gap-1 sm:gap-2">
+                                <Progress value={percent} className="w-12 sm:w-16 h-1.5 sm:h-2" />
+                                <span className="text-xs w-10 sm:w-12">{percent.toFixed(1)}%</span>
+                              </div>
+                            ) : (
+                              "-"
+                            )}
                           </TableCell>
                         </TableRow>
                       );

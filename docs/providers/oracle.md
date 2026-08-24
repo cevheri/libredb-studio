@@ -19,7 +19,7 @@
 | **Connection string** | Supported — EZConnect `host:port/service` or a TNS string (passed straight to the driver's `connectString`) |
 | **Transactions** | Yes — explicit begin/commit/rollback (**no** auto-rollback timeout) |
 | **Query cancellation** | Yes — tracked connection + `connection.break()` |
-| **SSL** | Not configured by the provider (TLS via connect string / Oracle wallet) |
+| **SSL** | Yes — `connection.ssl` selects TCPS, the DN match and the wallet ([§4.3](#43-ssl--tls)) |
 | **Source** | [`src/lib/db/providers/sql/oracle.ts`](../../src/lib/db/providers/sql/oracle.ts) |
 | **Base** | [`src/lib/db/providers/sql/sql-base.ts`](../../src/lib/db/providers/sql/sql-base.ts) |
 | **Tests** | [`tests/integration/db/oracle-provider.test.ts`](../../tests/integration/db/oracle-provider.test.ts) |
@@ -41,7 +41,7 @@ providers, with several Oracle-isms that are worth knowing before reading the co
 | Maintenance | vacuum / analyze / reindex / kill | `analyze` (DBMS_STATS) / `optimize` (index rebuild) / `kill` |
 | Transaction timeout | 5-minute auto-rollback | **none** |
 | Cancellation | `pg_cancel_backend(pid)` | `connection.break()` (tracked connection) |
-| SSL | `buildSSLConfig()` + cloud auto-detect | **not handled** — TLS via connect string / wallet |
+| SSL | `buildSSLConfig()` + cloud auto-detect | `tcps://` + `sslServerDNMatch` + `walletContent` (no cloud auto-detect) |
 | Monitoring source | `pg_stat_*` | `V$` views (privilege-gated, each guarded) |
 | UI labels | default SQL | **overridden** (Gather Statistics / Rebuild Indexes) |
 
@@ -172,12 +172,15 @@ connection and marks the transaction active — **there is no timeout**. An aban
 holds its connection (and locks) until explicitly committed/rolled back or the connection is
 reclaimed by the pool.
 
-### 3.5 No SSL config path
+### 3.5 SSL through the connect string, not a `buildSSLConfig()`
 
-The Oracle provider **does not read `connection.ssl`** and has no `buildSSLConfig()` /
-cloud-auto-detect. Transport security is expected to be configured outside the provider — via a TLS
-(`tcps`) connect string or an Oracle wallet. (So, unlike Postgres/MySQL, there is no
-`rejectUnauthorized: false` auto-detect caveat here.)
+The Oracle provider has no `buildSSLConfig()` and no cloud auto-detect: TLS is not an option object
+here but a **protocol in the connect string**. The Thin driver calls `tls.connect` only when the
+resolved address protocol is TCPS (audited in `oracledb/lib/thin/sqlnet/ntTcp.js`), so honouring
+`connection.ssl` means composing `tcps://host:port/service` — see [§4.3](#43-ssl--tls) for the full
+mapping, and for the two Oracle-specific consequences: the chain is **always** verified (there is no
+`rejectUnauthorized` to turn off), and the CA and client certificates travel as one `walletContent`
+PEM rather than three options.
 
 ### 3.6 Privilege-resilient monitoring
 
@@ -229,8 +232,31 @@ exposes `{ total: connectionsOpen, idle, active: connectionsInUse, waiting: 0 }`
 
 ### 4.3 SSL / TLS
 
-Not handled by the provider — see [§3.5](#35-no-ssl-config-path). Use a `tcps://` connect string or
-an Oracle wallet for encrypted transport.
+`getConnectString()` and `buildTLSAttributes()`
+([oracle.ts:271](../../src/lib/db/providers/sql/oracle.ts)) map `connection.ssl` onto the three
+things the driver understands:
+
+| `ssl.mode` | Connect string | `sslServerDNMatch` | Chain verified |
+|------------|----------------|--------------------|----------------|
+| absent / `disable` | `host:port/service` | not set | — (plaintext) |
+| `require` | `tcps://host:port/service` | `false` | **yes** (unavoidable) |
+| `verify-ca` | `tcps://host:port/service` | `false` | yes |
+| `verify-full` | `tcps://host:port/service` | `true` | yes |
+
+`caCert`, `clientCert` and `clientKey` are concatenated, in that order and newline-separated, into a
+single `walletContent` attribute. That is the driver's own shape, not a convenience: Thin mode hands
+the same string to `tls.createSecureContext()` as `cert`, `key` **and** `ca`.
+
+> **Note: `require` is not "encrypt without verifying" on Oracle.** Thin mode calls `tls.connect` with
+> `rejectUnauthorized: true` unconditionally, so every TCPS connection checks the chain and
+> `ssl.rejectUnauthorized: false` has nothing to map to. A server with a self-signed certificate is
+> reachable only by supplying its CA in `caCert`. `require` and `verify-ca` therefore differ from
+> `verify-full` only in the **DN/hostname** match, which is the one check Oracle does expose.
+
+> Note: a pasted `connectionString` is returned **verbatim**, so its own protocol (or full TNS
+> descriptor) decides whether the transport is encrypted — a `require` selected alongside a `tcp`
+> connect string cannot upgrade it. `sslServerDNMatch` and `walletContent` are separate pool
+> attributes and still apply.
 
 ### 4.4 Thick-mode opt-in (`ORACLE_CLIENT_LIB_DIR`)
 
@@ -302,16 +328,41 @@ the derived image above is the supported path.
 
 `query(sql, params?, queryId?)` ([oracle.ts:162](../../src/lib/db/providers/sql/oracle.ts)) checks
 out a pooled connection, optionally stores the **connection object** under `queryId` for
-cancellation, runs `conn.execute(sql, binds, { outFormat: OUT_FORMAT_OBJECT, autoCommit: true })`,
+cancellation, runs `conn.execute(sql, binds, { outFormat: OUT_FORMAT_OBJECT, autoCommit: true, fetchTypeHandler })`
+([§5.3](#53-what-each-oracle-type-arrives-as) says what the handler is for),
 and returns:
 
 ```ts
-{ rows, fields: metaData.map(m => m.name), rowCount: rows.length, executionTime }
+{ rows, fields: metaData.map(m => m.name), rowCount: rows.length, executionTime, columnTypes? }
 ```
 
-`rowCount` is `rows.length`. Non-`SELECT` statements (INSERT/UPDATE/DELETE/DDL) return no `rows`
-array, so `rows` defaults to `[]` and **`rowCount` is `0`** — Oracle's `rowsAffected` is not
-surfaced. Bind parameters use Oracle's `:1`-style placeholders (`getPlaceholder()` from the base).
+A `SELECT` answers with a `rows` array and `rowCount` is `rows.length`. A non-`SELECT`
+(INSERT/UPDATE/DELETE/DDL/PL/SQL) carries **no `rows` array at all**, and that absence is what
+selects the other branch of `buildQueryResult()`: the grid is empty (`rows: []`, `fields: []`, no
+`columnTypes`, because there is no metadata to state them from) and **`rowCount` is the driver's own
+`result.rowsAffected`**, `0` when the driver states none. Same shape as the MySQL provider's
+`buildQueryResult()` (#469).
+
+Until 2026-08-24 the count was `rows.length` on both branches, so every statement that wrote
+something reported `0` for work it had done. Measured 2026-08-24 through
+`createDatabaseProvider({type:"oracle"})` against Oracle Free 23ai, with an interleaved `SELECT`
+proving each statement had landed:
+
+| statement | `rowsAffected` on the wire | `rowCount` before | after |
+|---|---|---|---|
+| `CREATE TABLE d13_probe (…)` | `0` | 0 | 0 |
+| `INSERT INTO d13_probe VALUES (1, 'a')` | `1` | **0** | 1 |
+| `INSERT INTO d13_probe SELECT … ROWNUM <= 3` | `3` | **0** | 3 |
+| `UPDATE d13_probe SET note = 'z'` (4 rows) | `4` | **0** | 4 |
+| `DELETE FROM d13_probe WHERE id = 9` (3 rows) | `3` | **0** | 3 |
+| `DELETE FROM d13_probe WHERE id = 4242` | `0` | 0 | 0 |
+| `BEGIN NULL; END;` | *unset* | 0 | 0 |
+| `TRUNCATE TABLE d13_probe` | `0` | 0 | 0 |
+
+`autoCommit: true` on the call is load-bearing, not decoration: `oracledb.autoCommit` defaults to
+`false`, and measured without it the `INSERT` still reported `rowsAffected: 1` while a second
+session saw `COUNT(*) = 0`, and the row was gone for good once the writing connection went back to
+the pool. Bind parameters use Oracle's `:1`-style placeholders (`getPlaceholder()` from the base).
 Native errors are normalised through `mapDatabaseError()` (see [§11](#11-error-handling)).
 
 ### 5.2 Query cancellation
@@ -321,17 +372,262 @@ A query issued with a `queryId` stores its connection in a `Map`. `cancelQuery(q
 interrupting the in-flight OCI call — and returns `true` on success (it does not verify a query was
 actually running). Exposed via `POST /api/db/cancel`.
 
-### 5.3 Data-type handling (LOBs & NUMBER) ⚠️
+### 5.3 What each Oracle type arrives as
 
-node-oracledb returns several Oracle types as non-primitive values, and the provider does **not**
-currently configure `fetchAsString`/`fetchAsBuffer`/`fetchInfo`:
+Every row below was measured on 2026-08-24 through `createDatabaseProvider({type:"oracle"})` against
+**Oracle Free 23ai** with **oracledb 6.10.0 in Thin mode**, over a probe table holding one populated
+row and one all-`NULL` row. The `JSON.stringify` column is what `POST /api/db/query` puts on the wire,
+and therefore what the grid, the row detail sheet, the CSV, the SQL export and the agent's result
+summary all read.
 
-- **`CLOB`/`NCLOB`/`BLOB`** are returned as `Lob` **stream objects**, not strings/buffers — so a
-  result row containing a LOB column does not serialize cleanly into the JSON grid. (Contrast the
-  MySQL provider's `sanitizeRow` Buffer→hex conversion.) Oracle schemas commonly use LOBs, so this
-  is a real gap — see [Known limitations](#14-known-limitations--future-work).
-- **`NUMBER`** is returned as a JavaScript `number`; values beyond 2^53 (e.g. `NUMBER(38)` ids or
-  high-precision decimals) **lose precision**. Fetching such columns as strings would preserve them.
+| Oracle type | Arrives as | `JSON.stringify` gives | Reported as |
+|---|---|---|---|
+| `CLOB` / `NCLOB` | `string` (see below) | `"the quick brown fox"` | the text |
+| `BLOB` | `Buffer` (see below) | `{"type":"Buffer","data":[222,173,190,239,1,2]}` | `\xdeadbeef0102` |
+| `RAW` | `Buffer` | `{"type":"Buffer","data":[10,11,12]}` | `\x0a0b0c` |
+| `NUMBER` | `number` | `1.2345678901234568e+37` — **digits lost** | the double, see below |
+| `BINARY_DOUBLE` | `number` | `3.5` | the number |
+| `TIMESTAMP` / `DATE` | `Date` | `"2026-08-23T17:46:46.422Z"` | the formatted date |
+| `TIMESTAMP WITH TIME ZONE` | `Date` | `"2026-08-24T07:11:12.345Z"` — offset folded to UTC, sub-ms dropped | the formatted date — [§5.5](#55-an-interval-is-normalized-to-its-oracle-literal-a-time-zone-cannot-be) |
+| `TIMESTAMP WITH LOCAL TIME ZONE` | `Date` | `"2026-08-24T07:11:12.345Z"` — same, normalized to the session time zone first | the formatted date — [§5.5](#55-an-interval-is-normalized-to-its-oracle-literal-a-time-zone-cannot-be) |
+| `INTERVAL YEAR TO MONTH` | `IntervalYM` | `"+03-07"` | its Oracle literal — [§5.5](#55-an-interval-is-normalized-to-its-oracle-literal-a-time-zone-cannot-be) |
+| `INTERVAL DAY TO SECOND` | `IntervalDS` | `"+05 06:07:08.9"` | its Oracle literal — [§5.5](#55-an-interval-is-normalized-to-its-oracle-literal-a-time-zone-cannot-be) |
+| `XMLTYPE` | `string` | `"<r>\n  <a>1</a>\n</r>\n"` | the serialized document |
+| `JSON` | plain object | `{"k":[1,2]}` | that object, as JSON |
+| any of the above, `NULL` | `null` | `null` | empty |
+
+#### A LOB used to fail the whole query, not just the cell
+
+`query()` and `queryInTransaction()` pass a per-call **`fetchTypeHandler`**
+([oracle.ts](../../src/lib/db/providers/sql/oracle.ts)) that maps `CLOB` and `NCLOB` to
+`oracledb.STRING` and `BLOB` to `oracledb.BUFFER`. Every other column keeps the driver's own default:
+`RAW` is already a `Buffer` and `VARCHAR2` already a string, and restating them would put this
+provider in charge of types it has no reason to touch.
+
+Without it oracledb answers a LOB with a **`Lob` stream object**, and the row cannot be serialized at
+all. Measured over four LOB columns, each arriving with `constructor.name === "Lob"`:
+
+```
+TypeError: Converting circular structure to JSON
+    --> starting at object with constructor 'NVPair'
+    |     property 'list' -> object with constructor 'Array'
+    |     index 0 -> object with constructor 'NVPair'
+    --- property 'parent' closes the circle          (Node 24.14.0)
+
+TypeError: JSON.stringify cannot serialize cyclic structures   (Bun 1.3.14)
+```
+
+`POST /api/db/query` builds its answer with `NextResponse.json`, so **the whole SELECT failed** —
+no grid, no CSV, no export, nothing for the agent to summarize. The in-process path
+(`StudioWorkspace`, the agent's tools) got further and was worse: the cell classified as JSON and the
+export wrote the stream's internals, measured verbatim as
+
+```
+INSERT INTO r6_lob ("ID", "C", "B") VALUES (1, '{"_events":{"finish":[null]},"_readableState":{...
+```
+
+A `BLOB` as a `Buffer` needs nothing further: `asBytes` in
+[`src/lib/export/binary.ts`](../../src/lib/export/binary.ts) accepts both a live `Uint8Array` and the
+`{"type":"Buffer","data":[…]}` JSON it serializes to, which is the same contract a Postgres `bytea`
+and a MySQL `BLOB` already reach the binary cell renderer, the row detail sheet, the CSV and the SQL
+export's binary literal through. Verified by exporting a row and replaying it into Oracle itself:
+
+```
+SOURCE   {"ID":1,"C":"the quick brown fox","NC":"ncl-value-unicode-café","B":{"type":"Buffer","data":[222,173,190,239,1,2]}}
+EXPORT   INSERT INTO r6_replay ("ID", "C", "NC", "B") VALUES (1, 'the quick brown fox', 'ncl-value-unicode-café', HEXTORAW('deadbeef0102'));
+REPLAYED {"ID":1,"C":"the quick brown fox","NC":"ncl-value-unicode-café","B":{"type":"Buffer","data":[222,173,190,239,1,2]}}
+```
+
+**A LOB is fetched whole, with no length cap.** That is the same contract every other provider here
+already has for a large value — a Postgres `text`/`bytea` and a MySQL `BLOB` arrive whole too, and
+`DEFAULT_QUERY_LIMIT` bounds the row count, not the cell. A cap was considered and rejected: a
+truncated `CLOB` looks exactly like a complete one in the grid, and the SQL export would write the
+truncation into the target as though it were the value. The cost is linear and measured — a
+16,384,000-character `CLOB` fetched as a string took **66 ms** and serialized to **16.4 MB** of JSON
+in **18 ms** — and the ceiling is the runtime's own and fails loudly: a string past V8's
+536,870,888-character maximum throws `RangeError: Invalid string length`, which reaches the user as a
+failed query rather than as a value that has quietly lost its tail.
+
+The handler is deliberately **per-call**, not the process-wide `oracledb.fetchAsString` /
+`fetchAsBuffer` globals: those would also change every schema and monitoring read (`getSchema` reads
+`ALL_TAB_COLUMNS.DATA_DEFAULT`, a `LONG`), and they outlive the provider — the embeddable library
+surface runs inside a host application that may have its own oracledb consumers.
+
+#### `NUMBER` still loses digits, and that is a separate defect
+
+`NUMBER` arrives as a JS double and the loss is silent: measured,
+`12345678901234567890123456789012345678` (a `NUMBER(38,0)`) came back as `1.2345678901234568e+37`,
+and `NUMBER(20,4)` `1234567890123456.7891` as `1234567890123456.8`. Fetching `NUMBER` as a string
+would keep the digits — the way `docs/providers/cassandra.md` §3.8 keeps a `bigint`'s — but it is
+**not** part of that change: it changes every numeric cell Oracle produces, including the ones the grid
+right-aligns and the agent arithmetics over, so it is tracked separately rather than smuggled in with
+the LOB fix. `JSON` is lossless as an object and is left as it is; `XMLTYPE` needs nothing, it is
+already a string. The two `INTERVAL` types were left alone by that change too and are handled now —
+[§5.5](#55-an-interval-is-normalized-to-its-oracle-literal-a-time-zone-cannot-be).
+
+### 5.4 Declared column types
+
+Oracle is the one engine of the four whose driver hands over a NAME rather than a wire code:
+`result.metaData[].dbTypeName`. It is passed through into `QueryResult.columnTypes` verbatim
+([column-types.ts](../../src/lib/db/providers/sql/column-types.ts)), keyed by the column name in
+`fields`, by both `query()` and `queryInTransaction()`, and it is uppercase - the same spelling
+`ALL_TAB_COLUMNS.DATA_TYPE` uses, so a declared type reads like the schema tree's entry.
+
+Measured on Oracle Free 23ai over the probe table, verbatim from `oracledb`:
+
+| declared | `dbTypeName` | also reported |
+|---|---|---|
+| `NUMBER(19)` | `NUMBER` | `precision: 19, scale: 0` |
+| `NUMBER(10,2)` | `NUMBER` | `precision: 10, scale: 2` |
+| `BINARY_DOUBLE` | `BINARY_DOUBLE` | |
+| `VARCHAR2(40)` | `VARCHAR2` | `byteSize: 40` |
+| `CLOB` / `BLOB` | `CLOB` / `BLOB` | |
+| `TIMESTAMP` / `DATE` | `TIMESTAMP` / `DATE` | `precision: 6` on the timestamp |
+| `SYSTIMESTAMP` (computed) | `TIMESTAMP WITH TIME ZONE` | `precision: 6` |
+| `COUNT(*)` (computed) | `NUMBER` | `precision: 0, scale: 0` |
+| `1/3` (computed) | `NUMBER` | `precision: 0, scale: -127` |
+
+The precision and scale sit right beside the name and are deliberately **not** spelled into it. The
+last two rows are why: a computed column reports precision 0 or scale -127, and a `NUMBER(p,s)`
+built from those would claim something Oracle did not. `DATA_TYPE` is the type; the declaration
+channel carries the type.
+
+This is the only source of a type for a computed column or an ad-hoc projection - the schema tree has
+no catalog entry to answer with - and it is what stops the SQL-DDL export from guessing. Measured
+before this existed, the probe table's `NUMBER(10,2)` column exported as `BINARY_DOUBLE` and its
+`BLOB` as `VARCHAR2(4000)`, both inferred from a value.
+
+### 5.5 An interval is normalized to its Oracle literal; a time zone cannot be
+
+Four Oracle types "lose or hide what they carry", and the answers are not the same for both pairs:
+the two intervals are **normalized at the driver boundary**, the two time-zone timestamps **cannot
+be** and this section says so plainly instead of implying otherwise. This is the decision
+[`docs/providers/cassandra.md` §3.8](cassandra.md#38-values-are-normalized-once-at-the-driver-boundary)
+already took for a CQL `duration`, applied to the one other engine here that has the same shape of
+problem.
+
+Measured 2026-08-24 against **Oracle Free 23ai** with **oracledb 6.10.0 in Thin mode**, through
+`createDatabaseProvider({type:"oracle"})`:
+
+| Oracle type | stored | before | after |
+|---|---|---|---|
+| `INTERVAL YEAR TO MONTH` | `INTERVAL '3-7' YEAR TO MONTH` | `{"months":7,"years":3}` | `"+03-07"` |
+| `INTERVAL DAY TO SECOND` | `INTERVAL '5 6:7:8.9' DAY TO SECOND` | `{"fseconds":900000000,"seconds":8,"minutes":7,"hours":6,"days":5}` | `"+05 06:07:08.9"` |
+| `TIMESTAMP WITH TIME ZONE` | `TIMESTAMP '2026-08-24 10:11:12.345678 +03:00'` | `"2026-08-24T07:11:12.345Z"` | unchanged — see below |
+| `TIMESTAMP WITH LOCAL TIME ZONE` | the same value | `"2026-08-24T07:11:12.345Z"` | unchanged — see below |
+
+#### The intervals
+
+The old objects were lossless and unreadable: nothing in the product reconstructs either one, the
+grid showed a JSON blob where a duration belongs, and the SQL export wrote that blob into an
+`INTERVAL` column — which Oracle **refuses** (`ORA-01867: the interval is invalid`), so the row was
+lost rather than silently wrong.
+
+The literal is composed in the provider, not asked of the driver, because the driver refuses to
+produce it: a `fetchTypeHandler` returning `{type: oracledb.STRING}` for either type fails the whole
+statement with `NJS-119: conversion from type DB_TYPE_INTERVAL_YM to type DB_TYPE_VARCHAR is not
+supported`, and the process-wide `oracledb.fetchAsString` rejects both identities up front with
+`NJS-021: invalid type for conversion specified`.
+
+The spelling is Oracle's own signed form rather than the `INTERVAL '3-7' YEAR TO MONTH` keyword form,
+and that is a measured choice, not a preference. A cell reaches the SQL export as a **value**, so the
+keyword form would be exported quoted — `'INTERVAL ''3-7'' YEAR TO MONTH'` — and Oracle answers
+`ORA-01867`. The signed form is accepted as a plain string in exactly the position the export puts
+it. Every form below was replayed against the live server:
+
+```
+ACCEPTED   INSERT INTO d19_cand (tag, iym) VALUES ('a', '+03-07')
+ACCEPTED   INSERT INTO d19_cand (tag, iym) VALUES ('b', '-03-07')
+ACCEPTED   INSERT INTO d19_cand (tag, iym) VALUES ('c', '+00-00')
+ACCEPTED   INSERT INTO d19_cand (tag, ids) VALUES ('d', '+05 06:07:08.9')
+ACCEPTED   INSERT INTO d19_cand (tag, ids) VALUES ('e', '+09 08:07:06')
+ACCEPTED   INSERT INTO d19_cand (tag, ids9) VALUES ('h', '+123456789 23:59:59.123456789')
+REFUSED    INSERT INTO d19_replay (tag, iym) VALUES ('ym-quoted-keyword', 'INTERVAL ''3-7'' YEAR TO MONTH')
+           -> ORA-01867: the interval is invalid
+```
+
+Details that follow from the measurements:
+
+- **One leading sign.** A negative interval arrives with *every* field negative
+  (`INTERVAL '-3-7'` → `{"months":-7,"years":-3}`), so the sign is taken once and the fields are
+  printed absolute: `-03-07`, not `-03--07`.
+- **Two digits is a minimum, not a width.** `INTERVAL '123456789-11' YEAR(9) TO MONTH` arrives as
+  `{"months":11,"years":123456789}` and is spelled `+123456789-11`, which Oracle takes back into the
+  same column. The two-digit padding matches what `TO_CHAR` prints at Oracle's *default* leading
+  precision; the declared precision is not in the value, so a `YEAR(4)` column reads `+03-07` here
+  where the server's own `TO_CHAR` says `+0003-07`. Same value, different padding.
+- **`fseconds` is nanoseconds**, so the fraction is nine digits with trailing zeros trimmed — exact
+  for a `SECOND(9)` column, and no fractional part at all for a whole-second interval
+  (`+09 08:07:06`).
+- **A NULL interval stays `null`**, not a zero interval.
+
+Verified end to end — read through the provider, exported, replayed into a fresh table, and compared
+**by the server**, not by re-reading our own spelling:
+
+```
+PROVIDER ROWS  [{"K":1,"IYM":"+03-07","IDS":"+05 06:07:08.9"},{"K":2,"IYM":"-03-07","IDS":"+09 08:07:06"},{"K":3,"IYM":null,"IDS":null}]
+EXPORT DDL     CREATE TABLE d19_replay ("K" NUMBER, "IYM" INTERVAL YEAR TO MONTH, "IDS" INTERVAL DAY TO SECOND);
+EXPORT INSERT  INSERT INTO d19_replay ("K", "IYM", "IDS") VALUES (1, '+03-07', '+05 06:07:08.9');
+               INSERT INTO d19_replay ("K", "IYM", "IDS") VALUES (2, '-03-07', '+09 08:07:06');
+               INSERT INTO d19_replay ("K", "IYM", "IDS") VALUES (3, NULL, NULL);
+REPLAYED       all four statements accepted; rows read back identical
+SERVER SAYS    SELECT ... CASE WHEN s.iym = r.iym AND s.ids = r.ids THEN 'EQUAL' ...  ->  EQUAL, EQUAL, EQUAL
+               (source TO_CHAR '+0003-07' / '+0005 06:07:08.900000' vs replayed '+03-07' /
+                '+05 06:07:08.900000' — the difference is the declared leading precision of the
+                exported column, not the value)
+```
+
+The columns are found once per result from `metaData[].dbType`, so a query with no interval column
+does no per-cell work and keeps the driver's own rows array untouched.
+
+#### The time zones, and why the offset is not recoverable
+
+**A `TIMESTAMP WITH TIME ZONE` loses its stored offset, and this provider cannot keep it.** The
+driver has already reduced the value to a UTC instant by the time any code here sees it: it hands
+over a JS `Date`, which holds no zone and no sub-millisecond digits.
+
+The obvious candidate was measured and is *worse* than the `Date`. Asking for the column as a string
+(`fetchTypeHandler` → `{type: oracledb.STRING}`) is accepted, but what the driver returns is that
+same `Date` put through `toString()` — in the **Node process's** time zone, with the milliseconds
+gone. Three rows with three different stored offsets, read by a process running in `+03:00`:
+
+```
+SERVER TEXT  plus3  2026-08-24 10:11:12.345678 +03:00
+             minus7 2026-08-24 10:11:12.345678 -07:00
+             named  2026-08-24 10:11:12.345678 ASIA/TOKYO
+
+DEFAULT      plus3  "2026-08-24T07:11:12.345Z"
+             minus7 "2026-08-24T17:11:12.345Z"
+             named  "2026-08-24T01:11:12.345Z"
+
+AS STRING    plus3  "Mon Aug 24 2026 10:11:12 GMT+0300 (Türkiye Standard Time)"
+             minus7 "Mon Aug 24 2026 20:11:12 GMT+0300 (Türkiye Standard Time)"
+             named  "Mon Aug 24 2026 04:11:12 GMT+0300 (Türkiye Standard Time)"
+```
+
+Every row reports `GMT+0300` — the reader's zone, not the stored one — and `.345` is gone. That
+would replace a correct instant with a wrong-looking local rendering, and would break the ordinary
+`DATE`/`TIMESTAMP` path the grid formats, so it was rejected. `oracledb.fetchAsString` refuses both
+identities outright (`NJS-021`), and the driver exposes no offset beside the `Date`
+(`Object.keys(date)` is empty).
+
+So the instant is right and the offset is gone. **A user who needs the stored zone must ask the
+server for it**, which is the one place that still has it:
+
+```sql
+SELECT TO_CHAR(ttz, 'YYYY-MM-DD HH24:MI:SS.FF6 TZR') FROM t;   -- 2026-08-24 10:11:12.345678 -07:00
+```
+
+The same `TO_CHAR` recovers the sub-millisecond digits that a `Date` cannot hold — for a plain
+`TIMESTAMP(6)` too, where `.345678` is likewise truncated to `.345`. A `TIMESTAMP WITH LOCAL TIME
+ZONE` has no stored offset to lose (Oracle normalizes it on write and renders it in the *session's*
+zone), so for that type only the sub-millisecond truncation applies.
+
+**A `Date` cell does not replay through the SQL export into Oracle** — that is a separate defect and
+not fixed here. Measured on the same run: a `TIMESTAMP WITH TIME ZONE` cell exports as
+`'2026-08-24T07:11:12.345Z'` and Oracle refuses it with `ORA-01843: An invalid month was specified`.
+It affects every `DATE`/`TIMESTAMP` column, not just the zoned ones, and it lives in the shared
+export (`src/lib/export/result-export.ts`), not in this provider.
 
 ---
 
@@ -345,7 +641,7 @@ Surfaced via `POST /api/db/transaction`.
 | Method | Behaviour |
 |--------|-----------|
 | `beginTransaction()` | Checks out a connection, marks active. Throws if one is active. |
-| `queryInTransaction(sql, params?)` | Runs on that connection with `autoCommit: false`. Throws if none active. |
+| `queryInTransaction(sql, params?)` | Runs on that connection with `autoCommit: false`, through the same `buildQueryResult()` — so a DML statement reports its own `rowsAffected` here too. Throws if none active. |
 | `commitTransaction()` / `rollbackTransaction()` | `commit()`/`rollback()`, then closes the connection. Throws if none active. |
 | `isInTransaction()` | Current state. |
 
@@ -375,14 +671,47 @@ sub-query is independently privilege-guarded ([§3.6](#36-privilege-resilient-mo
 
 | Method | Primary source | Notes / degradation |
 |--------|----------------|---------------------|
-| `getHealth()` | `V$SESSION`, `USER_SEGMENTS`, `V$SYSSTAT`, `V$SQL` | each block guarded → `N/A`/`0`/`[]` if no privilege |
+| `getHealth()` | `V$SESSION`, `USER_SEGMENTS`, `V$SYSSTAT`, `V$SQL` | each block guarded → `N/A`/`0`/`[]` if no privilege; `cacheHitRatio` is `N/A`, never `0%` ([§7.1](#71-when-the-cache-hit-ratio-is-not-measurable)) |
 | `getOverview()` | `V$VERSION`, `V$INSTANCE`, `V$SESSION`, `V$PARAMETER`, `USER_SEGMENTS`, `USER_TABLES`/`USER_INDEXES` | each guarded |
-| `getPerformanceMetrics()` | `V$SYSSTAT` | **only** `cacheHitRatio` + `bufferPoolUsage` (no QPS/deadlocks); defaults to `100` if denied |
+| `getPerformanceMetrics()` | `V$SYSSTAT` | **only** `cacheHitRatio`, and it is **omitted** when `V$SYSSTAT` cannot be read (no QPS/deadlocks/buffer-pool) — [§7.1](#71-when-the-cache-hit-ratio-is-not-measurable) |
 | `getSlowQueries()` | `V$SQL` (top-N by `ELAPSED_TIME`) | `sharedBlksHit`=`BUFFER_GETS`, `sharedBlksRead`=`DISK_READS`; `[]` on failure |
 | `getActiveSessions()` | `V$SESSION` ⋈ `V$SQL` | `pid` = `"SID,SERIAL#"`; wait class/event; `[]` on failure |
 | `getTableStats()` | `ALL_TABLES` + `USER_SEGMENTS` | sizes + `lastAnalyze`; no live/dead tuples, no bloat; `[]` on failure |
 | `getIndexStats()` | `ALL_INDEXES` + `USER_SEGMENTS` + `ALL_IND_COLUMNS` | **`scans` always `0`** (no usage counter exposed); `isPrimary` always `false`; `[]` on failure |
 | `getStorageStats()` | `DBA_DATA_FILES` → fallback `USER_SEGMENTS` | per-tablespace size; DBA view falls back to user segments without privilege |
+
+### 7.1 When the cache hit ratio is not measurable
+
+Two states, both ordinary:
+
+- **The connected user cannot read `V$SYSSTAT`.** Measured 2026-08-23 on Oracle Free 23ai against a
+  user granted only `CREATE SESSION`:
+
+  ```
+  ORA-00942: table or view "SYS"."V_$SYSSTAT" does not exist
+  ```
+
+- **The counter denominator is zero.** `NULLIF(..., 0)` guards the division, so the statement returns
+  one row whose single column is `NULL`. Measured 2026-08-23 on the same instance:
+
+  ```
+   HIT_RATIO
+  ----------
+  <NULL>
+  ```
+
+In both cases **`getHealth().cacheHitRatio` is `"N/A"` and `getPerformanceMetrics()` omits
+`cacheHitRatio`** (returning `{}` when nothing else was read), and the Overview and Performance tabs
+render "Not measured". A ratio measured as `0` is kept and shown as `0.0%`.
+
+`getHealth()` previously published `"0%"` for an unreadable ratio and `getPerformanceMetrics()`
+defaulted to `100`. The `0%` was worse than the `100`: the Overview card rates a low ratio "Needs
+tuning", so a least-privilege application user saw a cache fault Oracle never reported.
+
+`bufferPoolUsage` is **no longer reported**. It was assigned `cacheHitRatio` itself — the same number
+under a second name, which the Performance tab drew and rated as an independent gauge. Oracle does
+publish pool occupancy, in `V$BUFFER_POOL_STATISTICS`/`V$SGASTAT`, but this method does not query
+them.
 
 ---
 
@@ -414,6 +743,7 @@ inside `DBMS_STATS` arguments / `ALTER` identifiers that can't take bind paramet
 | `supportsExternalQueryLimiting` | `true` (from base) |
 | `supportsCreateTable` | `true` (from base) |
 | `supportsInlineRowEdit` | `true` — `UPDATE t SET c = v WHERE pk = v` is core Oracle DML |
+| `supportsTransactions` | `true` — Oracle is always in a transaction and the held connection commits or rolls back, so the trio and the SANDBOX toggle are offered (#U13) |
 | `declaresForeignKeys` | `true` — inherited from the base capabilities; read from `ALL_CONSTRAINTS`, so an empty list is about the schema or the owner, not the engine |
 | `supportsMaintenance` | `true` |
 | `maintenanceOperations` | `['analyze', 'optimize', 'kill']` |
@@ -426,6 +756,12 @@ inside `DBMS_STATS` arguments / `ALTER` identifiers that can't take bind paramet
 Oracle **overrides** the default SQL labels so the UI uses Oracle vocabulary:
 `analyzeAction` → *"Gather Statistics"*, `vacuumAction` → *"Rebuild Indexes"*, and the matching
 global labels (*"Gather Stats"*, *"Rebuild All Indexes"*).
+
+`slowQueriesEmptyState` → *"Query stats come from V$SQL, which this user needs SELECT on to read."*
+The monitoring Queries panel's empty state was hardcoded to PostgreSQL's `pg_stat_statements` advice
+on every engine (`docs/BACKLOG.md` U12); `getSlowQueries()` here reads `V$SQL`
+([§8](#8-monitoring--health)) and returns `[]` when that read is refused, so the grant is the thing a
+DBA can act on.
 
 ---
 
@@ -460,6 +796,21 @@ The `oracledb` module is replaced with an in-process mock via `mock.module('orac
 the provider is imported — there is no live Oracle in the suite. The mock pool/connection returns
 canned `{ rows, metaData }` results, exercising the same code paths as the real driver.
 
+**The mock is why this went unnoticed for as long as it did.** It answered every column with a plain
+JS value, so no test could produce the `Lob` stream object oracledb really returns for a `CLOB`, an
+`NCLOB` or a `BLOB` — a defect that made the whole query fail against a real Oracle was invisible to
+a suite that never saw the driver's own value shape. The mock now carries the `DB_TYPE_*` / `STRING`
+/ `BUFFER` identities a fetch type handler is written against, and records the options each
+`execute()` received, so the handler itself is asserted over each type; the value shapes it produces
+are pinned from live measurements ([§5.3](#53-what-each-oracle-type-arrives-as)). The same holds for
+the two `INTERVAL` identities and the `IntervalYM`/`IntervalDS` field shapes
+([§5.5](#55-an-interval-is-normalized-to-its-oracle-literal-a-time-zone-cannot-be)) — and those
+constants are typed as the driver's `DbType` from `src/types/db-drivers.d.ts`, which is what keeps
+the mock and the provider reading the same declaration. That declaration is hand-written because
+**`oracledb` publishes none** (verified on 6.10.0: no `types`/`typings` field, no `.d.ts` in the
+package, and no `@types/oracledb` dependency here), so a driver upgrade that changes a shape is
+caught by a live probe, not by `tsc`.
+
 > ⚠️ **Mock isolation:** `bun`'s `mock.module()` is process-wide; files mocking different drivers
 > cross-contaminate in a shared process. A **single file** is safe (one file = one process). The
 > full `bun run test` script runs the core group in **one** process and is load-order flaky, so
@@ -472,7 +823,14 @@ The suite covers: validation, connect/disconnect, query, capabilities, **labels 
 **`prepareQuery` FETCH FIRST / OFFSET-FETCH**, `getSchema` (columns/PKs/FKs/indexes grouping),
 health, maintenance (analyze/optimize/kill), pool stats, the transaction lifecycle, query
 cancellation (`break()`), overview, performance metrics, slow queries, active sessions,
-table/index/storage stats, and error mapping.
+table/index/storage stats, **the LOB fetch type handler** (per type, plus that `getSchema` is left
+alone and that a `BLOB` reaches `asBytes` in both its live and its serialized shape), **the
+`INTERVAL` literals** (both types, positive/negative/zero, a nine-digit year count, nanosecond
+precision, `NULL`, both query paths, and that a result with no interval column keeps the driver's own
+rows array), error mapping,
+and **every `ssl.mode` branch** (the TCPS switch, the
+DN-match flag, the concatenated `walletContent`, and a pasted connect string keeping its own
+protocol) asserted against the attributes `createPool` received.
 
 ### 12.3 Run it
 
@@ -515,12 +873,33 @@ Over the API: `POST /api/db/query`, `POST /api/db/transaction`, `POST /api/db/ca
 
 ## 14. Known limitations & future work
 
-- **CLOB/BLOB columns don't render.** No `fetchAsString`/`fetchAsBuffer` is configured, so LOB
-  columns come back as `Lob` stream objects rather than text/bytes ([§5.3](#53-data-type-handling-lobs--number)).
-  *Future:* set `oracledb.fetchAsString = [oracledb.CLOB]` / `fetchAsBuffer = [oracledb.BLOB]` (or
-  per-query `fetchInfo`), and stream genuinely large LOBs instead of buffering.
-- **Large `NUMBER` precision loss** — returned as a JS `number`; `NUMBER` values beyond 2^53 should
-  be fetched as strings to stay exact.
+- **A LOB is fetched whole.** `CLOB`/`NCLOB`/`BLOB` are read into a string or a `Buffer` in one
+  piece rather than streamed, so a single very large cell is held in memory and then in the JSON
+  response. Measured: 16 MB of `CLOB` costs 66 ms and 16.4 MB of JSON; V8 refuses a string past
+  536,870,888 characters with `RangeError: Invalid string length`. Bounding it was rejected on
+  purpose — a truncated value looks complete in the grid and would be written into the target by the
+  SQL export ([§5.3](#53-what-each-oracle-type-arrives-as)). *Future:* if a real workload hits
+  the ceiling, stream the cell to the download rather than truncating it in the row.
+- **Large `NUMBER` loses digits, silently.** Returned as a JS double: a `NUMBER(38,0)` measured as
+  `1.2345678901234568e+37` and a `NUMBER(20,4)` as `1234567890123456.8`. Fetching `NUMBER` as a
+  string would keep them exact, at the cost of changing every numeric cell Oracle produces — which
+  is why it was left out of the LOB change rather than bundled with it ([§5.3](#53-what-each-oracle-type-arrives-as)).
+- **`TIMESTAMP WITH TIME ZONE` arrives as a `Date`**, so the stated offset is folded into UTC and
+  sub-millisecond precision is dropped (`+03:00 10:11:12.345678` measured as
+  `"2026-08-24T07:11:12.345Z"`). **Not fixable here:** the driver produces a `Date` and offers no
+  string form that keeps the offset — measured, asking for one returns the reader process's own time
+  zone for every row. `TO_CHAR(col, '… TZR')` is the way to see the stored zone
+  ([§5.5](#55-an-interval-is-normalized-to-its-oracle-literal-a-time-zone-cannot-be)).
+- **A `DATE`/`TIMESTAMP` cell does not replay through the SQL export into Oracle.** It is written as
+  the ISO string a `Date` serializes to (`'2026-08-24T07:11:12.345Z'`) and Oracle answers
+  `ORA-01843: An invalid month was specified`. The fix belongs in the shared export
+  (`src/lib/export/result-export.ts`), which has no Oracle date literal, not in this provider.
+- **`oracledb` ships no TypeScript declarations, so the driver surface is hand-declared.** Verified
+  on 6.10.0: no `types`/`typings` field in its `package.json` and no `.d.ts` anywhere in the package,
+  and there is no `@types/oracledb` in this project's dependencies. `src/types/db-drivers.d.ts`
+  declares the members this provider actually uses instead of the blanket `any` it used to; that
+  declaration is checked against the driver only by the live probes and the integration mock, so a
+  driver upgrade that changes a shape will not be caught by `tsc` alone.
 - **`NJS-138` (pre-12.1 server) is a non-retryable configuration error, not a transient one.**
   `mapDatabaseError()` maps it to `DatabaseConfigError` instead of the generic retryable
   `ConnectionError` every other `connect()` failure produces — see [§4.4](#44-thick-mode-opt-in-oracle_client_lib_dir)
@@ -541,6 +920,12 @@ Over the API: `POST /api/db/query`, `POST /api/db/transaction`, `POST /api/db/ca
 - **Module-global driver settings.** The constructor sets `oracledb.outFormat`/`autoCommit` on the
   shared `oracledb` module singleton (not per-pool/connection) — fine for a single embedding, but a
   process-wide side effect to be aware of if Oracle is ever used alongside another `oracledb` consumer.
+- **TLS cannot be encryption-only, and cannot be forced onto a pasted connect string.** Thin mode
+  always verifies the chain, so `ssl.mode: require` needs the server's CA in `caCert` when the
+  certificate is self-signed, and `ssl.rejectUnauthorized: false` has no Oracle equivalent
+  ([§4.3](#43-ssl--tls)). A `connectionString` is passed through verbatim, so the protocol it names
+  is the one used. *Future:* surface the mismatch in the dialog rather than leaving the connect
+  string to decide silently.
 - **No transaction auto-rollback timeout** (unlike Postgres/MySQL) — an abandoned transaction holds
   its connection/locks until committed, rolled back, or pool-reclaimed.
 - **Schema is owner-scoped** to the connecting user (`OWNER = USER`); objects in other schemas the
@@ -550,8 +935,9 @@ Over the API: `POST /api/db/query`, `POST /api/db/transaction`, `POST /api/db/ca
 - **Row counts (`NUM_ROWS`) are optimizer estimates** populated by `DBMS_STATS`; they can be stale
   or `NULL` until stats are gathered.
 - **Monitoring depends on `V$` privileges.** A low-privilege app user silently gets `N/A`/`0`/`[]`
-  for the views it can't read. `getPerformanceMetrics()` reports only cache-hit ratio (no
-  QPS/deadlocks).
+  for the views it can't read. `getPerformanceMetrics()` reports only the cache-hit ratio (no QPS,
+  deadlocks, or buffer-pool usage), and **omits even that** when `V$SYSSTAT` is unreadable rather
+  than substituting a figure — [§7.1](#71-when-the-cache-hit-ratio-is-not-measurable).
 - **No two-phase schema loading** — `/api/db/schema/list` falls back to the full `getSchema()`.
 
 ---

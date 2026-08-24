@@ -6,22 +6,25 @@ a result on these pages.
 
 ## Before spending the download
 
-Tool calling is the gate. Pull the model, then run the probe in
-[`setup.md`](setup.md#3-check-the-model-can-drive-a-run-at-all). A model that answers
-in prose rather than with a `tool_calls` array cannot drive a run, and no amount of
-prompting changes that — four `deepseek-r1` sizes were confirmed that way.
+Tool calling is the gate, though not an absolute one. Pull the model, then run the probe in
+[`setup.md`](setup.md#checking-a-model-this-list-does-not-cover). A model that answers in prose
+rather than with a `tool_calls` array cannot be driven natively, and no amount of prompting
+changes that — several reasoning distills were confirmed that way.
+
+What it does NOT mean is that the model is unusable: the application drops such a model to a
+prose tool protocol rather than turning it away. It decides per endpoint, from what the endpoint
+does, rather than from a list of names.
 
 Two things that look like evidence and are not:
 
-* **the `tools` tag on the Ollama model page.** `deepseek-r1` advertises it and cannot
-  do it.
-* **the chat template.** A missing `.Tools` block proves nothing: `gemma4:26b`,
-  `qwen3.8` and `muse-glimmer` all lack it and all score 3/3, because recent Ollama
-  renders tools outside the template.
+* **the `tools` tag on the Ollama model page.** Models advertise it and cannot do it.
+* **the chat template.** A missing `.Tools` block proves nothing: `gemma4:26b` and
+  `qwen3.8:latest` both lack it and both clear all six surfaces, because recent Ollama renders
+  tools outside the template.
 
-## The three runs
+## The runs
 
-Ask each question against the embedded SQLite sample, one run each:
+Ask each question against the embedded SQLite sample, five times each — see below for why five:
 
 | Workflow | Question |
 | --- | --- |
@@ -64,12 +67,31 @@ Note these, because a number without them cannot be compared:
 Then add a row to the model's page, or a new page under the family folder if the
 family is not covered. Sizes are rows inside a version page, not separate files.
 
-## Run it more than once
+## Making it take effect
 
-Every table on these pages is one run per cell, and that is the method's weakest
-point — see [`methodology.md`](methodology.md). Some models are genuinely unstable:
-one captured request replayed five times against `mistral-small3.2:24b` produced three
-tool-calling runs and two refusals.
+A page records a measurement; it does not change how the model is driven. If yours needed
+something the defaults do not give it — a longer turn, a lower call ceiling, an empty turn asked
+again — write those settings as a **model-tuning document** and mount it. No Studio release, no
+code change.
 
-If a result surprises you, run it again before writing it down. If a model passes
-sometimes and fails sometimes, that IS the finding, and it belongs on the page.
+[`model-tuning.md`](model-tuning.md) is the contract: where the file goes, what every setting
+means and is bounded by, and how to check `GET /api/agent/config` to see whether it was applied or
+ignored. Start from [`model-tuning.example.json`](model-tuning.example.json) and change it.
+
+Two things worth knowing before you write one. An entry replaces the shipped entry for that model
+**whole**, so re-stating a model Studio already measured and mentioning one setting drops the rest
+to the defaults rather than keeping half the old entry. And a document may not carry wording: the
+sentences Studio says to a model stay in Studio.
+
+## Five consecutive runs, not one
+
+One run per cell was the old method here and it was the weakest thing about it. These models are
+not deterministic: cells that passed once came back 3 of 5 when the same question was asked
+again, and one captured request replayed five times produced three tool-calling runs and two
+refusals.
+
+So a surface counts only when five runs in a row pass. Four in five is not a model you would put
+in front of a user, and one pass says nothing about the fifth.
+
+If a result surprises you, run it again before writing it down. A model that passes sometimes and
+fails sometimes IS the finding, and it belongs on the page as a rate rather than a tick.

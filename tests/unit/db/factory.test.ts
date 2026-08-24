@@ -274,6 +274,7 @@ const {
   registerShutdownHandlers,
   acquireExecutionProfileProvider,
   getExecutionProfileCacheStats,
+  withOneShotTunnel,
 } = await import("@/lib/db/factory");
 if (nodeEnvBefore === undefined) {
   delete (process.env as Record<string, string>).NODE_ENV;
@@ -433,6 +434,51 @@ describe("createDatabaseProvider", () => {
     const provider = await createDatabaseProvider(conn);
     expect(provider).toBeDefined();
     expect(provider.type).toBe("libredb");
+  });
+
+  // ─── supportsTransactions agrees with the route's own shape check (#U13) ───
+  //
+  // `POST /api/db/transaction` gates on `isTransactionProvider(provider)` — the three
+  // methods being present — which no client can read, so `Studio.tsx` reads the
+  // declared capability instead. Two declarations for one fact drift, and the drift is
+  // silent in both directions: `true` without the methods puts back the HTTP 400 the
+  // capability exists to prevent, and `false` with them hides working controls. Every
+  // SHIPPED type is checked rather than a sample, since the one nobody notices is
+  // exactly the one that drifts.
+  test("every provider's supportsTransactions matches whether it implements the trio", async () => {
+    const overrides: Record<string, Partial<DatabaseConnection>> = {
+      sqlite: { database: ":memory:" },
+      mongodb: { connectionString: "mongodb://localhost/test" },
+      oracle: { serviceName: "ORCL" } as Partial<DatabaseConnection>,
+      couchbase: { port: 8091, database: "travel" },
+      elasticsearch: { port: 9200 },
+      opensearch: { port: 9200 },
+      clickhouse: { port: 8123, database: "demo" },
+      druid: { port: 8888 },
+      trino: { port: 8080, database: "tpch" },
+      cassandra: { port: 9042, database: "probe", localDataCenter: "datacenter1" } as Partial<DatabaseConnection>,
+      libredb: { database: "/tmp/test.libredb" },
+    };
+
+    const declaringTypes: string[] = [];
+    for (const type of SHIPPED_DATABASE_TYPES) {
+      const provider = (await createDatabaseProvider(makeConnection(type, overrides[type] ?? {}))) as unknown as Record<
+        string,
+        unknown
+      >;
+      const implementsTrio =
+        typeof provider.beginTransaction === "function" &&
+        typeof provider.commitTransaction === "function" &&
+        typeof provider.rollbackTransaction === "function";
+      const declared = (provider.getCapabilities as () => { supportsTransactions?: boolean })().supportsTransactions;
+
+      expect(declared).toBe(implementsTrio);
+      if (declared === true) declaringTypes.push(type);
+    }
+
+    // The positive half, pinned by name: exactly four providers hold a transaction
+    // session, so a fifth (or a lost one) fails here and not only in the loop above.
+    expect(declaringTypes.sort()).toEqual(["mssql", "mysql", "oracle", "postgres"]);
   });
 });
 
@@ -1247,5 +1293,133 @@ describe("acquireExecutionProfileProvider", () => {
       expect((error as ExecutionProfileError).reasonCode).toBe("PROFILE_UNSUPPORTED_TARGET");
       expect(getExecutionProfileCacheStats().size).toBe(0);
     });
+  });
+});
+
+// ============================================================================
+// One-shot tunnel scope (#457)
+// ----------------------------------------------------------------------------
+// The routes that build a provider outside both caches - test-connection and
+// schema-snapshot - reach the database through here. Every assertion below is
+// about lifecycle rather than transport: the tunnel must be unshared, and it
+// must close on every exit path, because no cache eviction will ever do it.
+// ============================================================================
+
+describe("withOneShotTunnel", () => {
+  // `mockHasTunnel` is not reset by the file-level beforeEach, and one assertion below
+  // is that this scope never consults the shared pool - a negative that only means
+  // anything against a counter this describe owns.
+  beforeEach(() => {
+    mockHasTunnel.mockClear();
+  });
+
+  const tunnelled = () =>
+    makeConnection("postgres", {
+      id: "one-shot-conn",
+      host: "db.internal",
+      port: 5432,
+      sshTunnel: {
+        enabled: true,
+        host: "bastion.example.com",
+        port: 22,
+        username: "jump",
+        authMethod: "password",
+        password: "pw",
+      },
+    });
+
+  const closeOf = async (call: number) =>
+    ((await mockCreateSSHTunnel.mock.results[call]?.value) as { close: ReturnType<typeof mock> } | undefined)?.close;
+
+  test("runs the callback against the local tunnel endpoint", async () => {
+    const seen: Array<{ host?: string; port?: number }> = [];
+
+    const result = await withOneShotTunnel(tunnelled(), async (effective) => {
+      seen.push({ host: effective.host, port: effective.port });
+      return "done";
+    });
+
+    expect(result).toBe("done");
+    expect(seen).toEqual([{ host: "127.0.0.1", port: 54321 }]);
+    expect(mockCreateSSHTunnel).toHaveBeenCalledTimes(1);
+  });
+
+  test("asks for an unshared tunnel so nothing pools it under the connection id", async () => {
+    await withOneShotTunnel(tunnelled(), async () => undefined);
+
+    expect(mockCreateSSHTunnel).toHaveBeenCalledWith(
+      "one-shot-conn",
+      expect.objectContaining({ host: "bastion.example.com" }),
+      "db.internal",
+      5432,
+      { shared: false },
+    );
+    // The shared pool is never consulted: a one-shot scope must not adopt, or be
+    // mistaken for, the tunnel serving a cached provider of the same connection.
+    expect(mockHasTunnel).not.toHaveBeenCalled();
+  });
+
+  test("closes the tunnel after the callback succeeds", async () => {
+    await withOneShotTunnel(tunnelled(), async () => undefined);
+
+    expect(await closeOf(0)).toHaveBeenCalledTimes(1);
+  });
+
+  test("closes the tunnel and rethrows when the callback fails", async () => {
+    await expect(
+      withOneShotTunnel(tunnelled(), async () => {
+        throw new Error("connect refused");
+      }),
+    ).rejects.toThrow("connect refused");
+
+    expect(await closeOf(0)).toHaveBeenCalledTimes(1);
+  });
+
+  test("propagates the callback failure even when closing the tunnel throws", async () => {
+    mockCreateSSHTunnel.mockImplementationOnce(async () => ({
+      localHost: "127.0.0.1",
+      localPort: 54321,
+      close: mock(async () => {
+        throw new Error("close failed");
+      }),
+    }));
+
+    await expect(
+      withOneShotTunnel(tunnelled(), async () => {
+        throw new Error("connect refused");
+      }),
+    ).rejects.toThrow("connect refused");
+  });
+
+  test("opens no tunnel when the connection has none configured", async () => {
+    const plain = makeConnection("postgres", { id: "no-tunnel-conn" });
+
+    const seen = await withOneShotTunnel(plain, async (effective) => effective);
+
+    expect(mockCreateSSHTunnel).not.toHaveBeenCalled();
+    expect(seen).toBe(plain);
+  });
+
+  test("opens no tunnel when the SSH config is present but disabled", async () => {
+    const off = tunnelled();
+    off.sshTunnel!.enabled = false;
+
+    await withOneShotTunnel(off, async (effective) => {
+      expect(effective.host).toBe("db.internal");
+    });
+
+    expect(mockCreateSSHTunnel).not.toHaveBeenCalled();
+  });
+
+  test("opens no tunnel for a connection with no host and port to forward to", async () => {
+    // A connection-string connection (MongoDB, Couchbase, ClickHouse) and SQLite carry
+    // neither, so there is no endpoint to rewrite - the same rule the pooled paths apply.
+    const stringOnly = tunnelled();
+    delete stringOnly.host;
+    delete stringOnly.port;
+
+    await withOneShotTunnel(stringOnly, async () => undefined);
+
+    expect(mockCreateSSHTunnel).not.toHaveBeenCalled();
   });
 });

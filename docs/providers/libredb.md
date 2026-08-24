@@ -215,7 +215,8 @@ strings are returned as-is. This mirrors how the Redis provider handles structur
 Unlike Redis (`INFO`) or PostgreSQL (system catalogs), LibreDB has no server introspection API.
 Overview and storage stats derive entirely from `fs.statSync` (file size in bytes) and a schema
 scan (prefix group count). There are no sessions, slow queries, or index statistics — those
-methods return empty arrays.
+methods return empty arrays — and no cache statistics either, so there is no cache hit ratio to
+report ([§7.1](#71-there-is-no-cache-hit-ratio-and-there-never-will-be)).
 
 ---
 
@@ -358,7 +359,8 @@ node, so you do not have to type the grammar from memory. The generation is driv
 `queryDialect: 'redis'`; MongoDB is now the only provider that reaches the JSON branch:
 
 - **Scan Keys** runs `prefix <group>:` for a `:`-prefix group (e.g. `users:*` → `prefix users:`), or
-  `get <name>` for a bare single-key node.
+  `get <name>` for a bare single-key node — except for a name carrying CR or LF, where it emits the
+  same `#` note and no command as the cheatsheet does (see below).
 - **Generate Command** inserts an explanatory cheatsheet — a use-case comment above each command —
   where every command line is a **concrete, directly-runnable example** (no `<placeholder>` tokens),
   so "Run Selected" on any line works as-is. The example `put` value is shaped by the group's
@@ -395,11 +397,18 @@ and no lossless JSON command form to fall back to the way Redis's does. Since ev
 is line-oriented, a name containing CR or LF cannot be addressed by a generated line at all: a key
 named `x\ndelete billing:2024` would render `delete billing:2024` as a line of its own that
 **Run Selected** would execute. For such a name the cheatsheet emits the header plus a single `#`
-note saying the key must be addressed with a hand-written command, and **no command line** (#427).
+note saying no generated line can address the key, and **no command line** (#427). The note stops
+there rather than pointing at a hand-written command: `firstCommandLine()` splits the buffer on LF
+before tokenizing, so an LF-bearing name cannot be reached from this editor at all. A CR survives
+inside quotes and could be typed by hand, but one note covers both characters and advice that fails
+for half of them is worse than none.
 
-That answer covers the cheatsheet only. `Scan Keys` still emits `get <name>` for such a key, so its
-second line lands in the editor as a runnable command; nothing destructive auto-executes, because
-`firstCommandLine()` runs only `get x`. Recorded as U11 in [`docs/BACKLOG.md`](../BACKLOG.md).
+`Scan Keys` gives the same answer — the note on its own, no command — through the same code path, so
+the two cannot drift. It matters more there than in the cheatsheet: `Scan Keys` auto-executes on a
+node click, and it used to emit `get x\ndelete billing:2024`, whose second line sat in the editor as
+a plausible, runnable `delete billing:2024` one **Run Selected** away (only `get x` ever ran, because
+`firstCommandLine()` takes the first line). Auto-executing the note alone runs nothing and reports
+*No command to run (only comments or blank lines)* (U11).
 
 Two menu actions are **not offered** on this provider. `Profile Table` and `Generate Test Data`
 address an object and insert rows into it; a `users:*` row is a prefix grouping this server derived
@@ -458,9 +467,9 @@ There is no embedded stats API.
 
 | Method | Source | Returns |
 |--------|--------|---------|
-| `getHealth()` | `fs.statSync` | `activeConnections: 1`, file size as `databaseSize`, `cacheHitRatio: 100.0` |
+| `getHealth()` | `fs.statSync` | `activeConnections: 1`, file size as `databaseSize`, `cacheHitRatio: "N/A"` |
 | `getOverview()` | `fs.statSync` + schema scan | `version`, file size, prefix-group count as `tableCount`, `indexCount: 0` |
-| `getPerformanceMetrics()` | — | `cacheHitRatio: 100` |
+| `getPerformanceMetrics()` | — | `{}` — nothing is measurable here |
 | `getSlowQueries()` | — | `[]` (N/A) |
 | `getActiveSessions()` | — | `[]` (N/A — single embedded process) |
 | `getStorageStats()` | `fs.statSync` | one entry: file path + size |
@@ -475,10 +484,21 @@ The `[]` and the absent metrics above now reach the panels as absence rather tha
 know about, with statistics for none of them — so its *Tables* and *Size* cards read `N/A` and the
 list says *No table statistics available.* instead of summing `0` and `0 B`; the **Queries** tab's
 three cards read `N/A` for the same reason, an average over no statements not being `0.00ms`; and
-because `getPerformanceMetrics()` reports only `cacheHitRatio`, the *Buffer* and *Deadlocks* cards on
-the Overview and Performance tabs read `N/A` beside *Not measured* rather than `0%` and a `0` badged
-healthy. `cacheHitRatio: 100` is the one figure here that is stated rather than absent, and it keeps
-its gauge.
+because `getPerformanceMetrics()` returns an empty object, every card on the Overview and Performance
+tabs — *Cache Hit*, *Buffer*, *Deadlocks* — reads `N/A` beside *Not measured* rather than a
+percentage or a `0` badged healthy.
+
+### 7.1 There is no cache hit ratio, and there never will be
+
+`getPerformanceMetrics()` used to report `cacheHitRatio: 100` and `getHealth()` `"100.0"`. Neither
+was a reading. The embedded kernel's entire public surface is `open` / `kv` / `doc` / `table` /
+`catalog` (`@libredb/libredb` 0.2.2) with no statistics call of any kind, and the store the provider
+reads from is this process's own memory rather than a buffer pool with hits and misses — so there is
+no counter to read and nothing a ratio would be a ratio *of*. A number this provider invents is worse
+than a gap, because the panel cannot tell it apart from a measurement (the rule
+[#424](https://github.com/libredb/libredb-studio/issues/424) exists to enforce). Both sites now omit
+it, permanently: the *Cache Hit* card reads `N/A` / *Not measured*, and the agent's health tool
+reports the string `"N/A"`.
 
 ---
 
@@ -514,6 +534,7 @@ for a different reason — the rows are derived groupings, see 5.3.
 | `supportsExternalQueryLimiting` | `false` |
 | `supportsCreateTable` | `false` |
 | `supportsInlineRowEdit` | `false` — the command grammar (`get`/`put`/`delete`/`prefix`/`range`) has no `UPDATE ... SET` for the results grid's inline editor to emit |
+| `supportsTransactions` | `false` — the command grammar has no transaction verb at all, so the trio and SANDBOX are not offered (#U13) |
 | `declaresForeignKeys` | `false` — the catalog declares namespaces and columns and nothing that references another namespace, so there is no foreign key to read |
 | `tablesAreDerivedGroupings` | `true` — the namespaces come from a bounded `kv.range` over 10000 keys, grouped by prefix, so they are this server's summary of what one scan reached rather than objects the engine declares. The agent layer states this to a plan run in one sentence |
 | `supportsMaintenance` | `false` |
@@ -530,6 +551,11 @@ refresh — `put` and `delete` both add or remove keys.
 The label map relabels the generic schema-explorer UI for key-value semantics: entity ->
 "Key Prefix", row -> "key", select -> "Scan Keys", generate -> "Generate Command",
 analyze -> "Key Info", search placeholder -> "Search keys...", etc.
+
+One label is about the monitoring tab instead: `slowQueriesEmptyState` -> *"LibreDB keeps no
+statistics about finished statements in this version."* `getSlowQueries()` answers `[]`
+unconditionally ([§7](#7-monitoring--health)), so the Queries panel is always empty here, and its
+sentence was hardcoded to PostgreSQL's `pg_stat_statements` advice (`docs/BACKLOG.md` U12).
 
 ---
 

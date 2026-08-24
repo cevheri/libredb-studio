@@ -163,7 +163,13 @@ Monitoring never hard-fails on a missing optional feature:
   currently-running queries when the extension isn't installed, whereas `getHealth()`'s lighter
   slow-query block returns a single placeholder row (`pg_stat_statements extension not enabled`).
 - WAL size (`getStorageStats`) and `pg_stat_bgwriter` checkpoint times are superuser/version-gated;
-  failures are swallowed and the field is simply omitted or reported as `N/A`.
+  failures are swallowed and the field is simply omitted or reported as `N/A`. PostgreSQL 17 moved
+  `checkpoint_write_time`/`checkpoint_sync_time` from `pg_stat_bgwriter` to `pg_stat_checkpointer`,
+  so on 17+ the query throws and `checkpointWriteTime` is `"N/A"` — measured 2026-08-23 through this
+  provider against `postgres:18`. It is never `"0.0s"` for an unread counter.
+- A metric the statistics views did not publish is **omitted rather than defaulted**
+  ([§7.1](#71-when-the-cache-hit-ratio-is-not-measurable)); `deadlocks` is absent when
+  `pg_stat_database` has no row for the database, rather than reported as zero deadlocks.
 
 ### 3.6 Safe maintenance targets
 
@@ -269,7 +275,7 @@ acquires a pooled client, optionally records its backend PID for cancellation, r
 (optionally parameterized — `$1`, `$2`, …) statement, and returns the standard envelope:
 
 ```ts
-{ rows, fields: string[], rowCount, executionTime }
+{ rows, fields: string[], rowCount, executionTime, columnTypes? }
 ```
 
 Native `pg` errors are normalised through `mapDatabaseError()` into the shared
@@ -374,6 +380,57 @@ A query issued with a `queryId` records its backend PID in a `Map`. `cancelQuery
 `pg_cancel_backend(pid)` on a fresh pooled client, returning whether the cancel signalled. Exposed
 via `POST /api/db/cancel`.
 
+### 5.4 Declared column types
+
+`pg` says exactly one thing about a column's type: `field.dataTypeID`, a `pg_type` OID. There is no
+name on the wire, and no value-shaped guess can supply one — `numeric` arrives as the **string**
+`"4.99"` so that its precision survives, `bigint` arrives as a string for the same reason, and a
+`timestamp` is a string by the time the browser has read the JSON. Measured against the local
+dvdrental before this existed, `SELECT rental_rate, last_update, film_id FROM film` exported as
+`("rental_rate" TEXT, "last_update" TIMESTAMP, "film_id" BIGINT)`: a `numeric` typed as text, and an
+`integer` widened. Guessing from the string's SHAPE is not the answer either — it would type a text
+column holding `2026-01-01` as a timestamp.
+
+So the OID is resolved to a name and reported in `QueryResult.columnTypes`, keyed by the name in
+`fields` ([column-types.ts](../../src/lib/db/providers/sql/column-types.ts)). All three execution
+paths do it: `query()`, `queryInTransaction()` and the agent's `queryReadOnly()`.
+
+- **A static table, not a catalog lookup.** The built-in OIDs are compiled into the server
+  (`pg_type.dat`) and are never reused, so a generated table is correct on every version — a newer
+  server can only add OIDs it does not know. A lookup would also need a round trip that three of the
+  four call sites cannot make: `query()` releases its pooled client before the result is assembled,
+  and `queryReadOnly()` promises EXACTLY ONE statement inside `BEGIN READ ONLY` (§12) — a catalog
+  `SELECT` smuggled in beside it would break that promise for a column label.
+- **`format_type` supplies the spelling**, because it is what PostgreSQL itself prints: OID 20 is
+  `bigint`, not the internal `int8` that `pg`'s own `types.builtins` is keyed by. The table's
+  generating query is in the module's header comment.
+- **A user-defined OID (>= 16384) is absent rather than wrong.** An enum, a composite or an
+  extension type gets its OID per database, so no static table can name it. Measured by running
+  `SELECT *` through `pg` over every table and view in dvdrental — 128 result columns — 125 are
+  named, 0 wrongly, and 3 are absent: the `mpaa_rating` enum in `film` and the two views over it.
+  Arrays are named (`text[]`). A **domain** does not reach that case at all: `film.release_year` is
+  the domain `year` (OID 16516) in `pg_attribute`, and `pg` reports the column as OID 23 — its base
+  type — so the result says `integer`, which is what the wire carries.
+
+| `dataTypeID` | reported as |
+|---|---|
+| 20 / 23 / 21 | `bigint` / `integer` / `smallint` |
+| 1700 | `numeric` |
+| 701 | `double precision` |
+| 16 | `boolean` |
+| 1043 / 25 / 1042 | `character varying` / `text` / `character` |
+| 1114 / 1184 / 1082 | `timestamp without time zone` / `timestamp with time zone` / `date` |
+| 114 / 3802 | `json` / `jsonb` |
+| 2950 / 17 | `uuid` / `bytea` |
+| 1009 | `text[]` |
+| >= 16384 | *absent* |
+
+The names are the base type's, without the type modifier: `character varying`, not
+`character varying(40)`. That is what `information_schema.columns.data_type` — the same source the
+schema tree shows — answers for the same column, and the modifier is not on the wire in a form worth
+reconstructing. `columnTypes` is consumed by the results grid's column labels, by the SQL-DDL export
+(which prefers a declared type over its value-shaped guess) and by the agent's state summary.
+
 ---
 
 ## 6. Schema introspection
@@ -403,9 +460,9 @@ base) fans these out in parallel.
 
 | Method | Primary source | Notes |
 |--------|----------------|-------|
-| `getHealth()` | `pg_stat_activity`, `pg_database_size`, `pg_statio_user_tables`, `pg_stat_statements` | connections, size, cache-hit %, top-5 slow queries (single placeholder row if the extension is absent), 10 sessions |
+| `getHealth()` | `pg_stat_activity`, `pg_database_size`, `pg_statio_user_tables`, `pg_stat_statements` | connections, size, cache-hit % (`N/A` when unmeasurable — [§7.1](#71-when-the-cache-hit-ratio-is-not-measurable)), top-5 slow queries (single placeholder row if the extension is absent), 10 sessions |
 | `getOverview()` | `version()`, `pg_postmaster_start_time()`, `pg_settings`, `pg_database_size`, `pg_tables`/`pg_indexes` | version, uptime, conns, max_conns, size, table/index counts |
-| `getPerformanceMetrics()` | `pg_statio_user_tables`, `pg_stat_database`, `pg_stat_bgwriter` | cache-hit %, buffer-pool %, deadlocks, checkpoint write time (gated) |
+| `getPerformanceMetrics()` | `pg_statio_user_tables`, `pg_stat_database`, `pg_stat_bgwriter` | cache-hit % (omitted when unmeasurable), deadlocks, checkpoint write time (gated, `N/A`); **no buffer-pool %** — see [§7.1](#71-when-the-cache-hit-ratio-is-not-measurable) |
 | `getSlowQueries()` | `pg_stat_statements` → fallback `pg_stat_activity` | detailed per-statement stats; fallback shows live active queries |
 | `getActiveSessions()` | `pg_stat_activity` | pid, user, state, query, wait events, duration; excludes own backend |
 | `getTableStats()` | `pg_stat_user_tables` + size functions | live/dead tuples, sizes, last (auto)vacuum/analyze, bloat ratio |
@@ -415,6 +472,38 @@ base) fans these out in parallel.
 
 `getTableStats()` / `getIndexStats()` accept an optional `{ schema }` filter; with none they cover
 all user schemas.
+
+### 7.1 When the cache hit ratio is not measurable
+
+The ratio comes from `pg_statio_user_tables`, and there are two ordinary states in which that view
+has nothing to divide:
+
+- **A database with no user tables.** The aggregate is `NULL`, not zero. Measured 2026-08-23 on
+  `postgres:18`, on a freshly created database:
+
+  ```
+   heap_read | heap_hit | raw_ratio
+  -----------+----------+-----------
+             |          |
+  ```
+
+- **A table nothing has read yet.** `heap_blks_hit` and `heap_blks_read` are both `0`, so the ratio
+  is `0/0` — a division by zero, which `NULLIF(..., 0)` turns into the same `NULL`.
+
+In both cases **`getHealth().cacheHitRatio` is `"N/A"` and `getPerformanceMetrics().cacheHitRatio`
+is absent from the object**, and the Overview and Performance tabs render "Not measured" rather
+than a figure. A ratio that *is* measured as `0` is kept and shown as `0.0%`: a cold cache is a real
+reading, and the one the panel most needs to show.
+
+Both SQL statements used to wrap the `NULL` in `COALESCE(..., 100)`, so an unmeasured database
+reported a perfect cache; the panels rated it "Excellent". A missing panel is honest; a populated
+wrong one is not.
+
+`bufferPoolUsage` is **not reported at all**. It used to be `blks_hit / (blks_hit + blks_read)` from
+`pg_stat_database` — which is a cache hit ratio, not pool occupancy, so the Performance tab drew the
+same quantity twice with one of the two mislabelled, and substituted `100` when both counters were
+`0`. PostgreSQL publishes no buffer-pool occupancy without the `pg_buffercache` extension, which is
+not installed by default and whose scan locks `shared_buffers`.
 
 ---
 
@@ -434,6 +523,12 @@ the client is not returned to the pool until commit/rollback. Surfaced via `POST
 
 The auto-rollback timer is the key safety mechanism: a client that opens a transaction and
 disconnects without committing would otherwise hold locks indefinitely.
+
+`supportsTransactions: true` ([§10](#10-capabilities--labels)) is what tells the editor toolbar to
+offer BEGIN/COMMIT/ROLLBACK and the auto-rolled-back SANDBOX toggle at all. It is declared rather
+than inferred because the route's own gate is `isTransactionProvider(provider)`, a runtime shape
+check no client can read, so before `docs/BACKLOG.md` U13 those controls rendered on every
+connection — including the ten providers that answer HTTP 400.
 
 ---
 
@@ -468,6 +563,7 @@ Overrides the SQL base defaults:
 | `supportsExternalQueryLimiting` | `true` |
 | `supportsCreateTable` | `true` |
 | `supportsInlineRowEdit` | `true` — `UPDATE t SET c = v WHERE pk = v` is core PostgreSQL DML |
+| `supportsTransactions` | `true` — `beginTransaction()` holds one pool client and runs `BEGIN` / `COMMIT` / `ROLLBACK` on it, so the editor's transaction trio and the auto-rolled-back SANDBOX toggle are offered here (#U13) |
 | `declaresForeignKeys` | `true` — inherited from the base capabilities; an empty `foreignKeys` list is then a fact about the schema or the reading role, never about the engine |
 | `supportsMaintenance` | `true` |
 | `maintenanceOperations` | `['vacuum', 'analyze', 'reindex', 'kill']` |
@@ -477,9 +573,22 @@ Overrides the SQL base defaults:
 
 ### Labels
 
-PostgreSQL uses the default SQL `getLabels()` from `BaseDatabaseProvider` (entity → *Table*,
-row → *row*, *Select Top 50*, *Vacuum Table*, *Analyze Table*, etc.) — no override needed, since
-the generic SQL wording already fits.
+PostgreSQL keeps the default SQL vocabulary from `BaseDatabaseProvider` (entity → *Table*,
+row → *row*, *Select Top 50*, *Vacuum Table*, *Analyze Table*, etc.) — the generic SQL wording
+already fits.
+
+`getLabels()` is overridden for **one** triad only: the Operations tab's global Reindex card, which
+was hardcoded to *"Run Reindex"* / *"Rebuild Indexes"* / *"Reconstructs all indexes in the database."*
+for every engine (`docs/BACKLOG.md` U6). That wording was written for this engine — the global card
+sends no target, so `runMaintenance('reindex')` here runs `REINDEX DATABASE`
+([§9](#9-maintenance)) — so declaring it changes nothing on PostgreSQL and lets the two
+other providers that offer `reindex` (SQLite, Couchbase) say what theirs does instead:
+
+| Field | Value |
+| --- | --- |
+| `reindexGlobalLabel` | *Run Reindex* |
+| `reindexGlobalTitle` | *Rebuild Indexes* |
+| `reindexGlobalDesc` | *Runs REINDEX DATABASE, reconstructing every index in the database.* |
 
 ---
 
@@ -661,18 +770,28 @@ Four things about the PostgreSQL side of that layer are worth knowing here:
   backslash is refused outright rather than quoted — the dialect-less span reader treats it as an
   escape, so `'a\'` would read as an unterminated literal.
 - **A run reads three catalog inventories at its start (#329 T8), not one.** `inspect_schema` takes
-  a `kind` — `columns` (the default), `relations` (foreign keys, from
-  `information_schema.table_constraints` joined to `key_column_usage` and `constraint_column_usage`)
-  and `indexes` (from `pg_index` joined to `pg_class`, `pg_namespace` and `pg_attribute`, carrying
+  a `kind` — `columns` (the default), `relations` (foreign keys, from `pg_constraint` with
+  `unnest(conkey, confkey) WITH ORDINALITY` pairing the two sides) and `indexes` (from `pg_index`
+  joined to `pg_class` and `pg_namespace`, with `indkey` unnested WITH ORDINALITY, carrying
   `indisunique` and `indisprimary`). The index read is also the only place on this path that says
-  which columns are the primary key, since `information_schema.columns` does not carry it. Two
-  consequences of the projections, both deliberate: an **expression index** has no `pg_attribute` row
-  for its expression, so it is absent from the inventory rather than listed without columns; and the
-  `information_schema` views are privilege-filtered, so a least-privilege `libredb_agent` role sees
-  exactly the tables it was granted — a smaller inventory on the agent path than the editor's is
-  correct, not a defect. All three are subject to the same row cap and are **refused, not truncated**,
-  when a schema is wider than `maxResultRows`; the run then continues with no snapshot and is told to
-  narrow `inspect_schema` itself.
+  which columns are the primary key, since `information_schema.columns` does not carry it.
+  **The relations read deliberately does not use the `information_schema` constraint views**
+  (`table_constraints` / `key_column_usage` / `constraint_column_usage`): PostgreSQL restricts them
+  to constraints on tables the role owns or holds a privilege on other than `SELECT`, so the
+  least-privilege `libredb_agent` role read an empty graph — 0 rows on the seeded dvdrental where
+  `pg_constraint WHERE contype = 'f'` holds 18. Those views also expose no ordinal, so a composite
+  key came back as the cross-product of the two column lists, and a constraint name is unique per
+  table rather than per schema, so two same-named constraints cross-matched; `pg_constraint` rows
+  carry `conrelid` / `confrelid` and are identified by oid, which closes all three. Two properties
+  of these projections worth knowing: an **expression index** appears with its expression in the
+  written form `pg_get_indexdef(indexrelid, n, true)` emits, in the position `indkey` holds a 0 for,
+  which is the same shape the SQLite side produces from the index DDL; and the *column* inventory is
+  still the privilege-filtered one, since `information_schema.columns` shows a role only the tables it
+  holds some privilege on — a smaller inventory on the agent path than the editor's is correct, not a
+  defect, and it is the inventory a table has to appear in for the relation and index rows to attach
+  to anything. All three are subject to the same row cap and are
+  **refused, not truncated**, when a schema is wider than `maxResultRows`; the run then continues with
+  no snapshot and is told to narrow `inspect_schema` itself.
 - **Plan inspection uses `EXPLAIN (FORMAT JSON)`, never `EXPLAIN (ANALYZE, …)`.** The editor's
   Explain button emits the ANALYZE form deliberately (a user asked for real timings) and that form
   EXECUTES the statement, which on this engine performs a data-modifying CTE. The agent path is

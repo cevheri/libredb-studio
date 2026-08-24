@@ -134,7 +134,7 @@ const SQLITE_INDEXES = [
 
 function answerPostgres(sql: string): QueryResult {
   if (sql.includes("information_schema.columns")) return result(PG_COLUMNS);
-  if (sql.includes("table_constraints")) return result(PG_RELATIONS);
+  if (sql.includes("pg_constraint")) return result(PG_RELATIONS);
   return result(PG_INDEXES);
 }
 
@@ -160,6 +160,7 @@ function harness(type: DatabaseType, answer?: (sql: string) => Promise<QueryResu
   return {
     context: {
       runId: "run-1",
+      modelId: "unmeasured-model-for-tests",
       mode: "agent",
       workflowType: "investigation",
       actor: { sessionId: "session-1", role: "user" },
@@ -201,7 +202,7 @@ describe("captureContextSnapshot — PostgreSQL", () => {
     // catalog SQL and this module sends none of its own.
     expect(h.statements()).toHaveLength(3);
     expect(h.statements()[0]).toContain("information_schema.columns");
-    expect(h.statements()[1]).toContain("information_schema.table_constraints");
+    expect(h.statements()[1]).toContain("pg_constraint");
     expect(h.statements()[2]).toContain("pg_index");
   });
 
@@ -359,7 +360,7 @@ describe("captureContextSnapshot — the fingerprint", () => {
     );
     // The same foreign key, pointing somewhere else.
     const withMovedReference = harness("postgres", async (sql: string) =>
-      sql.includes("table_constraints")
+      sql.includes("pg_constraint")
         ? result([{ ...(PG_RELATIONS[0] as Record<string, unknown>), referenced_column: "legacy_id" }])
         : answerPostgres(sql),
     );
@@ -550,6 +551,7 @@ describe("captureContextSnapshot — the provider's own inventory", () => {
     return {
       context: {
         runId: "run-1",
+        modelId: "unmeasured-model-for-tests",
         mode: "agent",
         workflowType: "investigation",
         actor: { sessionId: "session-1", role: "user" },
@@ -1403,6 +1405,13 @@ describe("the identity a held inventory is filed under", () => {
     // captures its own inventory when the hold has nothing. A false hit costs an answer.
     expect(repointed({ user: "readonly" })).not.toBe(connectionIdentity(CONNECTION));
     expect(repointed({ agentUser: "agent_ro" })).not.toBe(connectionIdentity(CONNECTION));
+  });
+
+  test("a different auth database is a different identity, because it is a different user record", () => {
+    // MongoDB looks the user up in the database `authSource` names, so the same name
+    // against `admin` and against the data database is two principals with two catalog
+    // views - the same reason the role fields are keyed.
+    expect(repointed({ authSource: "admin" })).not.toBe(connectionIdentity(CONNECTION));
   });
 
   test("a rotated password is the SAME identity, because it is not which database this is", () => {

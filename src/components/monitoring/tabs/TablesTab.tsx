@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
-import { Table2, Search, AlertTriangle, Loader2, RefreshCw, Zap, type LucideIcon } from "lucide-react";
+import { Table2, Search, TriangleAlert, LoaderCircle, RefreshCw, Zap, type LucideIcon } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -9,6 +9,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import type { MaintenanceType, MonitoringData, ProviderCapabilities } from "@/lib/db/types";
+import { PanelUnavailable } from "../PanelUnavailable";
 
 /**
  * The per-row maintenance controls this tab can render, each keyed to the
@@ -122,6 +123,13 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
   const totalSize = tables.reduce((sum, t) => sum + t.totalSizeBytes, 0);
   const tablesNeedingVacuum = tables.filter((t) => (t.bloatRatio ?? 0) > 10).length;
 
+  // A panel whose read failed is absent from the payload with its own message under
+  // `errors`, and that is a different fact from an empty answer: rendering it as data
+  // would claim a measurement the engine refused to make. The whole-dashboard error state
+  // is not right either - the other panels answered - so this panel alone carries the
+  // engine's own sentence. See MonitoringData in src/lib/db/types.ts.
+  const tablesUnavailable = data?.tables === undefined ? data?.errors?.tables : undefined;
+
   // ABSENCE and ZERO are different inputs — the rule #448 settled for StorageTab, which
   // this panel was still breaking one component over. A provider that publishes no table
   // statistics answers `[]` (Apache Cassandra's `getTableStats` returns an empty array as
@@ -133,7 +141,7 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
   // knows about but reports no statistics for means the figures are not knowable, so the
   // cards say so rather than publishing a confident zero the engine never measured. A
   // provider that reports a genuine 0 keeps today's arithmetic and today's rendering.
-  const statsAbsent = tables.length === 0 && (data?.overview.tableCount ?? 0) > 0;
+  const statsAbsent = tablesUnavailable !== undefined || (tables.length === 0 && (data?.overview?.tableCount ?? 0) > 0);
 
   // Whether the engine HAS vacuum is a capability question, not a data question, so it is
   // read from what the provider declares instead of inferred from the rows. Cassandra
@@ -190,7 +198,7 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
         <Card className="p-0">
           <CardHeader className="flex flex-row items-center justify-between space-y-0 p-2 sm:p-4 pb-1 sm:pb-2">
             <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Vacuum</CardTitle>
-            <AlertTriangle
+            <TriangleAlert
               className={`h-3 w-3 sm:h-4 sm:w-4 ${vacuumIconClass(vacuumStateKnown, tablesNeedingVacuum)}`}
             />
           </CardHeader>
@@ -222,7 +230,9 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
           </div>
         </CardHeader>
         <CardContent className="p-0 sm:p-4 sm:pt-0">
-          {filteredTables.length === 0 ? (
+          {tablesUnavailable ? (
+            <PanelUnavailable message={tablesUnavailable} />
+          ) : filteredTables.length === 0 ? (
             <div className="text-center py-8 text-muted-foreground">
               <Table2 strokeWidth={1.5} className="h-8 w-8 mx-auto mb-2 opacity-50" />
               <p className="text-xs">{statsAbsent ? "No table statistics available." : "No tables found."}</p>
@@ -292,7 +302,7 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
                                 title={label}
                               >
                                 {actionLoading === `${type}-${table.tableName}` ? (
-                                  <Loader2 strokeWidth={1.5} className="h-3 w-3 animate-spin" />
+                                  <LoaderCircle strokeWidth={1.5} className="h-3 w-3 animate-spin" />
                                 ) : (
                                   <Icon strokeWidth={1.5} className="h-3 w-3" />
                                 )}

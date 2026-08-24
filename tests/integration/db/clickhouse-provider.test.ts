@@ -414,6 +414,7 @@ describe("ClickHouseProvider metadata", () => {
       supportsExternalQueryLimiting: true,
       supportsCreateTable: false,
       supportsInlineRowEdit: false,
+      supportsTransactions: false,
       declaresForeignKeys: false,
       supportsMaintenance: true,
       maintenanceOperations: ["optimize", "analyze", "kill"],
@@ -452,6 +453,17 @@ describe("ClickHouseProvider metadata", () => {
     expect(labels.vacuumAction).toBe("Optimize Table");
     expect(labels.vacuumGlobalDesc).toContain("OPTIMIZE");
     expect(labels.analyzeGlobalDesc).toContain("no ANALYZE");
+  });
+
+  // Until #U12 the monitoring Queries panel told a ClickHouse operator to install a
+  // PostgreSQL extension. `getSlowQueries()` reads system.query_log, which records
+  // nothing while `log_queries` is off, so that is the setting the sentence must name.
+  test("names system.query_log, not a Postgres extension, as where query stats come from", () => {
+    const { slowQueriesEmptyState } = new ClickHouseProvider(makeConnection()).getLabels();
+
+    expect(slowQueriesEmptyState).toContain("system.query_log");
+    expect(slowQueriesEmptyState).toContain("log_queries");
+    expect(slowQueriesEmptyState).not.toContain("pg_stat_statements");
   });
 });
 
@@ -1469,8 +1481,8 @@ describe("ClickHouseProvider monitoring", () => {
     expect(data.tables).toEqual([]);
     expect(data.indexes).toEqual([]);
     expect(data.storage).toEqual([]);
-    expect(data.performance.cacheHitRatio).toBe(0);
-    expect(data.overview.version).toBe("unknown");
+    expect(data.performance?.cacheHitRatio).toBe(0);
+    expect(data.overview?.version).toBe("unknown");
   });
 
   test("a monitoring failure that is not a denial propagates, so no panel hides a bug", async () => {

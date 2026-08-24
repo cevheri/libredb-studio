@@ -215,6 +215,21 @@ const TYPED_PAGE =
   '"data":[[1,"1.5","x","2020-01-01","2020-01-01 10:00:00.000",null,[1,2],{"k":"v"},[1,"a"],"1.23",true,"AQI="]],' +
   `"stats":${FINISHED_STATS},"warnings":[]}`;
 
+/**
+ * `SELECT CAST(9223372036854775807 AS BIGINT) hi, CAST(-9223372036854775807 AS BIGINT) - 1 lo,
+ * 42 safe, CAST(1.5 AS DOUBLE) d`, captured 2026-08-22.
+ *
+ * The two wide values are the BIGINT range's own endpoints, which is where the
+ * rounding shows; `safe` and `d` are here to prove the pass leaves everything it
+ * does not have to touch alone. The declaration is verbatim too, because it is the
+ * proof that the server called these `bigint` and still sent them UNQUOTED.
+ */
+const WIDE_INTEGER_PAGE =
+  `{"id":"${QUERY_ID}","columns":[{"name":"hi","type":"bigint"},{"name":"lo","type":"bigint"},` +
+  '{"name":"safe","type":"integer"},{"name":"d","type":"double"}],' +
+  '"data":[[9223372036854775807,-9223372036854775808,42,1.5]],' +
+  `"stats":${FINISHED_STATS},"warnings":[]}`;
+
 /** `SELEKT 1`. HTTP 200, `state: FAILED`, the fault inside the document. */
 const SYNTAX_FAILURE_PAGE =
   `{"id":"${QUERY_ID}","infoUri":"${INFO_URI}","stats":${FAILED_STATS},"error":{"message":` +
@@ -344,6 +359,79 @@ describe("TrinoHttpTransport request", () => {
     expect(firstCall().body).toBe("SELECT version()");
     expect(firstCall().headers["content-type"]).toBe("text/plain");
     expect(firstCall().headers.accept).toBe("application/json");
+  });
+
+  /**
+   * D5, measured on 476: `SELECT 1;` answers `SYNTAX_ERROR, line 1:9: mismatched
+   * input ';'` where `SELECT 1` succeeds, and Trino is the only engine this product
+   * ships that refuses the terminator. So the two statements below have to reach the
+   * wire as the SAME bytes - asserted against the literal rather than against each
+   * other, because two calls that both stripped the whole statement would agree.
+   */
+  test("drops the terminator Trino refuses, so a statement written with one still runs", async () => {
+    await makeTransport().query("SELECT 1;");
+
+    expect(firstCall().body).toBe("SELECT 1");
+  });
+
+  test("sends a statement written without a terminator unchanged", async () => {
+    await makeTransport().query("SELECT 1");
+
+    expect(firstCall().body).toBe("SELECT 1");
+  });
+
+  // A statement pasted out of a file carries the newline the file ended with, and
+  // the engine refuses that exactly as it refuses the bare semicolon.
+  test("counts whitespace and a newline after the terminator as trailing", async () => {
+    await makeTransport().query("SELECT 1 ;\n");
+
+    expect(firstCall().body).toBe("SELECT 1");
+  });
+
+  /**
+   * Deliberately NOT a splitter: this endpoint takes exactly one statement, so two
+   * of them must keep failing the way the engine already fails them. Stripping here
+   * would send `SELECT 1; SELECT 2` and turn the engine's own SYNTAX_ERROR into a
+   * silently truncated answer.
+   */
+  test("leaves two statements alone, because the endpoint takes exactly one", async () => {
+    await makeTransport().query("SELECT 1; SELECT 2");
+
+    expect(firstCall().body).toBe("SELECT 1; SELECT 2");
+  });
+
+  // The semicolon that is not a terminator: inside a comment it is prose, inside a
+  // literal it is data, and a doubled one is a second, empty statement the engine
+  // has to refuse. Every statement here ENDS with `;`, which is what a
+  // `replace(/;$/, "")` would have cut out of the middle of the text.
+  test.each([
+    ["a trailing line comment", "SELECT 1 -- done;"],
+    ["a doubled terminator, which is a second empty statement", "SELECT 1;;"],
+    // `spans.ts` cannot say where an unterminated literal ends, so nothing here may
+    // decide that this `;` is outside it.
+    ["an unterminated literal", "SELECT 'oops;"],
+  ])("leaves a semicolon inside %s untouched", async (_label, sql) => {
+    await makeTransport().query(sql);
+
+    expect(firstCall().body).toBe(sql);
+  });
+
+  // Both at once: the literal's own semicolon is data the statement needs and the
+  // last one is the terminator the engine refuses, three characters apart.
+  test("drops the terminator without touching a semicolon inside a literal", async () => {
+    await makeTransport().query("SELECT ';';");
+
+    expect(firstCall().body).toBe("SELECT ';'");
+  });
+
+  // The declared limit of the strip, asserted rather than left to be discovered: a
+  // terminator with a COMMENT after it is trailing trivia to a reader and not to
+  // `readStatementEnd`, which reports the whole run. The statement keeps failing on
+  // 476, the same way it does today - this is a strip, not a rewriter.
+  test("leaves a terminator that has a comment after it, which the engine still refuses", async () => {
+    await makeTransport().query("SELECT 1; -- done\n");
+
+    expect(firstCall().body).toBe("SELECT 1; -- done\n");
   });
 
   // Every header the coordinator recognises is generated from the descriptor's
@@ -620,6 +708,34 @@ describe("TrinoHttpTransport result", () => {
     });
     expect(result.columnTypes?.dec).toBe("decimal(3, 2)");
     expect(result.columnTypes?.r).toBe("row(x integer, y varchar)");
+  });
+
+  /**
+   * A DECIMAL is safe because the server quotes it. A BIGINT is not: it arrives as
+   * an UNQUOTED JSON number, and `JSON.parse` has no exact form for an integer
+   * wider than 2^53 - it rounds one silently, with no error to catch. Measured on
+   * 2026-08-22: `9223372036854775807` written into `memory` and read back through
+   * this transport returned 9223372036854776000, so a value the database held
+   * correctly reached the grid wrong.
+   *
+   * ClickHouse escapes this with a server-side setting
+   * (`output_format_json_quote_64bit_integers`, #264) and Trino has no counterpart,
+   * which leaves the raw text as the only place to fix it - the same position Druid
+   * is in, and the reason `quoteUnsafeIntegers` (#265) lives in `db/utils` rather
+   * than inside one provider. Both endpoints come back as STRINGS for that reason;
+   * anything a double can hold exactly is left as a number.
+   */
+  test("keeps a 64-bit integer exact instead of letting JSON.parse round it", async () => {
+    sequence(WIDE_INTEGER_PAGE);
+
+    const result = await makeTransport().query("SELECT ...");
+
+    expect(result.rows[0]).toEqual({
+      hi: "9223372036854775807",
+      lo: "-9223372036854775808",
+      safe: 42,
+      d: 1.5,
+    });
   });
 
   test("reports the coordinator's own execution numbers", async () => {

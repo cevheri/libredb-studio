@@ -15,13 +15,29 @@
 </p>
 
 <p align="center">
+  Listed by the PostgreSQL project:
+  <a href="https://www.postgresql.org/about/news/libredb-studio-an-open-source-self-hosted-sql-ide-for-postgresql-in-the-browser-3368/">News</a>
+  ·
+  <a href="https://www.postgresql.org/download/products/1/">Software Catalogue</a>
+  ·
+  <a href="https://wiki.postgresql.org/wiki/Community_Guide_to_PostgreSQL_GUI_Tools#LibreDB_Studio">Community Guide to GUI Tools</a>
+</p>
+<p align="center">
+  Also listed in official
+  <a href="https://redis.io/docs/latest/develop/tools/#libredb-studio">Redis</a>,
+  <a href="https://clickhouse.com/docs/integrations/connectors/tools/gui#libredb-studio">ClickHouse</a>
+  and
+  <a href="https://druid.apache.org/libraries">Apache Druid</a>
+  docs
+</p>
+
+<p align="center">
   <img src="public/screenshots/hero-demo.gif" alt="Opening a table, running a join, charting the result and reading the ER diagram in LibreDB Studio" width="100%" />
 </p>
 
 <p align="center">
   <a href="https://github.com/libredb/libredb-studio"><img src="https://img.shields.io/github/stars/libredb/libredb-studio?style=social" alt="GitHub stars"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
-  <a href="https://app.fossa.com/projects/git%2Bgithub.com%2Flibredb%2Flibredb-studio?ref=badge_shield"><img src="https://app.fossa.com/api/projects/git%2Bgithub.com%2Flibredb%2Flibredb-studio.svg?type=shield" alt="FOSSA Status"></a>
   <a href="https://sonarcloud.io/project/overview?id=libredb_libredb-studio"><img src="https://sonarcloud.io/api/project_badges/measure?project=libredb_libredb-studio&metric=alert_status" alt="Quality Gate"></a>
   <a href="#testing"><img src="https://img.shields.io/badge/coverage-100%25-brightgreen" alt="Coverage 100%"></a>
   <a href="https://deepwiki.com/libredb/libredb-studio"><img src="https://img.shields.io/badge/Docs-DeepWiki-blue?logo=gitbook" alt="DeepWiki Docs"></a>
@@ -46,7 +62,7 @@
 
 ## Quick Start
 
-Run a full SQL IDE in one command — no clone, no build:
+Run a full SQL IDE in one command, no clone, no build:
 
 ```bash
 # Docker (recommended)
@@ -56,7 +72,7 @@ docker run -p 3000:3000 ghcr.io/libredb/libredb-studio:latest
 npx @libredb/studio
 ```
 
-Then open **http://localhost:3000** — on first run the admin password is printed to the log (zero-config).
+Then open **http://localhost:3000**. On first run, the admin password is printed to the log (zero-config).
 
 > Need Helm, Homebrew, Snap, winget, or deb/rpm? See [all install options](#getting-started).
 
@@ -86,15 +102,15 @@ Fourteen engines share one interface — PostgreSQL, MySQL, Oracle, SQL Server, 
 And nothing is held back. Single sign-on, ER diagrams, the AI features and the NoSQL engines all ship in the MIT build. MIT is not generosity here, it is a requirement of the architecture: you cannot place a per-seat licensed, feature-gated tool into every environment you own.
 
 ### Why LibreDB Studio?
-- **Deploys next to the data**: container, Helm chart, OpenShift operator, one-click PaaS template, or embedded via npm.
-- **Fourteen engines, one interface**: PostgreSQL, MySQL, Oracle, SQL Server, SQLite, MongoDB, Redis, Couchbase, ClickHouse, Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra.
-- **Runs where you are**: browser, phone, Windows, Linux desktop.
-- **A read-only agent, with your own model**: state a question, and the run drafts SQL, reads the results and writes a report whose claims cite them. Gemini, OpenAI, or a local Ollama.
-- **Nothing behind a wall**: RBAC, OIDC single sign-on, query audit trail and ER diagrams all ship under MIT.
+- **Deploys next to the data**: container, Helm chart, Rancher, OpenShift operator, one-click PaaS template, or embedded via npm.
+- **Fourteen engines, one interface**: PostgreSQL, MySQL, Oracle, SQL Server, SQLite, MongoDB, Redis, Couchbase, ClickHouse, Druid, Elasticsearch, OpenSearch, Trino, Cassandra.
+- **Runs where you are**: browser, phone, Windows, MacOS, Linux desktop.
+- **A read-only agent, with your own model**: state a question, and the run drafts SQL, reads the results, and writes a report whose claims cite them. Gemini, OpenAI, or a local Ollama with open-source models.
+- **Nothing behind a wall**: RBAC, OIDC single sign-on, query audit trail, and ER diagrams all ship under MIT.
 
 <p align="center">
   <img src="public/screenshots/connection-modal.png" alt="Multi-Database Connection Manager" width="100%" />
-  <br/><em>Connect to PostgreSQL, MySQL, Oracle, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Redis, or SQLite with SSL/TLS and SSH Tunnel support.</em>
+  <br/><em>Connect to PostgreSQL, MySQL, Oracle, SQL Server, MongoDB, Couchbase, ClickHouse, Druid, Elasticsearch, OpenSearch, Trino, Cassandra, Redis, or SQLite with SSL/TLS and SSH Tunnel support.</em>
 </p>
 
 ---
@@ -121,9 +137,9 @@ And nothing is held back. Single sign-on, ER diagrams, the AI features and the N
 
 ### The Database Agent
 
-Studio's main AI surface is an **agent rail** beside the editor — the model-backed helpers listed
-below it are the others. You state an objective — *"which department has the most employees?"*, *"why
-is this query slow?"* — and press Start. The run drafts SQL against the connected database, reads
+Studio's main AI surface is an **agent rail** beside the editor; the model-backed helpers listed
+below it are the others. You state an objective: *"which department has the most employees?"*, *"why
+is this query slow?"*; and press Start. The run drafts SQL against the connected database, reads
 what comes back, and finishes by composing a report whose every claim cites the result it came from.
 
 - **Read-only, enforced by the database rather than by a parser.** Every statement the agent runs
@@ -136,7 +152,7 @@ what comes back, and finishes by composing a report whose every claim cites the 
   (`src/app/api/db/query/route.ts:44`) and are neither policy-checked nor audited this way.
 - **Agent mode reads PostgreSQL and SQLite only.** The read-only profile is database-native, so it
   exists only where a provider implements it — `queryReadOnly` on `postgres.ts:870` and
-  `sqlite.ts:397`, and nowhere else. On any other engine an Agent-mode run ends `engine-unsupported`
+  `sqlite.ts:397`, and nowhere else. On any other engine, an Agent-mode run ends `engine-unsupported`
   (`src/lib/agent/runtime.ts:199`). **Plan** mode opens on every connection — the model there is
   toolless, runs no statement of yours, writes nothing, and drafts a statement for you to run
   yourself. Its GROUNDING reaches every engine: on PostgreSQL and SQLite the server composes catalog
@@ -153,11 +169,11 @@ what comes back, and finishes by composing a report whose every claim cites the 
 - **Bounded, and the meter is on screen**: 20 statements, 60 s of database time, 200 rows per read,
   a 5-minute run deadline.
 - **Your own model.** Gemini (the default), OpenAI, Ollama, or any OpenAI-compatible endpoint.
-  **Agent** mode needs a model that can call tools — on Ollama a live probe, not the vendor's page,
+  **Agent** mode needs a model that can call tools — on Ollama, a live probe, not the vendor's page,
   is what establishes that, and the guide says how to run one. **Plan** mode needs no tools and is
   never probed (`src/lib/agent/capability-gate.ts:74`), so a model refused for Agent mode can still
   be used in Plan mode, which is what the rail offers you.
-- **No model configured, no AI.** With no `LLM_*` settings at all the rail does not render and
+- **No model configured, no AI.** With no `LLM_*` settings at all, the rail does not render, and
   nothing leaves your network. Note that a key is not the switch: Ollama and a custom endpoint count
   as a configured model without one, and then the AI is on. What the agent sends is
   [`docs/AGENT_DATA_FLOW.md`](docs/AGENT_DATA_FLOW.md).
@@ -169,11 +185,11 @@ Standalone application only: the embedded `@libredb/studio` package carries no a
 [`docs/llms/`](docs/llms/README.md)
 
 ### Model-backed helpers
-- **Universal LLM Support**: Defaults to Gemini 2.5 Flash, and serves OpenAI, Ollama and any OpenAI-compatible endpoint (LM Studio, LiteLLM, vLLM).
+- **Universal LLM Support**: Defaults to Gemini and serves OpenAI, Ollama, and any OpenAI-compatible endpoint (LM Studio, LiteLLM, vLLM).
 - **Query Safety Analysis**: AI-powered pre-execution risk assessment for destructive queries (DELETE, DROP, TRUNCATE).
 - **AI Query Explainer**: EXPLAIN plans translated into plain language with optimization suggestions.
 - **Schema Awareness**: the connected database's schema is sent as context, so an explanation names your own tables and columns.
-- **Data Profiler summary**: the profiler's per-column statistics written up in prose. That context carries each column's `min` and `max`, which are real values out of your data — see [Agent Data Flow](docs/AGENT_DATA_FLOW.md).
+- **Data Profiler summary**: the profiler's per-column statistics written up in prose. That context carries each column's `min` and `max`, which are real values from your data; see [Agent Data Flow](docs/AGENT_DATA_FLOW.md).
 
 ### Pro Data Management
 - **Universal Data Grid**: Virtualized rendering (TanStack) for millions of rows.
@@ -190,7 +206,7 @@ Standalone application only: the embedded `@libredb/studio` package carries no a
 
 ### Display Masking (Preview)
 - **Client-Side Display Layer**: Masks sensitive values in the browser UI — useful for screen sharing, demos, and reducing accidental on-screen exposure. **Not server-enforced**; query API responses still contain full values for authenticated users.
-- **Column-Name Pattern Matching**: 10 built-in patterns (email, phone, credit card, SSN, password, IP, date, financial, and more) match **result column headers** by regex. Works when the output name matches (e.g. `SELECT salary`). Aliases (`salary AS x`) and aggregates (`SUM(salary)`) are not masked today.
+- **Column-Name Pattern Matching**: 10 built-in patterns (email, phone, credit card, SSN, password, IP, date, financial, and more) match **result column headers** by regex. Works when the output name matches (e.g., `SELECT salary`). Aliases (`salary AS x`) and aggregates (`SUM(salary)`) are not masked today.
 - **Configurable Rules**: Admin panel to add, edit, enable/disable masking patterns. Custom patterns with regex support. Settings stored per-browser in localStorage.
 - **RBAC UI Controls**: User role cannot toggle or reveal masked cells in the UI. Admin role can toggle masking and temporarily reveal individual cells (10s auto-hide).
 - **Export & Clipboard**: CSV, JSON, and SQL INSERT exports use masked display values when masking is active in the UI. This does not prevent access to raw data via the API, browser DevTools, or admin reveal.
@@ -213,11 +229,11 @@ Standalone application only: the embedded `@libredb/studio` package carries no a
 </p>
 
 ### Authentication & SSO
-- **Dual Auth Modes**: Local email/password login or OpenID Connect (OIDC) Single Sign-On — switchable via environment variable.
+- **Dual Auth Modes**: Local email/password login or OpenID Connect (OIDC) Single Sign-On; switchable via environment variable.
 - **Vendor-Agnostic OIDC**: Works with any OIDC-compliant provider — Auth0, Keycloak, Okta, Azure AD, Zitadel, Google, and more.
 - **PKCE Security**: Authorization Code Flow with Proof Key for Code Exchange (S256) for secure authentication.
 - **Auto Role Mapping**: Configurable claim-based role mapping with dot-notation for nested claims (e.g., `realm_access.roles`).
-- **Provider Logout**: Logout clears both local JWT session and identity provider session.
+- **Provider Logout**: Logout clears both the local JWT session and identity provider session.
 
 ### DBA Maintenance Toolkit (Admin Only)
 - **Live Monitoring Dashboard**: 7-tab monitoring with Overview, Performance, Queries, Sessions, Tables, Storage, and Connection Pool views.
@@ -249,9 +265,9 @@ Standalone application only: the embedded `@libredb/studio` package carries no a
 | **Apache Cassandra** | `cassandra-driver` (pure JS, no native module) | CQL IDE over the native protocol (port 9042), keyspace browser marking partition and clustering keys, `system_views` overview, uptime and running statements. No EXPLAIN (the keyword is not in CQL), no cancellation (the protocol has none), no maintenance (every operation is a `nodetool` action), and **no row counts or sizes**: the only figures Cassandra publishes are partition estimates from flushed files and whole mebibytes, so neither is shown rather than shown wrong |
 | **Redis** | `ioredis` | Command editor, key browser, INFO-based monitoring |
 
-> **Eighteen more engines have no driver of their own.** The fourteen above are the drivers this build ships. Eighteen further engines speak one of those wire protocols and connect through an existing driver unchanged, so fourteen drivers reach thirty-two named engines in all. They are MariaDB, TiDB, Vitess, StarRocks, OceanBase, SingleStore, Citus, TimescaleDB, YugabyteDB, AlloyDB Omni, Apache Cloudberry (incubating), CockroachDB, Materialize and RisingWave (as PostgreSQL or MySQL), Valkey, DragonflyDB and KeyDB (as Redis), and FerretDB (as MongoDB). Each was measured against a live instance, and how much of the product works differs per engine. MariaDB, TiDB, Vitess, AlloyDB Omni, Citus, TimescaleDB, YugabyteDB, Valkey, DragonflyDB, KeyDB and FerretDB behave as their driver's own engine, though three of them report statistics you should not trust: a Citus distributed table and a TimescaleDB hypertable report row counts and sizes that are wrong rather than missing, and YugabyteDB reports 0 until you run `ANALYZE`. Vitess is not one of those three, its row counts and sizes being exact to the byte, but a running query cannot be cancelled there: vtgate refuses `KILL QUERY` and the statement runs to completion. AlloyDB Omni is not one of them either, reporting 2000 rows for 2000 and 270336 bytes for 270336, but two things there surprise: `version()` names AlloyDB nowhere, so the version panel cannot be told apart from a stock PostgreSQL 17, and eight of AlloyDB's own `google_ml` tables list in the object browser, which any role that can connect at all may also read. StarRocks reports itself as MySQL 5.1 and loses the overview, health, session and monitoring panels; Cloudberry loses the monitoring dashboard and its table and index statistics, all three to one MPP planner restriction, and reads a foreign key back as though it were enforced when it is not, though its row counts are correct; CockroachDB loses the object browser and the size panels; OceanBase answers fourteen of the fifteen surfaces but only twelve of them usefully, health failing outright because its tenant has no `performance_schema` database at all and every size reading 0 B, though its row counts are correct once `ANALYZE TABLE` has run; SingleStore loses five surfaces to a cause that is ours rather than its own - the provider sends every statement through the prepared-statement protocol, which SingleStore refuses for the `SHOW` and `EXPLAIN` statements four panels need - and its numbers are missing rather than wrong, a 2000-row table reading 0 rows and 0 B with no `ANALYZE` able to change it; Materialize and RisingWave are query-editor-only. The per-engine detail, with the exact version probed, is in [`docs/providers/README.md`](docs/providers/README.md#wire-compatible-engines) — we publish a name only after connecting to it, so a name absent there is untested rather than unsupported.
+> **Nineteen more engines have no driver of their own.** The fourteen above are the drivers this build ships. Nineteen further engines speak one of those wire protocols and connect through an existing driver unchanged, so fourteen drivers reach thirty-three named engines in all. They are MariaDB, TiDB, Vitess, StarRocks, OceanBase, SingleStore, Citus, TimescaleDB, YugabyteDB, AlloyDB Omni, Apache Cloudberry (incubating), CockroachDB, Materialize and RisingWave (as PostgreSQL or MySQL), Valkey, DragonflyDB and KeyDB (as Redis), FerretDB (as MongoDB), and ScyllaDB (as Cassandra). Each was measured against a live instance, and how much of the product works differs per engine. MariaDB, TiDB, Vitess, AlloyDB Omni, Citus, TimescaleDB, YugabyteDB, Valkey, DragonflyDB, KeyDB and FerretDB behave as their driver's own engine, though three of them report statistics you should not trust: a Citus distributed table and a TimescaleDB hypertable report row counts and sizes that are wrong rather than missing, and YugabyteDB reports 0 until you run `ANALYZE`. Vitess is not one of those three, its row counts and sizes being exact to the byte, but a running query cannot be cancelled there: vtgate refuses `KILL QUERY` and the statement runs to completion. AlloyDB Omni is not one of them either, reporting 2000 rows for 2000 and 270336 bytes for 270336, but two things there surprise: `version()` names AlloyDB nowhere, so the version panel cannot be told apart from a stock PostgreSQL 17, and eight of AlloyDB's own `google_ml` tables list in the object browser, which any role that can connect at all may also read. StarRocks reports itself as MySQL 5.1 and loses the overview, health, session and monitoring panels; Cloudberry loses the monitoring dashboard and its table and index statistics, all three to one MPP planner restriction, and reads a foreign key back as though it were enforced when it is not, though its row counts are correct; CockroachDB loses the object browser and the size panels; OceanBase answers fourteen of the fifteen surfaces but only twelve of them usefully, health failing outright because its tenant has no `performance_schema` database at all and every size reading 0 B, though its row counts are correct once `ANALYZE TABLE` has run; SingleStore loses five surfaces to a cause that is ours rather than its own - the provider sends every statement through the prepared-statement protocol, which SingleStore refuses for the `SHOW` and `EXPLAIN` statements four panels need - and its numbers are missing rather than wrong, a 2000-row table reading 0 rows and 0 B with no `ANALYZE` able to change it; ScyllaDB loses five surfaces and Test Connection with them, all six to one absent keyspace - the overview, health, performance-metrics, active-session and monitoring panels read Cassandra's `system_views` virtual tables and ScyllaDB has no `system_views` keyspace at all - and the dialog will not even save the connection, Establish Connection being gated on that same failing test, so it has to be seeded or admin-managed today - while the editor and the object browser work in full, every one of 18 CQL types reading back byte-identically to the Cassandra 5.0.9 probed in the same pass; Materialize and RisingWave are query-editor-only. The per-engine detail, with the exact version probed, is in [`docs/providers/README.md`](docs/providers/README.md#wire-compatible-engines) — we publish a name only after connecting to it, so a name absent there is untested rather than unsupported.
 
-> **Transport security is cross-cutting, not per engine.** The SSH tunnel is opened before the provider connects and the connection is rewritten to the local endpoint, so it is provider-independent: it applies to any connection configured with a host and a port. A connection entered as a connection string instead (an option for MongoDB, Couchbase and ClickHouse) carries neither, so it is not tunnelled; SQLite has neither either. The SSL/TLS panel is honoured by PostgreSQL, MySQL, SQL Server, Couchbase, ClickHouse, Druid, Elasticsearch, OpenSearch and Trino — and on Trino it is load-bearing rather than optional, because the coordinator refuses a password over plain HTTP. Oracle, MongoDB and Redis ignore that setting, so on those three encryption depends on what the connection string itself asks for rather than on what the dialog shows.
+> **Transport security is cross-cutting, not per engine.** The SSH tunnel is opened before the provider connects and the connection is rewritten to the local endpoint, so it is provider-independent: it applies to any connection configured with a host and a port. A connection entered as a connection string instead (an option for MongoDB, Couchbase and ClickHouse) carries neither, so it is not tunnelled; SQLite has neither either. The SSL/TLS panel is honoured by every engine that shows it — which is every engine except the two file-based ones, SQLite and the embedded LibreDB, where no transport exists to secure and no panel is offered. On Trino it is load-bearing rather than optional, because the coordinator refuses a password over plain HTTP. Oracle is the one engine whose mapping carries a caveat worth stating up front: its Thin driver always verifies the certificate chain, so `require` needs the server's CA supplied when that certificate is self-signed, and a connect string pasted whole keeps whatever protocol it names.
 
 > All SQL databases share: schema explorer, ER diagrams, schema diff & migration, display masking (preview), monitoring dashboard, and connection string import. Druid, Elasticsearch, OpenSearch and Trino are each the exception twice over: their HTTP SQL APIs have no URI convention this build can parse, so they are configured by host and port only, and a generated migration names the limitation instead of emitting column-modification DDL against an engine whose SQL contains none — as it also does for Couchbase's schemaless collections. An ER diagram over a search cluster draws boxes and no edges: an index declares no foreign keys and the engine's model has none to declare, which the provider states as `declaresForeignKeys: false` rather than leaving to be guessed from an empty list.
 

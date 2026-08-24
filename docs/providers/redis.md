@@ -14,6 +14,7 @@
 | **Query language** | `json` (plain command **or** JSON command object) |
 | **Default port** | `6379` |
 | **Connection pooling** | None — single lazy connection |
+| **SSL** | Yes — `connection.ssl` → ioredis `tls` ([§4.3](#43-ssl--tls)) |
 | **Source** | [`src/lib/db/providers/keyvalue/redis.ts`](../../src/lib/db/providers/keyvalue/redis.ts) |
 | **Tests** | [`tests/integration/db/redis-provider.test.ts`](../../tests/integration/db/redis-provider.test.ts) |
 | **Tracking issue** | [#7 — Implement Redis Provider](https://github.com/libredb/libredb-studio/issues/7) |
@@ -228,6 +229,7 @@ Redis uses the discrete-field form of `DatabaseConnection` (not `connectionStrin
 | `port` | — | Defaults to `6379` |
 | `password` | — | Sent as `password`; omit for unauthenticated instances |
 | `database` | — | Logical DB index, parsed as int; defaults to `0` |
+| `ssl` | — | `SSLConfig`; becomes the ioredis `tls` option ([§4.3](#43-ssl--tls)) |
 
 ```ts
 const connection = {
@@ -250,6 +252,48 @@ discrete fields. However, the UI connection-string parser
 recognise `redis://` and `rediss://` URLs and **decomposes** them into `host` / `port` (default
 `6379`) / `password` / `database` before they reach the provider. So a user can paste a
 `redis://:pw@host:6379/0` URL into the modal, but the provider never sees the raw string.
+
+Because the raw string is dropped, the scheme's TLS intent has to travel as a field: the parser
+returns `sslMode: 'require'` for `rediss://` and `sslMode: 'disable'` for `redis://`, which the
+connection form applies to the SSL panel ([§4.3](#43-ssl--tls)). Both arms are explicit on purpose -
+a paste overwrites the form rather than merging into it, so pasting a plaintext URL clears a
+`require` left over from a previous edit.
+
+### 4.3 SSL / TLS
+
+`buildTLSOptions()` ([`redis.ts:156`](../../src/lib/db/providers/keyvalue/redis.ts)) maps
+`connection.ssl` onto the single `tls` option ioredis hands to `tls.connect`, so the material travels
+under Node's own names — the same mapping the PostgreSQL, MySQL and Couchbase adapters use:
+
+| `ssl.mode` | `tls` option |
+|------------|--------------|
+| absent / `disable` | **not present at all** — ioredis negotiates TLS whenever `tls` is set, `{}` included |
+| `require` | `{ rejectUnauthorized: false }` |
+| `verify-ca` / `verify-full` | `{ rejectUnauthorized: true }` |
+
+`caCert` / `clientCert` / `clientKey` become `ca` / `cert` / `key` when set, each independently — a
+server can demand mutual TLS while presenting a self-signed certificate itself. An explicit
+`ssl.rejectUnauthorized` always wins over the mode. `require` does not check the chain because a
+self-hosted Redis presents a self-signed certificate by default.
+
+Measured against a TLS-only server on 2026-08-23 (`redis:latest --port 0 --tls-port 6380`, so no
+plaintext port exists): `disable` is refused with *"Connection is closed."* and `require` connects in
+1ms. Both arms matter — before the mode reached the driver, `require` failed the same way `disable`
+does, so the pair is what distinguishes a wired path from a documented shape.
+
+> A pasted `rediss://` URL arrives with `mode: 'require'` and a `redis://` one with `disable`
+> ([§4.2](#42-connection-string-nuance)), so the scheme picks the mode and the panel is only needed
+> to go *further* than `require` - a verifying mode, or certificate material. `require` rather than
+> `verify-full` because that is what the ordinary `--tls-port` deployment can satisfy: a paste
+> encrypts, and never silently claims to have checked a chain.
+>
+> Measured through the parser and the provider together on 2026-08-23, against
+> `redis:latest --port 0 --tls-port 6390` with a self-signed certificate:
+>
+> ```text
+> rediss://localhost:6390 -> sslMode require | connected, PING = [{"result":"PONG"}] | 14ms
+> redis://localhost:6390  -> sslMode disable | FAILED: Failed to connect to Redis: Connection is closed.
+> ```
 
 ---
 
@@ -491,6 +535,7 @@ by no component (#427).
 | `supportsExternalQueryLimiting` | `false` |
 | `supportsCreateTable` | `false` |
 | `supportsInlineRowEdit` | `false` — Redis commands are not SQL, so there is no `UPDATE ... SET` for the results grid's inline editor to emit |
+| `supportsTransactions` | `false` — `MULTI`/`EXEC` exists in Redis and is not exposed through this provider, so the transaction trio and SANDBOX are not offered (#U13) |
 | `declaresForeignKeys` | `false` — Redis has no constraints at all, and the "tables" here are key prefixes this provider grouped rather than objects anyone declared |
 | `tablesAreDerivedGroupings` | `true` — `getSchema()` SCANs a bounded slice of the keyspace and groups the real key names it found by their prefix, so a `user:*` row is this server's own summary and not a key any command can be given. The agent layer states this to a plan run, in one sentence, so a grounded run does not draft a command against a grouping |
 | `supportsMaintenance` | `true` |
@@ -513,6 +558,27 @@ no longer reaches the schema explorer's per-row menu, which offers no maintenanc
 The labels rename actions that behave differently here, not generic ones wearing Redis names:
 *"Scan Keys"* really emits `SCAN`, and *"Generate Command"* really emits Redis commands (§5.3).
 That was not true before #427, when both emitted MongoDB documents under these labels.
+
+`statementLanguage` is the one label no person sees: the agent's plan contract states it verbatim to
+the model. Unlike MongoDB's, it is not about the language — a plan run on 2026-08-22 wrote real Redis
+commands — but about the **shape** they were packaged in:
+
+```
+1) KEYS session:*
+2) GET session:1
+```
+
+`executeRedisCommand` reads the whole body as **one** command (§5), so the server answered
+`ERR unknown command '1)'`. The label therefore names the two things that made it unrunnable — the
+list numbering and the second command — alongside the two accepted forms (plain and the lossless
+`{"command": …, "args": […]}`), and repeats in words what `tablesAreDerivedGroupings` says in a flag:
+a `prefix:*` row is this server's grouping, not a key, so a prefix is reached with `SCAN … MATCH`.
+
+`slowQueriesEmptyState` (*"Redis lists what SLOWLOG holds, and nothing has yet run slower than
+slowlog-log-slower-than."*) is the monitoring Queries panel's empty state. It exists for the same
+reason the `analyzeGlobal*` triad had to be read rather than merely declared (#427): that panel's
+sentence was hardcoded to PostgreSQL's `pg_stat_statements` advice on every engine
+(`docs/BACKLOG.md` U12), while what is empty here is the `SLOWLOG` (§7).
 
 `analyzeGlobalLabel` / `analyzeGlobalTitle` / `analyzeGlobalDesc` (*"Run Info"*, *"Server Info"*,
 *"Get Redis server information and statistics."*) are rendered by the admin Operations tab. The
@@ -565,8 +631,9 @@ Redis 6.0+ instance.
 The suite covers: validation, connect/disconnect, capabilities, labels, `prepareQuery`, all query
 formats (JSON, plain, empty, `HGETALL`, `INFO`, nil), error handling (malformed JSON, missing
 `command`, Redis-side error, disconnected provider), schema scanning, health, overview, performance,
-slow queries, active sessions, table/index/storage stats, `getMonitoringData`, maintenance, and a
-battery of common commands (`KEYS`, `SET`, `DEL`, `PING`, `DBSIZE`).
+slow queries, active sessions, table/index/storage stats, `getMonitoringData`, maintenance, a
+battery of common commands (`KEYS`, `SET`, `DEL`, `PING`, `DBSIZE`), and **every `ssl.mode` branch**
+asserted against the options object the `Redis` constructor received.
 
 ### 11.3 Run it
 
@@ -620,11 +687,11 @@ request/response contract.
 
 ## 13. Known limitations & future work
 
-- **TLS (`rediss://`) is parsed but not connected.** The connection-string parser recognises
-  `rediss://`, but it does not preserve the secure scheme, and `connect()` neither passes a `tls`
-  option to `ioredis` nor reads `config.ssl`. The provider always attempts a **plaintext**
-  connection, so a TLS-only endpoint will fail to connect rather than negotiate TLS. *Future:*
-  thread `config.ssl` into the `ioredis` constructor.
+- **A pasted `rediss://` URL selects `require`, not a verifying mode.** The parser carries the
+  scheme as `sslMode` ([§4.2](#42-connection-string-nuance)), so the paste is encrypted, but nothing
+  in a `rediss://` URL says whose certificate to trust - and the ordinary self-hosted `--tls-port`
+  node presents a self-signed one, which a verifying mode would refuse. Verification therefore stays
+  an explicit choice in the SSL panel; the URL alone never turns it on.
 - **No Cluster / Sentinel support.** Only a single standalone node is supported.
 - **`SCAN` is capped at 1000 keys** for schema discovery — prefixes that only appear beyond the cap
   won't show as "tables". This is a deliberate bound, not a bug.
