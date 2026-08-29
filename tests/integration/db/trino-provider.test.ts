@@ -515,6 +515,22 @@ afterEach(() => {
 // ============================================================================
 
 describe("TrinoProvider metadata", () => {
+  // #U9: the only operation Trino has is terminating a statement, and that needs the
+  // query id the Sessions panel lists - neither a table nor a whole database. So no
+  // maintenance control is offered anywhere, which is what the two `false`s say.
+  test("declares its one maintenance operation as neither per-table nor global", () => {
+    const caps = new TrinoProvider(makeConnection()).getCapabilities();
+
+    expect(caps.maintenanceOperationSpecs).toEqual({
+      kill: { label: "Terminate Query", perEntity: false, global: false },
+    });
+    expect(Object.keys(caps.maintenanceOperationSpecs ?? {}).sort()).toEqual([...caps.maintenanceOperations].sort());
+    // "Reclaim Space" and "Table Statistics" name nothing this engine can run, and
+    // both stay unshown because the operations behind them are undeclared - not
+    // because the wording is redirected anywhere.
+    expect(new TrinoProvider(makeConnection()).getLabels().vacuumActionOperation).toBeUndefined();
+    expect(caps.maintenanceOperations).toEqual(["kill"]);
+  });
   test("declares SQL on port 8080, with double-quoted identifiers and no statement terminator", () => {
     const capabilities = new TrinoProvider(makeConnection()).getCapabilities();
 
@@ -531,7 +547,7 @@ describe("TrinoProvider metadata", () => {
     expect(capabilities.declaresForeignKeys).toBe(false);
     expect(capabilities.supportsInlineRowEdit).toBe(false);
     // Trino has START TRANSACTION, but a transaction lives in an HTTP session header
-    // this provider does not carry between statements, so the trio is withheld (#U13).
+    // this provider does not carry between statements, so the trio is withheld (#464).
     expect(capabilities.supportsTransactions).toBe(false);
     // These rows are real tables, not groupings this server derived.
     expect(capabilities.tablesAreDerivedGroupings).toBeUndefined();
@@ -1051,6 +1067,22 @@ describe("TrinoProvider monitoring", () => {
     expect(overview.indexCount).toBe(0);
   });
 
+  test("states no size in bytes at all, rather than a zero that reads as a measurement", async () => {
+    const provider = await connectProvider();
+    const overview = await provider.getOverview();
+
+    // The KEY IS ABSENT, not undefined-valued and not zero. `databaseSizeBytes` is
+    // optional exactly so a provider with no byte figure to publish can omit it, and
+    // Trino has none: the bytes live in the systems its connectors reach, and
+    // `SHOW STATS` is a per-table logical estimate covering variable-width columns
+    // only. `toBeUndefined()` alone would pass for a `databaseSizeBytes: undefined`
+    // that still ships the key, so `in` is what pins the absence (docs/BACKLOG.md D44).
+    expect("databaseSizeBytes" in overview).toBe(false);
+    expect(overview.databaseSizeBytes).toBeUndefined();
+    // The string keeps saying the figure is unavailable; only the number is gone.
+    expect(overview.databaseSize).toBe("N/A");
+  });
+
   test("reports the cluster's own completed-query rate and invents no other metric", async () => {
     const provider = await connectProvider();
 
@@ -1097,10 +1129,79 @@ describe("TrinoProvider monitoring", () => {
 
   test("narrows the stats pass to one schema when asked", async () => {
     const provider = await connectProvider();
-    await provider.getTableStats({ schema: "sf1" });
+    // `sf1.customer` is the fixture's one table whose connector published no row count,
+    // so narrowing to that schema examines a table and gets nothing back - a refusal
+    // (D24), not an empty schema. The assertion here is about WHICH statements went out.
+    await expect(provider.getTableStats({ schema: "sf1" })).rejects.toThrow(/None of the 1 tables examined/);
 
     expect(sentAnything('SHOW STATS FOR "tpch"."tiny"')).toBe(false);
     expect(sentAnything('SHOW STATS FOR "tpch"."sf1"."customer"')).toBe(true);
+  });
+
+  /*
+    #515: the pass used to describe the first 25 tables of a bigger catalog and hand those
+    rows back as the reading. Nothing in `TableStats[]` or in `MonitoringData.tables`
+    could say more had been dropped, so the panel's count and the agent's `rowCount` both
+    read 25 for a catalog of any size. The provider now refuses the oversized scope, which
+    is why these two tests assert the same sentence in the two shapes it travels in: a
+    thrown `QueryError` for a direct caller, and `errors.tables` beside an absent panel for
+    the dashboard.
+
+    Live-verified 2026-08-27 against Trino 476 through this provider's own transport: the
+    real `tpch` holds 72 user tables and refuses, while `getTableStats({ schema: "tiny" })`
+    answers all 8 of them (lineitem 60175, nation 25) - a reading the catalog-wide pass
+    could never return, `tiny` sorting last behind 64 tables it never reached.
+  */
+  // The 72 in the shape it really has: the tpch connector publishes these nine schemas of
+  // the same eight tables, which is both where the number comes from and why the refusal
+  // can tell this caller that narrowing WILL work - every one of the nine is inside the
+  // bound. A catalog whose schemas are all oversized is told the opposite, in the unit
+  // tests, because there is no fixture shape that makes both sentences true at once.
+  const SEVENTY_TWO = ["tiny", "sf1", "sf100", "sf300", "sf1000", "sf3000", "sf10000", "sf30000", "sf100000"].flatMap(
+    (schema) =>
+      ["customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier"].map((table) => [
+        schema,
+        table,
+      ]),
+  );
+
+  test("a catalog bigger than one stats pass is refused with the number of tables it holds", async () => {
+    const provider = await connectProvider();
+    overrideSurface(trinoTableListSql(CATALOG), rows(TABLE_LIST_COLUMNS, SEVENTY_TWO));
+    sentSql = [];
+
+    await expect(provider.getTableStats()).rejects.toThrow(/Catalog "tpch" holds 72 tables/);
+    // Not one statement per table up to the bound either: the refusal is cheaper than the
+    // truncation it replaces, because the table list already answered the whole question.
+    expect(sentAnything("SHOW STATS FOR")).toBe(false);
+  });
+
+  test("the oversized table panel is ABSENT in the dashboard, carrying the size sentence", async () => {
+    const provider = await connectProvider();
+    overrideSurface(trinoTableListSql(CATALOG), rows(TABLE_LIST_COLUMNS, SEVENTY_TWO));
+    const data = await provider.getMonitoringData({ includeIndexes: false, includeStorage: false });
+
+    expect(data.tables).toBeUndefined();
+    expect(data.errors?.tables).toContain('Catalog "tpch" holds 72 tables');
+    // The advice reaches the dashboard intact, and it is the advice that is TRUE of this
+    // catalog: nine schemas, every one of them describable on its own.
+    expect(data.errors?.tables).toContain("which holds for 9 of the schemas this catalog's tables are in");
+    expect(data.overview).toBeDefined();
+  });
+
+  test("the refused table panel is ABSENT with its sentence while the rest of the dashboard answers", async () => {
+    // The whole point of the conversion: one panel that cannot be answered costs that
+    // panel and carries its reason, instead of rendering as a table of no rows.
+    const provider = await connectProvider();
+    const data = await provider.getMonitoringData({
+      schemaFilter: "sf1",
+      includeIndexes: false,
+      includeStorage: false,
+    });
+
+    expect(data.tables).toBeUndefined();
+    expect(data.errors?.tables).toContain("None of the 1 tables examined");
+    expect(data.overview).toBeDefined();
   });
 
   test("describes the catalogs as the storage, because that is where the data is", async () => {

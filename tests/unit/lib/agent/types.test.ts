@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { AGENT_TERMINAL_STATUSES } from "@/lib/agent/types";
 import { assertPersistableState } from "@/lib/agent/state-guard";
 import type {
   AgentArtifactReference,
@@ -62,6 +63,10 @@ const DATABASE_ERROR: AgentToolRefusal = {
   class: "database-error",
   statementFingerprint: "sha256-8e1b",
   message: 'column "totl" does not exist',
+  // The span the tracker charged this failed execution against `maxTotalRunMs`
+  // (#512). In the fixture rather than left out, because the shape a
+  // run written by this build produces is the one worth pinning.
+  elapsedMs: 31,
 };
 
 /**
@@ -71,6 +76,16 @@ const DATABASE_ERROR: AgentToolRefusal = {
  */
 const EVENTS: Record<AgentRunEvent["kind"], AgentRunEvent> = {
   "run-started": { kind: "run-started", atMs: 1, mode: "agent" },
+  // What drove a stretch of the run. The `operator` provenance is the fixture rather than
+  // `bundled` because it is the shape with fields to get wrong, and the one an operator's
+  // deployment actually writes.
+  "driver-resolved": {
+    kind: "driver-resolved",
+    atMs: 1,
+    modelId: "qwen3:8b",
+    provider: "ollama",
+    tuning: { origin: "operator", digest: "f".repeat(64) },
+  },
   // A call the server turned back, carrying the verifier's own name for what was missing.
   // `shortfall` is optional because the purpose-written notices answer conditions the
   // verifier has no vocabulary for — a run holding two plans and citing neither, say.
@@ -114,6 +129,39 @@ const EVENTS: Record<AgentRunEvent["kind"], AgentRunEvent> = {
     // And the word the engine used for those rows (#414), which is two strings and
     // therefore as inert as the rest of the entry.
     noun: { singular: "key pattern", plural: "key patterns" },
+    // What the reading cost this run, measured off the tracker (B13). In the fixture
+    // because it is what a run driven by this build records: the capture's catalog reads
+    // are charged against the ceilings the rail shows and write no `tool-completed`.
+    charged: { statements: 3, elapsedMs: 41 },
+  },
+  // The inventory the run did NOT read, because this process already held one (B56). Its
+  // own kind rather than the entry above, because every reader that finds a capture treats
+  // it as this run's own reading — and `ageMs` is the field the entry exists for: the hold
+  // has no expiry, so a plan run can be grounded on a reading taken before the user added
+  // the collection they are asking about.
+  "context-reused": {
+    kind: "context-reused",
+    atMs: 2,
+    fingerprint: SNAPSHOT.fingerprint,
+    tableCount: SNAPSHOT.tables.length,
+    ageMs: 3_600_000,
+    noun: { singular: "key pattern", plural: "key patterns" },
+  },
+  // The capture that was REFUSED (B54). Its own kind rather than the entry above
+  // carrying an absence, and the fixture is the row-budget case because that is the
+  // shape with fields to get wrong — and because it is the one an operator has to
+  // diagnose: B52's 536 rows against a 200-row bound. No `tableCount` and no
+  // `fingerprint` exist on it at all, which is the absence rule in the type system
+  // rather than in a convention (#477).
+  "context-unavailable": {
+    kind: "context-unavailable",
+    atMs: 2,
+    reasonCode: "CATALOG_READ_REFUSED",
+    detail: "This run's schema inventory was refused.",
+    rowBudget: { projected: 536, allowed: 200 },
+    // A refusal is not a free capture: the read was admitted and charged before it was
+    // answered, and on this shape the engine had already produced the rows (B13).
+    charged: { statements: 1, elapsedMs: 18 },
   },
   "statement-drafted": {
     kind: "statement-drafted",
@@ -220,6 +268,7 @@ const EVENT_ENTRIES = Object.entries(EVENTS) as Array<[AgentRunEvent["kind"], Ag
 
 const RUN: AgentRunRecord = {
   runId: "run_1",
+  thread: { threadId: "run_1", steps: [], text: "" },
   mode: "agent",
   workflowType: "query-optimization",
   workflowSource: "chosen",
@@ -306,6 +355,42 @@ describe("contract shapes", () => {
     expect("statementFingerprint" in DATABASE_ERROR).toBe(true);
   });
 
+  /**
+   * Since #512, a duration belongs to the two variants the tracker CHARGED
+   * and to no others, and the boundary is structural rather than a convention a writer
+   * has to remember: a policy denial and an approval requirement return before
+   * `beginExecution`, so a duration on either would be a spend nobody made.
+   */
+  test("only the refusals that cost database time can carry a duration", () => {
+    const charged: AgentToolRefusal[] = [
+      DATABASE_ERROR,
+      { class: "reading-refused", reasonCode: "READING_OVER_BUDGET", elapsedMs: 9 },
+    ];
+    expect(charged.every((refusal) => "elapsedMs" in refusal)).toBe(true);
+
+    // @ts-expect-error — a policy denial charges nothing, so a duration is inexpressible on it.
+    const denied: AgentToolRefusal = { class: "policy-denied", reasonCode: "ROLE_FORBIDDEN", elapsedMs: 9 };
+    // @ts-expect-error — nor may an approval requirement carry one.
+    const held: AgentToolRefusal = { class: "approval-required", operationId: "sql.explain.analyze", elapsedMs: 9 };
+    expect([denied.class, held.class]).toEqual(["policy-denied", "approval-required"]);
+  });
+
+  /**
+   * And the field is OPTIONAL, because every refusal recorded before it existed carries
+   * none. A required duration would have made those ledgers unreadable, and a fold that
+   * read the absence as `0` would state that a failed statement cost the database no
+   * time — which is what #477 forbids.
+   */
+  test("a refusal recorded before the field existed is still a refusal", () => {
+    const older: AgentToolRefusal = {
+      class: "database-error",
+      statementFingerprint: "sha256-old",
+      message: 'relation "custmers" does not exist',
+    };
+
+    expect("elapsedMs" in older).toBe(false);
+  });
+
   test("a chart spec cannot ask for a histogram, because the run has no bins to show", () => {
     // A histogram is a client-side binning of raw values, so the picture would show
     // something the artifact does not contain. A bucketing wanted is a bucketing the
@@ -341,5 +426,23 @@ describe("contract shapes", () => {
     // policy.ts): a run records who started it, and the execution mode is
     // supplied by the server when a tool call reaches the pipeline.
     expect(Object.keys(RUN.actor).sort()).toEqual(["role", "sessionId"]);
+  });
+
+  test("the terminal statuses are the union's members and nothing else", () => {
+    /*
+      `AGENT_TERMINAL_STATUSES` is built with `satisfies Record<AgentRunTerminalStatus,
+      true>`, so adding a member to the union stops `types.ts` compiling until it is
+      named — which is the half a test cannot assert. What this asserts is the other
+      half: that the set says what the union says today, and that neither non-terminal
+      status has crept into it.
+
+      It matters at one call site in particular. `POST /api/agent/runs` refuses to
+      continue a conversation whose predecessor is not terminal, so a status missing
+      here is a legitimate follow-up refused with a message that names nothing: the
+      caller is told only that the run may not be continued.
+    */
+    expect([...AGENT_TERMINAL_STATUSES].sort()).toEqual(["cancelled", "failed", "succeeded"]);
+    expect(AGENT_TERMINAL_STATUSES.has("queued")).toBe(false);
+    expect(AGENT_TERMINAL_STATUSES.has("running")).toBe(false);
   });
 });

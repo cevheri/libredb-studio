@@ -32,6 +32,15 @@ const SHIPPED: Readonly<Record<DatabaseType, true>> = Object.freeze({
   postgres: true,
   mysql: true,
   sqlite: true,
+  // libSQL (#424 Phase 5): its own provider, doc and integration test. A separate
+  // driver from `sqlite` rather than a relative of it - the two share a dialect and
+  // nothing else, since one holds a file handle and the other speaks HTTP.
+  libsql: true,
+  // DuckDB (#424): its own provider, doc and integration test. It is a driver rather
+  // than a relative of anything - it speaks no PostgreSQL or MySQL wire protocol, and
+  // there is no wire at all, so no engine can be compatible with it by pretending to
+  // be it. Nothing is recorded as a relative below for that reason.
+  duckdb: true,
   oracle: true,
   mssql: true,
   clickhouse: true,
@@ -70,10 +79,10 @@ export const SHIPPED_DATABASE_TYPES: readonly DatabaseType[] = Object.freeze(Obj
 /**
  * Which shipped ids are databases a user already runs, and which one is not.
  *
- * `libredb` is the embedded store this app carries with it; the other fourteen are
+ * `libredb` is the embedded store this app carries with it; the other sixteen are
  * external engines you point the product at. Everything published as a database
- * count means the external fourteen - README.md's "fourteen drivers reach
- * thirty-three named engines", the login hero's engine claim - so the split needs a
+ * count means the external sixteen - README.md's "sixteen drivers reach
+ * forty-two named engines", the login hero's engine claim - so the split needs a
  * definition somewhere, and it belongs beside `SHIPPED` rather than in the UI that
  * prints it. That is the same reason `SHIPPED` itself lives here.
  *
@@ -85,6 +94,10 @@ const EXTERNAL: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
   postgres: true,
   mysql: true,
   sqlite: true,
+  libsql: true,
+  // The user's own file, opened from a path they give us - the same reading as
+  // `sqlite` below, and external for the same reason.
+  duckdb: true,
   oracle: true,
   mssql: true,
   clickhouse: true,
@@ -102,7 +115,14 @@ const EXTERNAL: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
   libredb: false,
 });
 
-/** The shipped ids that are databases a user already runs, in registry order. */
+/**
+ * The shipped ids that are databases a user already runs, in registry order.
+ *
+ * Also the DENOMINATOR the outward-facing catalog copy is counted against:
+ * `tests/unit/lib/catalog-copy-engine-count.test.ts` compares this length with every
+ * numeral qualifying "engines" in nine storefront files, which until #D47 were only ever
+ * corrected by somebody noticing.
+ */
 export const EXTERNAL_DATABASE_TYPES: readonly DatabaseType[] = Object.freeze(
   SHIPPED_DATABASE_TYPES.filter((type) => EXTERNAL[type]),
 );
@@ -142,14 +162,23 @@ export interface WireCompatibleEngine {
  * TimescaleDB, YugabyteDB, TiDB and StarRocks added from a second probe run on
  * 2026-08-20, Apache Cloudberry and Vitess from a third run the same day,
  * AlloyDB Omni from a fourth run the same day, OceanBase Community Edition
- * and SingleStore from a fifth run the same day, and ScyllaDB from a sixth run on
- * 2026-08-21/22.
+ * and SingleStore from a fifth run the same day, ScyllaDB from a sixth run on
+ * 2026-08-21/22, Apache Doris, Garnet and both Percona distributions from a seventh run
+ * on 2026-08-26, and ParadeDB, OrioleDB and Databend from an eighth on 2026-08-27.
  * Names still awaiting an instance are tracked in issue #424, never here: there
  * is no "pending" state on purpose, because a reader cannot tell a pending entry
  * from a probed one. A name that WAS probed and did not earn an entry has no
  * representation here either - Cloud Spanner's PostgreSQL dialect answered 1 of 15
- * surfaces - so that result is recorded in `docs/providers/README.md` beside this
- * table, with the number that refused it.
+ * surfaces, and QuestDB 10.0.1 failed the one surface a query-only row exists to claim -
+ * so those results are recorded in `docs/providers/README.md` beside this table, with the
+ * number that refused each of them.
+ *
+ * QuestDB is the entry NOT to add back without re-reading that section. It looks like a
+ * query-only relative from the provider's side and is not one from the product's: the
+ * editor always attaches a `queryId`, the provider then issues `SELECT pg_backend_pid()`
+ * first, and QuestDB has no such function - so `provider.query(sql)` answers three rows
+ * while pressing Run answers a 500. Same shape as Cloud Spanner, found the same way,
+ * and only in a browser.
  */
 export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
   {
@@ -191,6 +220,18 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     caveats: [
       "Only the SQL editor works. The object browser, the monitoring dashboard and every statistics panel are unavailable.",
       "RisingWave rejects a parameterised LIMIT, so the slow-query and active-session panels cannot run at all.",
+    ],
+  },
+  {
+    name: "OrioleDB",
+    via: "postgres",
+    tier: "full",
+    probedVersion: "OrioleDB beta 16 on PostgreSQL 18.4 (nightly of 2026-08-24)",
+    caveats: [
+      "All fifteen surfaces answer, the object browser is clean (2 objects for 2 user tables) and row counts are exact - 2000 read as 2000 - with a foreign key and its indexes read back.",
+      "Every index reads 0 bytes in the object browser and the table statistics: an OrioleDB table keeps its indexes in its own storage and pg_indexes_size() returns 0 for it, the same shape as YugabyteDB's DocDB.",
+      "The cache hit ratio is absent rather than wrong: OrioleDB has its own buffer manager, so pg_statio_user_tables stays at 0 hits and 0 reads and the panel reads N/A.",
+      "version() DOES name OrioleDB, and the string carries the build hash and date, because the project publishes nightly images only - there is no released tag to pin.",
     ],
   },
   {
@@ -250,6 +291,36 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     ],
   },
   {
+    // Read this entry beside OrioleDB below: both are `full`, and what each costs the user
+    // is the opposite of the other. ParadeDB's cost is WIDTH - nine extensions in the
+    // object browser - and OrioleDB's is DEPTH, its own storage being invisible to
+    // PostgreSQL's size functions. Neither caveat belongs on the other row.
+    name: "ParadeDB",
+    via: "postgres",
+    tier: "full",
+    probedVersion: "ParadeDB 0.25.4 on PostgreSQL 18.6",
+    caveats: [
+      "All fifteen surfaces answer and the numbers are correct, but the object browser lists 41 objects for 2 user tables and 74 indexes: ParadeDB ships nine extensions, and PostGIS, its tiger geocoder, pg_ivm and paradedb's own tables are all in there.",
+      "Agent plan mode WORKS here, and the reason is worth knowing because the opposite was expected: the grounding capture reads what the ROLE can see, and an unprivileged role sees 168 columns where a superuser sees 539 - the tiger geocoder's 425 are not readable - so the capture stays under its 200-row ceiling and a plan run grounded on 21 tables. Connect as a least-privilege role, not as a superuser: the execution profile refuses a superuser outright, on any PostgreSQL.",
+      "version() names PostgreSQL only, so the version panel cannot tell a ParadeDB apart from a stock PostgreSQL 18.6. The release is in the image tag, nowhere the provider reads.",
+    ],
+  },
+  {
+    // The drop-in pair, and they are two entries rather than one because they are served by
+    // two different drivers - the invariant here is one row per (engine, driver) claim.
+    // Read them together anyway: the measurements are identical except for which of the two
+    // publishes its own name where the provider looks.
+    name: "Percona Distribution for PostgreSQL",
+    via: "postgres",
+    tier: "full",
+    probedVersion: "Percona Server for PostgreSQL 18.6.1 on PostgreSQL 18.6",
+    caveats: [
+      "Behaves as PostgreSQL throughout: all fifteen surfaces answer, row counts and sizes are correct (2000 rows read as 2000, 131072 bytes as 131072), and a foreign key is read back with its indexes.",
+      "The version panel names Percona, unlike the MySQL distribution below: version() answers PostgreSQL 18.6 - Percona Server for PostgreSQL 18.6.1, so there is nothing to mistake for stock PostgreSQL.",
+      "Slow queries are empty until pg_stat_statements is enabled, which is stock PostgreSQL behaviour and not a Percona property.",
+    ],
+  },
+  {
     name: "MariaDB",
     via: "mysql",
     tier: "full",
@@ -258,6 +329,16 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
       "The version shown is MariaDB's full build string, including its OS suffix, not a MySQL-style number.",
       "performance_schema ships OFF (@@performance_schema = 0), so the cache-hit, queries-per-second and buffer-pool figures are absent and the slow-query list is empty until the server is started with performance_schema=ON. Everything the schema tree, sizes, sessions and EXPLAIN need comes from information_schema and is unaffected.",
       "Verified on MariaDB 12.3 only; the 10.x information_schema surface was not probed.",
+    ],
+  },
+  {
+    name: "Percona Server for MySQL",
+    via: "mysql",
+    tier: "full",
+    probedVersion: "Percona Server for MySQL 8.4.11-11 (version() reports 8.4.11-11)",
+    caveats: [
+      "Behaves as MySQL throughout: all fifteen surfaces answer, row counts and sizes are correct (2000 rows read as 2000, 114688 bytes as 114688), indexes and a foreign key are read back, and Analyze, Optimize and Check all succeed.",
+      "Nothing on screen says Percona: version() answers a bare 8.4.11-11 and the product name lives in @@version_comment (Percona Server (GPL), Release 11), which the provider does not read - so the overview is indistinguishable from a stock MySQL 8.4.",
     ],
   },
   {
@@ -286,6 +367,42 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
       "Row counts and sizes are always 0: information_schema.TABLES reports 0 rows and 0 bytes for a populated table.",
       "No index information at all: StarRocks exposes no secondary-index catalog, so the object browser and the index panel show none.",
       "The Explain panel does not work: StarRocks does not parse EXPLAIN FORMAT='json', so the editor's plan request fails while the query itself runs normally.",
+    ],
+  },
+  {
+    // Placed next to StarRocks because StarRocks is a FORK of Doris, and this registry
+    // had been carrying the fork while missing the original. The neighbouring rows are
+    // the reason to read both: they share the fictitious version() and the empty index
+    // catalog, and they differ on the numbers, which is the half a reader acts on.
+    // Doris reported 2000 rows and 10187 bytes for a table holding exactly that, where
+    // StarRocks reports hard zeros - so a fork's row is a prior for the next probe and
+    // never an inheritance.
+    name: "Apache Doris",
+    via: "mysql",
+    tier: "partial",
+    probedVersion: "Apache Doris 4.1.3-rc02-7126cf65d96 (version() reports 5.7.99)",
+    caveats: [
+      "The overview and health panels are unavailable, and one statement form is the whole reason: Doris parses SHOW STATUS but rejects the LIKE filter both panels use, so they fail with a syntax error instead of reading an empty result.",
+      "The version shown is MySQL 5.7.99: version() returns a fictitious compatibility number, the real build is only in @@version_comment, and Doris has no current_version() function to read it from.",
+      "No index information at all: information_schema.statistics is empty on Doris, so the index panel and the object browser report none however many keys a table declares.",
+      "A declared foreign key is invisible and unenforced: Doris accepts ADD CONSTRAINT ... FOREIGN KEY and lists it in SHOW CONSTRAINTS, but information_schema.KEY_COLUMN_USAGE is empty, so the ER diagram draws no relationship - and an orphan row inserts successfully, because the constraint is a planner hint there.",
+      "Optimize and Check are unavailable: neither statement exists in the Doris grammar. Analyze works.",
+      "The Explain panel does not work: Doris rejects EXPLAIN FORMAT='json', while a plain EXPLAIN runs in the editor.",
+      "Row counts and sizes are correct but late: a table read 0 rows and 0 B immediately after a 2000-row insert and the true 2000 rows / 10187 bytes about a minute later, with an ANALYZE in between changing nothing. The lag is self-correcting, so a freshly loaded table looks empty for a while.",
+      "A UNIQUE KEY table declares no primary key to the product: information_schema reports COLUMN_KEY as UNI rather than PRI, so the object browser marks no column primary.",
+    ],
+  },
+  {
+    name: "Databend",
+    via: "mysql",
+    tier: "query-only",
+    probedVersion: "Databend v1.2.925-patch-11 (advertises MySQL 8.0.90)",
+    caveats: [
+      "The SQL editor works and a plain EXPLAIN shows Databend's own plan. Nothing else does: the object browser, every statistics panel and the monitoring dashboard are unavailable.",
+      "The cause is ours rather than Databend's, which is why the catalogs are worth naming: asked with literal SQL, information_schema.tables answers the true 3 and 2000 rows with sizes. Every parameterised read fails instead with Prepare is not support in Databend, because those still go through mysql2's prepared protocol.",
+      "Databend has no SHOW STATUS statement at all and no information_schema.processlist, so the overview, health and session panels have no source even once the protocol question is settled.",
+      "Strings must be single-quoted: Databend follows the SQL standard and reads a double-quoted value as an identifier, so a double-quoted literal is an unknown-column error.",
+      "EXPLAIN FORMAT='json' does not parse, and neither Optimize nor Check exists. Analyze runs but the provider mis-reads its reply.",
     ],
   },
   {
@@ -357,7 +474,8 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     caveats: [
       "The overview shows DragonflyDB's Redis emulation level (7.4.0), not the Dragonfly version.",
       "Max connections reads 0, because Dragonfly's INFO reports no usable maxclients.",
-      "Active sessions show a numeric id instead of a username: Dragonfly's CLIENT LIST omits the user field.",
+      "Active sessions show a numeric id instead of a username: Dragonfly's CLIENT LIST sets name= to the connection id.",
+      "Every active session reads idle with state N: Dragonfly's CLIENT LIST carries no cmd= or flags= field.",
     ],
   },
   {
@@ -368,6 +486,25 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     caveats: [
       "KeyDB publishes no version field of its own, so the overview cannot be told apart from a Redis 6 server.",
       'An active session\'s command can appear without its subcommand ("client" rather than "client|list").',
+    ],
+  },
+  {
+    // The fourth Redis relative and the only one that publishes its own version while the
+    // product shows the emulation level anyway: `garnet_version` and `server_name` are both
+    // in its INFO output. Valkey and DragonflyDB publish only an emulation level, and KeyDB
+    // publishes nothing of its own, so on those three the displayed version is the best
+    // available reading. Here it is not.
+    name: "Garnet",
+    via: "redis",
+    tier: "full",
+    probedVersion: "Garnet 2.1.5 (advertises Redis 7.4.3)",
+    caveats: [
+      "The overview shows the Redis emulation level (7.4.3), not Garnet's version. Unlike the other Redis relatives, Garnet does publish its own - garnet_version:2.1.5 and server_name:garnet in INFO - and the provider reads redis_version instead.",
+      "Every size reads 0 B: Garnet's INFO publishes no used_memory field at all, so the database size and the memory storage panel are a derived zero rather than a measurement.",
+      "The cache hit ratio reads 100%: Garnet publishes neither keyspace_hits nor keyspace_misses, and 100 is the fallback both counters being absent produces (D14).",
+      "Max connections reads 0, as on DragonflyDB: Garnet publishes no maxclients.",
+      "Connected clients reads 0 even with a client attached, because Garnet's connected_clients stays 0; the session list itself is correct and shows the connection.",
+      "Key prefixes group as expected: 71 keys across user:*, session:* and queue:* were read back as three patterns.",
     ],
   },
   {
@@ -421,8 +558,8 @@ export function compatibleEnginesFor(type: DatabaseType): readonly WireCompatibl
  * app at it, so the embedded store is out of both halves of the sum.
  *
  * Still no runtime consumer: README.md and the docs table are markdown and quote the
- * number as prose, and the login hero prints the two halves separately - fourteen in
- * the proof row, nineteen in the relatives line - rather than their sum. This exists
+ * number as prose, and the login hero prints the two halves separately - sixteen in
+ * the proof row, twenty-six in the relatives line - rather than their sum. This exists
  * so the arithmetic has one definition, and the unit test pins it.
  */
 export function connectableProductCount(): number {

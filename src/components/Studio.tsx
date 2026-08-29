@@ -26,12 +26,18 @@ import { DatabaseConnection, SavedQuery } from "@/lib/types";
 import { ChunkBoundary, ViewLoading } from "@/components/LazyView";
 import { lazyRetry } from "@/lib/lazy";
 import { editorLanguageForTabType, resolveTabType } from "@/lib/editor/tab-language";
-import { buildResultExport, type ResultExportFormat } from "@/lib/export/result-export";
+import {
+  buildResultExport,
+  FALLBACK_TABLE_NAME,
+  resultExportFileName,
+  type ResultExportFormat,
+} from "@/lib/export/result-export";
 import { downloadText } from "@/lib/export/download";
 import { newLocalId } from "@/lib/ids";
 import { resolveAgentRunConnectionId } from "@/hooks/use-connection-payload";
-import { isMobileViewport } from "@/hooks/use-mobile";
+import { isMobileViewport, useIsMobile } from "@/hooks/use-mobile";
 import { useAgentCapability } from "@/hooks/use-agent-capability";
+import type { AgentArtifactHydration } from "@/components/agent/hydration";
 import { useAgentArtifact } from "@/components/agent/use-agent-artifact";
 import { useAgentPrefill } from "@/components/agent/use-agent-prefill";
 import { useToast } from "@/hooks/use-toast";
@@ -142,7 +148,7 @@ export default function Studio() {
     : undefined;
 
   // The transaction trio and the sandbox toggle are offered only where the provider
-  // declares it holds a transaction session (#U13). The server's gate is
+  // declares it holds a transaction session (#464). The server's gate is
   // `isTransactionProvider(provider)` — a runtime shape check no client can read — so
   // both shells used to supply all four unconditionally and POST /api/db/transaction
   // answered 400 "Transaction control is not supported for this database type"
@@ -193,6 +199,8 @@ export default function Studio() {
   const [isSaveQueryModalOpen, setIsSaveQueryModalOpen] = useState(false);
   const [savedKey, setSavedKey] = useState(0);
   const [activeMobileTab, setActiveMobileTab] = useState<"database" | "schema" | "editor">("editor");
+  /** What the panel group may hold: below the breakpoint, only the body panel. */
+  const isMobile = useIsMobile();
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [profilerTable, setProfilerTable] = useState<string | null>(null);
   const [codeGenTable, setCodeGenTable] = useState<string | null>(null);
@@ -319,7 +327,7 @@ export default function Studio() {
   const userCanToggle = canToggleMasking(user?.role, maskingConfig);
 
   // The Explorer's per-row items call this with the row's name; without carrying it
-  // the tab opened with nothing selected (#U5). The name rides the query string —
+  // the tab opened with nothing selected (#459). The name rides the query string —
   // the admin section is routed, so a param is what a section page can read. The
   // non-admin /monitoring route has no such reader, so it keeps the bare path.
   const openMaintenance = (_tab?: "global" | "tables" | "sessions", table?: string) => {
@@ -347,28 +355,40 @@ export default function Studio() {
     toast({ title: "Query Saved", description: `"${name}" has been added to your saved queries.` });
   };
 
-  const exportResults = (format: ResultExportFormat) => {
-    if (!tabMgr.currentTab.result) return;
+  /**
+   * Write what is on screen to a file.
+   *
+   * `hydrated` is the agent artifact the bottom panel is showing, or null when the
+   * tab's own rows are what the user is looking at. It is passed in rather than read
+   * back off the tab because the two disagree exactly when it matters (B34): a run's
+   * result is hydrated into the grid without touching the tab, so an export that read
+   * `currentTab.result` wrote rows nobody was looking at. That is why the menu used to
+   * be hidden over a hydrated view instead of retargeted.
+   */
+  const exportResults = (format: ResultExportFormat, hydrated: AgentArtifactHydration | null = null) => {
+    const source = hydrated?.result ?? tabMgr.currentTab.result;
+    if (!source) return;
     // The columns the engine declared for THIS result. The writers read every row by
     // these names rather than by whatever keys row 0 happens to carry, so a row with
     // a different key order — or a document store's row missing a field entirely —
     // lands in the right column instead of shifting the rest.
-    const fields = tabMgr.currentTab.result.fields;
+    const fields = source.fields;
     const sensitiveColumns = detectSensitiveColumnsFromConfig(fields, maskingConfig);
-    const rows = effectiveMasking
-      ? applyMaskingToRows(tabMgr.currentTab.result.rows, fields, sensitiveColumns)
-      : tabMgr.currentTab.result.rows;
+    const rows = effectiveMasking ? applyMaskingToRows(source.rows, fields, sensitiveColumns) : source.rows;
 
     const file = buildResultExport(format, {
       rows,
       fields,
-      tabName: tabMgr.currentTab.name,
+      // A run's rows did not come from this tab, so the SQL forms take the neutral
+      // fallback name: naming the tab's table would attribute them to a table that
+      // never produced them.
+      tabName: hydrated === null ? tabMgr.currentTab.name : FALLBACK_TABLE_NAME,
       dialect: conn.activeConnection?.type,
       // The types the engine declared for THIS result, which is what the DDL form
       // writes when they are there — the only source for a computed column.
-      columnTypes: tabMgr.currentTab.result.columnTypes,
+      columnTypes: source.columnTypes,
     });
-    downloadText(file.content, file.mimeType, `query_result_export.${file.extension}`);
+    downloadText(file.content, file.mimeType, resultExportFileName(file.extension, hydrated?.runId));
   };
 
   const onTableClick = (tableName: string) => {
@@ -394,6 +414,42 @@ export default function Studio() {
     if (conn.activeConnection?.id === id) conn.setActiveConnection(updated[0] || null);
   };
 
+  /**
+   * One rail, two mounts: a panel of the group above the breakpoint, a bare child of
+   * the shell below it. Declared once so the two placements cannot drift apart.
+   */
+  const agentRail = (
+    <AgentRail
+      connectionId={agentConnectionId}
+      connectionName={conn.activeConnection?.name ?? null}
+      sheetOpen={isAgentSheetOpen}
+      onSheetOpenChange={setIsAgentSheetOpen}
+      prefill={agentPrefill.request}
+      connectionType={conn.activeConnection?.type ?? null}
+      onApplyStatement={(sql) => tabMgr.updateCurrentTab({ query: sql })}
+      /*
+          The handover a run's answer can record (§2.1): the statement goes
+          into the editor AND is run there. Through the hook's own entry point
+          rather than `executeQuery`, and the difference is the boundary
+          (#373 review): `executeQuery` goes to the editor's read-WRITE route,
+          where a `SELECT` calling a VOLATILE function that writes would
+          succeed. `executeHandedOverStatement` asks the run's own hand-over
+          route instead, which runs the ledger's statement under the engine's
+          read-only session at the editor's default row limit and with no
+          statement timeout.
+
+          The statement is put in the editor first so the user reads what is
+          running while it runs; the RUN is what is sent, because the text the
+          server executes is the ledger's, not this component's copy of it.
+        */
+      onRunStatement={(sql, runId) => {
+        tabMgr.updateCurrentTab({ query: sql });
+        void queryExec.executeHandedOverStatement(runId, sql);
+      }}
+      onShowArtifact={agentArtifact.show}
+    />
+  );
+
   return (
     <div className="flex h-screen w-full bg-canvas text-fg overflow-hidden font-sans select-none">
       <ResizablePanelGroup id="studio-main" orientation="horizontal" className="h-full">
@@ -401,33 +457,46 @@ export default function Studio() {
             a sibling is conditional (the agent rail); it replaces v3's `order`,
             since v4 keys its layout by panel id. Sizes are strings on purpose:
             v4 reads a bare number as pixels and a unitless string as a percentage. */}
-        <ResizablePanel id="studio-sidebar" defaultSize="22" minSize="15" maxSize="35" className="hidden md:block">
-          <Sidebar
-            connections={conn.connections}
-            activeConnection={conn.activeConnection}
-            schema={conn.schema}
-            isLoadingSchema={conn.isLoadingSchema}
-            onSelectConnection={conn.setActiveConnection}
-            onDeleteConnection={handleDeleteConnection}
-            onEditConnection={(c) => {
-              setEditingConnection(c);
-              setIsConnectionModalOpen(true);
-            }}
-            onAddConnection={() => setIsConnectionModalOpen(true)}
-            onTableClick={onTableClick}
-            onGenerateSelect={tabMgr.handleGenerateSelect}
-            onCreateTableClick={() => setIsCreateTableModalOpen(true)}
-            onShowDiagram={() => setShowDiagram(true)}
-            isAdmin={isAdmin}
-            onOpenMaintenance={openMaintenance}
-            databaseType={conn.activeConnection?.type}
-            metadata={metadata}
-            onProfileTable={(name) => setProfilerTable(name)}
-            onGenerateCode={(name) => setCodeGenTable(name)}
-            onGenerateTestData={(name) => setTestDataTable(name)}
-          />
-        </ResizablePanel>
-        <ResizableHandle className="hidden md:flex w-1 bg-transparent hover:bg-blue-500/30 transition-colors" />
+        {/*
+          Not merely hidden: `react-resizable-panels` 4 puts a `Panel`'s `className`
+          on a NESTED div ("Class is applied to nested HTMLDivElement to avoid styles
+          that interfere with Flex layout"), so `hidden md:block` hid the sidebar's
+          CONTENTS while the panel itself kept its 22% of the row. At 390px that left
+          the studio body 211px wide with its own header overlapping. A panel the
+          viewport cannot show has to be out of the group, not styled out of sight.
+        */}
+        {!isMobile && (
+          <>
+            <ResizablePanel id="studio-sidebar" defaultSize="22" minSize="15" maxSize="35">
+              <Sidebar
+                connections={conn.connections}
+                activeConnection={conn.activeConnection}
+                schema={conn.schema}
+                isLoadingSchema={conn.isLoadingSchema}
+                schemaError={conn.schemaError}
+                onSelectConnection={conn.setActiveConnection}
+                onDeleteConnection={handleDeleteConnection}
+                onEditConnection={(c) => {
+                  setEditingConnection(c);
+                  setIsConnectionModalOpen(true);
+                }}
+                onAddConnection={() => setIsConnectionModalOpen(true)}
+                onTableClick={onTableClick}
+                onGenerateSelect={tabMgr.handleGenerateSelect}
+                onCreateTableClick={() => setIsCreateTableModalOpen(true)}
+                onShowDiagram={() => setShowDiagram(true)}
+                isAdmin={isAdmin}
+                onOpenMaintenance={openMaintenance}
+                databaseType={conn.activeConnection?.type}
+                metadata={metadata}
+                onProfileTable={(name) => setProfilerTable(name)}
+                onGenerateCode={(name) => setCodeGenTable(name)}
+                onGenerateTestData={(name) => setTestDataTable(name)}
+              />
+            </ResizablePanel>
+            <ResizableHandle className="w-1 bg-transparent hover:bg-blue-500/30 transition-colors" />
+          </>
+        )}
         <ResizablePanel id="studio-body" defaultSize={agentEnabled ? "54" : "78"}>
           <div className="flex-1 flex flex-col min-w-0 h-full bg-surface pb-16 md:pb-0">
             <StudioMobileHeader
@@ -537,6 +606,7 @@ export default function Studio() {
                     <SchemaExplorer
                       schema={conn.schema}
                       isLoadingSchema={conn.isLoadingSchema}
+                      schemaError={conn.schemaError}
                       onTableClick={(tableName) => {
                         onTableClick(tableName);
                         setActiveMobileTab("editor");
@@ -595,6 +665,7 @@ export default function Studio() {
                                 : undefined
                             }
                             language={editorLanguageForTabType(tabMgr.currentTab.type)}
+                            databaseType={conn.activeConnection?.type}
                             schemaContext={conn.schemaContext}
                             capabilities={metadata?.capabilities}
                           />
@@ -669,43 +740,23 @@ export default function Studio() {
           package boundary — the one that matters for what ships to platform — is
           pinned separately in T12.
         */}
-        {agentEnabled && (
+        {agentEnabled && !isMobile && (
           <>
-            <ResizableHandle className="hidden md:flex w-1 bg-transparent hover:bg-blue-500/30 transition-colors" />
-            <ResizablePanel id="studio-agent" defaultSize="24" minSize="18" maxSize="45" className="hidden md:block">
-              <AgentRail
-                connectionId={agentConnectionId}
-                connectionName={conn.activeConnection?.name ?? null}
-                sheetOpen={isAgentSheetOpen}
-                onSheetOpenChange={setIsAgentSheetOpen}
-                prefill={agentPrefill.request}
-                connectionType={conn.activeConnection?.type ?? null}
-                onApplyStatement={(sql) => tabMgr.updateCurrentTab({ query: sql })}
-                /*
-                  The handover a run's answer can record (§2.1): the statement goes
-                  into the editor AND is run there. Through the hook's own entry point
-                  rather than `executeQuery`, and the difference is the boundary
-                  (#373 review): `executeQuery` goes to the editor's read-WRITE route,
-                  where a `SELECT` calling a VOLATILE function that writes would
-                  succeed. `executeHandedOverStatement` asks the run's own hand-over
-                  route instead, which runs the ledger's statement under the engine's
-                  read-only session at the editor's default row limit and with no
-                  statement timeout.
-
-                  The statement is put in the editor first so the user reads what is
-                  running while it runs; the RUN is what is sent, because the text the
-                  server executes is the ledger's, not this component's copy of it.
-                */
-                onRunStatement={(sql, runId) => {
-                  tabMgr.updateCurrentTab({ query: sql });
-                  void queryExec.executeHandedOverStatement(runId, sql);
-                }}
-                onShowArtifact={agentArtifact.show}
-              />
+            <ResizableHandle className="w-1 bg-transparent hover:bg-blue-500/30 transition-colors" />
+            <ResizablePanel id="studio-agent" defaultSize="24" minSize="18" maxSize="45">
+              {agentRail}{" "}
             </ResizablePanel>
           </>
         )}
       </ResizablePanelGroup>
+
+      {/*
+        Below the breakpoint the rail is not a panel — see the sidebar's note above —
+        but it must still be MOUNTED: its mobile presentation is a sheet it renders
+        itself, and `MobileNav`'s Agent control is what opens it. Dropping it with the
+        panel would take the phone's only agent surface with it.
+      */}
+      {agentEnabled && isMobile && agentRail}
 
       {/* Modals */}
       <ConnectionModal

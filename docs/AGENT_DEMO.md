@@ -14,6 +14,51 @@ used, case 19 opens as the wrong workflow, case 20's ending is not the one this 
 and case 22 cannot be performed at all. They are written down as they are. A script that only
 records the improvements is not a measurement.
 
+### Conversations, driven 2026-08-26
+
+Six runs through a browser against a production build, `gemini-3.5-flash-lite` and the seeded
+dvdrental on PostgreSQL 18, read as the least-privilege `libredb_agent` role. Verified against the
+run ledgers in `.workflow-data` rather than off the screen.
+
+The shape driven is the one the design is weakest at — a **transformation step in the middle**, whose
+own objective is a pronoun and whose report might carry nothing forward:
+
+1. *"count my films by category"* — answered: 16 categories, Sports highest at 74, Music lowest at 51.
+2. *"chart those"* — resolved, and re-ran the full `category`/`film_category` aggregate to chart it.
+3. *"show the highest rental rate among those"* — **resolved to films.** It read the grouping too: it
+   drafted `SELECT c.name AS category, MAX(f.rental_rate) … JOIN film_category …` before settling on
+   the simpler `SELECT MAX(rental_rate) FROM film`, and answered 4.99.
+
+**What this drive established, and what it did not.** It establishes that the conversation reached
+step 3 and that the referent resolved: the header carried `Step 1: count my films by category`,
+`Step 2: chart those`, step 2's answer statement and step 2's claim, and the run answered about films.
+
+It does **not** establish that the spine was load-bearing, and the drive has to be read carefully to
+see why. Step 2's report was rich rather than thin — its answer statement names `category` and
+`film_category` outright, and its claim reads *"16 distinct film categories, Sports 74, Music 51"*. A
+pairwise chain would therefore have handed step 3 that report, which resolves *"those"* to films on
+its own. The shape this design exists for — a middle step whose report carries nothing forward — is
+the shape this drive did not produce.
+
+So the claim to hold is the narrower one: the transport works, and the conversation is robust to a
+thin middle report *by construction* rather than *by measurement*. Driving a genuinely thin middle
+step (one that charts without re-reading, or fails) is the measurement still owed.
+
+Recorded as it happened rather than as it flatters, on the other axis too: step 3 resolved the
+referent and read the category framing — it drafted the per-category maximum — and then presented the
+ungrouped one. Which of two correct readings a model presents is a question about the model, not
+about the transport.
+
+**Control arm**, driven with that three-step conversation still attached: *"how many customers are
+there in each country?"* — answered about customers and countries in one statement, with no film or
+category framing anywhere in it and no refusal for a referent it did not need. Both confusion modes
+the design worried about — contamination, and refusing an answerable question — were absent here.
+
+**The two controls were exercised too.** Switching connection between runs produced the rail's own
+sentence (*"Connection changed, so this question started a new conversation"*) rather than the
+server's decline; and **new conversation** left the next run's header with no `thread` key at all —
+the run wrote nothing, which is the same bytes a run written before conversations existed carries.
+
 ## What works on which engine
 
 Driven live on 2026-08-15 and 2026-08-17, one engine at a time, against real servers. **Verified**
@@ -196,7 +241,7 @@ really declares none is described the same way — as a graph this run cannot vo
 price of not stating the negative, and the cheaper of the two errors.
 
 **Run it from a production build** (`bun run build` then `bun run start`). In development React needs
-`eval`, which the CSP does not allow, so the login page does not hydrate (`docs/BACKLOG.md` B40).
+`eval`, which the CSP does not allow, so the login page does not hydrate (#459).
 
 **Two axes, and you now choose only one of them.** Plan or Agent decides whether the run may touch
 the database, and that is still a button you press. What the run is *for* — Investigate / Analyze /
@@ -546,10 +591,14 @@ are worth knowing before you show this:
 - *"How many users are stored, and how do I look one up?"* → drafted **`KEYS user:*`**, and explained
   the lookup as `HGETALL user:<id>` — a whole key, which is the new rule working. `KEYS` is not: it is
   the blocking O(N) command Studio's own provider refuses to use, and the product is offering it with
-  an Apply-to-editor button. Nothing runs unless the user applies and runs it, and this is recorded as
-  `docs/BACKLOG.md` **B50** rather than fixed, because whether the rules should speak about
-  operational cost at all is an open question the owner has not ruled on. Do not show this one, and do
-  not claim the Redis drafts are safe to run unread.
+  an Apply-to-editor button. Nothing runs unless the user applies and runs it, and whether the
+  planning rules should speak about operational cost at all was **ruled on and declined** on
+  2026-08-22 (#459): a rule naming one command is engine trivia that goes stale, teaches nothing about
+  the next command, and buys nothing plan mode does not already have - plan mode holds no tools, so
+  reaching the hazard takes the user applying the draft and running it on their own connection. The
+  reasoning is recorded at `planningDerivedGroupingsRule` in `src/lib/agent/investigation.ts` so the
+  question is not reopened. Show this one only alongside that ruling, and do not claim the Redis
+  drafts are safe to run unread.
 
 *One thing to watch for on stage, because it was there when this script was driven and is not now:*
 a plan-mode Operate run used to name the **wrong engine's** readings with complete confidence — a
@@ -769,9 +818,9 @@ would close it, so "not yet" means deferred with a reason, not overlooked.
 | Not yet | What happens today | Waiting on |
 | --- | --- | --- |
 | **A verdict that fits an optimization run** | Every Optimize run ends `unanswered`, however good its plans and index recommendation were | B45 — a plan artifact is not an empty result, the same exemption the Operate template already has |
-| **Follow-up questions** | Each run starts fresh, and neither the surface nor the model says so — ask "and how many of those?" and you get a confident answer to a different question | B36 — either carrying the previous run's objective and report into the next as fenced context, or run history |
+| **Returning to an earlier conversation** | A follow-up asked on the same connection continues the previous run's conversation, and the rail names the steps it is continuing — but only for the conversation you are in. Yesterday's conversations cannot be listed or reopened, and a page reload starts a new one without saying so | B67 — run history across conversations needs store enumeration, a list route and a retention rule, none of which exist. B69 for the reload |
 | **Causal questions** — "why are sales down?" | Answered from the schema alone, which cannot know which decomposition of a metric is the business one | A per-connection business note, held server-side; sketched in `docs/AGENT_ANALYST_DESIGN.md` §5 |
-| **"This database cannot answer that"** | It does say so, but has to run a throwaway query to be scored as having answered — case 21 spends 5 tool invocations to report that an employees database holds no customer data | B39 — a second arm on the verdict, so a schema-only conclusion counts |
+| **"This database cannot answer that"** | It does say so, but has to run a throwaway query to be scored as having answered — case 21 spends 5 tool invocations to report that an employees database holds no customer data | A second arm on the verdict, so a schema-only conclusion counts |
 | **Agent mode on MySQL, Oracle, MongoDB, Redis…** | Only Operate. The other four workflows refuse, correctly and clearly | A database-native read-only statement path per engine — the same `queryReadOnly` PostgreSQL and SQLite implement |
 | **A run you can watch from your own stack** | Everything is in the run's ledger and on the rail; nothing is exported | B33 — OpenTelemetry spans, designed in #332 and deliberately not built while the event model is still moving |
 | **Resuming a run after a restart** | A drive that dies leaves a durable ledger, but nothing picks it up | B9 — a queue and a re-attach path for the stream |

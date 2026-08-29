@@ -81,6 +81,13 @@ export class RedisProvider extends BaseDatabaseProvider {
       tablesAreDerivedGroupings: true,
       supportsMaintenance: true,
       maintenanceOperations: ["analyze"],
+      // `runMaintenance(type)` takes no target parameter at all: the operation is
+      // `INFO`, which reports on the server and cannot be pointed at a key pattern.
+      // A per-row control here would have named one grouping and answered with
+      // server-wide metrics - the dead end #427 reported for "Key Info" (#496).
+      maintenanceOperationSpecs: {
+        analyze: { label: "Server Info", perEntity: false, global: true },
+      },
       supportsConnectionString: false,
       defaultPort: 6379,
       schemaRefreshPattern: "(DEL|FLUSHDB|FLUSHALL|RENAME)\\b",
@@ -121,7 +128,7 @@ export class RedisProvider extends BaseDatabaseProvider {
         'exactly one Redis command, in the plain form `SCAN 0 MATCH session:* COUNT 50` or the lossless form {"command": "GET", "args": ["session:1"]} - one command and no more, with no list numbering, no bullet, no `redis-cli` prefix and no trailing semicolon; and the inventory\'s `prefix:*` rows are groupings this server summarised, not keys, so reach a prefix with SCAN ... MATCH and a key by its real name',
       // `getSlowQueries()` maps SLOWLOG GET, so an empty panel means the log is empty
       // rather than absent - a different fact from the PostgreSQL extension this used
-      // to advertise (#U12), and the one a Redis operator can act on.
+      // to advertise (#463), and the one a Redis operator can act on.
       slowQueriesEmptyState:
         "Redis lists what SLOWLOG holds, and nothing has yet run slower than slowlog-log-slower-than.",
     };
@@ -161,7 +168,9 @@ export class RedisProvider extends BaseDatabaseProvider {
     if (!ssl || ssl.mode === "disable") return undefined;
 
     const tls: NonNullable<RedisOptions["tls"]> = {
-      rejectUnauthorized: ssl.rejectUnauthorized ?? (ssl.mode === "verify-ca" || ssl.mode === "verify-full"),
+      // `require` encrypts without checking; every other mode verifies. `verify-system`
+      // verifies against the runtime's own trust store, with no CA PEM to paste (D26).
+      rejectUnauthorized: ssl.rejectUnauthorized ?? ssl.mode !== "require",
     };
     if (ssl.caCert) tls.ca = ssl.caCert;
     if (ssl.clientCert) tls.cert = ssl.clientCert;
@@ -169,12 +178,29 @@ export class RedisProvider extends BaseDatabaseProvider {
     return tls;
   }
 
+  /**
+   * The connection form's Username is the Redis 6 ACL user, and it has to reach the
+   * driver under ioredis's own name — the field is `user` on the connection and
+   * `username` in `RedisOptions`. Without it ioredis sends a one-argument `AUTH`,
+   * which Redis resolves against `default`.
+   *
+   * Measured 2026-08-26 against `redis:latest` with `default` left `nopass +@all` and
+   * `probe` defined `on >probepw ~* +@all -info`, both arms: with `{password}` alone
+   * `ACL WHOAMI` answered `default` and `INFO` succeeded — the app ran as a principal
+   * the user never chose, and health went green. With `{username, password}` WHOAMI
+   * answered `probe` and `INFO` was refused `NOPERM`. The two arms together are what
+   * make it a measurement rather than a shape (D29).
+   *
+   * `undefined` when the field is empty, never `""`: a plain `requirepass` server has
+   * no ACL user to name, and only an absent `username` authenticates as `default`.
+   */
   public async connect(): Promise<void> {
     try {
       const tls = this.buildTLSOptions();
       this.client = new Redis({
         host: this.config.host,
         port: this.config.port || 6379,
+        username: this.config.user || undefined,
         password: this.config.password || undefined,
         db: this.config.database ? parseInt(this.config.database, 10) : 0,
         connectTimeout: this.queryTimeout,

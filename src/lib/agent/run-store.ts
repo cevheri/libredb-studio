@@ -60,6 +60,7 @@ import { randomUUID } from "node:crypto";
 import { getAgentRuntimeConfig } from "./config";
 import { assertPersistableState } from "./state-guard";
 import {
+  type AgentThreadHeader,
   type AgentRunActor,
   type AgentRunEvent,
   type AgentRunMode,
@@ -98,7 +99,10 @@ export const AGENT_RUN_ID_PATTERN = /^[A-Za-z0-9_]{1,64}$/;
 const EVENT_KINDS: ReadonlySet<string> = new Set(
   Object.keys({
     "run-started": true,
+    "driver-resolved": true,
     "context-captured": true,
+    "context-reused": true,
+    "context-unavailable": true,
     "statement-drafted": true,
     "tool-invoked": true,
     "tool-completed": true,
@@ -166,8 +170,22 @@ export type AgentLedgerEntry =
        * other way to ask.
        */
       readonly toolProtocol?: AgentToolProtocol;
+      /**
+       * Optional on the READ side for the same reason `workflowType` is: `openRun`
+       * writes it only when a run CONTINUES a conversation, and a header written
+       * before this field existed folds to a thread of one named after itself —
+       * which is what was true of it, since no run belonged to a conversation then.
+       */
+      readonly thread?: AgentThreadHeader;
       readonly actor: AgentRunActor;
       readonly connectionId: string;
+      /**
+       * Which database `connectionId` addressed at open; see
+       * `AgentRunRecord.connectionIdentity`. Optional on both sides and never
+       * defaulted: a header written before this field says nothing about the database
+       * it read, and the fold must not turn that silence into an answer.
+       */
+      readonly connectionIdentity?: string;
       readonly objective: string;
     }
   | { readonly kind: "event"; readonly event: AgentRunEvent }
@@ -250,8 +268,12 @@ export interface AgentRunOpenInput {
   readonly autoExecute?: boolean;
   /** Defaults to `native`. Decided by the capability gate at start; see `AgentRunRecord`. */
   readonly toolProtocol?: AgentToolProtocol;
+  /** The conversation this run continues; written to the header only when it does. */
+  readonly thread?: AgentThreadHeader;
   readonly actor: AgentRunActor;
   readonly connectionId: string;
+  /** Which database that connection addresses; see `AgentRunRecord.connectionIdentity`. */
+  readonly connectionIdentity?: string;
   readonly objective: string;
   /**
    * Supplied when the run's identity is minted elsewhere — the workflow run id, so
@@ -361,9 +383,21 @@ function foldLedger(runId: string, entries: readonly AgentLedgerEntry[]): AgentR
       // Spread rather than defaulted: `native` is the absence, so writing it would put
       // a field on every record to say what its absence already says.
       ...(header.toolProtocol === undefined ? {} : { toolProtocol: header.toolProtocol }),
+      // Defaulted rather than spread, because every run HAS a conversation: one it
+      // continues, or one of its own that begins here. A header written before this
+      // field folds to a thread of one named after itself, which is what was true of
+      // it, and a run that starts a conversation today folds to exactly the same.
+      thread:
+        header.thread === undefined
+          ? { threadId: runId, steps: [], text: "" }
+          : { ...header.thread, threadId: header.thread.threadId ?? runId },
       status,
       actor: header.actor,
       connectionId: header.connectionId,
+      // Spread rather than defaulted, because absence is a real answer here and not a
+      // missing one: an older header read some database this fold cannot name, and a
+      // placeholder would be a claim about it.
+      ...(header.connectionIdentity === undefined ? {} : { connectionIdentity: header.connectionIdentity }),
       objective: header.objective,
       createdAtMs: header.atMs,
       updatedAtMs: entryAtMs(lastEntry),
@@ -427,8 +461,15 @@ export class AgentRunStore {
       // generation can be read as having permitted something it did not.
       autoExecute: input.autoExecute ?? false,
       ...(input.toolProtocol === undefined ? {} : { toolProtocol: input.toolProtocol }),
+      // Written only when a run CONTINUES a conversation, so a ledger opened before
+      // this field and one that starts its own thread are the same bytes.
+      ...(input.thread === undefined ? {} : { thread: input.thread }),
       actor: input.actor,
       connectionId: input.connectionId,
+      // Written only when the opener resolved a connection to fingerprint, so a ledger
+      // opened before this field and one opened by a caller that cannot supply it are
+      // the same bytes.
+      ...(input.connectionIdentity === undefined ? {} : { connectionIdentity: input.connectionIdentity }),
       objective: input.objective,
     };
     if ((await this.read(runId)) !== null) {

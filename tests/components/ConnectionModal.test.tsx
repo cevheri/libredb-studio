@@ -228,6 +228,23 @@ mock.module("@/hooks/use-connection-form", () => ({
 }));
 
 // ── Mock @/lib/db-ui-config ─────────────────────────────────────────────────
+// Mirrors the real table for the engines that diverge from the networked default. A mock
+// that gave every type the full field set is what let the modal draw a Username box for
+// libSQL and a Database box for Druid unnoticed: the assertion that the box is absent
+// passes or fails against THIS list, not against src/lib/db-ui-config.ts. The real table is
+// the authority and tests/unit/lib/db-ui-config.test.ts derives it from the providers.
+const MOCK_CONNECTION_FIELDS: Record<string, string[]> = {
+  sqlite: ["database"],
+  libredb: ["database"],
+  duckdb: ["database"],
+  libsql: ["host", "port", "password", "connectionString"],
+  druid: ["host", "port", "user", "password"],
+  elasticsearch: ["host", "port", "user", "password"],
+  opensearch: ["host", "port", "user", "password"],
+};
+const mockFields = (type: string): string[] =>
+  MOCK_CONNECTION_FIELDS[type] ?? ["host", "port", "user", "password", "database"];
+
 mock.module("@/lib/db-ui-config", () => ({
   getDBConfig: (type: string) => ({
     icon: () => null,
@@ -236,8 +253,9 @@ mock.module("@/lib/db-ui-config", () => ({
     defaultPort: type === "mysql" ? "3306" : type === "mongodb" ? "27017" : "5432",
     // Mirrors the real config: the URI-addressed providers offer the toggle.
     showConnectionStringToggle: type === "mongodb" || type === "couchbase",
-    connectionFields: ["host", "port", "user", "password", "database"],
+    connectionFields: mockFields(type),
   }),
+  takesConnectionField: (type: string, field: string) => mockFields(type).includes(field),
   getDBIcon: () => () => null,
   getDBColor: () => "text-blue-400",
   // `isFileBased` must be mocked now that `DB_UI_CONFIG` is an exported binding (#425 made
@@ -245,7 +263,7 @@ mock.module("@/lib/db-ui-config", () => ({
   // binding, and this mock replaces it with `{}`, so leaving the function to the real module
   // makes it throw on `DB_UI_CONFIG[type].connectionFields` for every render. Mirrors the
   // real rule: a file-based provider carries only a path.
-  isFileBased: (type: string) => type === "sqlite" || type === "libredb",
+  isFileBased: (type: string) => mockFields(type).length === 1 && mockFields(type)[0] === "database",
   DB_UI_CONFIG: {},
 }));
 
@@ -512,19 +530,37 @@ describe("ConnectionModal", () => {
   // ── 20. Test result success displayed ──────────────────────────────────
 
   test("test result success message displayed", () => {
-    mockFormOverrides = { testResult: { success: true, message: "Connection successful" } };
+    mockFormOverrides = { testResult: { tone: "success", message: "Connection successful" } };
     const props = createDefaultProps();
-    const { queryByText } = render(React.createElement(ConnectionModal, props));
+    const { queryByText, getByTestId } = render(React.createElement(ConnectionModal, props));
     expect(queryByText("Connection successful")).not.toBeNull();
+    expect(getByTestId("connection-test-result").getAttribute("data-tone")).toBe("success");
   });
 
   // ── 21. Test result failure displayed ──────────────────────────────────
 
   test("test result failure message displayed", () => {
-    mockFormOverrides = { testResult: { success: false, message: "Connection failed: timeout" } };
+    mockFormOverrides = { testResult: { tone: "error", message: "Connection failed: timeout" } };
     const props = createDefaultProps();
-    const { queryByText } = render(React.createElement(ConnectionModal, props));
+    const { queryByText, getByTestId } = render(React.createElement(ConnectionModal, props));
     expect(queryByText("Connection failed: timeout")).not.toBeNull();
+    expect(getByTestId("connection-test-result").getAttribute("data-tone")).toBe("error");
+  });
+
+  // ── 21b. Test result warning displayed (#498) ────────────────────────────
+
+  test("test result warning message renders as neither success nor failure", () => {
+    // A degraded save/connect asks the user to act again - it is not a completed
+    // action and not a refusal either, so it must not render as the success
+    // (emerald/CircleCheck) or error (red/CircleX) tone.
+    mockFormOverrides = {
+      testResult: { tone: "warning", message: "Connected, but this server answered no health data." },
+    };
+    const props = createDefaultProps();
+    const { queryByText, getByTestId } = render(React.createElement(ConnectionModal, props));
+    expect(queryByText("Connected, but this server answered no health data.")).not.toBeNull();
+    const banner = getByTestId("connection-test-result");
+    expect(banner.getAttribute("data-tone")).toBe("warning");
   });
 
   // ── 22. isTesting shows spinner state ─────────────────────────────────
@@ -597,6 +633,53 @@ describe("ConnectionModal", () => {
     const props = createDefaultProps();
     const { queryByText } = render(React.createElement(ConnectionModal, props));
     expect(queryByText(/postgres:\/\//)).not.toBeNull();
+  });
+
+  // ── 29b. verify-system is offered, and says what it verifies (D26) ──────
+
+  test("the SSL mode row offers verify-system and selecting it reaches the form", () => {
+    mockFormOverrides = { showSSL: true };
+    const props = createDefaultProps();
+    const { getByText } = render(React.createElement(ConnectionModal, props));
+
+    const button = getByText("verify-system").closest("button");
+    expect(button).not.toBeNull();
+    fireEvent.click(button as HTMLButtonElement);
+    expect(mockSetSSLMode).toHaveBeenCalledWith("verify-system");
+  });
+
+  // The copy is the whole point of the mode: a user who cannot tell it from verify-ca will
+  // go looking for the CA file it does not need. Each mode gets its own sentence, so the
+  // panel says what the selected one verifies rather than only naming it.
+  test("each SSL mode explains what it verifies", () => {
+    mockFormOverrides = { showSSL: true, sslMode: "verify-system" };
+    const { queryByTestId } = render(React.createElement(ConnectionModal, createDefaultProps()));
+    expect(queryByTestId("ssl-mode-hint")?.textContent).toContain("system trust store");
+    expect(queryByTestId("ssl-mode-hint")?.textContent).toContain("no certificate");
+  });
+
+  test("the hint for require says it checks nothing", () => {
+    mockFormOverrides = { showSSL: true, sslMode: "require" };
+    const { queryByTestId } = render(React.createElement(ConnectionModal, createDefaultProps()));
+    expect(queryByTestId("ssl-mode-hint")?.textContent).toContain("Encrypts but verifies nothing");
+  });
+
+  test("the hint for disable says the traffic is plaintext", () => {
+    mockFormOverrides = { showSSL: true, sslMode: "disable" };
+    const { queryByTestId } = render(React.createElement(ConnectionModal, createDefaultProps()));
+    expect(queryByTestId("ssl-mode-hint")?.textContent).toContain("Plaintext");
+  });
+
+  test("the hints for verify-ca and verify-full both name the pasted CA", () => {
+    mockFormOverrides = { showSSL: true, sslMode: "verify-ca" };
+    const ca = render(React.createElement(ConnectionModal, createDefaultProps()));
+    expect(ca.queryByTestId("ssl-mode-hint")?.textContent).toContain("CA certificate below");
+    ca.unmount();
+
+    mockFormOverrides = { showSSL: true, sslMode: "verify-full" };
+    const full = render(React.createElement(ConnectionModal, createDefaultProps()));
+    expect(full.queryByTestId("ssl-mode-hint")?.textContent).toContain("CA certificate below");
+    expect(full.queryByTestId("ssl-mode-hint")?.textContent).toContain("names the host you typed");
   });
 
   // ── 30. SSL section for verify-ca shows client cert fields ─────────────
@@ -682,6 +765,54 @@ describe("ConnectionModal", () => {
     expect(uriInput!.placeholder).toContain("couchbase://");
   });
 
+  // ── an addressing input exists exactly where a value is written ──────────
+  //
+  // `connectionFields` decides what `buildConnection` saves. The modal used to draw
+  // Username and Database for every networked engine regardless, so four engines asked
+  // for a value that was then discarded on save - a box that collects nothing is the UI
+  // form of reporting an absence as a measurement.
+
+  test("libSQL renders neither a Username nor a Database box, because it takes neither", () => {
+    // libSQL authenticates with a token the server minted - it has no user names at all -
+    // and addresses the whole database by URL. Its `connectionFields` say so, and nothing
+    // carried either box's value before this.
+    mockFormOverrides = { type: "libsql" };
+    const props = createDefaultProps();
+    const { container } = render(React.createElement(ConnectionModal, props));
+
+    expect(container.querySelector("#user")).toBeNull();
+    expect(container.querySelector("#database")).toBeNull();
+    // Not a blanket removal: the engine is still addressed, and still takes a credential.
+    expect(container.querySelector("#host")).not.toBeNull();
+    expect(container.querySelector("#password")).not.toBeNull();
+  });
+
+  test.each(["druid", "elasticsearch", "opensearch"] as const)(
+    "%s renders a Username but no Database box, matching what it takes",
+    (type) => {
+      // These three authenticate with HTTP Basic - their transports build the header from
+      // `config.user` - and name the datasource or index in the statement instead of on
+      // the connection. So exactly one of the two boxes belongs.
+      mockFormOverrides = { type };
+      const props = createDefaultProps();
+      const { container } = render(React.createElement(ConnectionModal, props));
+
+      expect(container.querySelector("#user")).not.toBeNull();
+      expect(container.querySelector("#database")).toBeNull();
+    },
+  );
+
+  test("redis renders a Username box, because its provider authenticates with one", () => {
+    // The Redis 6 ACL user. #502 taught the provider to send it to ioredis as `username`,
+    // measured on both arms, and the box has to be here for a value to reach it.
+    mockFormOverrides = { type: "redis" };
+    const props = createDefaultProps();
+    const { container } = render(React.createElement(ConnectionModal, props));
+
+    expect(container.querySelector("#user")).not.toBeNull();
+    expect(container.querySelector("#database")).not.toBeNull();
+  });
+
   test("non-Couchbase types keep the Database Name label", () => {
     const props = createDefaultProps();
     const { queryByText } = render(React.createElement(ConnectionModal, props));
@@ -727,6 +858,32 @@ describe("ConnectionModal", () => {
 
     expect(queryByText("Catalog Name")).toBeNull();
     expect(queryByText(/refuses a password over plain HTTP/)).toBeNull();
+  });
+
+  // ── 34b-bis. libSQL asks for a TOKEN, and says where one comes from ───────
+  //
+  // libSQL has no user names at all: the credential a server checks is a JWT it
+  // minted, so the shared `password` field holds a token here. A field labelled
+  // Password invites a password no libSQL server has, and a self-hosted server
+  // started without authentication takes none at all - both measured on sqld 0.24.33
+  // and on Turso Cloud, 2026-08-27.
+
+  test("libSQL type labels the password field Auth Token and says where one comes from", () => {
+    mockFormOverrides = { type: "libsql" };
+    const props = createDefaultProps();
+    const { queryByText } = render(React.createElement(ConnectionModal, props));
+
+    expect(queryByText("Auth Token")).not.toBeNull();
+    expect(queryByText("Password")).toBeNull();
+    expect(queryByText(/turso db tokens create/)).not.toBeNull();
+  });
+
+  test("no other type is asked for an Auth Token", () => {
+    const props = createDefaultProps();
+    const { queryByText } = render(React.createElement(ConnectionModal, props));
+
+    expect(queryByText("Auth Token")).toBeNull();
+    expect(queryByText(/turso db tokens create/)).toBeNull();
   });
 
   // ── 34c. Cassandra asks for the one field its driver cannot start without ──

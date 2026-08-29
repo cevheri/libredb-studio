@@ -640,6 +640,17 @@ export class PostgresProvider extends SQLBaseProvider {
       // BEGIN / COMMIT / ROLLBACK over one held pool client (`beginTransaction()` below).
       supportsTransactions: true,
       maintenanceOperations: ["vacuum", "analyze", "reindex", "kill"],
+      // Every statement below has both forms - `VACUUM ANALYZE <table>` and bare
+      // `VACUUM ANALYZE`, `REINDEX TABLE <table>` and `REINDEX DATABASE` - so
+      // PostgreSQL is the engine whose per-row and global controls were both already
+      // right, and declaring them changes nothing here (#496). `kill` takes a backend
+      // PID, which only the Sessions panel can supply.
+      maintenanceOperationSpecs: {
+        vacuum: { label: "Vacuum Table", perEntity: true, global: true },
+        analyze: { label: "Analyze Table", perEntity: true, global: true },
+        reindex: { label: "Reindex Table", perEntity: true, global: true },
+        kill: { label: "Terminate Backend", perEntity: false, global: false },
+      },
     };
   }
 
@@ -647,7 +658,7 @@ export class PostgresProvider extends SQLBaseProvider {
    * Only the global reindex triad; every other label is the SQL default and right.
    *
    * The Operations tab's reindex card was hardcoded to this wording for every engine
-   * (#U6), so declaring it here changes nothing on PostgreSQL and lets the two other
+   * (#464), so declaring it here changes nothing on PostgreSQL and lets the two other
    * providers that declare `reindex` say what theirs does instead.
    */
   public override getLabels(): ProviderLabels {
@@ -790,7 +801,11 @@ export class PostgresProvider extends SQLBaseProvider {
       if (connSSL.mode === "disable") return false;
 
       const ssl: Record<string, unknown> = {
-        rejectUnauthorized: connSSL.mode === "verify-ca" || connSSL.mode === "verify-full",
+        // Every mode except `require` verifies (D26): `verify-system` checks the chain against
+        // the trust store the runtime already has - no `ca` is set below, so Node's bundled
+        // roots decide - while `verify-ca`/`verify-full` check it against the PEM pasted into
+        // the form. `require` is the one mode that encrypts without checking anything.
+        rejectUnauthorized: connSSL.mode !== "require",
       };
 
       if (connSSL.caCert) ssl.ca = connSSL.caCert;

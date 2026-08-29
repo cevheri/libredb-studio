@@ -1,10 +1,11 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
-import { Bot, ChevronDown, ChevronRight, LoaderCircle, PencilLine, Play, Square, TriangleAlert } from "lucide-react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { Bot, ChevronDown, ChevronRight, LoaderCircle, PencilLine, Play, Square, TriangleAlert, X } from "lucide-react";
 import { CopyButton } from "@/components/copy-button";
 import { renderProse } from "@/components/rich-text";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import type { AgentRunConnection } from "@/hooks/use-connection-payload";
 import { isMobileViewport, useIsMobile } from "@/hooks/use-mobile";
 import { describeAgentCapability } from "@/lib/agent/capability-labels";
 /*
@@ -35,6 +36,7 @@ import {
   type AgentRunWorkflowReading,
   type AgentRunWorkflowSource,
   type AgentRunWorkflowType,
+  type AgentThreadContext,
 } from "@/lib/agent/types";
 /*
   Type-only, and deliberately so: `workflow-classifier.ts` imports the AI SDK and the
@@ -63,7 +65,7 @@ import {
   describeFailureReason,
 } from "./timeline";
 import type { AgentPrefillRequest } from "./use-agent-prefill";
-import { useAgentRun } from "./use-agent-run";
+import { useAgentRun, type AgentStartRefusalCode } from "./use-agent-run";
 
 /**
  * The standalone agent rail (#329 T10a).
@@ -93,8 +95,15 @@ import { useAgentRun } from "./use-agent-run";
  */
 
 export interface AgentRailProps {
-  /** The run's connection, already narrowed to a server-resolvable id, or null. */
-  readonly connectionId: string | null;
+  /**
+   * The run's connection, already narrowed to a server-resolvable id — or, when there
+   * is none, the reason there is none. `null` when no connection is selected at all.
+   *
+   * The reason is carried rather than derived here because only the shell knows it: the
+   * two absences look identical from this component ("no id"), and they are not the same
+   * sentence to a user (B37).
+   */
+  readonly connectionId: AgentRunConnection | null;
   readonly connectionName: string | null;
   /** Below `md` only: whether the sheet presentation is open. */
   readonly sheetOpen?: boolean;
@@ -336,6 +345,103 @@ function refusalActionText(planModeOffered: boolean, streamingDisproved: boolean
     return "This endpoint answered without streaming, and plan mode reads the same stream, so it would produce nothing here either. A different model, or an endpoint that streams, is what gets an answer.";
   }
   return "A different model, one that passes the probe, is what gets a run that reads the database.";
+}
+
+/** The card's own paragraph, pointed at by the error line's `aria-describedby`. */
+const ENGINE_UNSUPPORTED_REASON_ID = "agent-engine-unsupported-reason";
+
+/**
+ * Typed rather than compared inline, so the comparison below is checked against the
+ * hook's admit list: a code renamed there stops compiling here instead of silently
+ * matching nothing and restoring the duplicated paragraph.
+ */
+const ENGINE_UNSUPPORTED_CODE: AgentStartRefusalCode = "engine-unsupported";
+
+/**
+ * A refused start, said in the register an error line owes: what happened to the REQUEST,
+ * and a pointer to the explanation the panel is already showing (#513).
+ *
+ * It states no engine fact of its own on purpose. The card above is the one author of
+ * that fact - it is `posture.ts`, verbatim - and a third phrasing beside it is the defect
+ * this replaces, not a fix for it.
+ *
+ * Measured in Chrome on 2026-08-27: the paragraph is 406 characters, and a refused start
+ * put it on screen twice - once as the card's standing explanation and once as the
+ * outcome of the action just taken. Twice VISIBLY, which is the count this removes one
+ * from: `SafetyStrip` renders a third copy in `agent-safety-claim` on every render, and
+ * that one stays. It is `sr-only` until the ⓘ is opened and is the mode pill's
+ * `aria-describedby` target, so it is a description rather than a reading - but it IS in
+ * the accessibility tree, so a screen-reader user meets the paragraph twice at the moment
+ * of refusal even now, as the description of the mode pill and as the card the error line
+ * points at. That is the trade: "the notice above" is meaningless without a pointer, and
+ * a pointer at a paragraph is what makes the short line honest.
+ */
+const ENGINE_REFUSAL_CONSEQUENCE = "No run was opened. The notice above says why, and what still runs on this engine.";
+
+/** Every reason the conversation strip has a sentence for, the rail's own included. */
+type ThreadDeclineReason = NonNullable<AgentThreadContext["declined"]> | "connection-dropped";
+
+/**
+ * Which sentence the conversation strip says, and `null` when it says nothing.
+ *
+ * An exhaustive `switch` with NO `default`, and both halves of that are load-bearing.
+ * The declared `string | null` return means a reason added to
+ * `AgentThreadContext.declined` with no case here at all fails `bun run typecheck`
+ * (TS2366, measured in-tree on a fifth member) instead of falling through to whichever
+ * arm happened to be last. Each arm being its own line then means an arm no test drives
+ * fails the 100% line gate.
+ *
+ * Neither gate covers the fifth reason FOLDED onto an existing arm, and that is the
+ * likely shape: a bare `case` label adds no executable line, so `typecheck` passes, the
+ * line gate reads 100%, and the new code renders a sentence no test has ever seen
+ * (measured 2026-08-27 — `"rotated"` folded onto the shared `unavailable`/`error`
+ * return: typecheck clean, 254 pass, this file still 100.00% lines). What closes that is
+ * in the test file: `DECLINE_SENTENCES` is a `Record` over the union, so a member with no
+ * entry is a TS2741 there whatever arm it is folded onto.
+ *
+ * The four arms were one nested ternary until #513 (SonarCloud `typescript:S3358`), and
+ * the cosmetic complaint was not the finding: a single covered line covered all four, so
+ * the gate read 100% while the fourth sentence's only assertion was a two-word
+ * `toContain` riding on a test about `previousRunId`. A `default` clause would take the
+ * TS2366 enforcement away again, so there is none, and `typescript:S131` on this switch
+ * is to be argued down rather than satisfied.
+ *
+ * The rail's own reason wins, because it is the specific one: a connection the user
+ * moved is deliberate and correct, while the server's `unavailable` collapses five
+ * causes it may not tell apart.
+ */
+function threadDeclineNotice(input: {
+  readonly connectionDropped: boolean;
+  readonly declined: AgentThreadContext["declined"];
+}): string | null {
+  const reason: ThreadDeclineReason | undefined = input.connectionDropped ? "connection-dropped" : input.declined;
+  if (reason === undefined) return null;
+  switch (reason) {
+    case "connection-dropped":
+      return "Connection changed, so this question started a new conversation.";
+    case "disabled":
+      return "Conversation context is switched off on this server, so every question starts on its own.";
+    /*
+      Says what the server measured and no more. What it compared is the connection's
+      fingerprint - server, database, role, tunnel - so the copy says "re-pointed" rather
+      than naming the database, which is only one of the four things that can have moved.
+
+      The second half is scope, and it is scope because the decline is a ONE-QUESTION
+      event: the route writes the CURRENT identity onto the run it opens here
+      (`route.ts`, the `connectionIdentity` field of the `start` call), and an ordinary
+      follow-up continues THAT run (`continueTarget` in the component below), whose
+      identity matches - so the next question carries normally. An earlier draft promised
+      the opposite, that the decline persists until the connection is pointed back, and
+      it was false in both directions: nothing keeps declining, and pointing back does
+      not restore the old conversation either, because by then the run this question
+      opened is the one being followed (#512).
+    */
+    case "repointed":
+      return "This connection was re-pointed after the earlier step ran, so this question started a new conversation. Follow-ups from here continue on the connection as it points now.";
+    case "unavailable":
+    case "error":
+      return "The earlier step could not be carried into this question, so it started on its own.";
+  }
 }
 
 /**
@@ -666,8 +772,35 @@ function TimelineEntryBody({
   );
 }
 
+/**
+ * One workflow the open run can be swapped for. Its own component because the per-item
+ * handler belongs with the item rather than in the rail's render: an arrow that closes
+ * over both a `.map()` parameter and the rail's whole start chain is what costs the
+ * compiler its view of the rail's refs, and two effects below are then reported as
+ * missing dependencies they cannot legally take.
+ */
+function ChangeWorkflowButton({
+  candidate,
+  onSelect,
+}: {
+  readonly candidate: AgentRunWorkflowType;
+  readonly onSelect: (next: AgentRunWorkflowType) => void;
+}) {
+  return (
+    <button
+      type="button"
+      data-testid={`agent-change-workflow-${candidate}`}
+      aria-label={`Stop this run and open a new ${WORKFLOW_LABELS[candidate]} run`}
+      onClick={() => onSelect(candidate)}
+      className="px-2 py-0.5 rounded text-xs font-normal text-fg-muted hover:bg-fill transition-colors"
+    >
+      {WORKFLOW_LABELS[candidate]}
+    </button>
+  );
+}
+
 export function AgentRail({
-  connectionId,
+  connectionId: connection,
   connectionName,
   connectionType = null,
   sheetOpen = false,
@@ -677,6 +810,9 @@ export function AgentRail({
   onShowArtifact,
   prefill = null,
 }: AgentRailProps) {
+  // Everything below asks only "is there an id"; the reason is read once, where the
+  // caveat is written.
+  const connectionId = connection?.id ?? null;
   const [mode, setMode] = useState<AgentRunMode>("planning");
   /**
    * The workflow axis, which is now a choice the user need not make: Automatic until
@@ -731,6 +867,23 @@ export function AgentRail({
   const [replaceFailed, setReplaceFailed] = useState(false);
   /** Whether the way out of an inferred workflow is currently unfolded. */
   const [changeOpen, setChangeOpen] = useState(false);
+  /**
+   * The user has asked for the NEXT question to start a conversation of its own.
+   *
+   * It takes effect on a start that has not happened yet, so it gets a visible state
+   * line of its own: a control whose effect is delayed owes one, or the user cannot
+   * tell the click landed. `agent-change-failed` records the same lesson one control
+   * along. Cleared by the start it applied to.
+   */
+  const [startFresh, setStartFresh] = useState(false);
+  /**
+   * The last start dropped a conversation because the connection had moved.
+   *
+   * The rail's own sentence rather than the server's: it is a deliberate, correct
+   * behaviour and the rail is the layer that knows it happened, while the server's
+   * `declined: "unavailable"` collapses the five causes it may not tell apart.
+   */
+  const [connectionDropped, setConnectionDropped] = useState(false);
   /** An ask that arrived while the user was typing, waiting for them to take it. */
   const [offeredObjective, setOfferedObjective] = useState<string | null>(null);
   const run = useAgentRun();
@@ -768,9 +921,9 @@ export function AgentRail({
   const isMobile = useIsMobile();
   const wasMobile = useRef(isMobile);
   useEffect(() => {
-    // Only on a real crossing: `useIsMobile` reports false on its first render and
-    // resolves in an effect, so closing on "not mobile" alone would shut the sheet
-    // in the same commit that opened it.
+    // Only on a real crossing. `wasMobile` is seeded from the first render's answer,
+    // so closing on "not mobile" alone would shut the sheet on every desktop render,
+    // including the one that opened it.
     if (wasMobile.current && !isMobile && sheetOpen) onSheetOpenChange?.(false);
     wasMobile.current = isMobile;
   }, [isMobile, sheetOpen, onSheetOpenChange]);
@@ -790,8 +943,10 @@ export function AgentRail({
     Whether the sheet must be opened is decided HERE, from the viewport itself
     (`isMobileViewport`) rather than from `useIsMobile`. This effect runs after commit
     and only on the client, so the platform's answer is exact at the moment the ask is
-    served — while the hook seeds false and resolves in its own effect, which on a
-    narrow viewport is not a stale answer but a wrong one.
+    served. The hook answers exactly too since it moved to `useSyncExternalStore`, but
+    what it hands back is the value of the render this effect closed over, not the
+    platform's answer at the instant the effect runs. Opening the sheet is a decision
+    taken once, at that instant, so it asks the platform rather than the render.
 
     That replaced a ref recording an "owed" open, paid the next time the hook reported
     mobile. The T1 adversarial recheck showed it carried two defects (R1, R2): on a
@@ -962,6 +1117,22 @@ export function AgentRail({
    * below.
    */
   const openedOn = useRef<{ readonly id: string; readonly name: string | null } | null>(null);
+  // Read off the run rather than held here: the thread has one writer and it is the
+  // route, so what the strip renders is what was recorded on the run.
+  const threadSteps = run.thread?.steps ?? [];
+  const threadDeclined = run.thread?.declined;
+  /*
+    A conversation this browser was in and is not following any more: the stored thread id
+    while no run has opened. The hook owns the reading; the rail owns the sentence, because
+    what is lost is a rail affordance — the follow-up id it would have sent (#518).
+  */
+  const interruptedThread = run.interrupted;
+  /*
+    Computed here rather than inside the JSX guard below, and that is a coverage
+    decision as much as a readability one: under the guard, `threadDeclineNotice`'s
+    `return null` line would be unreachable and would sit uncovered forever (#513).
+  */
+  const declineNotice = threadDeclineNotice({ connectionDropped, declined: threadDeclined });
 
   /**
    * The objective the OPEN run was opened with.
@@ -1024,6 +1195,32 @@ export function AgentRail({
       return;
     }
     setReplaceFailed(false);
+    /*
+      Which run's CONVERSATION this one continues.
+
+      An ordinary follow-up continues the run that just ended. A REPLACEMENT continues
+      what the run it replaces continued — not that run, which is being thrown away:
+      `run.thread.steps` last entry IS that predecessor, and it comes off the server's
+      own record rather than off anything the browser inferred, because the thread has
+      one writer.
+
+      The id travels to the route, which re-derives the conversation from those runs'
+      own ledgers rather than trusting anything here.
+    */
+    const continueTarget = decided.replacesOpenRun
+      ? run.thread?.steps.at(-1)?.runId
+      : run.runId !== null && !LIVE_STATUSES.has(run.timeline.status)
+        ? run.runId
+        : undefined;
+    // Two reasons the rail withholds an id it has, and it OWNS both sentences: the
+    // server's `unavailable` collapses five causes it must not tell apart, while these
+    // two are deliberate and specific, so saying "could not be reached" of either
+    // would blame a failure for a choice.
+    const connectionHeld = openedOn.current?.id === decided.connection.id;
+    const droppedForConnection = continueTarget !== undefined && !connectionHeld;
+    const previousRunId = startFresh || !connectionHeld ? undefined : continueTarget;
+    setConnectionDropped(droppedForConnection);
+    setStartFresh(false);
     openedOn.current = { id: decided.connection.id, name: decided.connection.name };
     setOpenedObjective(decided.objective);
     /*
@@ -1056,6 +1253,9 @@ export function AgentRail({
       autoExecute: handover,
       objective: decided.objective,
       connectionId: decided.connection.id,
+      // Sent only when this run genuinely continues the last one; the route refuses
+      // anything else, and nothing later may change which run this one was told about.
+      ...(previousRunId === undefined ? {} : { previousRunId }),
     });
   };
 
@@ -1211,17 +1411,26 @@ export function AgentRail({
     and the timeline's first entry quotes it, so the question stays readable beside the
     run answering it.
 
-    The dependency is the run id alone, which is what makes this fire once per run:
-    `start` sets it to null and then to the id the server named, so even a server that
-    reused an id still moves the value.
+    It is adjusted DURING render against the run id the box was last emptied for, which
+    is React's own remedy for state that has to follow a changing value, rather than in
+    an effect that would commit one frame still holding the previous question and then
+    cascade a second render over it. The guard on the id is what makes it fire once per
+    run — and what stops it looping, since the render that clears the box also records
+    the run it cleared for.
   */
-  useEffect(() => {
-    if (run.runId === null) return;
-    setObjective("");
-    // An edit begun against the run that is ending here is not a state the next run
-    // inherits: the box is a summary again, of the question this new run was opened on.
-    setEditingObjective(false);
-  }, [run.runId]);
+  /** The run the box has already been emptied for; the guard the adjustment needs. */
+  const [followedRunId, setFollowedRunId] = useState<string | null>(null);
+  if (run.runId !== followedRunId) {
+    setFollowedRunId(run.runId);
+    // Only an OPENED run empties it. The id going back to null is a run ending, and the
+    // box has to be left alone through that: see the refusal case above.
+    if (run.runId !== null) {
+      setObjective("");
+      // An edit begun against the run that is ending here is not a state the next run
+      // inherits: the box is a summary again, of the question this new run was opened on.
+      setEditingObjective(false);
+    }
+  }
 
   /**
    * A run this rail is still following. The setting above is frozen for exactly as
@@ -1499,10 +1708,10 @@ export function AgentRail({
   /**
    * Whether the run is still WRITING entries, for the observer's own closure.
    *
-   * A ref rather than the value in scope because the `ResizeObserver` below is created
-   * once and holds the first render's `pinToNewest`: a status read out of that closure
-   * would be `queued` for the life of the panel. It is written in the effect that
-   * follows, never during render.
+   * A ref rather than the value in scope because `pinToNewest` below is built once —
+   * `useCallback` over empty dependencies — and the `ResizeObserver` holds that single
+   * closure for the life of the panel: a status read out of it would be `queued`
+   * forever. It is written in the effect that follows, never during render.
    */
   const timelineLive = useRef(true);
   /** The run whose answer has already been brought into view, so it happens once. */
@@ -1513,11 +1722,17 @@ export function AgentRail({
     followingTimeline.current =
       scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= TIMELINE_BOTTOM_SLACK_PX;
   };
-  const pinToNewest = () => {
+  /*
+    One identity for the life of the panel, which is what lets both the effect below and
+    the `ResizeObserver` under it name this as a dependency without re-subscribing. The
+    dependencies are honestly empty: the body reads three refs and nothing reactive, so
+    there is no value it could go stale on — that is what the refs above are FOR.
+  */
+  const pinToNewest = useCallback(() => {
     const scroller = timelineScroller.current;
     if (scroller === null || !followingTimeline.current || !timelineLive.current) return;
     scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight;
-  };
+  }, []);
 
   /*
     Following the newest entry is right while there IS a newest entry to follow, and
@@ -1558,7 +1773,11 @@ export function AgentRail({
     if (!followingTimeline.current) return;
     const scroller = timelineScroller.current;
     if (scroller !== null) scroller.scrollTop = 0;
-  }, [run.timeline.items, run.timeline.status, run.runId]);
+    // `run.timeline` rather than its `items` and `status` separately: the fold behind it
+    // allocates a fresh object and a fresh `items` array on every recompute, so the whole
+    // timeline moves in exactly the renders those two did — the same firing, named by the
+    // value the body actually reads.
+  }, [run.timeline, run.runId, pinToNewest]);
 
   useEffect(() => {
     const scroller = timelineScroller.current;
@@ -1568,7 +1787,7 @@ export function AgentRail({
     const observer = new ResizeObserver(pinToNewest);
     observer.observe(scroller);
     return () => observer.disconnect();
-  }, []);
+  }, [pinToNewest]);
 
   /*
     What reaches the database, from `posture.ts` and from nowhere else — the whole reason
@@ -1639,6 +1858,24 @@ export function AgentRail({
   */
   const engineUnsupported =
     mode === "agent" && connectionType !== null && !AGENT_EXECUTION_ENGINES.includes(connectionType);
+
+  /*
+    Whether the amber card above is ALREADY saying what the refused start would say, which
+    is the only condition under which the error line may say less (#513).
+
+    Both halves are load-bearing. The code is what makes this the engine's refusal rather
+    than one of the route's other `400`s - the mode validation, an unresolvable connection,
+    the `autoExecute` cross-check - each of which carries a sentence that is the only thing
+    this surface has to tell the user what went wrong. (The unresolvable connection also
+    carries a `code`, because it is raised below the route and answered by the shared error
+    mapper - but it is a code about configuration, not one this rail has words for, so the
+    sentence is still all it can say.) And `engineUnsupported` is what makes the pointer
+    true: the toggle stays live through a refusal, the card's own Switch to Plan
+    unmounts it, and the host may re-point `connectionType` - in every one of those the
+    line goes back to carrying the server's whole paragraph, which is then the only copy
+    on screen.
+  */
+  const engineRefusalExplained: boolean = run.errorCode === ENGINE_UNSUPPORTED_CODE && engineUnsupported;
 
   /*
     The run's scaffolding, folded away (item 7 of the redesign).
@@ -1719,6 +1956,9 @@ export function AgentRail({
       ),
   ].join(" · ");
 
+  /** The sheet is the only presentation with something to close. */
+  const inSheet = sheetOpen === true && isMobile;
+
   const content = (
     <div className="flex flex-col h-full min-h-0 bg-surface text-fg">
       <div className="flex items-center justify-between gap-2 px-3 h-9 border-b border-hairline shrink-0">
@@ -1753,6 +1993,21 @@ export function AgentRail({
             </button>
           ))}
         </div>
+        {/*
+          The sheet's own close, in the header row with everything else. `SheetContent`
+          floats one at `top-4 right-4` and this sheet is `p-0`, so that one came down on
+          top of the toggle above - see the class that hides it where the sheet is built.
+        */}
+        {inSheet && (
+          <button
+            type="button"
+            aria-label="Close agent"
+            onClick={() => onSheetOpenChange?.(false)}
+            className="p-1 rounded text-fg-tertiary hover:text-fg-bright hover:bg-fill transition-colors shrink-0"
+          >
+            <X strokeWidth={1.5} className="w-3.5 h-3.5" />
+          </button>
+        )}
       </div>
 
       {/*
@@ -1950,13 +2205,32 @@ export function AgentRail({
           )}
         </div>
 
-        {connectionId === null && (
-          <p data-testid="agent-unresolvable-connection" className="mt-2 text-xs text-amber-400/80">
-            {connectionName ?? "This connection"} cannot be rebuilt on the server: its settings live in this browser. A
-            run re-resolves its connection there after a restart, so it can only investigate a connection the server
-            holds too.
-          </p>
-        )}
+        {/*
+          Two absences, and they are not the same sentence (B37). "No id" reads as
+          "the server does not hold this connection" only when the server ANSWERED
+          with the connections it holds. When it could not read its own seed
+          configuration, nothing has been established about this connection at all —
+          and saying its settings live in this browser is false of the samples this
+          application ships and seeds itself, while sending the operator to the wrong
+          file. Which absence it is comes from the shell, because only it asked.
+        */}
+        {connectionId === null &&
+          (connection?.reason === "seed-config-unreadable" ? (
+            <p
+              data-testid="agent-seed-config-unreadable"
+              data-tone="warning"
+              className="mt-2 text-xs text-amber-400/80"
+            >
+              The server could not read its own connection configuration, so it cannot resolve a connection for a run.
+              This is not a problem with {connectionName ?? "this connection"} — the server log says what failed.
+            </p>
+          ) : (
+            <p data-testid="agent-unresolvable-connection" className="mt-2 text-xs text-amber-400/80">
+              {connectionName ?? "This connection"} cannot be rebuilt on the server: its settings live in this browser.
+              A run re-resolves its connection there after a restart, so it can only investigate a connection the server
+              holds too.
+            </p>
+          ))}
 
         {/*
           Next to the status rather than only in the timeline: the timeline scrolls
@@ -2032,6 +2306,85 @@ export function AgentRail({
           That is the one thing this affordance may not do, and it is why the field is on
           the record now (#407 review).
         */}
+        {/*
+          What conversation this run belongs to, and the way out of it.
+
+          Rendered only when there is something to say — steps to list, a decline to
+          report, or a connection change to explain. A first question has none of
+          those, and a strip that said "this question started on its own" over every
+          first question would be noise standing where a real notice has to be read.
+
+          The sentences come from different knowers, and each says only what it knows:
+          the rail owns the connection change (deliberate, and it is the layer that saw
+          it), the server owns `declined` — its own switch, an unreadable ledger, a
+          re-pointed connection, and five causes it may not tell apart under
+          `unavailable` (#512) — and the step list is the run's own
+          header.
+        */}
+        {(threadSteps.length > 0 || declineNotice !== null || interruptedThread !== null) && (
+          <div data-testid="agent-thread" className="mt-2 text-[0.625rem] text-fg-muted">
+            {/*
+              Said BEFORE the next question rather than discovered after it. A reload clears
+              the run this rail was following, so the id a follow-up would have carried is
+              gone and the next question opens a fresh conversation — which the rail used to
+              be silent about, leaving a user mid-conversation to find out from an answer
+              that had forgotten what they asked (#518).
+
+              It names the conversation and how many questions it had reached, because those
+              are the two things a person can check against the strip they were reading. It
+              does not offer to resume: the runs behind a stored thread may have been
+              evicted, so an offer this rail cannot keep would be worse than the notice.
+            */}
+            {interruptedThread !== null && (
+              <p data-testid="agent-thread-ended" className="text-amber-400/80">
+                {`The conversation this browser was in (${interruptedThread.steps} question${
+                  interruptedThread.steps === 1 ? "" : "s"
+                }, ${interruptedThread.threadId}) ended when the page reloaded. Your next question starts a new one.`}
+              </p>
+            )}
+            {threadSteps.length > 0 && (
+              <>
+                <p>
+                  {`Conversation: ${threadSteps.length} step${threadSteps.length === 1 ? "" : "s"} before this one`}
+                  <button
+                    type="button"
+                    data-testid="agent-thread-new"
+                    onClick={() => setStartFresh(true)}
+                    className="ml-1 px-1 py-0.5 rounded text-[0.625rem] text-blue-300 hover:bg-fill transition-colors"
+                  >
+                    new conversation
+                  </button>
+                </p>
+                <ol data-testid="agent-thread-steps" className="mt-1 space-y-0.5">
+                  {threadSteps.map((step, index) => (
+                    <li key={step.runId} className="flex gap-1">
+                      <span className="text-fg-subtle">{index + 1}.</span>
+                      <span className="break-words">{step.objective}</span>
+                      <span className="ml-auto font-mono text-fg-subtle truncate">{step.runId}</span>
+                    </li>
+                  ))}
+                </ol>
+              </>
+            )}
+            {startFresh && (
+              <p data-testid="agent-thread-fresh-pending" className="mt-1 text-blue-300/90">
+                Your next question will start a new conversation.
+                <button
+                  type="button"
+                  onClick={() => setStartFresh(false)}
+                  className="ml-1 px-1 py-0.5 rounded text-[0.625rem] text-blue-300 hover:bg-fill transition-colors"
+                >
+                  keep it
+                </button>
+              </p>
+            )}
+            {declineNotice !== null && (
+              <p data-testid="agent-thread-notice" className="mt-1 text-amber-400/80">
+                {declineNotice}
+              </p>
+            )}
+          </div>
+        )}
         {run.runId !== null && run.timeline.workflowSource === "inferred" && (
           <div data-testid="agent-opened-as" className="mt-2 text-[0.625rem] text-fg-muted">
             <p>
@@ -2064,16 +2417,7 @@ export function AgentRail({
                 </p>
                 <div className="mt-1 flex flex-wrap items-center gap-1">
                   {(Object.keys(WORKFLOW_LABELS) as AgentRunWorkflowType[]).map((candidate) => (
-                    <button
-                      key={candidate}
-                      type="button"
-                      data-testid={`agent-change-workflow-${candidate}`}
-                      aria-label={`Stop this run and open a new ${WORKFLOW_LABELS[candidate]} run`}
-                      onClick={() => handleChangeWorkflow(candidate)}
-                      className="px-2 py-0.5 rounded text-xs font-normal text-fg-muted hover:bg-fill transition-colors"
-                    >
-                      {WORKFLOW_LABELS[candidate]}
-                    </button>
+                    <ChangeWorkflowButton key={candidate} candidate={candidate} onSelect={handleChangeWorkflow} />
                   ))}
                 </div>
               </div>
@@ -2105,8 +2449,10 @@ export function AgentRail({
           The facts are the posture's, so this card invents nothing: the engines that DO
           have one are named from `AGENT_EXECUTION_ENGINES` rather than typed, the two
           ways forward are the two that are actually open — plan mode drafts here, and the
-          operations workflow sends no statement at all — and the run would end
-          `engine-unsupported` before its first statement.
+          operations workflow sends no statement at all — and no run would open at all.
+          (It used to say the run would END `engine-unsupported` before its first
+          statement, which was true until #512 moved the refusal from the drive to the
+          route: the start is now answered `400` and no run id exists.)
 
           It does not gate Start, and `canStart` above is where that is visible: the
           refusal belongs to the provider factory, this is a notice about it, and one
@@ -2122,7 +2468,11 @@ export function AgentRail({
               <TriangleAlert strokeWidth={1.5} className="mt-px w-3 h-3 shrink-0" aria-hidden="true" />
               {selectionPosture.title}
             </p>
-            <p data-testid="agent-engine-unsupported-reason" className="text-[0.625rem] text-amber-300/90">
+            <p
+              id={ENGINE_UNSUPPORTED_REASON_ID}
+              data-testid="agent-engine-unsupported-reason"
+              className="text-[0.625rem] text-amber-300/90"
+            >
               {selectionPosture.body}
             </p>
             <button
@@ -2275,8 +2625,18 @@ export function AgentRail({
         )}
 
         {run.error !== null && (
-          <p role="alert" data-testid="agent-error" className="mt-2 text-xs text-red-400">
-            {run.error}
+          <p
+            role="alert"
+            data-testid="agent-error"
+            className="mt-2 text-xs text-red-400"
+            /*
+              "The notice above" is a positional claim, and a positional claim is false for
+              a reader who is not looking at the panel. Set on exactly the branch where the
+              target exists, so it never points at a node that has unmounted.
+            */
+            {...(engineRefusalExplained ? { "aria-describedby": ENGINE_UNSUPPORTED_REASON_ID } : {})}
+          >
+            {engineRefusalExplained ? ENGINE_REFUSAL_CONSEQUENCE : run.error}
           </p>
         )}
       </div>
@@ -2359,10 +2719,26 @@ export function AgentRail({
                   Every ceiling is per drive, so a run resumed after a restart starts each of them again and these
                   totals can read past a single drive&apos;s ceiling. What is counted comes from the run&apos;s ledger,
                   which records less than the server charges: the schema capture&apos;s catalog reads are not itemized,
-                  a statement that failed at the database records no duration, and a completed read reports the
-                  engine&apos;s own elapsed time rather than the span the budget was charged. So a spend shown here is a
-                  floor, never a ceiling. On SQLite a statement over its timeout is refused once it returns, not
-                  interrupted while it runs.
+                  and a completed read reports the engine&apos;s own elapsed time rather than the span the budget was
+                  charged. So a spend shown here is a floor, never a ceiling.
+                  {/*
+                    The one remaining gap in the database-time figure, and it is per RUN
+                    rather than a standing claim (#512). A failed
+                    statement now records the span the tracker charged it, so a run driven
+                    by this build has nothing missing here and is told nothing — a caveat
+                    that fires on every run is one a reader stops seeing. A run folded from
+                    an OLDER ledger holds refusals with no duration on them, and the fold
+                    counts those instead of summing a zero, so this says how many rather
+                    than letting the total read as measured (#477).
+                  */}
+                  {run.timeline.statementsWithoutDuration > 0 && (
+                    <>
+                      {" "}
+                      The ledger holds no duration for {run.timeline.statementsWithoutDuration} of this run&apos;s
+                      charged statements, so that spend is not in the figure above.
+                    </>
+                  )}{" "}
+                  On SQLite a statement over its timeout is refused once it returns, not interrupted while it runs.
                 </span>
               </InfoNote>
             </span>
@@ -2512,8 +2888,7 @@ export function AgentRail({
           Said where the results are listed, and keyed on this run having stored any
           plus the HOST's ability to show one — so it appears exactly when it explains
           something: while the run is live it states the bound in advance, and once the
-          run has ended it says why the controls that were there are gone
-          (`docs/BACKLOG.md` B15).
+          run has ended it says why the controls that were there are gone.
 
           It used to live inside the report section, which meant only a run that
           composed a report ever explained itself. The runs that most need the sentence
@@ -2558,7 +2933,14 @@ export function AgentRail({
         <SheetContent
           side="bottom"
           data-testid="agent-rail-sheet"
-          className="md:hidden h-[85vh] p-0 gap-0 bg-surface border-t border-hairline-strong rounded-t-3xl overflow-hidden"
+          /*
+            `[&>button]:hidden` takes down `SheetContent`'s own floating close - its only
+            direct-child button - which is absolutely placed at `top-4 right-4` and, with
+            `p-0` here, landed on the Plan/Agent toggle. The rail renders its own in the
+            header instead. Done from the caller rather than by adding a prop to
+            `ui/sheet.tsx`, which stays as shadcn ships it.
+          */
+          className="md:hidden h-[85vh] p-0 gap-0 bg-surface border-t border-hairline-strong rounded-t-3xl overflow-hidden [&>button]:hidden"
         >
           <SheetHeader className="sr-only">
             <SheetTitle>Agent</SheetTitle>

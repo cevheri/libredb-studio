@@ -43,6 +43,33 @@ export interface ResultExportFile {
 /** The table name used when the tab's own name cannot safely be one. */
 export const FALLBACK_TABLE_NAME = "table_name";
 
+/** What the file is called when the rows on screen are the tab's own. */
+const USER_EXPORT_STEM = "query_result_export";
+/** How much of a run id the file name carries, so a long id cannot dominate it. */
+const MAX_RUN_ID_CHARS = 64;
+/** Everything a file name may not carry, collapsed to a single separator. */
+const UNNAMEABLE = /[^A-Za-z0-9_]+/g;
+
+/**
+ * What an export is saved as.
+ *
+ * A run's rows are named after the RUN, not after the tab they were read in (B34):
+ * these files leave the product, and one carrying an agent's rows that is
+ * indistinguishable from one the user ran is a file nobody can attribute later. The
+ * id is reduced to characters a file name can hold — it reaches a path, so a `/` or a
+ * `..` in it is not a naming problem — and an id that survives that as nothing at all
+ * still leaves the attribution behind, because "an agent run produced this" is the
+ * part that matters.
+ */
+export function resultExportFileName(extension: string, runId?: string): string {
+  if (runId === undefined) return `${USER_EXPORT_STEM}.${extension}`;
+  const safe = runId
+    .replace(UNNAMEABLE, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, MAX_RUN_ID_CHARS);
+  return safe === "" ? `agent_run_export.${extension}` : `agent_run_${safe}_export.${extension}`;
+}
+
 /**
  * The prefix `use-tab-manager` puts on a generated tab name — `Query 1`, `Query: users`.
  *
@@ -384,6 +411,50 @@ const STANDS_ALONE: Record<DatabaseType, readonly string[]> = {
     "datetimeoffset",
     "year",
   ],
+  // The same list, for the same measured reason: libSQL IS SQLite 3.47.0, and
+  // `pragma_table_info` there answers the declared spelling verbatim too (measured on
+  // sqld 0.24.33). Written out rather than aliased so a future divergence can be
+  // recorded in one row without touching the other.
+  libsql: [
+    "character varying",
+    "varchar",
+    "varchar2",
+    "nvarchar",
+    "nvarchar2",
+    "character",
+    "char",
+    "nchar",
+    "text",
+    "ntext",
+    "tinytext",
+    "mediumtext",
+    "longtext",
+    "clob",
+    "nclob",
+    "binary",
+    "varbinary",
+    "raw",
+    "blob",
+    "tinyblob",
+    "mediumblob",
+    "longblob",
+    "bytea",
+    "image",
+    "numeric",
+    "decimal",
+    "number",
+    "binary_double",
+    "binary_float",
+    "money",
+    "timestamp",
+    "timestamp without time zone",
+    "timestamp with time zone",
+    "datetime",
+    "datetime2",
+    "smalldatetime",
+    "datetimeoffset",
+    "year",
+  ],
   clickhouse: [
     "character varying",
     "varchar",
@@ -406,6 +477,32 @@ const STANDS_ALONE: Record<DatabaseType, readonly string[]> = {
     "timestamp",
     "datetime",
     "year",
+  ],
+  // Measured on DuckDB v1.5.5, one `CREATE TABLE probe (c <name>)` per name read back
+  // out of `duckdb_columns().data_type`. Every name here resolved to an UNNARROWED
+  // type - the seven text spellings to `VARCHAR`, the four byte ones to `BLOB`, the
+  // four moment ones to `TIMESTAMP` (and `TIMESTAMP WITH TIME ZONE` to itself).
+  //
+  // `numeric` and `decimal` are the absences that matter: DuckDB accepts both and
+  // stores `DECIMAL(18,3)`, which rounds away every value past the third decimal the
+  // column existed for - the same silent narrowing MySQL's bare `decimal` does. They
+  // are therefore re-spelled from their family rather than kept.
+  duckdb: [
+    "character varying",
+    "varchar",
+    "nvarchar",
+    "character",
+    "char",
+    "nchar",
+    "text",
+    "binary",
+    "varbinary",
+    "blob",
+    "bytea",
+    "timestamp",
+    "timestamp without time zone",
+    "timestamp with time zone",
+    "datetime",
   ],
   trino: ["varchar", "varbinary", "timestamp", "timestamp without time zone", "timestamp with time zone"],
   cassandra: ["varchar", "text", "blob", "decimal", "timestamp"],
@@ -524,6 +621,10 @@ const BINARY_LITERAL: Record<DatabaseType, BinaryLiteral> = {
   // Measured through `bun:sqlite`: `select hex(X'0102deadbeef')` -> `0102DEADBEEF`,
   // and `typeof(X'')` -> `blob` with `length(X'')` 0.
   sqlite: "standard-hex",
+  // Measured over Hrana on sqld 0.24.33: `SELECT hex(X'0102deadbeef')` answers
+  // `0102DEADBEEF`, `typeof(X'')` answers `blob` and `length(X'')` answers 0 - the
+  // same readings as the SQLite row above, taken again rather than assumed.
+  libsql: "standard-hex",
   // Trino measured on 476: `SELECT typeof(X'0102')` answers `varbinary`,
   // `to_hex(X'0102deadbeef')` answers `0102DEADBEEF`, `length(X'')` answers 0, and the
   // whole generated pair replays into the memory connector. Druid is the one row here
@@ -553,6 +654,15 @@ const BINARY_LITERAL: Record<DatabaseType, BinaryLiteral> = {
   // Measured on 26.7.1: `unhex('0102deadbeef')` into a `String` column reads back as
   // `hex(payload)` = `0102DEADBEEF` with `length(payload)` 6, and `length(unhex(''))`
   // is 0.
+  // `unhex`, and NOT `standard-hex` even though DuckDB is Postgres-shaped everywhere
+  // else in this file. Measured on v1.5.5: `X'0102'` is not a binary literal at all -
+  // `SELECT typeof(X'0102')` answers `VARCHAR` and `SELECT X'0102'` answers the five
+  // characters `x0102`, so the standard spelling PARSES and writes text where bytes
+  // belong. `unhex('0102deadbeef')` answers a real `BLOB`, and the generated pair
+  // replays: inserted into a `BLOB` column it reads back as `hex(payload)` =
+  // `0102DEADBEEF` with `octet_length(payload)` 6, and `unhex('')` inserts the
+  // zero-length blob (`octet_length` 0). `0x0102` is a parser error here.
+  duckdb: "unhex",
   clickhouse: "unhex",
   couchbase: "text",
 };
@@ -586,6 +696,79 @@ function binaryLiteral(bytes: Uint8Array, dialect: DatabaseType | undefined): st
 }
 
 /**
+ * Which Oracle conversion function a `Date` cell is written through.
+ *
+ * Oracle parses none of the literal forms a `Date` stringifies to: measured through the
+ * real export path on the Oracle Free image (`Oracle AI Database 26ai Free Release
+ * 23.26.2.0.0`), an exported `'2026-08-24T07:11:12.345Z'` is `ORA-01843: An invalid month
+ * was specified` for all three timestamp types and `ORA-01861: literal does not match
+ * format string` for a DATE, so every ordinary Oracle table with a date column produced a
+ * file that could not be replayed. The conversion function IS the literal here, the way
+ * `HEXTORAW` is for a RAW.
+ *
+ * The shape has to come from the DECLARED type, because the two shapes disagree about
+ * which fields of the `Date` are the value:
+ *
+ * - A naive `DATE`/`TIMESTAMP` reaches us as a `Date` the driver built by reading the
+ *   stored wall clock **in the Node process's zone**. Measured, a `DATE` holding
+ *   `2026-08-24 10:11:12` arrived as `2026-08-24T07:11:12.000Z` from a process at
+ *   `+03:00`. So the fields that replay it are the LOCAL ones, and writing the ISO text
+ *   would move every such value by the exporter's own offset - silently, since it still
+ *   parses.
+ * - A zoned column (`WITH TIME ZONE`, `WITH LOCAL TIME ZONE`) reaches us as the true UTC
+ *   instant, its stored offset already gone at the driver boundary
+ *   (`docs/providers/oracle.md` 5.5). `FROM_TZ(..., 'UTC')` is what keeps that instant
+ *   whatever zone the replaying session runs in: a plain `TO_TIMESTAMP` is read in the
+ *   SESSION time zone, so the same file would land on a different instant on a machine
+ *   in another zone. No offset is invented - the value comes back rendered as UTC, and
+ *   the original zone is the thing 5.5 says only the server still has.
+ *
+ * With no declared type - `columnTypes` is optional on `ResultExportSource`, and a host
+ * driving the embeddable surface may supply none - the timestamp form is the fallback:
+ * Oracle's own provider always declares (`metaData[].dbTypeName`, 5.4), the naive types
+ * are the common ones, and the fallback is the shape that is exact for them.
+ */
+type OracleDateShape = "date" | "timestamp" | "zoned";
+
+function oracleDateShape(declared: string | undefined): OracleDateShape {
+  const bare = declared?.trim().toUpperCase().replace(/\s+/g, " ") ?? "";
+  if (bare === "DATE") return "date";
+  return bare.endsWith("TIME ZONE") ? "zoned" : "timestamp";
+}
+
+/** What `source` declared for `column`, or `undefined`. */
+function declaredTypeOf(source: ResultExportSource, column: string): string | undefined {
+  // `Object.hasOwn` for the reason `sqlTypeOf` uses it: a column named `constructor`
+  // would otherwise read `Object.prototype.constructor` as its declared type.
+  const declared = source.columnTypes;
+  return declared !== undefined && Object.hasOwn(declared, column) ? declared[column] : undefined;
+}
+
+/** `value`, two digits at least, so `2026-1-2 3:4:5` never reaches a format mask. */
+function pad(value: number, width = 2): string {
+  return String(value).padStart(width, "0");
+}
+
+/**
+ * An Oracle date literal, from the LOCAL fields for a naive column and the UTC ones for
+ * a zoned column (see `oracleDateShape`).
+ *
+ * The fraction is three digits and `FF3` rather than dropped: a `Date` carries
+ * milliseconds and a `TIMESTAMP(6)` keeps them. `TO_DATE` is used for a declared `DATE`
+ * because a `DATE` has no fractional second at all - measured, a `TO_TIMESTAMP` literal
+ * inserted into a `DATE` column is accepted and silently truncated to the whole second,
+ * so nothing is lost either way and the explicit function says what the column is.
+ */
+function oracleDateLiteral(value: Date, shape: OracleDateShape): string {
+  const utc = shape === "zoned";
+  const date = `${pad(utc ? value.getUTCFullYear() : value.getFullYear(), 4)}-${pad((utc ? value.getUTCMonth() : value.getMonth()) + 1)}-${pad(utc ? value.getUTCDate() : value.getDate())}`;
+  const time = `${pad(utc ? value.getUTCHours() : value.getHours())}:${pad(utc ? value.getUTCMinutes() : value.getMinutes())}:${pad(utc ? value.getUTCSeconds() : value.getSeconds())}`;
+  if (shape === "date") return `TO_DATE('${date} ${time}', 'YYYY-MM-DD HH24:MI:SS')`;
+  const stamp = `TO_TIMESTAMP('${date} ${time}.${pad(utc ? value.getUTCMilliseconds() : value.getMilliseconds(), 3)}', 'YYYY-MM-DD HH24:MI:SS.FF3')`;
+  return utc ? `FROM_TZ(${stamp}, 'UTC')` : stamp;
+}
+
+/**
  * A value as SQL.
  *
  * Everything that is not a number, a bigint or a boolean is quoted through the
@@ -595,14 +778,17 @@ function binaryLiteral(bytes: Uint8Array, dialect: DatabaseType | undefined): st
  * be stringified to a locale-dependent form no engine parses back, and an object to
  * the literal text `[object Object]`.
  */
-function sqlValue(value: unknown, dialect: DatabaseType | undefined): string {
+function sqlValue(value: unknown, dialect: DatabaseType | undefined, oracleShape?: OracleDateShape): string {
   if (value === null || value === undefined) return "NULL";
   if (typeof value === "bigint") return String(value);
   // NaN and ±Infinity are not numbers any of these dialects accepts as a literal,
   // and `String(NaN)` would put the bare word `NaN` where a value belongs.
   if (typeof value === "number") return Number.isFinite(value) ? String(value) : "NULL";
   if (typeof value === "boolean") return String(value);
-  if (value instanceof Date) return quoteLiteral(value.toISOString(), dialect);
+  if (value instanceof Date) {
+    if (oracleShape !== undefined) return oracleDateLiteral(value, oracleShape);
+    return quoteLiteral(value.toISOString(), dialect);
+  }
   // Before the object branch, which used to write a `bytea`/`BLOB` cell as the quoted
   // text `{"type":"Buffer","data":[…]}`. Replayed into Postgres 18.4 that INSERT
   // stored 46 bytes of that JSON where six bytes belonged, and it stored them
@@ -644,8 +830,12 @@ export function buildResultExport(format: ResultExportFormat, source: ResultExpo
 
   if (format === "sql-insert") {
     if (rows.length === 0) return sql(NOTHING_TO_EXPORT.rows);
+    // Resolved once per column rather than per cell: the shape comes from the declared
+    // type, which does not change row to row.
+    const oracleShapes =
+      dialect === "oracle" ? columns.map((column) => oracleDateShape(declaredTypeOf(source, column))) : undefined;
     const statements = rows.map((row) => {
-      const values = columns.map((column) => sqlValue(cellOf(row, column), dialect));
+      const values = columns.map((column, index) => sqlValue(cellOf(row, column), dialect, oracleShapes?.[index]));
       return `INSERT INTO ${tableName} (${quotedColumns.join(", ")}) VALUES (${values.join(", ")});`;
     });
     return sql(statements.join("\n"));

@@ -448,6 +448,71 @@ services:
     # does not catch it.
 
   # ---------------------------------------------------------------------------------------
+  # libSQL server (issue #424, Phase 5). SQLite over a network: one container is the whole
+  # server, and it is the SELF-HOSTED half of the `libsql` type-id. The other half is Turso
+  # Cloud, which cannot be a compose service - it is an account - so the doc records what was
+  # measured there and this service is what anyone can repeat.
+  # ---------------------------------------------------------------------------------------
+  libsql:
+    # Pinned to the exact build the provider was live-verified against, the same rule the
+    # trino and clickhouse services follow: the refusal wording recorded in
+    # docs/providers/libsql.md ("unsupported statement: VACUUM") is a claim about sqld
+    # 0.24.33, and Turso Cloud words the identical refusal differently.
+    #
+    # The tag is needed even though `:latest` reports the same 0.24.33: measured 2026-08-27,
+    # `:latest` is a ROLLING REBUILD of that version - it answers `/version` with
+    # `sqld 0.24.33 (f8fb14f3 2026-08-11)` where `v0.24.33` answers
+    # `sqld 0.24.33 (40a151bd 2025-12-19)`, two different digests under one version number.
+    # So `:latest` is not reproducible even while the number it prints looks pinned.
+    image: ghcr.io/tursodatabase/libsql-server:v0.24.33
+    container_name: libredb-libsql
+    restart: unless-stopped
+    environment:
+      # A single primary with no replica. Without it sqld starts in a mode that expects a
+      # primary to follow, and the first write fails rather than the server failing to start.
+      SQLD_NODE: primary
+    ports:
+      # 8080 carries the Hrana HTTP API AND the version route - one port, and there is no
+      # second protocol port to publish. Mapped to 18080 so it cannot collide with the trino
+      # service above, which owns 8080 on the host.
+      - "18080:8080"
+    healthcheck:
+      # sqld's own route, and it answers WITHOUT a token - which is exactly why it is a
+      # health check and not a connection test: the provider proves the credential with
+      # `SELECT 1` instead (see connect() in the provider).
+      #
+      # Spoken through bash's /dev/tcp rather than curl, because the image ships NEITHER
+      # curl NOR wget (checked before writing this, the same way the trino service's
+      # comment says to: `command -v wget || command -v curl` answers nothing, while
+      # /bin/bash and /bin/sqld are both there). A `CMD curl` here would have marked the
+      # service permanently unhealthy while the server answered every request.
+      # `CMD bash -c`, never `CMD-SHELL`: CMD-SHELL runs /bin/sh, which is dash here, and
+      # dash has no /dev/tcp - measured, the check failed with "cannot create
+      # /dev/tcp/localhost/8080: Directory nonexistent" while the server was answering.
+      test:
+        - CMD
+        - bash
+        - -c
+        - exec 3<>/dev/tcp/localhost/8080 && printf 'GET /health HTTP/1.0\r\n\r\n' >&3 && head -1 <&3 | grep -q 200
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------------------
+  # DuckDB (issue #424) has NO service here, and that is not an oversight.
+  #
+  # It is an EMBEDDED engine: the driver is a native N-API addon this app loads into its own
+  # process, and the whole connection is a file path (or `:memory:`). There is no server to
+  # start and nothing listening on a port, so a container would have nothing to run - the same
+  # reason `sqlite` and the embedded `libredb` have no service either. The file also admits
+  # exactly ONE operating-system process, measured refused even in read-only mode, so a
+  # sidecar holding it open would lock the app out rather than help it.
+  #
+  # To repeat the live pass, build a local file instead of starting a service - see
+  # docs/providers/duckdb.md.
+  # ---------------------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------------------
   # Apache Trino (issue #424, Phase 2). One container is the whole cluster: the coordinator
   # runs the worker in-process by default, which is enough to answer every statement the
   # provider sends. Nothing else is needed to exercise it.
@@ -577,6 +642,28 @@ services:
     ports:
       - "6875:6875"
 
+  # QuestDB speaks the PostgreSQL wire protocol on 8812 and its own HTTP API on 9000.
+  #
+  # This service exists to reproduce a REFUSAL, not a working connection: QuestDB was probed
+  # on 2026-08-26 and earns no registry row, because the editor cannot run anything there -
+  # every run with a `queryId` is preceded by `SELECT pg_backend_pid()`, which QuestDB does
+  # not have. It stays here so that finding can be re-measured rather than trusted; see
+  # `docs/providers/README.md`, "Measured, and refused a row".
+  #
+  # The HTTP port is published because the fixture recipe seeds through it: QuestDB has no
+  # `psql`-friendly bulk insert, and `long_sequence()` over /exec is the documented way.
+  #
+  # PINNED to 10.0.1, which is what the 2026-08-26 probe measured. `:latest` moved during
+  # that probe run - the tag served 10.0.1 while `version()` still answers PostgreSQL 12.3,
+  # so a rolling tag would change the engine under a version string that never moves.
+  questdb:
+    image: questdb/questdb:10.0.1
+    container_name: libredb-questdb
+    profiles: ["compat"]
+    ports:
+      - "18812:8812"
+      - "19000:9000"
+
   risingwave:
     image: risingwavelabs/risingwave:latest
     container_name: libredb-risingwave
@@ -597,6 +684,51 @@ services:
       POSTGRES_DB: probe
     ports:
       - "15432:5432"
+
+  # Percona Distribution for PostgreSQL. Same reasoning as `percona-mysql` above, and the
+  # one measured difference is the opposite of that one's: this build DOES put its own name
+  # in `version()`, so the product displays it.
+  percona-postgresql:
+    image: percona/percona-distribution-postgresql:18.6
+    container_name: libredb-percona-postgresql
+    profiles: ["compat"]
+    environment:
+      POSTGRES_PASSWORD: "Probe123pass!"
+      POSTGRES_DB: probe
+    ports:
+      - "15440:5432"
+
+  # ParadeDB: PostgreSQL plus nine extensions (pg_search, pgvector, PostGIS, pg_ivm and the
+  # rest). PINNED to a RELEASE tag rather than `latest`, because `version()` names only
+  # PostgreSQL here - the tag is the only record of which ParadeDB was measured.
+  #
+  # Expect a crowded object browser: 41 objects for 2 user tables on a fresh database, and
+  # agent plan mode fails on it (B52). That is the finding, not a misconfiguration.
+  paradedb:
+    image: paradedb/paradedb:0.25.4
+    container_name: libredb-paradedb
+    profiles: ["compat"]
+    environment:
+      POSTGRES_PASSWORD: "Probe123pass!"
+      POSTGRES_DB: probe
+    ports:
+      - "15441:5432"
+
+  # OrioleDB: a storage-engine extension on PostgreSQL, and the tables a fresh database
+  # creates already use it (`default_table_access_method` is `orioledb`) - verified, since a
+  # probe against heap tables would measure PostgreSQL and not OrioleDB.
+  #
+  # The tag is a DATED NIGHTLY on purpose: the project publishes no release tags at all, so
+  # `pg18-nightly-ubuntu` moves under you. This is the build the 2026-08-27 probe measured.
+  orioledb:
+    image: orioledb/orioledb:pg18-nightly-20260824-cc35a80-ubuntu
+    container_name: libredb-orioledb
+    profiles: ["compat"]
+    environment:
+      POSTGRES_PASSWORD: "Probe123pass!"
+      POSTGRES_DB: probe
+    ports:
+      - "15442:5432"
 
   # `yugabyted` is the single-node launcher: it starts the master and the tserver in
   # one container, and --background=false keeps it in the foreground so Docker owns
@@ -684,6 +816,40 @@ services:
       timeout: 5s
       retries: 20
 
+  # Percona Server for MySQL, a drop-in build of MySQL. Nothing here is Percona-specific:
+  # the point of the entry is that the probe ran against a real one rather than assuming a
+  # drop-in behaves like the thing it drops into.
+  #
+  # PINNED to 8.4: `version()` answers a bare 8.4.11-11 there and the product name is only in
+  # `@@version_comment`, so the tag is the only durable record of which build was measured.
+  percona-mysql:
+    image: percona/percona-server:8.4
+    container_name: libredb-percona-mysql
+    profiles: ["compat"]
+    environment:
+      MYSQL_ROOT_PASSWORD: "Probe123pass!"
+    ports:
+      - "13307:3306"
+
+  # Databend serves a MySQL wire handler on 3307 (not 3306) beside its own HTTP API on 8000.
+  # Connect as `mysql` on the published 13308.
+  #
+  # It earns a `query-only` row and the reason is ours: every parameterised read answers
+  # `Prepare is not support in Databend`. So this service exists to reproduce that, and to
+  # re-measure it when the prepared-protocol question is settled.
+  #
+  # PINNED to a patch release rather than `nightly`, which is what the tag list mostly holds.
+  databend:
+    image: datafuselabs/databend:v1.2.925-patch-11
+    container_name: libredb-databend
+    profiles: ["compat"]
+    environment:
+      QUERY_DEFAULT_USER: root
+      QUERY_DEFAULT_PASSWORD: "Probe123pass!"
+    ports:
+      - "13308:3307"
+      - "18000:8000"
+
   # TiDB needs no PD and no TiKV to run here: --store=unistore is its embedded
   # single-node storage engine, so this is one container like every other entry, and
   # an empty --path keeps that store in memory. TiDB speaks the MySQL protocol on
@@ -706,6 +872,34 @@ services:
     profiles: ["compat"]
     ports:
       - "19030:9030"
+
+  # Apache Doris, the engine StarRocks above was forked from. The all-in-one image is
+  # an FE and a BE in one container and needs no cluster, so this entry is a single
+  # service like the StarRocks one.
+  #
+  # The tag is PINNED. `all-in-one-4.1.3` is what the 2026-08-26 probe measured, and
+  # Doris publishes its real build only in `@@version_comment` - `version()` answers a
+  # fictitious 5.7.99 - so a rolling tag would silently move the version this fixture
+  # reproduces while every panel kept displaying the same 5.7.99.
+  #
+  # `nofile` is raised for the same reason the OceanBase entry raises it: the BE opens
+  # a file handle per tablet and the container default of 1024 is not enough for a
+  # loaded table.
+  #
+  # `root` has no password on a fresh image. Set one before probing - the fixture
+  # recipe in docs/providers/README.md does - because the connection dialog treats an
+  # empty password as a field the user has not filled in yet.
+  doris:
+    image: apache/doris:all-in-one-4.1.3
+    container_name: libredb-doris
+    profiles: ["compat"]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "19035:9030"
+      - "18035:8030"
 
   # vttestserver is Vitess in one container: it brings up the topology, a vtctld, a
   # vtgate and a mysqld for the keyspace named in KEYSPACES, so this entry needs no
@@ -846,6 +1040,23 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  # Microsoft Garnet, the fourth RESP relative. Single container, no configuration, and it
+  # needs no password - it starts with none, like the `redis` service above.
+  #
+  # PINNED to 2.1.5: Garnet is the one relative here that publishes its own version
+  # (`garnet_version` in INFO), so the tag and the caveat about which version the product
+  # displays have to stay in step.
+  #
+  # No volume, deliberately: Garnet holds everything in memory here and a restart empties it
+  # (measured - `dbsize` 71 before a `docker stop`, 0 after), so re-run the key seeding from
+  # docs/providers/README.md rather than expecting the fixture to survive.
+  garnet:
+    image: ghcr.io/microsoft/garnet:2.1.5
+    container_name: libredb-garnet
+    profiles: ["compat"]
+    ports:
+      - "16380:6379"
 
   # -- MongoDB wire --------------------------------------------------------
 

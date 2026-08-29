@@ -33,13 +33,65 @@ let mockExecuteFn: (sql: string, params?: unknown[]) => Promise<[unknown, unknow
 type ProtocolCall = { method: "query" | "execute"; sql: string; params?: unknown[] };
 let protocolCalls: ProtocolCall[] = [];
 
+/**
+ * Statements NO MySQL-family server accepts, and the refusal each one earns. A fixture
+ * that RESOLVES one models a server that does not exist, and every test built on that
+ * fixture is then a test of the mock - which is how the health read asking for
+ * `LEFT(sql_text, 100)` passed 100% line coverage and two reviews (#512).
+ *
+ * Evaluated in `recordCall`, the ONE funnel every fixture in this file goes through -
+ * named, delegating and inline alike - so a fixture added tomorrow cannot opt out of it.
+ *
+ * Each rule is a MEASURED refusal, never a guess: a rule that refuses what a server
+ * answers is the same defect with its sign flipped. `sql_text` is not a column of
+ * `events_statements_summary_by_digest` on any build - 1054 / ER_BAD_FIELD_ERROR /
+ * 42S22 on MySQL 26.7.0, Percona Server 8.4.11-11 and MariaDB 12.3.2, with
+ * `@@performance_schema` 1 and 0 alike (see `sqlTextRefusal()` below and
+ * `docs/providers/mysql.md`).
+ *
+ * The MATCH is wider than that measurement, on purpose and worth knowing: it is a
+ * co-occurrence over the whole statement, so any statement naming the digest table and
+ * `sql_text` anywhere trips it - including one shape a real server WOULD answer, a join
+ * of the digest table against `events_statements_current`, which does have `SQL_TEXT`.
+ * Nothing `mysql.ts` emits has that shape, so the over-match costs nothing today. The
+ * day a statement does, narrow this rule to a `sql_text` reference bound to the digest
+ * table; do not add an exception, which is the sign flipped a second time.
+ *
+ * There is one rule, so this list stays in this file. Lift it to `tests/helpers/` when a
+ * SECOND engine has a measured refusal of its own - not before: the other fourteen
+ * provider test files would receive an empty rule list, which proves nothing about their
+ * fixtures and reads as coverage.
+ */
+const UNANSWERABLE_STATEMENTS: readonly { readonly why: string; readonly matches: (lowered: string) => boolean }[] = [
+  {
+    why: "events_statements_summary_by_digest has no sql_text column (ER_BAD_FIELD_ERROR 1054)",
+    matches: (lowered) => lowered.includes("events_statements_summary_by_digest") && lowered.includes("sql_text"),
+  },
+];
+
+/** A fixture answered a statement a real server refuses. Drained and asserted per test. */
+let fixtureViolations: string[] = [];
+
 function recordCall(
   method: "query" | "execute",
   sql: string,
   params?: unknown[],
 ): Promise<[unknown, unknown[] | undefined]> {
   protocolCalls.push({ method, sql, params });
-  return mockExecuteFn(sql, params);
+  const answered = mockExecuteFn(sql, params);
+  const rule = UNANSWERABLE_STATEMENTS.find((entry) => entry.matches(sql.trim().toLowerCase()));
+  if (rule === undefined) return answered;
+  // RECORDED, not thrown. `getHealth()` catches per panel, so a throw from here would
+  // arrive as a panel error that the test under way may legitimately be asserting - the
+  // unfaithfulness would be swallowed at exactly the place it did its damage. Pushing to
+  // a sink a hook drains keeps the failure attributable to the fixture instead.
+  //
+  // The `.then` also has to leave a rejection alone: a fixture that refuses correctly
+  // must stay refused, which the second test of the guard's own describe pins.
+  return answered.then((value) => {
+    fixtureViolations.push(`${rule.why} - the fixture ANSWERED it: ${sql.trim()}`);
+    return value;
+  });
 }
 
 /** The method the first statement matching `fragment` (case-insensitive) went through. */
@@ -64,12 +116,34 @@ const mockPool = {
   execute: (sql: string, params?: unknown[]) => recordCall("execute", sql, params),
 };
 
+/**
+ * The config object the provider handed `createPool`. Recorded because `buildSSLConfig` is
+ * private and its result is only observable here: a test that merely constructs the provider
+ * and asserts it did not throw passes for every SSL mode, including a wrong one.
+ */
+let lastPoolConfig: Record<string, unknown> = {};
+
+const createPool = (config: Record<string, unknown>) => {
+  lastPoolConfig = config;
+  return mockPool;
+};
+
 mock.module("mysql2/promise", () => ({
-  default: {
-    createPool: () => mockPool,
-  },
-  createPool: () => mockPool,
+  default: { createPool },
+  createPool,
 }));
+
+/**
+ * FILE SCOPE on purpose. This file has five top-level `describe`s and a hook inside one
+ * of them would leave the other four unguarded - the funnel is shared, so its assertion
+ * has to be too. Drains before asserting, so one unfaithful answer fails the one test
+ * that produced it rather than every test after it.
+ */
+afterEach(() => {
+  const violations = fixtureViolations;
+  fixtureViolations = [];
+  expect(violations).toEqual([]);
+});
 
 // Dynamic import AFTER mock is installed
 const { MySQLProvider } = await import("@/lib/db/providers/sql/mysql");
@@ -91,6 +165,37 @@ function makeMySQLConfig(overrides: Partial<DatabaseConnection> = {}): DatabaseC
     createdAt: new Date(),
     ...overrides,
   };
+}
+
+/**
+ * The refusal a real MySQL-family server answers for `sql_text` over
+ * `performance_schema.events_statements_summary_by_digest` - the one column that table
+ * does not have on any build.
+ *
+ * Every fixture here that models the digest table answers WITH THIS rather than a row,
+ * and that is the repair the test file needed (#512): a mock that answers a statement no
+ * server accepts is how the defect survived every gate. The health line asked for
+ * `LEFT(sql_text, 100)`, the fixture invented a `query` column for it, and the read looked
+ * like a working one for as long as it was only mocked. The fields are the ones `mysql2`
+ * puts on the error - measured 2026-08-27 on MySQL 26.7.0, Percona Server 8.4.11-11 and
+ * MariaDB 12.3.2, with `@@performance_schema` 1 and 0 alike:
+ *
+ *   errno=1054 code=ER_BAD_FIELD_ERROR sqlState=42S22
+ *   Unknown column 'sql_text' in 'field list'
+ *
+ * (MariaDB words the same error `Unknown column 'sql_text' in 'SELECT'`; the code, errno
+ * and SQLSTATE are identical, and nothing under test reads the wording.)
+ */
+function sqlTextRefusal(): Error & { code: string; errno: number; sqlState: string } {
+  const error = new Error("Unknown column 'sql_text' in 'field list'") as Error & {
+    code: string;
+    errno: number;
+    sqlState: string;
+  };
+  error.code = "ER_BAD_FIELD_ERROR";
+  error.errno = 1054;
+  error.sqlState = "42S22";
+  return error;
 }
 
 /**
@@ -152,13 +257,30 @@ function defaultMockExecute(sql: string): Promise<[unknown[], unknown[]]> {
   }
 
   // performance_schema.events_statements_summary_by_digest (slow queries)
+  //
+  // THE SHARED FIXTURE REFUSES `sql_text` TOO, and that is the repair this fixture
+  // needed (#512): about a hundred of the tests in this file run against this function,
+  // and while it answered a row for ANY statement over the digest table it answered the
+  // health line's `LEFT(sql_text, 100)` as readily as the real one - which is how a
+  // statement no server has ever executed passed every gate. `sqlTextRefusal()` says what
+  // a server says instead. The columns below are the aliases the real statement asks for;
+  // the former `avgTime: "12.5ms"` is gone with it, an invention of the same kind (that
+  // alias belonged to the broken health statement, and nothing reads it now).
+  //
+  // Routing every digest fixture through the one refusal helper is no longer merely
+  // prophylactic: `UNANSWERABLE_STATEMENTS` records any fixture that ANSWERS this
+  // statement, and the guard's own describe at the end of the file drives that rule with
+  // an unfaithful fixture and then asserts THIS function refuses. So deleting the two
+  // lines below fails a test by name instead of leaving the suite green.
   if (normalized.includes("events_statements_summary_by_digest")) {
+    if (normalized.includes("sql_text")) {
+      return Promise.reject(sqlTextRefusal());
+    }
     return Promise.resolve([
       [
         {
           query: "SELECT * FROM users",
           calls: "100",
-          avgTime: "12.5ms",
           query_id: "abc123",
           total_time_ms: "1250",
           avg_time_ms: "12.5",
@@ -350,13 +472,47 @@ function defaultMockExecute(sql: string): Promise<[unknown[], unknown[]]> {
     return Promise.resolve([[], []]);
   }
 
-  // ANALYZE TABLE / OPTIMIZE TABLE / CHECK TABLE
+  // ANALYZE TABLE / OPTIMIZE TABLE / CHECK TABLE answer a RESULT SET, one row per
+  // (table, message), and the verdict lives in Msg_type/Msg_text. Measured through the
+  // driver against MySQL 26.7.0 (`libredb-mysql`) on 2026-08-25:
+  //   OPTIMIZE TABLE `real1`   -> note "Table does not support optimize, doing recreate
+  //                               + analyze instead" then status "OK"
+  //   OPTIMIZE TABLE `missing` -> Error "Table 'u9t.missing' doesn't exist" then
+  //                               status "Operation failed"
+  // The empty array this used to answer is what made the "reports success when MySQL
+  // reported failure" defect untestable: no row means no verdict to read.
   if (
     normalized.startsWith("analyze table") ||
     normalized.startsWith("optimize table") ||
     normalized.startsWith("check table")
   ) {
-    return Promise.resolve([[], []]);
+    const op = normalized.split(" ")[0];
+    const named = [...sql.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
+    return Promise.resolve([
+      named.flatMap((name) =>
+        name === "missing"
+          ? [
+              { Table: `testdb.${name}`, Op: op, Msg_type: "Error", Msg_text: `Table 'testdb.${name}' doesn't exist` },
+              { Table: `testdb.${name}`, Op: op, Msg_type: "status", Msg_text: "Operation failed" },
+            ]
+          : [
+              // InnoDB has no in-place OPTIMIZE, so the server prepends this note to
+              // every optimize it does perform - a non-error row the user should see.
+              ...(op === "optimize"
+                ? [
+                    {
+                      Table: `testdb.${name}`,
+                      Op: op,
+                      Msg_type: "note",
+                      Msg_text: "Table does not support optimize, doing recreate + analyze instead",
+                    },
+                  ]
+                : []),
+              { Table: `testdb.${name}`, Op: op, Msg_type: "status", Msg_text: "OK" },
+            ],
+      ),
+      [],
+    ]);
   }
 
   // Default: generic SELECT result
@@ -398,8 +554,102 @@ function perfSchemaDisabledMockExecute(sql: string): Promise<[unknown[], unknown
     return Promise.resolve([[{ hit_ratio: null }], []]);
   }
 
+  // OFF does not remove the column list. A server with `@@performance_schema` = 0 still
+  // rejects `sql_text` over this table with ER_BAD_FIELD_ERROR - the column does not
+  // exist on any build, whatever the switch says - and answering `[[], []]` to that
+  // statement too modelled a server that does not exist: it let BOTH the working read
+  // and the broken one produce `[]`, so the off-server test could not tell them apart.
   if (normalized.includes("events_statements_summary_by_digest")) {
+    if (normalized.includes("sql_text")) {
+      return Promise.reject(sqlTextRefusal());
+    }
     return Promise.resolve([[], []]);
+  }
+
+  return defaultMockExecute(sql);
+}
+
+/**
+ * The digest table with the columns a real server gives it, and the refusal a real
+ * server answers for the one column it does not have.
+ *
+ * `defaultMockExecute` used to invent a `query`/`calls`/`avgTime` row for ANY statement
+ * over `events_statements_summary_by_digest`, which is exactly how the defect survived
+ * every gate (#512): the health line asked for `LEFT(sql_text, 100)` and the mock
+ * answered it, while no MySQL-family server will. Measured 2026-08-27 via `information_schema.columns` on
+ * MySQL 26.7.0, Percona Server 8.4.11-11 and MariaDB 12.3.2 - the digest table carries
+ * `DIGEST_TEXT`, never `SQL_TEXT` (that one belongs to `events_statements_current`,
+ * MySQL 9.4 manual 29.12.20.1 / 29.12.20.3) - and asking for it answers
+ *
+ *   errno=1054 code=ER_BAD_FIELD_ERROR sqlState=42S22
+ *   Unknown column 'sql_text' in 'field list'
+ *
+ * on all three, with `@@performance_schema` 1 or 0 alike. So this mock refuses it too.
+ */
+function digestTableMockExecute(sql: string): Promise<[unknown[], unknown[]]> {
+  const normalized = sql.trim().toLowerCase();
+
+  if (normalized.includes("events_statements_summary_by_digest")) {
+    if (normalized.includes("sql_text")) {
+      return Promise.reject(sqlTextRefusal());
+    }
+    // The two rows MySQL 26.7.0 answered on the live d32 database, verbatim: mysql2
+    // hands DECIMAL divisions back as strings, which is why the times are quoted.
+    return Promise.resolve([
+      [
+        {
+          query_id: "4a851b710602abe1a349ea94f18828aa1ebd9c71a2aca9192b19239e7e644a71",
+          query: "CREATE TABLE IF NOT EXISTS `t` ( `id` INTEGER PRIMARY KEY )",
+          calls: "1",
+          total_time_ms: "15.3182",
+          avg_time_ms: "15.3182",
+          min_time_ms: "15.3182",
+          max_time_ms: "15.3182",
+          rows_examined: "0",
+        },
+        {
+          query_id: "ce25f4e6e4f27e1f15596c115886fcd761a1bdceb78383cf698d675423e8d23a",
+          query: "SELECT COUNT ( * ) FROM `t`",
+          calls: "2",
+          total_time_ms: "4.1114",
+          avg_time_ms: "2.0557",
+          min_time_ms: "0.0622",
+          max_time_ms: "4.0492",
+          rows_examined: "0",
+        },
+      ],
+      [],
+    ]);
+  }
+
+  return defaultMockExecute(sql);
+}
+
+/**
+ * The digest table present but UNREADABLE - the grant denied on it. This is the other
+ * half of what actually reaches the failure path (the first is the schema being absent
+ * outright, below); off-ness never does, it answers 0 rows.
+ *
+ * Measured 2026-08-27 on MySQL 26.7.0 with a user granted only `SELECT ON d32.*` plus
+ * `PROCESS`:
+ *
+ *   errno=1142 code=ER_TABLEACCESS_DENIED_ERROR sqlState=42000
+ *   SELECT command denied to user 'nops'@'172.17.0.1' for table
+ *   'events_statements_summary_by_digest'
+ *
+ * Everything else that connection can read still answers, which is why this fixture
+ * delegates the rest: the point of the tests below is that ONE unreadable source costs
+ * one reading and names itself, rather than emptying a list that is then counted.
+ */
+function digestGrantDeniedMockExecute(sql: string): Promise<[unknown[], unknown[]]> {
+  if (sql.trim().toLowerCase().includes("events_statements_summary_by_digest")) {
+    const error = new Error(
+      "SELECT command denied to user 'nops'@'172.17.0.1' for table 'events_statements_summary_by_digest'",
+    ) as Error & { code: string; errno: number; sqlState: string };
+    error.code = "ER_TABLEACCESS_DENIED_ERROR";
+    error.errno = 1142;
+    error.sqlState = "42000";
+    return Promise.reject(error);
   }
 
   return defaultMockExecute(sql);
@@ -582,6 +832,35 @@ describe("MySQLProvider", () => {
   // --------------------------------------------------------------------------
 
   describe("getCapabilities()", () => {
+    // #U9: MySQL has no VACUUM at all, and every statement it does have names tables.
+    test("declares the target grammar of every maintenance operation", () => {
+      provider = new MySQLProvider(makeMySQLConfig());
+      const caps = provider.getCapabilities();
+
+      expect(caps.maintenanceOperationSpecs).toEqual({
+        analyze: { label: "Analyze Table", perEntity: true, global: true },
+        optimize: { label: "Optimize Table", perEntity: true, global: true },
+        check: { label: "Check Table", perEntity: true, global: true },
+        kill: { label: "Kill Connection", perEntity: false, global: false },
+      });
+      expect(Object.keys(caps.maintenanceOperationSpecs ?? {}).sort()).toEqual([...caps.maintenanceOperations].sort());
+      // The engine has no `vacuum`, so nothing may be offered under that name.
+      expect(caps.maintenanceOperations).not.toContain("vacuum");
+    });
+
+    test("the vacuum label names OPTIMIZE, and the surfaces send that", () => {
+      // The base default put "Vacuum Table" in the explorer's per-row menu and
+      // "Run Vacuum / Reclaim Space" on the Operations tab for an engine that has
+      // neither, and the global card was gated on the literal `vacuum`, so MySQL's
+      // own wording could never appear (#496).
+      const labels = new MySQLProvider(makeMySQLConfig()).getLabels();
+
+      expect(labels.vacuumAction).toBe("Optimize Table");
+      expect(labels.vacuumActionOperation).toBe("optimize");
+      expect(labels.vacuumGlobalLabel).toBe("Run Optimize");
+      expect(labels.vacuumGlobalTitle).toBe("Optimize Tables");
+      expect(labels.vacuumGlobalDesc).toContain("OPTIMIZE TABLE");
+    });
     test("returns correct MySQL capabilities", () => {
       provider = new MySQLProvider(makeMySQLConfig());
       const caps = provider.getCapabilities();
@@ -594,7 +873,7 @@ describe("MySQLProvider", () => {
       // `UPDATE t SET c = v WHERE pk = v` is core MySQL DML — the shape the inline
       // row editor builds (#269).
       expect(caps.supportsInlineRowEdit).toBe(true);
-      // One held connection carries the transaction, so the trio is offered (#U13).
+      // One held connection carries the transaction, so the trio is offered (#464).
       expect(caps.supportsTransactions).toBe(true);
       // Inherited from the base capabilities: this engine declares foreign keys, so
       // an empty `foreignKeys` list is a fact about the schema or the role, never
@@ -612,10 +891,10 @@ describe("MySQLProvider", () => {
   // --------------------------------------------------------------------------
 
   describe("getLabels()", () => {
-    // The only label this provider declares. Until #U12 the monitoring Queries panel
-    // told a MySQL operator to install a PostgreSQL extension; `getSlowQueries()` reads
-    // `performance_schema.events_statements_summary_by_digest` and swallows a failure
-    // into `[]`, so the Performance Schema is the switch the sentence must name.
+    // The only label this provider declares. Until #U12 the monitoring Queries panel told
+    // a MySQL operator to install a PostgreSQL extension, so the sentence has to name the
+    // source MySQL actually has:
+    // `performance_schema.events_statements_summary_by_digest`.
     test("names the Performance Schema, not a Postgres extension, as the source of query stats", () => {
       provider = new MySQLProvider(makeMySQLConfig());
       const { slowQueriesEmptyState, entityName } = provider.getLabels();
@@ -625,6 +904,25 @@ describe("MySQLProvider", () => {
       expect(slowQueriesEmptyState).not.toContain("pg_stat_statements");
       // Everything else is still the inherited SQL wording, which is right for MySQL.
       expect(entityName).toBe("Table");
+    });
+
+    // The sentence describes the source and stops. `QueriesTab` renders this ONE fixed
+    // string for every empty list whatever produced it, so it cannot be a reason carrier
+    // and must not read as one: an instruction in it is addressed to causes it cannot tell
+    // apart. It used to end "enable the Performance Schema to see them", which named the
+    // one cause that never reaches the failure path - off-ness answers 0 rows, measured -
+    // and was unactionable for the ones that do (a denied grant, a tenant with no
+    // `performance_schema` database). Those reject now and reach the panel as the server's
+    // own sentence through `PanelUnavailable`, a different string on a different branch.
+    test("the empty-state sentence gives no instruction, because it cannot know which cause emptied the list", () => {
+      provider = new MySQLProvider(makeMySQLConfig());
+      const { slowQueriesEmptyState } = provider.getLabels();
+
+      expect(slowQueriesEmptyState).not.toMatch(/enable/i);
+      expect(slowQueriesEmptyState).not.toMatch(/not available|unavailable/i);
+      // What it does say: the two things an empty list can mean once an unreadable source
+      // rejects instead of emptying.
+      expect(slowQueriesEmptyState).toContain("recorded nothing");
     });
   });
 
@@ -711,8 +1009,139 @@ describe("MySQLProvider", () => {
       // with one honest gap in it.
       expect(health.cacheHitRatio).toBe(CACHE_HIT_RATIO_UNAVAILABLE);
       expect(health.activeConnections).toBe(5);
-      expect(health.slowQueries[0].query).toBe("Performance schema not available");
+      // EMPTY, not a sentence about the Performance Schema: see the slow-query line
+      // section below and the reason recorded next to the read in `mysql.ts`. A sentence
+      // wearing a row's clothes is a fabricated measurement whatever counts it; when this
+      // was written the agent's curated health reading also forwarded the list's length,
+      // and that projection has since been removed (#513).
+      expect(health.slowQueries).toEqual([]);
       expect(Array.isArray(health.activeSessions)).toBe(true);
+    });
+
+    // ------------------------------------------------------------------------
+    // #512: the slow-query line stated a capability as absent on servers that had it
+    // ------------------------------------------------------------------------
+
+    test("the health slow-query line carries the digest rows the panel reads, not a capability sentence", async () => {
+      mockExecuteFn = digestTableMockExecute;
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      const health = await provider.getHealth();
+
+      expect(health.slowQueries).toEqual([
+        {
+          query: "CREATE TABLE IF NOT EXISTS `t` ( `id` INTEGER PRIMARY KEY )",
+          calls: 1,
+          avgTime: "15.32ms",
+        },
+        { query: "SELECT COUNT ( * ) FROM `t`", calls: 2, avgTime: "2.06ms" },
+      ]);
+    });
+
+    test("no health read names sql_text, the column the digest table does not have", async () => {
+      mockExecuteFn = digestTableMockExecute;
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      protocolCalls = [];
+      await provider.getHealth();
+
+      // The regression guard that does not depend on the mock's kindness: the mock
+      // above refuses `sql_text` the way a server does, and this asserts the provider
+      // never asks for it in the first place.
+      expect(protocolCalls.filter((c) => c.sql.toLowerCase().includes("sql_text"))).toEqual([]);
+    });
+
+    test("the health slow-query line and the Queries panel report the same statements", async () => {
+      mockExecuteFn = digestTableMockExecute;
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      const health = await provider.getHealth();
+      const panel = await provider.getSlowQueries({ limit: 5 });
+
+      // The panel beside the health line must never be able to disprove it, which is
+      // only structurally true while both come from the one digest statement.
+      expect(health.slowQueries.map((q) => q.query)).toEqual(panel.map((q) => q.query));
+      expect(health.slowQueries.map((q) => q.calls)).toEqual(panel.map((q) => q.calls));
+    });
+
+    test("the health slow-query line is empty on a server whose Performance Schema is off", async () => {
+      mockExecuteFn = perfSchemaDisabledMockExecute;
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      const health = await provider.getHealth();
+
+      // Measured 2026-08-27 on MySQL 26.7.0 started with `--performance-schema=OFF` and
+      // on MariaDB 12.3.2, which ships it off: the digest table still EXISTS and answers
+      // 0 rows rather than throwing. So off-ness never reaches the catch, and the honest
+      // reading here is no rows.
+      expect(health.slowQueries).toEqual([]);
+    });
+
+    test("the health slow-query read is the five heaviest digests with no slowness threshold", async () => {
+      mockExecuteFn = digestTableMockExecute;
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      protocolCalls = [];
+      await provider.getHealth();
+
+      const digestRead = protocolCalls.find((c) => c.sql.toLowerCase().includes("events_statements_summary_by_digest"));
+      const normalized = digestRead?.sql.trim().toLowerCase() ?? "";
+
+      // WHAT THIS LIST IS, pinned so nobody can read its length as a count of slow
+      // statements. There is no slowness predicate anywhere in the statement: the only
+      // WHERE term is the connected schema, "slow" is an ORDERING (`SUM_TIMER_WAIT
+      // DESC`), and the LIMIT is 5. So on any server with five or more digests for this
+      // schema the list is five rows whatever their times are, so `health.slowQueries.length`
+      // reports 5 forever. It saturates at the cap; it is not a count, and no threshold
+      // makes a member of it "slow". The agent's curated health reading used to forward
+      // that length to the model and no longer projects any length at all (#513), which is
+      // why this stays pinned here: the cap is a property of the statement, not of the
+      // consumer that happened to count it.
+      expect(normalized).toContain("order by sum_timer_wait desc");
+      expect(normalized.endsWith("limit 5;")).toBe(true);
+      expect(normalized.split("where")[1]?.split("order by")[0]?.trim()).toBe("schema_name = ?");
+    });
+
+    test("a denied grant on the digest table empties the health line and names itself on the panel path", async () => {
+      mockExecuteFn = digestGrantDeniedMockExecute;
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+
+      // THE HEALTH LINE DROPS THE REASON, and this asserts exactly that rather than
+      // claiming otherwise: `HealthInfo.slowQueries` is a `SlowQuery[]` with no error
+      // field, so an unreadable source is indistinguishable here from a source that
+      // measured nothing. Empty is the least-wrong shape - a row saying "Performance
+      // schema not available" was what representing it anyway looked like, and it was
+      // counted as a slow query (#512). Everything else the connection can read still
+      // answers.
+      const health = await provider.getHealth();
+      expect(health.slowQueries).toEqual([]);
+      expect(health.activeConnections).toBe(5);
+      expect(health.activeSessions).toHaveLength(2);
+
+      // The reason is not lost to the operator, because the panel path has a channel for
+      // it: `getSlowQueries()` rejects rather than swallowing, `getMonitoringData()`
+      // (src/lib/db/base-provider.ts) records the rejection under `errors.slowQueries`,
+      // and `QueriesTab` renders that through `PanelUnavailable` with the server's own
+      // sentence. Without this test the comments saying so would be assertions about
+      // nothing: before the repair `getSlowQueries()` returned `[]` here too, and then
+      // `errors.slowQueries` could never be set for MySQL at all.
+      await expect(provider.getSlowQueries()).rejects.toThrow(
+        /SELECT command denied .* for table 'events_statements_summary_by_digest'/,
+      );
+
+      const monitoring = await provider.getMonitoringData({ includeTables: false, includeIndexes: false });
+      expect(monitoring.slowQueries).toBeUndefined();
+      expect(monitoring.errors?.slowQueries).toContain("events_statements_summary_by_digest");
+      // One refused panel costs only itself.
+      expect(monitoring.overview).toBeDefined();
+      expect(monitoring.activeSessions?.length).toBe(2);
     });
   });
 
@@ -786,6 +1215,130 @@ describe("MySQLProvider", () => {
       await expect(provider.runMaintenance("vacuum" as unknown as "analyze", "users")).rejects.toThrow(
         "Unsupported maintenance type for MySQL",
       );
+    });
+
+    // ------------------------------------------------------------------------
+    // The verdict is in the RESULT SET, not in the absence of a throw
+    // ------------------------------------------------------------------------
+    // `await runStatement(conn, sql); return { success: true }` discarded the rows
+    // MySQL answers with, so a statement the server refused was reported as a
+    // completed operation and CHECK TABLE's whole purpose - its Msg_text - never
+    // reached the user. Measured through the provider against MySQL 26.7.0 on
+    // 2026-08-25: `optimize u9t` answered `{"success":true,"message":"OPTIMIZE
+    // completed successfully"}` while the server's own answer for the same statement
+    // was Error / "Table 'u9t.missing' doesn't exist" / "Operation failed".
+
+    test("check reports the engine's own verdict rather than a generic sentence", async () => {
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      const result = await provider.runMaintenance("check", "users");
+
+      expect(result.success).toBe(true);
+      // The Msg_text is the point of CHECK TABLE: "OK" here, a corruption report on a
+      // damaged table.
+      expect(result.message).toContain("OK");
+    });
+
+    test("a table MySQL says does not exist is a failure, and says why", async () => {
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      const result = await provider.runMaintenance("optimize", "missing");
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain("Table 'testdb.missing' doesn't exist");
+    });
+
+    test("check on a missing table fails too", async () => {
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      const result = await provider.runMaintenance("check", "missing");
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain("doesn't exist");
+    });
+
+    test("one failing table fails the whole-database run and names that table", async () => {
+      // The global card sends no target and the statement names every table, so a
+      // per-table Error row is the only place the failure appears.
+      mockExecuteFn = (sql: string) => {
+        if (sql.includes("SELECT TABLE_NAME")) {
+          return Promise.resolve([[{ TABLE_NAME: "users" }, { TABLE_NAME: "missing" }], []]);
+        }
+        return defaultMockExecute(sql);
+      };
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      const result = await provider.runMaintenance("optimize");
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain("testdb.missing");
+      // The table that DID optimize is not reported as a failure.
+      expect(result.message).not.toContain("testdb.users");
+    });
+
+    test("the non-error rows MySQL adds are kept, deduplicated", async () => {
+      // InnoDB prepends a note to every OPTIMIZE it performs; over many tables that
+      // note and the OK repeat once per table, which is one sentence, not forty.
+      mockExecuteFn = (sql: string) => {
+        if (sql.includes("SELECT TABLE_NAME")) {
+          return Promise.resolve([[{ TABLE_NAME: "users" }, { TABLE_NAME: "orders" }], []]);
+        }
+        return defaultMockExecute(sql);
+      };
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      const result = await provider.runMaintenance("optimize");
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain("Table does not support optimize");
+      expect(result.message).toContain("OK");
+      expect(result.message.match(/OK/g)).toHaveLength(1);
+    });
+
+    test("the whole-database form on a database with no tables runs no statement", async () => {
+      // `OPTIMIZE TABLE ${await this.getAllTablesForMaintenance(conn)}` string-joined an
+      // empty list, and MySQL answered "You have an error in your SQL syntax ... near ''"
+      // - measured through the provider against an empty database on 2026-08-25.
+      const statements: string[] = [];
+      mockExecuteFn = (sql: string) => {
+        statements.push(sql);
+        if (sql.includes("SELECT TABLE_NAME")) {
+          return Promise.resolve([[], []]);
+        }
+        return defaultMockExecute(sql);
+      };
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      const result = await provider.runMaintenance("optimize");
+
+      // Nothing to do is not a failure, and it is not a syntax error either.
+      expect(result.success).toBe(true);
+      expect(result.message).toContain("no tables");
+      expect(statements.some((sql) => sql.startsWith("OPTIMIZE TABLE"))).toBe(false);
+    });
+
+    test("a statement that answers a header rather than a result set still succeeds", async () => {
+      // KILL is the one maintenance statement here that does NOT answer a result set -
+      // mysql2 hands back a `ResultSetHeader` object - so it never reaches the row reader
+      // and keeps the generic sentence. The three that do (ANALYZE/OPTIMIZE/CHECK TABLE)
+      // always answer rows, measured on 26.7.0, which is why the reader does not have to
+      // defend against a header shape it is never given.
+      mockExecuteFn = (sql: string) => {
+        if (sql.startsWith("KILL")) {
+          return Promise.resolve([{ affectedRows: 0, warningStatus: 0 }, undefined]);
+        }
+        return defaultMockExecute(sql);
+      };
+
+      provider = new MySQLProvider(makeMySQLConfig());
+      await provider.connect();
+      const result = await provider.runMaintenance("kill", "1234");
+
+      expect(result.success).toBe(true);
+      expect(result.message).toBe("KILL completed successfully");
     });
   });
 
@@ -1300,14 +1853,35 @@ describe("MySQLProvider", () => {
       expect(provider).toBeDefined();
     });
 
-    test("explicit ssl mode disable", () => {
+    test("explicit ssl mode disable", async () => {
       provider = new MySQLProvider(
         makeMySQLConfig({
           ssl: { mode: "disable" },
         }),
       );
-      // Should not throw — ssl disabled
-      expect(provider).toBeDefined();
+      await provider.connect();
+      expect(lastPoolConfig.ssl).toBeUndefined();
+    });
+
+    // D26: the mode a pasted `?ssl=true` / `?useSSL=true` lands on. mysql2 gets
+    // `rejectUnauthorized: true` and no `ca`, which is what the driver does with `ssl: {}`
+    // itself - so the paste is honoured instead of quietly downgraded to `require`.
+    test("ssl mode verify-system verifies against the runtime trust store with no ca", async () => {
+      provider = new MySQLProvider(makeMySQLConfig({ ssl: { mode: "verify-system" } }));
+      await provider.connect();
+      expect(lastPoolConfig.ssl).toEqual({ rejectUnauthorized: true });
+    });
+
+    test("ssl mode require encrypts without checking the chain", async () => {
+      provider = new MySQLProvider(makeMySQLConfig({ ssl: { mode: "require" } }));
+      await provider.connect();
+      expect(lastPoolConfig.ssl).toEqual({ rejectUnauthorized: false });
+    });
+
+    test("ssl mode verify-ca carries the pasted CA alongside the chain check", async () => {
+      provider = new MySQLProvider(makeMySQLConfig({ ssl: { mode: "verify-ca", caCert: "ca-pem" } }));
+      await provider.connect();
+      expect(lastPoolConfig.ssl).toEqual({ rejectUnauthorized: true, ca: "ca-pem" });
     });
   });
 
@@ -1858,5 +2432,43 @@ describe("MySQLProvider wire protocol", () => {
     await running;
 
     expect(methodFor("kill query 42")).toBe("query");
+  });
+});
+
+// ============================================================================
+// The fixture-fidelity guard itself
+// ============================================================================
+
+/**
+ * `UNANSWERABLE_STATEMENTS` is a construction, and a construction nothing drives is the
+ * `toBeNull()`-after-a-testid-rename shape: `mysql.ts` no longer emits any statement
+ * naming `sql_text`, so no other test in this file can make the guard fire. These two
+ * do it directly - one with an unfaithful fixture, one with the shared one.
+ */
+describe("the mysql2 fixture-fidelity guard", () => {
+  const SQL_TEXT_DIGEST_READ =
+    "SELECT LEFT(sql_text, 100) as query, COUNT_STAR as calls FROM performance_schema.events_statements_summary_by_digest WHERE SCHEMA_NAME = ?";
+
+  test("an unfaithful fixture that answers the sql_text digest read is recorded as a violation", async () => {
+    mockExecuteFn = () => Promise.resolve([[{ query: "SELECT * FROM users", calls: "100" }], []]);
+
+    await mockConnection.execute(SQL_TEXT_DIGEST_READ, ["testdb"]);
+
+    expect(fixtureViolations).toHaveLength(1);
+    expect(fixtureViolations[0]).toContain("no sql_text column");
+    expect(fixtureViolations[0]).toContain("ANSWERED it");
+    // Drained here so the file-scope afterEach does not fail this test for the very
+    // violation it exists to produce.
+    fixtureViolations = [];
+  });
+
+  test("the SHARED fixture refuses that statement, so the guard has nothing to record", async () => {
+    mockExecuteFn = defaultMockExecute;
+
+    // `rejects` is doing two jobs: it pins the shared fixture's fidelity (reverting it
+    // to the shape that answered a row fails here), and it proves the guard's `.then`
+    // wrapper leaves a rejection a rejection rather than resolving it.
+    await expect(mockConnection.execute(SQL_TEXT_DIGEST_READ, ["testdb"])).rejects.toThrow(/Unknown column 'sql_text'/);
+    expect(fixtureViolations).toEqual([]);
   });
 });

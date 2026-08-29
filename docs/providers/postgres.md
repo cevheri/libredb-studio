@@ -210,6 +210,39 @@ const connection = {
 };
 ```
 
+#### `sslmode` in a pasted URL
+
+The paste box ([`connection-string-parser.ts`](../../src/lib/connection-string-parser.ts)) reads the
+query string, so `postgresql://host/db?sslmode=verify-full` arrives on the form with SSL Mode already
+set. `disable`, `require`, `verify-ca` and `verify-full` map one-to-one. `verify-system` is not in
+that table: it is the form's own mode name, not a libpq one, so `?sslmode=verify-system` is reported
+as a parameter we cannot honour rather than accepted.
+
+`prefer` and `allow` are **not** mapped, and neither is any spelling the map does not know. Both mean
+"encrypt if the server offers it", which no mode on the form can express, and both directions of
+guess are wrong against a live server: measured on postgres 18 with no server certificate,
+`?sslmode=prefer` connects with `pg_stat_ssl.ssl = f` while `?sslmode=require` is refused outright
+("server does not support SSL, but SSL was required"). So the mode the form already holds is left
+alone and the paste banner names the parameter it declined to act on — the string is never silently
+downgraded to "disable". Set SSL Mode yourself in the SSL / TLS panel.
+
+`?ssl=true` / `?ssl=false` (the JDBC and Heroku spelling) map to **`verify-system`** / `disable`,
+since neither is opportunistic. The rule the parser states for every boolean TLS spelling is: it maps
+onto the mode that matches what the engine's own driver does with it, never onto a weaker one. `pg`
+given `ssl: true` connects with Node's default `rejectUnauthorized: true`, so `verify-system` — chain
+and host name checked against the runtime's trust store, no PEM to paste — is that mode.
+
+This used to map to `require`, which here means `rejectUnauthorized: false` (encrypted, chain **not**
+verified), because the form had no mode that both verified and asked for nothing: `verify-ca` and
+`verify-full` are the modes that want a CA certificate, so pointing `?ssl=true` at one of them turned
+a working paste into a connection the user could not complete. `verify-system` is that missing mode
+(D26), so a Neon / Supabase / RDS URL now arrives verified and complete. Pick `verify-ca`/`verify-full`
+only when the server's certificate is signed by a CA the runtime does not already trust.
+
+`sslrootcert`, `sslcert` and `sslkey` are ignored: they are paths on the machine
+that wrote the string, while the panel holds PEM text and the process that opens the connection is the
+server. Paste the certificate content instead.
+
 ### 4.2 Connection pooling
 
 `connect()` builds a `pg.Pool` ([postgres.ts:281](../../src/lib/db/providers/sql/postgres.ts)) and
@@ -254,9 +287,14 @@ oracledb expose no pool-level `error` event at all, which is recorded at each pr
 `buildSSLConfig()` ([postgres.ts:342](../../src/lib/db/providers/sql/postgres.ts)) resolves SSL with
 this precedence:
 
-1. **Explicit `connection.ssl`** (`SSLConfig`, mode = `disable` | `require` | `verify-ca` | `verify-full`):
+1. **Explicit `connection.ssl`** (`SSLConfig`, mode = `disable` | `require` | `verify-system` |
+   `verify-ca` | `verify-full`):
    - `disable` → no SSL.
-   - `verify-ca` / `verify-full` → `rejectUnauthorized: true`; otherwise `false`.
+   - `require` → `rejectUnauthorized: false` — the ONE mode that encrypts without verifying.
+   - `verify-system` / `verify-ca` / `verify-full` → `rejectUnauthorized: true`. `verify-system`
+     passes no `ca`, so Node's own trust store checks the chain and the host name; the other two
+     verify against `caCert` when one is supplied. `pg` exposes no separate name check, so
+     `verify-ca` and `verify-full` build the same object here.
    - `caCert` / `clientCert` / `clientKey` map to `ca` / `cert` / `key`.
 2. **`options.ssl === true` or cloud auto-detect** — `shouldEnableSSL()` returns true when
    `options.ssl === true` *or* the host matches a known managed provider, enabling
@@ -527,7 +565,7 @@ disconnects without committing would otherwise hold locks indefinitely.
 `supportsTransactions: true` ([§10](#10-capabilities--labels)) is what tells the editor toolbar to
 offer BEGIN/COMMIT/ROLLBACK and the auto-rolled-back SANDBOX toggle at all. It is declared rather
 than inferred because the route's own gate is `isTransactionProvider(provider)`, a runtime shape
-check no client can read, so before `docs/BACKLOG.md` U13 those controls rendered on every
+check no client can read, so before #464 those controls rendered on every
 connection — including the ten providers that answer HTTP 400.
 
 ---
@@ -547,6 +585,33 @@ with targets quoted via [§3.6](#36-safe-maintenance-targets):
 `getCapabilities().maintenanceOperations = ['vacuum', 'analyze', 'reindex', 'kill']`. `kill`
 validates that the target parses as an integer PID.
 
+### Where each operation may be offered (`maintenanceOperationSpecs`)
+
+Declaring that an operation EXISTS is not enough to put a button on it: two engines that
+declare the same `MaintenanceType` take different kinds of target, so each provider also
+declares what its own operations may be pointed at. The monitoring Tables tab renders a
+per-row control only where `perEntity` is true, the admin Operations tab a whole-database
+card only where `global` is true, and both take the wording from `label` (#496).
+
+`POST /api/db/maintenance` reads the same declaration since #U20, and it is the one reader that
+REFUSES rather than hides: it takes the placement from whether the request carries a `target`
+(absent or empty means whole-database) and answers `400` when this provider marks that
+placement unavailable while the other one is available. On PostgreSQL it never speaks, for the
+same reason both surfaces were already right here: every declaration above is either both
+placements or neither.
+
+| Operation | Control label | Per-row | Global | Why |
+|-----------|---------------|---------|--------|-----|
+| `vacuum` | Vacuum Table | yes | yes | `VACUUM ANALYZE <t>` and bare `VACUUM ANALYZE` both exist |
+| `analyze` | Analyze Table | yes | yes | same, for `ANALYZE` |
+| `reindex` | Reindex Table | yes | yes | `REINDEX TABLE <t>` / `REINDEX DATABASE <db>` |
+| `kill` | Terminate Backend | no | no | the target is a backend PID, which only the Sessions panel lists |
+
+PostgreSQL is the engine both surfaces were already right about - every statement here has
+a one-table form and a whole-database form - so these declarations record the baseline the
+other providers are measured against rather than a change in behaviour. `vacuumAction`
+really means `vacuum` here, so `vacuumActionOperation` stays absent.
+
 ---
 
 ## 10. Capabilities & labels
@@ -563,7 +628,7 @@ Overrides the SQL base defaults:
 | `supportsExternalQueryLimiting` | `true` |
 | `supportsCreateTable` | `true` |
 | `supportsInlineRowEdit` | `true` — `UPDATE t SET c = v WHERE pk = v` is core PostgreSQL DML |
-| `supportsTransactions` | `true` — `beginTransaction()` holds one pool client and runs `BEGIN` / `COMMIT` / `ROLLBACK` on it, so the editor's transaction trio and the auto-rolled-back SANDBOX toggle are offered here (#U13) |
+| `supportsTransactions` | `true` — `beginTransaction()` holds one pool client and runs `BEGIN` / `COMMIT` / `ROLLBACK` on it, so the editor's transaction trio and the auto-rolled-back SANDBOX toggle are offered here (#464) |
 | `declaresForeignKeys` | `true` — inherited from the base capabilities; an empty `foreignKeys` list is then a fact about the schema or the reading role, never about the engine |
 | `supportsMaintenance` | `true` |
 | `maintenanceOperations` | `['vacuum', 'analyze', 'reindex', 'kill']` |
@@ -579,7 +644,7 @@ already fits.
 
 `getLabels()` is overridden for **one** triad only: the Operations tab's global Reindex card, which
 was hardcoded to *"Run Reindex"* / *"Rebuild Indexes"* / *"Reconstructs all indexes in the database."*
-for every engine (`docs/BACKLOG.md` U6). That wording was written for this engine — the global card
+for every engine (#464). That wording was written for this engine — the global card
 sends no target, so `runMaintenance('reindex')` here runs `REINDEX DATABASE`
 ([§9](#9-maintenance)) — so declaring it changes nothing on PostgreSQL and lets the two
 other providers that offer `reindex` (SQLite, Couchbase) say what theirs does instead:
@@ -909,8 +974,10 @@ await provider.disconnect();
 - **Cloud SSL auto-detect does not verify the server certificate.** When SSL is enabled by host
   heuristic (`shouldEnableSSL()`), it uses `rejectUnauthorized: false` — the connection is encrypted
   but **not authenticated**, so it is exposed to man-in-the-middle attacks. For verified TLS, set an
-  explicit `connection.ssl` with mode `verify-ca`/`verify-full` and a `caCert`. *Future:* prefer
-  verifying modes by default and treat the heuristic as encryption-only opportunistic TLS.
+  explicit `connection.ssl` with mode `verify-system` (nothing to paste — the runtime's trust store
+  checks the chain, which is what a managed provider's certificate needs) or `verify-ca`/`verify-full`
+  with a `caCert`. *Future:* prefer verifying modes by default and treat the heuristic as
+  encryption-only opportunistic TLS.
 
 ---
 

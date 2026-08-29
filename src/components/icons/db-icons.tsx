@@ -359,3 +359,63 @@ export const CassandraIcon: React.FC<IconProps> = ({ className, ...props }) => (
     <circle cx="12" cy="12" r="1.1" fill="currentColor" stroke="none" />
   </svg>
 );
+
+/**
+ * libSQL: SQLite's file, reached across a network.
+ *
+ * Deliberately not a copy of either project's logo. What distinguishes this engine
+ * from the SQLite icon above is the whole point of the id - the same store, with a
+ * server in front of it - so the mark is the document outline that icon uses with a
+ * connecting arc and an endpoint drawn to it. Single stroke at weight 1.5, like
+ * every other mark here, and it still reads at 14px.
+ */
+export const LibSQLIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <path d="M13 3H7.5A1.5 1.5 0 006 4.5v15A1.5 1.5 0 007.5 21H14" />
+    <polyline points="13 3 13 8 18 8" />
+    <path d="M9 12h4" />
+    <path d="M9 16h2.5" />
+    <path d="M17 12a4 4 0 010 8" />
+    <circle cx="19.5" cy="16" r="1.2" fill="currentColor" stroke="none" />
+  </svg>
+);
+
+/**
+ * DuckDB: an analytical store the app opens as a local file.
+ *
+ * Not a copy of the project's logo, which is a filled duck head in its own brand
+ * yellow. This is the house idiom instead - one stroke at weight 1.5 - and what it
+ * draws is the two halves of the id rather than the brand: a duck's head and bill
+ * above a database cylinder, because the engine is a database FILE this process
+ * opens and not a server it dials. The cylinder is what tells it apart from the
+ * SQLite document outline above; the head is what tells it apart from every other
+ * cylinder on the page. It still reads at 14px, where the eye is the only fill.
+ */
+export const DuckDBIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <circle cx="17.3" cy="6" r="3" />
+    <polyline points="14.4 5 10.4 6 14.1 7.7" />
+    <path d="M15.3 8.4 13.9 10.2" />
+    <ellipse cx="9" cy="12" rx="5" ry="2" />
+    <path d="M4 12v5.2c0 1.1 2.2 2 5 2s5-.9 5-2V12" />
+    <circle cx="18.3" cy="5.2" r="0.85" fill="currentColor" stroke="none" />
+  </svg>
+);

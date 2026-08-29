@@ -261,6 +261,26 @@ describe("MonitoringDashboard", () => {
     expect(queryByText("PG Dev")).not.toBeNull();
   });
 
+  test("falls back to the first connection when the saved active id is not in the list", async () => {
+    // The stored active connection can name something that no longer exists -
+    // it was deleted, or the seed that served it is gone. The dashboard must
+    // still open on a connection rather than on the empty state.
+    const storageModule = await import("@/lib/storage");
+    const storageRecord = storageModule.storage as unknown as Record<string, unknown>;
+    const originalGetActiveConnectionId = storageRecord.getActiveConnectionId;
+    storageRecord.getActiveConnectionId = mock(() => "gone");
+
+    let renderResult: ReturnType<typeof render>;
+    await act(async () => {
+      renderResult = render(<MonitoringDashboard />);
+    });
+    const { queryByText } = renderResult!;
+
+    expect(queryByText("PG Dev")).not.toBeNull();
+
+    storageRecord.getActiveConnectionId = originalGetActiveConnectionId;
+  });
+
   test("shows 7 tab triggers", async () => {
     let renderResult: ReturnType<typeof render>;
     await act(async () => {
@@ -422,7 +442,7 @@ describe("MonitoringDashboard", () => {
 
   test("hands the selected connection's own labels to the queries tab", async () => {
     // Without this the "Slowest Queries" empty state can only be Postgres's: the tab
-    // holds the copy, but only the dashboard has the provider metadata (#U12).
+    // holds the copy, but only the dashboard has the provider metadata (#463).
     const user = userEvent.setup();
     queriesTabProps.length = 0;
 

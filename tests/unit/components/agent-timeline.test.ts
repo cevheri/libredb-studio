@@ -147,7 +147,7 @@ describe("foldLedgerEntries", () => {
 
   /*
     The two causes of one profile refusal, each pinned to the sentence a user reads
-    (docs/BACKLOG.md B47). Both used to render the engine sentence, so a PostgreSQL
+    (#459). Both used to render the engine sentence, so a PostgreSQL
     run whose agent credential no longer decrypted was told its engine offers no
     read-only execution profile.
   */
@@ -189,6 +189,45 @@ describe("foldLedgerEntries", () => {
     that says the run stopped without a cited report — which is the difference
     between "succeeded" and "answered".
   */
+  test("the rail names the model that drove the run, and never the document behind it", () => {
+    /*
+      Two halves, and the second is the one worth having.
+
+      SHOWN: which model produced a run was not visible anywhere in this interface. For somebody
+      running several local models it is the first thing they want to know about a run they are
+      reading back, and the ledger now carries it.
+
+      NOT SHOWN: the tuning provenance the same event carries. Its digest is an auditing detail —
+      it answers "which settings drove this" for whoever deploys the server, and that reader has
+      `GET /api/agent/config`. Asserted as an absence rather than trusted to the mapping, which is
+      how the path would have been caught had it stayed on the event at all.
+    */
+    const view = foldLedgerEntries([
+      OPENED,
+      event({ kind: "event", event: { kind: "run-started", atMs: 2, mode: "agent" } }),
+      event({
+        kind: "event",
+        event: {
+          kind: "driver-resolved",
+          atMs: 3,
+          modelId: "qwen3:8b",
+          provider: "ollama",
+          tuning: { origin: "operator", digest: "c".repeat(64) },
+        },
+      }),
+    ]);
+
+    const driver = view.items.at(-1);
+    expect(driver?.headline).toBe("Driven by qwen3:8b");
+    expect(driver?.chrome).toBe(true);
+    expect(driver?.tone).toBe("neutral");
+    // The digest is the whole of what the event carries about the document now — the path was
+    // removed from the event itself, because this record is served to the run's owner and a
+    // server path is not theirs. The rail still must not print the digest: it identifies a
+    // deployment's configuration and answers a question the user did not ask.
+    expect(JSON.stringify(view.items)).not.toContain("c".repeat(64));
+  });
+
   test("the model's closing prose becomes an entry of its own", () => {
     const view = foldLedgerEntries([
       OPENED,
@@ -890,6 +929,134 @@ describe("foldLedgerEntries", () => {
   });
 
   /*
+    The capture that was REFUSED (B54).
+
+    It reads as a capture that did not happen rather than as a failure of the run: an
+    ungrounded run continues, and on the engines this server cannot ground that is its
+    ordinary state. What must never appear is a count — "0 tables" would be this
+    component stating a fact about the database from an event that measured nothing.
+  */
+  test("a refused capture says so, and names the row budget when that is what refused it", () => {
+    const view = foldLedgerEntries([
+      event({
+        kind: "event",
+        event: {
+          kind: "context-unavailable",
+          atMs: 3,
+          reasonCode: "CATALOG_READ_REFUSED",
+          detail: "The columns inventory was refused.",
+          rowBudget: { projected: 536, allowed: 200 },
+        },
+      }),
+    ]);
+
+    expect(view.items[0].headline).toBe("Schema not captured");
+    expect(view.items[0].detail).toBe("CATALOG_READ_REFUSED — 536 rows read against a bound of 200");
+    // Chrome, like the successful capture beside it: it is the run's own scaffolding
+    // rather than something the run found.
+    expect(view.items[0].chrome).toBe(true);
+    // And it is NOT a capture. The fold's `capture` field is what other surfaces read as
+    // the provenance of an answer, and a refusal is provenance for nothing.
+    expect(view.capture).toBeNull();
+  });
+
+  /*
+    The inventory the run REUSED (B56).
+
+    `heldSnapshotForConnection` has no expiry, so a plan run can be grounded on a reading
+    taken before the user added the collection they are asking about — and such a run's
+    ledger used to carry no context entry at all, which reads as a run that needed no
+    grounding. The age is what the line exists to say.
+  */
+  test("a reused inventory says so, in the engine's own word, with the age of the reading", () => {
+    const view = foldLedgerEntries([
+      event({
+        kind: "event",
+        event: {
+          kind: "context-reused",
+          atMs: 3,
+          fingerprint: "abcdef1234",
+          tableCount: 17,
+          ageMs: 3 * 3_600_000 + 90_000,
+          noun: { singular: "key pattern", plural: "key patterns" },
+        },
+      }),
+    ]);
+
+    expect(view.items[0].headline).toBe("Schema reused");
+    expect(view.items[0].detail).toBe("17 key patterns, fingerprint abcdef12, read by an earlier run and 3 hours old");
+    // It IS provenance: the run reasoned over this inventory, so the surfaces that state
+    // where an answer came from read it exactly as they read a capture.
+    expect(view.capture).toEqual({
+      fingerprint: "abcdef1234",
+      tableCount: 17,
+      noun: { singular: "key pattern", plural: "key patterns" },
+    });
+    // And it charged nothing, which is the fact rather than an omission: the reuse is why
+    // no catalog read happened.
+    expect(view.budget.map((entry) => entry.used)).toEqual([0, 0, 0]);
+  });
+
+  test("a reused inventory with no noun on it is described in the default word", () => {
+    // A ledger written before the noun was recorded reads as it always read.
+    const view = foldLedgerEntries([
+      event({
+        kind: "event",
+        event: { kind: "context-reused", atMs: 3, fingerprint: "abcdef1234", tableCount: 1, ageMs: 0 },
+      }),
+    ]);
+
+    expect(view.items[0].detail).toBe("1 table, fingerprint abcdef12, read by an earlier run and under a minute old");
+  });
+
+  /*
+    The age, in the coarsest unit that is still true. Every step rounds DOWN, so the line
+    cannot claim a reading is older than it is — and under a minute is said in words,
+    because a reading taken in this same drive is not a stale one.
+  */
+  test.each([
+    [0, "under a minute old"],
+    [59_999, "under a minute old"],
+    [60_000, "1 minute old"],
+    [119_000, "1 minute old"],
+    [120_000, "2 minutes old"],
+    [3_599_999, "59 minutes old"],
+    [3_600_000, "1 hour old"],
+    [7_200_000, "2 hours old"],
+    [86_399_999, "23 hours old"],
+    [86_400_000, "1 day old"],
+    [172_800_000, "2 days old"],
+  ])("an age of %ims reads as %s", (ageMs, said) => {
+    const view = foldLedgerEntries([
+      event({
+        kind: "event",
+        event: { kind: "context-reused", atMs: 3, fingerprint: "abcdef1234", tableCount: 2, ageMs },
+      }),
+    ]);
+
+    expect(view.items[0].detail).toBe(`2 tables, fingerprint abcdef12, read by an earlier run and ${said}`);
+  });
+
+  test("a refused capture with no budget in it shows the reason alone", () => {
+    // The other refusal family — a provider that cannot describe itself — where there is
+    // no bound to name. The entry states the reason and stops, rather than printing a
+    // pair of zeros (#477).
+    const view = foldLedgerEntries([
+      event({
+        kind: "event",
+        event: {
+          kind: "context-unavailable",
+          atMs: 3,
+          reasonCode: "PROVIDER_INVENTORY_TIMED_OUT",
+          detail: "This database did not describe its own schema in time.",
+        },
+      }),
+    ]);
+
+    expect(view.items[0].detail).toBe("PROVIDER_INVENTORY_TIMED_OUT");
+  });
+
+  /*
     The word the timeline calls the inventory's rows by (#414).
 
     The prompt half of this was fixed first, and a live drive against a seeded Redis
@@ -1410,6 +1577,79 @@ describe("foldLedgerEntries — the budget meter", () => {
     expect(view.budget.map((entry) => entry.used)).toEqual([0, 0, 0]);
   });
 
+  /**
+   * The schema capture's own spend (B13).
+   *
+   * Its catalog reads reach the execution layer through `captureContextSnapshot` and
+   * never through `runStep`, the only writer of `tool-completed`, so the meter of a run
+   * whose first three statements were catalog reads read "0 of 20" before its first
+   * model turn.
+   */
+  test("a capture contributes the statements and the span the tracker charged it", () => {
+    const view = foldLedgerEntries([
+      OPENED,
+      event({
+        kind: "event",
+        event: {
+          kind: "context-captured",
+          atMs: 5,
+          fingerprint: "ctx_1",
+          tableCount: 3,
+          charged: { statements: 3, elapsedMs: 41 },
+        },
+      }),
+      completed("s1", "corr_1", 12),
+    ]);
+
+    expect(gauge(view, "statements").used).toBe(4);
+    expect(gauge(view, "database-time").used).toBe(53);
+    // Nothing was repaired and nothing is missing a duration: the capture measured its
+    // own span, so the caveat about missing durations has nothing to say about this run.
+    expect(gauge(view, "repairs").used).toBe(0);
+    expect(view.statementsWithoutDuration).toBe(0);
+  });
+
+  test("a REFUSED capture contributes what it paid, because the read was charged before it was answered", () => {
+    const view = foldLedgerEntries([
+      OPENED,
+      event({
+        kind: "event",
+        event: {
+          kind: "context-unavailable",
+          atMs: 5,
+          reasonCode: "CATALOG_READ_REFUSED",
+          detail: "row budget: 536 rows > 200 allowed",
+          rowBudget: { projected: 536, allowed: 200 },
+          charged: { statements: 1, elapsedMs: 18 },
+        },
+      }),
+    ]);
+
+    expect(gauge(view, "statements").used).toBe(1);
+    expect(gauge(view, "database-time").used).toBe(18);
+  });
+
+  /*
+    A ledger written before the measurement existed. It contributes nothing rather than
+    a zero: a capture whose spend nobody measured is not a free capture, and the fold has
+    no figure to state (#477). Such a run reads exactly as it always read.
+  */
+  test("a capture carrying no charge contributes nothing rather than a fabricated zero", () => {
+    const view = foldLedgerEntries([
+      OPENED,
+      event({
+        kind: "event",
+        event: { kind: "context-captured", atMs: 5, fingerprint: "ctx_1", tableCount: 3 },
+      }),
+      event({
+        kind: "event",
+        event: { kind: "context-unavailable", atMs: 6, reasonCode: "CATALOG_READ_REFUSED", detail: "denied" },
+      }),
+    ]);
+
+    expect(view.budget.map((entry) => entry.used)).toEqual([0, 0, 0]);
+  });
+
   test("a completed read costs one statement and the database time it reported", () => {
     const view = foldLedgerEntries([completed("s1", "corr_1", 12), completed("s2", "corr_2", 30)]);
 
@@ -1433,9 +1673,163 @@ describe("foldLedgerEntries — the budget meter", () => {
 
     expect(gauge(view, "statements").used).toBe(1);
     expect(gauge(view, "repairs").used).toBe(1);
-    // The ledger records no duration for a statement that failed, so the meter
-    // does not invent one — the caveat beside it is what says so.
+    /*
+      An entry with no duration on it — the shape every refusal had before #512, and
+      the shape a ledger written by an older build still holds: every entry written
+      before the refusal here carries one, and every hand-written fixture. The meter adds nothing for it
+      rather than a zero — a zero would say this statement cost the database no time,
+      which is not what the absence records — and the run is COUNTED as holding an
+      unmeasured statement, so the rail can say so rather than presenting a total it
+      cannot stand behind (#477).
+    */
     expect(gauge(view, "database-time").used).toBe(0);
+    expect(view.statementsWithoutDuration).toBe(1);
+  });
+
+  /**
+   * Since #512 a failed statement carries the span the tracker charged it. The tracker
+   * charges a failed execution's elapsed time against `maxTotalRunMs` exactly as it
+   * charges a completed one's, so a meter that skipped it reported less than the bound
+   * the server was enforcing.
+   */
+  test("a failed statement that recorded its duration is counted, like the read that succeeded", () => {
+    const view = foldLedgerEntries([
+      completed("s1", "corr_1", 12),
+      event({
+        kind: "event",
+        event: {
+          kind: "tool-refused",
+          atMs: 8,
+          stepId: "s2",
+          refusal: {
+            class: "database-error",
+            statementFingerprint: "fp1",
+            message: 'relation "custmers"',
+            elapsedMs: 30,
+          },
+        },
+      }),
+    ]);
+
+    expect(gauge(view, "statements").used).toBe(2);
+    expect(gauge(view, "database-time").used).toBe(42);
+    // Nothing is unmeasured on this run, so the rail owes it no such sentence.
+    expect(view.statementsWithoutDuration).toBe(0);
+  });
+
+  /**
+   * A MEASURED zero is a measurement, and `0` is the one duration that can be mistaken for
+   * an absence: the fold asks `refusal.elapsedMs === undefined`, and rewriting that as a
+   * truthiness check would move a statement the tracker charged 0 ms into the count of
+   * statements that recorded nothing - a refusal reported as "we do not know" about a span
+   * the server does know. The two tests above separate `undefined` from `30`, which a
+   * falsy check passes either way, so neither of them can see that inversion.
+   */
+  test("a failed statement charged zero milliseconds is measured, not counted as unmeasured", () => {
+    const view = foldLedgerEntries([
+      completed("s1", "corr_1", 12),
+      event({
+        kind: "event",
+        event: {
+          kind: "tool-refused",
+          atMs: 8,
+          stepId: "s2",
+          refusal: {
+            class: "reading-refused",
+            reasonCode: "READING_OVER_BUDGET",
+            elapsedMs: 0,
+          },
+        },
+      }),
+    ]);
+
+    expect(gauge(view, "statements").used).toBe(2);
+    // 12 + 0: the zero is added as a span, which is why the sum does not move.
+    expect(gauge(view, "database-time").used).toBe(12);
+    expect(view.statementsWithoutDuration).toBe(0);
+  });
+
+  /**
+   * The same sum, but reached the way the rail really reaches it. Every other test in
+   * this describe folds object literals, and the only fixture here that carried a
+   * duration through `parseLedgerLine` is a `tool-completed` — so `refusal.elapsedMs`
+   * was never pinned across the NDJSON the run store is written as.
+   *
+   * It does survive today: `run-service.ts` puts the whole `settlement.refusal` on the
+   * `tool-refused` event, and `parseLedgerLine` validates `kind` and then casts, so it
+   * narrows nothing. This is the assertion that would notice if either end ever started
+   * dropping fields it does not name.
+   */
+  test("a refusal's duration survives the NDJSON line the ledger is actually written as", () => {
+    const refused = event({
+      kind: "event",
+      event: {
+        kind: "tool-refused",
+        atMs: 8,
+        stepId: "s2",
+        refusal: {
+          class: "database-error",
+          statementFingerprint: "fp1",
+          message: 'relation "custmers"',
+          elapsedMs: 30,
+        },
+      },
+    });
+
+    const parsed = [completed("s1", "corr_1", 12), refused]
+      .map((entry) => parseLedgerLine(JSON.stringify(entry)))
+      .filter((entry): entry is AgentLedgerEntry => entry !== null);
+
+    // Non-vacuous: a line dropped by the parser would leave a shorter list and a
+    // smaller sum that this length check catches first.
+    expect(parsed).toHaveLength(2);
+    expect(parsed[1]).toEqual(refused);
+    expect(gauge(foldLedgerEntries(parsed), "database-time").used).toBe(42);
+  });
+
+  /**
+   * The refused operational reading is charged the same way and for the same reason:
+   * it is decided inside the invoke callback, after `beginExecution`, so the tracker
+   * has already charged whatever the provider method spent getting there.
+   */
+  test("a refused reading's recorded duration is counted too", () => {
+    const view = foldLedgerEntries([
+      event({
+        kind: "event",
+        event: {
+          kind: "tool-refused",
+          atMs: 8,
+          stepId: "s1",
+          refusal: { class: "reading-refused", reasonCode: "READING_OVER_BUDGET", elapsedMs: 9 },
+        },
+      }),
+    ]);
+
+    expect(gauge(view, "statements").used).toBe(1);
+    expect(gauge(view, "database-time").used).toBe(9);
+    expect(gauge(view, "repairs").used).toBe(0);
+    expect(view.statementsWithoutDuration).toBe(0);
+  });
+
+  /**
+   * A refusal that charged NOTHING must not be reported as an unmeasured spend: the
+   * pipeline returned before `beginExecution`, so there is no missing duration to
+   * confess — the absence is the truth, not a gap in the record.
+   */
+  test("a denial is not an unmeasured spend, because nothing was charged", () => {
+    const view = foldLedgerEntries([
+      event({
+        kind: "event",
+        event: {
+          kind: "tool-refused",
+          atMs: 8,
+          stepId: "s1",
+          refusal: { class: "policy-denied", reasonCode: "ROLE_FORBIDDEN" },
+        },
+      }),
+    ]);
+
+    expect(view.statementsWithoutDuration).toBe(0);
   });
 
   test("a policy denial and an approval requirement cost nothing, because nothing ran", () => {
@@ -1469,7 +1863,8 @@ describe("foldLedgerEntries — the budget meter", () => {
    * provider, which `tools.ts` accounts as a spent statement even though nothing
    * ran. The fold charges neither, because the ledger cannot tell them apart and a
    * meter that guessed would be the one figure here that is not an enforced value.
-   * The second case is a known under-count, recorded as `docs/BACKLOG.md` B13.
+   * The second case is a known under-count, and a deliberate one: the ledger cannot
+   * tell it apart from an interruption, so the fold declines to guess.
    */
   /**
    * A ceiling is per drive (`docs/BACKLOG.md` B6) while the ledger spans every
@@ -2550,6 +2945,34 @@ describe("an answer reads as the app's decision, with the model's caption quoted
       expect(view.items[1]?.detail ?? "").not.toContain("finished looking at the tables");
     });
 
+    /*
+      A held delivery is ONE entry, and this is what keeps it that way (B51). The notice id
+      is a field on the hold rather than a second `guidance-issued` beside it, because two
+      entries for one delivery would render twice in the rail — and the entry the ledger
+      needs is the one that says the call was not run.
+    */
+    test("a held call names its notice on the ledger and still renders as one line", () => {
+      const view = foldLedgerEntries([
+        OPENED,
+        event({
+          kind: "event",
+          event: {
+            kind: "call-held",
+            atMs: 6_000,
+            tool: "compose_report",
+            reason: "Cite the reading you took.",
+            notice: "cite-what-you-read",
+          },
+        }),
+      ]);
+
+      expect(view.items).toHaveLength(2);
+      expect(view.items[1]?.headline).toBe("Held back compose_report");
+      // The prose the model was sent, which is what a reader needs; the id is for the fold
+      // that bounds the notice across a resume, not for the line.
+      expect(view.items[1]?.detail).toBe("Cite the reading you took.");
+    });
+
     test("a notice the drive issued is shown, so a reminded run does not read as an idle one", () => {
       const view = foldLedgerEntries([
         OPENED,
@@ -2558,6 +2981,34 @@ describe("an answer reads as the app's decision, with the model's caption quoted
 
       expect(view.items).toHaveLength(2);
       expect(`${view.items[1]?.headline} ${view.items[1]?.detail}`.length).toBeGreaterThan(0);
+    });
+
+    test.each([
+      "report-reminder",
+      "plan-statement",
+      "report-reserve",
+      "unread-stop",
+      // The three delivered as a tool result (B51). They reach a reader through the
+      // `call-held` entry, so these ids only render here for a ledger written by a build
+      // that recorded one this way — and a headline map with no word for an id it can be
+      // handed renders `undefined` at the top of a timeline item.
+      "present-before-report",
+      "cite-what-you-read",
+      "compare-before-report",
+    ] as const)("the %s notice reads as a sentence rather than as its own event name", (notice) => {
+      /*
+          Every notice at once, because the headline map is DATA: a missing entry renders
+          `undefined` at the top of a timeline item and the line still counts as covered the
+          moment the module loads. Only rendering each one asks the question.
+        */
+      const view = foldLedgerEntries([
+        OPENED,
+        event({ kind: "event", event: { kind: "guidance-issued", atMs: 6_000, notice } }),
+      ]);
+
+      const headline = view.items[1]?.headline ?? "";
+      expect(headline.length).toBeGreaterThan(0);
+      expect(headline).not.toContain(notice);
     });
   });
 

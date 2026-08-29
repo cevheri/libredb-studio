@@ -1,5 +1,6 @@
 import { describe, test, expect, spyOn } from "bun:test";
 import { BaseDatabaseProvider } from "@/lib/db/base-provider";
+import { maintenanceControl } from "@/lib/db/types";
 import { AuthenticationError, ConnectionError, DatabaseConfigError, DatabaseError } from "@/lib/db/errors";
 import type {
   DatabaseConnection,
@@ -228,7 +229,7 @@ describe("BaseDatabaseProvider", () => {
       // The opposite default to the line above, and deliberately: this class
       // implements no transaction methods, so a subclass that does not add them has
       // none and POST /api/db/transaction refuses the call. Only the four providers
-      // that hold a session for one declare `true` (#U13).
+      // that hold a session for one declare `true` (#464).
       expect(caps.supportsTransactions).toBe(false);
       // Compile-time pin, checked by `bun run typecheck`: `ProviderCapabilities` is
       // published (`src/exports/types.ts`), so a capability added later must be
@@ -295,7 +296,7 @@ describe("BaseDatabaseProvider", () => {
       // required field added after the fact stops every external implementer of the
       // type compiling. Only the three providers that declare the `reindex`
       // maintenance operation set it, and `OperationsTab` falls back to the wording
-      // the card had (#U6). The literal below is the compile-time half of that,
+      // the card had (#464). The literal below is the compile-time half of that,
       // checked by `bun run typecheck`.
       const externalImplementer: ProviderLabels = {
         entityName: "Node",
@@ -467,6 +468,9 @@ describe("BaseDatabaseProvider", () => {
   // ─── getConnectionInfo ────────────────────────────────────────────────
 
   describe("getConnectionInfo", () => {
+    const infoFor = (connectionString: string) =>
+      new TestProvider(makeConfig({ connectionString })).callGetConnectionInfo();
+
     test("returns host:port/database when no connectionString", () => {
       const provider = new TestProvider(makeConfig());
       const info = provider.callGetConnectionInfo();
@@ -482,6 +486,180 @@ describe("BaseDatabaseProvider", () => {
       expect(info).not.toContain("s3cret");
       expect(info).toContain(":***@");
       expect(info).toContain("db.example.com");
+    });
+
+    // A connection string does not always carry its credential in the authority. libSQL
+    // passes the whole token as a query parameter, and libpq accepts `password`/`sslkey`
+    // there too, so each shape below is one the authority-only mask used to let through.
+
+    test("masks an authToken carried in the query string", () => {
+      const info = infoFor("libsql://db-org.turso.io?authToken=eyJhbGciOiJFZERTQSJ9.payload.signature");
+
+      expect(info).not.toContain("eyJhbGciOiJFZERTQSJ9");
+      expect(info).toBe("libsql://db-org.turso.io?authToken=***");
+    });
+
+    test("matches credential parameter names case-insensitively", () => {
+      expect(infoFor("libsql://host?AUTHTOKEN=abc")).toBe("libsql://host?AUTHTOKEN=***");
+      expect(infoFor("postgres://host/db?PassWord=abc")).toBe("postgres://host/db?PassWord=***");
+    });
+
+    test("masks every credential parameter when several appear in one string", () => {
+      const info = infoFor("postgres://host/db?sslmode=verify-full&password=pw&sslkey=/client.pem&token=tk");
+
+      expect(info).toBe("postgres://host/db?sslmode=verify-full&password=***&sslkey=***&token=***");
+    });
+
+    test("masks a bracketed IPv6 authority without disturbing the brackets", () => {
+      // The authority parse finds the credential at the LAST `@` and the password at the
+      // authority's FIRST `:`. An IPv6 host puts colons inside `[...]`, which is the shape
+      // that would break a naive first-`:`-to-first-`@` mask. It does not break this one,
+      // and these pin why: with a credential the mask lands before the brackets, and with
+      // no credential the colons inside them are left alone rather than read as a password
+      // boundary - there is no `@`, so nothing is masked.
+      expect(infoFor("postgres://user:pw@[::1]:5432/db")).toBe("postgres://user:***@[::1]:5432/db");
+      expect(infoFor("postgres://user:pw@[2001:db8::1]:5432/db")).toBe("postgres://user:***@[2001:db8::1]:5432/db");
+      expect(infoFor("postgres://[::1]:5432/db")).toBe("postgres://[::1]:5432/db");
+      expect(infoFor("redis://[2001:db8::1]:6379")).toBe("redis://[2001:db8::1]:6379");
+      // An `@` in the password, with an IPv6 host behind it: masked whole, as elsewhere.
+      expect(infoFor("postgres://user:p@ss@[::1]:5432/db")).toBe("postgres://user:***@[::1]:5432/db");
+      // User name and no password, and an empty password: both verbatim, as they are for a
+      // named host - '***' over a value the string never carried would assert a secret.
+      expect(infoFor("postgres://user@[::1]:5432/db")).toBe("postgres://user@[::1]:5432/db");
+      expect(infoFor("postgres://user:@[::1]:5432/db")).toBe("postgres://user:@[::1]:5432/db");
+    });
+
+    test("the known limit: a bracketed host in the userinfo position is mangled", () => {
+      // Recorded rather than fixed. `postgres://[::1]:5432@host/db` is not a URI any driver
+      // or connection form produces - an IPv6 host cannot be followed by `@host` - and the
+      // parse reads the bracket's first `:` as the password boundary. Bracket-awareness
+      // would be a branch with no real caller, so the boundary is written down instead of
+      // being left for someone to rediscover as a defect.
+      expect(infoFor("postgres://[::1]:5432@host/db")).toBe("postgres://[:***@host/db");
+    });
+
+    test("masks a credential in the authority and in the query string together", () => {
+      const info = infoFor("libsql://admin:s3cret@db-org.turso.io?authToken=jwt");
+
+      expect(info).toBe("libsql://admin:***@db-org.turso.io?authToken=***");
+    });
+
+    test("masks a credential value whole, url-encoded or containing '='", () => {
+      expect(infoFor("libsql://host?authToken=a%2Fb%3Dc")).toBe("libsql://host?authToken=***");
+      // Base64 padding puts a literal '=' inside the value; it must not end the value.
+      expect(infoFor("libsql://host?authToken=YWJj==&mode=ro")).toBe("libsql://host?authToken=***&mode=ro");
+    });
+
+    test("leaves an empty credential value empty rather than inventing a redaction", () => {
+      // '***' over a value that was never there would assert a secret the string does
+      // not carry, which is the absence rule wearing a redaction's clothes.
+      expect(infoFor("libsql://host?authToken=&mode=ro")).toBe("libsql://host?authToken=&mode=ro");
+    });
+
+    test("over-redacts a parameter whose name merely contains a credential word", () => {
+      // Deliberate. A driver spelling we have not seen is far more costly to miss than a
+      // non-secret is to hide, and the second case here is exactly why: `sslpassword` is
+      // a real libpq keyword that an exact-name list would have leaked.
+      expect(infoFor("libsql://host?tokenLifetime=3600")).toBe("libsql://host?tokenLifetime=***");
+      expect(infoFor("postgres://host/db?sslpassword=pw")).toBe("postgres://host/db?sslpassword=***");
+    });
+
+    test("leaves a non-credential parameter whose value contains a credential word intact", () => {
+      // The name is matched between a delimiter and '=', so a credential word sitting in
+      // somebody else's value neither triggers a mask nor mangles the string.
+      expect(infoFor("postgres://host/db?applicationName=my-password-app")).toBe(
+        "postgres://host/db?applicationName=my-password-app",
+      );
+      expect(infoFor("postgres://host/db?options=-c%20statement_timeout=5s")).toBe(
+        "postgres://host/db?options=-c%20statement_timeout=5s",
+      );
+    });
+
+    test("masks a semicolon-delimited credential in a string that is not a valid URL", () => {
+      // An ADO-style SQL Server string has no query string and no scheme, so a redaction
+      // built on URL parsing would throw on it instead of masking it.
+      expect(infoFor("Server=localhost,1433;Database=db;User Id=sa;Password=P4ssw0rd")).toBe(
+        "Server=localhost,1433;Database=db;User Id=sa;Password=***",
+      );
+    });
+
+    test("does not mistake an '@' outside the authority for userinfo", () => {
+      // ':' + text + '@' also occurs in a path and in a parameter value; masking there
+      // would destroy the host the reader needs and redact nothing secret.
+      expect(infoFor("postgres://host:5432/tenant@acme")).toBe("postgres://host:5432/tenant@acme");
+      expect(infoFor("mongodb://host/db?replicaSet=rs:0@node")).toBe("mongodb://host/db?replicaSet=rs:0@node");
+    });
+
+    // An ADO-style string orders its parameters arbitrarily, so the credential is as
+    // likely to lead as to trail. Matching a name only AFTER a delimiter returned the
+    // leading one verbatim, which is the shape a review of this round measured leaking.
+    test.each([
+      ["Password=P4ssw0rd;Server=host", "Password=***;Server=host"],
+      // Deliberately not JWT-shaped. The realistic libSQL token is pinned above, in the
+      // query-string position where it belongs; here the POSITION is the subject, so a
+      // high-entropy literal would buy nothing and trips the secret scanner's
+      // generic-api-key rule (measured: entropy 3.98 in this exact `name=value;` shape).
+      ["authToken=leading-token-value;Server=host", "authToken=***;Server=host"],
+      ["SslKey=/etc/client.pem;Server=host", "SslKey=***;Server=host"],
+      ["ClientSecret=s3cr3t;Server=host", "ClientSecret=***;Server=host"],
+    ])("masks %s, whose credential leads the string", (given, expected) => {
+      expect(infoFor(given)).toBe(expected);
+    });
+
+    test("masks a password containing an unencoded '@'", () => {
+      // The authority is parsed, and the credential ends at the LAST '@' inside it: '@' is
+      // a legal password character while a host name cannot hold one. A single-'@' pattern
+      // left everything after the first one in the clear.
+      expect(infoFor("postgres://user:p@ss@db.example.com/mydb")).toBe("postgres://user:***@db.example.com/mydb");
+      expect(infoFor("mongodb://admin:a@b@c@cluster0.example.com:27017/db")).toBe(
+        "mongodb://admin:***@cluster0.example.com:27017/db",
+      );
+    });
+
+    test("masks an authority that no delimiter follows", () => {
+      // Nothing bounds the authority on the right here, so its end is the end of the
+      // string; a parse that required a '/' would return this password verbatim.
+      expect(infoFor("postgres://user:s3cret@db.example.com")).toBe("postgres://user:***@db.example.com");
+    });
+
+    test.each([
+      // RFC 3986 wants each of these percent-encoded in userinfo, and each one ENDS the
+      // authority - so the '@' falls outside it and the parse sees no credential. Pinned
+      // so the gap is visible rather than assumed closed. '/' is why: the path-holding
+      // '@' pinned above (`postgres://host:5432/tenant@acme`) has the identical shape, and
+      // hiding a port behind a `***` that asserts a credential the string never carried is
+      // the worse error of the two.
+      ["postgres://user:p/w@db.example.com/mydb"],
+      ["postgres://user:p?w@db.example.com/mydb"],
+      ["postgres://user:p#w@db.example.com/mydb"],
+    ])("leaves %s unmasked, which is the documented limit", (given) => {
+      expect(infoFor(given)).toBe(given);
+    });
+
+    test("masks the authority of a string whose scheme carries its own prefix", () => {
+      // A JDBC-style URL puts a second scheme in front. Anchoring the userinfo to the
+      // START of the string rather than to '://' would leave this password in the clear.
+      expect(infoFor("jdbc:postgresql://user:s3cret@host/db")).toBe("jdbc:postgresql://user:***@host/db");
+    });
+
+    test("leaves an authority that carries no credential exactly as it was", () => {
+      // A user name with no password, and a ':'+text+'@' that lives in the path. Neither
+      // holds a secret, so replacing either would cost the reader the host or the user
+      // and hide nothing - and a mask that eats the '//' is how a scheme goes missing.
+      expect(infoFor("postgres://user@db.example.com/mydb")).toBe("postgres://user@db.example.com/mydb");
+      expect(infoFor("postgres://host/db:owner@example.com")).toBe("postgres://host/db:owner@example.com");
+      // The ':' here belongs to the PORT, which sits after the '@'. Masking from the
+      // authority's first ':' without checking that it precedes the '@' would replace the
+      // user name and the host with one '***'.
+      expect(infoFor("postgres://user@db.example.com:5432/mydb")).toBe("postgres://user@db.example.com:5432/mydb");
+      // An empty password stays empty, as it does in the parameter half.
+      expect(infoFor("postgres://user:@db.example.com/mydb")).toBe("postgres://user:@db.example.com/mydb");
+    });
+
+    test("masks a credential a fragment delimits", () => {
+      // '#' bounds a parameter the same way '&' does, so a credential written after one
+      // must not swallow the rest of the string into its value.
+      expect(infoFor("libsql://host?mode=ro#authToken=jwt")).toBe("libsql://host?mode=ro#authToken=***");
     });
   });
 
@@ -774,5 +952,90 @@ describe("getMonitoringData partial failures", () => {
 
     expect(data.slowQueries).toBeUndefined();
     expect(data.errors?.slowQueries).toBe("slow log unavailable");
+  });
+});
+
+// ============================================================================
+// maintenanceControl() — the one gate both maintenance surfaces ask (#496)
+// ============================================================================
+
+describe("maintenanceControl", () => {
+  const caps = (overrides: Partial<ProviderCapabilities> = {}): ProviderCapabilities =>
+    ({
+      supportsMaintenance: true,
+      maintenanceOperations: ["vacuum", "analyze"],
+      ...overrides,
+    }) as ProviderCapabilities;
+
+  test("undefined capabilities are a denial, not a permission", () => {
+    // /api/db/provider-meta answers with nothing both while it is in flight and when
+    // it failed, and failing open there is what put the dead buttons on the very
+    // connections the #272/#282 gates exist for.
+    expect(maintenanceControl(undefined, "vacuum", "perEntity")).toEqual({ offered: false });
+    expect(maintenanceControl(undefined, "vacuum", "global")).toEqual({ offered: false });
+  });
+
+  test("an engine with no maintenance offers nothing in either placement", () => {
+    const cassandraShaped = caps({ supportsMaintenance: false, maintenanceOperations: [] });
+
+    expect(maintenanceControl(cassandraShaped, "vacuum", "perEntity").offered).toBe(false);
+    expect(maintenanceControl(cassandraShaped, "analyze", "global").offered).toBe(false);
+  });
+
+  test("an operation the provider does not declare is never offered", () => {
+    expect(maintenanceControl(caps(), "reindex", "perEntity").offered).toBe(false);
+    expect(maintenanceControl(caps(), "reindex", "global").offered).toBe(false);
+  });
+
+  test("no spec means both placements under the CALLER's wording", () => {
+    // The compatibility promise `maintenanceOperationSpecs` was made optional for:
+    // an implementation that declares nothing behaves exactly as it did before #U9,
+    // and gets no label of its own, so the surface keeps its generic verb.
+    expect(maintenanceControl(caps(), "vacuum", "perEntity")).toEqual({ offered: true });
+    expect(maintenanceControl(caps(), "vacuum", "global")).toEqual({ offered: true });
+  });
+
+  test("a spec decides each placement independently and names the control", () => {
+    const sqliteShaped = caps({
+      maintenanceOperations: ["vacuum", "analyze"],
+      maintenanceOperationSpecs: {
+        vacuum: { label: "Vacuum Database", perEntity: false, global: true },
+        analyze: { label: "Analyze Table", perEntity: true, global: true },
+      },
+    });
+
+    expect(maintenanceControl(sqliteShaped, "vacuum", "perEntity")).toEqual({
+      offered: false,
+      label: "Vacuum Database",
+    });
+    expect(maintenanceControl(sqliteShaped, "vacuum", "global")).toEqual({
+      offered: true,
+      label: "Vacuum Database",
+    });
+    expect(maintenanceControl(sqliteShaped, "analyze", "perEntity")).toEqual({
+      offered: true,
+      label: "Analyze Table",
+    });
+  });
+
+  test("an operation whose target is a session id is offered in neither placement", () => {
+    const withKill = caps({
+      maintenanceOperations: ["kill"],
+      maintenanceOperationSpecs: { kill: { label: "Terminate Backend", perEntity: false, global: false } },
+    });
+
+    expect(maintenanceControl(withKill, "kill", "perEntity").offered).toBe(false);
+    expect(maintenanceControl(withKill, "kill", "global").offered).toBe(false);
+  });
+
+  test("a spec for an operation the provider does not declare cannot resurrect it", () => {
+    // The two lists can drift; `maintenanceOperations` stays the authority, because
+    // /api/db/maintenance validates against it and answers 400 for anything else.
+    const drifted = caps({
+      maintenanceOperations: ["analyze"],
+      maintenanceOperationSpecs: { vacuum: { label: "Vacuum Table", perEntity: true, global: true } },
+    });
+
+    expect(maintenanceControl(drifted, "vacuum", "perEntity").offered).toBe(false);
   });
 });

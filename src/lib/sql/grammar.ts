@@ -103,6 +103,25 @@ export interface SqlGrammar {
    * literal out of ordinary code.
    */
   readonly alternateQuoting: boolean;
+  /**
+   * Whether `//` opens a line comment.
+   *
+   * A form some dialects simply HAVE rather than a disagreement about a character,
+   * the same shape of question as `alternateQuoting` - except that two unrelated
+   * engines have this one: CQL and ClickHouse both read `//` to the end of the line,
+   * and everywhere else those two characters are refused outright or - in
+   * PostgreSQL, where `//` is a real operator NAME - are code the server tries to
+   * resolve.
+   *
+   * It is the fact this record said it could not carry, and the splitter is where
+   * that cost was live rather than merely inconvenient. A comment is what a `;` can
+   * hide inside, `statement-splitter.ts` reads its boundaries through `spans.ts`,
+   * and `/api/db/multi-query` RUNS every fragment the splitter returns - so on the
+   * two engines that have the form, `SELECT … // note; DROP …` was cut into a read
+   * and a bare DROP out of text the server reads as one statement. Measured, not
+   * argued: the probes are quoted on the rows below and in `grammar.test.ts`.
+   */
+  readonly doubleSlashComment: boolean;
 }
 
 /**
@@ -121,6 +140,7 @@ export const DEFAULT_SQL_GRAMMAR: SqlGrammar = {
   bracket: "quoted-identifier",
   blockComment: "flat",
   alternateQuoting: false,
+  doubleSlashComment: false,
 };
 
 /**
@@ -135,36 +155,99 @@ const MYSQL_GRAMMAR: SqlGrammar = {
   bracket: DEFAULT_SQL_GRAMMAR.bracket,
   blockComment: "flat",
   alternateQuoting: false,
+  // Probed 2026-08-25 on 26.7.0: `SELECT 1 AS a // note` is ERROR 1064, "check the
+  // manual … near '// note'". Nothing on that line is hidden.
+  doubleSlashComment: false,
 };
 const CLICKHOUSE_GRAMMAR: SqlGrammar = {
   hash: "comment",
   bracket: "subscript",
   blockComment: "nesting",
   alternateQuoting: false,
+  // A LINE comment, and the one CLICKHOUSE fact here established by probe rather than
+  // from the reference - three probes on 26.7.1 over HTTP, because "the statement still ran"
+  // cannot tell a comment from a token the parser skipped:
+  //   `SELECT 1 AS a // note`             -> 1. So the characters are accepted.
+  //   `SELECT 1 AS a // note; SELECT 999` -> 1, no error, while `SELECT 1; DROP TABLE
+  //                                         nope` is "Syntax error (Multi-statements
+  //                                         are not allowed)". So the `;` was HIDDEN.
+  //   `SELECT 1 AS a // note\n, 2 AS b`   -> TWO columns: the run ends at the
+  //                                         NEWLINE, so it is a line comment.
+  // The cost of the old reading is measurable rather than theoretical: the shared
+  // limiter appends before trailing trivia, so with `//` as code
+  // `SELECT number FROM numbers(1000) // note` was emitted as
+  // `… // note LIMIT 5` - 1000 rows returned while `wasLimited: true` was reported,
+  // the exact shape #280 exists to prevent. With the fact carried it emits
+  // `… LIMIT 5 // note` and returns 5 (both measured).
+  doubleSlashComment: true,
 };
 const POSTGRES_GRAMMAR: SqlGrammar = {
   hash: "code",
   bracket: "subscript",
   blockComment: "nesting",
   alternateQuoting: false,
+  // CODE, and the strongest of the six refusals: `SELECT 1 // 2` on 18 is "operator
+  // does not exist: integer // integer", so `//` is a real OPERATOR NAME here that
+  // merely has no implementation for those argument types - not a comment and not a
+  // syntax error. `SELECT 1 AS a // note` is "syntax error at or near \"//\"".
+  doubleSlashComment: false,
+};
+/**
+ * DuckDB, every fact measured on v1.5.5 through `@duckdb/node-api` 1.5.5-r.4.
+ *
+ * A separate object from `POSTGRES_GRAMMAR` even though the five values coincide, and
+ * the coincidence is why: DuckDB's dialect is Postgres-SHAPED rather than PostgreSQL's,
+ * so sharing the object would say the two move together, which nothing measured here
+ * supports. The engine already disagrees with PostgreSQL elsewhere in this codebase
+ * (`X'…'` is a string here, `bytea` is an alias for `BLOB`), and a divergence in one of
+ * these five should be a value changing in this object rather than a split.
+ */
+const DUCKDB_GRAMMAR: SqlGrammar = {
+  // CODE: `SELECT 1 # x` is `Parser Error: syntax error at or near "#"`, so the rest
+  // of the line is not hidden.
+  hash: "code",
+  // A SUBSCRIPT, not a name quote: `SELECT [1,2][1]` answers 1, so the brackets are a
+  // LIST literal followed by a 1-based index. Copying SQLite's `quoted-identifier`
+  // row - the tempting move, since both engines open a local file - would read an
+  // everyday DuckDB list literal as a name and lose the statement's bound.
+  bracket: "subscript",
+  // NESTING: `/* a /* b */ still */ SELECT 1` runs, so the inner `*/` did not close
+  // the run.
+  blockComment: "nesting",
+  // `SELECT q'[x]' AS a` is `Catalog Error: Type with name q does not exist!` - the
+  // `q` was read as a type name, so the form is not in the grammar.
+  alternateQuoting: false,
+  // `SELECT 1 AS a // note` is `Parser Error: syntax error at or near "//"`.
+  doubleSlashComment: false,
 };
 const ORACLE_GRAMMAR: SqlGrammar = {
   hash: "code",
   bracket: DEFAULT_SQL_GRAMMAR.bracket,
   blockComment: "flat",
   alternateQuoting: true,
+  // Probed 2026-08-25 on Oracle Free through sqlplus: `SELECT 1 AS a // note FROM
+  // dual` is ORA-00923, "FROM keyword not found where expected", with the caret under
+  // the slashes. Nothing on that line is hidden.
+  doubleSlashComment: false,
 };
 const MSSQL_GRAMMAR: SqlGrammar = {
   hash: "code",
   bracket: "quoted-identifier",
   blockComment: "nesting",
   alternateQuoting: false,
+  // Probed 2026-08-25 on 2022 through sqlcmd: `SELECT 1 AS a // note` is Msg 102,
+  // "Incorrect syntax near '/'".
+  doubleSlashComment: false,
 };
 const SQLITE_GRAMMAR: SqlGrammar = {
   hash: "code",
   bracket: "quoted-identifier",
   blockComment: "flat",
   alternateQuoting: false,
+  // Probed 2026-08-25 through the bundled driver: `SELECT 1 AS a // note` and
+  // `SELECT 1 // 2` are both 'near "/": syntax error'. The amalgamation's tokenizer
+  // agrees - `case CC_SLASH` opens a run only on `/*`.
+  doubleSlashComment: false,
 };
 
 /**
@@ -187,7 +270,9 @@ const ELASTICSEARCH_GRAMMAR: SqlGrammar = {
   // NOT established, and left at the default deliberately. `[` has no meaning at all
   // in this grammar - `SELECT [1, 2]` and `SELECT [customer] FROM probe_orders` are
   // both "extraneous input '['" - so it is neither an identifier quote nor a
-  // subscript, and PD-5 forbids reading one dialect's rule off another's. The name
+  // subscript, and this module's rule 2 forbids reading one dialect's rule off
+  // another's behaviour (see the header, and the undecided table in
+  // `docs/editor/query-optimization.md`). The name
   // reading can only cost a bound on a statement the engine refuses anyway, which is
   // the same fail-safe argument the `mysql` and `oracle` rows make.
   bracket: DEFAULT_SQL_GRAMMAR.bracket,
@@ -196,6 +281,12 @@ const ELASTICSEARCH_GRAMMAR: SqlGrammar = {
   blockComment: "flat",
   // `SELECT q'{it's}'` is a `parsing_exception` - the form does not exist here.
   alternateQuoting: false,
+  // NOT established: this engine was not reachable from the run that probed the other
+  // eight (2026-08-25), and this module's rule 2 forbids reading its rule off the
+  // five refusals measured elsewhere. It keeps the compatibility default, and the direction that
+  // costs is worth stating: if `//` DOES open a comment here, this dialect's splitter
+  // over-splits exactly as `cassandra`'s did.
+  doubleSlashComment: DEFAULT_SQL_GRAMMAR.doubleSlashComment,
 };
 const OPENSEARCH_GRAMMAR: SqlGrammar = {
   // `#` really is a line comment, and this is where the fork's SQL plugin parts
@@ -218,6 +309,8 @@ const OPENSEARCH_GRAMMAR: SqlGrammar = {
   blockComment: "flat",
   // `SELECT q'{it's}'` is refused, "Illegal SQL expression".
   alternateQuoting: false,
+  // NOT established, same reason and same stated cost as the Elasticsearch row above.
+  doubleSlashComment: DEFAULT_SQL_GRAMMAR.doubleSlashComment,
 };
 /**
  * Established the same way and for the same reason as the two search rows: the engine
@@ -248,6 +341,11 @@ const TRINO_GRAMMAR: SqlGrammar = {
   // `SELECT q'{it''s}'` is "line 1:8: Unknown resolvedType: q" - the form does not
   // exist here, so those characters are a name followed by an ordinary string.
   alternateQuoting: false,
+  // CODE, probed 2026-08-25 on 476: `SELECT 1 AS a // note` is "line 1:15: mismatched
+  // input '/'", and the same text with a newline before a second column is the same
+  // error at the same offset - so the slashes are refused where they stand rather
+  // than hiding what follows.
+  doubleSlashComment: false,
 };
 
 /**
@@ -257,17 +355,31 @@ const TRINO_GRAMMAR: SqlGrammar = {
  * native protocol). Every fact below is a statement the server answered, not a
  * reading taken from a neighbouring dialect.
  *
- * One CQL fact has no field here to hold it, and it is worth naming because it bites
- * the same readers: CQL has a THIRD comment form, `//`, and a line comment of EITHER
- * form must be closed by a NEWLINE. Measured, `SELECT * FROM probe.customers LIMIT 3
- * -- note` with nothing after it is a syntax error ("line 1:45 mismatched character
- * '<EOF>' expecting set null"), and the same text with a trailing `\n` returns the
- * rows. So on this one engine the shared limiter's insert-before-trailing-trivia
- * rewrite (#280) can turn a VALID statement into a syntax error, because it trims the
- * newline that closed the comment. `SqlGrammar` cannot express either fact, and
- * widening it would change how every dialect's comments are read, so the Cassandra
- * provider's own `prepareQuery` declines to rewrite a statement that would end inside
- * a line comment. See `providers/sql/cassandra/index.ts`.
+ * CQL needs TWO facts about comments that the rows above do not, and they are
+ * carried in two different places because only one of them is about WHAT a run is.
+ * The first is shared with exactly one other dialect here, ClickHouse; the second is
+ * this engine's alone.
+ *
+ * 1. A THIRD comment form, `//`, which ClickHouse has too. That IS a grammar fact,
+ *    it is now the
+ *    `doubleSlashComment` field, and this docblock used to say the record could not
+ *    express it - which cost the splitter a manufactured `DROP` (see the field's own
+ *    doc and the row below). It is not widened to the dialects that lack it: five of
+ *    them refuse the characters outright and PostgreSQL reads them as an operator
+ *    name, each measured.
+ * 2. A line comment of EITHER form must be closed by a NEWLINE. That is a fact about
+ *    where a statement may END rather than about what a run is, so it has no field
+ *    here: `SqlSpan` reports a line comment closed by end of input as terminated,
+ *    which is right in every other dialect and is what the readers over it are
+ *    asking. Measured, `SELECT * FROM probe.customers LIMIT 3 -- note` with nothing
+ *    after it is "line 1:45 mismatched character '<EOF>' expecting set null" and the
+ *    same text with a trailing `\n` returns the rows - so the shared limiter's
+ *    insert-before-trailing-trivia rewrite (#280) can turn a VALID statement into a
+ *    syntax error, because `sql.trim()` drops the newline that closed the comment.
+ *    The Cassandra provider's own `prepareQuery` still declines to rewrite a
+ *    statement that would end inside a line comment; what changed is that it now
+ *    finds BOTH comment forms through the shared span reader rather than carrying a
+ *    private `//` scan of its own. See `providers/sql/cassandra/index.ts`.
  */
 const CASSANDRA_GRAMMAR: SqlGrammar = {
   // `#` opens NOTHING and is not an identifier character either. Three probes:
@@ -299,6 +411,19 @@ const CASSANDRA_GRAMMAR: SqlGrammar = {
   // '{it's}'" - the form does not exist here, so those characters are a name followed
   // by an ordinary string.
   alternateQuoting: false,
+  // A LINE comment, which is what the docblock above used to say this record could not
+  // carry. Probed 2026-08-25 over the native protocol on 5.0.9 AND on ScyllaDB
+  // 2026.2.4, which shares this type-id and answered identically:
+  //   `SELECT release_version FROM system.local // note; DROP KEYSPACE nope\n`
+  //     -> the ROW. One read. And the DROP did not run: a bare `DROP KEYSPACE nope`
+  //        answers "Keyspace 'nope' doesn't exist", so the OK is the proof.
+  //   the same text with no trailing newline
+  //     -> "line 1:68 mismatched character '<EOF>' expecting set null" (Scylla: "line
+  //        1:68 : Unexpected ''") - the SECOND CQL fact, stated in the docblock above.
+  //   `SELECT release_version FROM system.local // note\nDROP KEYSPACE nope`
+  //     -> "line 2:0 mismatched input 'DROP' expecting EOF", so the run ended at the
+  //        newline: a LINE comment, not a to-end-of-input one.
+  doubleSlashComment: true,
 };
 
 /**
@@ -311,8 +436,9 @@ const CASSANDRA_GRAMMAR: SqlGrammar = {
  * confirmation gate reads their editor text as SQL only where `readsSqlText` says
  * the text IS SQL, which for those two it does not (#297). Present for one fact and
  * undecided about another: `mysql` and `oracle` carry no established BRACKET
- * reading (see the row below), and `elasticsearch` carries none either - `[` is not
- * in its grammar at all.
+ * reading (see the row below), `elasticsearch` carries none either - `[` is not
+ * in its grammar at all - and neither search row carries a `//` reading, because
+ * neither engine was reachable from the run that probed the other eight.
  *
  * Sources, one per row, all offline or first-party documentation - except
  * `elasticsearch` and `opensearch`, whose rows were established by probing the
@@ -389,6 +515,25 @@ const CASSANDRA_GRAMMAR: SqlGrammar = {
  *     stops at the first `*\/`, and Oracle's PL/SQL Language Reference states that
  *     one multiline comment cannot contain another.
  *
+ * - `//`, the third line-comment form, and every row here is a LIVE PROBE from
+ *   2026-08-25 rather than a document. It is the fact this record used to say it
+ *   could not carry, and the splitter is where that cost was live: a comment is what
+ *   a `;` can hide inside, and `/api/db/multi-query` runs every fragment the splitter
+ *   returns.
+ *   - `cassandra` (Apache Cassandra 5.0.9 and ScyllaDB 2026.2.4, both over the native
+ *     protocol) and `clickhouse` (26.7.1 over HTTP) read it as a LINE comment. Two
+ *     probes each rather than one, because a statement that still ran does not
+ *     distinguish a comment from a token the parser skipped: the hiding was shown by
+ *     a `;` plus a write that did NOT execute, and the LINE half by a second column
+ *     or clause on the next line that DID.
+ *   - `postgres` (18), `mysql` (26.7.0), `oracle` (Free, sqlplus), `mssql` (2022,
+ *     sqlcmd), `trino` (476) and `sqlite` (the bundled driver) read it as CODE, each
+ *     refusing the characters where they stand. PostgreSQL is the most explicit of
+ *     the six: `SELECT 1 // 2` is "operator does not exist: integer // integer", so
+ *     `//` is an operator NAME there rather than a comment marker or a syntax error.
+ *   The full probe text for every row is quoted on the constants above and in
+ *   `grammar.test.ts`.
+ *
  * - `postgres`, brackets - `expression[subscript]` extracts an element and
  *   `expression[lower:upper]` a slice (PostgreSQL manual 4.2.3 Subscripts), and
  *   array constructors nest: the manual's own example is
@@ -399,8 +544,8 @@ const CASSANDRA_GRAMMAR: SqlGrammar = {
  * NOT established, and therefore left at the default: how `mysql` and `oracle` read
  * `[…]`. It is not an identifier quote in either - MySQL gives it no meaning outside
  * a JSON path written inside a string, and Oracle none outside an alternate-quote
- * delimiter - but neither has a SUBSCRIPT rule to read it under instead, and PD-5
- * forbids reading one dialect's rule off another's. The name reading costs them a
+ * delimiter - but neither has a SUBSCRIPT rule to read it under instead, and this
+ * module's rule 2 forbids reading one dialect's rule off another's behaviour. The name reading costs them a
  * bound on a nested bracket run, and it can never misplace one: a run it cannot
  * close is undeterminable, and an undeterminable end is not cut. That is the
  * fail-safe direction, so it is what they keep.
@@ -422,6 +567,15 @@ const SQL_GRAMMARS: Partial<Record<DatabaseType, SqlGrammar>> = {
   oracle: ORACLE_GRAMMAR,
   mssql: MSSQL_GRAMMAR,
   sqlite: SQLITE_GRAMMAR,
+  duckdb: DUCKDB_GRAMMAR,
+  // The SAME grammar object, and every one of its four facts was re-measured over
+  // Hrana on sqld 0.24.33 rather than inherited: `SELECT 1 # x` is refused ("bad
+  // variable name", so `#` is no comment), `SELECT [id] FROM probe_customers` parses
+  // (so brackets quote an identifier), `/* outer /* inner */ SELECT 1` RUNS (so block
+  // comments do not nest), and `q'[x]'` is a syntax error. Sharing the object rather
+  // than declaring a second identical one is deliberate: a divergence would then have
+  // to be written down as its own grammar, which is the change a reader should see.
+  libsql: SQLITE_GRAMMAR,
   elasticsearch: ELASTICSEARCH_GRAMMAR,
   opensearch: OPENSEARCH_GRAMMAR,
   trino: TRINO_GRAMMAR,
@@ -485,8 +639,8 @@ const NON_SQL_DIALECTS: ReadonlySet<DatabaseType> = new Set<DatabaseType>(["mong
  * document or a Redis command is simply read as SQL under the compatibility
  * grammar. For a reader that only ever declines to act, that costs nothing. For the
  * confirmation gate it cost a false prompt on ordinary reads: the escaped quote in
- * `{"filter":{"msg":"say \"hi\""}}` or in `SET k "a\"b"` is an unresolvable literal
- * to a SQL span reader and a perfectly closed one in the grammar the text is
+ * `{"filter":{"msg":"say \"hi\""}}` or in `GETRANGE k "a\"b" 0 1` is an unresolvable
+ * literal to a SQL span reader and a perfectly closed one in the grammar the text is
  * actually written in - and the dialog then said the statement could not be read
  * about text that reads fine. An operator who learns to click the confirmation away
  * is the one thing that gate cannot survive.

@@ -41,6 +41,7 @@ describe("resolveSqlGrammar", () => {
     ["oracle", "code"],
     ["mssql", "code"],
     ["sqlite", "code"],
+    ["libsql", "code"],
     // Trino, probed 2026-08-20 on 476: `#` opens nothing in either position.
     // `SELECT 1 AS a # trailing` is "line 1:15: mismatched input '#'" and
     // `SELECT # x` is "line 1:8: mismatched input '#'", so the rest of the line is
@@ -57,6 +58,11 @@ describe("resolveSqlGrammar", () => {
     // ask, and leaving it at the compatibility default would make every `#` run
     // ambiguous and prompt on a statement CQL refuses outright.
     ["cassandra", "code"],
+    // DuckDB, probed 2026-08-27 on v1.5.5: `SELECT 1 # x` is `Parser Error: syntax
+    // error at or near "#"`, so the rest of the line is not hidden. NOT read off the
+    // SQLite row it sits beside in this file - each of DuckDB's five facts was taken
+    // against the engine.
+    ["duckdb", "code"],
   ])("%s reads `#` as %s", (type, hash) => {
     expect(resolveSqlGrammar(type).hash).toBe(hash);
   });
@@ -109,12 +115,21 @@ describe("resolveSqlGrammar", () => {
     expect(resolveSqlGrammar("oracle").alternateQuoting).toBe(true);
   });
 
-  test.each<DatabaseType>(["mysql", "clickhouse", "postgres", "mssql", "sqlite", "trino", "cassandra"])(
-    "%s does not read `q'…'` as a literal",
-    (type) => {
-      expect(resolveSqlGrammar(type).alternateQuoting).toBe(false);
-    },
-  );
+  test.each<DatabaseType>([
+    "mysql",
+    "clickhouse",
+    "postgres",
+    "mssql",
+    "sqlite",
+    "libsql",
+    "trino",
+    "cassandra",
+    // `SELECT q'[x]' AS a` on v1.5.5 is `Catalog Error: Type with name q does not
+    // exist!` - the `q` was read as a type name, so the form is not in the grammar.
+    "duckdb",
+  ])("%s does not read `q'…'` as a literal", (type) => {
+    expect(resolveSqlGrammar(type).alternateQuoting).toBe(false);
+  });
 
   test("a call that names no dialect does not read the form either", () => {
     // The compatibility default: before the channel existed no reader here had a
@@ -144,6 +159,7 @@ describe("resolveSqlGrammar", () => {
   test.each<[DatabaseType, BracketGrammar]>([
     ["mssql", "quoted-identifier"],
     ["sqlite", "quoted-identifier"],
+    ["libsql", "quoted-identifier"],
     ["clickhouse", "subscript"],
     ["postgres", "subscript"],
     // Trino, probed on 476, and BOTH halves of the rule were measured rather than one
@@ -164,6 +180,12 @@ describe("resolveSqlGrammar", () => {
     // complaint - which the identifier reading, stopping at the first `]`, could not
     // do. CQL also subscripts a collection for real (`m['k']`).
     ["cassandra", "subscript"],
+    // DuckDB, probed on v1.5.5: `SELECT [1,2][1]` answers 1 - a LIST literal followed
+    // by a 1-based index. This is the one fact where copying the SQLite row would have
+    // been actively wrong, and the temptation to copy it is real: both engines open a
+    // local file through an in-process driver. The identifier reading would take an
+    // everyday DuckDB list literal for a name and lose the statement's bound.
+    ["duckdb", "subscript"],
   ])("%s reads `[…]` as %s", (type, bracket) => {
     expect(resolveSqlGrammar(type).bracket).toBe(bracket);
   });
@@ -213,6 +235,7 @@ describe("resolveSqlGrammar", () => {
     ["clickhouse", "nesting"],
     ["mysql", "flat"],
     ["sqlite", "flat"],
+    ["libsql", "flat"],
     ["oracle", "flat"],
     // Trino, probed on 476: `SELECT /* a /* b */ 1 AS a` returns the column, so the
     // FIRST `*/` closed the run. A nesting reader would have seen an unterminated
@@ -222,6 +245,9 @@ describe("resolveSqlGrammar", () => {
     // id = 1` returns the row, so the FIRST `*/` closed the run. A nesting reader
     // would have seen an unterminated comment and refused to bound the statement.
     ["cassandra", "flat"],
+    // DuckDB, probed on v1.5.5: `/* a /* b */ still */ SELECT 1` runs, so the inner
+    // `*/` did NOT close the run - the opposite reading from the SQLite row above.
+    ["duckdb", "nesting"],
   ])("%s closes a block comment the %s way", (type, blockComment) => {
     expect(resolveSqlGrammar(type).blockComment).toBe(blockComment);
   });
@@ -231,6 +257,85 @@ describe("resolveSqlGrammar", () => {
     // #294 calls these readers without a dialect, and `indexOf("*/")` is what they
     // were written against.
     expect(DEFAULT_SQL_GRAMMAR.blockComment).toBe("flat");
+  });
+
+  // ── `//`: a THIRD line-comment form (S1 follow-up) ───────────────────────
+  //
+  // The one fact `grammar.ts` said it could not carry, and the splitter is where
+  // that cost was live: `//` hides the rest of the line on TWO shipped engines, so
+  // a `;` written inside such a comment is not a statement boundary - and
+  // `/api/db/multi-query` RUNS every fragment the splitter returns, so the
+  // dialect-blind reading manufactured a bare `DROP` out of text the server reads
+  // as one statement. Every row below was probed 2026-08-25 against a live engine,
+  // through the surface the provider itself uses, because "it is documented" is not
+  // the same claim as "it is what the server does".
+  //
+  // A comment: two engines, and both halves measured rather than one inferred.
+  //  - `cassandra` (Apache Cassandra 5.0.9 and ScyllaDB 2026.2.4, which shares this
+  //    type-id, both over the native protocol):
+  //    `SELECT release_version FROM system.local // note; DROP KEYSPACE nope\n`
+  //    returns the ROW - one read - and the DROP does not run (a bare
+  //    `DROP KEYSPACE nope` answers "Keyspace 'nope' doesn't exist", so the OK is
+  //    proof it was hidden). Without the trailing newline the same text is "line
+  //    1:68 mismatched character '<EOF>' expecting set null", which is the SECOND
+  //    CQL fact - a line comment needs a newline to close it - and that one still
+  //    has no field here (see `CASSANDRA_GRAMMAR`).
+  //  - `clickhouse` (26.7.1, over HTTP): `SELECT 1 AS a // note; SELECT 999`
+  //    answers `1` with no error, while `SELECT 1; DROP TABLE nope` is refused with
+  //    "Syntax error (Multi-statements are not allowed)" - so the `;` was inside the
+  //    comment rather than ignored. `SELECT 1 AS a // note\n, 2 AS b` answers TWO
+  //    columns, so the run ends at the NEWLINE: it is a LINE comment, not a
+  //    to-end-of-input one. Unlike CQL, end of input closes it (`SELECT 1 AS a //
+  //    note` answers 1).
+  //
+  // Code: five engines plus SQLite, each refusing the characters outright, so
+  // nothing on that line is hidden - which is the only thing these readers ask.
+  //  - `postgres` (18): `SELECT 1 // 2` is "operator does not exist: integer //
+  //    integer", so `//` is an OPERATOR NAME there, and `SELECT 1 AS a // note` is
+  //    "syntax error at or near \"//\"".
+  //  - `mysql` (26.7.0): ERROR 1064 near '// note'.
+  //  - `oracle` (Oracle Free 23, via sqlplus): ORA-00923 "FROM keyword not found
+  //    where expected".
+  //  - `mssql` (2022, via sqlcmd): Msg 102 "Incorrect syntax near '/'".
+  //  - `trino` (476, `POST /v1/statement`): "line 1:15: mismatched input '/'".
+  //  - `sqlite` (the bundled driver): 'near "/": syntax error'.
+  test.each<[DatabaseType, boolean]>([
+    ["cassandra", true],
+    ["clickhouse", true],
+    ["postgres", false],
+    ["mysql", false],
+    ["oracle", false],
+    ["mssql", false],
+    ["trino", false],
+    ["sqlite", false],
+    ["libsql", false],
+    // DuckDB, probed on v1.5.5: `SELECT 1 AS a // note` is `Parser Error: syntax error
+    // at or near "//"`, so the characters are refused where they stand rather than
+    // hiding the rest of the line.
+    ["duckdb", false],
+  ])("%s reads `//` as a line comment: %s", (type, doubleSlashComment) => {
+    expect(resolveSqlGrammar(type).doubleSlashComment).toBe(doubleSlashComment);
+  });
+
+  // Neither search engine is reachable from this run, so neither row was
+  // established - and grammar.ts's rule 2 forbids reading one dialect's rule off
+  // another's behaviour, which
+  // here would mean copying five refusals onto a sixth grammar. They keep the
+  // compatibility default, and the direction that costs is stated rather than
+  // implied: if `//` DOES open a comment in one of them, its splitter over-splits
+  // exactly as `cassandra`'s did.
+  test.each<DatabaseType>(["elasticsearch", "opensearch"])(
+    "%s is left at the compatibility default for `//`",
+    (type) => {
+      expect(resolveSqlGrammar(type).doubleSlashComment).toBe(DEFAULT_SQL_GRAMMAR.doubleSlashComment);
+    },
+  );
+
+  test("the compatibility default does not read `//` as a comment", () => {
+    // Today's reading once more: no reader in this folder had a `//` branch before
+    // this fact existed, so keeping it out is what leaves every dialect-less
+    // fixture answering what it answered.
+    expect(DEFAULT_SQL_GRAMMAR.doubleSlashComment).toBe(false);
   });
 });
 
@@ -273,6 +378,16 @@ const GRAMMAR_COVERAGE: Record<DatabaseType, "established" | "default"> = {
   postgres: "established",
   mysql: "established",
   sqlite: "established",
+  // Re-measured over Hrana rather than inherited from the row above: all four facts
+  // answered the same way on sqld 0.24.33 (#, brackets, nesting, q'…'), which is why
+  // the registry shares SQLite's grammar object.
+  libsql: "established",
+  // Five facts probed 2026-08-27 against DuckDB v1.5.5 through `@duckdb/node-api`,
+  // and NOT inherited from either neighbour: the SQLite row's `[…]` reading is wrong
+  // here (a list literal, not a name quote) and the PostgreSQL object is not shared
+  // even though the five values coincide. See DUCKDB_GRAMMAR in `grammar.ts` for the
+  // statement behind each one.
+  duckdb: "established",
   oracle: "established",
   mssql: "established",
   clickhouse: "established",
@@ -317,6 +432,10 @@ const SQL_TEXT_COVERAGE: Record<DatabaseType, boolean> = {
   postgres: true,
   mysql: true,
   sqlite: true,
+  libsql: true,
+  // SQL, and the statement text IS what the editor sends: the provider extends
+  // SQLBaseProvider and hands the text to `runAndReadAll`.
+  duckdb: true,
   oracle: true,
   mssql: true,
   clickhouse: true,

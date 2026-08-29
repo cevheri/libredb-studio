@@ -45,10 +45,11 @@ generic components render LibreDB-appropriate wording.
 | `query(input)` | A command (`get`/`put`/`delete`/`prefix`/`range`) | `kv` lens methods |
 | `getHealth()` / `getOverview()` | File stats | `fs.statSync` + prefix count |
 | `getStorageStats()` | File path and size on disk | `fs.statSync` |
-| `getSlowQueries()` | Not applicable | returns `[]` |
-| `getActiveSessions()` | Not applicable (single embedded process) | returns `[]` |
+| `getSlowQueries()` | Not applicable | returns `[]`, and the Queries panel shows the engine's own sentence ([§9](#getlabels)) |
+| `getActiveSessions()` | Not applicable (single embedded process) | **refuses** — the panel is absent with its reason |
 | `runMaintenance(type)` | Not supported (throws) | — |
-| Indexes / table stats | Not applicable | returns `[]` |
+| `getTableStats()` | One key-count per namespace | the schema tree's own `kv.range` scan |
+| `getIndexStats()` | No index object exists | **refuses** — the panel is absent with its reason |
 
 ---
 
@@ -213,10 +214,12 @@ strings are returned as-is. This mirrors how the Redis provider handles structur
 ### 3.7 Monitoring is file-stat-based
 
 Unlike Redis (`INFO`) or PostgreSQL (system catalogs), LibreDB has no server introspection API.
-Overview and storage stats derive entirely from `fs.statSync` (file size in bytes) and a schema
-scan (prefix group count). There are no sessions, slow queries, or index statistics — those
-methods return empty arrays — and no cache statistics either, so there is no cache hit ratio to
-report ([§7.1](#71-there-is-no-cache-hit-ratio-and-there-never-will-be)).
+Overview, table and storage stats derive entirely from `fs.statSync` (file size in bytes) and one
+`kv.range` scan of the keyspace (per-namespace key counts). There is no session list and no index
+object — those two panels are **absent with a sentence** rather than answered empty
+([§7.2](#72-the-two-panels-that-are-absent-and-the-one-that-is-empty)) — and no cache statistics
+either, so there is no cache hit ratio to report
+([§7.1](#71-there-is-no-cache-hit-ratio-and-there-never-will-be)).
 
 ---
 
@@ -273,6 +276,29 @@ condition as a clear `ConnectionError` (see [§10](#10-error-handling)):
   it after 30 minutes idle — the lock is held that whole time. To edit the same file with external
   tooling, disconnect the Studio connection first (or wait for eviction); otherwise the external
   writer gets `LOCKED`.
+- **Studio's own second openers reuse the handle instead.** Inside this server the lock used to
+  defeat three callers that build a provider outside the writable cache, and it did so every time
+  (#498):
+  - `POST /api/db/test-connection` reported the lock as a failed connection test. The connection
+    dialog tests before it saves, so **the built-in sample could not be edited at all**: the edit
+    was discarded with a toast about a connection error, as if the sample were broken.
+  - `acquireExecutionProfileProvider(connection, "agent-operations")` — the agent's grounding read —
+    lost its schema capture to the lock. A `ConnectionError` becomes an *unavailable* capture rather
+    than a failure, so every plan run on a LibreDB connection was silently ungrounded from the
+    moment anyone browsed it in the sidebar.
+  - `POST /api/db/schema-snapshot` answered HTTP 503 with the same message, so the Schema Diff tab's
+    **Snapshot** button — its only caller — could not read a schema the sidebar was listing at that
+    moment. Measured in the browser against the released 0.13.4 image on 2026-08-25.
+
+  All three now call `findOpenSingleWriterProvider` (`src/lib/db/factory.ts`) first, which returns the
+  connected provider already holding the file. The lookup is keyed by the **resolved file path**,
+  not the connection id — the second opener is usually a different connection record pointing at
+  the same file, which is exactly how the sample-edit case reproduced. A borrowed handle is never
+  disconnected by its borrower and never cached under the profiled key: it belongs to the live
+  connection. Two bounds keep the agent's isolation invariant intact — only `agent-operations`
+  borrows (it sends no statement of the model's, so `agent-read-only` and `agent-handover` are
+  still refused on this engine), and an acquisition is not borrowed for a connection that
+  configures an `agentUser`, because a reuse cannot substitute one principal for another.
 
 > **DOWNGRADE WARNING:** a file written by `@libredb/libredb` 0.2.x must never be opened by 0.1.3
 > or older. The old recovery cannot parse the header, classifies the whole file as a torn tail,
@@ -462,29 +488,24 @@ were written through the raw `kv` lens are never cataloged, so they keep the hon
 
 ## 7. Monitoring & health
 
-All monitoring derives from `fs.statSync` (file size) and a schema scan (prefix group count).
+All monitoring derives from `fs.statSync` (file size) and one `kv.range` scan of the keyspace.
 There is no embedded stats API.
 
 | Method | Source | Returns |
 |--------|--------|---------|
 | `getHealth()` | `fs.statSync` | `activeConnections: 1`, file size as `databaseSize`, `cacheHitRatio: "N/A"` |
-| `getOverview()` | `fs.statSync` + schema scan | `version`, file size, prefix-group count as `tableCount`, `indexCount: 0` |
+| `getOverview()` | `fs.statSync` + schema scan | `version`, file size, namespace count as `tableCount`, `indexCount: 0` |
 | `getPerformanceMetrics()` | — | `{}` — nothing is measurable here |
-| `getSlowQueries()` | — | `[]` (N/A) |
-| `getActiveSessions()` | — | `[]` (N/A — single embedded process) |
+| `getSlowQueries()` | — | `[]`; the Queries panel renders `slowQueriesEmptyState` |
+| `getActiveSessions()` | — | **throws** `LIBREDB_ACTIVE_SESSIONS_REFUSAL` — no session registry exists |
 | `getStorageStats()` | `fs.statSync` | one entry: file path + size |
-| `getTableStats()` | — | `[]` (N/A) |
-| `getIndexStats()` | — | `[]` (N/A) |
+| `getTableStats()` | the schema tree's scan | one row per namespace: lens as `schemaName`, key count as `rowCount`, no bytes |
+| `getIndexStats()` | — | **throws** `LIBREDB_INDEX_STATS_REFUSAL` — no index object exists |
 
 `getOverview().tableCount` calls `getSchema()` internally — it is a full scan, so it honors the
 10 000-key cap and may undercount for very large files.
 
-The `[]` and the absent metrics above now reach the panels as absence rather than as zero. The
-**Tables** tab reads the empty `getTableStats()` against `tableCount` — prefix groups the store does
-know about, with statistics for none of them — so its *Tables* and *Size* cards read `N/A` and the
-list says *No table statistics available.* instead of summing `0` and `0 B`; the **Queries** tab's
-three cards read `N/A` for the same reason, an average over no statements not being `0.00ms`; and
-because `getPerformanceMetrics()` returns an empty object, every card on the Overview and Performance
+Because `getPerformanceMetrics()` returns an empty object, every card on the Overview and Performance
 tabs — *Cache Hit*, *Buffer*, *Deadlocks* — reads `N/A` beside *Not measured* rather than a
 percentage or a `0` badged healthy.
 
@@ -499,6 +520,50 @@ than a gap, because the panel cannot tell it apart from a measurement (the rule
 [#424](https://github.com/libredb/libredb-studio/issues/424) exists to enforce). Both sites now omit
 it, permanently: the *Cache Hit* card reads `N/A` / *Not measured*, and the agent's health tool
 reports the string `"N/A"`.
+
+### 7.2 The two panels that are absent, and the one that is empty
+
+Four monitoring methods used to be `return [];` with no reason attached. LibreDB is the **embedded
+engine of the zero-config first run**, so that dashboard is the first one many users ever open — and
+it reported *zero tables* on a database with tables. Measured before the change, on a file holding a
+25-row relational table, a 7-document collection and 4 raw kv keys, `getMonitoringData()` answered
+`"tableCount": 5` in the Overview and `"tables": []` beside it. Each of the four was decided
+separately:
+
+- **`getTableStats()` — implemented.** A namespace's rows *are* its keys (`employees:1`,
+  `articles:a1`), which is exactly what `getSchema()` already counts, so the panel now reports one
+  row per namespace from that same scan (`scanGroups()` is shared, so the tree and the panel can
+  never disagree). `schemaName` carries the namespace's **lens** — `relational` / `document` / `kv`
+  — because LibreDB has no schema namespace and the lens is the one thing the catalog declares about
+  it. The **byte** fields (`tableSize*`, `indexSize*`) stay absent and `totalSize` is `"N/A"`: the
+  file format keeps no per-namespace size, and a `0` would be summed by the Storage tab as a
+  measurement.
+- **`getTableStats()` above the scan cap — refused.** The scan stops at `LIBREDB_MAX_KEY_SCAN`
+  (10 000 keys). Past it every count is short by an unknown amount, so the panel refuses with
+  `LIBREDB_TABLE_STATS_TRUNCATED` rather than publish a silently low row count. The schema tree
+  still lists the namespaces it reached — a list of namespaces is not a count.
+- **`getActiveSessions()` — refused.** The file is opened inside this server's own process and the
+  engine publishes no session, connection or client call at all (`@libredb/libredb` 0.2.2 — grep its
+  shipped `.d.ts`). The exclusive lock is not a session registry either: measured, `<path>.lock`
+  holds `libredb-lock\n<pid>\n<hostname>\n<nonce>`, where the pid is this very server's and there
+  is no user, statement or start time to build a session row from. `[]` claimed the store was asked
+  who was connected and said nobody; nobody can be asked.
+- **`getIndexStats()` — refused.** The kernel is a single ordered key-value keyspace, where a key's
+  own byte order is the only index there is, and the catalog declares a namespace's lens and a
+  relational table's columns and nothing that indexes them. An empty Indexes panel reads as *this
+  database has no indexes yet*, which invites creating one; this engine can never have one.
+  `getOverview().indexCount: 0` is not the same claim and stays — there genuinely are zero index
+  objects, and that is a measurement.
+- **`getSlowQueries()` — stays empty, deliberately.** `QueriesTab` renders
+  `ProviderLabels.slowQueriesEmptyState` in place of an empty list and this provider declares one
+  ([§9](#getlabels)), so LibreDB's own sentence already reaches the user without an error. This is
+  the one always-empty panel that is allowed to stay empty.
+
+`getHealth()` keeps answering with `activeSessions: []` where the panel refuses, and that is
+deliberate: `POST /api/db/test-connection` calls it and the connection dialog's **Save** is gated on
+that request, so a throwing health check would lock the embedded engine out of the product
+(the lesson of [#455](https://github.com/libredb/libredb-studio/issues/455)). A monitoring panel has
+the opposite obligation — it is the surface that must say what it could not read.
 
 ---
 
@@ -534,9 +599,10 @@ for a different reason — the rows are derived groupings, see 5.3.
 | `supportsExternalQueryLimiting` | `false` |
 | `supportsCreateTable` | `false` |
 | `supportsInlineRowEdit` | `false` — the command grammar (`get`/`put`/`delete`/`prefix`/`range`) has no `UPDATE ... SET` for the results grid's inline editor to emit |
-| `supportsTransactions` | `false` — the command grammar has no transaction verb at all, so the trio and SANDBOX are not offered (#U13) |
+| `supportsTransactions` | `false` — the command grammar has no transaction verb at all, so the trio and SANDBOX are not offered (#464) |
 | `declaresForeignKeys` | `false` — the catalog declares namespaces and columns and nothing that references another namespace, so there is no foreign key to read |
 | `tablesAreDerivedGroupings` | `true` — the namespaces come from a bounded `kv.range` over 10000 keys, grouped by prefix, so they are this server's summary of what one scan reached rather than objects the engine declares. The agent layer states this to a plan run in one sentence |
+| `singleWriterFile` | `true` — `lib.open({ path })` takes an exclusive `<path>.lock`, so this file admits ONE handle and a second open throws `LOCKED`. The three callers that used to open a second one reuse the open handle instead ([§4.2.1](#421-on-disk-format-locking-and-version-compatibility-02x)). The only engine that declares it: SQLite, the other file engine, takes its locks per transaction rather than at open |
 | `supportsMaintenance` | `false` |
 | `maintenanceOperations` | `[]` |
 | `supportsConnectionString` | `false` |
@@ -552,10 +618,29 @@ The label map relabels the generic schema-explorer UI for key-value semantics: e
 "Key Prefix", row -> "key", select -> "Scan Keys", generate -> "Generate Command",
 analyze -> "Key Info", search placeholder -> "Search keys...", etc.
 
+`statementLanguage` is the one label no person sees: the agent's plan contract states it verbatim to
+the model. It exists for the reason Redis's does. Measured 2026-08-22 in plan mode against the
+embedded sample, objective *"list every entry under the users prefix and read one user by key"*: the
+run was grounded — three prefixes captured, `articles:*`, `config:*`, `users:*` — and drafted
+
+```
+GET users:*
+```
+
+`dispatchCommand` gives `get` exactly one meaning, `kv.get(parts[1])`, an exact-key lookup with no
+glob of any kind ([§5.1](#51-command-grammar)), so that command answers **zero rows and no error** —
+which on a key-value store reads as "nothing stored there" rather than as a mistake. The label
+therefore names all five verbs, so none has to be guessed, and states that a key is matched exactly
+with no wildcard, repeating in words what `tablesAreDerivedGroupings` says in a flag: a `users:*` row
+is this engine's grouping, so every entry under it is reached with `prefix users:` — the form
+`generateTableQuery` already emits when a person clicks the same row.
+
 One label is about the monitoring tab instead: `slowQueriesEmptyState` -> *"LibreDB keeps no
 statistics about finished statements in this version."* `getSlowQueries()` answers `[]`
-unconditionally ([§7](#7-monitoring--health)), so the Queries panel is always empty here, and its
-sentence was hardcoded to PostgreSQL's `pg_stat_statements` advice (`docs/BACKLOG.md` U12).
+unconditionally ([§7.2](#72-the-two-panels-that-are-absent-and-the-one-that-is-empty)), so the
+Queries panel is always empty here — and this label is why that emptiness is allowed to stand where
+the Sessions and Indexes panels refuse instead. Its sentence was hardcoded to PostgreSQL's
+`pg_stat_statements` advice (#463).
 
 ---
 
@@ -621,12 +706,33 @@ all five query commands (`get` found, `get` missing, `prefix`, `range`, `put`, `
 multi-word values, error paths (unknown verb, unmatched quote), and monitoring (`getOverview` file
 size + group count, `getStorageStats` path + size, `runMaintenance` unsupported).
 
+The monitoring suite also pins the panel decisions of
+[§7.2](#72-the-two-panels-that-are-absent-and-the-one-that-is-empty): `getTableStats()` counts each
+namespace and names its lens, reports an empty cataloged table as a real `0`, publishes no byte
+fields, and **refuses** past the 10 000-key cap (seeded in one `db.transact()` — the kv lens fsyncs
+per `set()`, so 10 500 keys cost ~30 ms that way against ~12 s one at a time); `getActiveSessions()`
+and `getIndexStats()` reject with their own sentences while `getHealth()` still answers; and
+`getMonitoringData()` is asserted end to end — the two refused panels absent with their reasons under
+`errors`, the Tables panel populated.
+
 A dedicated **catalog-aware schema** suite seeds a file with a relational table (`table()`) and a
 document collection (`doc()`) alongside the raw kv keys, then asserts: (a) `getSchema()` and
 `range`/`prefix` queries never surface the reserved catalog prefix; (b) the relational table shows
 its real declared columns with the primary key marked (the relational signal); (c) the document
 collection shows the generic `id`/`document` columns (the document signal); and (d) raw kv
 namespaces still group as `key`/`value` pseudo-tables.
+
+The **single-writer reuse** (D3/B49) is asserted in `tests/unit/db/factory.test.ts` rather than
+here, because it is the factory's behaviour and it needs the real factory — which this file cannot
+import, since `tests/api/db/test-connection.test.ts` replaces `@/lib/db/factory` process-wide with
+`mock.module`. Two suites there run on the real package and real temp files: *single-writer file
+reuse* (the borrow, the resolved-path identity, the control arm proving a second open really is
+refused, and SQLite proving it is not borrowed from) and *grounding a plan run while the writable
+provider holds the file* (a real plan-mode `captureContextSnapshot` comes back `captured` via
+`provider-inventory` with the profiled cache owning nothing; its control arm — the same run with an
+`agentUser`, which opts out of the reuse — comes back `unavailable` / `CATALOG_READ_REFUSED`, which
+is what every run did before this was closed). What this file asserts is the provider's own half:
+`getCapabilities().singleWriterFile === true`.
 
 A **0.2.x error mapping & locking** suite covers the hardened file boundary: a second open of a
 live-locked file is a clear `ConnectionError` (`LOCKED`); `connect()` takes the exclusive
@@ -732,7 +838,10 @@ await provider.disconnect();
   signalled by the columns rather than a label. The reserved catalog namespace is excluded from
   all user-facing views (schema and query results).
 - **Schema scan capped at 10 000 keys.** Prefix groups that only appear beyond the cap won't show
-  as "tables". This is a deliberate bound, not a bug.
+  as "tables", and the row counts in the schema tree are capped with it. This is a deliberate bound,
+  not a bug — but it is why the monitoring **Tables** panel refuses outright above the cap instead of
+  publishing counts that are short by an unknown amount
+  ([§7.2](#72-the-two-panels-that-are-absent-and-the-one-that-is-empty)).
 - **File must be on the Studio server's filesystem.** There is no remote LibreDB connection model.
   The database has no server or wire protocol; embedded-in-process is the only supported mode.
 - **No column modification in a generated migration.** Since

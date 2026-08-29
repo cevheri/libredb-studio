@@ -777,6 +777,13 @@ first-class `DatabaseConnection` field and is independent of the form's `connect
 applies even though the Druid form shows no TLS row of its own. An explicit `disable` turns TLS
 **off** as firmly as an explicit mode turns it on (the #264 lesson).
 
+`verify-system` (D26) is the mode that DESCRIBES this transport: `fetch` always verifies the chain
+against the platform's certificate store and cannot be told otherwise, so of the four non-`disable`
+modes it is the only one whose name matches the handshake. `require` here does not mean "encrypt
+without checking" the way it does on the driver-based providers — nothing in this transport can skip a
+check — and `verify-ca`/`verify-full` cannot pin against a pasted CA. Nothing in the code branches on
+which one is selected.
+
 The port is **not** changed by TLS, unlike ClickHouse's `8123` → `8443`: a TLS Druid serves on
 whatever `druid.tlsPort` the deployment configured, and there is no well-known value to guess.
 
@@ -1104,6 +1111,15 @@ The honest empties, each with its reason:
   no file holds finished queries. No statement is sent to discover that.
 - **`getIndexStats()` is `[]`** and **`indexCount` is `0`** because no index object exists
   ([§6](#6-schema-introspection)).
+
+Those two empty arrays were re-checked on **2026-08-25** against the ABSENT-is-not-EMPTY rule
+`MonitoringData` states (the rule that converted five Cassandra panels and one Trino one). Both stay
+EMPTY, and the distinction is which fact the panel is reporting: **an absent panel means the engine
+could not answer; an empty one means zero is a real measurement.** Druid has no query log and no index
+object, so the count of listable rows really is zero and an empty panel states it correctly — the
+`slowQueriesEmptyState` label carries the reason into the tab besides. The Cassandra panels were
+different: its tables and secondary indexes *exist* and the schema tree lists them in the same frame,
+so `[]` there denied objects the product was showing.
 - **`maxConnections` is `0`** because Druid publishes no connection limit anywhere in SQL — it has no
   pool. A number here would be invented.
 - **`uptime` says `"unknown"`, not `"0ms"`**, when either clock reading is missing: an uptime of zero
@@ -1234,7 +1250,7 @@ Both halves of that are real constraints, not scope cuts made lightly:
 | `supportsExternalQueryLimiting` | `true` | `LIMIT n` / `LIMIT n OFFSET m` are both correct Druid SQL |
 | `supportsCreateTable` | **`false`** | `CREATE` is not in the grammar; a datasource is created by ingestion ([§3.11](#311-the-three-false-capabilities-are-each-impossible-not-merely-unimplemented)) |
 | `supportsInlineRowEdit` | **`false`** | `UPDATE t SET ...` answers `Unsupported SQL statement [UPDATE]`; Druid SQL has no row-level DML ([§5.5](#55-druid-sql-cannot-write-and-the-server-says-so-clearly)) |
-| `supportsTransactions` | **`false`** | Druid SQL has no DML at all, so there is nothing for a transaction to hold; the trio and SANDBOX are withheld instead of answering HTTP 400 (#U13) |
+| `supportsTransactions` | **`false`** | Druid SQL has no DML at all, so there is nothing for a transaction to hold; the trio and SANDBOX are withheld instead of answering HTTP 400 (#464) |
 | `declaresForeignKeys` | **`false`** | Druid has no constraints — no primary key either — and a datasource cannot reference another, so an empty relations list is the engine and not the schema |
 | `supportsMaintenance` | **`false`** | Nothing in `MaintenanceType` is reachable from Druid SQL ([§8](#8-maintenance)) |
 | `maintenanceOperations` | `[]` | Consequence of the above |
@@ -1251,7 +1267,7 @@ Three overrides:
 - `slowQueriesEmptyState` → **"Druid keeps no query log: no system table and no endpoint holds
   finished queries."** `getSlowQueries()` is empty by design, so the monitoring Queries panel is
   **always** empty here, and its hardcoded sentence used to tell the reader to enable
-  `pg_stat_statements` (`docs/BACKLOG.md` U12).
+  `pg_stat_statements` (#463).
 
 Everything else is inherited on purpose. **A Druid row is a row**, so renaming it would only make the
 grid speak a dialect the cluster does not. The maintenance labels are irrelevant here

@@ -277,6 +277,12 @@ export class TrinoProvider extends SQLBaseProvider {
       // implements it, and vacuum, reindex, optimize and check belong to storage
       // systems Trino does not own.
       maintenanceOperations: ["kill"],
+      // Trino owns no storage and computes no statistics, so the only operation it
+      // has is terminating a statement - and that needs the query id the Sessions
+      // panel lists, which is neither a table nor a whole database (#496).
+      maintenanceOperationSpecs: {
+        kill: { label: "Terminate Query", perEntity: false, global: false },
+      },
       // Trino's own JDBC URL is `jdbc:trino://host:port/catalog/schema`, which the
       // shared parser in `connection-string-parser.ts` does not accept. Rather than
       // advertise a field that would reject everything a user pastes, this stays
@@ -323,7 +329,7 @@ export class TrinoProvider extends SQLBaseProvider {
         "Trino is a query engine: the bytes live in the systems its connectors reach, and reclaiming them is done there. Nothing runs from here.",
       // `getSlowQueries()` reads system.runtime.queries, which is the coordinator's own
       // bounded history rather than a persisted store - a different fact from the
-      // PostgreSQL extension the panel used to advertise (#U12).
+      // PostgreSQL extension the panel used to advertise (#463).
       slowQueriesEmptyState:
         "Query stats come from system.runtime.queries, which holds only what this coordinator still remembers.",
     };
@@ -621,10 +627,30 @@ export class TrinoProvider extends SQLBaseProvider {
     return this.guarded(() => readActiveSessions(transport, options));
   }
 
+  /**
+   * The tables that published statistics, or an ABSENT panel with the reason.
+   *
+   * An empty array here has four causes and only one of them is a measurement (see
+   * `TrinoTableStatsReading`). Two of the other three used to render as an empty table,
+   * which claims the engine answered "no tables" - measured 2026-08-25 against Trino 476,
+   * the jmx catalog holds 379 tables in schema `current` and a 20-table random sample
+   * of them answered SHOW STATS with an empty row_count (0 of 20 non-null; the jmx
+   * connector supplies no statistics at all), so that panel reported nothing about a
+   * catalog full of data.
+   *
+   * The fourth (#515) used to render as something worse than an empty table: a scope
+   * holding more tables than one pass describes was silently CUT to the first 25, and
+   * `TableStats[]` has no field in which the cut could have been declared, so the panel
+   * and the agent's curated reading both published 25 as the count. It is now refused
+   * with the number of tables the scope really holds.
+   */
   public async getTableStats(options: { schema?: string } = {}): Promise<TableStats[]> {
     const transport = this.requireTransport();
     const catalog = this.requireCatalog();
-    return this.guarded(() => readTableStats(transport, catalog, options));
+    const reading = await this.guarded(() => readTableStats(transport, catalog, options));
+    if (reading.refusal !== undefined) throw new QueryError(reading.refusal, this.type);
+
+    return reading.tables;
   }
 
   /**

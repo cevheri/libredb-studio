@@ -1,15 +1,17 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { isAgentModelCapability } from "@/lib/agent/capability-labels";
 // Type-only, so nothing of the probe — or of the AI SDK it runs — reaches this bundle.
 import type { AgentModelCapability } from "@/lib/agent/capability-probe";
 import type { AgentLedgerEntry } from "@/lib/agent/run-store";
 import type {
+  AgentRunFailureReason,
   AgentRunMode,
   AgentRunWorkflowReading,
   AgentRunWorkflowSource,
   AgentRunWorkflowType,
+  AgentThreadContext,
 } from "@/lib/agent/types";
 import { foldLedgerEntries, parseLedgerLine, type AgentRunTimeline } from "./timeline";
 
@@ -69,6 +71,15 @@ export interface AgentRunStartInput {
    * can widen a run that is already open.
    */
   readonly autoExecute?: boolean;
+  /**
+   * The run whose CONVERSATION this one continues, when the user asks a follow-up.
+   *
+   * A request, like the fields above, and a weaker one than they are: the server
+   * derives the conversation from that run's own ledger and persists it, so nothing
+   * the browser remembers is trusted into the prompt — and a run it cannot reach opens
+   * anyway, carrying no conversation and saying so. Naming it never risks the question.
+   */
+  readonly previousRunId?: string;
   readonly objective: string;
   readonly connectionId: string;
 }
@@ -76,6 +87,22 @@ export interface AgentRunStartInput {
 export interface AgentRunFollower {
   /** Set once the server has opened a run; null before the first start. */
   readonly runId: string | null;
+  /**
+   * The conversation the server said this run belongs to, or null before the first
+   * start. What the rail renders comes from here rather than from anything it
+   * inferred: the thread has one writer, and it is the route.
+   */
+  readonly thread: AgentThreadContext | null;
+  /**
+   * The conversation this browser was in when it last held one, and that nothing here is
+   * following now — the stored id, while `runId` is still null.
+   *
+   * It exists because a reload clears `runId`, so the next question is answered as a
+   * fresh one. The rail was honest about the RESULT — no thread, no strip — and silent
+   * about the TRANSITION, which is the half a user mid-conversation needs (#518). Null
+   * whenever `thread` is set: the two never describe the same conversation.
+   */
+  readonly interrupted: AgentInterruptedThread | null;
   /** A start is in flight, or its ledger is still open. */
   readonly isBusy: boolean;
   /**
@@ -88,6 +115,17 @@ export interface AgentRunFollower {
   readonly timeline: AgentRunTimeline;
   /** The app's own words about why the last attempt did not continue. */
   readonly error: string | null;
+  /**
+   * WHICH refusal `error` is, when the server named one, and `null` otherwise.
+   *
+   * Only for a refused START, and only for a code this build has words for. It exists
+   * because a surface may already be explaining the same fact for itself — the rail's
+   * amber engine card is, verbatim — and a second copy of that explanation in an error
+   * line is not an error message (#513). A reader that ignores this field renders `error`
+   * and is correct, which is why it is a code beside the sentence rather than a
+   * replacement for it.
+   */
+  readonly errorCode: AgentStartRefusalCode | null;
   /**
    * The one start failure that is a verdict about the MODEL rather than about the
    * attempt (#331 T4). Set only for the capability gate's `422`; every other refused
@@ -119,8 +157,187 @@ export interface AgentRunFollower {
 interface StartResponse {
   readonly runId?: unknown;
   readonly error?: unknown;
+  readonly refused?: unknown;
   readonly missing?: unknown;
   readonly disproved?: unknown;
+  readonly thread?: unknown;
+}
+
+/**
+ * The start-refusal codes this build has words for (`route.ts`, `badRequest`).
+ *
+ * `Extract` rather than a bare literal so the wire value cannot drift from the name the
+ * same fact travels under as an `AgentRunFailureReason`: with two independent literals,
+ * renaming the union member broke `timeline.ts` and `runtime.ts` and left both ends of
+ * THIS wire silently on the old string.
+ *
+ * Exported because the surface that acts on it has to be able to name it: `AgentRail`
+ * compares against this rather than against a string of its own.
+ */
+export type AgentStartRefusalCode = Extract<AgentRunFailureReason, "engine-unsupported">;
+
+/** Typed rather than compared inline, so the RUNTIME string is extracted from the union too. */
+const ENGINE_UNSUPPORTED_CODE: AgentStartRefusalCode = "engine-unsupported";
+
+/**
+ * What `errorCode` may hold, checked at runtime and not only declared.
+ *
+ * A value outside the list is not shown AS A CODE: it is dropped here and the refusal
+ * renders as the server's own sentence, which is the right answer to a refusal this build
+ * has no words for. What that guarantees is the TYPE of `errorCode` — no surface added
+ * later can read a code out of it that this build cannot name. It is not what keeps the
+ * wrong paragraph off the screen today: the rail compares against its own
+ * `ENGINE_UNSUPPORTED_CODE` as well, and the two checks are in SERIES, so widening either
+ * one alone changes nothing that renders (both measured, 2026-08-27). Driven by "an
+ * unknown code never reaches errorCode" in `tests/components/agent/AgentRail.test.tsx`,
+ * which reaches for the hook rather than the rail for exactly that reason.
+ */
+const isStartRefusalCode = (value: unknown): value is AgentStartRefusalCode => value === ENGINE_UNSUPPORTED_CODE;
+
+/**
+ * Where this browser remembers which conversation it was in.
+ *
+ * localStorage only, and per browser rather than per user: it is a resumption hint, not
+ * user data, so it must never reach the storage layer or a server — the rule
+ * `lib/community/star-prompt.ts` states for the same reason. Every access is wrapped, and
+ * every failure degrades to "nothing was interrupted", which is the behaviour before this
+ * existed: a rail that cannot say a conversation ended is strictly better than one that
+ * cannot open a run (#518).
+ */
+const THREAD_STORAGE_KEY = "libredb_agent_thread";
+
+/** A conversation this browser was in and is no longer following. */
+export interface AgentInterruptedThread {
+  /** The conversation the server named, as this browser last saw it. */
+  readonly threadId: string;
+  /**
+   * How many questions it had asked by then: the steps the server reported before the
+   * last run, plus that run itself.
+   */
+  readonly steps: number;
+}
+
+/*
+  Held as an external store rather than read into state by a mount effect, which is the
+  same shape `use-line-numbers-preference.ts` uses and for the same reason: the value has
+  to be SSR-stable and only become the stored one at hydration. React provides
+  `useSyncExternalStore` for exactly that, and an effect that called `setState` would be a
+  cascading render the React Compiler rules refuse (#488).
+
+  localStorage's own `storage` event fires only in OTHER tabs, so the writer below is what
+  notifies this one. Deliberately NOT subscribed to `storage`: picking up another tab's
+  conversation would be new behaviour, and a tab is not the thing the notice is about.
+*/
+const threadListeners = new Set<() => void>();
+
+function subscribeStoredThread(onStoreChange: () => void): () => void {
+  threadListeners.add(onStoreChange);
+  return () => {
+    threadListeners.delete(onStoreChange);
+  };
+}
+
+/**
+ * The last raw value read, and what it parsed to.
+ *
+ * `useSyncExternalStore` calls the snapshot on every render and compares by identity, so a
+ * fresh object each time is an infinite loop rather than a slow read. Keyed on the raw
+ * string, which is also what makes a write visible: the bytes change, so the object does.
+ */
+let cachedRaw: string | null = null;
+let cachedThread: AgentInterruptedThread | null = null;
+
+/** The stored conversation, or null — absent, unreadable, and off-shape all mean the same here. */
+function storedThreadSnapshot(): AgentInterruptedThread | null {
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(THREAD_STORAGE_KEY);
+  } catch {
+    // A store that cannot be read holds no conversation, as far as anything here can say.
+    raw = null;
+  }
+  if (raw === cachedRaw) return cachedThread;
+  cachedRaw = raw;
+  cachedThread = parseStoredThread(raw);
+  return cachedThread;
+}
+
+/** No localStorage on the server, and nothing there was interrupted. */
+function serverThreadSnapshot(): AgentInterruptedThread | null {
+  return null;
+}
+
+function parseStoredThread(raw: string | null): AgentInterruptedThread | null {
+  if (raw === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const candidate = parsed as Record<string, unknown> | null;
+  // Narrowed rather than trusted, for the reason `readThread` narrows the wire: this value
+  // survives an upgrade, so a build that shaped it differently must read as absent instead
+  // of putting a half-read object behind a sentence about it.
+  if (candidate === null || typeof candidate.threadId !== "string" || typeof candidate.steps !== "number") return null;
+  return { threadId: candidate.threadId, steps: candidate.steps };
+}
+
+/** Remember the conversation this run belongs to, or forget the one that no longer applies. */
+function rememberThread(thread: AgentThreadContext | null): void {
+  try {
+    // Removed rather than left standing when a run belongs to no conversation: a stale
+    // entry would tell the next mount a conversation was interrupted that had already ended.
+    if (thread === null) localStorage.removeItem(THREAD_STORAGE_KEY);
+    // `steps + 1` counts the run just opened as well. The server reports the steps BEFORE
+    // it, so storing that number verbatim would have the notice say "two questions" about a
+    // conversation whose strip the user had just read as three.
+    else
+      localStorage.setItem(
+        THREAD_STORAGE_KEY,
+        JSON.stringify({ threadId: thread.threadId, steps: thread.steps.length + 1 }),
+      );
+  } catch {
+    // A store that refuses a write costs the notice, never the run.
+  }
+  for (const listener of threadListeners) listener();
+}
+
+/**
+ * The conversation the SERVER says this run belongs to.
+ *
+ * Read off the start response rather than assembled here, because the thread has one
+ * writer and it is the route: what the rail renders — the steps, and whether
+ * continuing one was declined — has to be what was actually recorded on the run,
+ * never what the browser asked for.
+ */
+function readThread(value: unknown): AgentThreadContext | null {
+  if (typeof value !== "object" || value === null) return null;
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.threadId !== "string" || typeof candidate.text !== "string") return null;
+  if (!Array.isArray(candidate.steps)) return null;
+  const steps = candidate.steps.filter(
+    (step): step is { runId: string; objective: string } =>
+      typeof step === "object" &&
+      step !== null &&
+      typeof (step as Record<string, unknown>).runId === "string" &&
+      typeof (step as Record<string, unknown>).objective === "string",
+  );
+  const declined = candidate.declined;
+  return {
+    threadId: candidate.threadId,
+    steps,
+    text: candidate.text,
+    // Every code the header may carry is admitted here, and an unrecognised one is
+    // dropped. Dropping is the safe half only as long as this list is complete: a code
+    // the server writes and this narrowing does not know leaves the rail with no
+    // `declined` at all, so a continuation that was refused renders no notice rather
+    // than the wrong one. That is how `"repointed"` had to be added here as well as to
+    // the union (#512).
+    ...(declined === "unavailable" || declined === "disabled" || declined === "error" || declined === "repointed"
+      ? { declined }
+      : {}),
+  };
 }
 
 /**
@@ -179,6 +396,24 @@ class ModelRefusedError extends Error {
   }
 }
 
+/**
+ * Carries a named refusal out through the same exit as the unnamed ones, so nothing
+ * about what may be reported after an abort is written twice.
+ *
+ * A subclass rather than a second `setState` at the throw site for the same reason
+ * `ModelRefusedError` is one: the `catch` below is the single place that knows whether
+ * the request was abandoned. Its `message` is the server's sentence, so a reader that
+ * loses the `instanceof` still shows the paragraph rather than nothing.
+ */
+class StartRefusedError extends Error {
+  readonly code: AgentStartRefusalCode;
+
+  constructor(message: string, code: AgentStartRefusalCode) {
+    super(message);
+    this.code = code;
+  }
+}
+
 /** Names this build has words for, and nothing else: an unknown one is dropped, never shown. */
 function readCapabilities(value: unknown): readonly AgentModelCapability[] {
   return Array.isArray(value) ? value.filter(isAgentModelCapability) : [];
@@ -190,10 +425,13 @@ function messageFor(error: unknown): string {
 
 export function useAgentRun(): AgentRunFollower {
   const [runId, setRunId] = useState<string | null>(null);
+  const [thread, setThread] = useState<AgentThreadContext | null>(null);
+  const storedThread = useSyncExternalStore(subscribeStoredThread, storedThreadSnapshot, serverThreadSnapshot);
   const [entries, setEntries] = useState<readonly AgentLedgerEntry[]>([]);
   const [isBusy, setIsBusy] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<AgentStartRefusalCode | null>(null);
   const [refusal, setRefusal] = useState<AgentModelRefusal | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -251,6 +489,7 @@ export function useAgentRun(): AgentRunFollower {
       setIsBusy(true);
       setIsStopping(false);
       setError(null);
+      setErrorCode(null);
       // A verdict is about the model that was configured when it was reached; an
       // operator who changed it and started again is owed the new answer, not the old one.
       setRefusal(null);
@@ -258,6 +497,7 @@ export function useAgentRun(): AgentRunFollower {
       setRunId(null);
 
       let openedRunId: string;
+      let openedThread: AgentThreadContext | null = null;
       try {
         const res = await fetch("/api/agent/runs", {
           method: "POST",
@@ -281,22 +521,36 @@ export function useAgentRun(): AgentRunFollower {
               mode: input.mode,
             });
           }
+          // A code the server named, when this build knows it. It rides beside the
+          // sentence rather than replacing it: a surface that has no use for the code
+          // renders `error` and is right (#513).
+          if (isStartRefusalCode(body.refused)) throw new StartRefusedError(said, body.refused);
           throw new Error(said);
         }
         if (typeof body.runId !== "string") {
           throw new Error("The server opened a run without naming it");
         }
         openedRunId = body.runId;
+        openedThread = readThread(body.thread);
       } catch (startError) {
         if (!controller.signal.aborted) {
           if (startError instanceof ModelRefusedError) setRefusal(startError.refusal);
-          else setError(messageFor(startError));
+          else {
+            setError(messageFor(startError));
+            if (startError instanceof StartRefusedError) setErrorCode(startError.code);
+          }
           setIsBusy(false);
         }
         return;
       }
 
       setRunId(openedRunId);
+      setThread(openedThread);
+      // Written from what the SERVER said this run belongs to, like everything else about
+      // the thread. The notice this feeds is about the ABSENCE of a run, so nothing has to
+      // clear it: `runId` above is what stops the conversation just begun being announced
+      // as one that ended.
+      rememberThread(openedThread);
 
       try {
         await follow(openedRunId, controller.signal);
@@ -362,5 +616,23 @@ export function useAgentRun(): AgentRunFollower {
   */
   const timeline = useMemo(() => foldLedgerEntries(entries), [entries]);
 
-  return { runId, isBusy, isStopping, timeline, error, refusal, start, cancel };
+  /*
+    Derived rather than held: what makes a stored conversation INTERRUPTED is that nothing
+    here is following one, and `runId` is that fact. Held in state it would need clearing
+    from the start path, which is a second writer for something already knowable.
+
+    A start writes the new conversation to the store, so the snapshot moves to it — and
+    `runId` is what keeps that from being announced as interrupted the moment it begins.
+
+    `runId` alone was not enough. `start()` clears it BEFORE it fetches, so for as long as
+    the POST was in flight this read the previous conversation out of the store and the rail
+    said it "ended when the page reloaded" — about the conversation the user was in the act
+    of continuing, and with no page having reloaded. `isBusy` is the missing half: while a
+    start is in flight a run IS being opened, so nothing is un-followed. It also restores
+    what this property documents about itself, because `thread` keeps its previous value
+    across that same window and the two would otherwise both name one conversation.
+  */
+  const interrupted = runId === null && !isBusy ? storedThread : null;
+
+  return { runId, thread, interrupted, isBusy, isStopping, timeline, error, errorCode, refusal, start, cancel };
 }

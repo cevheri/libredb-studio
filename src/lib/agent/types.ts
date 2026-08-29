@@ -42,15 +42,41 @@
  */
 
 import type { Role } from "@/lib/auth";
+import type { LLMProviderType } from "@/lib/llm/types";
+
 import type { PolicyDenyCode } from "@/lib/db/operations/policy";
 import type { AgentStatementViolation } from "@/lib/db/operations/statement-guard";
 import type { AgentChartSpec, DatabaseType, TableSchema } from "@/lib/types";
+import type { AgentContextCharge, AgentContextRowBudget, AgentContextUnavailableCode } from "./context-snapshot";
 import type { AgentGoalShortfall, AgentGoalVerifierId } from "./goal-verifier";
 import type { AgentToolName } from "./tools";
 import type { AgentInventoryNoun } from "./inventory-noun";
 import type { PlanStatementIdentifiers } from "./plan-statement";
 import type { AgentPlanSummary } from "./plan-summary";
 import type { AgentTableProfile } from "./table-profile";
+
+/**
+ * Where the settings that drove a run came from — for THIS model, not for the server.
+ *
+ * A named type rather than an inline union because two places need the same shape: the ledger
+ * event that records it, and `model-tuning`'s projection from its own status onto it. Spelled
+ * twice, the two would drift, and the drift would be invisible — both sides would still compile.
+ *
+ * `operator` means the operator's document supplied THIS model's entry. A document that was applied
+ * but says nothing about the model a run used did not drive that run, and reads `bundled`.
+ *
+ * NO PATH, and that is a boundary rather than an omission. This event is part of the run record,
+ * and `GET /api/agent/runs/[runId]` serves that record — with its events — to the run's OWNER, who
+ * is an ordinary user: `agent-run-access.ts` matches on `actor.sessionId` and asks for no role. An
+ * absolute server path here would be topology handed to every user who starts a run, and hiding it
+ * in the rail would not help, because the API is where it would leak. The digest identifies WHICH
+ * version drove the run without saying where the file lives, and which file that is belongs to
+ * `GET /api/agent/config`, which is admin-only and says so.
+ */
+export type AgentRunTuningProvenance =
+  | { readonly origin: "bundled" }
+  | { readonly origin: "operator"; readonly digest: string }
+  | { readonly origin: "operator-ignored" };
 
 /**
  * Which surface a run drives. Planning is TOOLLESS — the model is handed no tool at
@@ -204,6 +230,44 @@ export const AGENT_WORKFLOW_PRESENTS_ANSWER: Readonly<Record<AgentRunWorkflowTyp
   "data-analysis": true,
 } satisfies Record<AgentRunWorkflowType, boolean>);
 
+/**
+ * Which workflows SEND A STATEMENT the engine has to run under a read-only path — and
+ * therefore which ones can be offered at all on an engine whose provider implements no
+ * such path.
+ *
+ * A property of the workflow, stated here beside `AGENT_WORKFLOW_PRESENTS_ANSWER`
+ * rather than a list inside the route that refuses, and for the same reason: the set is
+ * then explicit, total over the union, and pinned to the tool sets by a test instead of
+ * being a claim a reader has to re-derive from `WORKFLOW_TOOLS`. A new workflow stops
+ * this file compiling until somebody decides whether it drafts SQL, which is the
+ * question that decides where it may run.
+ *
+ * `operations` is the false one, and it is the whole reason this record exists rather
+ * than a blanket rule about agent mode. Its tools are the curated provider readings
+ * every engine implements, served under `AGENT_OPERATIONS_PROFILE`, whose acquisition
+ * does not require `queryReadOnly` (`PROFILE_ACQUISITION` in `src/lib/db/factory.ts`).
+ * A refusal that ignored this axis would withhold from MySQL, Oracle, SQL Server,
+ * MongoDB, Redis and the rest a workflow that runs on them today (#411).
+ *
+ * It says nothing about PLAN mode, which drafts on every engine and executes nothing it
+ * drafts: a caller reading this record has to have established the mode first, exactly
+ * as `selectAgentTools` does.
+ *
+ * The binding to the tool set is not left to prose. `tools.test.ts` asserts, over every
+ * workflow, that `selectAgentTools` offers a tool whose operation carries a STATEMENT
+ * exactly when this record says true — so a workflow that gains such a tool without the
+ * flag (it would open on an engine that then refuses its first statement) or the flag
+ * without the tools (it would be withheld from an engine it runs on) fails the build
+ * rather than shipping the mismatch.
+ */
+export const AGENT_WORKFLOW_SENDS_STATEMENTS: Readonly<Record<AgentRunWorkflowType, boolean>> = Object.freeze({
+  investigation: true,
+  "query-optimization": true,
+  "database-assessment": true,
+  operations: false,
+  "data-analysis": true,
+} satisfies Record<AgentRunWorkflowType, boolean>);
+
 /** A run that has stopped, and why. Terminal states are never re-entered. */
 export type AgentRunTerminalStatus = "succeeded" | "failed" | "cancelled";
 
@@ -218,6 +282,29 @@ export type AgentRunTerminalStatus = "succeeded" | "failed" | "cancelled";
 export type AgentToolProtocol = "native" | "prompted";
 
 export type AgentRunStatus = "queued" | "running" | AgentRunTerminalStatus;
+
+/**
+ * The terminal statuses as a set, EXHAUSTIVE by construction.
+ *
+ * `satisfies Record<AgentRunTerminalStatus, true>` is the whole point: adding a member
+ * to that union stops this file compiling until it is named here. A hand-written
+ * `Set<string>` keeps compiling and silently answers "not terminal" for the new one,
+ * and on the follow-up path that is a legitimate conversation refused with a message
+ * that names nothing — the caller is told only that the run may not be continued.
+ *
+ * `LIVE_STATUSES` in the rail is deliberately NOT derived from this: `queued | running`
+ * is drift-safe on its own, since a new terminal status correctly reads as not live.
+ * This one is the direction that needed pinning.
+ */
+const TERMINAL_STATUS_MEMBERS = {
+  succeeded: true,
+  failed: true,
+  cancelled: true,
+} satisfies Record<AgentRunTerminalStatus, true>;
+
+export const AGENT_TERMINAL_STATUSES: ReadonlySet<AgentRunStatus> = new Set(
+  Object.keys(TERMINAL_STATUS_MEMBERS) as AgentRunTerminalStatus[],
+);
 
 /**
  * Why a drive could not carry a run, in terms a user can act on.
@@ -450,17 +537,108 @@ export type AgentReadingDenyCode = "KIND_UNSUPPORTED_BY_PROVIDER" | "READING_OVE
  * is the server's own decision about a curated reading it will not deliver, and its
  * reason code is a closed union rather than prose for the same reason the policy
  * variant's is.
+ *
+ * `elapsedMs` is on exactly the two variants that COST the run database time, and the
+ * split is the accounting's and not a style choice (#512). Both are decided inside the
+ * invoke callback, so `tracker.beginExecution` has run and `endExecution` charges the
+ * span against `maxTotalRunMs` on the failure path exactly as it does on the success
+ * one; a policy denial and an approval requirement return before `beginExecution` and
+ * are charged nothing at all, so a duration on either would be a spend nobody made.
+ * It was absent, and the consequence was concrete: the rail folds its database-time
+ * meter out of this ledger, so a run whose statement failed reported LESS than the
+ * tracker had already charged it — and under-reporting a spend a bound has taken is
+ * the direction that misleads, since it reads as room the run does not have.
+ *
+ * It sits beside the engine's `message` under a different rule, and the difference is
+ * the point. A duration is a MEASUREMENT this server took with its own clock, so it is
+ * recorded as data and read as data; the message is text the engine wrote, so it stays
+ * untrusted input that any prompt re-entering it has to label and quote.
+ *
+ * Optional, and the absence is a reading rather than a hedge: every refusal recorded
+ * before this field existed carries none, and a fold that read one as `0` would state
+ * that a failed statement cost the database no time — which is exactly what #477
+ * forbids. A reader therefore counts such an entry as unmeasured and says so, instead
+ * of folding a fabricated zero into a total it then presents as measured.
  */
 export type AgentToolRefusal =
   | { readonly class: "policy-denied"; readonly reasonCode: PolicyDenyCode }
   | { readonly class: "approval-required"; readonly operationId: string }
-  | { readonly class: "database-error"; readonly statementFingerprint: string; readonly message: string }
-  | { readonly class: "reading-refused"; readonly reasonCode: AgentReadingDenyCode };
+  | {
+      readonly class: "database-error";
+      readonly statementFingerprint: string;
+      readonly message: string;
+      readonly elapsedMs?: number;
+    }
+  | { readonly class: "reading-refused"; readonly reasonCode: AgentReadingDenyCode; readonly elapsedMs?: number };
 
 interface AgentRunEventBase {
   /** Epoch milliseconds. A number, not a Date: a Date does not round-trip. */
   readonly atMs: number;
 }
+
+/**
+ * Every sentence the drive says to a run, named — and the ONE place a new one has to
+ * state itself (B51).
+ *
+ * Each notice is one-shot or count-bounded per DRIVE, and the flags that bound them are
+ * `let`s inside `runInvestigation` — which is also what RESUMES a run a dead process left
+ * running. So "once" meant once per drive, and a resumed drive could say again what the
+ * previous drive already said. The flags are now SEEDED from the deliveries the ledger
+ * already holds (`guidanceDelivered`), which is why every notice needs an id here: a
+ * delivery nothing records cannot bound anything.
+ *
+ * Two kinds of entry carry these ids, and which one a notice lands on follows from HOW it
+ * is delivered rather than from a second decision:
+ *
+ *  - a notice delivered as a `user` message, on a turn where nothing was refused, is a
+ *    `guidance-issued` entry — the drive said something and the model acts on it next
+ *    turn;
+ *  - a notice delivered as a TOOL RESULT, instead of running the call, is the `notice`
+ *    field of the `call-held` entry that already records the hold. A second entry for one
+ *    delivery would be the only place in this ledger where one thing writes twice, and the
+ *    rail would render both.
+ *
+ * The rail's own reading of these ids is `GUIDANCE_HEADLINE`; the wording lives in
+ * `models/notices.ts` and in `investigation.ts` for the two that name artifact ids.
+ */
+export type AgentGuidanceNotice =
+  /**
+   * A prose turn after a tool this run holds was called. Delivered as a `user` message,
+   * and the turn is taken again. Bounded by the model's own `reportReminderLimit`.
+   */
+  | "report-reminder"
+  /**
+   * A plan run whose prose named neither statement nor refusal. Delivered as a `user`
+   * message; bounded by the model's own `planStatementRetries`.
+   */
+  | "plan-statement"
+  /**
+   * A run within the turn or time reserve of a ceiling. Delivered as a `user` message
+   * riding the turn about to be taken; once per run.
+   */
+  | "report-reserve"
+  /**
+   * A run that stopped having read nothing, on a set holding both reading tools.
+   * Delivered as a `user` message; once per run, and only where the model's profile
+   * says the retry earned its turn.
+   */
+  | "unread-stop"
+  /**
+   * A `compose_report` on an answering workflow with a presentable read and no
+   * presentation. Delivered as a TOOL RESULT instead of running the call, so it rides
+   * the `call-held` entry; bounded by the model's own `presentReminderLimit`.
+   */
+  | "present-before-report"
+  /**
+   * A `compose_report` resting on no citation, or on nothing but empty readings.
+   * Delivered as a TOOL RESULT instead of running the call; once per run.
+   */
+  | "cite-what-you-read"
+  /**
+   * A `compose_report` from a run holding the two plans a comparison would use.
+   * Delivered as a TOOL RESULT instead of running the call; once per run.
+   */
+  | "compare-before-report";
 
 /**
  * The semantic events one run emits, in the vocabulary a user reads in the rail
@@ -476,6 +654,37 @@ interface AgentRunEventBase {
  */
 export type AgentRunEvent =
   | (AgentRunEventBase & { readonly kind: "run-started"; readonly mode: AgentRunMode })
+  | (AgentRunEventBase & {
+      /**
+       * What drove this stretch of the run: the model, and where its settings came from.
+       *
+       * Written because a finished run said neither. The record carries no model id and no event
+       * did either, so "these settings were measured" — the product's whole claim about a model —
+       * was not checkable from the run that used them. Once a tuning document can arrive from an
+       * operator's disk, neither was "which settings", and `GET /api/agent/config` answers only
+       * for the server at the moment somebody asks rather than for a run read afterwards.
+       *
+       * Per DRIVE rather than per run: a resume can pick up a different model, so a resumed run
+       * carries one of these per stretch and each says what that stretch ran on. A reader takes
+       * the last, or notices they disagree, which is the fact worth noticing.
+       */
+      readonly kind: "driver-resolved";
+      readonly modelId: string;
+      readonly provider: LLMProviderType;
+      /**
+       * `bundled` is written rather than left out: a ledger silent about provenance and one that
+       * says "the shipped measurements" are different claims, and only the second is checkable.
+       *
+       * `operator-ignored` is its own case because the fail-open policy rests on the distinction.
+       * A run driven by the shipped settings because nobody configured a document, and one driven
+       * by them because the operator's could not be read, behave identically and mean opposite
+       * things — the second is a misconfiguration nobody has noticed yet.
+       *
+       * Per MODEL: see `AgentRunTuningProvenance` for why a document that was applied can still
+       * read `bundled` here, and for why no path is carried.
+       */
+      readonly tuning: AgentRunTuningProvenance;
+    })
   | (AgentRunEventBase & {
       readonly kind: "context-captured";
       readonly fingerprint: string;
@@ -517,6 +726,121 @@ export type AgentRunEvent =
        * claiming a vocabulary nobody recorded.
        */
       readonly noun?: AgentInventoryNoun;
+      /**
+       * What the reading COST this run, measured off the tracker around the capture
+       * (B13).
+       *
+       * The capture's catalog reads are charged against exactly the ceilings the rail
+       * shows and go through `executeAuditedOperation` rather than the run loop's
+       * `runStep`, which is the only writer of `tool-completed` — so a run that had
+       * spent three statements before its first model turn folded to a meter reading
+       * zero. This is what the fold adds instead of itemising reads it never saw.
+       *
+       * The tracker's own delta and not a count of the catalog kinds this dialect has:
+       * a denied read charges nothing while an acquisition failure charges a statement
+       * for a call that never ran, so a derived figure would state the reads the server
+       * INTENDED rather than the ones the run paid for.
+       *
+       * Optional, and the absence is the honest reading rather than a hedge: a ledger
+       * written before this field records a capture whose spend nobody measured, and a
+       * `{ statements: 0, elapsedMs: 0 }` there would state that the reading was free
+       * (#477). A reader folds an entry without one exactly as it always folded it.
+       */
+      readonly charged?: AgentContextCharge;
+    })
+  | (AgentRunEventBase & {
+      /**
+       * An inventory this run did not read, because the PROCESS already held one for
+       * its connection, and how old that reading was when this run took it (B56).
+       *
+       * `heldSnapshotForConnection` is consulted before any capture and has no expiry:
+       * newest reading wins, eviction is by use, nothing re-reads. Measured 2026-08-22,
+       * twice in one session — MongoDB's schema inference was changed, the schema tree
+       * showed the new dotted paths immediately, and two plan runs afterwards still
+       * grouped by the old field. Their ledgers carried NO context event at all, so the
+       * record could not distinguish "held, hours old" from "captured just now", and the
+       * only diagnosis available was restarting the process.
+       *
+       * Its own kind rather than a `context-captured`, for the reason
+       * `context-unavailable` is one: every reader that asks `kind === "context-captured"`
+       * treats the entry as this run's own reading — `reusableSnapshot` re-derives a
+       * snapshot from it and would hand a later drive an inventory this run never read,
+       * and the timeline would say "Schema captured" of a capture that did not happen.
+       *
+       * `ageMs` is what the entry exists for. The fingerprint says WHICH reading, and a
+       * user who has just added a collection needs to know it was taken before they did.
+       * It is the age at the moment of REUSE and not a timestamp difference a reader has
+       * to compute: the reading's own `capturedAtMs` belongs to whichever run captured it,
+       * and that run may not be in this ledger at all.
+       *
+       * No snapshot on the entry, deliberately. The inventory is not this run's reading,
+       * and recording it here would make `reusableSnapshot` reachable from a reuse — which
+       * is the reading that ages, so a resumed drive would keep re-deriving it for as long
+       * as the run lived.
+       */
+      readonly kind: "context-reused";
+      readonly fingerprint: string;
+      readonly tableCount: number;
+      /** How old the reading was when this run took it, in milliseconds. */
+      readonly ageMs: number;
+      /**
+       * What this engine calls the rows of that inventory, from the same source the
+       * capture entry takes it from (#414) and optional for the same reason.
+       */
+      readonly noun?: AgentInventoryNoun;
+    })
+  | (AgentRunEventBase & {
+      /**
+       * A capture that was REFUSED, and why (B54).
+       *
+       * Its own kind rather than a `context-captured` carrying an absence, for two
+       * reasons that point the same way. A refused capture read nothing, so it has no
+       * fingerprint and no table count, and the absence rule this repository already
+       * enforces (#477) says a refusal must be representable AS a refusal rather than
+       * as a zero or a fabricated measurement — `tableCount: 0` here would state that
+       * this database has no tables. And every reader that asks
+       * `kind === "context-captured"` — `reusableSnapshot`, the grounding check in
+       * `tools.ts`, the timeline — treats the entry as PROOF that an inventory exists,
+       * so a variant of it carrying a refusal would make all three claim grounding a
+       * run never had. `call-declined` beside `call-held` is the same decision one
+       * layer down: what did NOT happen gets its own entry.
+       *
+       * Written because the ledger is supposed to be the authority on what a run did
+       * (`docs/llms/setup.md`) and, for exactly the case an operator has to diagnose, it
+       * was not: the refusal branch pushed a sentence into the prompt and returned, so a
+       * plan run whose capture was refused left four events and nothing between the
+       * second and the third. The measured cost is B52 — 536 rows against a 200-row
+       * budget on a live AlloyDB Omni — where the reason code, the numbers and the
+       * catalog read were all computed, handed to the model, and then dropped. And a
+       * missing event is worse here than missing telemetry: it reads as work that was
+       * not needed rather than knowledge that was lost.
+       *
+       * `detail` is the capture's OWN sentence — the same one the model was given — so
+       * the ledger and the prompt cannot disagree about why this run had no inventory.
+       * It is needed rather than redundant: `CATALOG_READ_REFUSED` covers four causes
+       * (a denied read, an over-budget one, an unreachable host, a refused execution
+       * profile) and this is what tells them apart. On the composed path it arrives
+       * fenced, because part of it is text the engine wrote, exactly as `tool-refused`
+       * carries an engine's message.
+       *
+       * NOT recorded: the statements the capture composed, and no noun. The first
+       * belongs to the audit stream — what those reads COST is a different question and
+       * `charged` answers it; the second describes rows, and there are none to describe.
+       */
+      readonly kind: "context-unavailable";
+      readonly reasonCode: AgentContextUnavailableCode;
+      readonly detail: string;
+      /** Present only when the row budget is what refused it. */
+      readonly rowBudget?: AgentContextRowBudget;
+      /**
+       * What the refused reading cost this run, measured off the tracker (B13).
+       *
+       * A refusal is not a free capture: the pipeline admitted the call, charged the
+       * statement and only then answered, and on the row-budget case the engine had
+       * already produced the rows. Same reading as the captured entry's, same reason for
+       * being optional there.
+       */
+      readonly charged?: AgentContextCharge;
     })
   | (AgentRunEventBase & {
       readonly kind: "statement-drafted";
@@ -561,6 +885,20 @@ export type AgentRunEvent =
       readonly tool: AgentToolName;
       readonly reason: string;
       readonly shortfall?: AgentGoalShortfall;
+      /**
+       * WHICH sentence the hold answered with, from the one vocabulary every delivery is
+       * named in (`AgentGuidanceNotice`, B51).
+       *
+       * `reason` is the prose the model was sent and names artifact ids in two of the
+       * three cases, so it cannot be matched against: a resumed drive reading it back to
+       * decide whether a notice had already been delivered would be pattern-matching a
+       * paragraph. This is the id that reading uses.
+       *
+       * Absent on the verdict-preview holds, which speak for a `shortfall` rather than for
+       * a notice, and on every entry written before the field existed — where the absence
+       * says "this delivery was not recorded under a name", not "no notice was sent".
+       */
+      readonly notice?: AgentGuidanceNotice;
     })
   | (AgentRunEventBase & {
       /**
@@ -645,7 +983,22 @@ export type AgentRunEvent =
        * badly and read as this server's own prose.
        */
       readonly kind: "guidance-issued";
-      readonly notice: "report-reminder" | "plan-statement" | "report-reserve";
+      readonly notice: AgentGuidanceNotice;
+      /**
+       * What the run had DONE when the sentence arrived (B51).
+       *
+       * The question `docs/llms/` exists to answer is "did this model do that by itself?",
+       * and after #416 and #417 a ledger could say a notice was delivered without saying
+       * where in the run it landed — a reminder on the second turn and one on the last are
+       * different facts about a model. Both figures are the drive's own counters at the
+       * moment of delivery.
+       *
+       * Optional, because a ledger written before they were recorded holds neither, and a
+       * zero would say the notice arrived before the run did anything.
+       */
+      readonly atTurn?: number;
+      /** Tool calls this run had made when it arrived. */
+      readonly toolCalls?: number;
     })
   | (AgentRunEventBase & {
       /**
@@ -850,8 +1203,8 @@ export type AgentRunEvent =
        */
       readonly reason?: AgentRunFailureReason;
       /**
-       * Whether the run met the goal its workflow was opened for (`docs/BACKLOG.md`
-       * B24, ratified 2026-08-13).
+       * Whether the run met the goal its workflow was opened for (ratified 2026-08-13
+       * in #347).
        *
        * A field beside the status rather than a fourth status word, and the reason is
        * an observation rather than a preference: the two axes are genuinely
@@ -884,6 +1237,108 @@ export type AgentRunEvent =
        */
       readonly stopReason?: AgentRunStopReason;
     });
+
+/**
+ * One step of the conversation a run belongs to, as the SURFACE needs it.
+ *
+ * The objective is capped for carrying. A thread of twenty steps would otherwise
+ * put twenty full objectives on every header after it, and the full text is one
+ * `GET /api/agent/runs/{runId}` away on the run that owns it.
+ */
+export interface AgentThreadStep {
+  readonly runId: string;
+  readonly objective: string;
+}
+
+/**
+ * What a run is told about the conversation it belongs to.
+ *
+ * Two consumers, two fields. `steps` serves the RAIL, which renders the
+ * conversation from the header with no additional request. `text` serves the
+ * MODEL, and holds inert content only: the instruction lines and the fence are
+ * added when the prompt is built, so improving that wording never requires
+ * rewriting a stored ledger, and the server's own voice never enters one.
+ *
+ * `text` is derived once, at open, rather than re-derived at drive time. A resumed
+ * drive must reason from byte-identical context to the first drive, and a
+ * predecessor's ledger going unreadable in between must not silently shrink what
+ * the run was told — the same instinct the held context snapshot follows by
+ * having no TTL.
+ *
+ * `declined` is set only when continuing a conversation was ASKED for and did not
+ * happen. It is persisted rather than answered once, so a reload still shows the
+ * notice rather than leaving the user to wonder.
+ *
+ * Inert by construction, like every other contract here: strings and ids. The
+ * state guard therefore admits it exactly as it admits the objective.
+ */
+export interface AgentThreadContext {
+  readonly threadId: string;
+  /** Prior steps, oldest first. Empty for a thread's first run. */
+  readonly steps: readonly AgentThreadStep[];
+  readonly text: string;
+  /**
+   * How many steps have fallen off the FRONT of this conversation, across its whole
+   * length rather than at this link.
+   *
+   * Cumulative because each header carries at most `AGENT_THREAD_MAX_STEPS`, so the
+   * per-derivation figure is 1 forever once the cap is reached: a thirty-step
+   * conversation would keep reporting that one step was dropped. Absent means none.
+   */
+  readonly droppedSteps?: number;
+  /**
+   * Why continuing did not happen, in codes a surface can say something specific about.
+   *
+   * `"disabled"` is the operator's switch (`LIBREDB_AGENT_THREAD_CONTEXT`), `"error"` an
+   * unreadable ledger, and `"repointed"` a predecessor established against another
+   * database than this connection now addresses.
+   *
+   * `"repointed"` is split out and the rest are not, and the line between them is NOT a
+   * remedy. It was written as one — the decline was said to persist until the connection
+   * is pointed back — and that was false: the route writes the CURRENT identity onto the
+   * run this question opens (`route.ts`, the `connectionIdentity` field of its `start`
+   * call), and an ordinary follow-up continues THAT run (`AgentRail.tsx`,
+   * `continueTarget`), so the next question matches and carries. The decline is exactly
+   * one question long, and pointing the connection back afterwards does not restore the
+   * old conversation either — it declines once more, in the other direction.
+   *
+   * What earns the split is that this is the only code here that does not report a
+   * failure. It is reached only after every check in `route.ts` has PASSED: the
+   * predecessor exists, is this session's, is on this connection, has ended, and its
+   * ledger read. The server then refuses the carry on purpose, because the earlier steps'
+   * claims are about a database this run is not reading — carrying them would have been
+   * WRONG, not merely impossible. Two consequences a shared sentence cannot deliver: the
+   * user must not go hunting for a fault that does not exist, and they must learn that
+   * their own saved connection has moved, which nothing else tells them. That last is
+   * mechanical, not a guess: no client module computes `connectionIdentity` at all, and
+   * the rail's own connection sentence (`AgentRail.tsx`, `connectionDropped`) compares
+   * the connection's ID, which re-pointing a saved record does not change. This code is
+   * the only channel the operator has for learning it moved.
+   *
+   * The five left under `"unavailable"` are failures and are alike as failures — the
+   * predecessor does not exist, is not this session's, is on another connection, has not
+   * ended, or is named by an id the ledger refuses. Two are the caller's own bug (no such
+   * run, malformed id), one is transient and resolves by itself (not ended yet), one is
+   * session-scoped and cannot be fixed from this session at all (another session's run),
+   * and the last is a case the rail never reaches, because it withholds `previousRunId`
+   * itself when the editor has moved and owns a specific sentence for it (`AgentRail.tsx`,
+   * `connectionDropped`). Splitting them would also start telling a caller guessing ids
+   * which of its guesses were wrong, which is the leak `"repointed"` does not have
+   * (#512).
+   */
+  readonly declined?: "unavailable" | "disabled" | "error" | "repointed";
+}
+
+/**
+ * The thread as a LEDGER HEADER carries it.
+ *
+ * `threadId` is absent when the run starts a conversation of its own, and the fold
+ * supplies the run's own id — the same rule that lets a header with no thread at all
+ * fold to a thread of one. It matters for a DECLINED continuation: naming that thread
+ * after the run it was refused would make a later follow-up inherit a root that was
+ * never part of the conversation.
+ */
+export type AgentThreadHeader = Omit<AgentThreadContext, "threadId"> & { readonly threadId?: string };
 
 /**
  * One run, whole. Everything a restarted process needs to continue, and nothing
@@ -952,10 +1407,44 @@ export interface AgentRunRecord {
    * the prose path existed, and of every model that can call a tool.
    */
   readonly toolProtocol?: AgentToolProtocol;
+  /**
+   * The conversation this run belongs to.
+   *
+   * Required HERE and optional on the ledger header, which is the whole
+   * compatibility story in one sentence: the fold always produces a thread. A run
+   * whose thread was not recorded is a thread of ONE, named after itself — which
+   * is what was true of it, since no run belonged to a conversation then, and it
+   * is equally true of a run that starts a conversation today.
+   *
+   * It is on the record for the reason every other header field is: a resumed
+   * drive must be told the same thing the drive that died was told, so the context
+   * has to live in the ledger rather than in a request body only the opener saw.
+   */
+  readonly thread: AgentThreadContext;
   readonly status: AgentRunStatus;
   readonly actor: AgentRunActor;
   /** The single connection this run may reach; the server builds the scope from it. */
   readonly connectionId: string;
+  /**
+   * WHICH DATABASE that connection addressed when this run opened, as
+   * `connectionIdentity` fingerprints it: engine, host, port, database, service,
+   * instance, role and the SSH tunnel it is reached through, and deliberately not the
+   * password.
+   *
+   * The id above names the RECORD; this names the database behind it, and the two
+   * are not the same fact. A saved connection edited to address another server keeps
+   * its id, so a conversation checked only on the id carried one database's
+   * established claims into a run reading another — nothing refused, nothing wrong to
+   * look at, and a report about production resting on staging (#509).
+   *
+   * Optional because a header written before this field records nothing about the
+   * database it read, and a mismatch must not be invented out of that silence: absent
+   * is carried, a recorded identity that DISAGREES is what declines. Excluding the
+   * password is the point of reusing that function rather than hashing the record —
+   * rotating a credential does not change which database this is, and must not cost a
+   * user the conversation they were having.
+   */
+  readonly connectionIdentity?: string;
   /** The user's own question, in their words. */
   readonly objective: string;
   readonly createdAtMs: number;

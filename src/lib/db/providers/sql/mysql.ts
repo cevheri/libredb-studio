@@ -105,6 +105,67 @@ const runStatement = <T extends RowDataPacket[] = RowDataPacket[]>(
     ? queryable.query<T>(sql)
     : queryable.execute<T>(sql, asExecuteParams(params));
 
+/**
+ * One row of MySQL's answer to `ANALYZE`/`OPTIMIZE`/`CHECK TABLE`. These statements
+ * return a RESULT SET, not a header: the outcome is data, and reading it is the only
+ * way to know what happened.
+ */
+interface MaintenanceReportRow extends RowDataPacket {
+  Table: string;
+  Op: string;
+  Msg_type: string;
+  Msg_text: string;
+}
+
+/**
+ * MySQL's verdict on a table maintenance statement, taken from the statement's own
+ * answer.
+ *
+ * The statement does NOT throw when the server refuses it: measured through this
+ * provider against MySQL 26.7.0 (`libredb-mysql`) on 2026-08-25, `OPTIMIZE TABLE
+ * \`missing\`` resolves normally and answers
+ *
+ *   [{ Table: 'u9t.missing', Op: 'optimize', Msg_type: 'Error',
+ *      Msg_text: "Table 'u9t.missing' doesn't exist" },
+ *    { Table: 'u9t.missing', Op: 'optimize', Msg_type: 'status',
+ *      Msg_text: 'Operation failed' }]
+ *
+ * so `await runStatement(...); return { success: true }` reported a completed
+ * operation for a statement the server had rejected - and discarded the `Msg_text`
+ * that is the entire point of `CHECK TABLE`, whose OK-or-corruption-report is the only
+ * thing the user asked for. `Msg_type` is the decision (`'Error'` from the server,
+ * matched case-insensitively because the manual documents the set in lower case), and
+ * the same read is what SQLite's `check` already does with `PRAGMA integrity_check`.
+ *
+ * The whole-database form names every table in one statement, so a failing table is
+ * quoted WITH its name - it is the only place the failure appears - while a successful
+ * run quotes the messages alone and deduplicates them: over forty tables the OK and
+ * InnoDB's "doing recreate + analyze instead" note repeat once per table and say the
+ * same thing forty times.
+ */
+function readMaintenanceReport(
+  type: MaintenanceType,
+  rows: MaintenanceReportRow[],
+): { success: boolean; message: string } {
+  const failures = rows.filter((row) => String(row.Msg_type).toLowerCase() === "error");
+  if (failures.length > 0) {
+    return {
+      success: false,
+      message: `${type.toUpperCase()} failed: ${unique(failures.map((row) => `${row.Table}: ${row.Msg_text}`)).join("; ")}`,
+    };
+  }
+
+  // A statement that answers no row at all leaves nothing to quote; the generic
+  // sentence is then all there is to say.
+  if (rows.length === 0) {
+    return { success: true, message: `${type.toUpperCase()} completed successfully` };
+  }
+
+  return { success: true, message: `${type.toUpperCase()}: ${unique(rows.map((row) => row.Msg_text)).join("; ")}` };
+}
+
+const unique = (values: string[]): string[] => [...new Set(values)];
+
 // ============================================================================
 // SQL Statements
 // ============================================================================
@@ -174,17 +235,6 @@ const BUFFER_CACHE_HIT_RATIO_SQL = `
           )) * 100 as hit_ratio;
       `;
 
-const HEALTH_SLOW_QUERIES_SQL = `
-          SELECT
-            LEFT(sql_text, 100) as query,
-            count_star as calls,
-            CONCAT(ROUND(avg_timer_wait / 1000000000, 2), 'ms') as avgTime
-          FROM performance_schema.events_statements_summary_by_digest
-          WHERE schema_name = ?
-          ORDER BY sum_timer_wait DESC
-          LIMIT 5;
-        `;
-
 const HEALTH_ACTIVE_SESSIONS_SQL = `
         SELECT
           ID as pid,
@@ -238,7 +288,31 @@ const QUERIES_PER_SECOND_SQL = `
           (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Uptime') as uptime;
       `;
 
-// The LIMIT clause is interpolated at the call site in getSlowQueries().
+/**
+ * The ONE read of `performance_schema.events_statements_summary_by_digest`, shared by
+ * `getSlowQueries()` (the Queries panel) and `getHealth()`'s slow-query line, with only
+ * the LIMIT interpolated at each call site.
+ *
+ * It is shared because the two used to be separate statements and the health one was
+ * wrong (#512): it asked for `LEFT(sql_text, 100)`, and this table has no `sql_text`
+ * column. `SQL_TEXT` belongs to `events_statements_current`/`_history`; the digest table
+ * carries the normalised `DIGEST_TEXT` (MySQL 9.4 manual, "Statement Summary Tables",
+ * and the server's own `information_schema.columns` on every build below). So that
+ * statement answered
+ *
+ *   errno=1054 code=ER_BAD_FIELD_ERROR sqlState=42S22
+ *   Unknown column 'sql_text' in 'field list'
+ *
+ * and never once returned a row. Measured 2026-08-27 on MySQL 26.7.0, Percona Server
+ * 8.4.11-11, MySQL 26.7.0 started `--performance-schema=OFF` and MariaDB 12.3.2 - all
+ * four, whatever `@@performance_schema` said - while this statement answered 5 real rows
+ * on the two with the schema on, over the same connection.
+ *
+ * Two statements for one fact is what drifted, and the copy the health panel used was
+ * the one no test ever put in front of a server: the mysql2 mock invented a `query`
+ * column for any statement over this table, so the broken read looked like a working one
+ * for as long as it was only mocked.
+ */
 const SLOW_QUERIES_BODY_SQL = `
         SELECT
           DIGEST as query_id,
@@ -252,6 +326,78 @@ const SLOW_QUERIES_BODY_SQL = `
         FROM performance_schema.events_statements_summary_by_digest
         WHERE SCHEMA_NAME = ?
         ORDER BY SUM_TIMER_WAIT DESC`;
+
+/**
+ * The five heaviest digests - the LIMIT the health statement this replaced already used,
+ * kept so the reading's size does not change with the repair.
+ *
+ * A CAP, NOT A COUNT, and nothing downstream can tell the difference, which is why it is
+ * written here. `SLOW_QUERIES_BODY_SQL` has no slowness predicate at all: its only WHERE
+ * term is the connected schema and "slow" is the ORDERING (`SUM_TIMER_WAIT DESC`), so the
+ * top five digests for a schema come back whether they took 15 ms or 15 hours. So on any
+ * server with five or more digests for this schema, the LENGTH of this list is 5 -
+ * permanently, and about statements no threshold has called slow. The agent's curated
+ * health reading used to forward that length to the model as `slowQueryCount`; it no
+ * longer projects any length at all, because a figure whose value is a cap has no
+ * referent (`src/lib/agent/tools.ts`, and #513). The cap is still
+ * written here: nothing downstream can tell a cap from a count, so the only place the
+ * distinction can be recorded is where the limit is applied.
+ *
+ * Measured 2026-08-27 on MySQL 26.7.0: the digest table held 59 rows for one connected
+ * schema, and the five this statement returns for it were ALL Studio's own introspection
+ * statements, with the slow-query read itself first at `avg 79.11ms, calls 3` and the rest
+ * between 1.15 ms and 7.78 ms. Nothing in that list is slow and none of it is the user's
+ * workload; what the reading honestly reports is "the five heaviest digests recorded for
+ * this schema". Raising the limit would move the saturation point without turning the
+ * number into a count - only a slowness threshold, or a differently named projection,
+ * would - and the projection is in a file this one does not own.
+ */
+const HEALTH_SLOW_QUERY_LIMIT = 5;
+
+/**
+ * One digest row in the Queries panel's shape. Module-level rather than inline in
+ * `getSlowQueries()` so `getHealth()` projects the SAME row the panel does: the health
+ * line's job is to agree with the panel beside it, and it can only be structurally
+ * unable to disagree while there is one statement and one mapper.
+ */
+function toSlowQueryStats(r: RowDataPacket): SlowQueryStats {
+  return {
+    queryId: r.query_id || undefined,
+    query: r.query || "",
+    calls: parseInt(r.calls || "0"),
+    totalTime: parseFloat(r.total_time_ms || "0"),
+    avgTime: parseFloat(r.avg_time_ms || "0"),
+    minTime: parseFloat(r.min_time_ms || "0"),
+    maxTime: parseFloat(r.max_time_ms || "0"),
+    rows: parseInt(r.rows_examined || "0"),
+  };
+}
+
+/**
+ * The health summary's narrower `SlowQuery` shape, from the panel's row.
+ *
+ * NOTHING RENDERS THESE TWO FIELDS, and the format is chosen on that basis rather than on
+ * an appearance nobody can check. No component reads `HealthInfo.slowQueries` (the
+ * monitoring Queries and Overview tabs read `MonitoringData.slowQueries`, a different
+ * reading with its own `SlowQueryStats` shape), and the one caller of
+ * `POST /api/db/health` - the 60s connection pulse in `src/hooks/use-connection-manager.ts` -
+ * reads `res.ok` and discards the body. The agent's curated health reading
+ * (`src/lib/agent/tools.ts`) was the last live consumer and read only the list's LENGTH -
+ * never `query`, never `avgTime` - and it no longer reads the list at all (#513). So this
+ * shape now has no consumer in the app beyond the serialised route body.
+ *
+ * So `toFixed(2)` plus `"ms"` is here for one reason: it is the string the statement this
+ * replaced produced with `CONCAT(ROUND(avg_timer_wait / 1000000000, 2), 'ms')`, and
+ * keeping the type's contents identical in form means no consumer added later inherits a
+ * silent change of units from this repair. What DID change is the query text: the old
+ * statement asked for `LEFT(sql_text, 100)` (and answered ER_BAD_FIELD_ERROR every time,
+ * so no consumer ever saw 100 characters of anything), the shared one asks for
+ * `LEFT(DIGEST_TEXT, 500)` - the panel's own width, five times wider, and the reason the
+ * two readings can no longer disagree about a statement's text.
+ */
+function toHealthSlowQuery(stats: SlowQueryStats): SlowQuery {
+  return { query: stats.query, calls: stats.calls, avgTime: `${stats.avgTime.toFixed(2)}ms` };
+}
 
 /**
  * Vendor names that a MySQL-protocol server puts into its own `VERSION()` string.
@@ -390,22 +536,54 @@ export class MySQLProvider extends SQLBaseProvider {
       // The driver's own connection.beginTransaction() over one held connection.
       supportsTransactions: true,
       maintenanceOperations: ["analyze", "optimize", "check", "kill"],
+      // MySQL has no VACUUM, and every statement it does have names tables:
+      // `ANALYZE/OPTIMIZE/CHECK TABLE <t>` with a target, the same verb over every
+      // table in the database without one (`getAllTablesForMaintenance`). `kill`
+      // takes a connection id from the Sessions panel.
+      maintenanceOperationSpecs: {
+        analyze: { label: "Analyze Table", perEntity: true, global: true },
+        optimize: { label: "Optimize Table", perEntity: true, global: true },
+        check: { label: "Check Table", perEntity: true, global: true },
+        kill: { label: "Kill Connection", perEntity: false, global: false },
+      },
     };
   }
 
   /**
-   * Only the slow-query empty state; every other label is the SQL default and right.
+   * The vacuum slot and the slow-query empty state; every other label is the SQL
+   * default and right.
    *
-   * `getSlowQueries()` reads `performance_schema.events_statements_summary_by_digest`
-   * and answers `[]` when that read fails, which on a server with the Performance
-   * Schema off is the ordinary case. The panel used to name PostgreSQL's extension
-   * there (#U12) - a statement store MySQL does not have under any name.
+   * MySQL rendered the base default *"Vacuum Table"* in the explorer's per-row menu
+   * and the base *"Run Vacuum" / "Reclaim Space"* copy on the Operations tab, for an
+   * engine whose operations are `analyze`/`optimize`/`check`/`kill` (#496). The words
+   * below name what MySQL actually runs, and `vacuumActionOperation` says which
+   * operation the surfaces should send for them.
+   *
+   * `getSlowQueries()` reads `performance_schema.events_statements_summary_by_digest`,
+   * and the panel used to name PostgreSQL's extension in its empty state (#463) - a
+   * statement store MySQL does not have under any name.
+   *
+   * The sentence describes the SOURCE and what an empty list means about it, and stops
+   * there. It cannot do more: `QueriesTab` renders this one fixed string for every empty
+   * list whatever produced it, so any instruction in it is addressed to causes it cannot
+   * tell apart. It used to end "enable the Performance Schema to see them", which named
+   * the one cause that never reaches the failure path at all (off-ness answers 0 rows,
+   * measured; see `getSlowQueries()`) and was unactionable advice for the ones that do -
+   * a denied grant, or a tenant with no `performance_schema` database. Those now reject
+   * instead of emptying, and the panel shows the server's own reason through
+   * `PanelUnavailable`, which is a different string on a different branch.
    */
   public override getLabels(): ProviderLabels {
     return {
       ...super.getLabels(),
+      vacuumAction: "Optimize Table",
+      vacuumActionOperation: "optimize",
+      vacuumGlobalLabel: "Run Optimize",
+      vacuumGlobalTitle: "Optimize Tables",
+      vacuumGlobalDesc:
+        "Runs OPTIMIZE TABLE over every table in the database, rebuilding its storage and reclaiming the space deleted rows left behind.",
       slowQueriesEmptyState:
-        "Query stats come from performance_schema.events_statements_summary_by_digest - enable the Performance Schema to see them.",
+        "Query stats come from performance_schema.events_statements_summary_by_digest for this database. An empty list means it recorded nothing - the Performance Schema is off, or nothing has run against this database yet.",
     };
   }
 
@@ -502,7 +680,11 @@ export class MySQLProvider extends SQLBaseProvider {
       if (connSSL.mode === "disable") return undefined;
 
       const ssl: mysql.SslOptions = {
-        rejectUnauthorized: connSSL.mode === "verify-ca" || connSSL.mode === "verify-full",
+        // Every mode except `require` verifies (D26): `verify-system` checks the chain against
+        // the trust store the runtime already has - no `ca` is set below, so Node's bundled
+        // roots decide - while `verify-ca`/`verify-full` check it against the PEM pasted into
+        // the form. `require` is the one mode that encrypts without checking anything.
+        rejectUnauthorized: connSSL.mode !== "require",
       };
 
       if (connSSL.caCert) ssl.ca = connSSL.caCert;
@@ -791,16 +973,59 @@ export class MySQLProvider extends SQLBaseProvider {
         // Nothing to read, so nothing is reported.
       }
 
+      // The digest rows, or none - never a sentence dressed as a row (#512).
+      //
+      // This used to report `[{ query: "Performance schema not available", calls: 0,
+      // avgTime: "N/A" }]` whenever its statement threw, and the statement threw on every
+      // server: it named a column the digest table does not have (see
+      // SLOW_QUERIES_BODY_SQL). So the line stated an engine capability as absent on
+      // MySQL 26.7.0 and Percona Server 8.4.11-11 where `@@performance_schema` was 1 and
+      // `getSlowQueries()` answered 5 rows on the same connection - measured 2026-08-27,
+      // both arms.
+      //
+      // That row was a fabricated measurement rather than a missing number, which is the
+      // class the absence rule (#477) exists to prevent: `calls: 0` is a figure nobody
+      // took, and it was COUNTED - the agent's curated health reading then forwarded
+      // `health.slowQueries.length` as `slowQueryCount` (src/lib/agent/tools.ts), so the
+      // invented row told the model "1 slow query" about every MySQL-family server. That
+      // projection carries no length any more (#513), so a row invented here would now be
+      // silent rather than counted - a reason to keep it out, not a reason it could return.
+      //
+      // Why an empty list rather than a marker that says "unavailable": the capability
+      // being OFF does not raise here at all. Measured on the same pass, MySQL 26.7.0
+      // started `--performance-schema=OFF` and MariaDB 12.3.2 (which ships it off) both
+      // keep the digest table selectable and answer 0 rows. A marker keyed on the throw
+      // would therefore be emitted for something other than off-ness - the same fabrication
+      // as the row it replaces, one level up.
+      // What remains in the catch is a genuine refusal: no `performance_schema` DATABASE
+      // at all (ER_1049 on the OceanBase tenant above), or a grant denied on it.
+      //
+      // ON THIS PATH THE REASON IS DROPPED, and saying so is the point of this
+      // paragraph. `HealthInfo.slowQueries` is a `SlowQuery[]`; it has no error field
+      // and no sibling that carries one, so a refusal cannot be represented here at all,
+      // and a row saying "Performance schema not available" is what representing it
+      // anyway looked like. Empty is the least-wrong shape, not a shape that carries the
+      // reason. Nothing renders this list either: no component reads
+      // `HealthInfo.slowQueries` (the monitoring Queries and Overview tabs read
+      // `MonitoringData.slowQueries`, a different reading), and the one caller of
+      // `POST /api/db/health` - the 60s connection pulse in
+      // `src/hooks/use-connection-manager.ts` - looks at `res.ok` and discards the body.
+      //
+      // The operator is not left without the reason, because the SAME refusal reaches
+      // them on the path that does have a channel: `getSlowQueries()` below lets it
+      // reject, `getMonitoringData()` (src/lib/db/base-provider.ts) records it as
+      // `errors.slowQueries`, and `QueriesTab` renders that through `PanelUnavailable`
+      // with the server's own sentence. `ProviderLabels.slowQueriesEmptyState` is NOT
+      // that channel - it is the same sentence for every empty list regardless of cause,
+      // which is why it must not name one cause as the fix.
       let slowQueries: SlowQuery[] = [];
       try {
-        const [slowRows] = await runStatement(conn, HEALTH_SLOW_QUERIES_SQL, [this.config.database]);
-        slowQueries = slowRows.map((r) => ({
-          query: r.query || "",
-          calls: parseInt(r.calls || "0"),
-          avgTime: r.avgTime || "N/A",
-        }));
+        const [slowRows] = await runStatement(conn, `${SLOW_QUERIES_BODY_SQL} LIMIT ${HEALTH_SLOW_QUERY_LIMIT};`, [
+          this.config.database,
+        ]);
+        slowQueries = slowRows.map((r) => toHealthSlowQuery(toSlowQueryStats(r)));
       } catch {
-        slowQueries = [{ query: "Performance schema not available", calls: 0, avgTime: "N/A" }];
+        // Nothing was read, so nothing is reported.
       }
 
       const [sessionRows] = await runStatement(conn, HEALTH_ACTIVE_SESSIONS_SQL, [this.config.database]);
@@ -839,21 +1064,27 @@ export class MySQLProvider extends SQLBaseProvider {
         let sql = "";
 
         switch (type) {
+          // The three table verbs share one shape: `<VERB> TABLE <list>`, where the
+          // list is the one table the caller named or every table in the database, and
+          // the answer is a RESULT SET carrying the verdict (`readMaintenanceReport`).
           case "analyze":
-            sql = target
-              ? `ANALYZE TABLE ${this.escapeIdentifier(target)}`
-              : `ANALYZE TABLE ${await this.getAllTablesForMaintenance(conn)}`;
-            break;
           case "optimize":
-            sql = target
-              ? `OPTIMIZE TABLE ${this.escapeIdentifier(target)}`
-              : `OPTIMIZE TABLE ${await this.getAllTablesForMaintenance(conn)}`;
-            break;
-          case "check":
-            sql = target
-              ? `CHECK TABLE ${this.escapeIdentifier(target)}`
-              : `CHECK TABLE ${await this.getAllTablesForMaintenance(conn)}`;
-            break;
+          case "check": {
+            const tables = target ? this.escapeIdentifier(target) : await this.getAllTablesForMaintenance(conn);
+            // An empty database joined to an empty list, and `OPTIMIZE TABLE ` alone is
+            // a syntax error - measured through the provider against a database with no
+            // tables on 2026-08-25: "You have an error in your SQL syntax ... near ''".
+            // Nothing to do is not a failure, so it is reported as what it is rather
+            // than as the engine's complaint about a statement we should not have sent.
+            if (!tables) {
+              return {
+                success: true,
+                message: `${type.toUpperCase()}: no tables in ${this.config.database ?? "this database"} to run it on.`,
+              };
+            }
+            const [rows] = await runStatement<MaintenanceReportRow[]>(conn, `${type.toUpperCase()} TABLE ${tables}`);
+            return readMaintenanceReport(type, rows);
+          }
           case "kill":
             if (!target) {
               throw new QueryError("Target connection ID is required for kill operation", "mysql");
@@ -875,7 +1106,7 @@ export class MySQLProvider extends SQLBaseProvider {
         }
 
         await runStatement(conn, sql);
-        return { success: true };
+        return { success: true, message: `${type.toUpperCase()} completed successfully` };
       } finally {
         conn.release();
       }
@@ -884,7 +1115,7 @@ export class MySQLProvider extends SQLBaseProvider {
     return {
       success: result.success,
       executionTime,
-      message: `${type.toUpperCase()} completed successfully`,
+      message: result.message,
     };
   }
 
@@ -989,6 +1220,34 @@ export class MySQLProvider extends SQLBaseProvider {
     }
   }
 
+  /**
+   * The digests, or the server's refusal - this read does NOT swallow.
+   *
+   * It used to `return []` on any throw, with a comment saying the reason travelled
+   * through `ProviderLabels.slowQueriesEmptyState` instead. It did not: that label is
+   * one fixed sentence rendered for every empty list whatever produced it, and the
+   * sentence this provider declares names the Performance Schema - the one cause that
+   * never reaches here.
+   *
+   * What never reaches here is off-ness. Measured 2026-08-27, a server with
+   * `@@performance_schema` = 0 keeps the digest table selectable and answers 0 rows
+   * (MySQL 26.7.0 started `--performance-schema=OFF`, MariaDB 12.3.2 which ships it off),
+   * so an unreadable source is the ONLY thing that throws: no `performance_schema`
+   * DATABASE at all (ER_1049 on an OceanBase tenant) or the grant denied on it -
+   *
+   *   errno=1142 code=ER_TABLEACCESS_DENIED_ERROR sqlState=42000
+   *   SELECT command denied to user 'nops'@'...' for table
+   *   'events_statements_summary_by_digest'
+   *
+   * measured on MySQL 26.7.0 with a user holding only `SELECT ON d32.*` plus `PROCESS`.
+   * Letting that reject is what puts the reason in front of the operator: it becomes
+   * `errors.slowQueries` in `getMonitoringData()` (src/lib/db/base-provider.ts), which
+   * reads every panel with `Promise.allSettled` and records a rejected one by name, and
+   * `QueriesTab` renders it through `PanelUnavailable` carrying the server's own
+   * sentence. One rejected panel costs nothing else: that method throws only when all
+   * four core reads reject. This is also what the PostgreSQL provider already does - it
+   * falls back to `pg_stat_activity` and lets a failure of THAT propagate.
+   */
   public async getSlowQueries(options?: { limit?: number }): Promise<SlowQueryStats[]> {
     this.ensureConnected();
     const limit = options?.limit ?? 10;
@@ -999,19 +1258,7 @@ export class MySQLProvider extends SQLBaseProvider {
         this.config.database,
       ]);
 
-      return rows.map((r) => ({
-        queryId: r.query_id || undefined,
-        query: r.query || "",
-        calls: parseInt(r.calls || "0"),
-        totalTime: parseFloat(r.total_time_ms || "0"),
-        avgTime: parseFloat(r.avg_time_ms || "0"),
-        minTime: parseFloat(r.min_time_ms || "0"),
-        maxTime: parseFloat(r.max_time_ms || "0"),
-        rows: parseInt(r.rows_examined || "0"),
-      }));
-    } catch {
-      // Performance schema not available
-      return [];
+      return rows.map(toSlowQueryStats);
     } finally {
       conn.release();
     }

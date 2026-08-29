@@ -58,6 +58,21 @@ import { logger } from "@/lib/logger";
 
 type ChartType = "bar" | "line" | "pie" | "area" | "scatter" | "histogram" | "stacked-bar" | "stacked-area";
 
+/*
+  The forms that draw one mark per selected Y field, and so the only ones the palette
+  cap can drop a series from. Histogram buckets `yAxis[0]` on its own and scatter draws
+  X against its own Y, so a cap never applies to either — they keep the whole selection
+  visible in the picker regardless, and must not carry the truncation note. The pie caps
+  rows rather than fields and says so in its own note.
+*/
+const MULTI_SERIES_CHART_TYPES: ReadonlySet<ChartType> = new Set([
+  "bar",
+  "line",
+  "area",
+  "stacked-bar",
+  "stacked-area",
+]);
+
 export type AggregationType = "none" | "sum" | "avg" | "count" | "min" | "max";
 export type DateGrouping = "hour" | "day" | "week" | "month" | "year";
 
@@ -401,6 +416,14 @@ export function DataCharts({ result, spec = null }: DataChartsProps) {
   // so the chart is the one surface that has to be handed its palette.
   const viz = chartTheme(useEffectiveTheme());
   const CHART_COLORS = viz.series;
+  // The palette has one colour per slot; past that, a series or pie slice
+  // would repeat an earlier colour and become indistinguishable from it. Cap
+  // rendering at the palette size rather than silently reusing a colour, and
+  // say so in the footer so a dropped series isn't mistaken for missing data
+  // (it's still in the Results grid). With the cap in place every render site
+  // indexes the palette directly: a wrapping index would only bring the colour
+  // collision back, so `undefined` is the honest outcome if the cap ever slips.
+  const MAX_SERIES = CHART_COLORS.length;
 
   // Recharts writes legend entries in the series colour. The coloured icon beside
   // each entry already carries identity, so the word itself goes back to ink —
@@ -417,41 +440,31 @@ export function DataCharts({ result, spec = null }: DataChartsProps) {
   const [aggregation, setAggregation] = useState<AggregationType>("none");
   const [dateGrouping, setDateGrouping] = useState<DateGrouping | "">("");
 
-  // Saved charts state
-  const [savedCharts, setSavedCharts] = useState<
-    {
-      id: string;
-      name: string;
-      chartType: ChartType;
-      xAxis: string;
-      yAxis: string[];
-      aggregation: AggregationType;
-      dateGrouping: string;
-    }[]
-  >([]);
+  // Saved charts state, read once from the store the save/delete handlers below write back to.
+  const [savedCharts, setSavedCharts] = useState(() =>
+    storage.getSavedCharts().map((c) => ({
+      id: c.id,
+      name: c.name,
+      chartType: c.chartType as ChartType,
+      xAxis: c.xAxis,
+      yAxis: c.yAxis,
+      aggregation: (c.aggregation || "none") as AggregationType,
+      dateGrouping: c.dateGrouping || "",
+    })),
+  );
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [saveName, setSaveName] = useState("");
 
-  // Load saved charts from storage
-  React.useEffect(() => {
-    const charts = storage.getSavedCharts();
-    if (charts.length > 0) {
-      setSavedCharts(
-        charts.map((c) => ({
-          id: c.id,
-          name: c.name,
-          chartType: c.chartType as ChartType,
-          xAxis: c.xAxis,
-          yAxis: c.yAxis,
-          aggregation: (c.aggregation || "none") as AggregationType,
-          dateGrouping: c.dateGrouping || "",
-        })),
-      );
-    }
-  }, []);
-
-  // Initialize axis selections when analysis changes
-  React.useEffect(() => {
+  /*
+    The analysis and the specification these selections were derived from. Adjusting the
+    state during render rather than in an effect means the chart never paints once with
+    the previous result's axes; the condition is what stops it looping. Both `analysis`
+    and `appliedSpec` are memos over the props, so they hold their identity until the
+    props change and the condition goes false again on the very next pass.
+  */
+  const [derivedFrom, setDerivedFrom] = useState<{ a: DataAnalysis; s: AgentChartSpec | null } | null>(null);
+  if (derivedFrom === null || derivedFrom.a !== analysis || derivedFrom.s !== appliedSpec) {
+    setDerivedFrom({ a: analysis, s: appliedSpec });
     if (analysis.isVisualizable) {
       /*
         A specification that survived validation seeds the view instead of the
@@ -465,21 +478,21 @@ export function DataCharts({ result, spec = null }: DataChartsProps) {
         setYAxis([...appliedSpec.y]);
         // Scatter draws x against ONE other column, held separately from `yAxis`.
         if (appliedSpec.type === "scatter") setScatterY(appliedSpec.y[0]);
-        return;
-      }
-      setChartType(analysis.suggestedChartType);
+      } else {
+        setChartType(analysis.suggestedChartType);
 
-      const defaultX = analysis.categoricalFields[0] || analysis.dateFields[0] || analysis.fields[0]?.name || "";
-      setXAxis(defaultX);
+        const defaultX = analysis.categoricalFields[0] || analysis.dateFields[0] || analysis.fields[0]?.name || "";
+        setXAxis(defaultX);
 
-      if (analysis.numericFields.length > 0) {
-        setYAxis([analysis.numericFields[0]]);
-      }
-      if (analysis.numericFields.length >= 2) {
-        setScatterY(analysis.numericFields[1]);
+        if (analysis.numericFields.length > 0) {
+          setYAxis([analysis.numericFields[0]]);
+        }
+        if (analysis.numericFields.length >= 2) {
+          setScatterY(analysis.numericFields[1]);
+        }
       }
     }
-  }, [analysis, appliedSpec]);
+  }
 
   const chartData = useMemo(() => {
     if (!result?.rows) return [];
@@ -667,6 +680,9 @@ export function DataCharts({ result, spec = null }: DataChartsProps) {
         return <CircleAlert strokeWidth={1.5} className="w-3 h-3" />;
     }
   };
+
+  const plottedYAxis = yAxis.slice(0, MAX_SERIES);
+  const droppedYAxisCount = yAxis.length - plottedYAxis.length;
 
   return (
     <div className="h-full flex flex-col bg-sunken">
@@ -938,13 +954,8 @@ export function DataCharts({ result, spec = null }: DataChartsProps) {
                 <YAxis tick={{ fill: viz.axis, fontSize: 11 }} tickFormatter={formatNumber} />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend wrapperStyle={{ paddingTop: 20 }} {...legendProps} />
-                {yAxis.map((field, index) => (
-                  <Bar
-                    key={field}
-                    dataKey={field}
-                    fill={CHART_COLORS[index % CHART_COLORS.length]}
-                    radius={[4, 4, 0, 0]}
-                  />
+                {plottedYAxis.map((field, index) => (
+                  <Bar key={field} dataKey={field} fill={CHART_COLORS[index]} radius={[4, 4, 0, 0]} />
                 ))}
               </BarChart>
             ) : chartType === "line" ? (
@@ -960,14 +971,14 @@ export function DataCharts({ result, spec = null }: DataChartsProps) {
                 <YAxis tick={{ fill: viz.axis, fontSize: 11 }} tickFormatter={formatNumber} />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend wrapperStyle={{ paddingTop: 20 }} {...legendProps} />
-                {yAxis.map((field, index) => (
+                {plottedYAxis.map((field, index) => (
                   <Line
                     key={field}
                     type="monotone"
                     dataKey={field}
-                    stroke={CHART_COLORS[index % CHART_COLORS.length]}
+                    stroke={CHART_COLORS[index]}
                     strokeWidth={2}
-                    dot={{ fill: CHART_COLORS[index % CHART_COLORS.length], strokeWidth: 0, r: 4 }}
+                    dot={{ fill: CHART_COLORS[index], strokeWidth: 0, r: 4 }}
                     activeDot={{ r: 6, strokeWidth: 0 }}
                   />
                 ))}
@@ -985,13 +996,13 @@ export function DataCharts({ result, spec = null }: DataChartsProps) {
                 <YAxis tick={{ fill: viz.axis, fontSize: 11 }} tickFormatter={formatNumber} />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend wrapperStyle={{ paddingTop: 20 }} {...legendProps} />
-                {yAxis.map((field, index) => (
+                {plottedYAxis.map((field, index) => (
                   <Area
                     key={field}
                     type="monotone"
                     dataKey={field}
-                    stroke={CHART_COLORS[index % CHART_COLORS.length]}
-                    fill={CHART_COLORS[index % CHART_COLORS.length]}
+                    stroke={CHART_COLORS[index]}
+                    fill={CHART_COLORS[index]}
                     fillOpacity={0.3}
                     strokeWidth={2}
                   />
@@ -1048,8 +1059,8 @@ export function DataCharts({ result, spec = null }: DataChartsProps) {
                 <YAxis tick={{ fill: viz.axis, fontSize: 11 }} tickFormatter={formatNumber} />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend wrapperStyle={{ paddingTop: 20 }} {...legendProps} />
-                {yAxis.map((field, index) => (
-                  <Bar key={field} dataKey={field} stackId="stack" fill={CHART_COLORS[index % CHART_COLORS.length]} />
+                {plottedYAxis.map((field, index) => (
+                  <Bar key={field} dataKey={field} stackId="stack" fill={CHART_COLORS[index]} />
                 ))}
               </BarChart>
             ) : chartType === "stacked-area" ? (
@@ -1065,14 +1076,14 @@ export function DataCharts({ result, spec = null }: DataChartsProps) {
                 <YAxis tick={{ fill: viz.axis, fontSize: 11 }} tickFormatter={formatNumber} />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend wrapperStyle={{ paddingTop: 20 }} {...legendProps} />
-                {yAxis.map((field, index) => (
+                {plottedYAxis.map((field, index) => (
                   <Area
                     key={field}
                     type="monotone"
                     dataKey={field}
                     stackId="stack"
-                    stroke={CHART_COLORS[index % CHART_COLORS.length]}
-                    fill={CHART_COLORS[index % CHART_COLORS.length]}
+                    stroke={CHART_COLORS[index]}
+                    fill={CHART_COLORS[index]}
                     fillOpacity={0.5}
                   />
                 ))}
@@ -1080,7 +1091,7 @@ export function DataCharts({ result, spec = null }: DataChartsProps) {
             ) : (
               <PieChart margin={{ top: 20, right: 30, left: 20, bottom: 20 }}>
                 <Pie
-                  data={chartData.slice(0, 10)}
+                  data={chartData.slice(0, MAX_SERIES)}
                   dataKey={yAxis[0]}
                   nameKey={xAxis}
                   cx="50%"
@@ -1092,8 +1103,8 @@ export function DataCharts({ result, spec = null }: DataChartsProps) {
                   label={<PieSliceLabel ink={viz.ink} />}
                   labelLine={{ stroke: viz.grid }}
                 >
-                  {chartData.slice(0, 10).map((_entry, index) => (
-                    <Cell key={`cell-${index}`} fill={CHART_COLORS[index % CHART_COLORS.length]} />
+                  {chartData.slice(0, MAX_SERIES).map((_entry, index) => (
+                    <Cell key={`cell-${index}`} fill={CHART_COLORS[index]} />
                   ))}
                 </Pie>
                 <Tooltip content={<CustomTooltip />} />
@@ -1115,7 +1126,14 @@ export function DataCharts({ result, spec = null }: DataChartsProps) {
         <span>
           Numeric: <span className="text-fg-tertiary font-mono">{analysis.numericFields.length}</span>
         </span>
-        {chartType === "pie" && chartData.length > 10 && <span className="text-amber-500">Showing top 10 values</span>}
+        {chartType === "pie" && chartData.length > MAX_SERIES && (
+          <span className="text-amber-500">Showing top {MAX_SERIES} values</span>
+        )}
+        {MULTI_SERIES_CHART_TYPES.has(chartType) && droppedYAxisCount > 0 && (
+          <span className="text-amber-500">
+            Showing first {MAX_SERIES} of {yAxis.length} series — see the Results grid for the rest
+          </span>
+        )}
       </div>
     </div>
   );

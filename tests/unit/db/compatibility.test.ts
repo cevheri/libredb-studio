@@ -45,15 +45,22 @@ const COMPOSE_SERVICE_BY_ENGINE: Readonly<Record<string, string>> = {
   YugabyteDB: "yugabytedb",
   "Apache Cloudberry (incubating)": "cloudberry",
   "AlloyDB Omni": "alloydb",
+  "Percona Distribution for PostgreSQL": "percona-postgresql",
+  ParadeDB: "paradedb",
+  OrioleDB: "orioledb",
   MariaDB: "mariadb",
   TiDB: "tidb",
   StarRocks: "starrocks",
+  "Apache Doris": "doris",
+  "Percona Server for MySQL": "percona-mysql",
+  Databend: "databend",
   Vitess: "vitess",
   OceanBase: "oceanbase",
   SingleStore: "singlestore",
   Valkey: "valkey",
   DragonflyDB: "dragonfly",
   KeyDB: "keydb",
+  Garnet: "garnet",
   FerretDB: "ferretdb",
   ScyllaDB: "scylla",
 };
@@ -98,6 +105,179 @@ describe("wire-compatibility registry", () => {
     expect(WIRE_COMPATIBLE_ENGINES.map((engine) => engine.name.toLowerCase())).toContain("scylladb");
   });
 
+  test("Apache Doris is recorded as a partial MySQL relative, on what the probe measured", () => {
+    // Probed 2026-08-26 against `apache/doris:all-in-one-4.1.3` (#424 Phase 0). The entry
+    // exists because StarRocks - already registered here - is a FORK of Doris, and this
+    // registry had been carrying the fork while missing the original. It is not a copy of
+    // that row: thirteen of the fifteen surfaces answer where StarRocks manages eleven,
+    // and the numbers are the sharp difference. StarRocks reports hard zeros; Doris reports
+    // 2000 rows and 10187 bytes for a table holding exactly that, so the object browser and
+    // the table-statistics panel are trustworthy here.
+    //
+    // Two surfaces fail, both on ONE statement form: `SHOW STATUS LIKE '...'` is a parse
+    // error in the Doris grammar while a bare `SHOW STATUS` is accepted (and answers zero
+    // rows), which takes the overview and health panels. That cause is ours rather than the
+    // engine's and is filed as a backlog defect - the tier records what a user gets today,
+    // not what a fix could give them.
+    const relatives = compatibleEnginesFor("mysql");
+    const doris = relatives.find((engine) => engine.name === "Apache Doris");
+    expect(doris).toBeDefined();
+    expect(doris?.via).toBe("mysql");
+    expect(doris?.tier).toBe("partial");
+    expect(doris?.probedVersion).toBe("Apache Doris 4.1.3-rc02-7126cf65d96 (version() reports 5.7.99)");
+    // The caveat set has to name the two failures and the two traps, because each one is a
+    // thing a reader would otherwise believe works: the fictitious version, the invisible
+    // foreign key, the absent indexes, and the statement form that costs two panels.
+    const caveats = doris?.caveats.join(" ") ?? "";
+    expect(caveats).toContain("SHOW STATUS");
+    expect(caveats).toContain("5.7.99");
+    expect(caveats).toContain("KEY_COLUMN_USAGE");
+    expect(caveats).toContain("information_schema.statistics");
+  });
+
+  test("the Doris row is not the StarRocks row, and says so where it matters", () => {
+    // A fork's measurements are a PRIOR, never an inheritance. This test pins the one
+    // difference that would be tempting to copy across and would be wrong: StarRocks'
+    // caveats say the row counts and sizes are hard zeros, and Doris's must not, because
+    // the probe read the true numbers there.
+    const byName = new Map(WIRE_COMPATIBLE_ENGINES.map((engine) => [engine.name, engine]));
+    const starrocks = byName.get("StarRocks");
+    const doris = byName.get("Apache Doris");
+    expect(starrocks?.caveats.some((caveat) => caveat.includes("Row counts and sizes are always 0"))).toBe(true);
+    expect(doris?.caveats.some((caveat) => caveat.includes("always 0"))).toBe(false);
+    expect(doris?.caveats.some((caveat) => caveat.includes("2000 rows"))).toBe(true);
+  });
+
+  test("QuestDB is NOT in the registry, and the reason is the one a provider probe cannot see", async () => {
+    // Probed 2026-08-26 against `questdb/questdb:10.0.1` and REFUSED a row (#424 Phase 0),
+    // which is why this test asserts an absence. It is here rather than left implicit
+    // because QuestDB is the most re-addable name on that list: it speaks the PostgreSQL
+    // wire protocol, and through the provider a statement answers three rows, so every
+    // signal short of a browser says "query-only relative, register it".
+    //
+    // In the product the editor cannot run anything. It always attaches a `queryId`, the
+    // provider then issues `SELECT pg_backend_pid()` first, and QuestDB has no such
+    // function: `500 unknown function name: pg_backend_pid()`. Measured both ways at the
+    // provider boundary - the same call with a queryId fails, without one returns the rows -
+    // so the cause is established rather than guessed. A query-editor-only tier claims
+    // exactly one thing, and that is the thing that does not work, which makes it the Cloud
+    // Spanner case: the number is the finding and the finding lives in the docs.
+    expect(WIRE_COMPATIBLE_ENGINES.map((engine) => engine.name)).not.toContain("QuestDB");
+    // ...and the reason must be readable beside the table, not only in this test.
+    const docs = await Bun.file("docs/providers/README.md").text();
+    expect(docs).toContain("Measured, and refused a row");
+    const refusedSection = docs.slice(docs.indexOf("Measured, and refused a row"));
+    expect(refusedSection).toContain("QuestDB 10.0.1");
+    expect(refusedSection).toContain("pg_backend_pid()");
+  });
+
+  test("Garnet is a full Redis relative whose own version the product does not show", () => {
+    // Probed 2026-08-26 against `ghcr.io/microsoft/garnet:2.1.5` (#424 Phase 0). Every Redis
+    // surface answers, so `full` by this registry's own definition - the numbers that are
+    // wrong are recorded as caveats, the way Citus's are.
+    //
+    // What separates this row from the other three Redis relatives: Valkey and DragonflyDB
+    // show an emulation level because that is all they publish, and KeyDB publishes nothing
+    // of its own at all. Garnet DOES publish `garnet_version:2.1.5` and `server_name:garnet`
+    // in INFO, and the product still shows Redis 7.4.3 - the one place where the real
+    // version was there to be read and went unread.
+    const garnet = compatibleEnginesFor("redis").find((engine) => engine.name === "Garnet");
+    expect(garnet).toBeDefined();
+    expect(garnet?.tier).toBe("full");
+    expect(garnet?.probedVersion).toBe("Garnet 2.1.5 (advertises Redis 7.4.3)");
+    const caveats = garnet?.caveats.join(" ") ?? "";
+    expect(caveats).toContain("garnet_version");
+    // The two numbers a reader must not trust, both from INFO fields Garnet does not publish
+    // at all: no `used_memory` (so every size reads 0 B) and no keyspace counters (so the
+    // cache hit ratio is the `: 100` fallback D14 already records).
+    expect(caveats).toContain("used_memory");
+    expect(caveats).toContain("cache hit ratio");
+  });
+
+  test("both Percona distributions are full relatives, and they differ in one thing only", () => {
+    // Probed 2026-08-26 (#424 Phase 0) against `percona/percona-server:8.4` and
+    // `percona/percona-distribution-postgresql:18.6`. Both answer all fifteen surfaces with
+    // the correct numbers, which is the expected result for a drop-in build and the reason
+    // these two were the cheapest names left on the list.
+    //
+    // The one difference is worth a test rather than a sentence, because it is the same
+    // trap Garnet's row records and it lands on only one of the pair: Percona for
+    // PostgreSQL puts its own name in `version()` ("PostgreSQL 18.6 - Percona Server for
+    // PostgreSQL 18.6.1"), so the product displays it, while Percona Server for MySQL
+    // answers a bare `8.4.11-11` and keeps its identity in `@@version_comment`, which the
+    // provider does not read - so that one is indistinguishable from stock MySQL on screen.
+    const mysqlSide = compatibleEnginesFor("mysql").find((e) => e.name === "Percona Server for MySQL");
+    const pgSide = compatibleEnginesFor("postgres").find((e) => e.name === "Percona Distribution for PostgreSQL");
+    expect(mysqlSide?.tier).toBe("full");
+    expect(pgSide?.tier).toBe("full");
+    expect(mysqlSide?.probedVersion).toBe("Percona Server for MySQL 8.4.11-11 (version() reports 8.4.11-11)");
+    expect(pgSide?.probedVersion).toBe("Percona Server for PostgreSQL 18.6.1 on PostgreSQL 18.6");
+    expect(mysqlSide?.caveats.some((c) => c.includes("@@version_comment"))).toBe(true);
+    // The PostgreSQL side must NOT carry that caveat - it does not have the problem, and a
+    // copied caveat is how a pair of rows stops describing two different measurements.
+    expect(pgSide?.caveats.some((c) => c.includes("@@version_comment"))).toBe(false);
+  });
+
+  test("ParadeDB and OrioleDB are full PostgreSQL relatives that fail for opposite reasons", () => {
+    // Probed 2026-08-27 (#424 Phase 0) against `paradedb/paradedb:0.25.4` and
+    // `orioledb/orioledb:pg18-nightly-20260824-cc35a80-ubuntu`. Both answer all fifteen
+    // surfaces, so both are `full` - and the pair is worth reading together because what
+    // each one costs the user is the opposite of the other.
+    //
+    // ParadeDB's cost is WIDTH: its nine extensions put 41 objects in the object browser
+    // for 2 user tables and 74 indexes.
+    //
+    // That looked like B52 - the grounding capture refusing past 200 rows, as it does on
+    // TimescaleDB - and the measurement refuted it, which is why the caveat says so
+    // explicitly. The capture reads what the ROLE can see: a superuser sees 539 non-system
+    // columns there, an unprivileged role 168, because the tiger geocoder's 425 are not
+    // readable. So gate 7 PASSES under a least-privilege role (21 tables read), and what
+    // fails as a superuser is the execution profile refusing a superuser - true on any
+    // PostgreSQL and not a ParadeDB property at all.
+    //
+    // OrioleDB's cost is DEPTH: the browser is clean (2 objects for 2 tables) and the row
+    // counts are exact, but its own storage is invisible to PostgreSQL's size functions -
+    // `pg_indexes_size()` reads 0 - and `pg_statio_user_tables` stays at 0/0, so the cache
+    // hit ratio is absent rather than wrong. Absent is the honest reading, which is why it
+    // is a caveat and not a defect.
+    const relatives = compatibleEnginesFor("postgres");
+    const parade = relatives.find((engine) => engine.name === "ParadeDB");
+    const oriole = relatives.find((engine) => engine.name === "OrioleDB");
+    expect(parade?.tier).toBe("full");
+    expect(oriole?.tier).toBe("full");
+    expect(parade?.probedVersion).toBe("ParadeDB 0.25.4 on PostgreSQL 18.6");
+    expect(oriole?.probedVersion).toBe("OrioleDB beta 16 on PostgreSQL 18.4 (nightly of 2026-08-24)");
+    expect(parade?.caveats.some((caveat) => caveat.includes("41 objects"))).toBe(true);
+    // The B52 claim must NOT be here: it was measured and refuted (see above).
+    expect(parade?.caveats.some((caveat) => caveat.includes("B52"))).toBe(false);
+    expect(parade?.caveats.some((caveat) => caveat.includes("168 columns"))).toBe(true);
+    expect(oriole?.caveats.some((caveat) => caveat.includes("pg_indexes_size"))).toBe(true);
+    // The width caveat must NOT be copied onto the clean engine, and vice versa.
+    expect(oriole?.caveats.some((caveat) => caveat.includes("41 objects"))).toBe(false);
+    expect(parade?.caveats.some((caveat) => caveat.includes("pg_indexes_size"))).toBe(false);
+  });
+
+  test("Databend is query-editor-only because our own reads cannot run there", () => {
+    // Probed 2026-08-27 against `datafuselabs/databend:v1.2.925-patch-11`. SQL runs: a
+    // 2000-row `count(*)` and a plain `EXPLAIN` both answer, and the catalogs THEMSELVES
+    // answer when asked with literal SQL - `information_schema.tables` reported the true
+    // 3 and 2000 rows with sizes.
+    //
+    // The object browser still gets nothing, and the reason is ours: every parameterised
+    // read goes through mysql2's prepared protocol and Databend replies
+    // `Prepare is not support in Databend`. D8 moved the PARAMETERLESS statements to the
+    // text protocol; the ones carrying placeholders - the table list, the schema, sessions,
+    // table/index/storage stats - still prepare. So this row is `query-only` for what a
+    // user gets today, with the cause recorded as a backlog item rather than as the
+    // engine's fault.
+    const databend = compatibleEnginesFor("mysql").find((engine) => engine.name === "Databend");
+    expect(databend?.tier).toBe("query-only");
+    expect(databend?.probedVersion).toBe("Databend v1.2.925-patch-11 (advertises MySQL 8.0.90)");
+    const caveats = databend?.caveats.join(" ") ?? "";
+    expect(caveats).toContain("Prepare is not support in Databend");
+    expect(caveats).toContain("information_schema.tables");
+  });
+
   test("every entry names a driver we actually ship", () => {
     for (const engine of WIRE_COMPATIBLE_ENGINES) {
       expect(SHIPPED_DATABASE_TYPES).toContain(engine.via);
@@ -130,6 +310,18 @@ describe("wire-compatibility registry", () => {
 
   test("compatibleEnginesFor tolerates a type outside the shipped union", () => {
     expect(compatibleEnginesFor("not-a-database" as DatabaseType)).toEqual([]);
+  });
+
+  test("duckdb ships as a driver and is a relative of nothing", () => {
+    // The negative half is the load-bearing one. DuckDB speaks no wire protocol at all -
+    // it is an in-process library reading a file - so no engine can be compatible with
+    // it by pretending to be it, and an empty relatives list here is a measured fact
+    // rather than work not yet done.
+    expect(SHIPPED_DATABASE_TYPES).toContain("duckdb");
+    expect(EXTERNAL_DATABASE_TYPES).toContain("duckdb");
+    expect(compatibleEnginesFor("duckdb")).toEqual([]);
+    // And nothing reaches DuckDB through another driver either.
+    for (const engine of WIRE_COMPATIBLE_ENGINES) expect(engine.via).not.toBe("duckdb");
   });
 
   test("EXTERNAL_DATABASE_TYPES omits the embedded provider and nothing else", () => {

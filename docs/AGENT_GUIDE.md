@@ -138,6 +138,29 @@ the next question needs no deleting; the question itself is not lost, since the 
 it and the timeline's first entry quotes it. A start that was *refused* leaves what you typed exactly
 where it was, so retrying is one click rather than one retyping.
 
+**A question you ask next CONTINUES the last one.** Type into the emptied box after a run has
+finished, on the same connection, and the new run is told what the conversation so far asked and what
+its most recent step found — so *"and how many of those?"* resolves instead of being answered as a
+fresh question. The panel says which conversation you are in, above the run:
+
+> Conversation: 2 steps before this one — new conversation
+> 1. count my films by category
+> 2. chart those
+
+It is a list rather than a chat: each step is still its own run, with its own ledger, its own budget
+and its own report. What the next run inherits is a bounded account of the earlier ones — every
+step's question, and the newest step's findings — never the rows of anybody's result.
+
+**"new conversation" is how you leave it.** Press it and the panel says *"Your next question will
+start a new conversation"* until you either ask that question or press *"keep it"*. Two other things
+end a conversation without being asked to: switching connection, which the panel says in its own
+words, and reloading the page, which simply leaves no conversation to show.
+
+**And it can be off.** Where an operator has set `LIBREDB_AGENT_THREAD_CONTEXT=false`, every question
+opens on its own and the panel tells you so the first time you ask a follow-up — rather than leaving
+you to work it out from an answer that does not resolve. The same line appears, worded differently,
+when a conversation could not be reached at all.
+
 Both axes are **fixed when the run opens** and are read from the run's own record for the rest of
 its life (`src/app/api/agent/runs/route.ts:35-56`), so nothing can widen a Plan run into an Agent
 one afterwards. The record also carries **how** the workflow was decided and how that reading went,
@@ -150,7 +173,14 @@ investigated. The rail says so rather than offering a Start that must fail:
 
 > *"… cannot be rebuilt on the server: its settings live in this browser. A run re-resolves its
 > connection there after a restart, so it can only investigate a connection the server holds too."*
-> (`AgentRail.tsx:1604-1610`)
+> (`AgentRail.tsx:2098-2104`)
+
+A *different* absence gets a different sentence. When the server could not read its own seed
+configuration, nothing has been established about your connection at all, so the rail says that
+instead of blaming it:
+
+> *"The server could not read its own connection configuration, so it cannot resolve a connection
+> for a run. This is not a problem with … — the server log says what failed."*
 
 ### What a Plan run knows about your database
 
@@ -199,9 +229,9 @@ workflow including **Operate**.
 now two different sentences, and the difference is the whole of what changed:
 
 - **Grounding — every engine.** What a Plan run is TOLD about your database. It needs no read-only
-  statement path, because the provider reading sends no statement, so it reaches all fourteen engines.
-- **Agent mode — PostgreSQL and SQLite.** What a run may DO by itself. Its tools execute statements
-  and need a database-native read-only path, which only those two providers implement, so a
+  statement path, because the provider reading sends no statement, so it reaches all seventeen engines.
+- **Agent mode — PostgreSQL, SQLite and DuckDB.** What a run may DO by itself. Its tools execute
+  statements and need a database-native read-only path, which only those three providers implement, so a
   schema-workflow Agent run on any other engine still ends *"The agent cannot run on this database
   engine: it offers no read-only execution profile."* — after grounding has succeeded, which is
   slightly odd to watch and entirely honest: the run knows your schema and still may not read a row.
@@ -346,9 +376,16 @@ For the state of the data itself — where it is incomplete, inconsistent or sur
 reading before you point it at a table of personal data:
 
 **A profile records counts, never values.** Row counts, present counts, distinct counts, and how
-many values match a shape — computed inside the database with `count(CASE WHEN … LIKE …)`, so no
+many values match a shape — computed inside the database with `count(CASE WHEN <predicate> …)`, so no
 matching value leaves it. There is deliberately no `min`/`max`, because on a text column those
-return real values (`src/lib/agent/table-profile.ts:1-27`). The findings — `high_null`, `constant`,
+return real values (`src/lib/agent/table-profile.ts:1-30`).
+
+Two shapes are tested at `pattern` depth, and each is the **dialect's own** predicate rather than one
+shared operator: an email address (`LIKE '%_@_%._%'`, spelled the same on both engines) and a run of
+nine or more digits — a phone number, a national id, a card — which PostgreSQL spells `~ '[0-9]{9,}'`
+and SQLite spells `GLOB '*[0-9]…*'`. Nine is the shortest of the identifiers worth suspecting, so a
+shorter bound would match years, prices and quantities. `LIKE` cannot express a digit run at all: `_`
+in it means "any character". The findings — `high_null`, `constant`,
 `low_cardinality`, `suspected_pii`, `fk_unindexed` — are the server's own mechanical predicates over
 those counts, with stated thresholds; the model may interpret them and cannot invent one.
 
@@ -367,7 +404,7 @@ as an ordinary citable result.
 Two consequences you will notice:
 
 - **It runs on every engine.** The other workflows need a database-native read-only statement path,
-  which only PostgreSQL and SQLite have; this one needs none, so a run opened on MySQL, Oracle, SQL
+  which only PostgreSQL, SQLite and DuckDB have; this one needs none, so a run opened on MySQL, Oracle, SQL
   Server, MongoDB or Redis works rather than ending `engine-unsupported`.
 - **It has no free-form SQL, and its schema is a short list of names.** There is no `inspect_schema`
   and no `run_read_query` here, and the run is told so in its opening message rather than being left
@@ -760,7 +797,7 @@ Investigate one, so a figure shown before the workflow is known would be a numbe
 enforcing. The gauges themselves wait for a run either way.
 
 **There is no token gauge, and its absence is deliberate**: this build enforces no token budget, so
-a figure would mean nothing (`docs/BACKLOG.md` B10).
+a figure would mean nothing.
 
 **A run that ends early was asked to stop.** When a run comes within 2 model turns or 20 seconds of
 either of those ceilings, the server tells it once — in its own words, not the database's — that this
@@ -776,9 +813,11 @@ gauges it is about:
 - **Every ceiling is per drive.** A run resumed after a restart starts each of them again, so these
   totals can read past a single drive's ceiling.
 - **Every figure is a floor, never a ceiling.** The ledger records less than the server charges: the
-  schema capture's catalog reads are not itemized, a statement that failed at the database records
-  no duration, and a completed read reports the engine's own elapsed time rather than the span the
-  budget was charged (`docs/BACKLOG.md` B12, B13).
+  schema capture now contributes the statements and the span it was charged, but a call that failed
+  while acquiring its provider settles no step and so cannot be seen, and a completed read reports the
+  engine's own elapsed time rather than the span the budget was charged. A statement that
+  failed at the database DOES record its span since #512; a refusal written before that build
+  carries none, and those are counted rather than summed as zero.
 - **On SQLite a statement over its timeout is refused once it returns, not interrupted while it
   runs.** PostgreSQL preempts with `SET LOCAL statement_timeout`; SQLite does not, so there the
   timeout is a post-execution deadline.
@@ -817,9 +856,9 @@ start the run and are reported by the drive as `model-unauthorized`, `model-rate
 
 Ollama is a first-class path: `LLM_PROVIDER=ollama` with `LLM_API_URL=http://localhost:11434/v1`
 reaches the OpenAI-compatible endpoint through the same adapter as the `openai` and `custom` kinds
-(`src/lib/agent/provider-registry.ts:121-132,154-159`), and no key is required — the adapter sends a
+(`src/lib/agent/provider-registry.ts:123-134,156-161`), and no key is required — the adapter sends a
 placeholder rather than leaving `apiKey` undefined, so an ambient `OPENAI_API_KEY` cannot leak in
-(`provider-registry.ts:86,107,110`).
+(`provider-registry.ts:88,109,112`).
 
 **The model decides whether a local deployment can run the agent — not the endpoint.** This is
 worth stating precisely, because it is the opposite of what the mechanism suggests. The capability
@@ -882,18 +921,19 @@ Stated plainly, because a surface that hides its edges is the one that surprises
   it. `/api/db/query` calls the provider directly (`src/app/api/db/query/route.ts:44`), so an editor
   query is neither policy-checked nor written to the agent audit trail. The controls above describe
   what the agent is held to, not a guarantee the whole product enforces.
-- **Agent mode runs on PostgreSQL and SQLite only.** The read-only profile has to be implemented by
-  the provider, and only two do: `queryReadOnly` exists on `postgres.ts:870` and `sqlite.ts:397`.
+- **Agent mode runs on PostgreSQL, SQLite and DuckDB only.** The read-only profile has to be
+  implemented by the provider, and only three do: `queryReadOnly` exists on `postgres.ts:915`,
+  `sqlite.ts:537` and `duckdb/index.ts:525`.
   Acquiring a profiled provider for any other engine raises `PROFILE_UNSUPPORTED_BY_PROVIDER`
-  (`src/lib/db/factory.ts:473`), which the runtime reports as `engine-unsupported`
-  (`src/lib/agent/runtime.ts:242`) — the rail says so in as many words
-  (`src/components/agent/timeline.ts:341`). So on MySQL, Oracle, SQL Server, MongoDB, Redis,
+  (`src/lib/db/factory.ts:649`), which the runtime reports as `engine-unsupported`
+  (`src/lib/agent/runtime.ts:273`) — the rail says so in as many words
+  (`src/components/agent/timeline.ts:341`). So on MySQL, Oracle, SQL Server, libSQL, MongoDB, Redis,
   ClickHouse, Druid, Trino and Couchbase an Agent-mode run cannot read anything. It also covers the bundled
   **LibreDB sample** connection, whose provider implements no `queryReadOnly`
   (`src/lib/db/providers/embedded/libredb.ts`) — the bundled **SQLite sample** is the seeded
   connection to try a run against (`src/lib/seed/sqlite-sample.ts:131`). **Plan** mode still opens on
   every connection — the model is toolless there, so no profile has to be acquired for it — and since
-  #414 its **grounding** no longer takes this path at all on the other twelve: it asks the provider to
+  #414 its **grounding** no longer takes this path at all on the other fifteen: it asks the provider to
   describe its schema, which needs no read-only statement profile, so a Plan run on MongoDB or MySQL
   is ordinarily grounded while an Agent run on the same connection still cannot read anything. Where
   the reading does fail — a provider that cannot describe itself, a description that overran its
@@ -910,8 +950,8 @@ Stated plainly, because a surface that hides its edges is the one that surprises
   2.4 seconds after the Stop. That is the contract rather than a defect, so what changed in #356 is
   that the ending now says it: *"A stop was requested before this ending: the run took no further
   database step, and finished what it already had in hand."*
-- **A run's stored rows do not outlive it**, so a report can outlive the rows its citations point at
-  (`docs/BACKLOG.md` B15). A result opens in the grid, the explain view or the charts view — whichever
+- **A run's stored rows do not outlive it**, so a report can outlive the rows its citations point at.
+  A result opens in the grid, the explain view or the charts view — whichever
   the run's own record names — and cannot be exported from any of them, because Export writes the
   tab's own rows (B34).
 - **An interrupted run is resumable but is not resumed on its own** — nothing enqueues a drive yet

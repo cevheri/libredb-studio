@@ -19,6 +19,8 @@
  * end run in a real browser caught it again.
  */
 
+import { resolveSqlGrammar } from "@/lib/sql/grammar";
+import { splitStatements } from "@/lib/sql/statement-splitter";
 import { fenceTagEngine, isQueryFenceTag } from "@/lib/sql/fence-tags";
 import type { DatabaseType } from "@/lib/types";
 
@@ -249,21 +251,49 @@ export function readPlanStatement(text: string, dialect?: DatabaseType): PlanSta
   // only AFTER the fenced and refusal paths, which keeps every existing precedence
   // untouched: a fenced block still wins among several, and a refusal still wins over an
   // illustration the run declined to stand behind.
-  const unfenced = unfencedStatement(plain);
+  const unfenced = unfencedStatement(plain, dialect);
   return unfenced === null ? { kind: "absent" } : { kind: "statement", sql: unfenced, tag: undefined };
 }
 
 /**
  * The statement in text that never opened a fence: from the first line that opens one to
- * the last line that still looks like part of it.
+ * where the SQL ends.
  *
- * Ends at the first BLANK line, because that is where these models put the explanation
- * they were also asked for, and carrying prose into the SQL would hand the editor
- * something no engine accepts. No tag is returned: the model named no fence, so there is
- * nothing it told us about the engine, and the recorder stamps the connection's own
- * dialect the way it does for an untagged fence.
+ * TWO CUTS, and the second was missing. The blank line comes first, because that is where
+ * these models put the explanation they were also asked for. Then the SQL SPLITTER, because
+ * a model that explains itself on the very next line leaves no blank line at all — and that
+ * shape walked straight through: `STATEMENT_OPENER` guards the START (a sentence about a
+ * select is not a select) and nothing guarded the END, so `SELECT 1;` followed by "This query
+ * returns one row." came back as one statement with the prose inside it.
+ *
+ * That is not a formatting nicety. `plan-statement-drafted` is recorded whenever this reader
+ * returns a statement, with the validation riding along rather than gating it, and the goal
+ * verifier reads that event as the run having ANSWERED. Prose carried into the SQL therefore
+ * scores a run answered while the user is handed something no engine will run.
+ *
+ * The splitter rather than another line rule because it knows where a statement ends: it
+ * tracks string literals, comments and dollar-quoting, so `SELECT 'a;b' AS pair;` is one
+ * statement and not two. Whitespace knows none of that.
+ *
+ * Under THIS CONNECTION'S dialect, which this reader already holds and used to pass only
+ * to `fencedBlock`. Where a statement ends is exactly the question `grammar.ts` answers
+ * per engine, and the answers differ on shipped ones: `//` is a line comment in CQL and
+ * ClickHouse and an operator name or a syntax error everywhere else, so a draft whose
+ * comment carried a `;` was cut at that `;` and the run recorded HALF its statement -
+ * scored as a shortfall against a model that wrote a good one. The grammar record is a
+ * pure lookup over a frozen table, so it costs this file's browser boundary nothing;
+ * `plan-draft-boundary.test.ts` checks that rather than trusting it.
+ *
+ * With NO terminator the splitter has nothing to cut on and returns the whole candidate, so
+ * the blank line remains the only signal — a model that omits the semicolon and explains
+ * itself on the next line still gets its prose through. Narrower, undemonstrated on a real
+ * run, and pinned in the tests as it behaves rather than guessed at.
+ *
+ * No tag is returned: the model named no fence, so there is nothing it told us about the
+ * engine, and the recorder stamps the connection's own dialect the way it does for an
+ * untagged fence.
  */
-function unfencedStatement(lines: readonly string[]): string | null {
+function unfencedStatement(lines: readonly string[], dialect: DatabaseType | undefined): string | null {
   const start = lines.findIndex((line) => STATEMENT_OPENER.test(line));
   if (start === -1) return null;
   const body: string[] = [];
@@ -271,6 +301,23 @@ function unfencedStatement(lines: readonly string[]): string | null {
     if (line.trim().length === 0) break;
     body.push(line);
   }
-  const sql = body.join("\n").trim();
+  const candidate = body.join("\n").trim();
+  if (candidate.length === 0) return null;
+  /*
+    Cut at the LINE the second statement starts on rather than taking the splitter's first `sql`,
+    so the statement is handed back in the model's own bytes. The splitter strips the terminator,
+    and returning `SELECT 1` where the fenced path returns `SELECT 1;` would change every unfenced
+    draft to fix one — a wider change than the defect.
+
+    A second statement on the SAME line has no line to cut at, so the splitter's text is the only
+    answer left there; it costs that rare draft its semicolon and nothing else.
+  */
+  const [first, second] = splitStatements(candidate, resolveSqlGrammar(dialect));
+  const sql =
+    second === undefined
+      ? candidate
+      : second.startLine > 0
+        ? candidate.split("\n").slice(0, second.startLine).join("\n").trim()
+        : (first?.sql ?? candidate).trim();
   return sql.length === 0 ? null : sql;
 }

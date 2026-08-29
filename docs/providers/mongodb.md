@@ -98,6 +98,13 @@ Supported operations: `find`, `findOne`, `aggregate`, `count`, `distinct`, `inse
 [`API_DOCS.md` MongoDB Query Format](../API_DOCS.md) section (under `POST /api/db/query`) and
 [`CLAUDE.md`](../../CLAUDE.md) for the request shape.
 
+Since S8 the **execution confirmation gate reads this same shape**:
+`src/lib/db/destructive-commands.ts` names `deleteOne`, `deleteMany`, `updateOne`, `updateMany` and
+the top-level `$out` / `$merge` aggregate stages as the destructive operations here - so each of
+them asks before it runs, exactly as a `DELETE FROM` does on a SQL engine, and a payload the reader
+cannot read as a document with a string `operation` (mongosh syntax such as
+`db.users.deleteMany({})`, a half-typed object) asks as well rather than staying silent.
+
 ### 3.2 BSON serialization for the grid
 
 `serializeDocument()` ([mongodb.ts:388](../../src/lib/db/providers/document/mongodb.ts)) recursively
@@ -206,12 +213,37 @@ MySQL and Couchbase:
 |------------|---------------|
 | absent / `disable` | none — the client is built as before |
 | `require` | `tls: true`, `rejectUnauthorized: false` |
+| `verify-system` | `tls: true`, `rejectUnauthorized: true`, and **no** `ca` |
 | `verify-ca` / `verify-full` | `tls: true`, `rejectUnauthorized: true` |
 
 `caCert` / `clientCert` / `clientKey` become `ca` / `cert` / `key` when set, each independently — a
 cluster can demand mutual TLS while presenting a self-signed certificate itself. An explicit
 `ssl.rejectUnauthorized` always wins over the mode. `require` does not check the chain because a
-self-hosted replica set presents a self-signed certificate by default.
+self-hosted replica set presents a self-signed certificate by default; `verify-system` is the same
+handshake with verification on and nothing to paste, which is what an Atlas cluster needs (its
+certificate is signed by a public root the runtime already trusts). The driver exposes no separate
+host-name check, so `verify-ca` and `verify-full` build the same options object.
+
+#### `tls=true` in a pasted URI (D26)
+
+The paste box now reads the URI's own TLS options, and maps them by the rule stated in
+`readBooleanTLS` — a boolean TLS spelling lands on the mode that matches what the driver does with it:
+
+| In the pasted URI | SSL Mode set on the form |
+|-------------------|--------------------------|
+| `tls=true` / `ssl=true` | `verify-system` — the driver enables TLS **with** chain verification |
+| `tls=false` / `ssl=false` | `disable` |
+| `mongodb+srv://` with no TLS parameter | `verify-system` — SRV implies TLS in the driver itself |
+| `tlsInsecure=true` / `tlsAllowInvalidCertificates=true` alongside TLS | `require` — both turn `rejectUnauthorized` off |
+| a non-boolean value (`tls=maybe`) | nothing; the paste banner quotes the parameter |
+
+`tls=true` was deliberately **ignored** before this: the only non-`disable` mode that needed no PEM
+was `require`, i.e. `rejectUnauthorized: false`, and because the options object is a second channel
+the driver prefers over the URI, setting it would have stopped an Atlas certificate being verified.
+Leaving it unset had its own cost — the SSL panel read `disable` for a connection that was in fact
+encrypted. `verify-system` removes the trade: the form now says what the URI says.
+`tlsAllowInvalidHostnames` is not in the relaxing set, because this provider never sends
+`checkServerIdentity`, so the URI's own relaxation survives next to a verifying mode.
 
 Measured against a TLS-only server on 2026-08-23 (`mongo:latest --tlsMode requireTLS`): `disable` is
 refused - the server logs *"The server is configured to only allow SSL connections"* - and `require`
@@ -288,8 +320,8 @@ Every method is wrapped in try/catch. Degradation reports the absence rather tha
 
 | Method | Source | Notes |
 |--------|--------|-------|
-| `getHealth()` | `serverStatus`, `dbStats`, `currentOp`, `system.profile` | connections, data size, WiredTiger cache-hit % (`"N/A"` when unmeasurable, [§7.1](#71-what-the-panel-shows-when-the-cache-cannot-be-measured)), current ops; slow queries need the profiler (placeholder row if disabled) |
-| `getOverview()` | `serverStatus`, `buildInfo`, `dbStats`, `listCollections` | version, uptime, connections, collection/index counts. `maxConnections` is `connections.current + connections.available`, or `0` — the repo's spelling of *no limit published* — when the server publishes no headroom |
+| `getHealth()` | `serverStatus`, `dbStats`, `currentOp`, `system.profile` | connections (**omitted**, never `0`, when the server publishes none — [§7.2](#72-a-connection-count-nobody-published-is-absent-not-zero)), data size (**`"N/A"`**, never `"0 B"`, when `db.stats()` answers without `dataSize` — [§7.3](#73-a-database-size-nobody-published-is-absent-not-0-b)), WiredTiger cache-hit % (`"N/A"` when unmeasurable, [§7.1](#71-what-the-panel-shows-when-the-cache-cannot-be-measured)), current ops; slow queries need the profiler (placeholder row if disabled) |
+| `getOverview()` | `serverStatus`, `buildInfo`, `dbStats`, `listCollections` | version, uptime, connections (**omitted**, never `0`, on the same two paths as `getHealth()` — [§7.2](#72-a-connection-count-nobody-published-is-absent-not-zero)), database size (`databaseSizeBytes` **omitted**, never `0`, on those same two paths — [§7.3](#73-a-database-size-nobody-published-is-absent-not-0-b)), collection/index counts. `maxConnections` is `connections.current + connections.available`, or `0` — the repo's spelling of *no limit published* — when the server publishes no headroom |
 | `getPerformanceMetrics()` | `serverStatus` (WiredTiger + opcounters) | cache-hit %, **ops/sec** (`query`+`insert`+`update`+`delete` opcounters ÷ uptime — *total operations, not just queries*), buffer-pool % (cache bytes), `deadlocks: 0`. **Every field is optional**: each one is present only if its reading was, and a failed `serverStatus` reports `{}` ([§7.1](#71-what-the-panel-shows-when-the-cache-cannot-be-measured)) |
 | `getSlowQueries()` | `system.profile` | per-op time/returned; **`[]` if the profiler isn't enabled** (`db.setProfilingLevel(1)`); sorted by `millis` (slowest) — note `getHealth()`'s slow-query block instead sorts by `ts` (most recent) and emits a placeholder row when disabled |
 | `getActiveSessions()` | `currentOp` | opid, ns, lock waits, duration — ⚠️ the **`user` field is populated from `op.client`** (the client `host:port`), **not** an authenticated user |
@@ -322,6 +354,119 @@ from a measurement (the rule [#424](https://github.com/libredb/libredb-studio/is
 enforce, and [#452](https://github.com/libredb/libredb-studio/pull/452) built the *unavailable*
 rendering for).
 
+### 7.2 A connection count nobody published is absent, not zero
+
+`getHealth().activeConnections` and `getOverview().activeConnections` both come from
+`serverStatus.connections.current`, and there are two ordinary ways that reading does not happen:
+
+- the deployment publishes no `connections` section at all — an API-compatible service, or any
+  deployment whose `serverStatus` answers without it. This is **not** [§7.1](#71-what-the-panel-shows-when-the-cache-cannot-be-measured)'s
+  set: `connections` is a network-layer field of `serverStatus`, not a storage-engine sub-document
+  like `wiredTiger`, so the reason that set omits `wiredTiger` does not carry here, and which
+  deployments omit `connections` is not measured in this repo. The
+  [`serverStatus` manual page](https://www.mongodb.com/docs/manual/reference/command/serverStatus/)
+  offers no guarantee to measure it against either: it notes that "the output fields vary depending
+  on the version of MongoDB, underlying operating system platform, the storage engine, and the kind
+  of node, including `mongos`, `mongod` or replica set member", and describes `connections` only as
+  "a document that reports on the status of the connections" — it promises no top-level field,
+  `connections` included, on every deployment. So the provider treats a `serverStatus` that answers
+  without the section as an ordinary answer, without ruling on which deployments answer that way;
+- `serverStatus` (or `db.stats()`, or `currentOp`, or `buildInfo`) fails outright, which is what a
+  user without `clusterMonitor` gets, and the whole read then falls into its outer catch.
+
+`HealthInfo.activeConnections` and `DatabaseOverview.activeConnections` are both **optional** for
+exactly this case, so in all four paths the key is now **omitted** — absent from the object, absent
+from the `POST /api/db/health` body, absent from the monitoring payload, and the admin fleet-health
+row drops its `N conn` figure rather than printing `0 conn`
+([`src/components/admin/tabs/OverviewTab.tsx`](../../src/components/admin/tabs/OverviewTab.tsx)).
+Every one of them used to answer `0`: `connections?.current || 0` on both success paths and a literal
+`activeConnections: 0` in both outer catches. On the `getHealth()` side that reached the model: the
+agent's curated `health` reading is `getHealth()` (`method: "getHealth"` in
+[`src/lib/agent/tools.ts`](../../src/lib/agent/tools.ts), which projects this key with `?? null`), so
+a MongoDB the caller could not query at all arrived as a *measured* "no connections open".
+`getOverview()`'s count does **not** reach the model - nothing under `src/lib/agent` reads
+`getOverview()` - and its readers are the monitoring **Connections** card, that card's trend chart,
+and the connection-threshold rating that colours it. On the Overview tab the `0` was not merely a
+blank in disguise: it printed as the figure `0` on the *Connections* card, and — because that tab
+keeps a history — each refresh added a real `0` point to the connection sparkline, whose `flatMap`
+drops absent samples and plots present ones. With the key absent the card reads `N/A` above *not
+published* and the sample is dropped from the trend
+([`src/components/monitoring/tabs/OverviewTab.tsx`](../../src/components/monitoring/tabs/OverviewTab.tsx)).
+No percentage was ever involved on these paths: whenever `connections.current` is unmeasurable
+`maxConnections` is `0` too, and the card only computes a share when a limit is published.
+
+A server that really has `0` open connections keeps the `0` — it is a reading, and the absence is
+spelled `measuredNumber(...)` plus a conditional spread, never `|| undefined` and never `|| 0`. The
+`|| 0` form was in fact two defects on one line: it invented a figure where none was published *and*
+flattened a genuinely idle server's measured `0` into the same value, so the two are
+indistinguishable downstream.
+
+Both outer catches still **resolve** rather than rethrowing, but for different reasons, and neither
+reason licenses naming a figure:
+
+- `getHealth()` resolves because `POST /api/db/health` serialises whatever it resolves with and
+  `POST /api/admin/fleet-health` reads `healthy` from a read that returned, so rethrowing would
+  report a server that is up as an error;
+- `getOverview()` resolves because `getMonitoringData()`
+  ([`src/lib/db/base-provider.ts`](../../src/lib/db/base-provider.ts)) reads the panel through
+  `Promise.allSettled`, so a rethrow would replace the whole overview with an `errors.overview`
+  entry instead of the `"MongoDB Unknown"` / `"N/A"` placeholders the tab renders. That is a
+  legitimate alternative rather than a bug, and it is left alone here: it is a cross-provider
+  decision, since every provider's `getOverview()` degrades the same way.
+
+(`getHealth()`'s `slowQueries: [{ query: "Error fetching health info" }]` placeholder is the same
+class of fabrication one size down and is still there; it is tracked separately, because removing it
+needs `HealthInfo.slowQueries` to become optional across all 15 type-ids.)
+
+### 7.3 A database size nobody published is absent, not `0 B`
+
+The byte figure travels the same two paths as the count above and had the same two spellings of a
+fabrication. Both outlived the round that fixed the count, one field over in the same object:
+
+- `getOverview()`'s outer catch returned a literal `databaseSizeBytes: 0`. Nothing was read on that
+  path - `serverStatus`, `db.stats()`, `buildInfo` and `listCollections` are all inside the same
+  `try`, so a user without `clusterMonitor` reaches it - and `DatabaseOverview.databaseSizeBytes` is
+  **optional** precisely so that a provider with no byte figure can say so. The key is now omitted;
+- both success paths formatted `dbStats.dataSize || 0`, which cannot tell a database that measures
+  0 bytes from a `db.stats()` that answered without `dataSize`. Both are now
+  `measuredNumber(dbStats.dataSize)`: absent, the overview omits `databaseSizeBytes` and reports
+  `databaseSize: "N/A"`; measured, a real `0` still formats as `"0 B"`. MongoDB's own
+  [`dbStats` reference](https://www.mongodb.com/docs/manual/reference/command/dbStats/) documents
+  `dataSize` unconditionally - the only output fields it gates are `freeStorageSize`,
+  `indexFreeStorageSize` and `totalFreeStorageSize`, on the command's `freeStorage: 1` option - so
+  this arm is **not** a deployment measured in this repo; it is the input `|| 0` could not
+  distinguish, and the optional field exists to carry it.
+
+**What the absence buys is a whole panel.**
+[`StorageTab.tsx`](../../src/components/monitoring/tabs/StorageTab.tsx) keys its entire breakdown off
+`overview?.databaseSizeBytes !== undefined`. With the key present as `0` it treated the size as
+**known** and drew the breakdown over a `0 B` total: the *Tables* and *Indexes* cards at `0.0%`, and
+an *Other (unattributed)* row computed as `totalSize - totalTableSize - totalIndexSize`. That
+remainder is the part a refused `serverStatus` makes visibly wrong rather than merely empty, because
+the table read does **not** share the failure - `getTableStats()` goes through `listCollections` +
+`collStats`, neither of which needs `clusterMonitor` - so its per-table byte figures arrive, both
+`known` flags are true, and the row draws a **negative** byte count as a measurement. A 1 KB collection
+with 512 B of indexes renders the literal string `-1536 B` (measured 2026-08-27 against the cascade
+itself): the tab formats bytes with its own local threshold cascade, whose last arm returns whatever it
+was given, so a negative passes through intact and reads as a figure the engine reported. With the key absent the tab draws its own *"No storage size
+information available."* instead, and the *Tables* / *Indexes* cards read `N/A`. Both arms are pinned
+in [`tests/components/monitoring/StorageTab.test.tsx`](../../tests/components/monitoring/StorageTab.test.tsx).
+
+`getHealth()`'s size is a required string, so its absence is spelled `"N/A"` - the value that
+method's own catch already returns. That one **does** reach the model: the curated `health` reading
+projects `databaseSize` verbatim, so `"0 B"` told the model a database it could not measure holds
+nothing.
+
+Three `0`s stay in `getOverview()`'s catch, for two different reasons - and neither reason is that
+something was measured:
+
+- `maxConnections` stays `0` because there `0` *means* "no limit published" - absence and zero are
+  the same fact for a published ceiling, which is why the field is a required number
+  ([`DatabaseOverview` in types.ts](../../src/lib/db/types.ts));
+- `tableCount` and `indexCount` are required numbers with no absence to spell, so `0` is the only
+  value the type leaves for a path that counted nothing. They are the one place this object still
+  states more than it read ([§13](#13-known-limitations--future-work)).
+
 ---
 
 ## 8. Maintenance
@@ -340,6 +485,29 @@ maps the generic operations onto MongoDB admin commands:
 `getCapabilities().maintenanceOperations = ['vacuum', 'analyze', 'check']` — so the UI surfaces those
 three, though `runMaintenance` also accepts `optimize`/`kill`/`reindex` when invoked directly.
 
+### Where each operation may be offered (`maintenanceOperationSpecs`)
+
+Declaring that an operation EXISTS is not enough to put a button on it: two engines that
+declare the same `MaintenanceType` take different kinds of target, so each provider also
+declares what its own operations may be pointed at. The monitoring Tables tab renders a
+per-row control only where `perEntity` is true, the admin Operations tab a whole-database
+card only where `global` is true, and both take the wording from `label` (#496).
+
+`POST /api/db/maintenance` reads the same declaration since #U20, and it is the one reader that
+REFUSES rather than hides: it takes the placement from whether the request carries a `target`
+(absent or empty means whole-database) and answers `400` when this provider marks that
+placement unavailable while the other one is available - a targetless `{type:"check"}` is that
+request here.
+
+| Operation | Control label | Per-row | Global | Why |
+|-----------|---------------|---------|--------|-----|
+| `vacuum` | Compact Collection | yes | yes | `{compact: <coll>}`, or every collection from `listCollections()` |
+| `analyze` | Validate Collection | yes | yes | `{validate: <coll>}`, same loop without a target |
+| `check` | Check Collection | yes | **no** | `{dbCheck: <coll>}` is not looped and throws without a collection name |
+
+*"Compact Collection"* really is the `vacuum` this provider declares, so
+`vacuumActionOperation` stays absent.
+
 ---
 
 ## 9. Capabilities & labels
@@ -353,7 +521,7 @@ three, though `runMaintenance` also accepts `optimize`/`kill`/`reindex` when inv
 | `supportsExternalQueryLimiting` | `false` |
 | `supportsCreateTable` | `false` |
 | `supportsInlineRowEdit` | `false` — the query language is JSON commands, so there is no `UPDATE ... SET` for the results grid's inline editor to emit |
-| `supportsTransactions` | `false` — multi-document transactions need a client session this provider does not hold, so BEGIN/COMMIT/ROLLBACK and SANDBOX are not offered; they used to be, and answered HTTP 400 (#U13) |
+| `supportsTransactions` | `false` — multi-document transactions need a client session this provider does not hold, so BEGIN/COMMIT/ROLLBACK and SANDBOX are not offered; they used to be, and answered HTTP 400 (#464) |
 | `declaresForeignKeys` | `false` — MongoDB has no foreign key constraint at all, so an empty `foreignKeys` list here is the engine's model and not this database's shape |
 | `supportsMaintenance` | `true` |
 | `maintenanceOperations` | `['vacuum', 'analyze', 'check']` |
@@ -380,7 +548,7 @@ language *is* did not survive contact with the model's prior; naming what it is 
 `slowQueriesEmptyState` (*"Query stats come from the database profiler - run db.setProfilingLevel()
 to start recording into system.profile."*) is the monitoring Queries panel's empty state. That
 sentence was hardcoded to PostgreSQL's `pg_stat_statements` advice on every engine
-(`docs/BACKLOG.md` U12); here `getSlowQueries()` reads `system.profile`
+(#463); here `getSlowQueries()` reads `system.profile`
 ([§7](#7-monitoring--health)), which does not exist until the profiler is switched on.
 
 ---
@@ -483,7 +651,17 @@ Over the API: `POST /api/db/query` (JSON MQL in the `sql` field) and `POST /api/
 - **Monitoring needs privileges.** `serverStatus`/`currentOp`/`$indexStats` and the profiler require
   appropriate roles (`clusterMonitor`, etc.); without them the affected metrics are reported as
   *unavailable* rather than as numbers ([§7.1](#71-what-the-panel-shows-when-the-cache-cannot-be-measured)),
-  and slow queries require the profiler to be enabled.
+  the health connection count is omitted rather than reported as `0`
+  ([§7.2](#72-a-connection-count-nobody-published-is-absent-not-zero)), the overview's byte figure is
+  omitted rather than reported as `0`
+  ([§7.3](#73-a-database-size-nobody-published-is-absent-not-0-b)), and slow queries require the
+  profiler to be enabled.
+- **A failed overview read still reports `tableCount: 0` and `indexCount: 0`.** Both fields are
+  required numbers on `DatabaseOverview`, so `getOverview()`'s catch has no absence to spell for
+  them and a denied `serverStatus` reports two counts nobody took
+  ([§7.3](#73-a-database-size-nobody-published-is-absent-not-0-b)). *Future:* the same change the
+  connection count and the byte figure got, which needs the two fields to become optional across all
+  15 type-ids.
 - **`Binary` values are shown as a placeholder** (`<Binary: N bytes>`), not the raw bytes, and only
   a subset of BSON types are normalised (`Long`/`Timestamp`/`UUID`/`RegExp`/`Code`/`DBRef` render as
   generic objects).
@@ -508,6 +686,7 @@ Over the API: `POST /api/db/query` (JSON MQL in the `sql` field) and `POST /api/
 ## 14. References
 
 - Driver: [`mongodb` (node-mongodb-native)](https://github.com/mongodb/node-mongodb-native)
+- MongoDB manual: [`serverStatus`](https://www.mongodb.com/docs/manual/reference/command/serverStatus/) · [`dbStats`](https://www.mongodb.com/docs/manual/reference/command/dbStats/) — the two commands §7.1–§7.3 read, and the pages the claims about which output fields are guaranteed come from
 - Source: [`src/lib/db/providers/document/mongodb.ts`](../../src/lib/db/providers/document/mongodb.ts)
 - Base class: [`src/lib/db/base-provider.ts`](../../src/lib/db/base-provider.ts)
 - Interface & DTOs: [`src/lib/db/types.ts`](../../src/lib/db/types.ts)

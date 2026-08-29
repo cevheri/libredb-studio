@@ -44,8 +44,9 @@ if it only lists the good news.
 | Surface | What it sends | Fenced? |
 | --- | --- | --- |
 | `POST /api/agent/classify`, **before any run exists** | Your objective, and nothing else. One short completion that asks the model to name one of the five workflows. It fires when you press **Start** with the workflow left on **Automatic**, which is the default; naming a workflow yourself under **Advanced** skips it entirely. See [the classification, before any run](#the-classification-before-any-run) | No — it carries no database content to fence. Your objective is sent as the user message, and the server's instructions tell the model to treat that text as data to classify and never as instructions to it |
-| Any **run**, in either mode, on **any** engine | Your objective, and a schema inventory (table, column, index identifiers and column types) with its relations graph (identifiers only). **Since #414 that inventory leaves on every engine**, where before it left on PostgreSQL and SQLite alone: those two are read with catalog statements the server composes, and the other twelve by asking the connection's own provider to describe its schema. On **MongoDB and Couchbase** the provider works out a collection's fields from a **sample of your own documents** — no value from them is in the message, but the **existence** of a field there is derived from your data rather than read from a catalog, which is a weaker claim than a catalog reading's and is why that reading has its own operation id (`db.schema.read`) an operator can deny alone. When the reading cannot be taken — a refusal, a provider that cannot describe its own schema, a description that overran the time the run granted it — nothing of the schema leaves and a server sentence saying which of those happened goes in its place. See [the schema inventory](#3-the-schema-inventory--identifiers-and-types-fenced) | Everything derived from the database is wrapped in an untrusted-content fence before it reaches a prompt |
+| Any **run**, in either mode, on **any** engine | Your objective, and a schema inventory (table, column, index identifiers and column types) with its relations graph (identifiers only). **Since #414 that inventory leaves on every engine**, where before it left on PostgreSQL and SQLite alone: those two are read with catalog statements the server composes, and the other fifteen by asking the connection's own provider to describe its schema. On **MongoDB and Couchbase** the provider works out a collection's fields from a **sample of your own documents** — no value from them is in the message, but the **existence** of a field there is derived from your data rather than read from a catalog, which is a weaker claim than a catalog reading's and is why that reading has its own operation id (`db.schema.read`) an operator can deny alone. When the reading cannot be taken — a refusal, a provider that cannot describe its own schema, a description that overran the time the run granted it — nothing of the schema leaves and a server sentence saying which of those happened goes in its place. See [the schema inventory](#3-the-schema-inventory--identifiers-and-types-fenced) | Everything derived from the database is wrapped in an untrusted-content fence before it reaches a prompt |
 | An **agent run** | The above, plus the rows of each read the model performed, up to 200 per read; engine error text; server-written refusals; server-minted ids | Same fence |
+| Any **run that continues a conversation**, in either mode, on any engine | **In addition to everything above**: the earlier steps' objectives — *your own earlier questions*, capped at 200 characters each — and the most recent step's report, which is a model's claims about your data. No row of any result, and no earlier step's report but the newest. Sent only when the rail attaches a previous run's id, which it does for a follow-up on the same connection; a run that starts its own conversation sends no such message. Bounded to 4000 characters by default and switchable off with `LIBREDB_AGENT_THREAD_CONTEXT=false`. See [the conversation](#2a-the-conversation-when-a-run-continues-one--fenced) | Same fence, identified as `operation agent/thread`: it is prose a user and a model wrote, and none of it is the server's voice |
 | An **agent run opened as Operate** | Your objective; a **schema inventory reduced to its own names and index names** (no column names, no column types, no relations graph), read whichever of the two ways that engine is read and named with whichever noun that engine's provider declares — tables, collections, datasources, key patterns; in Plan mode the engine's **row-count estimates** for those same tables where the engine holds any — PostgreSQL and SQLite — and nothing per column; and the rows of each curated reading — which, for the `sessions` and `slow-queries` kinds, include **other database users' in-flight statement text and their database usernames**. See [the operations workflow](#5a-the-operations-workflow-what-a-curated-reading-sends) | Same fence: the inventory and every reading's rows are database content and are fenced |
 | `POST /api/ai/explain` | Your statement, the EXPLAIN plan, the schema context the browser holds, the engine type | No |
 | `POST /api/ai/query-safety` | Your statement, a filtered schema context, the engine type | No |
@@ -64,8 +65,8 @@ that can disagree (`src/lib/agent/model-adapter.ts`).
 
 | Kind | Endpoint | Call site |
 | --- | --- | --- |
-| `gemini` | Google's own Generative AI endpoint. **No `baseURL` is passed, deliberately**, so an `LLM_API_URL` left over from another setup cannot redirect Gemini traffic — carrying your key — to that host | `src/lib/agent/provider-registry.ts:134-146` |
-| `openai`, `ollama`, `custom` | `{LLM_API_URL}/chat/completions` — whatever host you named | `src/lib/agent/provider-registry.ts:121-132` |
+| `gemini` | `{LLM_API_URL}` when you set one, Google's own Generative AI endpoint otherwise. The variable is read on both Gemini surfaces, so a proxy configured for the chat surface is also where a run goes — nothing routes to a host you did not name, and nothing silently keeps talking to Google either | `src/lib/agent/provider-registry.ts:136-150`, `src/lib/llm/utils/gemini-endpoint.ts` |
+| `openai`, `ollama`, `custom` | `{LLM_API_URL}/chat/completions` — whatever host you named | `src/lib/agent/provider-registry.ts:123-134` |
 
 Two properties of that seam are enforced rather than assumed:
 
@@ -73,14 +74,18 @@ Two properties of that seam are enforced rather than assumed:
   `OPENAI_BASE_URL` when they are undefined, and `@ai-sdk/google` reads
   `GOOGLE_GENERATIVE_AI_API_KEY`. Every setting is therefore passed explicitly, so none of those
   reads can happen — a keyless Ollama gets a placeholder token and a keyless custom endpoint gets no
-  `Authorization` header at all (`provider-registry.ts:81-111`, asserted on the wire in
+  `Authorization` header at all (`provider-registry.ts:83-113`, asserted on the wire in
   `tests/isolated/agent-model-adapter.test.ts`).
 - **The SDK's hosted gateway is unreachable by construction.** The AI SDK also accepts a bare model
   id, which it resolves through its own gateway — a third party nothing in this repository
-  configures. The type excludes that arm (`AgentLanguageModel`, `provider-registry.ts:53-61`).
+  configures. The type excludes that arm (`AgentLanguageModel`, `provider-registry.ts:55-63`).
 
-`LLM_API_URL` is unread for the `gemini` kind, on the agent path exactly as on the chat surface. A
-Gemini deployment behind a proxy is therefore not configurable (`docs/BACKLOG.md` B20).
+`LLM_API_URL` reaches the `gemini` kind on the agent path exactly as on the chat surface, so a Gemini
+deployment behind an egress proxy or on a regional endpoint is configurable from the one variable. The
+two installed SDKs disagree about whether the version segment belongs to the base URL —
+`@google/generative-ai` appends it, `@ai-sdk/google` does not — so one value is normalised into both
+spellings in `src/lib/llm/utils/gemini-endpoint.ts`. Give the versioned URL; a bare origin also works,
+`/v1beta` is composed for it.
 
 ---
 
@@ -196,7 +201,7 @@ One field of your connection record *is*: its **engine type**, the canonical typ
 spends it on the fence tag the deliverable must carry, and since the Operate-engine fix a prose plan
 spends it twice: on the rule that binds the readings it may name to the engine it is planning
 against, and on the fence tag for a reading that engine happens to express as a statement. It is
-a server-side enum with fourteen members, so what it discloses is which of fourteen engines this
+a server-side enum with seventeen members, so what it discloses is which of seventeen engines this
 connection is — never its host, its database name or its credentials, none of which reach a prompt at
 all (see [What never leaves](#what-never-leaves)).
 
@@ -205,6 +210,46 @@ all (see [What never leaves](#what-never-leaves)).
 The first user message is the text you typed, unmodified apart from the trim the rail applies
 (`investigation.ts:698`). Bounded to 4000 characters by the route and by the rail
 (`AGENT_MAX_OBJECTIVE_LENGTH`).
+
+### 2a. The conversation, when a run continues one — fenced
+
+**This is the one message whose content came from an EARLIER question of yours.** It is sent only
+when a run continues a conversation: a follow-up asked on the same connection, where the rail
+attaches the previous run's id and the route derives the block server-side from those runs' own
+ledgers (`thread-context.ts`, `investigation.ts:1923`). A run that starts a conversation of its own
+sends nothing here, and there is no such message at all.
+
+What is in it, and where each half came from:
+
+| Half | Content | Whose words |
+| --- | --- | --- |
+| The **spine** | Every earlier step's objective, oldest first, each capped at 200 characters | **Yours** — the questions you typed, verbatim to the cap |
+| The **evidence** | The most recent step's report: its answer statement, its claims, its closing prose | A **model's**, about your data — a claim is prose a model wrote after reading rows |
+
+**A claim is derived from your rows, and that is the honest way to read this.** No value from any
+row is copied into it, but a claim like *"Sports has the most films (74)"* is a statement ABOUT your
+data that a model composed from a result it read. So a conversation carries derived findings from one
+question into the next one's prompt. That is the whole feature, and it is why there is an operator
+switch for it.
+
+**What is NOT in it.** Not the rows of any result. Not an earlier step's REPORT beyond the most
+recent one — only its objective travels, which is why the block says so in the server's own voice
+outside the fence ("earlier steps may list only what was ASKED, not what was found"). Not the schema
+inventory, which is its own message below. Not a run id of anybody else's: the route refuses to
+continue a run that is not this session's, is on another connection, or has not ended.
+
+**Bounded and fenced.** The whole block is capped
+(`AGENT_THREAD_CONTEXT_MAX_CHARS`, 4000 by default, sizeable per model through
+`AGENT_MODEL_TUNING_PATH`), the spine may take at most 75% of that, and every drop — a step past the
+cap, a report that did not fit, a report with no room at all — is stated in the text rather than
+performed silently. It is wrapped in the same untrusted-content fence every database-derived message
+gets, identified as `operation agent/thread`, because it is prose a user and a model wrote and none
+of it is the server's voice.
+
+**Switched off, nothing here leaves.** `LIBREDB_AGENT_THREAD_CONTEXT=false` and every run opens on
+its own; the run's own record says `declined: "disabled"` and the rail says so when a follow-up was
+not read as one. See [`docs/AGENT.md`](./AGENT.md) for the setting and
+[the conversation a run belongs to](./AGENT.md#the-conversation-a-run-belongs-to) for the model.
 
 ### 3. The schema inventory — identifiers and types, fenced
 
@@ -226,16 +271,25 @@ a refusal — nothing of the schema leaves and a server-written note says so in 
 
 **Two readings produce it, and which one runs is the dialect's decision** (#414). On PostgreSQL and
 SQLite the server composes a catalog statement per kind and executes it read-only. On the other
-twelve it invokes `db.schema.read`, which calls the connection's own `provider.getSchema()` — the
+fifteen it invokes `db.schema.read`, which calls the connection's own `provider.getSchema()` — the
 inspection the sidebar performs when it lists your tables — and composes no statement at all.
-**Twelve counts type-ids the factory can build, not engines a user would name**: `SHIPPED` holds
-fourteen, `CATALOG_PLANS` serves two of them, and the remainder is what this second reading covers.
-Every other "twelve" said about grounding in these docs counts the same thing. Two things it does
+**Fifteen counts type-ids the factory can build, not engines a user would name**: `SHIPPED` holds
+seventeen, `CATALOG_PLANS` serves two of them, and the remainder is what this second reading covers.
+Every other count said about grounding in these docs counts the same thing. libSQL is one of the
+fifteen and not one of the two: it speaks SQLite's dialect, but the read-only catalog path
+`CATALOG_PLANS` serves needs a database-native read-only profile, and `PRAGMA query_only` is refused
+by a libSQL server (see [`providers/libsql.md`](./providers/libsql.md)). Two things it does
 NOT count. The wire-compatible engines of
 [`docs/providers/README.md`](./providers/README.md) are not extra members — TiDB is grounded because it
-arrives as `mysql`, and it is that type-id that is counted. And one of the twelve, the embedded
-`libredb`, is reached by this path but cannot complete it: the file takes an exclusive lock, so the
-grounding provider never connects and the run is honestly ungrounded (`docs/BACKLOG.md` B49). What
+arrives as `mysql`, and it is that type-id that is counted. And two of the fifteen, the embedded
+`libredb` and `duckdb`, reach this path through a handle they do not open: the file takes an exclusive
+lock, so the grounding acquisition borrows the connection's own open provider rather than opening a
+second one that the lock would refuse (`findOpenSingleWriterProvider`, `src/lib/db/factory.ts`; see
+[`docs/providers/libredb.md`](./providers/libredb.md) §4.2.1 and
+[`docs/providers/duckdb.md`](./providers/duckdb.md)). DuckDB is the sharper of the two: a second
+OPERATING-SYSTEM process is refused on that file even in read-only mode, measured, so the borrow is
+not an optimisation there but the only handle there is. A connection that configures an
+`agentUser` opts out of that borrow, and such a run is still honestly ungrounded. What
 leaves this process is the same KIND of thing either way, identifiers and types and nothing else, but
 two properties differ and are stated here rather than left to be discovered:
 
@@ -491,7 +545,7 @@ The frozen execution policies are the ceiling on one run's egress, one row per w
 | Bound | Value | What it caps |
 | --- | --- | --- |
 | `maxResultRows` / `maxResultBytes` | 200 rows / 256 KiB | The most one read can return — and therefore the most one tool result can send |
-| `maxStatementsPerRun` | 18-45, by workflow | Reads per drive, grounding reads and repairs included — the composed catalog reads and, since #414, the one `db.schema.read` call that replaces them on the other twelve. The figures did not move for it: that path is the cheapest of the three, so nothing had to be bought (`docs/AGENT.md`, the budget arithmetic) |
+| `maxStatementsPerRun` | 18-45, by workflow | Reads per drive, grounding reads and repairs included — the composed catalog reads and, since #414, the one `db.schema.read` call that replaces them on the other fifteen. The figures did not move for it: that path is the cheapest of the three, so nothing had to be bought (`docs/AGENT.md`, the budget arithmetic) |
 | `AGENT_CONTEXT_PACK_MAX_CHARS` | 6000 | The fenced schema inventory |
 | `MAX_ER_CHARS` | 2000 | The fenced relations block |
 | `AGENT_MAX_OBJECTIVE_LENGTH` | 4000 | Your objective |
@@ -522,11 +576,11 @@ output cap, and what it sends is one objective — see
   **One credential does leave, necessarily: your `LLM_API_KEY`.** It is not in a prompt — it is in
   the request's authentication metadata, because that is how the provider authenticates you. The
   OpenAI-compatible kinds send it as the `Authorization` header
-  (`src/lib/agent/provider-registry.ts:106,123-126`) and Gemini passes it to the Google provider
-  (`:141`). Two consequences worth stating: a keyless Ollama gets a placeholder token and a keyless
-  custom endpoint gets no `Authorization` header at all (`:107,110`), so neither invents a
-  credential; and Gemini is deliberately given no `baseURL`, so a stale `LLM_API_URL` cannot
-  redirect that key to another host (`:134-146`). "No credentials leave" would be the wrong claim
+  (`src/lib/agent/provider-registry.ts:108,125-128`) and Gemini passes it to the Google provider
+  (`:143`). Two consequences worth stating: a keyless Ollama gets a placeholder token and a keyless
+  custom endpoint gets no `Authorization` header at all (`:109,112`), so neither invents a
+  credential; and Gemini's `baseURL` comes from `LLM_API_URL` — the host you configured for the chat
+  surface and no other (`:136-150`). "No credentials leave" would be the wrong claim
   here — the accurate one is that **no database credential** reaches the model, while the model
   provider's own key reaches the model provider and nothing else.
 - **Cell values from a table's own columns.** No agent path reads a row out of a user table and

@@ -2,7 +2,7 @@
 
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/libredb-studio)](https://artifacthub.io/packages/search?repo=libredb-studio)
 
-Web-based SQL IDE for cloud-native teams supporting fourteen engines - PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino and Apache Cassandra.
+Web-based SQL IDE for cloud-native teams supporting sixteen engines - PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino and Apache Cassandra.
 
 ## Prerequisites
 
@@ -40,7 +40,7 @@ helm install libredb libredb/libredb-studio \
 
 ```bash
 helm install libredb oci://ghcr.io/libredb/charts/libredb-studio \
-  --version 0.1.48 \
+  --version 0.1.54 \
   --set secrets.jwtSecret=$(openssl rand -base64 32) \
   --set secrets.adminPassword=MyAdmin123
 ```
@@ -126,6 +126,27 @@ kubectl exec deploy/libredb-libredb-studio -- cat /app/data/auth-bootstrap.json
 
 **Strict mode** (`--set config.authBootstrap=off`) restores fail-closed behavior: `secrets.jwtSecret` is required, and `secrets.adminPassword` is required as well while `authProvider=local` (or use `secrets.existingSecret`); the install fails fast with a clear message when either is missing, and with an existing secret the pod will not start until the referenced keys exist. Under `authProvider=oidc` the admin password is neither required nor referenced as a mandatory Secret key - the issuer authenticates users, so an OIDC `existingSecret` needs no `admin-password` entry. Recommended for production. `secrets.userPassword` stays optional in every mode. Setting `config.authBootstrap=on` is equivalent to the default `""`, just explicit.
 
+### Serving over plain HTTP (LAN or home server)
+
+Auth cookies carry the `Secure` flag in production, and a browser **rejects** a `Secure`
+cookie that arrives over plain `http` on a host that is not loopback. The login form then
+posts, succeeds, and returns you to the login form - the silent loop reported on home-server
+installs. Tell the chart when that is your situation:
+
+```bash
+helm install libredb libredb/libredb-studio \
+  --set config.authCookieSecure=false
+```
+
+The value is three-state and **unset is the default**: the chart writes no
+`AUTH_COOKIE_SECURE`, and the app decides for itself, exactly as it did before this value
+existed. So an upgrade changes nothing until you set it.
+
+You do **not** need this when TLS is terminated at an ingress or a load balancer: the
+browser still speaks `https`, so it accepts the cookie. `false` is only for the case where
+the browser's own connection is cleartext - and it means session cookies travel in
+cleartext, so keep it to a trusted network. `true` forces the flag on.
+
 ## OIDC SSO
 
 ```bash
@@ -193,6 +214,22 @@ helm upgrade libredb libredb/libredb-studio --reuse-values --set agent.enabled=f
 `LIBREDB_AGENT_ENABLED=false`, which is the supported way to have AI configured and no agent; `true`
 is accepted and explicit but cannot conjure a model. The chart renders the value as a quoted string,
 which is why no `--set-string` is needed here.
+
+`agent.threadContext` follows the same rule for a narrower thing: whether a run may be told about the
+**conversation** it belongs to. A follow-up asked on the same connection otherwise continues the
+previous run's conversation — the earlier steps' objectives and the most recent step's report are
+derived server-side from those runs' own ledgers and handed to the model fenced. Unset writes
+nothing and the runtime keeps its own default, which is on; `false` writes
+`LIBREDB_AGENT_THREAD_CONTEXT=false`, and every run then opens on its own with the rail saying so
+rather than going quiet.
+
+```bash
+helm upgrade libredb libredb/libredb-studio --reuse-values --set agent.threadContext=false
+```
+
+Set it where no question's context may reach another. The user already has the equivalent control —
+the rail names the conversation and offers to leave it — so this exists for deployments where that
+choice may not be theirs.
 
 **Run history lives in that ledger, so `persistence` decides whether it survives.** With
 `persistence.enabled=false` the ledger is an `emptyDir`: every run is written, and the entire history
@@ -415,9 +452,12 @@ helm install libredb libredb/libredb-studio \
   --set replicaCount=3 \
   --set ingress.enabled=true \
   --set ingress.className=nginx \
-  --set "ingress.annotations.nginx\.ingress\.kubernetes\.io/limit-rpm=120" \
-  --set "ingress.annotations.nginx\.ingress\.kubernetes\.io/limit-burst-multiplier=2"
+  --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/limit-rpm=120" \
+  --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/limit-burst-multiplier=2"
 ```
+
+`--set-string`, not `--set`: ingress annotations are a `map[string]string`, and plain `--set`
+type-coerces the bare number, rendering `limit-rpm: 120` as an integer that the API server rejects.
 
 With Traefik, attach a `rateLimit` middleware and reference it from the ingress annotations.
 
@@ -429,8 +469,8 @@ it, so pass it through `extraEnv`:
 
 ```bash
 helm install libredb libredb/libredb-studio \
-  --set extraEnv[0].name=ALLOWED_ORIGINS \
-  --set extraEnv[0].value=https://libredb.example.com
+  --set 'extraEnv[0].name=ALLOWED_ORIGINS' \
+  --set-string 'extraEnv[0].value=https://libredb.example.com'
 ```
 
 ### The Content-Security-Policy escape hatch
@@ -442,12 +482,19 @@ passed through `extraEnv`:
 
 ```bash
 helm install libredb libredb/libredb-studio \
-  --set extraEnv[0].name=CSP_REPORT_ONLY \
-  --set extraEnv[0].value="true"
+  --set 'extraEnv[0].name=CSP_REPORT_ONLY' \
+  --set-string 'extraEnv[0].value=true'
 ```
 
 In report-only mode the browser logs the same violation to its console instead of blocking the
 resource. Please also open an issue naming the violated directive.
+
+`--set-string`, not `--set`, and the single quotes are load-bearing in both `extraEnv` recipes above.
+`--set extraEnv[0].value=true` renders `value: true`, an unquoted YAML boolean, and the API server
+rejects the manifest with `invalid type for io.k8s.api.core.v1.EnvVar.value: got "bool", expected
+"string"` — `extraEnv` is typed only as an array of objects in `values.schema.json`, so nothing
+catches it before apply. Unquoted `extraEnv[0]` is also a glob pattern in zsh, which fails the
+command with `no matches found` before helm is reached.
 
 Setting both `ALLOWED_ORIGINS` and `CSP_REPORT_ONLY` at once needs a distinct index per entry —
 `extraEnv` is a list, and `--set` on the same index (`extraEnv[0]` in both examples above) just
@@ -456,10 +503,10 @@ second variable:
 
 ```bash
 helm install libredb libredb/libredb-studio \
-  --set extraEnv[0].name=ALLOWED_ORIGINS \
-  --set extraEnv[0].value=https://libredb.example.com \
-  --set extraEnv[1].name=CSP_REPORT_ONLY \
-  --set extraEnv[1].value="true"
+  --set 'extraEnv[0].name=ALLOWED_ORIGINS' \
+  --set-string 'extraEnv[0].value=https://libredb.example.com' \
+  --set 'extraEnv[1].name=CSP_REPORT_ONLY' \
+  --set-string 'extraEnv[1].value=true'
 ```
 
 ### Separating the storage encryption key
@@ -474,9 +521,9 @@ same directory, alongside the database file):
 
 ```bash
 helm install libredb libredb/libredb-studio \
-  --set extraEnv[0].name=STORAGE_ENCRYPTION_KEY \
-  --set extraEnv[0].valueFrom.secretKeyRef.name=libredb-studio-storage \
-  --set extraEnv[0].valueFrom.secretKeyRef.key=encryption-key
+  --set 'extraEnv[0].name=STORAGE_ENCRYPTION_KEY' \
+  --set 'extraEnv[0].valueFrom.secretKeyRef.name=libredb-studio-storage' \
+  --set 'extraEnv[0].valueFrom.secretKeyRef.key=encryption-key'
 ```
 
 Rotating the key makes existing stored credentials unreadable — the connections survive and their
@@ -532,6 +579,7 @@ helm uninstall libredb
 | `image.pullPolicy` | Pull policy | `IfNotPresent` |
 | `authProvider` | Auth mode: local or oidc | `local` |
 | `config.authBootstrap` | Auth bootstrap: `""` (zero-config, app default), `on` (explicit zero-config), `off` (strict) | `""` |
+| `config.authCookieSecure` | Whether auth cookies carry the `Secure` flag (`AUTH_COOKIE_SECURE`). Unset writes nothing and the app decides (Secure in production, except a loopback host reached over plain http); `false` drops the flag, which is what a browser reaching a non-loopback host over plain http needs - it rejects a Secure cookie and login silently loops; `true` forces it on. TLS terminated at an ingress does not need this | unset |
 | `secrets.jwtSecret` | JWT signing secret: empty (zero-config) or >= 32 chars (schema-enforced) | `""` |
 | `secrets.adminEmail` | Admin email | `admin@libredb.org` |
 | `secrets.adminPassword` | Admin password | `""` |

@@ -37,6 +37,14 @@ mock.module("@/components/ui/dropdown-menu", () => ({
   DropdownMenuSeparator: ({ className }: { className?: string }) => React.createElement("hr", { className }),
 }));
 
+// The real provider writes to <html> and localStorage; what matters here is only that a
+// provider EXISTS, since `ThemeToggle` renders nothing when `themes` is empty. Group 9 in
+// tests/run-components.sh holds no suite that reaches the real next-themes, so this
+// process-wide mock costs its neighbours nothing.
+mock.module("next-themes", () => ({
+  useTheme: () => ({ theme: "dark", themes: ["dark", "light"], setTheme: () => {} }),
+}));
+
 mock.module("@/components/ui/button", () => ({
   Button: ({ children, onClick, className, disabled, ...rest }: Record<string, unknown>) =>
     React.createElement(
@@ -264,7 +272,7 @@ describe("StudioMobileHeader", () => {
     expect(queryByText("Import Data")).not.toBeNull();
   });
 
-  test("BEGIN Transaction not rendered when the trio is withheld (#U13)", () => {
+  test("BEGIN Transaction not rendered when the trio is withheld (#464)", () => {
     // The positive is asserted by "BEGIN Transaction click calls onBeginTransaction"
     // above, on the same defaults; here only the three callbacks are removed.
     const { queryByText } = render(
@@ -297,7 +305,7 @@ describe("StudioMobileHeader", () => {
     expect(queryByText("Import Data")).not.toBeNull();
   });
 
-  test("Enable Sandbox not rendered when onTogglePlayground is withheld (#U13)", () => {
+  test("Enable Sandbox not rendered when onTogglePlayground is withheld (#464)", () => {
     const { queryByText } = render(<StudioMobileHeader {...defaults} onTogglePlayground={undefined} />);
     expect(queryByText("Enable Sandbox")).toBeNull();
     expect(queryByText("BEGIN Transaction")).not.toBeNull();
@@ -409,5 +417,30 @@ describe("StudioMobileHeader", () => {
   test("playgroundMode=true shows SANDBOX badge", () => {
     const { queryByText } = render(<StudioMobileHeader {...defaults} playgroundMode />);
     expect(queryByText("SANDBOX")).not.toBeNull();
+  });
+
+  // ── The theme control (#401) ───────────────────────────────────────────────
+
+  /**
+   * `ThemeToggle` was mounted in `StudioDesktopHeader` only, inside a container that
+   * is `hidden md:flex`, so a viewer at 390px started on dark and had no way to
+   * leave it. The user menu is where the other once-per-session settings already
+   * live, and where a theme preference is looked for.
+   */
+  test("the user menu carries a theme control", () => {
+    const { queryByText } = render(<StudioMobileHeader {...defaults} />);
+    expect(queryByText("Switch to light theme")).not.toBeNull();
+  });
+
+  /**
+   * As a button, not as a `menuitem` wrapping one: a button inside a menu item is
+   * two interactive roles in the same place, and the row a screen reader announces
+   * would not be the control it activates.
+   */
+  test("the theme control is a button of its own, not a menu row", () => {
+    const { queryByText } = render(<StudioMobileHeader {...defaults} />);
+    const control = queryByText("Switch to light theme")!.closest("button");
+    expect(control).not.toBeNull();
+    expect(control!.closest('[role="menuitem"]')).toBeNull();
   });
 });

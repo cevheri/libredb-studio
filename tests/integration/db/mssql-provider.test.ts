@@ -77,8 +77,12 @@ class MockConnectionPool extends EventEmitter {
  * The provider does `new mssql.ConnectionPool(config)`; recording the instance here lets a
  * test emit on the very emitter the provider attached its listener to.
  */
+/** The config the provider handed the pool, for the TLS assertions below. */
+let lastPoolConfig: { options?: { encrypt?: boolean; trustServerCertificate?: boolean } } = {};
+
 function ConnectionPoolFactory(config: unknown): MockConnectionPool {
   const pool = new MockConnectionPool(config);
+  lastPoolConfig = config as typeof lastPoolConfig;
   lastPool = pool;
   return pool;
 }
@@ -107,6 +111,17 @@ function defaultQuery(sql: string) {
 
   if (upper.includes("SELECT 1 AS TEST")) {
     return { recordset: [{ test: 1 }], rowsAffected: [1] };
+  }
+
+  // getOverview()'s connections query, which must be matched BEFORE the generic
+  // sessions-COUNT branch below: it selects COUNT(*) FROM sys.dm_exec_sessions too,
+  // so that branch used to answer it with `{ cnt: 12 }` - a column getOverview never
+  // reads. Both this fixture and its duplicate were therefore dead, and the
+  // `typeof activeConnections === "number"` assertion they were written for passed
+  // only on the fabricated 0 the provider fell back to. `sys.configurations` is
+  // unique to this statement, so the guard is exact.
+  if (upper.includes("SYS.CONFIGURATIONS") && upper.includes("USER CONNECTIONS")) {
+    return { recordset: [{ active_connections: 5, max_connections: 32767 }], rowsAffected: [1] };
   }
 
   if (upper.includes("SYS.DM_EXEC_SESSIONS") && upper.includes("COUNT")) {
@@ -377,15 +392,6 @@ function defaultQuery(sql: string) {
     };
   }
 
-  // Overview connections query (active_connections + max_connections)
-  if (upper.includes("SYS.CONFIGURATIONS") && upper.includes("USER CONNECTIONS")) {
-    return { recordset: [{ active_connections: 5, max_connections: 32767 }], rowsAffected: [1] };
-  }
-
-  if (upper.includes("SYS.CONFIGURATIONS")) {
-    return { recordset: [{ active_connections: 5, max_connections: 32767 }], rowsAffected: [1] };
-  }
-
   // Table/index counts for overview
   if (upper.includes("SYS.TABLES") && upper.includes("TABLE_COUNT") && upper.includes("INDEX_COUNT")) {
     return { recordset: [{ table_count: 5, index_count: 12 }], rowsAffected: [1] };
@@ -479,6 +485,37 @@ describe("MSSQLProvider", () => {
   // 2. Connect / Disconnect
   // =========================================================================
 
+  // =========================================================================
+  // TLS
+  // =========================================================================
+
+  describe("the TLS options handed to tedious", () => {
+    const connectWithSSL = async (mode: NonNullable<DatabaseConnection["ssl"]>["mode"]) => {
+      provider = new MSSQLProvider({ ...baseConfig, ssl: { mode } });
+      await provider.connect();
+      return lastPoolConfig.options;
+    };
+
+    test("mode disable turns encryption off", async () => {
+      expect(await connectWithSSL("disable")).toMatchObject({ encrypt: false });
+    });
+
+    test("mode require encrypts and trusts whatever certificate is presented", async () => {
+      expect(await connectWithSSL("require")).toMatchObject({ encrypt: true, trustServerCertificate: true });
+    });
+
+    // D26: SQL Server needed no code change to answer for `verify-system`. tedious has one
+    // knob, `trustServerCertificate`, and turning it off is already "validate the chain and
+    // the name against the host's trust store" - there is no separate CA channel here, so
+    // verify-system, verify-ca and verify-full all land on the same call. This pins that the
+    // widened union did not silently fall through to the trusting branch.
+    test("mode verify-system validates the certificate, like the two verify-* modes", async () => {
+      expect(await connectWithSSL("verify-system")).toMatchObject({ encrypt: true, trustServerCertificate: false });
+      expect(await connectWithSSL("verify-ca")).toMatchObject({ encrypt: true, trustServerCertificate: false });
+      expect(await connectWithSSL("verify-full")).toMatchObject({ encrypt: true, trustServerCertificate: false });
+    });
+  });
+
   describe("connect / disconnect", () => {
     test("connect creates pool and marks connected", async () => {
       await provider.connect();
@@ -566,6 +603,30 @@ describe("MSSQLProvider", () => {
   // =========================================================================
 
   describe("getCapabilities()", () => {
+    // #U9: DBCC CHECKDB takes no object, and `runMaintenance` ignores the target for
+    // it - a per-table Check control would have named one table and checked the
+    // database.
+    test("declares the target grammar of every maintenance operation", () => {
+      const caps = provider.getCapabilities();
+
+      expect(caps.maintenanceOperationSpecs).toEqual({
+        analyze: { label: "Update Statistics", perEntity: true, global: true },
+        check: { label: "Check Database", perEntity: false, global: true },
+        optimize: { label: "Rebuild Indexes", perEntity: true, global: true },
+        kill: { label: "Kill Session", perEntity: false, global: false },
+      });
+      expect(Object.keys(caps.maintenanceOperationSpecs ?? {}).sort()).toEqual([...caps.maintenanceOperations].sort());
+    });
+
+    test("the vacuum label names the index rebuild, and the surfaces send that", () => {
+      const labels = provider.getLabels();
+
+      expect(labels.vacuumAction).toBe("Rebuild Indexes");
+      expect(labels.vacuumActionOperation).toBe("optimize");
+      // A redirected slot must name an operation the provider really declares,
+      // otherwise the card it gates could only ever produce a 400.
+      expect(provider.getCapabilities().maintenanceOperations).toContain("optimize");
+    });
     test("returns correct capabilities for MSSQL", () => {
       const caps = provider.getCapabilities();
       expect(caps.defaultPort).toBe(1433);
@@ -583,7 +644,7 @@ describe("MSSQLProvider", () => {
       // `UPDATE t SET c = v WHERE pk = v` is core T-SQL DML — the shape the inline
       // row editor builds (#269).
       expect(caps.supportsInlineRowEdit).toBe(true);
-      // The mssql Transaction object over one held pool connection (#U13).
+      // The mssql Transaction object over one held pool connection (#464).
       expect(caps.supportsTransactions).toBe(true);
       // Inherited from the base capabilities: this engine declares foreign keys, so
       // an empty `foreignKeys` list is a fact about the schema or the role, never
@@ -1121,6 +1182,53 @@ describe("MSSQLProvider", () => {
       expect(health.activeSessions).toBeArray();
     });
 
+    test("a denied session DMV leaves activeConnections absent, never a measured 0", async () => {
+      // `sys.dm_exec_sessions` needs VIEW SERVER STATE - the sibling of the grant whose
+      // refusal WAS measured here, 2026-08-23 on SQL Server 2022 CU26 against a login
+      // with nothing beyond CONNECT (`Msg 300 ... VIEW SERVER PERFORMANCE STATE
+      // permission was denied on object 'server', database 'master'`, the
+      // getPerformanceMetrics test below). The Msg 300 shape is the same; only the
+      // permission named differs, so this fixture reproduces the shape, not a quote.
+      // The block was guarded, but `let activeConnections = 0` then published the
+      // denial as a server with no connections open - and `HealthInfo` is the shape
+      // the agent's curated health reading forwards to the model, so that zero was a
+      // measurement the model could cite about a figure SQL Server never gave.
+      mockQueryFn = async (sql: string) => {
+        const upper = sql.toUpperCase();
+        if (upper.includes("SYS.DM_EXEC_SESSIONS") && upper.includes("COUNT")) {
+          throw new Error("VIEW SERVER STATE permission was denied on object 'server', database 'master'");
+        }
+        return defaultQuery(sql);
+      };
+
+      await provider.connect();
+      const health = await provider.getHealth();
+
+      expect("activeConnections" in health).toBe(false);
+      // Only the denied block goes absent; the rest of the reading is unaffected.
+      expect(health.cacheHitRatio).toBe("99.5%");
+      expect(health.activeSessions).toBeArray();
+    });
+
+    test("a server with no user sessions keeps its measured zero connections", async () => {
+      // The anti-vacuity twin of the test above. Absence must never be spelled with a
+      // falsy test (`activeConnections || undefined`): an idle instance measures 0 and
+      // that 0 is a reading, not a refusal.
+      mockQueryFn = async (sql: string) => {
+        const upper = sql.toUpperCase();
+        if (upper.includes("SYS.DM_EXEC_SESSIONS") && upper.includes("COUNT")) {
+          return { recordset: [{ cnt: 0 }], rowsAffected: [1] };
+        }
+        return defaultQuery(sql);
+      };
+
+      await provider.connect();
+      const health = await provider.getHealth();
+
+      expect("activeConnections" in health).toBe(true);
+      expect(health.activeConnections).toBe(0);
+    });
+
     test("reports an unreadable cache hit ratio as unavailable, not as 0%", async () => {
       // `${recordset[0]?.hit_ratio || 0}%` published "0%" for a NULL, and the
       // Overview card rates 0 as "Needs tuning" - a fault SQL Server never
@@ -1344,12 +1452,75 @@ describe("MSSQLProvider", () => {
       expect(overview.version).toContain("Microsoft SQL Server");
       expect(typeof overview.uptime).toBe("string");
       expect(overview.uptime.length).toBeGreaterThan(0);
-      expect(typeof overview.activeConnections).toBe("number");
+      expect(overview.activeConnections).toBe(5);
       expect(typeof overview.maxConnections).toBe("number");
       expect(typeof overview.databaseSize).toBe("string");
       expect(typeof overview.databaseSizeBytes).toBe("number");
       expect(typeof overview.tableCount).toBe("number");
       expect(typeof overview.indexCount).toBe("number");
+    });
+
+    test("a refused connections read leaves overview activeConnections absent, never a measured 0", async () => {
+      // The getHealth() twin of this test has guarded the same figure since D17; the
+      // identical defect survived here because `let activeConnections = 0` swallowed
+      // this block's failure into a reading. Unlike that twin, the statement here
+      // names two objects, and the fixture below refuses exactly one of them: the
+      // `sys.configurations` ceiling subquery, which Microsoft documents as needing
+      // only membership in `public` on SQL Server 2019 and earlier but
+      // VIEW SERVER PERFORMANCE STATE on the server on 2022 and later (Permissions
+      // section of sys.configurations, read 2026-08-27). So this reproduces the
+      // 2022-and-later shape - one refused statement, one catch, count absent - and
+      // speaks for those versions only. It says nothing about a login-wide loss: on
+      // 2019 and earlier that arm needs no grant, and `sys.dm_exec_sessions` is
+      // documented as row-filtered rather than refused ("Everyone can see their own
+      // session information"), so an ungranted login there may instead SUCCEED with a
+      // COUNT of its own session. That under-reading is neither measured nor caught -
+      // see docs/providers/mssql.md section 7.2. The Msg 300 wording below is the
+      // refusal measured 2026-08-23 on SQL Server 2022 CU26 against a login holding
+      // nothing beyond CONNECT; nothing asserts on it, only that it throws.
+      mockQueryFn = async (sql: string) => {
+        const upper = sql.toUpperCase();
+        if (upper.includes("SYS.CONFIGURATIONS") && upper.includes("USER CONNECTIONS")) {
+          throw new Error("VIEW SERVER PERFORMANCE STATE permission was denied on object 'server', database 'master'");
+        }
+        return defaultQuery(sql);
+      };
+
+      await provider.connect();
+      const overview = await provider.getOverview();
+
+      // Absent, so OverviewTab.tsx's Connections card renders "N/A" over "not
+      // published" instead of a confident 0 with a "0% used" progress bar, and the
+      // sample is dropped from the connection trend rather than plotted as a floor.
+      expect("activeConnections" in overview).toBe(false);
+      // maxConnections is a required number where 0 and absence are the SAME fact -
+      // "no limit published" - so the refusal correctly leaves it 0. Pinned so the
+      // absence above is not widened into this field by a later change.
+      expect(overview.maxConnections).toBe(0);
+      // Only the denied block goes absent; every other reading survives.
+      expect(overview.version).toContain("Microsoft SQL Server");
+      expect(overview.tableCount).toBe(5);
+    });
+
+    test("a server with no user sessions keeps its measured zero overview connections", async () => {
+      // The anti-vacuity twin of the test above: absence must never be spelled with a
+      // falsy test. An idle instance answers COUNT(*) = 0 and that 0 is a reading, so
+      // the `Number(... || 0)` this replaces was destroying the very figure it
+      // published - it could not tell an idle server from a denied DMV.
+      mockQueryFn = async (sql: string) => {
+        const upper = sql.toUpperCase();
+        if (upper.includes("SYS.CONFIGURATIONS") && upper.includes("USER CONNECTIONS")) {
+          return { recordset: [{ active_connections: 0, max_connections: 32767 }], rowsAffected: [1] };
+        }
+        return defaultQuery(sql);
+      };
+
+      await provider.connect();
+      const overview = await provider.getOverview();
+
+      expect("activeConnections" in overview).toBe(true);
+      expect(overview.activeConnections).toBe(0);
+      expect(overview.maxConnections).toBe(32767);
     });
 
     test("Azure SQL detection from hostname", () => {

@@ -17,6 +17,9 @@ import * as realAuth from "@/lib/auth";
 import * as realSeed from "@/lib/seed/resolve-connection";
 import * as realGate from "@/lib/agent/capability-gate";
 import { AgentRunStoreError } from "@/lib/agent/run-store";
+import { agentPosture } from "@/lib/agent/posture";
+import { AGENT_WORKFLOW_SENDS_STATEMENTS, type AgentRunWorkflowType } from "@/lib/agent/types";
+import { getDBConfig } from "@/lib/db-ui-config";
 
 const { SeedConnectionError } = realSeed;
 
@@ -51,8 +54,10 @@ interface FakeRun {
   status: string;
   actor: { sessionId: string; role: string };
   connectionId: string;
+  connectionIdentity?: string;
   objective: string;
   events: unknown[];
+  thread: { threadId: string; steps: { runId: string; objective: string }[]; text: string; declined?: string };
 }
 
 function fakeRun(overrides: Partial<FakeRun> = {}): FakeRun {
@@ -76,6 +81,10 @@ function fakeRun(overrides: Partial<FakeRun> = {}): FakeRun {
     connectionId: "seed:sales",
     objective: "why is checkout slow",
     events: [],
+    // What the FOLD gives every run, so a fixture cannot be a shape the store
+    // never produces: a run whose thread was not recorded is a thread of one
+    // named after itself.
+    thread: { threadId: overrides.runId ?? "arun_1", steps: [], text: "" },
     ...overrides,
   };
 }
@@ -91,7 +100,9 @@ const mockStart = mock(
     autoExecute?: boolean;
     actor: FakeRun["actor"];
     connectionId: string;
+    connectionIdentity?: string;
     objective: string;
+    thread?: { threadId: string; steps: { runId: string; objective: string }[]; text: string; declined?: string };
   }) => {
     const record = fakeRun({ ...input, runId: "arun_new" });
     runs.set(record.runId, record);
@@ -189,8 +200,281 @@ afterEach(() => {
 
 describe("POST /api/agent/runs", () => {
   /*
+    A run may CONTINUE a conversation, and the context is derived SERVER-SIDE from the
+    predecessor's own ledger. The request only names the run; the route resolves it,
+    checks it is the caller's, on this connection and ended, and persists what it
+    derived on the new run's record.
+  */
+  test("a run that continues a conversation carries its steps and the derived text", async () => {
+    runs.set(
+      "arun_1",
+      fakeRun({
+        status: "succeeded",
+        events: [
+          {
+            kind: "report-composed",
+            atMs: 1,
+            claims: [{ claim: "A fact", evidence: [{ source: "artifact", correlationId: "corr_1" }] }],
+          },
+        ],
+      }),
+    );
+
+    const res = await POST(startRequest({ ...VALID_BODY, previousRunId: "arun_1" }));
+
+    expect(res.status).toBe(202);
+    expect(mockStart.mock.calls.at(-1)?.[0]).toMatchObject({
+      thread: { threadId: "arun_1", steps: [{ runId: "arun_1", objective: "why is checkout slow" }] },
+    });
+    expect(mockStart.mock.calls.at(-1)?.[0].thread?.text).toContain("Claim 1: A fact");
+  });
+
+  /*
+    B68. A conversation was single-connection by INDUCTION: every link checked the
+    connection ID at its own open, which is an identity check on the RECORD. Editing a
+    saved connection to address another server keeps that id, so the follow-up below
+    used to be handed the earlier step's claims about the OLD database while reading the
+    NEW one — nothing refused, nothing wrong to look at, and a report about one database
+    resting on another. What the route writes now is which DATABASE the run read, and
+    what it checks is that.
+  */
+  test("a follow-up on a re-pointed connection declines rather than carrying the conversation", async () => {
+    const original = mockResolveConnection.getMockImplementation();
+    try {
+      // Run one, against the database the connection addressed then. Its identity is
+      // taken from what the route itself wrote, not restated here.
+      await POST(startRequest(VALID_BODY));
+      const establishedIdentity = mockStart.mock.calls.at(-1)?.[0].connectionIdentity;
+      expect(establishedIdentity).toEqual(expect.any(String));
+      runs.set(
+        "arun_1",
+        fakeRun({
+          status: "succeeded",
+          connectionIdentity: establishedIdentity,
+          events: [
+            {
+              kind: "report-composed",
+              atMs: 1,
+              claims: [{ claim: "A fact", evidence: [{ source: "artifact", correlationId: "corr_1" }] }],
+            },
+          ],
+        }),
+      );
+
+      // The user edits the connection to address staging. Same record, same id.
+      mockResolveConnection.mockImplementation(async (body: { connectionId?: string }) => ({
+        id: body.connectionId ?? "seed:sales",
+        name: "Sales",
+        type: "postgres",
+        database: "staging",
+      }));
+
+      const res = await POST(startRequest({ ...VALID_BODY, previousRunId: "arun_1" }));
+
+      expect(res.status).toBe(202);
+      const thread = mockStart.mock.calls.at(-1)?.[0].thread;
+      // Since #512 the re-pointed carry has its own code, because it is the only decline
+      // that is not a failure - every check above passed and the carry was refused on
+      // purpose, while the five under `unavailable` are the caller's own bug, transient,
+      // or another session's. How long it lasts is the next test's subject, not this one's.
+      expect(thread).toMatchObject({ steps: [], text: "", declined: "repointed" });
+      // Nothing of the earlier step survives: not its objective, and not its claim.
+      expect(thread?.steps).toEqual([]);
+      expect(thread?.text).toBe("");
+      // And the new run records the database it is actually reading, so the conversation
+      // it starts is checkable in its turn.
+      expect(mockStart.mock.calls.at(-1)?.[0].connectionIdentity).not.toBe(establishedIdentity);
+    } finally {
+      // Restored by hand: `mock.module` is re-applied per test with the SAME mock
+      // object, so an implementation left here would outlive this test.
+      if (original !== undefined) mockResolveConnection.mockImplementation(original);
+    }
+  });
+
+  /*
+    The SCOPE of the decline (#512), which is what the rail's sentence had wrong: it read
+    as a persisting condition, and the route makes it a one-question event. The run
+    opened by the declined question records the connection as it points NOW
+    (`connectionIdentity: connectionIdentityOfRun` in the `start` call below the check),
+    and an ordinary follow-up continues THAT run (`AgentRail.tsx`, `continueTarget`), so
+    the identity matches and the conversation carries. Three questions across one
+    re-point is the smallest shape that shows it.
+  */
+  test("the decline lasts one question: the follow-up after it carries on the re-pointed connection", async () => {
+    const original = mockResolveConnection.getMockImplementation();
+    try {
+      // Q1, against the database the connection addressed then.
+      await POST(startRequest(VALID_BODY));
+      const establishedIdentity = mockStart.mock.calls.at(-1)?.[0].connectionIdentity;
+      runs.set("arun_1", fakeRun({ status: "succeeded", connectionIdentity: establishedIdentity }));
+
+      // The user edits the connection to address staging. Same record, same id.
+      mockResolveConnection.mockImplementation(async (body: { connectionId?: string }) => ({
+        id: body.connectionId ?? "seed:sales",
+        name: "Sales",
+        type: "postgres",
+        database: "staging",
+      }));
+
+      // Q2 names Q1's run and is declined - the arm the test above pins.
+      await POST(startRequest({ ...VALID_BODY, previousRunId: "arun_1" }));
+      const declinedStart = mockStart.mock.calls.at(-1)?.[0];
+      expect(declinedStart?.thread).toMatchObject({ declined: "repointed" });
+      const repointedIdentity = declinedStart?.connectionIdentity;
+      // Non-vacuous: the second run really is on a different database from the first,
+      // so what follows is about the decline's scope and not about nothing having moved.
+      expect(repointedIdentity).not.toBe(establishedIdentity);
+
+      // Q2's run ends. It is the one the rail names next, and it carries the identity
+      // the route just wrote - staging, not the production Q1 read.
+      runs.set(
+        "arun_new",
+        fakeRun({
+          runId: "arun_new",
+          status: "succeeded",
+          connectionIdentity: repointedIdentity,
+          objective: "why is checkout slow",
+        }),
+      );
+
+      // Q3, on the connection still pointed at staging.
+      await POST(startRequest({ ...VALID_BODY, previousRunId: "arun_new" }));
+      const carried = mockStart.mock.calls.at(-1)?.[0].thread;
+
+      expect(carried?.declined).toBeUndefined();
+      expect(carried?.steps).toEqual([{ runId: "arun_new", objective: "why is checkout slow" }]);
+    } finally {
+      if (original !== undefined) mockResolveConnection.mockImplementation(original);
+    }
+  });
+
+  test("an unchanged connection still carries the conversation, so the check above ends no ordinary follow-up", async () => {
+    await POST(startRequest(VALID_BODY));
+    const establishedIdentity = mockStart.mock.calls.at(-1)?.[0].connectionIdentity;
+    runs.set("arun_1", fakeRun({ status: "succeeded", connectionIdentity: establishedIdentity }));
+
+    const res = await POST(startRequest({ ...VALID_BODY, previousRunId: "arun_1" }));
+
+    expect(res.status).toBe(202);
+    expect(mockStart.mock.calls.at(-1)?.[0].thread).toMatchObject({
+      threadId: "arun_1",
+      steps: [{ runId: "arun_1", objective: "why is checkout slow" }],
+    });
+  });
+
+  test("a run that starts its own conversation writes no thread, so its ledger is the bytes it always was", async () => {
+    const res = await POST(startRequest(VALID_BODY));
+
+    expect(res.status).toBe(202);
+    expect(mockStart.mock.calls.at(-1)?.[0].thread).toBeUndefined();
+  });
+
+  /*
+    Every RUNTIME condition below degrades rather than refusing, and that is the rule
+    this block exists to pin: `previousRunId` is attached by the rail on its own — the
+    user never typed it — so a conversation that cannot be reached must not take down
+    the question they DID type. The run opens, carries no conversation, and says so.
+
+    Nothing is leaked that refusing did not leak: the same reasons collapsed into one
+    refusal before and collapse into one `declined` now.
+  */
+  test.each([
+    ["naming no run", () => "arun_missing"],
+    [
+      "naming another session's run",
+      () => {
+        runs.set("arun_other", fakeRun({ actor: { sessionId: "grace", role: "user" }, status: "succeeded" }));
+        return "arun_other";
+      },
+    ],
+    [
+      "naming a run on another connection",
+      () => {
+        runs.set("arun_elsewhere", fakeRun({ connectionId: "seed:analytics", status: "succeeded" }));
+        return "arun_elsewhere";
+      },
+    ],
+    [
+      "naming a run that has not ended",
+      () => {
+        runs.set("arun_running", fakeRun({ status: "running" }));
+        return "arun_running";
+      },
+    ],
+  ])(
+    "a previousRunId %s opens the run anyway and records that the conversation was not reached",
+    async (_case, arrange) => {
+      const previousRunId = arrange();
+
+      const res = await POST(startRequest({ ...VALID_BODY, previousRunId }));
+
+      expect(res.status).toBe(202);
+      expect(mockStart.mock.calls.at(-1)?.[0].thread).toMatchObject({ steps: [], text: "", declined: "unavailable" });
+      // No thread id is written: a refused continuation starts a conversation of its
+      // OWN, and the fold names it after the run being opened. Naming it after the run
+      // it was refused would hand a follow-up of THIS run a root that was never in the
+      // conversation, and the derivation would carry that root forward.
+      expect(mockStart.mock.calls.at(-1)?.[0].thread?.threadId).toBeUndefined();
+    },
+  );
+
+  test("a previousRunId that is not a non-empty string is still refused: that is a client bug", async () => {
+    const res = await POST(startRequest({ ...VALID_BODY, previousRunId: "" }));
+
+    expect(res.status).toBe(400);
+  });
+
+  test("a previousRunId the ledger cannot name opens the run anyway", async () => {
+    // The store refuses an id outside AGENT_RUN_ID_PATTERN before touching anything.
+    // It joins the same `unavailable`, because a caller guessing ids must not be able
+    // to tell "malformed" apart from "not yours" — and it does not stop the run.
+    mockStatus.mockImplementationOnce(async () => {
+      throw new AgentRunStoreError("INVALID_RUN_ID", 'agent run id "arun-1" is not usable as a ledger name');
+    });
+
+    const res = await POST(startRequest({ ...VALID_BODY, previousRunId: "arun-1" }));
+
+    expect(res.status).toBe(202);
+    expect(mockStart.mock.calls.at(-1)?.[0].thread).toMatchObject({ declined: "unavailable" });
+  });
+
+  test("an unreadable ledger is recorded as an error rather than as a refusal, and still opens the run", async () => {
+    // Not something the caller can fix by naming another run, and it says nothing about
+    // the id they sent — so it is recorded apart. Recorded rather than logged, because a
+    // fail-open decision has to carry its reason as data.
+    mockStatus.mockImplementationOnce(async () => {
+      throw new Error("ledger unavailable");
+    });
+
+    const res = await POST(startRequest({ ...VALID_BODY, previousRunId: "arun_1" }));
+
+    expect(res.status).toBe(202);
+    expect(mockStart.mock.calls.at(-1)?.[0].thread).toMatchObject({ declined: "error" });
+  });
+
+  test("with the operator switch off, previousRunId is ignored and the run says so", async () => {
+    const before = mockStatus.mock.calls.length;
+    process.env.LIBREDB_AGENT_THREAD_CONTEXT = "false";
+    runs.set("arun_1", fakeRun({ status: "succeeded" }));
+
+    try {
+      const res = await POST(startRequest({ ...VALID_BODY, previousRunId: "arun_1" }));
+
+      expect(res.status).toBe(202);
+      expect(mockStart.mock.calls.at(-1)?.[0].thread).toMatchObject({ steps: [], text: "", declined: "disabled" });
+      // Measured as a DELTA rather than as "never called": these mocks accumulate
+      // across the file, so `not.toHaveBeenCalled()` would be a claim about the
+      // whole suite. Nothing was looked up here — the switch decides before the
+      // ledger is touched.
+      expect(mockStatus.mock.calls.length).toBe(before);
+    } finally {
+      delete process.env.LIBREDB_AGENT_THREAD_CONTEXT;
+    }
+  });
+
+  /*
     A model that cannot call tools is refused BEFORE a run exists, which is the whole
-    point of the gate (`docs/BACKLOG.md` B18): otherwise the run opens, spends a drive
+    point of the gate (#340): otherwise the run opens, spends a drive
     and ends having answered in prose, and the user is left reading a failed run to
     learn something the server could have said at the start. 422 because the request is
     well-formed — it is the configuration that cannot honour it — and no ledger is
@@ -249,6 +533,113 @@ describe("POST /api/agent/runs", () => {
     expect(body.disproved).toEqual(["streaming"]);
   });
 
+  /*
+    An engine that has no read-only statement path is refused when the run is OPENED,
+    not after a model turn (#512).
+
+    Driven live on 2026-08-15 before this landed: a run on the bundled `libredb` sample
+    opened, captured a schema, drafted a statement, called `run_read_query` and ended
+    `failed` with `engine-unsupported`. Nothing about the objective could have changed
+    that outcome - `queryReadOnly` is a property of the provider - so the whole spend
+    bought a sentence the server could have said first.
+
+    What the tests below pin is the pair, because either half alone is wrong: the
+    statement-sending workflows are refused, and `operations` still opens on the SAME
+    connection. A blanket refusal would withhold a workflow over a claim that is not
+    true of it (#411), which is exactly why the rail's amber card does not gate Start.
+  */
+  const UNSUPPORTED_ENGINE = { id: "seed:sample", name: "LibreDB Sample", type: "libredb" };
+
+  /** The sentence the rail's own pre-start card shows, read from the same module. */
+  const unsupportedSentence = agentPosture({
+    mode: "agent",
+    engine: "libredb",
+    engineLabel: getDBConfig("libredb").label,
+    handover: false,
+  }).body;
+
+  test("a statement-sending workflow is refused on an engine with no read-only statement path", async () => {
+    mockResolveConnection.mockResolvedValueOnce(UNSUPPORTED_ENGINE);
+
+    const res = await POST(startRequest(VALID_BODY));
+    const body = await parseResponseJSON<{ error: string; refused?: string }>(res);
+
+    expect(res.status).toBe(400);
+    // The rail's sentence, not a third phrasing of the same fact.
+    expect(body.error).toBe(unsupportedSentence);
+    // And a marker beside it, because the sentence is not the protocol: the rail is
+    // already showing this paragraph in a standing card and has to be able to tell THIS
+    // refusal from the route's other `400`s in order to say something else (#513). The
+    // string is `AgentRunFailureReason`'s own `engine-unsupported`, so no new wire
+    // vocabulary enters here.
+    expect(body.refused).toBe("engine-unsupported");
+    // No run id and no drive: the point of the entry is that neither is spent.
+    expect(mockStart).not.toHaveBeenCalled();
+    expect(mockDriveAgentRun).not.toHaveBeenCalled();
+    // And no model turn either - not even the capability probe, which is a model call
+    // of its own. The engine fact needs no model to establish, so it is answered first.
+    expect(mockAdmitAgentModel).not.toHaveBeenCalled();
+  });
+
+  test("every workflow is refused there exactly when AGENT_WORKFLOW_SENDS_STATEMENTS says it sends one", async () => {
+    // The route reads the record rather than a list of its own, so this loop is what
+    // keeps the two from drifting: a workflow that gained a statement tool without the
+    // flag would open here and end `engine-unsupported`, and one that gained the flag
+    // without the tools would be withheld from an engine it runs on.
+    for (const workflowType of ["investigation", "query-optimization", "database-assessment", "data-analysis"]) {
+      mockResolveConnection.mockResolvedValueOnce(UNSUPPORTED_ENGINE);
+      const res = await POST(startRequest({ ...VALID_BODY, workflowType }));
+      expect(res.status, workflowType).toBe(400);
+      expect((await parseResponseJSON<{ refused?: string }>(res)).refused, workflowType).toBe("engine-unsupported");
+      expect(AGENT_WORKFLOW_SENDS_STATEMENTS[workflowType as AgentRunWorkflowType], workflowType).toBe(true);
+    }
+    expect(mockStart).not.toHaveBeenCalled();
+  });
+
+  test("the operations workflow still opens on the same connection", async () => {
+    // It sends no statement at all: its reads are the curated provider methods every
+    // engine implements, under a profile whose gate does not ask for `queryReadOnly`.
+    mockResolveConnection.mockResolvedValueOnce(UNSUPPORTED_ENGINE);
+
+    const res = await POST(startRequest({ ...VALID_BODY, workflowType: "operations" }));
+
+    expect(res.status).toBe(202);
+    expect(AGENT_WORKFLOW_SENDS_STATEMENTS.operations).toBe(false);
+    expect(mockStart).toHaveBeenCalledTimes(1);
+    expect(mockDriveAgentRun).toHaveBeenCalledTimes(1);
+  });
+
+  test("only this refusal carries the marker, so a client cannot read it off the status", async () => {
+    // `400` is the status of every other cross-field refusal this route makes, and a
+    // client discriminating on the status alone would relabel one of those as the
+    // engine's - which is that defect running in the other direction (#513): an operator
+    // told "the notice above says why" about a connection that no longer resolves.
+    // So the marker is asserted ABSENT on a neighbouring 400 as well as present above.
+    const other = await POST(startRequest({ ...VALID_BODY, previousRunId: "" }));
+
+    expect(other.status).toBe(400);
+    expect((await parseResponseJSON<{ refused?: string }>(other)).refused).toBeUndefined();
+  });
+
+  test("plan mode still opens there, because it executes nothing it drafts", async () => {
+    mockResolveConnection.mockResolvedValueOnce(UNSUPPORTED_ENGINE);
+
+    const res = await POST(startRequest({ ...VALID_BODY, mode: "planning" }));
+
+    expect(res.status).toBe(202);
+    expect(mockStart).toHaveBeenCalledTimes(1);
+  });
+
+  test("an engine that HAS a read-only statement path opens every workflow", async () => {
+    // The negative control: without it the refusal above could be refusing everything.
+    for (const workflowType of ["investigation", "operations", "data-analysis"]) {
+      mockStart.mockClear();
+      const res = await POST(startRequest({ ...VALID_BODY, workflowType }));
+      expect(res.status, workflowType).toBe(202);
+      expect(mockStart, workflowType).toHaveBeenCalledTimes(1);
+    }
+  });
+
   test("opens a run for the session's own actor and reports it queued", async () => {
     const res = await POST(startRequest(VALID_BODY));
     const body = await parseResponseJSON<{
@@ -259,6 +650,7 @@ describe("POST /api/agent/runs", () => {
       workflowSource: string;
       workflowReading: string;
       autoExecute: boolean;
+      thread: { threadId: string; steps: unknown[]; text: string };
     }>(res);
 
     expect(res.status).toBe(202);
@@ -270,6 +662,9 @@ describe("POST /api/agent/runs", () => {
       workflowSource: "chosen",
       workflowReading: "unrecorded",
       autoExecute: false,
+      // Echoed from the RECORD, so a run that started its own conversation reports
+      // the thread of one the fold gave it rather than nothing at all.
+      thread: { threadId: "arun_new", steps: [], text: "" },
     });
     // No `workflowType` reaches the service when the body named none: the store's
     // own default is the single place that answer is decided.
@@ -277,6 +672,9 @@ describe("POST /api/agent/runs", () => {
       mode: "agent",
       actor: { sessionId: "ada", role: "user" },
       connectionId: "seed:sales",
+      // The database behind that record, fingerprinted by the route (B68). Asserted as a
+      // presence here and by value in the re-pointing test below.
+      connectionIdentity: expect.any(String),
       objective: "why is checkout slow",
     });
   });
@@ -292,6 +690,9 @@ describe("POST /api/agent/runs", () => {
       workflowType: "query-optimization",
       actor: { sessionId: "ada", role: "user" },
       connectionId: "seed:sales",
+      // The database behind that record, fingerprinted by the route (B68). Asserted as a
+      // presence here and by value in the re-pointing test below.
+      connectionIdentity: expect.any(String),
       objective: "why is checkout slow",
     });
   });
@@ -321,6 +722,9 @@ describe("POST /api/agent/runs", () => {
       autoExecute: true,
       actor: { sessionId: "ada", role: "user" },
       connectionId: "seed:sales",
+      // The database behind that record, fingerprinted by the route (B68). Asserted as a
+      // presence here and by value in the re-pointing test below.
+      connectionIdentity: expect.any(String),
       objective: "why is checkout slow",
     });
   });
@@ -370,6 +774,9 @@ describe("POST /api/agent/runs", () => {
       mode: "agent",
       actor: { sessionId: "ada", role: "user" },
       connectionId: "seed:sales",
+      // The database behind that record, fingerprinted by the route (B68). Asserted as a
+      // presence here and by value in the re-pointing test below.
+      connectionIdentity: expect.any(String),
       objective: "why is checkout slow",
     });
   });
@@ -412,6 +819,9 @@ describe("POST /api/agent/runs", () => {
       mode: "agent",
       actor: { sessionId: "ada", role: "user" },
       connectionId: "seed:sales",
+      // The database behind that record, fingerprinted by the route (B68). Asserted as a
+      // presence here and by value in the re-pointing test below.
+      connectionIdentity: expect.any(String),
       objective: "why is checkout slow",
     });
   });
@@ -427,6 +837,9 @@ describe("POST /api/agent/runs", () => {
       workflowSource: "inferred",
       actor: { sessionId: "ada", role: "user" },
       connectionId: "seed:sales",
+      // The database behind that record, fingerprinted by the route (B68). Asserted as a
+      // presence here and by value in the re-pointing test below.
+      connectionIdentity: expect.any(String),
       objective: "why is checkout slow",
     });
   });
@@ -463,6 +876,9 @@ describe("POST /api/agent/runs", () => {
       mode: "agent",
       actor: { sessionId: "ada", role: "user" },
       connectionId: "seed:sales",
+      // The database behind that record, fingerprinted by the route (B68). Asserted as a
+      // presence here and by value in the re-pointing test below.
+      connectionIdentity: expect.any(String),
       objective: "why is checkout slow",
     });
   });
@@ -483,6 +899,9 @@ describe("POST /api/agent/runs", () => {
       workflowReading: "unclassified",
       actor: { sessionId: "ada", role: "user" },
       connectionId: "seed:sales",
+      // The database behind that record, fingerprinted by the route (B68). Asserted as a
+      // presence here and by value in the re-pointing test below.
+      connectionIdentity: expect.any(String),
       objective: "why is checkout slow",
     });
   });

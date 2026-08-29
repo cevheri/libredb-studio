@@ -151,20 +151,23 @@ id, so no reader can grow a dialect test of its own.
 | Character | Established reading | Dialects |
 |-----------|--------------------|----------|
 | `#` | opens a line comment | MySQL, MariaDB, ClickHouse (which also has `#!`), OpenSearch |
-| `#` | ordinary code — a jsonb/geometric operator, an identifier character, a temp-table name, a bind-variable prefix, or a character the parser simply refuses | PostgreSQL, Oracle, SQL Server, SQLite, Elasticsearch, Trino |
+| `#` | ordinary code — a jsonb/geometric operator, an identifier character, a temp-table name, a bind-variable prefix, or a character the parser simply refuses | PostgreSQL, Oracle, SQL Server, SQLite, libSQL, DuckDB, Elasticsearch, Trino |
 | `q'…'` | a string literal (alternate quoting): the delimiter after the tag opens the body and its partner followed by `'` closes it, so the body carries apostrophes unescaped — `[ ] { } ( ) < >` pair up, any other character closes with itself, either letter case of the tag, and `nq'…'` is the same form for the national character set | Oracle only |
 | `q'…'` | not a form at all — a name followed by an ordinary string, which is what those characters are there | everything else, including the default |
-| `[…]` | a quoted **name**: everything between the brackets is the identifier (`SELECT [a--b] FROM t` selects a column called `a--b`) and the run does not nest. The doubled `]` this reading honours is SQL Server's escape — SQLite stops at the first `]` and has none, so `[a]]b]` reads as one name where SQLite reads `[a]` and then junk, which it rejects either way | SQL Server, SQLite, OpenSearch |
-| `[…]` | an **array literal or subscript**: it nests (`[[1,2],[3,4]]`), nothing inside it is escaped, and a literal inside it is a literal (`m['a]b']`) | ClickHouse, PostgreSQL, Trino |
-| `/* … /* … */ … */` | one **nesting** comment: a `/*` inside a comment opens another and the run continues until the depth returns to zero, so a region that already contains comments can be commented out. A run short of a closer is undeterminable rather than closed early | PostgreSQL, SQL Server, ClickHouse |
-| `/* … /* … */ … */` | a **flat** comment: the first `*/` ends it, and everything after that is the statement's own code | MySQL, MariaDB, SQLite, Oracle, and the default |
+| `[…]` | a quoted **name**: everything between the brackets is the identifier (`SELECT [a--b] FROM t` selects a column called `a--b`) and the run does not nest. The doubled `]` this reading honours is SQL Server's escape — SQLite stops at the first `]` and has none, so `[a]]b]` reads as one name where SQLite reads `[a]` and then junk, which it rejects either way | SQL Server, SQLite, libSQL, OpenSearch |
+| `[…]` | an **array literal or subscript**: it nests (`[[1,2],[3,4]]`), nothing inside it is escaped, and a literal inside it is a literal (`m['a]b']`) | ClickHouse, PostgreSQL, DuckDB, Trino |
+| `/* … /* … */ … */` | one **nesting** comment: a `/*` inside a comment opens another and the run continues until the depth returns to zero, so a region that already contains comments can be commented out. A run short of a closer is undeterminable rather than closed early | PostgreSQL, SQL Server, ClickHouse, DuckDB |
+| `/* … /* … */ … */` | a **flat** comment: the first `*/` ends it, and everything after that is the statement's own code | MySQL, MariaDB, SQLite, libSQL, Oracle, and the default |
+| `//` | opens a **line comment**, ending at the newline like `--` | Apache Cassandra (and its relatives), ClickHouse |
+| `//` | **ordinary code** — an operator the parser refuses (`operator does not exist: integer // integer` on PostgreSQL 18), or a character it rejects outright | everything else, including the default |
 
 Each row was established from an authoritative source: the engine's own documentation, or its
 driver's own tokenizer under `node_modules` (node-oracledb accepts `#` inside an identifier; the
 SQLite amalgamation classifies `#` as a bind-variable prefix and `[` as a "`[...]` style quoted id").
 For the engines that ARE an HTTP endpoint — Elasticsearch, OpenSearch and Trino — the grammar was
 asked directly instead: each fact is a statement the live server answered, not an inference. Trino's
-four were probed on 2026-08-20 against 476, and two of them are the opposite of what a neighbouring
+first four were probed on 2026-08-20 against 476 (its fifth, `//`, on 2026-08-25), and two of them are
+the opposite of what a neighbouring
 dialect would have suggested: `SELECT 1 AS a # trailing` is `line 1:15: mismatched input '#'`, so `#`
 hides nothing and is `code`; and `SELECT [customer] FROM tpch.sf1.nation` fails with "Column
 'customer' cannot be resolved" while `SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]][1][2]` answers `2`, so the
@@ -173,18 +176,30 @@ A rule that could **not** be established is not guessed from a neighbouring dial
 at the compatibility default below, and it is listed here rather than left implicit. The default is per
 **fact**, not per dialect: a dialect whose `#` rule is known can still be undecided about its brackets.
 
-The three non-SQL types, **MongoDB, Redis and LibreDB, have no SQL grammar at all** and are left out of the rows
-below: their providers never reach these readers on the query path, and the confirmation gate — which
-reads whatever is in the editor — asks `readsSqlText()` before applying any span-based rule to their
-text, so a JSON document or a Redis command is not judged by a SQL reader that cannot parse it. The
-gate's keyword tests still run on that text.
+**MongoDB and Redis are the two types whose query text is not SQL at all** — `NON_SQL_DIALECTS` in
+`src/lib/sql/grammar.ts` holds exactly those two, which is what `readsSqlText()` reports on. Their
+providers never reach these readers on the query path, and the confirmation gate — which reads whatever
+is in the editor — asks `readsSqlText()` before applying any span-based rule to their text, so a JSON
+document or a Redis command is not judged by a SQL reader that cannot parse it.
+
+Nor is the gate's SQL keyword reading applied to it. Those two types have a vocabulary of their own in
+`src/lib/db/destructive-commands.ts`: one table per type of the destructive operations the provider can
+actually dispatch (`deleteOne`/`deleteMany`/`updateOne`/`updateMany` and the `$out`/`$merge` pipeline
+stages for MongoDB; `DEL`, `FLUSHALL`, `SET`, `CONFIG SET` and the rest for Redis), and the gate reduces
+the buffer the way the provider would — one JSON document, or Redis's first blank-line-delimited block —
+before looking a name up in it. Text it cannot read as a command at all is not treated as safe: mongosh
+syntax, a half-typed document or a broken JSON command body **asks**. Before that table existed the
+answer for both types was a bare `false`, so a `FLUSHALL` and a `deleteMany` ran with no confirmation
+while a `DELETE FROM` on every SQL engine asked. The embedded LibreDB is not in that set — its text is
+read as SQL, and its undecided grammar facts are rows in the table below.
 
 | Fact | Undecided, so left at the default | Established, and it happens to equal the default |
 |------|-----------------------------------|--------------------------------------------------|
 | `#` | Couchbase, Druid, the embedded LibreDB provider | — |
 | `q'…'` | nobody | everything except Oracle: the form is Oracle's alone, so "not a literal" is the correct reading for the rest |
-| `[…]` | MySQL, Oracle, Elasticsearch, Couchbase, Druid, LibreDB | SQL Server, SQLite and OpenSearch, whose rule the default already applied |
-| `/* … */` nesting | Couchbase, Druid, LibreDB | MySQL, SQLite, Oracle, Elasticsearch, OpenSearch and Trino, whose flat rule the default already applied — each established from its own source rather than assumed to agree |
+| `[…]` | MySQL, Oracle, Elasticsearch, Couchbase, Druid, LibreDB | SQL Server, SQLite, libSQL and OpenSearch, whose rule the default already applied |
+| `/* … */` nesting | Couchbase, Druid, LibreDB | MySQL, SQLite, libSQL, Oracle, Elasticsearch, OpenSearch and Trino, whose flat rule the default already applied — each established from its own source rather than assumed to agree |
+| `//` | Elasticsearch, OpenSearch, Couchbase, Druid, LibreDB | PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, SQL Server and Trino, each refused on a live server: `SELECT 1 // note` is an error there, so "not a comment" is the reading the default already applied |
 
 The distinction is visible in `src/lib/sql/grammar.ts` too: an established fact is written out in that
 dialect's row, an undecided one is written `DEFAULT_SQL_GRAMMAR.<fact>`.
@@ -350,10 +365,16 @@ bounded, a final data-modifying one is not. The route resolves its connection be
 reading is done under **that connection's dialect** and this route and the provider that runs the
 statement cannot disagree about what the statement is.
 
-The splitter itself is a separate, still dialect-blind scan: it inlines its own span walk and reads
-`#` as ordinary code, so a MySQL hash comment carrying a `;` still splits a statement there. Changing
-that moves statement boundaries, which is its own change with its own tests — recorded here rather
-than folded in.
+The splitter reads spans through the shared reader (`src/lib/sql/spans.ts`) under the caller's
+grammar, so it agrees with every other reader here about which `;` is code. It used to inline its own
+scan and know none of the dialect facts, and unlike the other readers its disagreement was not a
+missing bound: this route RUNS what it returns. Measured on postgres 18,
+`/* a /* b */ ; DROP TABLE t; -- */ SELECT 1` is one read (block comments nest there), and the flat
+reading cut it into three whose second was a bare `DROP TABLE t` — which the route executed. Measured
+on MySQL, whose comments are flat, that same text really does drop the table, so the fragment is
+honest there and the confirmation gate is what must see it. Callers pass the connection's dialect
+(this route, and the editor's multi-statement decision); a call that names none keeps the
+compatibility grammar, the same stated default the rest of `src/lib/sql` applies.
 
 Last-only is that route's own policy, and it leaves a hole this section does not close: a non-final
 `SELECT` runs exactly as written, and its **entire** result set travels back in `statements[i].rows`.
@@ -445,11 +466,13 @@ The accepted cost, pinned by tests rather than left to be discovered, in two cla
 **Not a cost this rule pays: non-SQL query text.** Both execution paths ask about whatever is in the
 editor, so this predicate is handed MongoDB documents and Redis commands as well. A SQL span reader's
 verdict about text that is not SQL is not evidence of anything — the escaped quote in
-`{"filter":{"msg":"say \"hi\""}}` or in `SET k "a\"b"` closes perfectly in the grammar the text is
-actually written in — so the unresolvable-run rule is applied only where `readsSqlText()` says the
-dialect writes SQL. Saying *"could not be read"* about text that reads fine is the false alarm this
-notice exists to avoid, and a gate operators learn to click through protects nothing. The keyword
-tests still run on that text; only the span-based rule is narrowed.
+`{"filter":{"msg":"say \"hi\""}}` or in `GETRANGE k "a\"b" 0 1` closes perfectly in the grammar the
+text is actually written in — so the unresolvable-run rule is applied only where `readsSqlText()` says
+the dialect writes SQL. Saying *"could not be read"* about text that reads fine is the false alarm this
+notice exists to avoid, and a gate operators learn to click through protects nothing. Only the
+span-based rule is narrowed: the non-SQL vocabulary above still answers for that text, which is why the
+Redis half of this example is a `GETRANGE` and not the `SET k "a\"b"` it used to be — `SET` is in that
+vocabulary and now prompts on its own merits, whatever its quoting.
 
 A fourth class arrives with the nesting fact (#300), and it is the reverse of the ones above — a prompt
 the dialect *adds* rather than one it narrows: on PostgreSQL, SQL Server and ClickHouse a block comment
@@ -464,7 +487,7 @@ own grammar (#295) and unresolvable only to a reader without it — and it lifts
 cannot read at all: Oracle's `q'{it's}'` (#292). It does nothing for the first class, per that
 bullet.
 
-Three gaps are known and pinned by tests rather than claimed closed:
+Two gaps are known and pinned by tests rather than claimed closed:
 
 - **Only `UPDATE … SET` is looked for inside a read.** A write hidden in a CTE *body* under any
   other keyword (`WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone`) does not prompt.
@@ -479,10 +502,15 @@ Three gaps are known and pinned by tests rather than claimed closed:
   `tests/components/QuerySafetyDialog.test.tsx` ("does not prompt when the statement's shape cannot
   be typed") so the boundary stays a decision — the shipped rule keys on unresolvable *runs*, and
   widening it to every statement the reader cannot type would prompt for an empty editor.
-- **A multi-statement script is read as one statement.** `SELECT 1; DROP TABLE users` does not
-  prompt (its first keyword is the `SELECT`), while `SELECT 1; UPDATE t SET x = 1` does, because
-  the unanchored probe finds it. Executing the destructive statement on its own prompts, as long
-  as that statement's own shape can be typed — the gap above is the exception.
+
+A third gap sat beside them and is closed (S1). A multi-statement script used to be read as one
+statement, so `SELECT 1; DROP TABLE users` did not prompt — its first keyword is the `SELECT` —
+while `SELECT 1; UPDATE t SET x = 1` did, because the unanchored probe happened to find it. The gate
+now splits the editor text with the same splitter and the same grammar the runner uses, and asks
+about **each fragment** the multi-statement route will run. The split is only performed where the dialect's text is SQL — a `;`
+in a Mongo document or a Redis command separates nothing, so a fragment cut there would be invented
+(#427). Pinned by `tests/components/QuerySafetyDialog.test.tsx` ("The gate reads what the RUNNER will
+run").
 
 Four runs bypass the gate on purpose, all on the standalone path
 (`src/hooks/use-query-execution.ts`): an EXPLAIN run (see below), a Load-More page of a result the

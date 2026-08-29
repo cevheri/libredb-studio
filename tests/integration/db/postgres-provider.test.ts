@@ -53,8 +53,16 @@ class MockPool extends EventEmitter {
 /** The pool handed to the most recently constructed provider. */
 let lastPool: MockPool | undefined;
 
+/**
+ * The config object the provider handed `new Pool(...)`. Recorded because `buildSSLConfig`
+ * is private and its result is only observable here: a test that merely connects and
+ * asserts `isConnected()` passes for every SSL mode, including a wrong one.
+ */
+let lastPoolConfig: Record<string, unknown> = {};
+
 mock.module("pg", () => ({
-  Pool: function () {
+  Pool: function (config: Record<string, unknown>) {
+    lastPoolConfig = config;
     lastPool = new MockPool();
     return lastPool;
   },
@@ -669,6 +677,21 @@ describe("PostgresProvider", () => {
       expect(provider.isConnected()).toBe(true);
     });
 
+    // D26: the mode a pasted `?ssl=true` lands on, and the reason it can: `pg` is handed
+    // `rejectUnauthorized: true` with NO `ca`, so Node's own trust store checks the chain and
+    // there is no PEM for the user to find. `require` is the same call with verification off.
+    test("ssl mode verify-system verifies against the runtime trust store with no ca", async () => {
+      provider = new PostgresProvider(makePgConfig({ ssl: { mode: "verify-system" } }));
+      await provider.connect();
+      expect(lastPoolConfig.ssl).toEqual({ rejectUnauthorized: true });
+    });
+
+    test("ssl mode require encrypts without checking the chain", async () => {
+      provider = new PostgresProvider(makePgConfig({ ssl: { mode: "require" } }));
+      await provider.connect();
+      expect(lastPoolConfig.ssl).toEqual({ rejectUnauthorized: false });
+    });
+
     test("ssl mode verify-ca sets rejectUnauthorized to true", async () => {
       provider = new PostgresProvider(
         makePgConfig({
@@ -677,6 +700,7 @@ describe("PostgresProvider", () => {
       );
       await provider.connect();
       expect(provider.isConnected()).toBe(true);
+      expect(lastPoolConfig.ssl).toEqual({ rejectUnauthorized: true });
     });
 
     test("ssl mode verify-full with certs includes ca, cert, key", async () => {
@@ -1858,6 +1882,32 @@ describe("PostgresProvider", () => {
   // --------------------------------------------------------------------------
 
   describe("getCapabilities()", () => {
+    // #U9: the target grammar of each operation, declared next to it. PostgreSQL is
+    // the engine both surfaces were already right about - every statement here has a
+    // one-table form and a whole-database form - so this records the baseline the
+    // other providers are measured against rather than a change in behaviour.
+    test("declares the target grammar of every maintenance operation", () => {
+      provider = new PostgresProvider(makePgConfig());
+      const specs = provider.getCapabilities().maintenanceOperationSpecs;
+
+      expect(specs).toEqual({
+        vacuum: { label: "Vacuum Table", perEntity: true, global: true },
+        analyze: { label: "Analyze Table", perEntity: true, global: true },
+        reindex: { label: "Reindex Table", perEntity: true, global: true },
+        // A backend PID comes from the Sessions panel; no table row and no global
+        // card can supply one.
+        kill: { label: "Terminate Backend", perEntity: false, global: false },
+      });
+      // Every declared operation carries a spec, and no spec names an operation the
+      // provider does not declare.
+      expect(Object.keys(specs ?? {}).sort()).toEqual([...provider.getCapabilities().maintenanceOperations].sort());
+    });
+
+    test("the vacuum label really means vacuum here", () => {
+      // Absent is the default, so the four engines whose vacuum wording names
+      // something else are the ones that have to say so (#496).
+      expect(new PostgresProvider(makePgConfig()).getLabels().vacuumActionOperation).toBeUndefined();
+    });
     test("returns correct PostgreSQL capabilities", () => {
       provider = new PostgresProvider(makePgConfig());
       const caps = provider.getCapabilities();
@@ -1872,7 +1922,7 @@ describe("PostgresProvider", () => {
       // statement shape the inline row editor builds (#269).
       expect(caps.supportsInlineRowEdit).toBe(true);
       // BEGIN/COMMIT/ROLLBACK run over one held pool client here, so the toolbar's
-      // transaction trio and the sandbox toggle are offered (#U13).
+      // transaction trio and the sandbox toggle are offered (#464).
       expect(caps.supportsTransactions).toBe(true);
       // Inherited from the base capabilities: this engine declares foreign keys, so
       // an empty `foreignKeys` list is a fact about the schema or the role, never
@@ -1893,7 +1943,7 @@ describe("PostgresProvider", () => {
     // The Operations tab's global reindex card was hardcoded to exactly this wording
     // for every engine. PostgreSQL is the engine it was written for - `runMaintenance`
     // sends `REINDEX DATABASE` with no target - so declaring it here changes nothing
-    // on this provider and lets SQLite and Couchbase say what theirs does (#U6).
+    // on this provider and lets SQLite and Couchbase say what theirs does (#464).
     test("declares the global reindex wording the card used to hardcode", () => {
       const labels = new PostgresProvider(makePgConfig()).getLabels();
 

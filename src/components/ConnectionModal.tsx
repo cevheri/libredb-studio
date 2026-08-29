@@ -21,6 +21,7 @@ import {
   Link,
   CircleCheck,
   CircleX,
+  TriangleAlert,
   ClipboardPaste,
   Lock,
   ChevronDown,
@@ -29,11 +30,29 @@ import {
   Server,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { getDBConfig, isFileBased } from "@/lib/db-ui-config";
+import { getDBConfig, isFileBased, takesConnectionField } from "@/lib/db-ui-config";
 import { motion, AnimatePresence } from "framer-motion";
 import { useConnectionForm } from "@/hooks/use-connection-form";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { WireCompatibilityHint } from "@/components/WireCompatibilityHint";
+
+/**
+ * What each SSL mode actually does, in the panel where it is chosen.
+ *
+ * `verify-system` is the one that needs the sentence most (D26): without it a reader cannot
+ * tell it from `verify-ca` and goes looking for a CA file that mode does not want. The
+ * SSLMode union is published (src/lib/types.ts), so this Record is exhaustive by type - a
+ * mode added there without copy here fails typecheck rather than rendering an empty hint.
+ */
+const SSL_MODE_HINTS: Record<SSLMode, string> = {
+  disable: "Plaintext. Nothing is encrypted.",
+  require: "Encrypts but verifies nothing - any certificate is accepted, including a forged one.",
+  "verify-system":
+    "Encrypts and verifies the certificate chain and host name against the system trust store - no certificate to paste. Use this for a managed endpoint (Neon, Supabase, Atlas, RDS, Capella).",
+  "verify-ca": "Encrypts and verifies the chain against the CA certificate below. Paste one for a private CA.",
+  "verify-full":
+    "Encrypts and verifies the chain against the CA certificate below, and that it names the host you typed.",
+};
 
 interface ConnectionModalProps {
   isOpen: boolean;
@@ -159,11 +178,19 @@ export function ConnectionModal({
   // So the ordinary deployment - users in `admin`, data elsewhere - had no way through
   // the discrete fields at all, and failed as a credentials error.
   const isMongoDB = type === "mongodb";
+  // libSQL has no user names at all: the credential a server checks is a TOKEN it
+  // minted (Turso prints one per database), so the shared `password` field holds a
+  // JWT here. A field labelled Password invites a password no libSQL server has,
+  // which is why this one is relabelled rather than left to be guessed at.
+  const isLibSQL = type === "libsql";
+  const passwordFieldLabel = isLibSQL ? "Auth Token" : "Password";
   const databaseFieldLabel = isCouchbase ? "Bucket" : isTrino ? "Catalog" : isCassandra ? "Keyspace" : "Database";
   const databaseFieldPlaceholder = isTrino ? "tpch" : isCassandra ? "probe" : "db";
   const connectionUriPlaceholder = isCouchbase
     ? "couchbase://localhost:8091/travel-sample  or  couchbases://cb.<id>.cloud.couchbase.com/..."
-    : "mongodb://localhost:27017/mydb  or  mongodb+srv://...";
+    : isLibSQL
+      ? "libsql://<database>-<org>.turso.io?authToken=<jwt>"
+      : "mongodb://localhost:27017/mydb  or  mongodb+srv://...";
 
   const formContent = (
     <>
@@ -426,27 +453,34 @@ export function ConnectionModal({
                   </div>
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="space-y-2">
-                      <div className="flex items-center gap-2 mb-1">
-                        <Key strokeWidth={1.5} className="w-3 h-3 text-fg-muted" />
-                        <Label htmlFor="user" className="text-xs font-mediumr text-fg-muted">
-                          Username
-                        </Label>
+                    {/*
+                      Only when the engine takes it. libSQL authenticates with a token the
+                      server minted and has no user names at all, so a Username box there
+                      collected a value `buildConnection` then discarded.
+                    */}
+                    {takesConnectionField(type, "user") && (
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2 mb-1">
+                          <Key strokeWidth={1.5} className="w-3 h-3 text-fg-muted" />
+                          <Label htmlFor="user" className="text-xs font-mediumr text-fg-muted">
+                            Username
+                          </Label>
+                        </div>
+                        <Input
+                          id="user"
+                          value={user}
+                          onChange={(e) => setUser(e.target.value)}
+                          placeholder="user"
+                          autoComplete="off"
+                          className="h-10 bg-panel border-hairline focus:border-blue-500/50 transition-all text-xs"
+                        />
                       </div>
-                      <Input
-                        id="user"
-                        value={user}
-                        onChange={(e) => setUser(e.target.value)}
-                        placeholder="user"
-                        autoComplete="off"
-                        className="h-10 bg-panel border-hairline focus:border-blue-500/50 transition-all text-xs"
-                      />
-                    </div>
-                    <div className="space-y-2">
+                    )}
+                    <div className={takesConnectionField(type, "user") ? "space-y-2" : "space-y-2 md:col-span-2"}>
                       <div className="flex items-center gap-2 mb-1">
                         <ShieldCheck strokeWidth={1.5} className="w-3 h-3 text-fg-muted" />
                         <Label htmlFor="password" className="text-xs font-mediumr text-fg-muted">
-                          Password
+                          {passwordFieldLabel}
                         </Label>
                       </div>
                       <Input
@@ -469,6 +503,12 @@ export function ConnectionModal({
                         work. The provider refuses the combination outright; this says
                         so before the user reaches that error.
                       */}
+                      {isLibSQL && (
+                        <p className="text-xs text-fg-muted">
+                          Turso Cloud mints this per database (`turso db tokens create`). A self-hosted libSQL server
+                          started without authentication takes none - leave it empty.
+                        </p>
+                      )}
                       {isTrino && (
                         <p className="text-xs text-fg-muted">
                           Trino refuses a password over plain HTTP. Enable TLS below, or leave this empty to connect as
@@ -478,32 +518,40 @@ export function ConnectionModal({
                     </div>
                   </div>
 
-                  <div className="space-y-2">
-                    <div className="flex items-center gap-2 mb-1">
-                      <Database strokeWidth={1.5} className="w-3 h-3 text-fg-muted" />
-                      <Label htmlFor="database" className="text-xs font-mediumr text-fg-muted">
-                        {databaseFieldLabel} Name
-                      </Label>
+                  {/*
+                    Only when the engine takes it. Druid and the two search engines address
+                    a datasource or an index by name in the statement, and libSQL addresses
+                    the whole database by URL, so none of the four has a database to name
+                    here - and `buildConnection` never wrote what this box collected.
+                  */}
+                  {takesConnectionField(type, "database") && (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2 mb-1">
+                        <Database strokeWidth={1.5} className="w-3 h-3 text-fg-muted" />
+                        <Label htmlFor="database" className="text-xs font-mediumr text-fg-muted">
+                          {databaseFieldLabel} Name
+                        </Label>
+                      </div>
+                      <Input
+                        id="database"
+                        value={database}
+                        onChange={(e) => setDatabase(e.target.value)}
+                        placeholder={databaseFieldPlaceholder}
+                        className="h-10 bg-panel border-hairline focus:border-blue-500/50 transition-all text-xs font-mono"
+                      />
+                      {isTrino && (
+                        <p className="text-xs text-fg-muted">
+                          The Trino catalog to open, such as tpch or hive. Its schemas are the level below.
+                        </p>
+                      )}
+                      {isCassandra && (
+                        <p className="text-xs text-fg-muted">
+                          The keyspace to open. Tables inside it are the level below; statements can still name any
+                          keyspace in full.
+                        </p>
+                      )}
                     </div>
-                    <Input
-                      id="database"
-                      value={database}
-                      onChange={(e) => setDatabase(e.target.value)}
-                      placeholder={databaseFieldPlaceholder}
-                      className="h-10 bg-panel border-hairline focus:border-blue-500/50 transition-all text-xs font-mono"
-                    />
-                    {isTrino && (
-                      <p className="text-xs text-fg-muted">
-                        The Trino catalog to open, such as tpch or hive. Its schemas are the level below.
-                      </p>
-                    )}
-                    {isCassandra && (
-                      <p className="text-xs text-fg-muted">
-                        The keyspace to open. Tables inside it are the level below; statements can still name any
-                        keyspace in full.
-                      </p>
-                    )}
-                  </div>
+                  )}
 
                   {/*
                     In the open rather than behind the Advanced accordion for the
@@ -658,22 +706,27 @@ export function ConnectionModal({
                       <div className="space-y-2">
                         <Label className="text-xs font-mediumr text-fg-muted">SSL Mode</Label>
                         <div className="flex flex-wrap gap-1.5">
-                          {(["disable", "require", "verify-ca", "verify-full"] as SSLMode[]).map((mode) => (
-                            <button
-                              key={mode}
-                              type="button"
-                              onClick={() => setSSLMode(mode)}
-                              className={cn(
-                                "px-2.5 py-1.5 rounded-md text-xs font-mediumr transition-all border",
-                                sslMode === mode
-                                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                                  : "border-transparent text-fg-muted hover:text-fg-secondary hover:bg-fill",
-                              )}
-                            >
-                              {mode}
-                            </button>
-                          ))}
+                          {(["disable", "require", "verify-system", "verify-ca", "verify-full"] as SSLMode[]).map(
+                            (mode) => (
+                              <button
+                                key={mode}
+                                type="button"
+                                onClick={() => setSSLMode(mode)}
+                                className={cn(
+                                  "px-2.5 py-1.5 rounded-md text-xs font-mediumr transition-all border",
+                                  sslMode === mode
+                                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                                    : "border-transparent text-fg-muted hover:text-fg-secondary hover:bg-fill",
+                                )}
+                              >
+                                {mode}
+                              </button>
+                            ),
+                          )}
                         </div>
+                        <p data-testid="ssl-mode-hint" className="text-xs text-fg-muted">
+                          {SSL_MODE_HINTS[sslMode]}
+                        </p>
                       </div>
                       {sslMode !== "disable" && (
                         <div className="space-y-3">
@@ -869,15 +922,21 @@ export function ConnectionModal({
                 className="overflow-hidden"
               >
                 <div
+                  data-testid="connection-test-result"
+                  data-tone={testResult.tone}
                   className={cn(
                     "flex items-center gap-2 p-3 rounded-lg border text-xs",
-                    testResult.success
+                    testResult.tone === "success"
                       ? "bg-emerald-500/5 border-emerald-500/20 text-emerald-400"
-                      : "bg-red-500/5 border-red-500/20 text-red-400",
+                      : testResult.tone === "warning"
+                        ? "bg-amber-500/5 border-amber-500/20 text-amber-400"
+                        : "bg-red-500/5 border-red-500/20 text-red-400",
                   )}
                 >
-                  {testResult.success ? (
+                  {testResult.tone === "success" ? (
                     <CircleCheck strokeWidth={1.5} className="w-3.5 h-3.5 shrink-0" />
+                  ) : testResult.tone === "warning" ? (
+                    <TriangleAlert strokeWidth={1.5} className="w-3.5 h-3.5 shrink-0" />
                   ) : (
                     <CircleX strokeWidth={1.5} className="w-3.5 h-3.5 shrink-0" />
                   )}

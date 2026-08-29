@@ -93,6 +93,20 @@ import type {
   TableSchema,
 } from "@/lib/types";
 
+/**
+ * How much of a catalog a refused capture asked for, against how much it may have.
+ *
+ * Its own named shape rather than two loose numbers, because it travels: the capture
+ * carries it, the `context-unavailable` ledger entry records it, and a reader that had
+ * to guess which of two bare integers was the bound is a reader that will guess wrong.
+ */
+export interface AgentContextRowBudget {
+  /** Rows the read produced, or would have. */
+  readonly projected: number;
+  /** Rows this run's policy allows one read to carry. */
+  readonly allowed: number;
+}
+
 /** Why a run has no snapshot. All are states the run continues from, not failures. */
 export type AgentContextUnavailableCode =
   /**
@@ -118,11 +132,62 @@ export type AgentContextUnavailableCode =
    */
   | "PROVIDER_INVENTORY_TIMED_OUT";
 
+/**
+ * What a capture SPENT, taken from the tracker's own accounting (B13).
+ *
+ * The capture's reads reach `executeAuditedOperation` through
+ * `readCatalogForGrounding` and `readProviderSchemaForGrounding` rather than through
+ * the run loop's `runStep`, and `runStep` is the only writer of `tool-completed`. So
+ * two or three catalog statements were charged against exactly the ceilings the rail
+ * displays and left no entry the rail could fold: an agent-mode drive with no
+ * reusable snapshot read "0 of 20 statements" with three already spent, before the
+ * model's first turn.
+ *
+ * MEASURED rather than counted here, and the difference is the whole reason this is a
+ * delta of `tracker.usage` around the reading instead of `plan.kinds.length`: what the
+ * budget enforces is what the tracker holds, and a read the pipeline denied before
+ * `beginExecution` charges nothing while an acquisition failure charges a statement
+ * for a call that never ran. A figure composed from the plan would state the reads
+ * this module INTENDED; this one states the reads the run paid for.
+ *
+ * `elapsedMs` is the span the tracker charged the whole capture, which is what
+ * `maxTotalRunMs` is measured against — not the engine's own elapsed time, which is
+ * the narrower figure a `tool-completed` entry carries.
+ */
+export interface AgentContextCharge {
+  /** Statements the tracker charged this run while the capture was reading. */
+  readonly statements: number;
+  /** The span it charged them, in milliseconds. */
+  readonly elapsedMs: number;
+}
+
 export type AgentContextCapture =
-  | { readonly kind: "captured"; readonly snapshot: AgentContextSnapshot }
+  | {
+      readonly kind: "captured";
+      readonly snapshot: AgentContextSnapshot;
+      /**
+       * What the reading cost, so the caller can record it (B13). Absent only where
+       * a capture was composed by something other than `captureContextSnapshot` —
+       * a fixture, or a test driving one of the two inner paths — and an absent
+       * charge is recorded as no charge at all rather than as a zero spend.
+       */
+      readonly charged?: AgentContextCharge;
+    }
   | {
       readonly kind: "unavailable";
       readonly reasonCode: AgentContextUnavailableCode;
+      /**
+       * The two numbers a row-budget refusal named, when that is what refused this
+       * capture: how many rows the catalog read projected, and how many the run's
+       * policy allows. Present only for that reason — see `rowBudgetIn`.
+       */
+      readonly rowBudget?: AgentContextRowBudget;
+      /**
+       * What the refused reading cost anyway (B13). A read the engine rejected was
+       * admitted, charged and only then answered, so the spend is real even where the
+       * inventory is not.
+       */
+      readonly charged?: AgentContextCharge;
       /**
        * WHY this run has no inventory, in one sentence and with no advice in it.
        *
@@ -262,7 +327,10 @@ function buildSqliteTables(rows: ReadonlyMap<AgentCatalogKind, readonly Record<s
     tables.set(name, {
       name,
       columns: [...definition.columns],
-      indexes: [],
+      // The constraint-created indexes SQLite stores no DDL for: the composed index
+      // read below cannot see them, and they are what kept a UNIQUE-covered foreign
+      // key reading as unindexed (#502).
+      indexes: [...definition.indexes],
       foreignKeys: [...definition.foreignKeys],
     });
   }
@@ -316,8 +384,50 @@ function fingerprintTables(tables: readonly TableSchema[]): string {
 // Capture
 // ============================================================================
 
+/**
+ * The row budget a refusal named, read out of the sentence that named it.
+ *
+ * A regex over a message is not the shape anybody would choose, and it is the only
+ * shape available: the two numbers are formatted by the PROVIDER
+ * (`postgres.ts`/`sqlite.ts` both refuse rather than truncate) into a `QueryError`
+ * message, and neither the error nor the tool refusal that wraps it carries them as
+ * fields. Reading them here is what turns the pair from prose the model was shown into
+ * data the ledger can hold — which is the whole of B54's second half, since the reason
+ * code alone says "somebody said no" where the numbers say "narrow the capture".
+ *
+ * Anchored on the whole phrase, so the `200` in the advice sentence the tool layer
+ * appends ("add LIMIT 200") cannot be mistaken for a measurement. `statementAdvice` in
+ * `tools.ts` reads the same message with the same anchor; the duplication is deliberate
+ * rather than shared, because the two answer different questions — one composes advice
+ * for a model, the other records a fact — and either may be given a different source.
+ *
+ * Absent when the refusal was about anything else, and absent is the honest answer:
+ * this run met no budget, so a pair of zeros would be a measurement nobody took (#477).
+ * The REASON CODE never depends on this function, so a message this cannot read still
+ * produces a diagnosable entry — one that says "refused" without inventing a bound.
+ *
+ * EXPORTED so the loop can be closed by a test rather than by a comment. The hazard is
+ * silent: reword the provider's sentence and this returns `undefined` for ever, the
+ * ledger quietly loses the pair, and B54 re-opens with nothing going red. So
+ * `tests/integration/db/sqlite-provider.test.ts` drives a REAL over-budget read through
+ * `bun:sqlite`, catches the error the provider itself threw, and feeds its message
+ * through here — and pins PostgreSQL's copy of the same sentence against its source.
+ */
+export function rowBudgetIn(detail: string): AgentContextRowBudget | undefined {
+  const matched = /row budget: (\d+) rows > (\d+) allowed/.exec(detail);
+  if (matched === null) return undefined;
+  return { projected: Number(matched[1]), allowed: Number(matched[2]) };
+}
+
 function unavailable(reasonCode: AgentContextUnavailableCode, detail: string): AgentContextCapture {
-  return { kind: "unavailable", reasonCode, detail, modelText: `${detail}\n${FALLBACK_ADVICE}` };
+  const rowBudget = rowBudgetIn(detail);
+  return {
+    kind: "unavailable",
+    reasonCode,
+    detail,
+    ...(rowBudget === undefined ? {} : { rowBudget }),
+    modelText: `${detail}\n${FALLBACK_ADVICE}`,
+  };
 }
 
 /**
@@ -368,7 +478,9 @@ export function reusableSnapshot(events: readonly AgentRunEvent[], connectionId:
  * Runs before the first model turn of a drive that has no recorded inventory to
  * reuse. It costs one statement per catalog kind out of the run's budget on the
  * composed path and exactly one on the provider path, which is why the result is
- * persisted rather than re-read.
+ * persisted rather than re-read — and what it actually cost is returned with the
+ * snapshot, measured off the tracker, so the caller can record it (see
+ * `AgentContextCharge`).
  *
  * PLANNING RUNS REACH THIS TOO, since the plan-mode grounding design of 2026-08-15.
  * Until then a planning run was refused here by the mode gate in `tools.ts` and was
@@ -381,6 +493,31 @@ export function reusableSnapshot(events: readonly AgentRunEvent[], connectionId:
  * mode.
  */
 export async function captureContextSnapshot(context: AgentToolContext): Promise<AgentContextCapture> {
+  // Around the reading and not inside either path, because the two paths spend
+  // differently — one statement per catalog kind against exactly one — and the
+  // question the meter asks is what the capture cost, not which route it took.
+  const before = context.tracker.usage(context.runId);
+  const capture = await readInventory(context);
+  const after = context.tracker.usage(context.runId);
+  // A REFUSED capture is charged too, and that is the half of B13 the ledger's own
+  // `context-unavailable` docblock deferred: a read the engine rejected, and a read
+  // whose rows overran the budget, both spent a statement before saying no.
+  return {
+    ...capture,
+    charged: {
+      statements: after.executedStatements - before.executedStatements,
+      elapsedMs: after.totalElapsedMs - before.totalElapsedMs,
+    },
+  };
+}
+
+/**
+ * The reading itself, through whichever of the two paths this dialect has.
+ *
+ * Separate from the measurement above so the delta cannot be taken around part of a
+ * capture: every `return` in here and in `captureFromProvider` is inside the span.
+ */
+async function readInventory(context: AgentToolContext): Promise<AgentContextCapture> {
   const plan = CATALOG_PLANS[context.connection.type];
   const nowMs = context.clock?.() ?? Date.now();
   // No composed catalog for this dialect, which used to end the capture here with
@@ -390,17 +527,31 @@ export async function captureContextSnapshot(context: AgentToolContext): Promise
 
   const rows = new Map<AgentCatalogKind, readonly Record<string, unknown>[]>();
 
-  for (const kind of plan.kinds) {
-    const outcome = await readCatalogForGrounding(context, { kind });
-    if (outcome.kind !== "completed") return unavailable("CATALOG_READ_REFUSED", outcome.modelText);
-    const artifact = context.artifacts.get(outcome.artifact.correlationId, nowMs);
-    if (artifact === undefined) {
-      return unavailable(
-        "CATALOG_RESULT_UNAVAILABLE",
-        `The ${kind} inventory was read but its rows are no longer held by this run.`,
-      );
+  // The same catch the provider path has, and B48 is the record of it having been
+  // absent here: a failure raised BEFORE the statement left — an unreachable host, a
+  // wrong password, a refused execution profile — propagates out of
+  // `readCatalogForGrounding` by design (`tools.ts`), so on PostgreSQL and SQLite it
+  // ended the whole run `internal`, or `engine-unsupported` on the profile error,
+  // where the same environment on the other nine engines lost only the grounding.
+  // `environmentFailure` is shared with `captureFromProvider` so the two paths cannot
+  // come to answer one environment in two voices.
+  try {
+    for (const kind of plan.kinds) {
+      const outcome = await readCatalogForGrounding(context, { kind });
+      if (outcome.kind !== "completed") return unavailable("CATALOG_READ_REFUSED", outcome.modelText);
+      const artifact = context.artifacts.get(outcome.artifact.correlationId, nowMs);
+      if (artifact === undefined) {
+        return unavailable(
+          "CATALOG_RESULT_UNAVAILABLE",
+          `The ${kind} inventory was read but its rows are no longer held by this run.`,
+        );
+      }
+      rows.set(kind, artifact.value.rows);
     }
-    rows.set(kind, artifact.value.rows);
+  } catch (error) {
+    const failure = environmentFailure(error, context);
+    if (failure === null) throw error;
+    return failure;
   }
 
   const tables = finalize(plan.build(rows));
@@ -444,8 +595,9 @@ export async function captureContextSnapshot(context: AgentToolContext): Promise
  * complete is the failure this module exists to avoid, and it is no less one for
  * having been read a second way.
  *
- * A failure raised BEFORE the reading left is caught here and becomes an unavailable
- * capture, rather than propagating and ending the run. That is a decision, and the
+ * A failure raised BEFORE the reading left becomes an unavailable capture, rather than
+ * propagating and ending the run — `environmentFailure` is where that is read, and the
+ * composed path asks it too now (B48). That is a decision, and the
  * reason is what plan mode promises: it opens and answers on every engine, and it did
  * on these nine before this change, because nothing was reached at all. Letting an
  * unreachable host, a wrong password, a refused `connect()` or an `ExecutionProfileError`
@@ -459,10 +611,10 @@ export async function captureContextSnapshot(context: AgentToolContext): Promise
  * a `TypeError` here is this server's bug and must not be reported to a user as a
  * property of their database.
  *
- * The COMPOSED path still propagates such a failure, and this change deliberately
- * leaves it alone: PostgreSQL and SQLite have never reached this line and changing
- * their failure mode is not what #414 is about. The asymmetry is filed in
- * `docs/BACKLOG.md` rather than resolved here.
+ * The COMPOSED path answers the same environment the same way, which it did not when
+ * this was written: #414 left PostgreSQL and SQLite propagating such a failure on the
+ * argument that they had never reached this line, and B48 is the record of a reader
+ * tripping over the asymmetry. Both paths now read it through `environmentFailure`.
  *
  * Neither sentence carries the error's own message. `detail` is spliced into the note
  * a plan run reads as the server's own voice, and a driver message is text the database
@@ -474,19 +626,9 @@ async function captureFromProvider(context: AgentToolContext, nowMs: number): Pr
   try {
     read = await readProviderSchemaForGrounding(context);
   } catch (error) {
-    if (error instanceof ExecutionProfileError) {
-      return unavailable(
-        "CATALOG_READ_REFUSED",
-        `This server could not open a connection to this ${context.connection.type} database under the execution profile a grounding read takes, so its schema was not read for this run.`,
-      );
-    }
-    if (error instanceof DatabaseError) {
-      return unavailable(
-        "CATALOG_READ_REFUSED",
-        `This run could not reach this ${context.connection.type} database to ask it for its schema, so nothing was read for this run.`,
-      );
-    }
-    throw error;
+    const failure = environmentFailure(error, context);
+    if (failure === null) throw error;
+    return failure;
   }
   if (read.kind === "timed-out") {
     return unavailable(
@@ -507,6 +649,38 @@ async function captureFromProvider(context: AgentToolContext, nowMs: number): Pr
       readVia: "provider-inventory",
     },
   };
+}
+
+/**
+ * An environment failure read as an unavailable capture, or `null` when it is not one.
+ *
+ * BOTH grounding paths ask this, which is the whole of B48: the same unreachable host
+ * lost only the grounding on the nine provider-path engines and lost the RUN on
+ * PostgreSQL and SQLite, and the difference was one catch block. One reading rather
+ * than two also means the sentence a plan run is shown does not depend on which route
+ * its dialect takes.
+ *
+ * Two classes and no others. Anything else is this server's bug — a `TypeError` here is
+ * not a property of the user's database and must not be reported to them as one — so it
+ * is handed back for the caller to rethrow rather than swallowed.
+ *
+ * Neither sentence carries the error's own message: `detail` is spliced into a note the
+ * run reads as the server's own voice, and a driver message is text the database wrote.
+ */
+function environmentFailure(error: unknown, context: AgentToolContext): AgentContextCapture | null {
+  if (error instanceof ExecutionProfileError) {
+    return unavailable(
+      "CATALOG_READ_REFUSED",
+      `This server could not open a connection to this ${context.connection.type} database under the execution profile a grounding read takes, so its schema was not read for this run.`,
+    );
+  }
+  if (error instanceof DatabaseError) {
+    return unavailable(
+      "CATALOG_READ_REFUSED",
+      `This run could not reach this ${context.connection.type} database to ask it for its schema, so nothing was read for this run.`,
+    );
+  }
+  return null;
 }
 
 /**
@@ -553,14 +727,15 @@ function providerTables(tables: readonly TableSchema[]): TableIndex {
  *    produces**, exactly as `reusableSnapshot` refuses a ledger entry. A snapshot
  *    that fingerprints as something else is not held at all, so a reader never has
  *    to decide whether to trust one.
- *  - **It is keyed by connection**, which is the same boundary the run loop already
- *    enforces (`RUN_CONNECTION_MISMATCH`). Everyone who can open a run on a
- *    connection can read its catalog through that run anyway. What the key does NOT
- *    carry is the database that connection currently points at, or its dialect: a
- *    connection record re-pointed at another database while keeping its id would be
- *    served the old inventory here. That is recorded as `docs/BACKLOG.md` B45 rather
- *    than left for a reader to find, and it matters more now that a plan run both
- *    fills this and reads it.
+ *  - **It is keyed by connection IDENTITY**, which is a stricter boundary than the
+ *    one the run loop enforces (`RUN_CONNECTION_MISMATCH`) and deliberately so.
+ *    Everyone who can open a run on a connection can read its catalog through that
+ *    run anyway, so the id would have been enough for access; what it is not enough
+ *    for is TRUTH. The original key was the connection id alone, and a connection
+ *    record re-pointed at another database while keeping its id was served the old
+ *    one's inventory. The key is now a hash over the fields that decide which
+ *    database a reading came from and whose view of it (`connectionIdentity` below,
+ *    #509), and it matters more now that a plan run both fills this and reads it.
  *
  * What it deliberately is NOT: durable. This is process memory, like the run-scoped
  * artifact store and for the same reason. Losing it on a restart no longer costs a
@@ -575,7 +750,7 @@ const heldSnapshots = new Map<string, AgentContextSnapshot>();
 /**
  * The fields that decide WHICH database a reading came from, and whose view of it.
  *
- * The hold used to be keyed on the connection id alone (`docs/BACKLOG.md` B45). Neither
+ * The hold used to be keyed on the connection id alone (#509). Neither
  * the key nor the snapshot carried any database identity — `AgentContextSnapshot` holds
  * an id, a fingerprint, a time and the tables — so a connection record re-pointed at
  * another database while keeping its id was served the old one's inventory until the
@@ -616,6 +791,22 @@ export function connectionIdentity(connection: DatabaseConnection): string {
         // the role fields are in here.
         connection.authSource ?? "",
         connection.agentUser ?? "",
+        // The tunnel is part of the ROUTE and not part of the credentials: `host` and
+        // `port` above are resolved at the FAR END of it, so the same `db:5432` reached
+        // through two different bastions is two different databases, and a connection
+        // whose only edit was its bastion is re-pointed exactly as squarely as one whose
+        // host changed. Its secrets are excluded on the rule the database password
+        // follows - rotating one changes who may reach the database, never which it is -
+        // and so is `hostKeyFingerprint`, which records what this connection TRUSTS
+        // rather than where it goes.
+        connection.sshTunnel === undefined
+          ? ""
+          : [
+              connection.sshTunnel.enabled,
+              connection.sshTunnel.host,
+              connection.sshTunnel.port,
+              connection.sshTunnel.username,
+            ],
       ]),
     )
     .digest("hex");

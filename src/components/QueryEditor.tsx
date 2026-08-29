@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useRef, useEffect, useState, useMemo, forwardRef, useImperativeHandle } from "react";
-import Editor, { useMonaco } from "@monaco-editor/react";
+import Editor from "@monaco-editor/react";
 import type * as Monaco from "monaco-editor";
 import { Zap, LoaderCircle, TextAlignStart, Trash2, Copy, Play, Hash } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -14,9 +14,14 @@ import { registerLibreDBLanguage } from "@/lib/editor/libredb-language";
 import { registerRedisLanguage } from "@/lib/editor/redis-language";
 import { configureMonacoLoader } from "@/lib/editor/monaco-loader";
 import { useEffectiveTheme } from "@/hooks/use-effective-theme";
+import { useMonacoInstance } from "@/hooks/use-monaco-instance";
 import { logger } from "@/lib/logger";
+import { setLineNumbersPreference, useLineNumbersPreference } from "@/hooks/use-line-numbers-preference";
 import { writeToClipboard } from "@/components/copy-button";
 import { toast } from "sonner";
+import { splitStatements } from "@/lib/sql/statement-splitter";
+import { resolveSqlGrammar } from "@/lib/sql/grammar";
+import type { DatabaseType } from "@/lib/types";
 
 // Serve Monaco from our own origin rather than @monaco-editor/react's jsdelivr default.
 // Runs at module load so it is in place before the first <Editor> mounts.
@@ -45,6 +50,13 @@ interface QueryEditorProps {
   onContentChange?: (val: string) => void;
   onExplain?: () => void;
   language?: "sql" | "json" | "libredb" | "redis";
+  /**
+   * The connected engine, whose grammar decides where a statement ends.
+   *
+   * Optional, and a caller that omits it gets the compatibility reading - the same
+   * stated default every reader in `src/lib/sql/` applies to a dialect-less call.
+   */
+  databaseType?: DatabaseType;
   schemaContext?: string;
   capabilities?: import("@/lib/db/types").ProviderCapabilities;
 }
@@ -96,8 +108,11 @@ const getEditorOptions = (showLineNumbers: boolean) => ({
 });
 
 export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
-  ({ value, onChange, onContentChange, onExplain, language = "sql", schemaContext, capabilities }, ref) => {
-    const monaco = useMonaco();
+  (
+    { value, onChange, onContentChange, onExplain, language = "sql", databaseType, schemaContext, capabilities },
+    ref,
+  ) => {
+    const monaco = useMonacoInstance();
     const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
     const [hasSelection, setHasSelection] = useState(false);
 
@@ -120,17 +135,9 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
       canExplainKeyRef.current?.set(canExplain);
     }, [canExplain, onExplain]);
 
-    // Line numbers toggle — default must be SSR-stable; localStorage is applied after mount.
-    const [showLineNumbers, setShowLineNumbers] = useState(true);
-    const [lineNumbersPreferenceReady, setLineNumbersPreferenceReady] = useState(false);
-
-    useEffect(() => {
-      const saved = localStorage.getItem("editor-line-numbers");
-      if (saved !== null) {
-        setShowLineNumbers(saved === "true");
-      }
-      setLineNumbersPreferenceReady(true);
-    }, []);
+    // Line numbers toggle. The store keeps the default SSR-stable and applies the stored
+    // value at hydration, so there is no local default left that could overwrite it.
+    const showLineNumbers = useLineNumbersPreference();
 
     // Track last synced value to detect external changes
     const lastSyncedValueRef = useRef<string>(value);
@@ -157,12 +164,6 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
         editorRef.current.updateOptions({ lineNumbers: showLineNumbers ? "on" : "off" });
       }
     }, [showLineNumbers]);
-
-    // Persist line numbers preference to localStorage
-    useEffect(() => {
-      if (!lineNumbersPreferenceReady) return;
-      localStorage.setItem("editor-line-numbers", String(showLineNumbers));
-    }, [showLineNumbers, lineNumbersPreferenceReady]);
 
     const parsedSchema = useMemo((): ParsedTable[] => {
       if (!schemaContext) return [];
@@ -274,28 +275,35 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
         }
       }
 
-      // 2. If no selection, try to find the current statement (between semicolons)
+      // 2. No selection: run the statement the cursor is in.
+      //
+      // Read through the shared splitter, under the connection's dialect. This used to be
+      // `lastIndexOf(";")` over the raw text - no spans, no dialect, not even a
+      // string-literal check - which made it the THIRD reader of "where does a statement
+      // end" and the only one whose answer is what gets SENT. Measured in Chrome on
+      // 2026-08-25 against postgres 18: a buffer PostgreSQL reads as one statement was
+      // cut at a `;` inside a nested comment, so what reached the engine was a line
+      // comment plus the SELECT, and the grid read 0 rows where psql answers 2. A `;`
+      // inside a literal (`SELECT 'a;b'`) cut the same way.
       if (language === "sql") {
         const position = editorRef.current.getPosition();
         if (position) {
           const fullText = model.getValue();
           const cursorOffset = model.getOffsetAt(position);
+          const statements = splitStatements(fullText, resolveSqlGrammar(databaseType));
+          // The statement the cursor is inside or immediately after, which is what "run
+          // this one" means with the caret resting at a statement's end. Whitespace
+          // between two statements belongs to neither, so the last one that starts at or
+          // before the cursor wins - and with the caret before the first statement, that
+          // first one does.
+          const current =
+            [...statements].reverse().find((statement) => statement.start <= cursorOffset) ?? statements[0];
 
-          // Find boundaries of the current statement
-          let startOffset = fullText.lastIndexOf(";", cursorOffset - 1);
-          let endOffset = fullText.indexOf(";", cursorOffset);
-
-          if (startOffset === -1) startOffset = 0;
-          else startOffset += 1; // skip the semicolon
-
-          if (endOffset === -1) endOffset = fullText.length;
-
-          const statement = fullText.substring(startOffset, endOffset).trim();
-          if (statement.length > 0) {
-            const startPos = model.getPositionAt(startOffset);
-            const endPos = model.getPositionAt(endOffset);
+          if (current) {
+            const startPos = model.getPositionAt(current.start);
+            const endPos = model.getPositionAt(current.end);
             const range = new monaco.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column);
-            return { query: statement, range };
+            return { query: current.sql, range };
           }
         }
       }
@@ -584,7 +592,7 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
               "h-7 text-xs font-medium gap-2",
               showLineNumbers ? "text-fg-secondary" : "text-fg-muted hover:text-fg-bright",
             )}
-            onClick={() => setShowLineNumbers(!showLineNumbers)}
+            onClick={() => setLineNumbersPreference(!showLineNumbers)}
             title={showLineNumbers ? "Hide line numbers" : "Show line numbers"}
           >
             <Hash strokeWidth={1.5} className="w-3 h-3" /> Lines

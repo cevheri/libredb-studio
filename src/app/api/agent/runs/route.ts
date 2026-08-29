@@ -1,18 +1,31 @@
 import { NextResponse } from "next/server";
 import { admitAgentModel } from "@/lib/agent/capability-gate";
-import { isAgentRuntimeEnabled } from "@/lib/agent/config";
+import { isAgentRuntimeEnabled, isThreadContextEnabled } from "@/lib/agent/config";
+import { connectionIdentity } from "@/lib/agent/context-snapshot";
+import { AGENT_EXECUTION_ENGINES } from "@/lib/agent/engine-support";
 import { AGENT_MAX_OBJECTIVE_LENGTH } from "@/lib/agent/execution-policy";
+import { threadContextMaxCharsFor } from "@/lib/agent/models";
+import { agentPosture } from "@/lib/agent/posture";
+import type { AgentRunStatusReport } from "@/lib/agent/run-service";
+import { AgentRunStoreError } from "@/lib/agent/run-store";
 import { driveAgentRun, getAgentRunService } from "@/lib/agent/runtime";
+import { threadContextFor } from "@/lib/agent/thread-context";
 import {
+  AGENT_TERMINAL_STATUSES,
   AGENT_WORKFLOW_PRESENTS_ANSWER,
+  AGENT_WORKFLOW_SENDS_STATEMENTS,
   DEFAULT_AGENT_WORKFLOW_TYPE,
+  type AgentRunFailureReason,
   type AgentRunMode,
   type AgentRunWorkflowReading,
   type AgentRunWorkflowSource,
   type AgentRunWorkflowType,
+  type AgentThreadHeader,
 } from "@/lib/agent/types";
 import { createErrorResponse } from "@/lib/api/errors";
+import { resolveConfig } from "@/lib/llm/utils/config";
 import { guardRoute } from "@/lib/api/require-session";
+import { getDBConfig } from "@/lib/db-ui-config";
 import { logger } from "@/lib/logger";
 import { resolveConnection } from "@/lib/seed/resolve-connection";
 
@@ -52,6 +65,11 @@ import { resolveConnection } from "@/lib/seed/resolve-connection";
  *    `"unrecorded"`, and unrecognised values refused like the two above. It is here
  *    rather than in the surface's memory because the fallback and the verdict are
  *    different sentences and a reloaded rail can only know which it owes from the run.
+ *  - **A run whose workflow sends a statement is refused on an engine whose provider
+ *    has no read-only statement path**, from the connection's own type and before a run
+ *    id exists (#512). It is the one refusal here that is about the
+ *    DATABASE rather than the request's own consistency, and it is narrowed by the
+ *    workflow: `operations` sends no statement, so it opens on every engine.
  *  - **Auto-execute is fixed at start, and that is the reason it is a run field at
  *    all.** It is what the run may hand to the editor to RUN, on a path with none of
  *    the agent's own bounds, so it is decided once by the request that opens the run
@@ -86,8 +104,34 @@ const WORKFLOW_READINGS: ReadonlySet<string> = new Set<AgentRunWorkflowReading>(
   "unrecorded",
 ]);
 
-function badRequest(message: string): NextResponse {
-  return NextResponse.json({ error: message }, { status: 400 });
+/**
+ * A refusal a CLIENT has to be able to tell apart from the route's other `400`s, as a
+ * code rather than as prose (#513).
+ *
+ * One member, and adding a second is a decision rather than a convenience: every other
+ * refusal here is a rule the caller can read off the message, and the rail renders the
+ * message. This one is different because the rail is already showing the same paragraph
+ * in a standing amber card, so it needs to know WHICH refusal this is in order to say
+ * something else — and `400` cannot tell it, being also the status of the mode
+ * validation, the unresolvable connection and the `autoExecute` cross-check.
+ *
+ * The string is `AgentRunFailureReason`'s own `engine-unsupported`, deliberately: the
+ * same fact already travels under that name on a run that ended this way, and
+ * `src/components/agent/timeline.ts` already has a sentence for it, so no new wire
+ * vocabulary enters. `Extract` rather than a bare literal, and that is the enforcement
+ * of the sentence above: renaming the union member used to break `timeline.ts` and
+ * `runtime.ts` while leaving THIS wire value silently on the old name (measured, five
+ * TS errors and none of them here), so the doc's claim that the two names are one could
+ * go false with every gate green. Narrowed to that one member rather than aliased to the
+ * whole union, because the other members are outcomes of a run that OPENED and none of
+ * them can be refused with here. The other end of the wire is `use-agent-run.ts`'s admit
+ * list, which is a `"use client"` module a route may not import, so the extraction is
+ * written twice on purpose and the two must stay equal.
+ */
+type AgentStartRefusalCode = Extract<AgentRunFailureReason, "engine-unsupported">;
+
+function badRequest(message: string, refused?: AgentStartRefusalCode): NextResponse {
+  return NextResponse.json({ error: message, ...(refused === undefined ? {} : { refused }) }, { status: 400 });
 }
 
 export async function POST(req: Request) {
@@ -109,7 +153,8 @@ export async function POST(req: Request) {
       return badRequest("Request body must be JSON");
     }
 
-    const { mode, workflowType, workflowSource, workflowReading, autoExecute, objective, connectionId } = body;
+    const { mode, workflowType, workflowSource, workflowReading, autoExecute, objective, connectionId, previousRunId } =
+      body;
     if (typeof mode !== "string" || !MODES.has(mode)) {
       return badRequest('mode must be "planning" or "agent"');
     }
@@ -182,13 +227,97 @@ export async function POST(req: Request) {
     if (typeof connectionId !== "string" || connectionId.trim().length === 0) {
       return badRequest("connectionId must be a non-empty string");
     }
+    // Absent means the run is opened on its own, which is the ordinary case. A
+    // supplied id is REFUSED rather than coerced when it is not a string: it names
+    // a run, and guessing at a run id is how one session could hand another's report
+    // into its own prompt.
+    if (previousRunId !== undefined && (typeof previousRunId !== "string" || previousRunId.trim().length === 0)) {
+      return badRequest("previousRunId must be a non-empty string when provided");
+    }
 
     const connection = await resolveConnection({ connectionId }, guard.session);
 
     /*
+      An engine whose provider implements no database-native read-only statement path,
+      refused at the point the run is OPENED (#512).
+
+      Driven live on 2026-08-15 before this existed: a run on the bundled `libredb`
+      sample opened, captured a schema, drafted a statement, called `run_read_query` and
+      ended `failed` with `engine-unsupported`. Every word of that failure was true and
+      none of it needed the model — `queryReadOnly` is a property of the provider, known
+      from the connection this route has just resolved, and nothing about the objective
+      can change it. So the run spent a run id, a grounding capture and a model turn to
+      reach a sentence that was already available here.
+
+      Three things this checks, in the order they exclude each other:
+
+       - **The MODE.** Plan mode drafts on every engine and executes nothing it drafts,
+         so an unsupported engine is no reason to refuse one.
+       - **The WORKFLOW**, read off `AGENT_WORKFLOW_SENDS_STATEMENTS` rather than a list
+         written here. `operations` sends no statement at all, and refusing it would
+         withhold a workflow that runs on every engine over a claim that is not true of
+         it (#411) — which is the same reason the rail's amber pre-start card does not
+         gate Start. The workflow has to be known first, and under Automatic it is: the
+         rail classifies at `POST /api/agent/classify` and names the workflow in this
+         request, so the refusal lands after the classify call and before the open.
+       - **The ENGINE**, from `AGENT_EXECUTION_ENGINES` — the one named mirror of the
+         factory's own gate (`requiresReadOnlyStatements && typeof provider.queryReadOnly
+         !== "function"`), which `tests/unit/lib/agent/engine-support.test.ts` keeps
+         equal to the provider prototypes it claims to describe. Read here rather than
+         probed off a constructed provider, because a construction is not free on the
+         engines this refusal is about: on a single-writer file the second handle throws
+         rather than opening (B49), and it is the same constant the rail, the safety
+         strip and the login hero already read, so the notice and the refusal cannot
+         disagree about which engines they are talking about.
+
+      The sentence is the posture's, which is the one the rail's own amber card shows as
+      its reason — it names the engines that DO have such a path, that `operations` runs
+      here, and that plan mode drafts here, so a refused user is told both ways forward
+      rather than a third phrasing of the same fact.
+
+      Ahead of `admitAgentModel` on purpose: that gate probes the configured model,
+      which is a model call. The engine fact needs no model to establish, so it is
+      answered before one is spent.
+
+      400 and not 422, and the difference is not cosmetic: `use-agent-run.ts` reads a
+      422 from THIS route as the capability gate's verdict and renders "This model
+      cannot drive an agent run", which would be false here. The request is what has to
+      change — its workflow, its mode or its connection — and that is what 400 says; it
+      is the same status the route's other cross-field refusal (`autoExecute` on a
+      workflow that presents no answer) answers with.
+    */
+    if (
+      mode === "agent" &&
+      AGENT_WORKFLOW_SENDS_STATEMENTS[requestedWorkflow] &&
+      !AGENT_EXECUTION_ENGINES.includes(connection.type)
+    ) {
+      return badRequest(
+        agentPosture({
+          mode: "agent",
+          engine: connection.type,
+          engineLabel: getDBConfig(connection.type).label,
+          handover: false,
+        }).body,
+        // The only refusal here that a client can already be explaining for itself, so
+        // the only one that carries a code (#513).
+        "engine-unsupported",
+      );
+    }
+
+    /*
+      WHICH DATABASE this run reads, fingerprinted here because here is the only place
+      that holds the resolved record: everything downstream holds an id. It is written
+      onto the run, so a later follow-up can tell that the connection has been
+      re-pointed since the conversation it continues was established (B68), and it is
+      read below for exactly that. The password is excluded by `connectionIdentity`
+      itself, which is why this is that function and not a hash of the record.
+    */
+    const connectionIdentityOfRun = connectionIdentity(connection);
+
+    /*
       Before a run exists, not after one has failed. A model that cannot call tools
       would otherwise open a run, spend a drive and end having answered in prose — the
-      diagnosis gap `docs/BACKLOG.md` B18 describes. The gate refuses only what the
+      diagnosis gap #340 describes. The gate refuses only what the
       probe positively ESTABLISHED, so nothing that merely went wrong (a quota, a bad
       key, an unreachable endpoint) reaches here as a refusal; those still start, and
       the drive reports them in its own vocabulary. 422 rather than 400: the request is
@@ -207,6 +336,79 @@ export async function POST(req: Request) {
     }
 
     const service = await getAgentRunService();
+
+    /*
+      A run may CONTINUE a conversation. The context is DERIVED on the server from the
+      predecessor's own ledger, never trusted from the request body, and a caller may
+      only continue a run its own session opened, on this connection, that has ended.
+
+      The rule that governs the failures is: a SHAPE error refuses, a RUNTIME condition
+      DEGRADES. `previousRunId` is attached by the rail on its own — the user never
+      typed it — so a predecessor that cannot be reached must not take down the question
+      they DID type. Continuing a conversation is an enhancement, never a precondition
+      for asking. The run opens, carries no conversation, and says so.
+
+      Nothing is leaked by degrading that refusing did not leak: the same five reasons
+      collapsed into one refusal before and collapse into one `declined: "unavailable"`
+      now, so a caller guessing ids learns exactly what it could learn already. The sixth
+      way a continuation does not happen - a predecessor established against another
+      database - is `threadContextFor`'s own `"repointed"`, and it is split out because it
+      is the only one that is not a FAILURE: it is reached only after all five checks
+      below have PASSED, and the carry is then refused on purpose. That is also why it
+      leaks nothing. It is NOT split out for a longer remedy - see the `connectionIdentity`
+      field of the `start` call below, which writes the identity of the connection as it
+      points NOW even for the declined run, so the follow-up after this one continues that
+      run and carries (#512).
+    */
+    let thread: AgentThreadHeader | undefined;
+    if (previousRunId !== undefined) {
+      if (!isThreadContextEnabled()) {
+        // No `threadId`: a refused continuation starts a conversation of its OWN, and
+        // the fold names it after this run. Naming it after the run it was refused
+        // would hand a later follow-up a root that was never part of the conversation.
+        thread = { steps: [], text: "", declined: "disabled" };
+      } else {
+        let previous: AgentRunStatusReport | null = null;
+        let failed: "unavailable" | "error" | null = null;
+        try {
+          previous = await service.status(previousRunId);
+        } catch (error) {
+          // Two KINDS of failure, recorded apart because they say different things: a
+          // malformed id is about what the caller sent, an unreadable ledger is about
+          // this server and says nothing about the id at all. Neither reaches the caller
+          // as a distinction, and neither stops the run. Recorded rather than logged
+          // because a fail-open decision has to carry its reason as data.
+          failed =
+            error instanceof AgentRunStoreError && error.reasonCode === "INVALID_RUN_ID" ? "unavailable" : "error";
+        }
+        if (
+          failed === null &&
+          (previous === null ||
+            previous.record.actor.sessionId !== guard.session.username ||
+            previous.record.connectionId !== connection.id ||
+            !AGENT_TERMINAL_STATUSES.has(previous.record.status))
+        ) {
+          failed = "unavailable";
+        }
+        thread =
+          failed === null && previous !== null
+            ? // Sized for the model that will actually read it. The budget is resolved
+              // HERE rather than at drive time because the context is derived and
+              // persisted at open, and a resumed drive must reason from what its first
+              // drive was handed. `resolveConfig` is synchronous and reaches nothing.
+              // The database check is inside: a predecessor that read another database
+              // declines here rather than handing its claims to a run reading this one,
+              // under its own `declined: "repointed"` rather than this route's
+              // `"unavailable"`.
+              threadContextFor(
+                previous.record,
+                connectionIdentityOfRun,
+                threadContextMaxCharsFor(resolveConfig().model),
+              )
+            : { steps: [], text: "", declined: failed ?? "unavailable" };
+      }
+    }
+
     const record = await service.start({
       mode: mode as AgentRunMode,
       // Spread rather than passed as `undefined`, so a body that named no workflow
@@ -226,8 +428,19 @@ export async function POST(req: Request) {
       // resumed drive must ask this model the way the first drive asked, and only the
       // start path is in a position to have probed.
       ...(gate.protocol === "native" ? {} : { toolProtocol: gate.protocol }),
+      // Spread for the same reason as the fields above: absent reaches the store as
+      // the request that predates the field, so a run that starts its own conversation
+      // writes the same bytes a run opened before conversations existed did.
+      ...(thread === undefined ? {} : { thread }),
       actor: { sessionId: guard.session.username, role: guard.session.role },
       connectionId: connection.id,
+      // The database this run is ACTUALLY reading, written unconditionally - including
+      // on a run whose conversation was just declined as `"repointed"`. That is what
+      // makes the decline one question long: the rail's next follow-up continues this
+      // run, and this identity is the one it will be compared against. Writing the
+      // predecessor's instead would keep declining, which is what the rail's copy used
+      // to promise and the code never did (#512).
+      connectionIdentity: connectionIdentityOfRun,
       objective,
     });
 
@@ -253,6 +466,11 @@ export async function POST(req: Request) {
         workflowSource: record.workflowSource,
         workflowReading: record.workflowReading,
         autoExecute: record.autoExecute,
+        // The conversation this run actually belongs to, which is how the rail learns
+        // both what it may render and — through `declined` — that continuing one was
+        // asked for and did not happen. Echoed from the RECORD, so a run that started
+        // its own conversation reports the thread of one the fold gave it.
+        thread: record.thread,
       },
       { status: 202 },
     );

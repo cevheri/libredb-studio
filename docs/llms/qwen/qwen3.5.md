@@ -2,8 +2,8 @@
 
 `ollama pull qwen3.5:<size>` · sizes supported: 9b
 
-Every size listed here runs **all six agent surfaces**, five consecutive times each: 30 of 30
-runs. One supported size, and the only model in the product with a turn limit of its own.
+The size listed here runs **all six agent surfaces**, five consecutive times each: 30 of 30
+runs.
 
 ## What it does, and how long it takes
 
@@ -19,7 +19,7 @@ Every cell is 5/5, so the table says how long rather than whether.
 
 ### `qwen3.5:9b`
 
-**a 150-second turn limit.** Five surfaces clear the shipped 90 seconds comfortably; its plan turn lands at 92 to 94. The limit stays 90 for every other model.
+**a 150-second turn limit.** Five surfaces clear the shipped 90 seconds comfortably; its plan turn lands at 92 to 94. It was the first model to need it and is now one of five that carry it; the limit stays 90 for the other ten.
 
 **empty-turn retry.** Its optimization runs stopped answering after being corrected, leaving no text behind.
 

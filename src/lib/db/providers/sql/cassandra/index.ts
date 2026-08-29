@@ -25,11 +25,13 @@
  * - `ALLOW FILTERING` IS THE LAST CLAUSE. `… LIMIT 3 ALLOW FILTERING` returns rows;
  *   `… ALLOW FILTERING LIMIT 3` is a syntax error. The shared limiter appends, so the
  *   two clauses are transposed.
- * - A LINE COMMENT NEEDS A NEWLINE TO CLOSE IT, and CQL has a third comment form the
- *   shared readers do not know. `SELECT … LIMIT 3 -- note` with nothing after it is
- *   "line 1:45 mismatched character '<EOF>' expecting set null", and `-- note\n`
- *   returns rows; `//` is a line comment too. The limiter trims the newline, so a
- *   statement that would end inside a comment is left alone.
+ * - A LINE COMMENT NEEDS A NEWLINE TO CLOSE IT. `SELECT … LIMIT 3 -- note` with
+ *   nothing after it is "line 1:45 mismatched character '<EOF>' expecting set null",
+ *   and `-- note\n` returns rows. `sql.trim()` inside the shared limiter drops that
+ *   newline, so a statement that would end inside a comment is left alone here. CQL's
+ *   THIRD comment form, `//`, used to be part of this trap and no longer is: it is a
+ *   grammar fact (`doubleSlashComment`) that every shared reader now honours, so this
+ *   file no longer scans for it - see `endsInsideLineComment`.
  * - THERE IS NO EXPLAIN. `EXPLAIN SELECT …` is "line 1:0 no viable alternative at
  *   input 'EXPLAIN'". The only substitute is `{traceQuery: true}` plus
  *   `system_traces.events`, which profiles a statement that has ALREADY RUN - so it
@@ -76,16 +78,17 @@ import { readSqlSpan } from "@/lib/sql/spans";
 import { CASSANDRA_DEFAULT_PORT, CassandraDriverTransport } from "./driver-transport";
 import {
   CASSANDRA_IDENTITY_CQL,
+  CASSANDRA_INDEX_STATS_REFUSAL,
+  CASSANDRA_STORAGE_STATS_REFUSAL,
+  CASSANDRA_TABLE_STATS_REFUSAL,
+  cassandraVirtualTableRefusal,
   type CassandraServerFacts,
   getActiveSessions as readActiveSessions,
   getHealth as readHealth,
-  getIndexStats as readIndexStats,
   getOverview as readOverview,
   getPerformanceMetrics as readPerformanceMetrics,
   getSchema as readSchema,
   getSlowQueries as readSlowQueries,
-  getStorageStats as readStorageStats,
-  getTableStats as readTableStats,
   readServerFacts,
 } from "./introspect";
 import { CassandraTransportError, type CassandraTransport } from "./transport";
@@ -122,15 +125,30 @@ const APPENDED_AFTER_ALLOW_FILTERING = /\bALLOW(\s+)FILTERING\s+(LIMIT\s+\d+)/i;
 /**
  * Whether this text ends INSIDE a line comment - i.e. whether CQL would refuse it.
  *
- * Two comment forms, and the second is why this cannot be left to the shared readers:
- * CQL treats `//` as a line comment as well as `--`, and neither may be closed by end
- * of input. Measured on 5.0.9, `SELECT * FROM probe.customers LIMIT 3 -- note` with
- * nothing after it is a syntax error while the same text plus a newline returns the
- * rows.
+ * CQL needs TWO facts about comments that most dialects here do not, and only one of
+ * them is still local to this provider. `//` being a line comment as well as `--` IS
+ * a grammar fact - and not this engine's alone, since ClickHouse reads it the same way
+ * (both measured) - so it is `grammar.ts`'s `doubleSlashComment` now and this function
+ * no longer carries a private scan for it: it asks the shared span reader, which reads
+ * both forms under the `cassandra` grammar. The fact that stays local is the other -
+ * that NEITHER form may be closed by end of input. Measured on 5.0.9,
+ * `SELECT * FROM probe.customers LIMIT 3 -- note` with nothing after it is "line 1:45
+ * mismatched character '<EOF>' expecting set null" while the same text plus a newline
+ * returns the rows. That is a fact about where a statement may END, not about what a
+ * run is: `SqlSpan` calls a line comment closed by end of input terminated, which is
+ * correct everywhere else and is the answer every reader over it wants.
  *
- * It walks with the shared span reader so a `--` or `//` inside a string literal or a
- * quoted name is not mistaken for one - `WHERE url = 'http://x'` is an ordinary
- * statement - and so the walk stays linear rather than backtracking.
+ * The private scan was not merely redundant, and dropping it is why this is a fix
+ * rather than a tidy-up: while `//` was invisible to the shared readers, the row
+ * limiter appended the bound INSIDE the comment on this engine and on ClickHouse
+ * (measured there: `SELECT number FROM numbers(1000) // note` limited to 5 was
+ * emitted as `… // note LIMIT 5` and returned 1000 rows while reporting
+ * `wasLimited: true`), and the statement splitter cut a bare DROP out of one CQL read.
+ *
+ * Walking with the shared reader is also what keeps a `--` or `//` inside a string
+ * literal or a quoted name from being mistaken for a comment - `WHERE url =
+ * 'http://x'` is an ordinary statement - and keeps the walk linear rather than
+ * backtracking.
  */
 function endsInsideLineComment(sql: string, grammar: SqlGrammar): boolean {
   let open = false;
@@ -138,17 +156,10 @@ function endsInsideLineComment(sql: string, grammar: SqlGrammar): boolean {
   for (let at = 0; at < sql.length; ) {
     const span = readSqlSpan(sql, at, grammar);
     if (span !== null) {
-      // A `--` run the shared reader recognises. It is only UNCLOSED if it reaches
-      // the end of the text with no newline to close it.
+      // Either comment form, whichever the grammar recognised. It is only UNCLOSED if
+      // it reaches the end of the text with no newline to close it.
       open = span.kind === "line-comment" && span.end === sql.length && !sql.endsWith("\n");
       at = span.end;
-      continue;
-    }
-
-    if (sql[at] === "/" && sql[at + 1] === "/") {
-      const newline = sql.indexOf("\n", at);
-      open = newline === -1;
-      at = newline === -1 ? sql.length : newline + 1;
       continue;
     }
 
@@ -283,7 +294,7 @@ export class CassandraProvider extends SQLBaseProvider {
       // same reason.
       statementLanguage: "CQL (Cassandra Query Language) - no JOIN, no subquery, no OFFSET",
       // `getSlowQueries()` is empty by design here (introspect.ts), so this panel is
-      // ALWAYS empty on Cassandra - and it used to name a PostgreSQL extension (#U12).
+      // ALWAYS empty on Cassandra - and it used to name a PostgreSQL extension (#463).
       slowQueriesEmptyState:
         "Cassandra keeps no aggregate of finished statements: the slow-query threshold writes to the node's log file rather than to a table.",
     };
@@ -456,6 +467,25 @@ export class CassandraProvider extends SQLBaseProvider {
   }
 
   /**
+   * The facts, or a refusal naming the virtual table this panel would have read.
+   *
+   * The gate is here rather than inside the read because the read is also what
+   * `getHealth()` composes, and health must keep answering on a build with no virtual
+   * tables: `POST /api/db/test-connection` calls it and the connection dialog's save is
+   * gated on that request, so a throwing health check locks the whole ScyllaDB family
+   * out of the product (#455). A monitoring panel has the opposite obligation - it is
+   * the surface that must say what it could not read.
+   */
+  private requireVirtualTables(source: string): CassandraServerFacts {
+    const facts = this.requireFacts();
+    if (facts.virtualTablesAbsence !== undefined) {
+      throw new QueryError(cassandraVirtualTableRefusal(source, facts.virtualTablesAbsence), this.type);
+    }
+
+    return facts;
+  }
+
+  /**
    * The keyspace every catalog read resolves against.
    *
    * The connection's `database` field, exactly as a PostgreSQL connection pins one
@@ -602,34 +632,61 @@ export class CassandraProvider extends SQLBaseProvider {
     return this.guarded(() => readOverview(transport, keyspace, this.requireFacts()));
   }
 
+  /**
+   * ABSENT rather than empty on a build with no `system_views`.
+   *
+   * The key cache's hit ratio is this panel's only source, so a build that does not
+   * publish `system_views.caches` cannot answer the panel at all - and an empty
+   * `PerformanceMetrics` said the opposite, that every field was looked up and found
+   * to have no value. `getMonitoringData` leaves a rejected panel absent with this
+   * sentence under `errors`, which is what `PanelUnavailable` renders (#477).
+   */
   public async getPerformanceMetrics(): Promise<PerformanceMetrics> {
     const transport = this.requireTransport();
-    return this.guarded(() => readPerformanceMetrics(transport, this.requireFacts()));
+    const facts = this.requireVirtualTables("system_views.caches");
+    return this.guarded(() => readPerformanceMetrics(transport, facts));
   }
 
-  /** Empty, and it asks the cluster nothing: there is no slow-query log to read. */
+  /**
+   * Empty, and it asks the cluster nothing: there is no slow-query log to read.
+   *
+   * The one always-empty panel that stays empty. `QueriesTab` renders
+   * `ProviderLabels.slowQueriesEmptyState` in its place, and this provider declares one
+   * (`getLabels()` above), so Cassandra's own sentence already reaches the user here -
+   * which is the thing the absence mechanism exists to deliver.
+   */
   public getSlowQueries(): Promise<SlowQueryStats[]> {
     return Promise.resolve(readSlowQueries());
   }
 
+  /** ABSENT rather than empty on a build with no `system_views`: see `getPerformanceMetrics`. */
   public async getActiveSessions(options: { limit?: number } = {}): Promise<ActiveSessionDetails[]> {
     const transport = this.requireTransport();
-    return this.guarded(() => readActiveSessions(transport, this.requireFacts(), options));
+    const facts = this.requireVirtualTables("system_views.queries");
+    return this.guarded(() => readActiveSessions(transport, facts, options));
   }
 
-  /** Empty, and it asks the cluster nothing: see `introspect.ts` for the two numbers refused. */
+  /**
+   * REFUSED on every build, with the reason, rather than answered empty.
+   *
+   * These three panels never had a source: the tables and the secondary indexes exist
+   * and the schema tree lists them, so `[]` claimed a measurement of nothing where the
+   * truth is that no honest figure is readable from CQL. The panels are absent with
+   * their own sentence for the same reason the ScyllaDB ones above are - the rule
+   * `MonitoringData` states, not a property of any one build.
+   */
   public getTableStats(): Promise<TableStats[]> {
-    return Promise.resolve(readTableStats());
+    return Promise.reject(new QueryError(CASSANDRA_TABLE_STATS_REFUSAL, this.type));
   }
 
-  /** Empty, and it asks the cluster nothing: an index here has no size and no scan counter. */
+  /** Refused with its reason: an index here has no size and no scan counter. */
   public getIndexStats(): Promise<IndexStats[]> {
-    return Promise.resolve(readIndexStats());
+    return Promise.reject(new QueryError(CASSANDRA_INDEX_STATS_REFUSAL, this.type));
   }
 
-  /** Empty, and it asks the cluster nothing: the only storage figures are whole mebibytes. */
+  /** Refused with its reason: the only storage figures are whole mebibytes. */
   public getStorageStats(): Promise<StorageStats[]> {
-    return Promise.resolve(readStorageStats());
+    return Promise.reject(new QueryError(CASSANDRA_STORAGE_STATS_REFUSAL, this.type));
   }
 
   public async getHealth(): Promise<HealthInfo> {

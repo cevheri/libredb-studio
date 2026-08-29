@@ -8,6 +8,12 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Progress } from "@/components/ui/progress";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import type { MonitoringData } from "@/lib/db/types";
+// The formatter is shared with `TablesTab` and every provider rather than local to this
+// tab: both tabs used to keep a byte-identical threshold cascade that stopped at GB and
+// guarded nothing, so a negative rendered as "-1 B", a non-finite as "NaN B" and an
+// exabyte as "1073741824.00 GB". The shared one refuses a negative or a non-finite with
+// "N/A" and spells PB and EB, which is the distinction this whole tab is about.
+import { formatBytes } from "@/lib/db/utils/pool-manager";
 import { PanelUnavailable } from "../PanelUnavailable";
 
 interface StorageTabProps {
@@ -29,7 +35,22 @@ export function StorageTab({ data, loading }: StorageTabProps) {
   // would claim a measurement the engine refused to make. The whole-dashboard error state
   // is not right either - the other panels answered - so this panel alone carries the
   // engine's own sentence. See MonitoringData in src/lib/db/types.ts.
+  //
+  // `overview` is not a panel of its own on this tab: what it feeds is the Storage Breakdown,
+  // so that is where its sentence goes. The DB Size card keeps the "N/A" it already draws for
+  // a byte figure it does not have, because a stat card has nowhere to put a sentence.
+  const overviewUnavailable = data?.overview === undefined ? data?.errors?.overview : undefined;
   const storageUnavailable = data?.storage === undefined ? data?.errors?.storage : undefined;
+  const tablesUnavailable = data?.tables === undefined ? data?.errors?.tables : undefined;
+
+  // A refused table read costs more than the Largest Tables panel below, because five figures
+  // on this tab come off those rows. Read as `[]`, a refusal is indistinguishable from a database
+  // that holds no tables: `every()` is vacuously true, so both totals below published a
+  // measured "0 B" at "0.0%" and the remainder row took the whole database at 100%. Gating the
+  // two `known` flags on the refusal routes every one of those figures to the "N/A" this tab
+  // already draws for a byte figure it does not have, and leaves a genuine "no tables" answer
+  // at the 0 B it measured.
+  const statsRefused = tablesUnavailable !== undefined;
 
   // Calculate totals
   //
@@ -42,7 +63,7 @@ export function StorageTab({ data, loading }: StorageTabProps) {
   // total is shown only when every table carries a figure; `every()` keeps a genuine
   // "no tables" answer at 0 B.
   const totalTableSize = tables.reduce((sum, t) => sum + (t.tableSizeBytes ?? 0), 0);
-  const tableSizeKnown = tables.every((t) => t.tableSizeBytes !== undefined);
+  const tableSizeKnown = !statsRefused && tables.every((t) => t.tableSizeBytes !== undefined);
   // The index total comes from the per-TABLE figure, not from summing the per-index rows.
   // InnoDB has no separate primary-key index: the clustered index IS the table, so
   // `mysql.innodb_index_stats` reports the PRIMARY row's size as the row data, and summing every
@@ -56,23 +77,19 @@ export function StorageTab({ data, loading }: StorageTabProps) {
   // the total is shown only when every table carries a figure - `every()` also keeps a genuine
   // "no tables" answer at 0 B.
   const totalIndexSize = tables.reduce((sum, t) => sum + (t.indexSizeBytes ?? 0), 0);
-  const indexSizeKnown = tables.every((t) => t.indexSizeBytes !== undefined);
+  const indexSizeKnown = !statsRefused && tables.every((t) => t.indexSizeBytes !== undefined);
   const walStorage = storage.find((s) => s.name === "WAL");
-
-  const formatBytes = (bytes: number) => {
-    if (bytes >= 1073741824) return `${(bytes / 1073741824).toFixed(2)} GB`;
-    if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(2)} MB`;
-    if (bytes >= 1024) return `${(bytes / 1024).toFixed(2)} KB`;
-    return `${bytes} B`;
-  };
 
   // Calculate storage breakdown. Absence and zero are different inputs: a provider that
   // OMITS `databaseSizeBytes` is saying no byte figure is knowable - Apache Cassandra's
   // `system_views.disk_usage` publishes whole mebibytes, measured as "1 MiB" for a
   // 19,476-byte table (#424) - so there is no total to divide by and no breakdown to
   // draw, and this tab says so instead of formatting a "0 B" the engine never reported.
-  // A provider that sends a real 0 (Trino, Druid) has measured one, and keeps the
-  // arithmetic below unchanged.
+  // A real 0 is a third input and keeps the arithmetic below unchanged - but no provider in
+  // this tree is known to send a measured one. Trino omits the key as of this round, and
+  // Druid's 0 comes out of its local `asNumber`, which returns 0 for an absent row (backlog
+  // D44). The distinction is honoured because the field is optional precisely so the absence
+  // can be said, not because a named engine exercises the zero.
   const sizeKnown = overview?.databaseSizeBytes !== undefined;
   const totalSize = overview?.databaseSizeBytes ?? 0;
   const tablePercent = totalSize > 0 && tableSizeKnown ? (totalTableSize / totalSize) * 100 : 0;
@@ -80,7 +97,27 @@ export function StorageTab({ data, loading }: StorageTabProps) {
   // Without the table or the index bytes the remainder is not computable either, so its bar
   // stays empty instead of absorbing the unknown share.
   const breakdownKnown = tableSizeKnown && indexSizeKnown;
-  const otherPercent = breakdownKnown ? Math.max(0, 100 - tablePercent - indexPercent) : 0;
+  // And a share needs a total to divide by. The two shares above are each guarded on
+  // `totalSize > 0`, so a total of 0 forced both to 0 and `100 - 0 - 0` handed the remainder the
+  // entire bar: measured in the DOM against the tab's own measured-zero fixture, Tables and
+  // Indexes read `translateX(-100%)` while the remainder read `translateX(-0%)` - a full bar over
+  // a database with no bytes. `totalSize > 0` is the honest gate for every share on this tab
+  // because it excludes BOTH inputs that cannot be divided by: an absent size falls to 0 here, so
+  // one test covers the refusal and the measured zero alike.
+  const shareKnown = breakdownKnown && totalSize > 0;
+  const otherPercent = shareKnown ? Math.max(0, 100 - tablePercent - indexPercent) : 0;
+  // The remainder's BYTES are gated differently, and deliberately NOT on `totalSize > 0`: with a
+  // measured 0 total and no tables, `0 - 0 - 0` is an honest 0 B and stays one. What it cannot
+  // survive is a NEGATIVE, which a 0 total beside per-table figures that answered produces -
+  // `getTableStats()` is a separate read and does not share the overview's failure - and the
+  // local cascade this tab used to format with returned its input unchanged, so the cell drew
+  // "-943718400 B": a negative byte count presented as a measurement (measured in the DOM). The
+  // shared formatter now answers "N/A" for a negative, which is the same refusal one layer down
+  // and no reason to stop refusing here. A negative remainder says the two
+  // reads disagree, not that the unattributed share is below zero, so there is no figure to
+  // print. Gating this on the share instead would refuse the honest 0 B as well.
+  const otherBytes = totalSize - totalTableSize - totalIndexSize;
+  const remainderKnown = breakdownKnown && otherBytes >= 0;
 
   return (
     <div className="p-3 sm:p-6 space-y-4 sm:space-y-6">
@@ -102,10 +139,18 @@ export function StorageTab({ data, loading }: StorageTabProps) {
             <HardDrive strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-green-500" />
           </CardHeader>
           <CardContent className="p-2 sm:p-4 pt-0">
-            <div className="text-lg sm:text-2xl font-medium truncate">
+            {/*
+              The FIGURE is this tab's own sum of per-table bytes and stays gated on the size
+              being known at all, which is the card's subject: Tables as part of the database.
+              The percentage below it is gated harder, on `totalSize > 0`, because a share of a
+              zero-byte total is not a smaller share - it is not a share. With a measured 0 and
+              real per-table bytes this line used to read "700.00 MB" over "0.0%", which is a
+              fabricated denominator under an honest numerator (measured in the DOM).
+            */}
+            <div className="text-lg sm:text-2xl font-medium truncate" data-testid="storage-stat-tables">
               {sizeKnown && tableSizeKnown ? formatBytes(totalTableSize) : "N/A"}
             </div>
-            {sizeKnown && tableSizeKnown && (
+            {totalSize > 0 && tableSizeKnown && (
               <p className="text-xs sm:text-xs text-muted-foreground mt-1">{tablePercent.toFixed(1)}%</p>
             )}
           </CardContent>
@@ -117,10 +162,10 @@ export function StorageTab({ data, loading }: StorageTabProps) {
             <Archive strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-purple-500" />
           </CardHeader>
           <CardContent className="p-2 sm:p-4 pt-0">
-            <div className="text-lg sm:text-2xl font-medium truncate">
+            <div className="text-lg sm:text-2xl font-medium truncate" data-testid="storage-stat-indexes">
               {sizeKnown && indexSizeKnown ? formatBytes(totalIndexSize) : "N/A"}
             </div>
-            {sizeKnown && indexSizeKnown && (
+            {totalSize > 0 && indexSizeKnown && (
               <p className="text-xs sm:text-xs text-muted-foreground mt-1">{indexPercent.toFixed(1)}%</p>
             )}
           </CardContent>
@@ -148,7 +193,9 @@ export function StorageTab({ data, loading }: StorageTabProps) {
           </CardTitle>
         </CardHeader>
         <CardContent className="p-3 sm:p-4 pt-0 space-y-3 sm:space-y-4">
-          {sizeKnown ? (
+          {overviewUnavailable ? (
+            <PanelUnavailable message={overviewUnavailable} />
+          ) : sizeKnown ? (
             <div className="space-y-2 sm:space-y-3">
               <div>
                 <div className="flex items-center justify-between text-xs sm:text-xs mb-1">
@@ -156,7 +203,9 @@ export function StorageTab({ data, loading }: StorageTabProps) {
                     <div className="w-2 h-2 sm:w-3 sm:h-3 rounded-sm bg-green-500" />
                     Tables
                   </span>
-                  <span className="font-medium">{tableSizeKnown ? formatBytes(totalTableSize) : "N/A"}</span>
+                  <span className="font-medium" data-testid="storage-breakdown-tables">
+                    {tableSizeKnown ? formatBytes(totalTableSize) : "N/A"}
+                  </span>
                 </div>
                 <Progress value={tablePercent} className="h-1.5 sm:h-2" />
               </div>
@@ -167,7 +216,9 @@ export function StorageTab({ data, loading }: StorageTabProps) {
                     <div className="w-2 h-2 sm:w-3 sm:h-3 rounded-sm bg-purple-500" />
                     Indexes
                   </span>
-                  <span className="font-medium">{indexSizeKnown ? formatBytes(totalIndexSize) : "N/A"}</span>
+                  <span className="font-medium" data-testid="storage-breakdown-indexes">
+                    {indexSizeKnown ? formatBytes(totalIndexSize) : "N/A"}
+                  </span>
                 </div>
                 <Progress value={indexPercent} className="h-1.5 sm:h-2 [&>div]:bg-purple-500" />
               </div>
@@ -176,17 +227,35 @@ export function StorageTab({ data, loading }: StorageTabProps) {
                 <div className="flex items-center justify-between text-xs sm:text-xs mb-1">
                   <span className="flex items-center gap-1 sm:gap-2">
                     <div className="w-2 h-2 sm:w-3 sm:h-3 rounded-sm bg-muted-foreground" />
-                    <span className="hidden sm:inline">Other (TOAST, FSM)</span>
-                    <span className="sm:hidden">Other</span>
+                    {/*
+                      Engine-neutral on purpose. This row is arithmetic - the database bytes the
+                      per-table data and index figures do not account for - and what fills it
+                      differs per engine: TOAST and the free space map on PostgreSQL, the schema,
+                      the freelist and page overhead on SQLite and libSQL, which have neither.
+                      Labelled "Other (TOAST, FSM)" it read "4.00 KB" of PostgreSQL structures
+                      against a real 64 KB libSQL database (#515) - the number was right and the
+                      words were another engine's. The label now names the arithmetic. Varying the
+                      wording per engine would have to come from `ProviderLabels`, the way the
+                      slow-query empty state does, and this tab is passed no labels.
+                    */}
+                    <span className="hidden sm:inline" data-testid="storage-breakdown-other-label">
+                      Other (unattributed)
+                    </span>
+                    <span className="sm:hidden" data-testid="storage-breakdown-other-label-compact">
+                      Other
+                    </span>
                   </span>
-                  <span className="font-medium">
-                    {breakdownKnown ? formatBytes(totalSize - totalTableSize - totalIndexSize) : "N/A"}
+                  <span className="font-medium" data-testid="storage-breakdown-other">
+                    {remainderKnown ? formatBytes(otherBytes) : "N/A"}
                   </span>
                 </div>
                 <Progress value={otherPercent} className="h-1.5 sm:h-2 [&>div]:bg-muted-foreground" />
               </div>
             </div>
           ) : (
+            // The engine answered and published no byte figure - Apache Cassandra is the case
+            // (#424) - which is a different fact from the refusal above and gets this tab's own
+            // copy rather than a sentence there is none of.
             <div className="text-center py-8 text-muted-foreground">
               <HardDrive strokeWidth={1.5} className="h-8 w-8 mx-auto mb-2 opacity-50" />
               <p className="text-xs">No storage size information available.</p>
@@ -278,7 +347,9 @@ export function StorageTab({ data, loading }: StorageTabProps) {
           </CardTitle>
         </CardHeader>
         <CardContent className="p-0 sm:p-4 sm:pt-0">
-          {tables.length === 0 ? (
+          {tablesUnavailable ? (
+            <PanelUnavailable message={tablesUnavailable} />
+          ) : tables.length === 0 ? (
             <div className="text-center py-8 text-muted-foreground">
               <Database strokeWidth={1.5} className="h-8 w-8 mx-auto mb-2 opacity-50" />
               <p className="text-xs">No table information available.</p>
@@ -304,8 +375,16 @@ export function StorageTab({ data, loading }: StorageTabProps) {
                       // engine that cannot measure the first cannot have measured the sum. When
                       // it is absent the share is left as "-" rather than drawn from the
                       // placeholder the required `totalSizeBytes` field still has to carry.
-                      const bytesReported = table.tableSizeBytes !== undefined;
-                      const percent = totalSize > 0 && bytesReported ? (table.totalSizeBytes / totalSize) * 100 : 0;
+                      //
+                      // A share also needs a database total to divide by, and this cell used to
+                      // draw one without: with `databaseSizeBytes` absent or 0 the guard forced
+                      // the share to 0 and every row rendered "0.0%" beside an empty bar -
+                      // measured against a refused overview, two rows with real bytes each
+                      // claiming to be 0.0% of a database whose size nothing had reported. The
+                      // same defect as the remainder's full bar above, in a shape a text
+                      // assertion CAN see.
+                      const shareKnown = totalSize > 0 && table.tableSizeBytes !== undefined;
+                      const percent = shareKnown ? (table.totalSizeBytes / totalSize) * 100 : 0;
                       return (
                         <TableRow key={`${table.schemaName}.${table.tableName}`}>
                           <TableCell className="py-2">
@@ -318,7 +397,7 @@ export function StorageTab({ data, loading }: StorageTabProps) {
                           </TableCell>
                           <TableCell className="text-right text-xs py-2">{table.totalSize}</TableCell>
                           <TableCell className="text-right hidden sm:table-cell py-2">
-                            {bytesReported ? (
+                            {shareKnown ? (
                               <div className="flex items-center justify-end gap-1 sm:gap-2">
                                 <Progress value={percent} className="w-12 sm:w-16 h-1.5 sm:h-2" />
                                 <span className="text-xs w-10 sm:w-12">{percent.toFixed(1)}%</span>

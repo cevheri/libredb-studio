@@ -1,14 +1,30 @@
 "use client";
 
 import React, { useState } from "react";
-import { Table2, Search, TriangleAlert, LoaderCircle, RefreshCw, Zap, type LucideIcon } from "lucide-react";
+import {
+  Table2,
+  Search,
+  TriangleAlert,
+  LoaderCircle,
+  RefreshCw,
+  Zap,
+  Wrench,
+  ShieldCheck,
+  type LucideIcon,
+} from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import type { MaintenanceType, MonitoringData, ProviderCapabilities } from "@/lib/db/types";
+import {
+  maintenanceControl,
+  type MaintenanceType,
+  type MonitoringData,
+  type ProviderCapabilities,
+} from "@/lib/db/types";
+import { formatBytes } from "@/lib/db/utils/pool-manager";
 import { PanelUnavailable } from "../PanelUnavailable";
 
 /**
@@ -16,25 +32,36 @@ import { PanelUnavailable } from "../PanelUnavailable";
  * `MaintenanceType` vocabulary a provider declares in `maintenanceOperations`
  * rather than to a loose string — a typo would then be a type error instead of
  * a silently missing control.
+ *
+ * `label` is only the fallback for a provider that declares no
+ * `maintenanceOperationSpecs`: where one exists, `maintenanceControl()` replaces the
+ * generic verb with the engine's own name for it, so MySQL titles its buttons
+ * "Optimize Table" and "Check Table" rather than borrowing PostgreSQL's vocabulary.
+ * `optimize` and `check` are candidates at all because the operations exist on five
+ * providers and had no per-table control anywhere; the ones whose statement takes no
+ * object (SQL Server's `DBCC CHECKDB`, SQLite's `PRAGMA integrity_check`) declare
+ * `perEntity: false` and are filtered out here (#496).
  */
 const MAINTENANCE_ACTIONS: { type: MaintenanceType; label: string; Icon: LucideIcon; className: string }[] = [
   { type: "analyze", label: "Analyze", Icon: Search, className: "h-6 w-6 sm:h-8 sm:w-8" },
   { type: "vacuum", label: "Vacuum", Icon: RefreshCw, className: "h-6 w-6 sm:h-8 sm:w-8" },
+  { type: "optimize", label: "Optimize", Icon: Wrench, className: "h-6 w-6 sm:h-8 sm:w-8" },
   { type: "reindex", label: "Reindex", Icon: Zap, className: "h-6 w-6 sm:h-8 sm:w-8 hidden sm:inline-flex" },
+  { type: "check", label: "Check", Icon: ShieldCheck, className: "h-6 w-6 sm:h-8 sm:w-8 hidden sm:inline-flex" },
 ];
 
 /**
  * Pure formatters, at module scope rather than re-created inside `TablesTab` on every
  * render. They also keep the component's own cognitive complexity to the decisions it
  * actually makes about absence, which is what this panel is about.
+ *
+ * `formatBytes` is NOT one of them and is imported instead: this tab and `StorageTab`
+ * each carried a byte-identical threshold cascade that stopped at GB and had no guard,
+ * so a negative rendered as "-1 B", a non-finite as "NaN B" and an exabyte as
+ * "1073741824.00 GB" - a non-magnitude drawn as a figure, in the panel whose whole
+ * subject is telling a reading from an absence. The shared one refuses a negative or a
+ * non-finite with "N/A" and spells PB and EB.
  */
-function formatBytes(bytes: number): string {
-  if (bytes >= 1073741824) return `${(bytes / 1073741824).toFixed(2)} GB`;
-  if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(2)} MB`;
-  if (bytes >= 1024) return `${(bytes / 1024).toFixed(2)} KB`;
-  return `${bytes} B`;
-}
-
 function formatNumber(n: number): string {
   if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
   if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
@@ -84,6 +111,41 @@ function VacuumNote({
   return null;
 }
 
+/**
+ * Why a per-table maintenance control is nowhere on this page.
+ *
+ * The two maintenance items in the schema explorer (`src/components/schema-explorer/TableItem.tsx`)
+ * are DEEP LINKS into a maintenance surface, and they are gated on what the OPERATION declares -
+ * `maintenanceControl(..., "perEntity")` - which is a different question from whether the surface
+ * has a ROW to hang the control on. Per-table buttons are rendered for rows of `data.tables` only,
+ * so both absence paths in this panel render none of them, and an operator who arrived asking for
+ * one operation was shown an empty list that said nothing about it (U22).
+ *
+ * The operations are named and the table is not: nothing passes the deep link's table name into
+ * this panel - `MonitoringDashboard` renders it with no search params - so naming a table here
+ * would be an invention. What can be stated honestly is which controls the engine declares per
+ * table and why none of them appears.
+ *
+ * Two things the note deliberately does NOT say:
+ *  - No page to go to instead. The only caller (`MonitoringDashboard`) passes no `isAdmin`, and the
+ *    prop defaults to true, so this component cannot tell an admin from the non-admin that
+ *    /monitoring is the route for - and `src/proxy.ts` denies a non-admin /admin/operations. Of the
+ *    two fixes available (thread the real role down, or drop the clause) dropping it is the smaller
+ *    one and the only one that changes no other behaviour: threading the role would also switch off
+ *    the per-row buttons on that route, which is older behaviour and not this change's business.
+ *  - One cause for two inputs. `refused` is the `errors.tables` branch, where `PanelUnavailable` is
+ *    already showing the engine's own reason - a permission or catalog failure as often as a missing
+ *    statistic - so that branch says only what was measured here: nothing could be read.
+ */
+function MaintenanceUnattachableNote({ actions, refused }: Readonly<{ actions: string[]; refused: boolean }>) {
+  const cause = refused ? "no table statistics could be read" : "this database published no table statistics";
+  return (
+    <p className="text-xs text-muted-foreground text-center px-4 pb-6" data-testid="tables-maintenance-unattachable">
+      {`Per-table maintenance (${actions.join(", ")}) is run from a row of this list, and ${cause} - so there is no row to run it on.`}
+    </p>
+  );
+}
+
 function bloatBadgeVariant(ratio: number): "destructive" | "outline" | "secondary" {
   if (ratio > 20) return "destructive";
   if (ratio > 10) return "outline";
@@ -121,6 +183,13 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
   // Calculate totals
   const totalRows = tables.reduce((sum, t) => sum + t.rowCount, 0);
   const totalSize = tables.reduce((sum, t) => sum + t.totalSizeBytes, 0);
+  // The same gate StorageTab has carried since #469: `tableSizeBytes` is what says whether
+  // this engine publishes per-table bytes at all, and `totalSizeBytes` is a required field
+  // that has to carry SOMETHING when it does not - a 0 beside the "N/A" its own `totalSize`
+  // spells. Summing those zeros drew "0 B / Total" for LibreDB over a database with bytes
+  // on disk (measured 2026-08-25: 1,878 file bytes, five namespaces), and bun:sqlite sits
+  // in the same shape wherever `dbstat` is missing. `every()` keeps a genuine "no tables"
+  // answer at 0 B, because there is nothing there to be unknown.
   const tablesNeedingVacuum = tables.filter((t) => (t.bloatRatio ?? 0) > 10).length;
 
   // A panel whose read failed is absent from the payload with its own message under
@@ -130,18 +199,22 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
   // engine's own sentence. See MonitoringData in src/lib/db/types.ts.
   const tablesUnavailable = data?.tables === undefined ? data?.errors?.tables : undefined;
 
-  // ABSENCE and ZERO are different inputs — the rule #448 settled for StorageTab, which
+  // ABSENCE and ZERO are different inputs - the rule #448 settled for StorageTab, which
   // this panel was still breaking one component over. A provider that publishes no table
-  // statistics answers `[]` (Apache Cassandra's `getTableStats` returns an empty array as
-  // a documented refusal; Apache Druid and Apache Trino do the same), and `BaseProvider`
-  // assigns that array whenever `includeTables` is set, so `tables` alone cannot tell a
-  // refusal from an empty database. The required `overview.tableCount` can: Cassandra
-  // populates it from `system_schema`, and it read 6 in the very frame these cards read 0
-  // (measured 2026-08-21 in Chrome against Apache Cassandra 5.0.9). Tables the engine
-  // knows about but reports no statistics for means the figures are not knowable, so the
-  // cards say so rather than publishing a confident zero the engine never measured. A
-  // provider that reports a genuine 0 keeps today's arithmetic and today's rendering.
+  // statistics can still answer `[]` (Apache Druid returns an empty array as a documented
+  // refusal, and so does any Trino catalog whose tables partly publish statistics), and
+  // `BaseProvider` assigns that array whenever `includeTables` is set, so `tables` alone
+  // cannot tell a refusal from an empty database. The required `overview.tableCount` can:
+  // Cassandra populated it from `system_schema` and it read 6 in the very frame these
+  // cards read 0 (measured 2026-08-21 in Chrome against Apache Cassandra 5.0.9). Tables
+  // the engine knows about but reports no statistics for means the figures are not
+  // knowable, so the cards say so rather than publishing a confident zero the engine
+  // never measured. A provider that reports a genuine 0 keeps today's arithmetic and
+  // today's rendering. Cassandra and a wholly unmeasurable Trino catalog no longer reach
+  // this heuristic at all: since 2026-08-25 they REJECT with their own sentence and land
+  // on `tablesUnavailable` above, which is the reading this approximation exists for.
   const statsAbsent = tablesUnavailable !== undefined || (tables.length === 0 && (data?.overview?.tableCount ?? 0) > 0);
+  const sizeAbsent = statsAbsent || !tables.every((t) => t.tableSizeBytes !== undefined);
 
   // Whether the engine HAS vacuum is a capability question, not a data question, so it is
   // read from what the provider declares instead of inferred from the rows. Cassandra
@@ -161,11 +234,23 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
     setActionLoading(null);
   };
 
-  // Offer only the maintenance a provider declares it can perform: /api/db/maintenance
-  // rejects everything else with 400, so an ungated button can only produce an error.
-  const availableActions = capabilities?.supportsMaintenance
-    ? MAINTENANCE_ACTIONS.filter((action) => capabilities.maintenanceOperations.includes(action.type))
-    : [];
+  // Offer only the maintenance a provider declares it can perform HERE: /api/db/maintenance
+  // rejects an undeclared operation with 400, and a declared one whose target is not a table
+  // rejects the table name the button sends — SQLite's VACUUM ignores it and rewrote the whole
+  // database from a control that named one table, Oracle's index rebuild answered ORA-01418
+  // for every table name there is. `maintenanceControl` reads the provider's own
+  // `perEntity` declaration for each, and hands back the engine's own wording with it (#496).
+  const availableActions = MAINTENANCE_ACTIONS.flatMap((action) => {
+    const control = maintenanceControl(capabilities, action.type, "perEntity");
+    return control.offered ? [{ ...action, label: control.label ?? action.label }] : [];
+  });
+
+  // Both halves have to be true for the dead end U22 names: the engine declares a control
+  // that takes ONE table, and this panel has no table to offer it on. `statsAbsent` covers
+  // both readings of that absence - the refusal recorded under `errors.tables` and the empty
+  // list an engine returns while its own overview counts tables - and is false for a database
+  // that genuinely holds none, where there is nothing to maintain and nothing to explain.
+  const maintenanceUnattachable = isAdmin && availableActions.length > 0 && statsAbsent;
 
   return (
     <div className="p-3 sm:p-6 space-y-4 sm:space-y-6">
@@ -177,7 +262,9 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
             <Table2 strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent className="p-2 sm:p-4 pt-0">
-            <div className="text-lg sm:text-2xl font-medium">{statsAbsent ? "N/A" : tables.length}</div>
+            <div className="text-lg sm:text-2xl font-medium" data-testid="tables-stat-count">
+              {statsAbsent ? "N/A" : tables.length}
+            </div>
             {!statsAbsent && (
               <p className="text-xs sm:text-xs text-muted-foreground mt-1">{formatNumber(totalRows)} rows</p>
             )}
@@ -190,8 +277,10 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
             <Search strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent className="p-2 sm:p-4 pt-0">
-            <div className="text-lg sm:text-2xl font-medium">{statsAbsent ? "N/A" : formatBytes(totalSize)}</div>
-            {!statsAbsent && <p className="text-xs sm:text-xs text-muted-foreground mt-1">Total</p>}
+            <div className="text-lg sm:text-2xl font-medium" data-testid="tables-stat-size">
+              {sizeAbsent ? "N/A" : formatBytes(totalSize)}
+            </div>
+            {!sizeAbsent && <p className="text-xs sm:text-xs text-muted-foreground mt-1">Total</p>}
           </CardContent>
         </Card>
 
@@ -270,7 +359,9 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
                           </span>
                         ) : null}
                       </TableCell>
-                      <TableCell className="text-right text-xs py-2">{table.tableSize}</TableCell>
+                      <TableCell className="text-right text-xs py-2" data-testid="table-row-size">
+                        {table.tableSize ?? "-"}
+                      </TableCell>
                       <TableCell className="text-right text-xs hidden md:table-cell py-2">
                         {table.indexSize || "-"}
                       </TableCell>
@@ -318,6 +409,12 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
                 </TableBody>
               </Table>
             </div>
+          )}
+          {maintenanceUnattachable && (
+            <MaintenanceUnattachableNote
+              actions={availableActions.map((a) => a.label)}
+              refused={tablesUnavailable !== undefined}
+            />
           )}
         </CardContent>
       </Card>

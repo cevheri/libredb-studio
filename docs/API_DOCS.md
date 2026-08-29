@@ -261,13 +261,15 @@ Detailed health check for a specific database connection.
 ```json
 {
   "error": "Connection failed: timeout",
-  "activeConnections": 0,
-  "databaseSize": "N/A",
-  "cacheHitRatio": "N/A",
-  "slowQueries": [],
-  "activeSessions": []
+  "code": "CONNECTION_ERROR",
+  "statusCode": 503
 }
 ```
+
+> A failed health read answers the shared error shape, NOT a `HealthInfo` filled with zeros. This
+> block used to show `"activeConnections": 0` beside `"error"`, which is a fabricated measurement in
+> a document other people build clients against: the route's failure path is
+> `createErrorResponse` (`src/lib/api/errors.ts`) and it never composes a reading.
 
 ---
 
@@ -764,7 +766,7 @@ admin routes use.
 |-------|------|----------|-------------|
 | `connection` | object | Yes | Database connection configuration |
 | `type` | string | Yes | Maintenance operation type |
-| `target` | string | No | Target table name or PID (for kill) |
+| `target` | string | No | Target table name or PID (for kill). Also selects the *placement* the request is validated as: absent or empty means whole-database, any name means one object |
 
 **Maintenance Types:**
 
@@ -808,6 +810,17 @@ admin routes use.
 ```
 
 The handler validates against the target provider's capabilities: `type` is required (`{ "error": "Maintenance type is required" }`), the provider must support maintenance at all, and the requested operation must be in that provider's supported set (see the matrix above) — otherwise a `400` is returned listing what the provider does support.
+
+A fourth `400` gates what the operation may be *pointed at*. Each provider declares that separately
+(`maintenanceOperationSpecs`, documented per engine under `docs/providers/`), and `target` selects
+which half of the declaration this request is: absent or empty is a whole-database request, a name
+is a per-object one. When the provider says that placement is not offered for this operation while
+the other one is, nothing is run and the reply names the provider's own wording for the control -
+`{ "error": "Vacuum Database takes no target on this database: it runs over the whole database. Omit 'target'." }`
+for a targeted SQLite `vacuum`, and the mirror-image *"requires a target"* message for a targetless
+operation that has no whole-database form. An operation whose declaration offers *neither* placement
+is not refused: its target is a session or query id that neither half describes (every engine's
+`kill`), so the request passes through.
 
 A `druid` connection fails the second check whatever the `type` is, with `{ "error": "Maintenance operations not supported for this database" }`: no maintenance operation is reachable from Druid SQL, so its supported set is empty by design. Compaction and retention are Coordinator and task concerns, and Druid publishes no catalog of running queries, so there is no id for `kill` to name.
 
@@ -894,8 +907,8 @@ required" }` without a session). Never `500`, and never names a key's value.
 |-------|---------|
 | `enabled` | A literal boolean. The rail compares `=== true` |
 | `ledgerVerified` | `true` when the durable ledger's writable-path probe passed; `false` for the Postgres backend, which is accepted without being contacted |
-| `reason` | One code per operator action: `OPERATOR_DISABLED`, `NO_MODEL_CONFIGURED`, `LEDGER_UNAVAILABLE`, `UNSANCTIONED_WORLD_TARGET`, `IMPLICIT_HOSTED_WORLD`. Sent to every session |
-| `detail` | The underlying message. **Admin sessions only** — `LEDGER_UNAVAILABLE`'s carries an absolute server path and an OS error string. Every other session gets one stable sentence instead |
+| `reason` | One code per operator action: `OPERATOR_DISABLED`, `NO_MODEL_CONFIGURED`, `LEDGER_UNAVAILABLE`, `LEDGER_INCOMPATIBLE`, `UNSANCTIONED_WORLD_TARGET`, `IMPLICIT_HOSTED_WORLD`. Sent to every session |
+| `detail` | The underlying message. **Admin sessions only** — the ledger codes' carry an absolute server path plus an OS error string or a quoted fragment of a file on that disk. Every other session gets one stable sentence instead |
 
 This route is **not** metered out of the `ai` bucket: a visibility probe must not spend a run's
 budget. Its ledger half is memoised for a few seconds instead.
@@ -975,6 +988,7 @@ Opens a run and returns immediately; the drive happens in the background.
 | `workflowReading` | string | No | How that decision WENT, as against who made it: `"classified"` (a classifier named this workflow), `"unclassified"` (a classifier was asked and reached its fallback) or `"unrecorded"` (nothing classified anything — what a caller naming its own workflow sends). Absent means `"unrecorded"`. An unrecognised value is **refused, not defaulted**, for the reason `workflowSource` is: the surface reads this field back to choose which of three sentences it says about the run, and a fallback presented as a verdict is the one it may not say |
 | `objective` | string | Yes | Non-empty, at most 4000 characters |
 | `connectionId` | string | Yes | Must resolve **server-side**. An inline `connection` object in the body is refused |
+| `previousRunId` | string | No | Continue the **conversation** a run this session opened belongs to. The server derives the earlier steps' objectives and the most recent step's report from those runs' own ledgers, verifies the named run belongs to this session, is on this connection and has ended, and persists the result as `thread` on the new run's header. A run it cannot reach **does not refuse the start**: the run opens carrying no conversation and the response says so through `thread.declined` — `"repointed"` when the predecessor was reachable but was established against a different database than this connection now addresses — the run still opens, and it records the connection as it now addresses it, so a follow-up naming **that** run carries normally: the decline is one question long, not a state the connection is left in — `"disabled"` when the server has conversations switched off, `"error"` on an unreadable ledger, and `"unavailable"` for the five remaining causes, which are deliberately not told apart. Only a value that is not a non-empty string is refused, with `400` — that is a malformed request rather than a runtime condition |
 
 **Response (202 Accepted):**
 
@@ -1001,6 +1015,11 @@ could arrive twice.
 // 400 Bad Request — one message per rule, e.g.
 { "error": "mode must be \"planning\" or \"agent\"" }
 { "error": "An agent run needs a server-resolvable connectionId; an inline connection cannot be resumed" }
+{ "error": "previousRunId must be a non-empty string when provided" }
+{
+  "error": "Agent mode executes only where the provider implements a database-native read-only statement path — PostgreSQL and SQLite. On MySQL a run whose workflow sends a statement is refused when it is started, before a run is opened. The operations workflow still runs here, because it sends no statement at all: it calls the curated reporting methods every provider implements. Plan mode drafts on every engine.",
+  "refused": "engine-unsupported"
+}
 
 // 404 Not Found — this server runs no agents
 { "error": "The agent runtime is not enabled on this server" }
@@ -1012,6 +1031,30 @@ could arrive twice.
   "disproved": []
 }
 ```
+
+> **The engine refusal is a `400`, and it changed this contract.** Since #512 an `agent` run whose
+> `workflowType` sends a statement — every workflow but `operations` — is refused here when the
+> connection's engine implements no database-native read-only statement path, and `error` carries the
+> posture's whole paragraph. It is refused **before a run id exists**: a client that used to receive
+> `202` for `investigation` on MySQL and then read `engine-unsupported` off the run receives `400`
+> and no run. `operations` is admitted on every engine because it sends no statement at all, and a
+> `planning` run is never refused this way — it executes nothing anywhere. The refusal reads the
+> same fact the provider factory does (`typeof provider.queryReadOnly`), so the two cannot disagree.
+>
+> **It is the only `400` here that carries `refused`**, and the value is `"engine-unsupported"` —
+> the same name the fact travels under as an `AgentRunFailureReason` on a run that ended this way,
+> and the same name in code: both ends of the wire extract that member from the union rather than
+> writing the string, so a rename cannot leave the wire on the old one. Every refusal this route's
+> own validation writes answers with `error` alone, because the message is the only thing that says
+> what went wrong. The connection resolver's `400` is the exception and is worth knowing about: a
+> `connectionId` that is not `seed:`-prefixed answers in the shared error shape — `error` plus
+> `code` (`"CONFIG_ERROR"`) plus `statusCode` — because it is raised below the route and answered by
+> the shared error mapper. The engine refusal is different again because a client may already be
+> showing the same paragraph itself: the studio's agent rail stands an amber card carrying it, so it
+> needs to know WHICH refusal this is in order to answer with the consequence and a pointer instead
+> of a second copy (#513). A client that ignores the field and renders `error` is correct; a client
+> that discriminates on the `400` alone is not, and would relabel a malformed `mode`, or an
+> `autoExecute` asked for on a workflow that presents no answer, as the engine's refusal.
 
 > `422` rather than `400`: the request is well-formed and it is the server's configuration that
 > cannot honour it. Only a **positively established** incapability refuses this way — a bad key, a
@@ -1139,6 +1182,20 @@ Auth required. Returns seed/managed connections for the current user's role, wit
 { "connections": [], "cacheHint": 60000 }
 ```
 
+A failure the endpoint attributes to its **own seed configuration** says so, so a client can tell
+"the server serves no seeds" (a `200` with an empty `connections`) from "the server could not read
+its seeds":
+
+```json
+{ "error": "Failed to load managed connections", "reason": "seed-config-unreadable" }
+```
+
+`500` with `reason: "seed-config-unreadable"` means `seed-connections.yaml` could not be read or
+parsed. A `500` **without** `reason` is any other failure of the request and is not a claim about
+that file. The browser holds the second as an unread seed list rather than an empty one, which is
+what stops the agent rail reporting a connection's settings as browser-local when the server's own
+configuration is what failed.
+
 ---
 
 ### Admin API
@@ -1181,7 +1238,7 @@ interface DatabaseConnection {
   createdAt: Date;         // Creation timestamp
 }
 
-type DatabaseType = 'postgres' | 'mysql' | 'sqlite' | 'mongodb' | 'redis' | 'oracle' | 'mssql' | 'libredb' | 'couchbase' | 'clickhouse' | 'druid' | 'elasticsearch' | 'opensearch' | 'trino' | 'cassandra';
+type DatabaseType = 'postgres' | 'mysql' | 'sqlite' | 'libsql' | 'duckdb' | 'mongodb' | 'redis' | 'oracle' | 'mssql' | 'libredb' | 'couchbase' | 'clickhouse' | 'druid' | 'elasticsearch' | 'opensearch' | 'trino' | 'cassandra';
 ```
 
 ### TableSchema
@@ -1246,7 +1303,7 @@ catalog entry to answer with.
 
 ```typescript
 interface HealthInfo {
-  activeConnections: number;
+  activeConnections?: number;  // Absent when the engine cannot measure it - never a fabricated 0
   databaseSize: string;
   cacheHitRatio: string;
   slowQueries: SlowQuery[];
@@ -1580,7 +1637,7 @@ async function streamAIExplanation(query: string, explainPlan: string) {
 | `LLM_PROVIDER` | No | AI provider: gemini, openai, ollama, custom |
 | `LLM_API_KEY` | No | AI provider API key |
 | `LLM_MODEL` | No | AI model name |
-| `LLM_API_URL` | No | Custom AI endpoint URL. Read for the `openai`, `ollama` and `custom` kinds, on the chat surface and in the agent alike; **unread for `gemini`** ([`docs/BACKLOG.md`](BACKLOG.md) B20) |
+| `LLM_API_URL` | No | Custom AI endpoint URL. Read for every kind, on the chat surface and in the agent alike. For `gemini` give the versioned URL (`https://host/v1beta`); a bare origin also works, the version segment is composed for it (`src/lib/llm/utils/gemini-endpoint.ts`) |
 | `LIBREDB_AGENT_ENABLED` | No | The agent's explicit **off**-switch. Availability is otherwise derived from the AI configuration and a writable ledger — see [`docs/AGENT.md`](AGENT.md) |
 | `WORKFLOW_TARGET_WORLD` | No | Durable backend for agent run state: `local` (default, single instance) or `@workflow/world-postgres` |
 | `WORKFLOW_LOCAL_DATA_DIR` | No | Where the `local` backend keeps run state (`/app/data/workflow` in the container image) |

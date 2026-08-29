@@ -413,6 +413,17 @@ export class MSSQLProvider extends SQLBaseProvider {
       // The mssql package's Transaction object over one held pool connection.
       supportsTransactions: true,
       maintenanceOperations: ["analyze", "check", "optimize", "kill"],
+      // `optimize` is `ALTER INDEX ALL ON [<t>] REBUILD`, so its target is a TABLE
+      // even though the wording says indexes - the same words Oracle uses for an
+      // operation that needed a different kind of name (#496). `check` is
+      // `DBCC CHECKDB`, which takes no object: `runMaintenance` ignores the target,
+      // so only a global control can honestly offer it.
+      maintenanceOperationSpecs: {
+        analyze: { label: "Update Statistics", perEntity: true, global: true },
+        check: { label: "Check Database", perEntity: false, global: true },
+        optimize: { label: "Rebuild Indexes", perEntity: true, global: true },
+        kill: { label: "Kill Session", perEntity: false, global: false },
+      },
     };
   }
 
@@ -421,6 +432,10 @@ export class MSSQLProvider extends SQLBaseProvider {
       ...super.getLabels(),
       analyzeAction: "Update Statistics",
       vacuumAction: "Rebuild Indexes",
+      // The vacuum slot has said "Rebuild Indexes" since this provider shipped, and
+      // that is `optimize`, not `vacuum` - so the global card gated on the literal
+      // `vacuum` never rendered these words at all (#496).
+      vacuumActionOperation: "optimize",
       analyzeGlobalLabel: "Update Stats",
       analyzeGlobalTitle: "Update Statistics",
       analyzeGlobalDesc: "Updates query optimizer statistics for all tables to improve query performance.",
@@ -429,7 +444,7 @@ export class MSSQLProvider extends SQLBaseProvider {
       vacuumGlobalDesc: "Rebuilds all indexes to reclaim space and reduce fragmentation.",
       // `getSlowQueries()` reads sys.dm_exec_query_stats, and a login without VIEW
       // SERVER STATE gets `[]` from the swallowed failure. The panel used to name a
-      // PostgreSQL extension there (#U12); the permission is what a DBA can act on.
+      // PostgreSQL extension there (#463); the permission is what a DBA can act on.
       slowQueriesEmptyState:
         "Query stats come from sys.dm_exec_query_stats, which needs the VIEW SERVER STATE permission.",
     };
@@ -882,7 +897,21 @@ export class MSSQLProvider extends SQLBaseProvider {
     this.ensureConnected();
 
     try {
-      let activeConnections = 0;
+      // Left UNDEFINED, and spread conditionally into the return below.
+      // `HealthInfo.activeConnections` is optional precisely so a server whose session
+      // DMV was denied omits the figure instead of sending a fabricated 0, and this is
+      // the reading the agent forwards to the model (`src/lib/agent/tools.ts` projects
+      // it with `?? null`), so an initial 0 made a denial indistinguishable from an
+      // idle instance. Reading every session from sys.dm_exec_sessions needs
+      // VIEW SERVER STATE on SQL Server 2019 and earlier and VIEW SERVER PERFORMANCE
+      // STATE on 2022 and later (Microsoft's reference for the view; VIEW SERVER STATE
+      // implies the newer grant, so it still covers this) - on the 2022 CU26 instance
+      // whose refusal was measured 2026-08-23 that is the SAME permission the
+      // performance-counter DMV wanted, not a sibling grant (`Msg 300 ... VIEW SERVER
+      // PERFORMANCE STATE permission was denied on object 'server', database
+      // 'master'`). Azure SQL Database wants VIEW DATABASE STATE and restricts the
+      // same server-scoped DMVs. See docs/providers/mssql.md section 7.2.
+      let activeConnections: number | undefined;
       let databaseSize = "N/A";
       let cacheHitRatio: string = CACHE_HIT_RATIO_UNAVAILABLE;
       const slowQueries: SlowQuery[] = [];
@@ -893,9 +922,14 @@ export class MSSQLProvider extends SQLBaseProvider {
         const connRes = await this.pool!.request().query(
           `SELECT COUNT(*) AS cnt FROM sys.dm_exec_sessions WHERE is_user_process = 1`,
         );
-        activeConnections = connRes.recordset[0]?.cnt || 0;
+        // measuredNumber, not `|| 0`: a genuinely idle instance answers 0 and that 0 is
+        // a reading, so the falsy test would have thrown away the very figure it was
+        // meant to publish. Only an unanswered COUNT stays absent.
+        activeConnections = measuredNumber(connRes.recordset[0]?.cnt);
       } catch {
-        /* DMV may require permissions */
+        /* The figure stays absent, never 0. Which grant this DMV wants is in the note
+           above; that an ungranted login is documented as row-filtered rather than
+           refused - so this guard may never run for one - is in section 7.2. */
       }
 
       // Database size
@@ -952,7 +986,13 @@ export class MSSQLProvider extends SQLBaseProvider {
         /* ignore */
       }
 
-      return { activeConnections, databaseSize, cacheHitRatio, slowQueries, activeSessions };
+      return {
+        ...(activeConnections === undefined ? {} : { activeConnections }),
+        databaseSize,
+        cacheHitRatio,
+        slowQueries,
+        activeSessions,
+      };
     } catch (error) {
       throw mapDatabaseError(error, "mssql");
     }
@@ -1047,7 +1087,25 @@ export class MSSQLProvider extends SQLBaseProvider {
       let version = "SQL Server";
       let uptime = "N/A";
       let startTime: Date | undefined;
-      let activeConnections = 0;
+      // Left UNDEFINED and spread conditionally into the return below, mirroring
+      // getHealth() above: `DatabaseOverview.activeConnections` is optional for the
+      // same reason, so a server whose session DMV was denied omits the figure
+      // instead of publishing a fabricated 0. getHealth() does NOT compose from this
+      // reading - it runs its own COUNT over the same DMV - and the agent's curated
+      // `health` reading is getHealth() too (`method: "getHealth"` in
+      // src/lib/agent/tools.ts; nothing under src/lib/agent reads getOverview()). This
+      // count's readers are the monitoring Connections card, its trend chart and the
+      // connection-threshold rating over them, so an initial 0 made a denial
+      // indistinguishable from an idle instance for all three.
+      // OverviewTab.tsx renders "N/A" over "not published" for the absence and drops
+      // the sample from the connection trend; the 0 printed as the figure 0 on that
+      // card and each refresh added a real 0 point to the trend. No percentage was
+      // involved: the ceiling comes from the SAME statement, so a refused read left
+      // maxConnections at its 0 initialiser and the card said "no limit published",
+      // with no "/32767" and no bar. See docs/providers/mssql.md section 7.2.
+      let activeConnections: number | undefined;
+      // maxConnections stays a required number: 0 MEANS "no limit published" here,
+      // so unlike the count above, 0 and absence are the SAME fact for the ceiling.
       let maxConnections = 0;
       let databaseSize = "0 bytes";
       let databaseSizeBytes = 0;
@@ -1080,11 +1138,25 @@ export class MSSQLProvider extends SQLBaseProvider {
       // Connections
       try {
         const connRes = await this.pool!.request().query(OVERVIEW_CONNECTIONS_SQL);
-        activeConnections = Number(connRes.recordset[0]?.active_connections || 0);
+        // measuredNumber, not `|| 0`: an idle instance answers COUNT(*) = 0 and that
+        // 0 is a reading, so the falsy test threw away the very figure it published.
+        // Only an unanswered COUNT stays absent.
+        activeConnections = measuredNumber(connRes.recordset[0]?.active_connections);
         maxConnections = Number(connRes.recordset[0]?.max_connections || 32767);
         if (maxConnections === 0) maxConnections = 32767; // 0 means unlimited
       } catch {
-        /* ignore */
+        /* The count stays absent, never 0, and the ceiling stays 0, which already
+           reads as "no limit published". Which half of this statement refuses is
+           version-dependent, and Microsoft documents only one of them plainly:
+           sys.configurations requires membership in `public` on SQL Server 2019 and
+           earlier but VIEW SERVER PERFORMANCE STATE on 2022 and later, so on 2022+ an
+           ungranted login lands here on the ceiling lookup alone. sys.dm_exec_sessions
+           is documented as row-filtered rather than refused - "Everyone can see their
+           own session information", the server-state grant only widening that to ALL
+           sessions - so on 2019 and earlier the same login may instead SUCCEED with a
+           COUNT of its own session, an under-reading no guard here can see because
+           nothing failed. That case is unmeasured and unfixed; see
+           docs/providers/mssql.md section 7.2. */
       }
 
       // Database size
@@ -1109,7 +1181,7 @@ export class MSSQLProvider extends SQLBaseProvider {
         version,
         uptime,
         startTime,
-        activeConnections,
+        ...(activeConnections === undefined ? {} : { activeConnections }),
         maxConnections,
         databaseSize,
         databaseSizeBytes,

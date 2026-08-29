@@ -185,6 +185,34 @@ describe("POST /api/db/maintenance", () => {
     expect(data.message).toBe("OK");
   });
 
+  // The audit log is where an operator reconstructs what was done to a database, so a
+  // refusal recorded as a completed operation is worse than no record. This became routine
+  // rather than theoretical on 2026-08-25: MySQL and Oracle now read the engine's own
+  // verdict, so `success: false` on an HTTP 200 is the ordinary answer for a target the
+  // engine would not touch.
+  test("an operation the engine refused is audited as a failure, not as success", async () => {
+    (mockProvider.runMaintenance as ReturnType<typeof mock>).mockImplementation(async () => ({
+      success: false,
+      executionTime: 3,
+      message: "OPTIMIZE failed: u9v.missing: Table 'u9v.missing' doesn't exist",
+    }));
+
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target: "missing", connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ success: boolean }>(res);
+
+    // Still a 200: the request was well formed and the statement reached the engine. What
+    // the engine answered travels in the body, and in the audit row.
+    expect(res.status).toBe(200);
+    expect(data.success).toBe(false);
+    expect(mockAuditPush).toHaveBeenCalledTimes(1);
+    expect((mockAuditPush.mock.calls[0]![0] as { result: string }).result).toBe("failure");
+  });
+
   test("non-admin user returns 403", async () => {
     mockGetSession.mockImplementation(
       async (): Promise<{ role: string; username: string } | null> => ({ role: "user", username: "user" }),
@@ -322,6 +350,152 @@ describe("POST /api/db/maintenance", () => {
 
     expect(res.status).toBe(400);
     expect(data.error).toContain("not supported");
+  });
+
+  // ─── U20: the route gates on WHAT an operation can be pointed at ──────────
+  //
+  // `maintenanceOperations` says only that an operation EXISTS on this engine; each
+  // provider also declares what KIND of target it takes (`maintenanceOperationSpecs`),
+  // and both UI surfaces already gate on `maintenanceControl`. The route did not, so a
+  // caller reaching the API directly bypassed the only declaration that says a target
+  // is meaningless here. The U20 backlog entry reports that gap from a live SQLite run:
+  // POST {type:"vacuum", target:"users"} answered 200 and vacuumed the whole file - the
+  // reading `perEntity: false` exists to withhold.
+  //
+  // These tests measure the status code and the message, not that run: the capabilities
+  // below are SQLite-SHAPED mocks, so what is asserted is that the route now refuses the
+  // request the declaration says is meaningless and attempts nothing.
+  const sqliteShapedCapabilities = () => ({
+    queryLanguage: "sql",
+    supportsExplain: true,
+    supportsExternalQueryLimiting: true,
+    supportsCreateTable: true,
+    supportsMaintenance: true,
+    maintenanceOperations: ["vacuum", "analyze", "reindex"],
+    maintenanceOperationSpecs: {
+      // SQLite's VACUUM rewrites the whole file and ignores a target entirely.
+      vacuum: { label: "Vacuum Database", perEntity: false, global: true },
+      analyze: { label: "Analyze Database", perEntity: true, global: true },
+      // Couchbase-shaped half of the same field: BUILD INDEX needs one keyspace and
+      // has no whole-database form.
+      reindex: { label: "Build Indexes", perEntity: true, global: false },
+    },
+    supportsConnectionString: true,
+    defaultPort: 0,
+    schemaRefreshPattern: "",
+  });
+
+  test("an operation that takes no target refuses a request that names one", async () => {
+    (mockProvider.getCapabilities as ReturnType<typeof mock>).mockImplementation(sqliteShapedCapabilities);
+
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target: "users", connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string; success?: boolean }>(res);
+
+    expect(res.status).toBe(400);
+    // The provider's own wording for the control, and what it does accept.
+    expect(data.error).toContain("Vacuum Database");
+    expect(data.error).toContain("whole database");
+    // A client error, not a maintenance verdict: no `success` field for a caller to
+    // read as "the engine refused the work".
+    expect(data.success).toBeUndefined();
+    // Nothing was attempted, so nothing may be recorded as done.
+    expect(mockProvider.runMaintenance).not.toHaveBeenCalled();
+    expect(mockAuditPush).not.toHaveBeenCalled();
+  });
+
+  test("an operation that requires a target refuses a request without one", async () => {
+    (mockProvider.getCapabilities as ReturnType<typeof mock>).mockImplementation(sqliteShapedCapabilities);
+
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "reindex", connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(data.error).toContain("Build Indexes");
+    expect(data.error).toContain("target");
+    expect(mockProvider.runMaintenance).not.toHaveBeenCalled();
+    expect(mockAuditPush).not.toHaveBeenCalled();
+  });
+
+  test("an empty target string reads as the whole-database form, not as a target", async () => {
+    (mockProvider.getCapabilities as ReturnType<typeof mock>).mockImplementation(sqliteShapedCapabilities);
+
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target: "", connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+
+    // Same reading the audit row below already uses (`target || "all"`).
+    expect(res.status).toBe(200);
+    expect(mockProvider.runMaintenance).toHaveBeenCalledTimes(1);
+  });
+
+  test("a target an operation does accept still runs", async () => {
+    (mockProvider.getCapabilities as ReturnType<typeof mock>).mockImplementation(sqliteShapedCapabilities);
+
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "analyze", target: "users", connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+
+    expect(res.status).toBe(200);
+    expect(mockProvider.runMaintenance).toHaveBeenCalledTimes(1);
+    expect(mockAuditPush).toHaveBeenCalledTimes(1);
+  });
+
+  // Every provider that declares `kill` declares it `perEntity: false, global: false`:
+  // its target is a session or query id, which no table row and no whole-database card
+  // can supply. Both halves false therefore does NOT mean "takes no target" - it means
+  // the target comes from somewhere neither placement describes (the Sessions panel),
+  // so the placement gate has nothing to say and must not refuse it.
+  test("kill keeps its session-id target, which neither placement describes", async () => {
+    (mockProvider.getCapabilities as ReturnType<typeof mock>).mockImplementation(() => ({
+      ...sqliteShapedCapabilities(),
+      maintenanceOperations: ["vacuum", "kill"],
+      maintenanceOperationSpecs: {
+        vacuum: { label: "Vacuum Database", perEntity: false, global: true },
+        kill: { label: "Terminate Backend", perEntity: false, global: false },
+      },
+    }));
+
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "kill", target: "4711", connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+
+    expect(res.status).toBe(200);
+    expect(mockProvider.runMaintenance).toHaveBeenCalledTimes(1);
+    expect((mockAuditPush.mock.calls[0]![0] as { type: string }).type).toBe("kill_session");
+  });
+
+  // A provider that declares no specs at all is offered in both placements - the
+  // documented compatibility reading of the optional field, and what the route did for
+  // every provider before this change.
+  test("a provider declaring no operation specs accepts a target as before", async () => {
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target: "users", connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+
+    expect(res.status).toBe(200);
+    expect(mockProvider.runMaintenance).toHaveBeenCalledTimes(1);
   });
 
   test("DatabaseError from runMaintenance returns 500", async () => {

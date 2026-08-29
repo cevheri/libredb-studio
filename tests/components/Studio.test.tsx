@@ -98,7 +98,7 @@ mock.module("@/hooks/use-auth", () => ({
 mock.module("@/hooks/use-connection-manager", () => ({
   useConnectionManager: mock(() => ({
     connections: [],
-    servedSeeds: [],
+    servedSeeds: { loaded: true, seeds: [] },
     activeConnection: null,
     schema: [],
     schemaContext: "[]",
@@ -710,7 +710,7 @@ describe("Studio", () => {
   });
 
   // The Explorer's row items call this with the row's name; it rides the admin
-  // route's query string so the Operations tab lands on that row (#U5).
+  // route's query string so the Operations tab lands on that row (#459).
   test("openMaintenance carries the named row to the operations tab", () => {
     render(<Studio />);
     const fn = capturedSidebarProps.onOpenMaintenance as (tab?: string, table?: string) => void;
@@ -973,6 +973,119 @@ describe("Studio", () => {
     expect(mockCreateObjectURL).not.toHaveBeenCalled();
   });
 
+  // --- exportResults over an agent run's rows (B34) ---
+  //
+  // The panel hands the artifact to the export rather than the export reading the tab
+  // back, so what leaves the product is what was on screen — and the file says which
+  // run produced it.
+  const withCapturedDownloadName = async (run: () => void): Promise<string[]> => {
+    const names: string[] = [];
+    const originalClick = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function (this: HTMLAnchorElement) {
+      names.push(this.download);
+    };
+    try {
+      run();
+      // The revoke is scheduled a task later; drain it so nothing leaks into the next test.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    } finally {
+      HTMLAnchorElement.prototype.click = originalClick;
+    }
+    return names;
+  };
+
+  const hydratedArtifact = {
+    runId: "arun_42",
+    correlationId: "corr_1",
+    operationId: "sql.query.read",
+    surface: "results" as const,
+    result: {
+      rows: [{ id: 9, city: "Ankara" }],
+      fields: ["id", "city"],
+      rowCount: 1,
+      executionTime: 3,
+      columnTypes: { id: "bigint", city: "text" },
+    },
+    explainPlan: null,
+    chartSpec: null,
+  };
+
+  test("exportResults writes the run's rows, not the tab's, when it is given the artifact", async () => {
+    tabMgrOverride = {
+      currentTab: {
+        id: "tab-1",
+        name: "Users",
+        query: "SELECT 1",
+        result: testResult,
+        isExecuting: false,
+        type: "sql",
+      },
+    };
+    render(<Studio />);
+    const exportFn = capturedBottomPanelProps.onExportResults as (
+      format: string,
+      hydrated: typeof hydratedArtifact | null,
+    ) => void;
+
+    const names = await withCapturedDownloadName(() => act(() => exportFn("json", hydratedArtifact)));
+
+    const blob = (mockCreateObjectURL.mock.calls[0] as unknown[])[0] as Blob;
+    expect(JSON.parse(await blob.text())).toEqual([{ id: 9, city: "Ankara" }]);
+    // Named after the run, so the file is not indistinguishable from one the user ran.
+    expect(names).toEqual(["agent_run_arun_42_export.json"]);
+  });
+
+  test("a run's rows take the neutral table name, not the tab's", async () => {
+    tabMgrOverride = {
+      currentTab: {
+        id: "tab-1",
+        name: "Users",
+        query: "SELECT 1",
+        result: testResult,
+        isExecuting: false,
+        type: "sql",
+      },
+    };
+    render(<Studio />);
+    const exportFn = capturedBottomPanelProps.onExportResults as (
+      format: string,
+      hydrated: typeof hydratedArtifact | null,
+    ) => void;
+
+    await withCapturedDownloadName(() => act(() => exportFn("sql-ddl", hydratedArtifact)));
+
+    const blob = (mockCreateObjectURL.mock.calls[0] as unknown[])[0] as Blob;
+    const content = await blob.text();
+    // The rows came from a run, so naming the tab's table would attribute them to a
+    // table that never produced them. The declared types are the artifact's own.
+    expect(content).toContain("CREATE TABLE table_name (");
+    expect(content).toContain("bigint");
+  });
+
+  test("the tab's own export is unchanged and keeps its own file name", async () => {
+    tabMgrOverride = {
+      currentTab: {
+        id: "tab-1",
+        name: "Users",
+        query: "SELECT 1",
+        result: testResult,
+        isExecuting: false,
+        type: "sql",
+      },
+    };
+    render(<Studio />);
+    const exportFn = capturedBottomPanelProps.onExportResults as (
+      format: string,
+      hydrated: typeof hydratedArtifact | null,
+    ) => void;
+
+    const names = await withCapturedDownloadName(() => act(() => exportFn("csv", null)));
+
+    expect(names).toEqual(["query_result_export.csv"]);
+  });
+
   // --- CommandPalette callbacks ---
   test("CommandPalette onLoadSavedQuery loads query and switches to results", () => {
     render(<Studio />);
@@ -1066,7 +1179,7 @@ describe("Studio", () => {
     expect(capturedBottomPanelProps.editingEnabled).toBe(true);
   });
 
-  // --- Transaction capability gate (#U13) ---
+  // --- Transaction capability gate (#464) ---
   test("passes the transaction trio and the sandbox toggle through when supportsTransactions is true", () => {
     // The positive first: the default mock declares the capability, so both shells
     // must receive all four callbacks and they must reach the hook.
@@ -1568,7 +1681,7 @@ describe("Studio", () => {
     const { findByTestId } = render(<Studio />);
     await findByTestId("agent-rail");
 
-    expect(capturedAgentRailProps.connectionId).toBe("seed:sales");
+    expect(capturedAgentRailProps.connectionId).toEqual({ id: "seed:sales" });
     expect(capturedAgentRailProps.connectionName).toBe("Sales");
   });
 
@@ -1581,7 +1694,7 @@ describe("Studio", () => {
     const { findByTestId } = render(<Studio />);
     await findByTestId("agent-rail");
 
-    expect(capturedAgentRailProps.connectionId).toBeNull();
+    expect(capturedAgentRailProps.connectionId).toEqual({ id: null, reason: "browser-only" });
     expect(capturedAgentRailProps.connectionName).toBe("TestPG");
   });
 
@@ -1600,21 +1713,29 @@ describe("Studio", () => {
 
   test("an untouched copy of an editable seed reaches the rail as startable", async () => {
     mockAgentConfig(true);
-    connMgrOverride = { activeConnection: seedCopy, connections: [seedCopy], servedSeeds: [servedSeed] };
+    connMgrOverride = {
+      activeConnection: seedCopy,
+      connections: [seedCopy],
+      servedSeeds: { loaded: true, seeds: [servedSeed] },
+    };
     const { findByTestId } = render(<Studio />);
     await findByTestId("agent-rail");
 
-    expect(capturedAgentRailProps.connectionId).toBe("seed:sample");
+    expect(capturedAgentRailProps.connectionId).toEqual({ id: "seed:sample" });
   });
 
   test("a seed copy edited to reach another database reaches the rail as unresolvable", async () => {
     mockAgentConfig(true);
     const edited = { ...seedCopy, database: "somewhere-else" };
-    connMgrOverride = { activeConnection: edited, connections: [edited], servedSeeds: [servedSeed] };
+    connMgrOverride = {
+      activeConnection: edited,
+      connections: [edited],
+      servedSeeds: { loaded: true, seeds: [servedSeed] },
+    };
     const { findByTestId } = render(<Studio />);
     await findByTestId("agent-rail");
 
-    expect(capturedAgentRailProps.connectionId).toBeNull();
+    expect(capturedAgentRailProps.connectionId).toEqual({ id: null, reason: "browser-only" });
   });
 
   test("with no connection selected the rail is told so", async () => {
@@ -2141,5 +2262,57 @@ describe("Studio", () => {
     expect(mockUpdateCurrentTab).toHaveBeenCalledWith({ query: "SELECT count(*) FROM orders" });
     // Applying is not executing: nothing runs until the user runs it.
     expect(mockExecuteQuery).not.toHaveBeenCalled();
+  });
+
+  // ===========================================================================
+  // What the panel group holds below the breakpoint
+  // ===========================================================================
+
+  /**
+   * `react-resizable-panels` 4 applies a `Panel`'s `className` to a NESTED div —
+   * "Class is applied to nested HTMLDivElement to avoid styles that interfere with
+   * Flex layout", its own types say — so `hidden md:block` on a panel never hid the
+   * panel. It hid the panel's CONTENTS and left the panel itself holding its desktop
+   * share of the row: at 390px the sidebar kept 22% and the agent rail 24%, which is
+   * why the studio body was 211px wide and its header overlapped itself.
+   *
+   * No class can fix that, on either element. A panel the viewport cannot show must
+   * not be in the group at all.
+   */
+  test("the phone renders no sidebar panel to take a share of the row", () => {
+    setViewportMobile(true);
+    const { queryByTestId } = render(<Studio />);
+    expect(queryByTestId("sidebar")).toBeNull();
+  });
+
+  test("and the sidebar is back above the breakpoint", () => {
+    setViewportMobile(false);
+    const { queryByTestId } = render(<Studio />);
+    expect(queryByTestId("sidebar")).not.toBeNull();
+  });
+
+  /**
+   * The agent rail leaves the GROUP on a phone but stays MOUNTED, because its mobile
+   * presentation is a sheet it renders itself — `MobileNav`'s Agent control opens it
+   * through `sheetOpen`. Dropping the rail with the panel would take the phone's only
+   * agent surface with it.
+   */
+  test("the agent rail leaves the panel group on a phone but keeps rendering", async () => {
+    setViewportMobile(true);
+    mockAgentConfig(true);
+    const { findByTestId, container } = render(<Studio />);
+
+    const rail = await findByTestId("agent-rail");
+    expect(rail.closest('[data-testid="resizable-panel"]')).toBeNull();
+    expect(container.querySelector('[data-testid="agent-rail"]')).not.toBeNull();
+  });
+
+  test("and above the breakpoint it is a panel of the group again", async () => {
+    setViewportMobile(false);
+    mockAgentConfig(true);
+    const { findByTestId } = render(<Studio />);
+
+    const rail = await findByTestId("agent-rail");
+    expect(rail.closest('[data-testid="resizable-panel"]')).not.toBeNull();
   });
 });

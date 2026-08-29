@@ -177,6 +177,15 @@ export class MongoDBProvider extends BaseDatabaseProvider {
       declaresForeignKeys: false,
       supportsMaintenance: true,
       maintenanceOperations: ["vacuum", "analyze", "check"],
+      // `validate` and `compact` are both per-collection commands that this provider
+      // also loops over `listCollections()` when no target is named, so both
+      // placements are real. `dbCheck` is not looped and refuses to run without a
+      // collection name, so it is offered on a collection row only (#496).
+      maintenanceOperationSpecs: {
+        vacuum: { label: "Compact Collection", perEntity: true, global: true },
+        analyze: { label: "Validate Collection", perEntity: true, global: true },
+        check: { label: "Check Collection", perEntity: true, global: false },
+      },
       supportsConnectionString: true,
       defaultPort: 27017,
       schemaRefreshPattern: '"operation"\\s*:\\s*"(insert|delete|update)',
@@ -213,7 +222,7 @@ export class MongoDBProvider extends BaseDatabaseProvider {
         'the JSON command object this editor executes - {"collection": "<name>", "operation": "find" | "findOne" | "aggregate" | "count" | "distinct", "filter": {...}, "pipeline": [...], "field": "<name>" (distinct only), "options": {"limit": 50}} - and NOT mongosh shell syntax: a statement that starts with `db.` cannot be run here',
       // `getSlowQueries()` reads `system.profile`, which does not exist until the
       // profiler is switched on - so the empty panel is the ordinary case here, and it
-      // used to name a PostgreSQL extension (#U12).
+      // used to name a PostgreSQL extension (#463).
       slowQueriesEmptyState:
         "Query stats come from the database profiler - run db.setProfilingLevel() to start recording into system.profile.",
     };
@@ -313,7 +322,10 @@ export class MongoDBProvider extends BaseDatabaseProvider {
 
     const options: MongoClientOptions = {
       tls: true,
-      rejectUnauthorized: ssl.rejectUnauthorized ?? (ssl.mode === "verify-ca" || ssl.mode === "verify-full"),
+      // `require` encrypts without checking; every other mode verifies. `verify-system`
+      // does it against the runtime's own trust store, which is what an Atlas / `tls=true`
+      // paste needs - no `ca` is set below unless the form carries one (D26).
+      rejectUnauthorized: ssl.rejectUnauthorized ?? ssl.mode !== "require",
     };
     if (ssl.caCert) options.ca = ssl.caCert;
     if (ssl.clientCert) options.cert = ssl.clientCert;
@@ -784,9 +796,31 @@ export class MongoDBProvider extends BaseDatabaseProvider {
 
       const healthCacheHitRatio = wiredTigerCacheHitRatio(serverStatus.wiredTiger?.cache);
 
+      // measuredNumber and a conditional spread, not `|| 0`, for the same reason
+      // `HealthInfo.activeConnections` is optional: an API-compatible service - or any
+      // deployment whose serverStatus answers without a `connections` section - publishes
+      // no figure. `connections` is a network-layer field, so unlike `wiredTiger` above
+      // its absence is not tied to the storage engine, and which deployments omit it is
+      // not measured here. The agent's curated health reading forwards this key to
+      // the model (`src/lib/agent/tools.ts` projects it with `?? null`), so a
+      // fabricated 0 told the model a server it could not measure had nothing
+      // connected. A server that really has 0 open connections keeps the 0.
+      const currentConnections = measuredNumber(serverStatus.connections?.current);
+
+      // The byte figure has the same two inputs, and this is the method whose reading
+      // reaches the model - the curated `health` projection sends `databaseSize` verbatim
+      // - so `dbStats.dataSize || 0` reported a `db.stats()` that answered without the
+      // field as a measured "0 B". `HealthInfo.databaseSize` is a required string, and
+      // "N/A" is the absence this method's own catch below already spells. MongoDB's
+      // dbStats reference documents `dataSize` unconditionally (only the three
+      // `freeStorage*` fields are gated, on the command's own `freeStorage: 1` option), so
+      // this arm is not a deployment measured here; a database that really holds 0 bytes
+      // still formats as "0 B".
+      const healthDataSize = measuredNumber(dbStats.dataSize);
+
       return {
-        activeConnections: serverStatus.connections?.current || 0,
-        databaseSize: formatBytes(dbStats.dataSize || 0),
+        ...(currentConnections === undefined ? {} : { activeConnections: currentConnections }),
+        databaseSize: healthDataSize === undefined ? "N/A" : formatBytes(healthDataSize),
         cacheHitRatio:
           healthCacheHitRatio === undefined
             ? CACHE_HIT_RATIO_UNAVAILABLE
@@ -796,8 +830,13 @@ export class MongoDBProvider extends BaseDatabaseProvider {
       };
     } catch (error) {
       this.logError("getHealth", error);
+      // A resolved HealthInfo on purpose, NOT a rethrow: `POST /api/db/health`
+      // serialises what this resolves with and `POST /api/admin/fleet-health` reads
+      // `healthy` from a read that returned, so rethrowing here would report a server
+      // that is up as an error - the health-gate lockout class. What it must not do is
+      // name a figure: nothing was read, so `activeConnections` is omitted entirely
+      // rather than resolved as a measured 0.
       return {
-        activeConnections: 0,
         databaseSize: "N/A",
         cacheHitRatio: "N/A",
         slowQueries: [{ query: "Error fetching health info", calls: 0, avgTime: "N/A" }],
@@ -915,9 +954,26 @@ export class MongoDBProvider extends BaseDatabaseProvider {
       // and substituted 100 - a limit no server stated, which the Overview card then
       // divided the live connection count by. 0 is how every provider in this repo
       // spells "no limit published", and the card renders it as exactly that.
+      //
+      // `current` is also the connection count itself, and it stays optional for the
+      // reason `getHealth()` above spells out: a deployment whose serverStatus answers
+      // without a `connections` section publishes no figure, and `?.current || 0`
+      // reported that as zero open connections - while destroying a genuinely idle
+      // server's real 0 into the same value. The Overview card prints the figure and
+      // its history plots one point per refresh, dropping absent samples and plotting
+      // present ones, so a fabricated 0 became a flat line nobody measured.
       const current = measuredNumber(serverStatus.connections?.current);
       const available = measuredNumber(serverStatus.connections?.available);
       const maxConnections = current === undefined || available === undefined ? undefined : current + available;
+
+      // `databaseSizeBytes` is optional and `|| 0` could not tell its two inputs apart:
+      // a database that measures 0 bytes and a `db.stats()` that answers without
+      // `dataSize` both arrived as a measured 0. MongoDB's dbStats reference documents
+      // `dataSize` unconditionally - only the three `freeStorage*` fields are gated, on
+      // the command's own `freeStorage: 1` option - so this arm is not a deployment
+      // measured here; it is the absence the optional field exists to carry, and the
+      // Storage tab keys its whole breakdown off the key being present.
+      const dataSizeBytes = measuredNumber(dbStats.dataSize);
 
       // Get index count
       let indexCount = 0;
@@ -934,23 +990,40 @@ export class MongoDBProvider extends BaseDatabaseProvider {
         version: `MongoDB ${serverInfo.version || "Unknown"}`,
         uptime,
         startTime: new Date(Date.now() - uptimeSeconds * 1000),
-        activeConnections: serverStatus.connections?.current || 0,
+        ...(current === undefined ? {} : { activeConnections: current }),
         maxConnections: maxConnections ?? 0,
-        databaseSize: formatBytes(dbStats.dataSize || 0),
-        databaseSizeBytes: dbStats.dataSize || 0,
+        databaseSize: dataSizeBytes === undefined ? "N/A" : formatBytes(dataSizeBytes),
+        ...(dataSizeBytes === undefined ? {} : { databaseSizeBytes: dataSizeBytes }),
         tableCount: collections.length,
         indexCount,
       };
     } catch (error) {
       this.logError("getOverview", error);
+      // A resolved DatabaseOverview, NOT a rethrow: `getMonitoringData()` in
+      // `base-provider.ts` reads this panel through `Promise.allSettled`, so a rethrow
+      // would drop the whole overview in favour of an `errors.overview` entry instead of
+      // the placeholders the tab renders. What it must not do is name a figure it did
+      // not read, so BOTH optional fields - `activeConnections` and `databaseSizeBytes`
+      // - are omitted entirely rather than resolved as measured 0s. `StorageTab.tsx`
+      // keys its whole breakdown off `databaseSizeBytes !== undefined`: with the key
+      // present as 0 it drew tables, indexes and an "Other (unattributed)" remainder
+      // over a 0 B total, and that remainder is `0 - tables - indexes`, so a table read
+      // that answered (it goes through `listCollections` + `collStats`, not
+      // `serverStatus`) drove it negative - and the tab formats bytes with its own local
+      // threshold cascade, whose last arm returns its input unchanged, so the remainder
+      // read "-1536 B": a negative byte count drawn as a measurement (measured against
+      // the cascade). Absent, the tab says "No storage size information available."
+      //
+      // The three figures below stay because their types leave nothing else: `0` MEANS
+      // "no limit published" for `maxConnections` (its docblock in `types.ts` says
+      // absence and zero are the same fact there), and `tableCount` / `indexCount` are
+      // required numbers, so 0 is the only value available on a path that counted
+      // nothing. Those two remain the one place this object states more than it read.
       return {
         version: "MongoDB Unknown",
         uptime: "N/A",
-        activeConnections: 0,
-        // Nothing was read, so no limit is published (see the success path above).
         maxConnections: 0,
         databaseSize: "N/A",
-        databaseSizeBytes: 0,
         tableCount: 0,
         indexCount: 0,
       };

@@ -21,12 +21,12 @@ metadata:
       ]
     capabilities: Basic Install
     categories: Database, Developer Tools
-    containerImage: ghcr.io/libredb/libredb-studio-operator:0.13.3
-    createdAt: "2026-08-23T22:58:40Z"
-    description: Open-source web-based SQL IDE for fourteen engines - PostgreSQL,
-      MySQL, Oracle, SQL Server, SQLite, MongoDB, Redis, Couchbase, ClickHouse, Apache
-      Druid, Elasticsearch, OpenSearch, Apache Trino and Apache Cassandra - with AI-powered
-      query assistance.
+    containerImage: ghcr.io/libredb/libredb-studio-operator:0.13.4
+    createdAt: "2026-08-27T12:52:21Z"
+    description: Open-source web-based SQL IDE for sixteen engines - PostgreSQL, MySQL,
+      Oracle, SQL Server, SQLite, DuckDB, MongoDB, Redis, Couchbase, ClickHouse, Apache
+      Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra and libSQL
+      - with AI-powered query assistance.
     operators.operatorframework.io/builder: operator-sdk-v1.42.3
     operators.operatorframework.io/project_layout: helm.sdk.operatorframework.io/v1
     repository: https://github.com/libredb/libredb-studio
@@ -35,7 +35,7 @@ metadata:
     operatorframework.io/arch.amd64: supported
     operatorframework.io/arch.arm64: supported
     operatorframework.io/os.linux: supported
-  name: libredb-studio-operator.v0.13.3
+  name: libredb-studio-operator.v0.13.4
   namespace: placeholder
 spec:
   apiservicedefinitions: {}
@@ -49,8 +49,9 @@ spec:
       version: v1alpha1
   description: |
     LibreDB Studio is an open-source, web-based SQL IDE. Query PostgreSQL,
-    MySQL, Oracle, SQL Server, SQLite, MongoDB, Redis, Couchbase, ClickHouse,
-    Apache Druid, Elasticsearch, OpenSearch and Apache Trino from the browser —
+    MySQL, Oracle, SQL Server, SQLite, libSQL, DuckDB, MongoDB, Redis, Couchbase,
+    ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino and Apache
+    Cassandra from the browser —
     with AI-powered query assistance (natural-language-to-SQL, explain, fix),
     an ERD viewer, schema diff and a data profiler. No desktop client required.
 
@@ -258,7 +259,7 @@ spec:
                 - --leader-elect
                 - --leader-election-id=libredb-studio-operator
                 - --health-probe-bind-address=:8081
-                image: ghcr.io/libredb/libredb-studio-operator:0.13.3
+                image: ghcr.io/libredb/libredb-studio-operator:0.13.4
                 livenessProbe:
                   httpGet:
                     path: /healthz
@@ -352,6 +353,10 @@ spec:
   - elasticsearch
   - opensearch
   - trino
+  - cassandra
+  - libsql
+  - turso
+  - duckdb
   links:
   - name: Website
     url: https://libredb.org
@@ -369,4 +374,4 @@ spec:
   provider:
     name: LibreDB
     url: https://libredb.org
-  version: 0.13.3
+  version: 0.13.4

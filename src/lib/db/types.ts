@@ -94,6 +94,72 @@ export interface MaintenanceResult {
   message: string;
 }
 
+/**
+ * What ONE maintenance operation can be pointed at on ONE engine, declared next to
+ * that engine's own wording for it.
+ *
+ * `maintenanceOperations` says only that an operation EXISTS here, and #427 measured
+ * what a surface built on that alone offers. Oracle declares `optimize`, so the
+ * per-table button sent `optimize` with a TABLE name - and `oracle.ts` built
+ * `ALTER INDEX "<target>" REBUILD` from it, so every click answered ORA-01418
+ * (reproduced 2026-08-25 against Oracle AI Database 26ai Free before this change). The target
+ * grammar differs between engines that declare the SAME `MaintenanceType`, so a
+ * generic label-to-operation mapping is wrong by construction and the declaration has
+ * to travel with the provider.
+ *
+ * `perEntity` and `global` are independent because both halves occur: Couchbase's
+ * `reindex` is BUILD INDEX for ONE keyspace and has no whole-database form (its global
+ * card answered *"The reindex operation requires a target"*), while SQLite's `VACUUM`
+ * rewrites the whole file and ignores a target entirely (a per-table control there
+ * names one table and vacuums the database). An operation whose target is a session or
+ * query id - every engine's `kill` - is `false` for both: the Sessions panel supplies
+ * that id, and no table or global control can.
+ */
+export interface MaintenanceOperationSpec {
+  /** This engine's own wording for a control that runs the operation. */
+  label: string;
+  /** Runs against ONE object the browser lists: a table, a collection, a keyspace. */
+  perEntity: boolean;
+  /** Runs with no target at all, over the whole database. */
+  global: boolean;
+}
+
+/** Where a surface wants to put a control: on one row, or on a whole-database card. */
+export type MaintenancePlacement = "perEntity" | "global";
+
+/**
+ * Whether ONE maintenance control may be offered in ONE place, and the wording to
+ * give it - the single gate both maintenance surfaces ask, so that they cannot
+ * disagree about what a provider declared.
+ *
+ * `label` is undefined rather than a fallback string on purpose: only the provider
+ * may name the operation, so a caller that gets no name keeps its own generic word.
+ * That is also the whole of the compatibility story for the optional
+ * `maintenanceOperationSpecs` - a provider that declares no spec is offered in both
+ * placements under the caller's own wording, which is what both surfaces did before
+ * #U9.
+ */
+export function maintenanceControl(
+  capabilities: ProviderCapabilities | undefined,
+  type: MaintenanceType,
+  placement: MaintenancePlacement,
+): { offered: boolean; label?: string } {
+  // Unknown capabilities are not a permission: `/api/db/provider-meta` answers with
+  // nothing both while it is in flight and when it failed, and failing open there
+  // puts the dead buttons back on exactly the connections the #272/#282 gates exist
+  // for.
+  if (capabilities?.supportsMaintenance !== true || !capabilities.maintenanceOperations.includes(type)) {
+    return { offered: false };
+  }
+
+  const spec = capabilities.maintenanceOperationSpecs?.[type];
+  if (spec === undefined) {
+    return { offered: true };
+  }
+
+  return { offered: spec[placement], label: spec.label };
+}
+
 // ============================================================================
 // Provider Capabilities & Labels
 // ============================================================================
@@ -110,7 +176,8 @@ export type ExplainFormat =
   | "couchbase-json"
   | "clickhouse-json"
   | "druid-native"
-  | "trino-json";
+  | "trino-json"
+  | "duckdb-json";
 
 export interface ProviderCapabilities {
   queryLanguage: "sql" | "json";
@@ -223,8 +290,54 @@ export interface ProviderCapabilities {
    * reader would guess, and a third would be added to a provider and forgotten here.
    */
   tablesAreDerivedGroupings?: boolean;
+  /**
+   * True when the engine admits exactly ONE open handle per database FILE, because
+   * opening the file takes an exclusive lock: a second open of a file this process
+   * already holds does not return a second handle, it throws.
+   *
+   * `libredb` is the only engine that declares it. `lib.open({ path })` takes an
+   * exclusive `<path>.lock` sidecar and a second open of the same path throws
+   * `LibreDbError` with `code: "LOCKED"` - measured 2026-08-25 against
+   * `@libredb/libredb` 0.2.2, in one process. SQLite is the engine a reader would
+   * expect beside it and does NOT belong: measured the same day on `bun:sqlite`, a
+   * second `new Database(path, { readwrite: true })` on a WAL file this process
+   * already holds both opens and writes, because SQLite takes its file locks per
+   * transaction rather than at open.
+   *
+   * It exists because three code paths open a SECOND handle on a file the connection's
+   * own cached provider is already holding, and on this engine the lock defeated every
+   * one of them every time (#498): `POST /api/db/test-connection`
+   * reported the lock as a failed connection test - which made the built-in LibreDB
+   * sample impossible to EDIT, because the dialog tests before it saves;
+   * `acquireExecutionProfileProvider` lost every agent grounding read on the
+   * connection to it, silently, since a `ConnectionError` becomes an unavailable
+   * capture rather than a failure; and `POST /api/db/schema-snapshot` answered 503, so
+   * the Schema Diff tab could not snapshot a schema the sidebar was listing.
+   * `findOpenSingleWriterProvider` (`factory.ts`) now hands all three the handle that
+   * is already open, keyed by the RESOLVED FILE PATH rather than the connection id: the
+   * second opener is usually a different connection record pointing at the same file.
+   *
+   * Optional for the same published-interface reason as `supportsInlineRowEdit`
+   * (`src/exports/types.ts`): a required field added after the fact stops every
+   * external implementer compiling. Consumers therefore gate on `=== true`, so an
+   * absent flag reads as "this engine serves as many handles as we open" - the
+   * ordinary case, and the one every client-server engine is in. Reading
+   * `connection.type` at the consumer was the alternative and is forbidden by
+   * `CLAUDE.md`.
+   */
+  singleWriterFile?: boolean;
   supportsMaintenance: boolean;
   maintenanceOperations: MaintenanceType[];
+  /**
+   * Per-operation targeting for the operations above, keyed by `MaintenanceType`.
+   *
+   * Optional for the published-interface reason `supportsInlineRowEdit` records
+   * (`src/exports/types.ts`): a required field added after the fact stops every
+   * external implementer compiling. Absent means "gate on `maintenanceOperations`
+   * alone", which is what both maintenance surfaces did before #U9 - so an
+   * implementation that declares nothing here behaves exactly as it did.
+   */
+  maintenanceOperationSpecs?: Partial<Record<MaintenanceType, MaintenanceOperationSpec>>;
   supportsConnectionString: boolean;
   defaultPort: number | null;
   /**
@@ -279,6 +392,34 @@ export interface ProviderLabels {
   generateAction: string;
   analyzeAction: string;
   vacuumAction: string;
+  /**
+   * Which operation `vacuumAction` and the `vacuumGlobal*` triad actually NAME.
+   *
+   * Four providers point that wording at something that is not `vacuum`: ClickHouse's
+   * *"Optimize Table"* and SQL Server's, Oracle's and MySQL's *"Rebuild Indexes"* /
+   * *"Optimize Table"* each stand for the `optimize` the provider declares. MySQL
+   * rendered the base default *"Vacuum Table"* for an engine whose operations
+   * are `analyze`/`optimize`/`check`/`kill`. The global vacuum card was gated on the
+   * literal `vacuum`, so every one of those provider's own words was written and never
+   * shown, and the per-row item named an operation the page behind it could not run.
+   *
+   * Absent means `vacuum`, so no provider that really vacuums declares anything - and
+   * a provider whose vacuum wording names NOTHING it can run leaves this absent too:
+   * Couchbase's *"Compact"* says in its own description that the server compacts
+   * automatically and there is no manual equivalent, so `vacuum` stays undeclared and
+   * the card stays withheld, which is the honest outcome rather than pointing the
+   * words at the unrelated `reindex` it does declare.
+   * `analyzeAction` needs no twin of this, but not because every engine's analyze
+   * wording stands for `analyze`: read across the providers, three point it at nothing
+   * runnable - Trino's *"Table Statistics"*, the search family's *"Index Statistics"*
+   * and the embedded LibreDB's *"Key Info"*. What makes the twin unnecessary is the
+   * other half of each of those three: none of them declares an `analyze` operation
+   * (`maintenanceOperations` is `['kill']` on Trino and `[]` on the other two), so the
+   * control is withheld there by the declaration alone. Not one provider points its
+   * analyze wording at a DIFFERENT operation it does declare, which is the only case a
+   * twin field would resolve.
+   */
+  vacuumActionOperation?: MaintenanceType;
   searchPlaceholder: string;
   analyzeGlobalLabel: string;
   analyzeGlobalTitle: string;
@@ -343,6 +484,22 @@ export interface ProviderLabels {
    * is dropped where this label is set instead of being re-worded from it.
    */
   slowQueriesEmptyState?: string;
+
+  /**
+   * Why the monitoring Sessions panel and the admin Operations session list are
+   * empty on this engine, in that engine's own terms.
+   *
+   * The counterpart of `slowQueriesEmptyState` for the other half of the same
+   * absence (#518). Both panels default to "No active sessions found.", which a
+   * reader takes as "nothing is running right now" - true on PostgreSQL, and false
+   * on an engine that publishes no session list at all and can never show a row.
+   *
+   * A provider sets this when its `getActiveSessions()` can only ever answer `[]`.
+   * The failure branch beside it is a different fact: it renders a reason only when
+   * the READ failed (`activeSessions` absent from the payload, the reason under
+   * `errors`), and an absence is not an error.
+   */
+  sessionsEmptyState?: string;
 }
 
 /**
@@ -581,9 +738,14 @@ export interface DatabaseOverview {
    * rather than send a fabricated 0. ScyllaDB is the case that forced this - the
    * count lives in Cassandra's `system_views` keyspace, which ScyllaDB does not
    * have - and a Cassandra role denied that same grant has answered a fabricated 0
-   * since the provider shipped (docs/BACKLOG.md D17). `HealthInfo.activeConnections`
-   * stays a required `number`: a provider composing it from this field falls back to
-   * `?? 0` at that one seam, the number this field has always answered with.
+   * since the provider shipped (#476). `HealthInfo.activeConnections`
+   * is optional for the identical reason and the absence travels THROUGH that seam:
+   * a provider composing one from the other must carry the missing key across rather
+   * than flatten it with `?? 0`, which is what the docblock on that field says and
+   * what MSSQL, Oracle and MongoDB were corrected to do - all three initialised a
+   * local to 0 and swallowed the read's failure into it, so a denied DMV, an
+   * unprivileged `V$SESSION` and a whole failed `serverStatus` each reached the
+   * agent's curated reading as a measured zero.
    */
   activeConnections?: number;
   /**

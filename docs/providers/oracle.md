@@ -38,7 +38,7 @@ providers, with several Oracle-isms that are worth knowing before reading the co
 | Pagination | `LIMIT … OFFSET` | `FETCH FIRST n ROWS ONLY` / `OFFSET m ROWS FETCH NEXT n` |
 | Schema scope | all non-system schemas | the connecting **user's** schema (`OWNER = USER`) |
 | Schema queries | 1 `MATERIALIZED`-CTE round-trip | **5 bulk** `ALL_*` queries grouped in memory |
-| Maintenance | vacuum / analyze / reindex / kill | `analyze` (DBMS_STATS) / `optimize` (index rebuild) / `kill` |
+| Maintenance | vacuum / analyze / reindex / kill | `analyze` (DBMS_STATS) / `optimize` (rebuild one table's indexes, or the schema's) / `kill` |
 | Transaction timeout | 5-minute auto-rollback | **none** |
 | Cancellation | `pg_cancel_backend(pid)` | `connection.break()` (tracked connection) |
 | SSL | `buildSSLConfig()` + cloud auto-detect | `tcps://` + `sslServerDNMatch` + `walletContent` (no cloud auto-detect) |
@@ -185,9 +185,12 @@ PEM rather than three options.
 ### 3.6 Privilege-resilient monitoring
 
 Oracle monitoring reads `V$` dynamic-performance views, which require privileges a typical app user
-may lack. Every monitoring sub-query is wrapped in its own try/catch and degrades to a default
-(`N/A`, `0`, or `[]`) rather than failing the whole call — so the dashboard still renders for a
-low-privilege user, just with gaps.
+may lack. Every monitoring sub-query is wrapped in its own try/catch and degrades rather than failing
+the whole call — so the dashboard still renders for a low-privilege user, just with gaps. The default
+it degrades to is `N/A` or `[]` where the shape has a place to say "not measured", and — in the
+health and overview readings, where a number would otherwise be invented — **nothing at all**:
+`getHealth().activeConnections` and `getOverview().activeConnections` are both omitted rather than
+reported as `0` ([§7.2](#72-when-the-connection-count-is-not-measurable)).
 
 ---
 
@@ -240,6 +243,7 @@ things the driver understands:
 |------------|----------------|--------------------|----------------|
 | absent / `disable` | `host:port/service` | not set | — (plaintext) |
 | `require` | `tcps://host:port/service` | `false` | **yes** (unavoidable) |
+| `verify-system` | `tcps://host:port/service` | `true` | yes, against the runtime's own roots |
 | `verify-ca` | `tcps://host:port/service` | `false` | yes |
 | `verify-full` | `tcps://host:port/service` | `true` | yes |
 
@@ -252,6 +256,14 @@ the same string to `tls.createSecureContext()` as `cert`, `key` **and** `ca`.
 > `ssl.rejectUnauthorized: false` has nothing to map to. A server with a self-signed certificate is
 > reachable only by supplying its CA in `caCert`. `require` and `verify-ca` therefore differ from
 > `verify-full` only in the **DN/hostname** match, which is the one check Oracle does expose.
+>
+> `verify-system` (D26) asks for that same match. What separates it from `verify-full` here is what it
+> does NOT send: with no PEM pasted there is no `walletContent`, so `tls.connect` falls back to Node's
+> bundled roots for the chain — which is exactly what the mode means. Audited in the installed driver:
+> `oracledb/lib/thin/sqlnet/ntTcp.js` runs `tls.checkServerIdentity(hostName, cert)` when
+> `sslServerDNMatch` is on and no `sslServerCertDN` is configured. Not exercised against a TLS
+> listener (the probe instance speaks TCP), so this is the driver's audited shape and no claim about a
+> verified handshake.
 
 > Note: a pasted `connectionString` is returned **verbatim**, so its own protocol (or full TNS
 > descriptor) decides whether the transport is encrypted — a `require` selected alongside a `tcp`
@@ -345,7 +357,7 @@ selects the other branch of `buildQueryResult()`: the grid is empty (`rows: []`,
 
 Until 2026-08-24 the count was `rows.length` on both branches, so every statement that wrote
 something reported `0` for work it had done. Measured 2026-08-24 through
-`createDatabaseProvider({type:"oracle"})` against Oracle Free 23ai, with an interleaved `SELECT`
+`createDatabaseProvider({type:"oracle"})` against Oracle AI Database 26ai Free, with an interleaved `SELECT`
 proving each statement had landed:
 
 | statement | `rowsAffected` on the wire | `rowCount` before | after |
@@ -375,7 +387,7 @@ actually running). Exposed via `POST /api/db/cancel`.
 ### 5.3 What each Oracle type arrives as
 
 Every row below was measured on 2026-08-24 through `createDatabaseProvider({type:"oracle"})` against
-**Oracle Free 23ai** with **oracledb 6.10.0 in Thin mode**, over a probe table holding one populated
+**Oracle AI Database 26ai Free** with **oracledb 6.10.0 in Thin mode**, over a probe table holding one populated
 row and one all-`NULL` row. The `JSON.stringify` column is what `POST /api/db/query` puts on the wire,
 and therefore what the grid, the row detail sheet, the CSV, the SQL export and the agent's result
 summary all read.
@@ -473,7 +485,7 @@ Oracle is the one engine of the four whose driver hands over a NAME rather than 
 `fields`, by both `query()` and `queryInTransaction()`, and it is uppercase - the same spelling
 `ALL_TAB_COLUMNS.DATA_TYPE` uses, so a declared type reads like the schema tree's entry.
 
-Measured on Oracle Free 23ai over the probe table, verbatim from `oracledb`:
+Measured on Oracle AI Database 26ai Free over the probe table, verbatim from `oracledb`:
 
 | declared | `dbTypeName` | also reported |
 |---|---|---|
@@ -506,7 +518,7 @@ be** and this section says so plainly instead of implying otherwise. This is the
 already took for a CQL `duration`, applied to the one other engine here that has the same shape of
 problem.
 
-Measured 2026-08-24 against **Oracle Free 23ai** with **oracledb 6.10.0 in Thin mode**, through
+Measured 2026-08-24 against **Oracle AI Database 26ai Free** with **oracledb 6.10.0 in Thin mode**, through
 `createDatabaseProvider({type:"oracle"})`:
 
 | Oracle type | stored | before | after |
@@ -623,11 +635,86 @@ The same `TO_CHAR` recovers the sub-millisecond digits that a `Date` cannot hold
 ZONE` has no stored offset to lose (Oracle normalizes it on write and renders it in the *session's*
 zone), so for that type only the sub-millisecond truncation applies.
 
-**A `Date` cell does not replay through the SQL export into Oracle** — that is a separate defect and
-not fixed here. Measured on the same run: a `TIMESTAMP WITH TIME ZONE` cell exports as
-`'2026-08-24T07:11:12.345Z'` and Oracle refuses it with `ORA-01843: An invalid month was specified`.
-It affects every `DATE`/`TIMESTAMP` column, not just the zoned ones, and it lives in the shared
-export (`src/lib/export/result-export.ts`), not in this provider.
+#### The SQL export writes an Oracle date literal, not an ISO string
+
+A `Date` cell used **not** to replay at all. The shared export wrote it as its ISO string, and every
+one of the four types refuses that — measured 2026-08-25 against the Oracle Free image
+(`Oracle AI Database 26ai Free Release 23.26.2.0.0`) by replaying the exported file:
+
+```
+D     REFUSED  ORA-01861: literal does not match format string
+TS    REFUSED  ORA-01843: An invalid month was specified.
+TTZ   REFUSED  ORA-01843: An invalid month was specified.
+TLTZ  REFUSED  ORA-01843: An invalid month was specified.
+        (all four from INSERT ... VALUES ('2026-08-24T07:11:12.345Z'))
+```
+
+So a DDL+INSERT export of any ordinary Oracle table with a date column was unreplayable. The fix is
+in the shared export (`src/lib/export/result-export.ts`), not in this provider, and the conversion
+function IS the literal — the way `HEXTORAW` already is for a `RAW`. Which function comes from the
+**declared** type (`columnTypes`, [§5.4](#54-declared-column-types)), because the two shapes disagree
+about which fields of the `Date` are the value:
+
+| declared | written as |
+|---|---|
+| `DATE` | `TO_DATE('2026-08-24 10:11:12', 'YYYY-MM-DD HH24:MI:SS')` — the **local** fields |
+| `TIMESTAMP` (and anything else, and no declared type) | `TO_TIMESTAMP('2026-08-24 10:11:12.345', 'YYYY-MM-DD HH24:MI:SS.FF3')` — the **local** fields |
+| `TIMESTAMP WITH TIME ZONE`, `TIMESTAMP WITH LOCAL TIME ZONE` | `FROM_TZ(TO_TIMESTAMP('2026-08-24 17:11:12.345', 'YYYY-MM-DD HH24:MI:SS.FF3'), 'UTC')` — the **UTC** instant |
+
+- **Local fields for a naive column**, because that is the inverse of what the driver did: it built
+  the `Date` by reading the stored wall clock in the *Node process's* zone. Measured above, a `DATE`
+  holding `2026-08-24 10:11:12` arrives as `2026-08-24T07:11:12.000Z` from a process at `+03:00`, so
+  writing the ISO text would move every naive value by the exporter's own offset — and it would parse,
+  which is worse than being refused.
+- **`FROM_TZ(..., 'UTC')` for a zoned column**, because the `Date` there is the true instant and the
+  stored offset is already gone (above). No offset is invented; the instant is preserved *whatever
+  zone the replaying session runs in*, which a plain `TO_TIMESTAMP` is not — it is read in the
+  session's zone. Measured by replaying the same instant into a session at `-07:00` and letting the
+  server compare it against the source row:
+
+  ```
+  fromtz              1999-01-01 18:04:05.006 UTC       EQUAL
+  plain-utc-fields    1999-01-01 18:04:05.006 -07:00    DIFF
+  plain-local-fields  1999-01-01 21:04:05.006 -07:00    DIFF
+  ```
+
+- **What a zoned column loses:** its original zone, and only its zone. A `TIMESTAMP WITH TIME ZONE`
+  that read `2026-08-24 10:11:12.345 -07:00` on the source comes back as
+  `2026-08-24 17:11:12.345 UTC` on the target — the same moment, rendered as UTC, because the offset
+  was gone before the export saw the value. `TIMESTAMP WITH LOCAL TIME ZONE` loses nothing: it has no
+  stored offset, and it renders in the reader's session zone on both sides. A user who needs the
+  original zone must take it from the server with the `TO_CHAR ... TZR` above, in the same result.
+- **Milliseconds are kept** (`FF3`), and a declared `DATE` gets `TO_DATE` because a `DATE` has no
+  fractional second at all. Both were measured: a `TO_TIMESTAMP` literal inserted into a `DATE`
+  column is accepted and silently truncated to the whole second, so the explicit function only says
+  what the column already is.
+
+Verified end to end — read through the provider, exported, replayed into a fresh table, compared **by
+the server**:
+
+```
+PROVIDER ROWS  [{"K":1,"D":"2026-08-24T07:11:12.000Z","TS":"2026-08-24T07:11:12.345Z","TTZ":"2026-08-24T17:11:12.345Z","TLTZ":"2026-08-24T17:11:12.345Z"},
+                {"K":2,"D":"1999-01-01T22:00:00.000Z","TS":"1999-01-02T01:04:05.006Z","TTZ":"1999-01-01T18:04:05.006Z","TLTZ":"1999-01-01T18:04:05.006Z"},
+                {"K":3,"D":null,"TS":null,"TTZ":null,"TLTZ":null}]
+COLUMN TYPES   {"K":"NUMBER","D":"DATE","TS":"TIMESTAMP","TTZ":"TIMESTAMP WITH TIME ZONE","TLTZ":"TIMESTAMP WITH LOCAL TIME ZONE"}
+EXPORT DDL     CREATE TABLE d23_replay ("K" NUMBER, "D" DATE, "TS" TIMESTAMP,
+                 "TTZ" TIMESTAMP WITH TIME ZONE, "TLTZ" TIMESTAMP WITH LOCAL TIME ZONE);
+EXPORT INSERT  INSERT INTO d23_replay ("K", "D", "TS", "TTZ", "TLTZ") VALUES (2,
+                 TO_DATE('1999-01-02 00:00:00', 'YYYY-MM-DD HH24:MI:SS'),
+                 TO_TIMESTAMP('1999-01-02 03:04:05.006', 'YYYY-MM-DD HH24:MI:SS.FF3'),
+                 FROM_TZ(TO_TIMESTAMP('1999-01-01 18:04:05.006', 'YYYY-MM-DD HH24:MI:SS.FF3'), 'UTC'),
+                 FROM_TZ(TO_TIMESTAMP('1999-01-01 18:04:05.006', 'YYYY-MM-DD HH24:MI:SS.FF3'), 'UTC'));
+REPLAYED       CREATE TABLE and all three INSERTs accepted
+SERVER SAYS    K=2  D_EQ EQUAL  TS_EQ EQUAL  TTZ_EQ EQUAL  TLTZ_EQ EQUAL
+               K=3  (the all-NULL row)       EQUAL on all four
+               K=1  DIFF on the three timestamps, by exactly 00:00:00.000678
+```
+
+That last row is the truncation this section is about, not an export defect: `K=1` was stored with
+`.345678` and a `Date` holds milliseconds, so the server measures the difference as the 678
+microseconds the driver dropped (`TO_CHAR(s."TS" - r."TS")` → `+000000000 00:00:00.000678`, and
+`+000000000 00:00:00.000000` for the millisecond-exact row). **A sub-millisecond digit does not
+survive an export, because it did not survive the driver.**
 
 ---
 
@@ -671,8 +758,8 @@ sub-query is independently privilege-guarded ([§3.6](#36-privilege-resilient-mo
 
 | Method | Primary source | Notes / degradation |
 |--------|----------------|---------------------|
-| `getHealth()` | `V$SESSION`, `USER_SEGMENTS`, `V$SYSSTAT`, `V$SQL` | each block guarded → `N/A`/`0`/`[]` if no privilege; `cacheHitRatio` is `N/A`, never `0%` ([§7.1](#71-when-the-cache-hit-ratio-is-not-measurable)) |
-| `getOverview()` | `V$VERSION`, `V$INSTANCE`, `V$SESSION`, `V$PARAMETER`, `USER_SEGMENTS`, `USER_TABLES`/`USER_INDEXES` | each guarded |
+| `getHealth()` | `V$SESSION`, `USER_SEGMENTS`, `V$SYSSTAT`, `V$SQL` | each block guarded → absent/`N/A`/`[]` if no privilege; `activeConnections` is **omitted**, never `0` ([§7.2](#72-when-the-connection-count-is-not-measurable)); `cacheHitRatio` is `N/A`, never `0%` ([§7.1](#71-when-the-cache-hit-ratio-is-not-measurable)) |
+| `getOverview()` | `V$VERSION`, `V$INSTANCE`, `V$SESSION`, `V$PARAMETER`, `USER_SEGMENTS`, `USER_TABLES`/`USER_INDEXES` | each guarded; `activeConnections` is **omitted**, never `0` ([§7.2](#72-when-the-connection-count-is-not-measurable)), while `maxConnections` stays `0` because `0` there means "no limit published" |
 | `getPerformanceMetrics()` | `V$SYSSTAT` | **only** `cacheHitRatio`, and it is **omitted** when `V$SYSSTAT` cannot be read (no QPS/deadlocks/buffer-pool) — [§7.1](#71-when-the-cache-hit-ratio-is-not-measurable) |
 | `getSlowQueries()` | `V$SQL` (top-N by `ELAPSED_TIME`) | `sharedBlksHit`=`BUFFER_GETS`, `sharedBlksRead`=`DISK_READS`; `[]` on failure |
 | `getActiveSessions()` | `V$SESSION` ⋈ `V$SQL` | `pid` = `"SID,SERIAL#"`; wait class/event; `[]` on failure |
@@ -684,7 +771,7 @@ sub-query is independently privilege-guarded ([§3.6](#36-privilege-resilient-mo
 
 Two states, both ordinary:
 
-- **The connected user cannot read `V$SYSSTAT`.** Measured 2026-08-23 on Oracle Free 23ai against a
+- **The connected user cannot read `V$SYSSTAT`.** Measured 2026-08-23 on Oracle AI Database 26ai Free against a
   user granted only `CREATE SESSION`:
 
   ```
@@ -713,6 +800,63 @@ under a second name, which the Performance tab drew and rated as an independent 
 publish pool occupancy, in `V$BUFFER_POOL_STATISTICS`/`V$SGASTAT`, but this method does not query
 them.
 
+### 7.2 When the connection count is not measurable
+
+**Two methods read a connection count, and both can be refused:**
+
+| Method | Statement | Field |
+|--------|-----------|-------|
+| `getHealth()` | `SELECT COUNT(*) FROM V$SESSION WHERE STATUS = 'ACTIVE'` | `HealthInfo.activeConnections` |
+| `getOverview()` | `SELECT COUNT(*) FROM V$SESSION WHERE TYPE = 'USER'` | `DatabaseOverview.activeConnections` |
+
+Both need the same `V_$` grant everything else here does, and lacking it is the ORDINARY case rather
+than an exotic one. Oracle's own
+[*Database Reference*](https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/about-dynamic-performance-views.html)
+is explicit: "After installation, only user
+`SYS` or anyone with `SYSDBA` privilege has access to the dynamic performance tables"; the views
+themselves carry the `V_$` prefix and what an application queries is the `V$` public synonym over
+them, until a DBA grants a wider set of users access. A plain schema user therefore reads nothing
+from `V$SESSION` at all. The refusal measured 2026-08-23 on Oracle AI Database 26ai Free, against a
+user granted only `CREATE SESSION`, was on the cache-ratio view
+([§7.1](#71-when-the-cache-hit-ratio-is-not-measurable)) - `V_$SESSION` answers in the same shape,
+naming the underlying view rather than the synonym:
+
+```
+ORA-00942: table or view "SYS"."V_$SYSSTAT" does not exist
+```
+
+`activeConnections` is **optional on both shapes** for this case, so a refused count is **omitted**
+rather than reported:
+
+- From `getHealth()` the key is absent from the object and from the `POST /api/db/health` body, and
+  the admin fleet-health row drops its `N conn` figure rather than printing `0 conn`
+  ([`src/components/admin/tabs/OverviewTab.tsx`](../../src/components/admin/tabs/OverviewTab.tsx)).
+- From `getOverview()` the key is absent from the monitoring payload, and the Overview tab's
+  Connections card draws **`N/A` / "not published"** instead of the figure `0`; the connections trend
+  chart drops that sample rather than plotting it at zero
+  ([`src/components/monitoring/tabs/OverviewTab.tsx`](../../src/components/monitoring/tabs/OverviewTab.tsx)).
+  The card's threshold rating is **not** among the things this changes: the `V$PARAMETER` ceiling is
+  read inside the same `try` as the count, so a refusal leaves `maxConnections` at its `0`
+  initialiser too, `connectionPercent` is `null` on both the old and the new path, and the rating is
+  taken from `connectionPercent ?? 0` either way - the same score and the same card border. The drawn
+  figure and the dropped trend sample are the whole of it.
+
+Both used to be initialised to `0` with the guard leaving that `0` standing, so `ORA-00942` arrived
+as a *measured* "no active sessions" about an instance Oracle had said nothing about. For the health
+figure that reached the model: the agent's curated `health` reading forwards this field
+(`src/lib/agent/tools.ts`), so the fabrication was a claim about a server it could not measure. The
+agent does not read `getOverview()`; that count's readers are the monitoring card and its trend
+chart (the threshold rating reads it too, to the same result either way, as above).
+
+An instance that really has no such session measures `0`, and that `0` is a reading: it is kept and
+reported as `0`. The absence is spelled `measuredNumber(...)` plus a conditional spread, never
+`|| undefined`.
+
+`maxConnections` is deliberately **not** optional alongside it. It is a published ceiling
+(`V$PARAMETER` `sessions`), and there `0` MEANS "no limit published" - the same fact as absence - so
+a refused `V$PARAMETER` leaves `0` and the card says "no limit published". The count is read first in
+that shared block precisely so a refused ceiling cannot carry a measured count away with it.
+
 ---
 
 ## 9. Maintenance
@@ -722,13 +866,86 @@ them.
 | Type | With target | Without target |
 |------|-------------|----------------|
 | `analyze` | `DBMS_STATS.GATHER_TABLE_STATS(USER, '<t>')` | `DBMS_STATS.GATHER_SCHEMA_STATS(USER)` |
-| `optimize` | `ALTER INDEX "<t>" REBUILD` | rebuild **every** normal user index (`USER_INDEXES`, each in its own try/catch) |
+| `optimize` | rebuild the indexes THAT TABLE owns: `SELECT INDEX_NAME FROM USER_INDEXES WHERE TABLE_NAME = :t AND INDEX_TYPE = 'NORMAL'`, then `ALTER INDEX "<i>" REBUILD` for each (own try/catch) | rebuild **every** normal user index (`USER_INDEXES`, each in its own try/catch) |
 | `kill` | `ALTER SYSTEM KILL SESSION '<SID,SERIAL#>'` | throws (`SID,SERIAL#` required) |
 
 `getCapabilities().maintenanceOperations = ['analyze', 'optimize', 'kill']`. Targets are
 **inline-escaped** (single quotes doubled for the PL/SQL string literal; double quotes doubled for
 the quoted index identifier) rather than routed through `escapeIdentifier()`, because they sit
-inside `DBMS_STATS` arguments / `ALTER` identifiers that can't take bind parameters.
+inside `DBMS_STATS` arguments / `ALTER` identifiers that can't take bind parameters. The
+`optimize` catalog read is the exception: `TABLE_NAME = :tableName` sits in a WHERE clause,
+which does take a bind.
+
+### Where each operation may be offered (`maintenanceOperationSpecs`)
+
+Declaring that an operation EXISTS is not enough to put a button on it: two engines that
+declare the same `MaintenanceType` take different kinds of target, so each provider also
+declares what its own operations may be pointed at. The monitoring Tables tab renders a
+per-row control only where `perEntity` is true, the admin Operations tab a whole-database
+card only where `global` is true, and both take the wording from `label` (#496).
+
+`POST /api/db/maintenance` reads the same declaration since #U20, and it is the one reader that
+REFUSES rather than hides: it takes the placement from whether the request carries a `target`
+(absent or empty means whole-database) and answers `400` when this provider marks that
+placement unavailable while the other one is available. On Oracle it never speaks: every
+declaration above is either both placements or neither. `kill` declaring neither is not "takes
+no target" - `SID,SERIAL#` comes from the Sessions panel, which this field says nothing about -
+so those requests pass through.
+
+| Operation | Control label | Per-row | Global | Why |
+|-----------|---------------|---------|--------|-----|
+| `analyze` | Gather Statistics | yes | yes | `GATHER_TABLE_STATS` / `GATHER_SCHEMA_STATS` |
+| `optimize` | Rebuild Indexes | yes | yes | the target is a TABLE, and its own indexes are rebuilt - the shape SQL Server's identically worded `ALTER INDEX ALL ON [<t>] REBUILD` has |
+| `kill` | Kill Session | no | no | the target is `SID,SERIAL#` from the Sessions panel |
+
+`optimize` used to take an INDEX name, so the per-table button #427 wired up sent a table
+and every click answered **ORA-01418: specified index does not exist** - reproduced against
+`ldb-oracle-r5` on 2026-08-25 and re-run after the fix, which brought an `UNUSABLE` index
+on the named table back to `VALID` both with a target and without one. That container's
+`SELECT BANNER_FULL FROM V$VERSION` answers *"Oracle AI Database 26ai Free Release
+23.26.2.0.0"*, which is the product name used throughout this document. `INDEX_TYPE =
+'NORMAL'` excludes what `ALTER INDEX ... REBUILD` cannot take (the LOB index a CLOB column
+creates was present in that probe) and keeps the B-tree indexes that back UNIQUE and PRIMARY
+KEY constraints. A table with no rebuildable index succeeds having rebuilt nothing: "nothing
+to do" is not a failure, and neither is a heap table.
+
+**An empty index list has two causes, and they are not the same fact.** A target the schema
+does not own answered `{"success": true}` in ~1 ms having done nothing at all - measured
+through the provider on 2026-08-25 for `U9MISSING` (no such table) and for `u9real` (a real
+table spelled in the wrong case, which Oracle stores folded to upper case). Where
+`TABLE_NAME = :t` returns no index, `SELECT TABLE_NAME FROM USER_TABLES WHERE TABLE_NAME = :t`
+is asked as well, and a target that catalog does not know is reported as a failed operation:
+
+| Target | Result |
+|--------|--------|
+| `U9REAL` (one index) | `success: true` · *"OPTIMIZE: rebuilt 1 of 1 indexes."* |
+| `U9HEAP` (no index, real table) | `success: true` · *"OPTIMIZE: rebuilt 0 of 0 indexes."* |
+| `u9real` (case mismatch) | `success: false` · *"this schema owns no TABLE named u9real …"* |
+| `U9MISSING` (absent) | `success: false` · *"this schema owns no TABLE named U9MISSING …"* |
+| a plain VIEW | `success: false` · the same sentence, which is why it names the view case too |
+| no target (whole schema) | `success: true` · *"OPTIMIZE: rebuilt 27 of 30 indexes."* |
+| every index of the table refused | `success: false` · *"rebuilt 0 of 2 indexes. ORA-01647 …"* |
+
+The existence question is asked ONLY when the index list came back empty, so the ordinary
+path stays at one catalog read. `USER_TABLES` is the catalog that answers it because it is
+not narrower than `USER_INDEXES`: measured on the same container, a MATERIALIZED VIEW's
+container appears there under the view's own name and its indexes are keyed to that name,
+while a plain VIEW appears in neither - and a view owns no index for "Rebuild Indexes" to
+have rebuilt. The count in the message is there because tolerating one failed index means
+`success: true` alone cannot distinguish 2 of 2 from 1 of 2.
+
+**None of them rebuilding is a third fact.** One index failing leaves the run completed - an
+offline tablespace or an unusable partition stops that index alone - but a table where EVERY
+rebuild is refused had nothing it was asked to do happen. Measured on 2026-08-25 with the
+table's tablespace put READ ONLY, so every `ALTER INDEX ... REBUILD` answers ORA-01647: this
+reported `{"success": true, "message": "OPTIMIZE: rebuilt 0 of 2 indexes."}` in 14 ms with the
+ORA text discarded in an empty `catch`. It now reports `success: false` and carries the
+engine's first refusal, because the count says how many and only the ORA text says why. A
+table with no index at all keeps its success: nothing to do is still not a failure.
+
+`vacuumAction` has said *"Rebuild Indexes"* since this provider shipped, and that is
+`optimize`, not a `vacuum` Oracle has no statement for: `vacuumActionOperation: 'optimize'`
+is what lets the Operations tab render those words and send an operation Oracle declares.
 
 ---
 
@@ -743,7 +960,7 @@ inside `DBMS_STATS` arguments / `ALTER` identifiers that can't take bind paramet
 | `supportsExternalQueryLimiting` | `true` (from base) |
 | `supportsCreateTable` | `true` (from base) |
 | `supportsInlineRowEdit` | `true` — `UPDATE t SET c = v WHERE pk = v` is core Oracle DML |
-| `supportsTransactions` | `true` — Oracle is always in a transaction and the held connection commits or rolls back, so the trio and the SANDBOX toggle are offered (#U13) |
+| `supportsTransactions` | `true` — Oracle is always in a transaction and the held connection commits or rolls back, so the trio and the SANDBOX toggle are offered (#464) |
 | `declaresForeignKeys` | `true` — inherited from the base capabilities; read from `ALL_CONSTRAINTS`, so an empty list is about the schema or the owner, not the engine |
 | `supportsMaintenance` | `true` |
 | `maintenanceOperations` | `['analyze', 'optimize', 'kill']` |
@@ -759,7 +976,7 @@ global labels (*"Gather Stats"*, *"Rebuild All Indexes"*).
 
 `slowQueriesEmptyState` → *"Query stats come from V$SQL, which this user needs SELECT on to read."*
 The monitoring Queries panel's empty state was hardcoded to PostgreSQL's `pg_stat_statements` advice
-on every engine (`docs/BACKLOG.md` U12); `getSlowQueries()` here reads `V$SQL`
+on every engine (#463); `getSlowQueries()` here reads `V$SQL`
 ([§8](#8-monitoring--health)) and returns `[]` when that read is refused, so the grant is the thing a
 DBA can act on.
 
@@ -890,10 +1107,13 @@ Over the API: `POST /api/db/query`, `POST /api/db/transaction`, `POST /api/db/ca
   string form that keeps the offset — measured, asking for one returns the reader process's own time
   zone for every row. `TO_CHAR(col, '… TZR')` is the way to see the stored zone
   ([§5.5](#55-an-interval-is-normalized-to-its-oracle-literal-a-time-zone-cannot-be)).
-- **A `DATE`/`TIMESTAMP` cell does not replay through the SQL export into Oracle.** It is written as
-  the ISO string a `Date` serializes to (`'2026-08-24T07:11:12.345Z'`) and Oracle answers
-  `ORA-01843: An invalid month was specified`. The fix belongs in the shared export
-  (`src/lib/export/result-export.ts`), which has no Oracle date literal, not in this provider.
+- **A zoned timestamp replays as UTC, not in its original zone.** The SQL export writes a date cell
+  through Oracle's own conversion functions, so the file does replay with the instant intact
+  ([§5.5](#55-an-interval-is-normalized-to-its-oracle-literal-a-time-zone-cannot-be)) — but the
+  stored offset is gone before the export sees the value, so a `TIMESTAMP WITH TIME ZONE` written
+  `10:11:12.345 -07:00` comes back rendered `17:11:12.345 UTC`, and the sub-millisecond digits a
+  `Date` cannot hold are not in the file either. Both are the driver's truncation, above, not the
+  export's.
 - **`oracledb` ships no TypeScript declarations, so the driver surface is hand-declared.** Verified
   on 6.10.0: no `types`/`typings` field in its `package.json` and no `.d.ts` anywhere in the package,
   and there is no `@types/oracledb` in this project's dependencies. `src/types/db-drivers.d.ts`
@@ -916,7 +1136,7 @@ Over the API: `POST /api/db/query`, `POST /api/db/transaction`, `POST /api/db/ca
 - **`kill` and full monitoring require elevated privileges.** `ALTER SYSTEM KILL SESSION` needs the
   `ALTER SYSTEM` privilege; the `V$` monitoring views need `SELECT` on the `V_$` views. A
   least-privilege application user can neither kill sessions nor read most monitoring (the queries
-  degrade to `N/A`/`0`/`[]`).
+  degrade to absent/`N/A`/`[]`).
 - **Module-global driver settings.** The constructor sets `oracledb.outFormat`/`autoCommit` on the
   shared `oracledb` module singleton (not per-pool/connection) — fine for a single embedding, but a
   process-wide side effect to be aware of if Oracle is ever used alongside another `oracledb` consumer.
@@ -934,8 +1154,9 @@ Over the API: `POST /api/db/query`, `POST /api/db/transaction`, `POST /api/db/ca
   counters aren't read here.
 - **Row counts (`NUM_ROWS`) are optimizer estimates** populated by `DBMS_STATS`; they can be stale
   or `NULL` until stats are gathered.
-- **Monitoring depends on `V$` privileges.** A low-privilege app user silently gets `N/A`/`0`/`[]`
-  for the views it can't read. `getPerformanceMetrics()` reports only the cache-hit ratio (no QPS,
+- **Monitoring depends on `V$` privileges.** A low-privilege app user silently gets `N/A`/`[]` for the
+  views it can't read, and no `activeConnections` at all in either the health or the overview reading
+  ([§7.2](#72-when-the-connection-count-is-not-measurable)). `getPerformanceMetrics()` reports only the cache-hit ratio (no QPS,
   deadlocks, or buffer-pool usage), and **omits even that** when `V$SYSSTAT` is unreadable rather
   than substituting a figure — [§7.1](#71-when-the-cache-hit-ratio-is-not-measurable).
 - **No two-phase schema loading** — `/api/db/schema/list` falls back to the full `getSchema()`.

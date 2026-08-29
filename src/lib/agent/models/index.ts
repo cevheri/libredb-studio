@@ -31,6 +31,7 @@
  * honest treatment of a model nobody has measured.
  */
 
+import { AGENT_THREAD_CONTEXT_MAX_CHARS } from "../execution-policy";
 import { activeTuning } from "../model-tuning";
 import type { AgentRunWorkflowType } from "../types";
 import {
@@ -41,6 +42,9 @@ import {
   DEFAULT_REFUSAL_EXAMPLES,
   DEFAULT_PRESENT_REMINDER_LIMIT,
   DEFAULT_RETRY_EMPTY_TURN,
+  DEFAULT_RETRY_UNREAD_STOP,
+  DEFAULT_SUPPRESS_AGENT_REASONING,
+  DEFAULT_SUPPRESS_PLAN_REASONING,
   DEFAULT_SAMPLING,
   DEFAULT_UNREPORTED_CALL_CEILING,
 } from "./profile";
@@ -116,6 +120,33 @@ export function retriesEmptyTurn(modelId: string): boolean {
 }
 
 /**
+ * Whether a stop with nothing read is answered with the instruments rather than accepted.
+ *
+ * False everywhere but the model measured asking its user for the statement it was sent to
+ * diagnose, so introducing it changed no other model's turn count.
+ */
+export function retriesUnreadStop(modelId: string): boolean {
+  return resolve(modelId, "retryUnreadStop") ?? DEFAULT_RETRY_UNREAD_STOP;
+}
+
+/**
+ * Whether this model's plan turn is told to spend nothing on reasoning.
+ *
+ * Read only for a run whose mode is not `agent`; see the field's own note for why the five
+ * agent cells this model already locks are left alone.
+ */
+export function suppressesPlanReasoning(modelId: string): boolean {
+  return resolve(modelId, "suppressPlanReasoning") ?? DEFAULT_SUPPRESS_PLAN_REASONING;
+}
+
+/**
+ * Whether this model's AGENT turns ask for no reasoning; see the field's own note in `profile.ts`.
+ */
+export function suppressesAgentReasoning(modelId: string): boolean {
+  return resolve(modelId, "suppressAgentReasoning") ?? DEFAULT_SUPPRESS_AGENT_REASONING;
+}
+
+/**
  * This model's own turn limit, or undefined where the shipped one fits it.
  *
  * Undefined rather than a default, because there IS no per-model default here: the fallback is
@@ -124,6 +155,19 @@ export function retriesEmptyTurn(modelId: string): boolean {
  */
 export function turnTimeoutMsFor(modelId: string): number | undefined {
   return resolve(modelId, "turnTimeoutMs");
+}
+
+/**
+ * How much of a CONVERSATION this model may be handed, in characters.
+ *
+ * Falls back to the compiled budget, which is what drives every model today: nothing
+ * measured ships for this setting, because nobody has measured one. It is per-model
+ * rather than per-server because the value that is right is a function of the context
+ * window, and this product runs a hosted 200k-window model and a small local one under
+ * the same code.
+ */
+export function threadContextMaxCharsFor(modelId: string): number {
+  return resolve(modelId, "threadContextMaxChars") ?? AGENT_THREAD_CONTEXT_MAX_CHARS;
 }
 
 /**

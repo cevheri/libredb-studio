@@ -307,6 +307,39 @@ const CAT_INDICES_BODY = JSON.stringify([
   },
 ]);
 
+/**
+ * The same listing with one OPEN index and one CLOSED one, so the cluster-wide
+ * aggregate has both inputs. Constructed from this product's measured closed-index
+ * shape (status word `close`, counts as JSON `null` - docs/providers/opensearch.md
+ * §6); the open row is the captured `probe_orders` verbatim.
+ */
+const CAT_INDICES_MIXED_BODY = JSON.stringify([
+  {
+    health: "yellow",
+    status: "open",
+    index: "probe_orders",
+    uuid: "e4QJ354KTqyCX763SC2eag",
+    pri: "1",
+    rep: "1",
+    "docs.count": "1",
+    "docs.deleted": "0",
+    "store.size": "4807",
+    "pri.store.size": "4807",
+  },
+  {
+    health: "yellow",
+    status: "close",
+    index: "probe_closed",
+    uuid: "Pjif3CuaTwW2pmgHmRr8iQ",
+    pri: "1",
+    rep: "1",
+    "docs.count": null,
+    "docs.deleted": null,
+    "store.size": null,
+    "pri.store.size": null,
+  },
+]);
+
 /** `GET /probe_orders/_mapping`. */
 const ORDERS_MAPPING_BODY = JSON.stringify({
   probe_orders: {
@@ -705,7 +738,7 @@ describe("OpenSearchProvider shares the Elasticsearch implementation", () => {
     expect(esQuoting).toBe("double");
     expect(opensearch.queryLanguage).toBe("sql");
     expect(opensearch.supportsExplain).toBe(false);
-    // Neither grammar has BEGIN and both are reached over stateless HTTP (#U13).
+    // Neither grammar has BEGIN and both are reached over stateless HTTP (#464).
     expect(opensearch.supportsTransactions).toBe(false);
     expect(opensearch.defaultPort).toBe(9200);
   });
@@ -984,6 +1017,9 @@ describe("OpenSearchProvider monitoring", () => {
     expect(overview.indexCount).toBe(0);
     expect(overview.databaseSize).toBe("272.56 KB");
     expect(overview.databaseSizeBytes).toBe(279104);
+    // A cluster that publishes the figure keeps it, including a real measured 0: only an
+    // unpublished size is absent.
+    expect("databaseSizeBytes" in overview).toBe(true);
   });
 
   test("excludes the same bookkeeping indices from the table stats", async () => {
@@ -997,6 +1033,44 @@ describe("OpenSearchProvider monitoring", () => {
     // provider made up.
     expect(stats.every((row) => row.schemaName === "")).toBe(true);
     expect(stats[1]).toMatchObject({ rowCount: 2, tableSizeBytes: 6070, totalSizeBytes: 6070 });
+  });
+
+  test("omits the optional size fields for a closed index, which takes the cluster's Data figure away", async () => {
+    // The closed row's shape is this product's own, documented in docs/providers/opensearch.md
+    // §6: the status word is `close` and `docs.count` / `pri.store.size` arrive as JSON null
+    // while the listing still names the index. `TableStats.rowCount`, `totalSize` and
+    // `totalSizeBytes` are required, so a closed index has nowhere to read but zero there;
+    // `tableSize` and `tableSizeBytes` are OPTIONAL and are omitted, because a 0 would be a
+    // fabricated measurement.
+    const provider = await connectProvider();
+    overridePath("/_cat/indices", ok(CAT_INDICES_MIXED_BODY));
+
+    const stats = await provider.getTableStats();
+
+    expect(stats).toEqual([
+      {
+        schemaName: "",
+        tableName: "probe_orders",
+        rowCount: 1,
+        tableSize: "4.69 KB",
+        tableSizeBytes: 4807,
+        totalSize: "4.69 KB",
+        totalSizeBytes: 4807,
+      },
+      {
+        schemaName: "",
+        tableName: "probe_closed",
+        rowCount: 0,
+        totalSize: "0 B",
+        totalSizeBytes: 0,
+      },
+    ]);
+    // The cluster-wide consequence, asserted rather than inferred: `StorageTab` gates its
+    // Data figure on `tables.every((t) => t.tableSizeBytes !== undefined)`, so the open
+    // index's measured 4807 bytes stop being drawn as a total the moment one index beside it
+    // published nothing. A partial sum would read as a measurement.
+    expect(stats.every((row) => row.tableSizeBytes !== undefined)).toBe(false);
+    expect("tableSizeBytes" in stats[1]).toBe(false);
   });
 
   test("reports the cluster as the one storage unit there is", async () => {
@@ -1016,6 +1090,30 @@ describe("OpenSearchProvider monitoring", () => {
     const provider = await connectProvider();
 
     expect(await provider.getStorageStats()).toEqual([]);
-    expect((await provider.getOverview()).databaseSize).toBe("N/A");
+
+    const overview = await provider.getOverview();
+
+    expect(overview.databaseSize).toBe("N/A");
+    // The number used to say 0 bytes while the string beside it said "N/A", in the same
+    // object (docs/BACKLOG.md D44). `in` rather than `toBeUndefined()` because a
+    // fabricated 0 is the other outcome being told apart, and it is not undefined.
+    expect("databaseSizeBytes" in overview).toBe(false);
+  });
+
+  test("OMITS activeConnections rather than sending a 0 that reads as a count", async () => {
+    // Nothing in this seam carries a connection count on either product: the open HTTP
+    // connections per node live in a stats API this provider never calls. Absence is how
+    // the optional field says "not published" (#517), and the composed
+    // health summary has to carry it across rather than fill it in.
+    const provider = await connectProvider();
+
+    const overview = await provider.getOverview();
+    const health = await provider.getHealth();
+
+    expect("activeConnections" in overview).toBe(false);
+    expect("activeConnections" in health).toBe(false);
+    // The ceiling keeps its 0: for `maxConnections` the type says 0 and absence are the
+    // SAME fact, and the Connections card reads it as "no limit published".
+    expect(overview.maxConnections).toBe(0);
   });
 });

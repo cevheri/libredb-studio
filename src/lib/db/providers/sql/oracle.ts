@@ -166,6 +166,33 @@ const STORAGE_USER_SEGMENTS_SQL = `SELECT TABLESPACE_NAME AS NAME,
              GROUP BY TABLESPACE_NAME
              ORDER BY SUM(BYTES) DESC`;
 
+/**
+ * The indexes ONE table owns, for the `optimize` operation.
+ *
+ * `INDEX_TYPE = 'NORMAL'` is the filter the whole-schema form has always used, and it
+ * is the one `ALTER INDEX ... REBUILD` can take: it excludes LOB and domain indexes,
+ * which answer ORA-22864 / ORA-29868 to a rebuild, while keeping the B-tree indexes
+ * that back UNIQUE and PRIMARY KEY constraints, which rebuild normally.
+ */
+const TABLE_INDEXES_SQL = `SELECT INDEX_NAME
+           FROM USER_INDEXES
+           WHERE TABLE_NAME = :tableName AND INDEX_TYPE = 'NORMAL'`;
+
+const SCHEMA_NORMAL_INDEXES_SQL = `SELECT INDEX_NAME FROM USER_INDEXES WHERE INDEX_TYPE = 'NORMAL'`;
+
+/**
+ * Whether the schema owns a table by exactly this name - asked only to tell the two
+ * causes of an empty `TABLE_INDEXES_SQL` answer apart.
+ *
+ * `USER_TABLES` is the right catalog and not a narrower one: measured on
+ * ldb-oracle-r5 on 2026-08-25, a MATERIALIZED VIEW's container appears here under the
+ * view's own name (and its indexes appear in `USER_INDEXES` keyed to that name), so
+ * everything `USER_INDEXES` can be keyed to is visible. A plain VIEW is NOT here, and
+ * that is the honest answer for it: a view owns no index, so there is nothing for
+ * "Rebuild Indexes" to have done.
+ */
+const TABLE_IS_KNOWN_SQL = `SELECT TABLE_NAME FROM USER_TABLES WHERE TABLE_NAME = :tableName`;
+
 // ============================================================================
 // Value shapes
 // ============================================================================
@@ -175,7 +202,7 @@ const STORAGE_USER_SEGMENTS_SQL = `SELECT TABLESPACE_NAME AS NAME,
  *
  * By default oracledb answers a CLOB, an NCLOB and a BLOB with a `Lob` object -
  * a readable stream - and nothing downstream of the provider can read one.
- * Measured on 2026-08-24 against Oracle Free 23ai (oracledb 6.10.0, Thin) through
+ * Measured on 2026-08-24 against Oracle AI Database 26ai Free (oracledb 6.10.0, Thin) through
  * `createDatabaseProvider({type:"oracle"})`: all four LOB columns of a probe table
  * arrived as `Lob`, and serialising the row threw rather than producing a value -
  * `TypeError: Converting circular structure to JSON ... starting at object with
@@ -258,7 +285,7 @@ type IntervalColumn = readonly [name: string, format: (value: unknown) => string
  * boundary - the decision `docs/providers/cassandra.md` 3.8 already took for a CQL
  * `duration`, for the same reason and with the same shape.
  *
- * Measured 2026-08-24 against Oracle Free 23ai (oracledb 6.10.0, Thin): the driver
+ * Measured 2026-08-24 against Oracle AI Database 26ai Free (oracledb 6.10.0, Thin): the driver
  * answers `INTERVAL '3-7' YEAR TO MONTH` with `{"months":7,"years":3}` and
  * `INTERVAL '5 6:7:8.9' DAY TO SECOND` with
  * `{"fseconds":900000000,"seconds":8,"minutes":7,"hours":6,"days":5}`. Both are
@@ -373,6 +400,16 @@ export class OracleProvider extends SQLBaseProvider {
       // Oracle is always in a transaction; the held connection commits or rolls back.
       supportsTransactions: true,
       maintenanceOperations: ["analyze", "optimize", "kill"],
+      // `optimize` now takes a TABLE and rebuilds that table's own indexes, which is
+      // what SQL Server's identically worded control has always done. It used to take
+      // an INDEX name, so the per-table button that #427 wired up sent a table and
+      // every click answered ORA-01418 (reproduced against Oracle AI Database 26ai Free on
+      // 2026-08-25, then fixed and re-run - see runMaintenance below).
+      maintenanceOperationSpecs: {
+        analyze: { label: "Gather Statistics", perEntity: true, global: true },
+        optimize: { label: "Rebuild Indexes", perEntity: true, global: true },
+        kill: { label: "Kill Session", perEntity: false, global: false },
+      },
     };
   }
 
@@ -381,6 +418,10 @@ export class OracleProvider extends SQLBaseProvider {
       ...super.getLabels(),
       analyzeAction: "Gather Statistics",
       vacuumAction: "Rebuild Indexes",
+      // Oracle has no VACUUM; this slot has always said "Rebuild Indexes", which is
+      // `optimize`. Saying so is what lets the two surfaces send that operation
+      // instead of a `vacuum` this provider rejects (#496).
+      vacuumActionOperation: "optimize",
       analyzeGlobalLabel: "Gather Stats",
       analyzeGlobalTitle: "Gather Statistics",
       analyzeGlobalDesc: "Collects optimizer statistics for all tables to improve query performance.",
@@ -389,7 +430,7 @@ export class OracleProvider extends SQLBaseProvider {
       vacuumGlobalDesc: "Rebuilds all indexes to reclaim space and improve performance.",
       // `getSlowQueries()` reads V$SQL, and a user without SELECT on the V$ views gets
       // `[]` from the swallowed failure. The panel used to name a PostgreSQL extension
-      // there (#U12); the grant is the thing an Oracle DBA can act on.
+      // there (#463); the grant is the thing an Oracle DBA can act on.
       slowQueriesEmptyState: "Query stats come from V$SQL, which this user needs SELECT on to read.",
     };
   }
@@ -453,7 +494,10 @@ export class OracleProvider extends SQLBaseProvider {
     const wallet = [ssl.caCert, ssl.clientCert, ssl.clientKey].filter(Boolean).join("\n");
 
     return {
-      sslServerDNMatch: ssl.mode === "verify-full",
+      // `verify-system` asks for the same server-name match as `verify-full`; what it does
+      // NOT ask for is a wallet, so with no PEM pasted `tls.connect` falls back to Node's
+      // bundled roots for the chain - which is exactly what the mode means (D26).
+      sslServerDNMatch: ssl.mode === "verify-full" || ssl.mode === "verify-system",
       ...(wallet ? { walletContent: wallet } : {}),
     };
   }
@@ -524,7 +568,7 @@ export class OracleProvider extends SQLBaseProvider {
    *
    * oracledb answers a SELECT with a `rows` array and a non-SELECT with no `rows` at
    * all plus its own `rowsAffected` - so the row count of a DML statement is only
-   * readable there. Measured 2026-08-24 against Oracle Free 23ai through
+   * readable there. Measured 2026-08-24 against Oracle AI Database 26ai Free through
    * `createDatabaseProvider({type:"oracle"})`: `INSERT` of one row -> rowsAffected 1,
    * `INSERT ... SELECT` of three -> 3, `UPDATE` touching four -> 4, a `DELETE` that
    * matched nothing -> 0, `CREATE TABLE` and `TRUNCATE` -> 0, a PL/SQL block ->
@@ -835,7 +879,17 @@ export class OracleProvider extends SQLBaseProvider {
     try {
       conn = await this.pool!.getConnection();
 
-      let activeConnections = 0;
+      // Left UNDEFINED, and spread conditionally into the return below.
+      // `HealthInfo.activeConnections` is optional precisely so a user who cannot read
+      // V$SESSION omits the figure instead of sending a fabricated 0, and this is the
+      // reading the agent forwards to the model (`src/lib/agent/tools.ts` projects it
+      // with `?? null`), so an initial 0 made a refused view indistinguishable from an
+      // idle instance. V$SESSION needs the same `V_$` grant as everything else here,
+      // and that refusal was measured 2026-08-23 on Oracle AI Database 26ai Free
+      // against a user granted only CREATE SESSION: `ORA-00942: table or view
+      // "SYS"."V_$SYSSTAT" does not exist`. V_$SESSION answers ORA-00942 in the same
+      // shape when the grant is missing.
+      let activeConnections: number | undefined;
       let databaseSize = "N/A";
       let cacheHitRatio: string = CACHE_HIT_RATIO_UNAVAILABLE;
       const slowQueries: SlowQuery[] = [];
@@ -847,9 +901,12 @@ export class OracleProvider extends SQLBaseProvider {
           outFormat: oracledb.OUT_FORMAT_OBJECT,
         });
         const rows = (connRes.rows || []) as Record<string, unknown>[];
-        activeConnections = Number(rows[0]?.CNT || 0);
+        // measuredNumber, not `Number(... || 0)`: an instance with no ACTIVE session
+        // answers 0 and that 0 is a reading, so the falsy test would have thrown away
+        // the very figure it was meant to publish. Only an unanswered COUNT stays absent.
+        activeConnections = measuredNumber(rows[0]?.CNT);
       } catch {
-        /* V$ requires privileges */
+        /* V$SESSION requires privileges; the figure stays absent, never 0. */
       }
 
       // Database size
@@ -869,7 +926,7 @@ export class OracleProvider extends SQLBaseProvider {
       // Cache hit ratio. `|| 0` used to publish "0%" for a reading Oracle never
       // took, and the Overview card rates 0 as "Needs tuning" - so a user who
       // simply cannot read V$SYSSTAT saw a cache fault. The two ways the reading
-      // goes absent, both measured 2026-08-23 on Oracle Free 23ai: a user granted
+      // goes absent, both measured 2026-08-23 on Oracle AI Database 26ai Free: a user granted
       // only CREATE SESSION gets `ORA-00942: table or view "SYS"."V_$SYSSTAT" does
       // not exist` (the catch below), and a zero counter denominator gives one row
       // of `<NULL>` through NULLIF (measuredNumber).
@@ -913,7 +970,13 @@ export class OracleProvider extends SQLBaseProvider {
         /* ignore */
       }
 
-      return { activeConnections, databaseSize, cacheHitRatio, slowQueries, activeSessions };
+      return {
+        ...(activeConnections === undefined ? {} : { activeConnections }),
+        databaseSize,
+        cacheHitRatio,
+        slowQueries,
+        activeSessions,
+      };
     } finally {
       if (conn) await conn.close();
     }
@@ -941,23 +1004,7 @@ export class OracleProvider extends SQLBaseProvider {
             }
             break;
           case "optimize":
-            if (target) {
-              sql = `ALTER INDEX "${target.replace(/"/g, '""')}" REBUILD`;
-            } else {
-              // Rebuild all indexes for user
-              const idxRes = await conn.execute(`SELECT INDEX_NAME FROM USER_INDEXES WHERE INDEX_TYPE = 'NORMAL'`, [], {
-                outFormat: oracledb.OUT_FORMAT_OBJECT,
-              });
-              for (const row of (idxRes.rows || []) as Record<string, unknown>[]) {
-                try {
-                  await conn.execute(`ALTER INDEX "${String(row.INDEX_NAME)}" REBUILD`);
-                } catch {
-                  /* individual index rebuild may fail */
-                }
-              }
-              return { success: true };
-            }
-            break;
+            return await this.rebuildIndexes(conn, target);
           case "kill":
             if (!target) {
               throw new QueryError("Target SID,SERIAL# is required for kill operation", "oracle");
@@ -975,7 +1022,7 @@ export class OracleProvider extends SQLBaseProvider {
         }
 
         await conn.execute(sql);
-        return { success: true };
+        return { success: true, message: `${type.toUpperCase()} completed successfully` };
       } finally {
         if (conn) await conn.close();
       }
@@ -984,8 +1031,99 @@ export class OracleProvider extends SQLBaseProvider {
     return {
       success: result.success,
       executionTime,
-      message: `${type.toUpperCase()} completed successfully`,
+      message: result.message,
     };
+  }
+
+  /**
+   * `optimize`: rebuild the indexes ONE table owns, or every normal index in the
+   * schema when the caller named nothing.
+   *
+   * The target is a TABLE NAME, because a table name is the only thing the two
+   * maintenance surfaces have to send - both take it from the object browser's rows.
+   * This used to build `ALTER INDEX "<target>" REBUILD` straight from that argument,
+   * so every per-table click answered *ORA-01418: specified index does not exist*
+   * (reproduced against Oracle AI Database 26ai Free on 2026-08-25). SQL Server's identically
+   * worded control is `ALTER INDEX ALL ON [<t>] REBUILD`, and this is that shape:
+   * Oracle has no `ALTER INDEX ALL`, so the index names come from `USER_INDEXES`
+   * first.
+   *
+   * A table with no rebuildable index succeeds having rebuilt nothing - "nothing to
+   * do" is not a failure, and a heap table with no index is an ordinary state. One
+   * index failing does not fail the run either (an offline tablespace or an unusable
+   * partition stops that index alone), which is the choice the whole-schema form
+   * already made and the reason each rebuild carries its own try/catch; the message
+   * says how many of the table's indexes were rebuilt, because "success" alone cannot
+   * distinguish 2 of 2 from 1 of 2.
+   *
+   * An EMPTY index list has a second cause, and it is not "nothing to do": a target the
+   * catalog does not know. A name that is not a table of this schema - including a real
+   * table spelled in the wrong case, since Oracle stores unquoted names folded to upper
+   * case - answered `{"success": true}` in ~1 ms having done nothing at all (measured
+   * against ldb-oracle-r5, Oracle AI Database 26ai Free Release 23.26.2.0.0, on
+   * 2026-08-25). A target the catalog cannot resolve is a failed operation, so the two
+   * are told apart with `TABLE_IS_KNOWN_SQL` - asked ONLY when the index list came back
+   * empty, so the ordinary path stays at one catalog read.
+   */
+  private async rebuildIndexes(
+    conn: oracledb.Connection,
+    target?: string,
+  ): Promise<{ success: boolean; message: string }> {
+    // The table name is a bind here, unlike the inline-escaped literals elsewhere in
+    // runMaintenance: this one sits in a WHERE clause, which does take a bind.
+    const indexes = target
+      ? await conn.execute(TABLE_INDEXES_SQL, [target], { outFormat: oracledb.OUT_FORMAT_OBJECT })
+      : await conn.execute(SCHEMA_NORMAL_INDEXES_SQL, [], { outFormat: oracledb.OUT_FORMAT_OBJECT });
+
+    const rows = (indexes.rows || []) as Record<string, unknown>[];
+
+    if (target && rows.length === 0) {
+      const known = await conn.execute(TABLE_IS_KNOWN_SQL, [target], { outFormat: oracledb.OUT_FORMAT_OBJECT });
+      if (((known.rows || []) as unknown[]).length === 0) {
+        return {
+          success: false,
+          // Two causes and one sentence, because the catalog cannot tell them apart from
+          // here: a name that is nothing in this schema, and a name that is a VIEW or a
+          // synonym - `USER_TABLES` holds neither, and rebuilding an index is not a thing
+          // either can be asked to do. Measured on ldb-oracle-r5: a real view answers this
+          // too, and blaming only the spelling would misdirect a caller who spelled it
+          // right. `USER_TABLES` does hold a materialized view's container table, so that
+          // case reaches the rebuild rather than this branch.
+          message: `OPTIMIZE failed: this schema owns no TABLE named ${target}. A view or a synonym has no index to rebuild, and an unquoted name is folded to upper case, so a lower-case spelling will not match the catalog.`,
+        };
+      }
+    }
+
+    let rebuilt = 0;
+    // The engine's first refusal, kept rather than discarded: with every rebuild failing,
+    // "rebuilt 0 of 2" states the count and withholds the only part an operator can act
+    // on. Measured on a table whose tablespace is READ ONLY (ldb-oracle-r5, Oracle AI
+    // Database 26ai Free Release 23.26.2.0.0, 2026-08-25): every rebuild answers ORA-01647
+    // and this reported success in 14 ms.
+    let firstFailure: string | undefined;
+    for (const row of rows) {
+      try {
+        await conn.execute(`ALTER INDEX "${String(row.INDEX_NAME).replace(/"/g, '""')}" REBUILD`);
+        rebuilt++;
+      } catch (error) {
+        // One index failing is still a completed run (an offline tablespace or an unusable
+        // partition stops that index alone), which is the choice the whole-schema form
+        // already made - so the reason is recorded and the loop goes on.
+        firstFailure ??= error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    // None of them rebuilding is a different fact from some of them rebuilding: nothing
+    // the operation was asked to do happened, so it did not succeed. A table with no index
+    // at all keeps its success above - `rows.length === 0` never enters this branch.
+    if (rebuilt === 0 && rows.length > 0) {
+      return {
+        success: false,
+        message: `OPTIMIZE failed: rebuilt 0 of ${rows.length} indexes. ${firstFailure ?? ""}`.trim(),
+      };
+    }
+
+    return { success: true, message: `OPTIMIZE: rebuilt ${rebuilt} of ${rows.length} indexes.` };
   }
 
   // ============================================================================
@@ -1019,7 +1157,22 @@ export class OracleProvider extends SQLBaseProvider {
       let version = "Oracle";
       let uptime = "N/A";
       let startTime: Date | undefined;
-      let activeConnections = 0;
+      // Left UNDEFINED, and spread conditionally into the return below - the same
+      // shape `getHealth()` above uses, for the same reason. `DatabaseOverview.activeConnections`
+      // is optional precisely so a user who cannot read V$SESSION omits the figure
+      // instead of publishing a fabricated 0, and the monitoring Overview card reads
+      // the absence as "N/A / not published" while a 0 is drawn as a real count and
+      // added as a real sample to the connections trend
+      // (`src/components/monitoring/tabs/OverviewTab.tsx`). The card's threshold rating
+      // is the same either way: the V$PARAMETER ceiling is read inside the same try
+      // below, so a refusal leaves maxConnections 0 as well and the card's percentage
+      // is null on both paths. Oracle's Database Reference
+      // states that after installation only SYS or a SYSDBA can read the dynamic
+      // performance tables, so a plain schema user hitting ORA-00942 here is the
+      // ordinary case rather than an exotic one.
+      let activeConnections: number | undefined;
+      // NOT made optional alongside it: `maxConnections` is a published ceiling where
+      // 0 MEANS "no limit published", so 0 and absence are the SAME fact there.
       let maxConnections = 0;
       let databaseSize = "0 bytes";
       let databaseSizeBytes = 0;
@@ -1061,14 +1214,19 @@ export class OracleProvider extends SQLBaseProvider {
         const sessRes = await conn.execute(`SELECT COUNT(*) AS CNT FROM V$SESSION WHERE TYPE = 'USER'`, [], {
           outFormat: oracledb.OUT_FORMAT_OBJECT,
         });
-        activeConnections = Number(((sessRes.rows || []) as Record<string, unknown>[])[0]?.CNT || 0);
+        // measuredNumber, not `Number(... || 0)`: a COUNT of 0 is a reading, so the
+        // falsy test would have thrown away the very figure it was meant to publish.
+        // Only an unanswered COUNT stays absent. The assignment deliberately precedes
+        // the ceiling read below, so a refused V$PARAMETER cannot carry this count away.
+        activeConnections = measuredNumber(((sessRes.rows || []) as Record<string, unknown>[])[0]?.CNT);
 
         const maxRes = await conn.execute(`SELECT VALUE FROM V$PARAMETER WHERE NAME = 'sessions'`, [], {
           outFormat: oracledb.OUT_FORMAT_OBJECT,
         });
         maxConnections = Number(((maxRes.rows || []) as Record<string, unknown>[])[0]?.VALUE || 0);
       } catch {
-        /* ignore */
+        /* Both V$ views need privileges: a refused count stays absent, never 0, while a
+           refused ceiling leaves the 0 that already means "no limit published". */
       }
 
       // Database size
@@ -1096,7 +1254,7 @@ export class OracleProvider extends SQLBaseProvider {
         version,
         uptime,
         startTime,
-        activeConnections,
+        ...(activeConnections === undefined ? {} : { activeConnections }),
         maxConnections,
         databaseSize,
         databaseSizeBytes,

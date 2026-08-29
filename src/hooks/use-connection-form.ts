@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback } from "react";
 import {
   DatabaseConnection,
   DatabaseType,
@@ -115,6 +115,16 @@ function degradedSentence(result: TestOutcome): string {
   return result.message ?? result.error ?? "Connected, but this server answered no health data.";
 }
 
+/**
+ * The banner's three renderings. `success` and `error` are the two outcomes the
+ * banner always had; `warning` is the missing third one (#498) - a caution that is
+ * neither a completed action nor a refusal, such as a degraded connect/save offer or
+ * a paste that filled the form but could not apply one setting. A single field
+ * instead of `success` plus a `degraded` flag, because two booleans read together is
+ * exactly the shape that let a caution wear a green tick in the first place.
+ */
+type TestResultTone = "success" | "warning" | "error";
+
 export function useConnectionForm({ isOpen, onConnect, editConnection, onTestConnection }: UseConnectionFormProps) {
   const [type, setType] = useState<DatabaseType>("postgres");
   const [name, setName] = useState("");
@@ -127,7 +137,9 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
   const [connectionString, setConnectionString] = useState("");
   const [mongoConnectionMode, setMongoConnectionMode] = useState<"host" | "connectionString">("host");
   const [environment, setEnvironment] = useState<ConnectionEnvironment>("local");
-  const [testResult, setTestResult] = useState<{ success: boolean; message: string; latency?: number } | null>(null);
+  const [testResult, setTestResult] = useState<{ tone: TestResultTone; message: string; latency?: number } | null>(
+    null,
+  );
   const [pasteInput, setPasteInput] = useState("");
   const [showPasteInput, setShowPasteInput] = useState(false);
   /** Whether the user has been shown, and clicked past, a connection with no health surface. */
@@ -165,8 +177,19 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
 
   const isEditMode = !!editConnection;
 
-  // Populate form when editing
-  useEffect(() => {
+  // Populate form when editing.
+  //
+  // Adjusted while rendering rather than in an effect, per React's "adjusting some
+  // state when a prop changes": these are user-editable inputs, so they have to be
+  // state, and an effect committed a frame of postgres/localhost/5432 defaults before
+  // repopulating. The `{ conn }` wrapper is a sentinel, not decoration — `null` means
+  // "no prop applied yet", which is what lets the FIRST render apply the target;
+  // seeding the state from `editConnection` directly would skip mount, and today's
+  // effect does run on mount. Comparing on `.conn` keeps exactly the identity
+  // semantics of the effect's old `[editConnection]` dependency.
+  const [appliedEdit, setAppliedEdit] = useState<{ conn: DatabaseConnection | null | undefined } | null>(null);
+  if (!appliedEdit || appliedEdit.conn !== editConnection) {
+    setAppliedEdit({ conn: editConnection });
     if (editConnection) {
       setType(editConnection.type);
       setName(editConnection.name);
@@ -217,10 +240,28 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
         setSSHPassphrase(editConnection.sshTunnel.passphrase || "");
       }
     }
-  }, [editConnection]);
+  }
 
-  // Reset form when modal closes
-  useEffect(() => {
+  // Reset the form when the dialog closes, AND when the edit target goes away while it
+  // is already closed — adjusted while rendering for the same reason as the block
+  // above, and placed here so the two still run in the order the two effects did.
+  //
+  // The second trigger is what keeps the previous connection's credentials out of the
+  // next dialog. Editing X and then clearing the target while closed leaves X's name,
+  // user, password and database in this state, and the Add-Connection dialog opens with
+  // them. The shell happens to clear `editConnection` and `isOpen` in the same handler,
+  // so `isOpen` co-changes today — but that is the caller's business, and a credential
+  // leak may not rest on it, so the guard covers the transition on its own terms.
+  //
+  // Presence, not identity: X -> Y is a new edit target, which the block above
+  // repopulates in full, and re-running the reset for it would only rewrite the same
+  // constants. The sentinel IS seeded from the props, unlike `appliedEdit` above,
+  // because there is nothing for a mount pass to do: in edit mode the body skips the
+  // field block entirely, and the four transient values it clears already start out
+  // null/false/"".
+  const [lastReset, setLastReset] = useState({ isOpen, isEditMode });
+  if (isOpen !== lastReset.isOpen || isEditMode !== lastReset.isEditMode) {
+    setLastReset({ isOpen, isEditMode });
     if (!isOpen) {
       setTestResult(null);
       setShowPasteInput(false);
@@ -247,7 +288,7 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
         setAuthSource("");
       }
     }
-  }, [isOpen, editConnection]);
+  }
 
   const buildConnection = useCallback((): DatabaseConnection => {
     const sslConfig: SSLConfig | undefined =
@@ -275,7 +316,12 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
 
     /*
       Write only the addressing fields this engine actually takes — the same list the
-      modal renders inputs from. A file-addressed engine (SQLite, LibreDB) takes a
+      modal renders inputs from, which is now true: `ConnectionModal` gates its Username
+      and Database inputs on `takesConnectionField`, so a box exists exactly where a value
+      is written. It did not hold when this comment was first written, and the gap was
+      silent in both directions — libSQL and the search engines drew boxes nothing carried,
+      while Redis had its ACL user discarded by a list that omitted the field its own
+      provider authenticates with. A file-addressed engine (SQLite, LibreDB) takes a
       path and nothing else, yet this used to write `host: "localhost"`, an empty user
       and password, and a port parsed out of an empty string. That looks harmless and
       is not: a seed descriptor carries none of them, so a copy the editor had touched
@@ -376,19 +422,21 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
       const result = await probeConnection(buildConnection());
 
       setTestResult({
-        success: result.success,
+        // A degraded connection IS connected, so it is not an error - but saying
+        // "Connected successfully" and nothing else is what hid the missing
+        // monitoring surface until the dashboard showed an error page. It is not a
+        // plain success either: it is the same caution `handleConnect` offers below,
+        // so it gets the same warning tone rather than the green tick.
+        tone: !result.success ? "error" : result.degraded ? "warning" : "success",
         message: result.success
-          ? // A degraded connection IS connected, so it stays a success - but saying
-            // "Connected successfully" and nothing else is what hid the missing
-            // monitoring surface until the dashboard showed an error page.
-            result.degraded
+          ? result.degraded
             ? degradedSentence(result)
             : `Connected successfully${result.latency ? ` (${result.latency}ms)` : ""}`
           : result.error || "Connection failed",
         latency: result.latency,
       });
     } catch {
-      setTestResult({ success: false, message: "Network error - could not reach server" });
+      setTestResult({ tone: "error", message: "Network error - could not reach server" });
     } finally {
       setIsTesting(false);
     }
@@ -403,7 +451,7 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
       const result = await probeConnection(conn);
 
       if (!result.success) {
-        setTestResult({ success: false, message: result.error || "Connection failed" });
+        setTestResult({ tone: "error", message: result.error || "Connection failed" });
         return;
       }
 
@@ -423,7 +471,12 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
       if (result.degraded === true && !degradedSaveAcknowledged) {
         setDegradedSaveAcknowledged(true);
         setTestResult({
-          success: true,
+          // The save is being OFFERED, not refused, and not yet completed either - a
+          // sentence that asks the user to click again does not belong under a
+          // "success" tick (#498). This is the same class as the degraded
+          // `handleTestConnection` message above: connected, but the server answered
+          // no health data.
+          tone: "warning",
           // The button's own label, because the dialog renders two of them: "Save
           // Changes" when editing and "Establish Connection" when creating, and naming
           // a button that is not on screen is worse than naming none.
@@ -444,7 +497,7 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
       setMongoConnectionMode("host");
       setTestResult(null);
     } catch {
-      setTestResult({ success: false, message: "Network error - could not reach server" });
+      setTestResult({ tone: "error", message: "Network error - could not reach server" });
     } finally {
       setIsTesting(false);
     }
@@ -457,14 +510,17 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
     const parsed = parseConnectionString(trimmed);
     if (!parsed) {
       setTestResult({
-        success: false,
+        tone: "error",
         // One scheme per branch in connection-string-parser.ts, and nothing else.
         // Elasticsearch, OpenSearch and Trino are absent on purpose: all three are
         // addressed by host and port like Druid, and `http(s)://` already resolves to
         // ClickHouse there, so listing them would promise a paste this form cannot
         // honour. Trino's own `jdbc:trino://…` is a JDBC URL the parser does not read.
+        // DuckDB, SQLite and the embedded store are absent for a different reason:
+        // they are FILE-based, `showConnectionStringToggle` is false for all three, so
+        // this control is never rendered for them and no scheme is being withheld.
         message:
-          "Could not parse connection string. Supported formats: postgres://, mysql://, mongodb://, couchbase://, clickhouse://, http(s)://, redis://, oracle://, mssql://",
+          "Could not parse connection string. Supported formats: postgres://, mysql://, mongodb://, couchbase://, clickhouse://, libsql://, http(s)://, redis://, oracle://, mssql://",
       });
       return;
     }
@@ -497,8 +553,33 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
 
     setShowPasteInput(false);
     setPasteInput("");
-    setTestResult({ success: true, message: "Connection string parsed successfully. Review the fields and connect." });
-  }, [pasteInput, name]);
+    // A TLS parameter the parser refused to map is the one thing a green "parsed
+    // successfully" must not swallow: the user asked for encryption and the form is still
+    // showing whatever mode it held. Postgres's `prefer`/`allow` and MySQL's `PREFERRED`
+    // mean "encrypt if the server offers it", which SSL Mode cannot express, and guessing
+    // either end is measurably wrong in both directions (see connection-string-parser.ts).
+    // So name the parameter, name the mode that is actually in force, and say where to fix it.
+    //
+    // The paste itself worked - every other field is filled in - so this is not a
+    // failure, but a green tick over "your TLS setting was dropped" would be exactly
+    // the defect #449 names (an affordance that contradicts its own sentence), just
+    // in its most dangerous direction. Originally emitted as `success: false` for want
+    // of a third rendering (#U19 found the same missing state one branch below, in
+    // `handleConnect`'s degraded save); now that the warning tone exists for that
+    // caller too, this is the same caution and gets the same tone. The sentence still
+    // leads with what was NOT applied and says outright that the other fields were.
+    if (parsed.unmappedTLSParam) {
+      setTestResult({
+        tone: "warning",
+        message: `TLS setting not applied: "${parsed.unmappedTLSParam}" has no equivalent among disable, require, verify-system, verify-ca and verify-full. The other fields were filled in, but SSL Mode stays "${sslMode}" - open SSL / TLS and choose one before connecting.`,
+      });
+      return;
+    }
+    setTestResult({
+      tone: "success",
+      message: "Connection string parsed successfully. Review the fields and connect.",
+    });
+  }, [pasteInput, name, sslMode]);
 
   // Ordered for display (the modal renders these as a 2-column grid), and covering the whole
   // DatabaseType union — the same form edits existing connections, so an omitted type leaves the
@@ -519,6 +600,8 @@ export function useConnectionForm({ isOpen, onConnect, editConnection, onTestCon
     "opensearch",
     "trino",
     "cassandra",
+    "libsql",
+    "duckdb",
   ];
   const dbTypes = selectableTypes.map((t) => {
     const cfg = getDBConfig(t);

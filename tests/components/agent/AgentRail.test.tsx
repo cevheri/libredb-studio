@@ -4,11 +4,22 @@ import "../../helpers/mock-navigation";
 
 import React from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanup, render, fireEvent, waitFor, act, type RenderResult } from "@testing-library/react";
+import { cleanup, render, renderHook, fireEvent, waitFor, act, type RenderResult } from "@testing-library/react";
 import { AgentRail } from "@/components/agent/AgentRail";
+import { useConnectionManager } from "@/hooks/use-connection-manager";
+import {
+  resolveAgentRunConnectionId,
+  SEED_CONFIG_UNREADABLE_REASON,
+  type ManagedConnectionPayload,
+} from "@/hooks/use-connection-payload";
 import { applyStatementName } from "@/components/agent/rail-parts";
+import { useAgentRun } from "@/components/agent/use-agent-run";
 import { AGENT_WORKFLOW_BUDGETS } from "@/lib/agent/execution-policy";
-import type { AgentRunWorkflowType } from "@/lib/agent/types";
+import { agentPosture } from "@/lib/agent/posture";
+import type { AgentRunWorkflowType, AgentThreadContext } from "@/lib/agent/types";
+import { getDBConfig } from "@/lib/db-ui-config";
+import type { DatabaseConnection } from "@/lib/types";
+import { mockGlobalFetch, restoreGlobalFetch } from "../../helpers/mock-fetch";
 
 /**
  * The standalone agent rail (#329 T10a): the gated surface, its two modes and the
@@ -115,6 +126,21 @@ const OVERSPENT_LINE = `${JSON.stringify({
   },
 })}\n`;
 
+/**
+ * A statement that failed and whose entry carries no duration — the shape every ledger
+ * written before #512 has. The meter cannot count what it does not
+ * hold, so the rail says the figure is missing one rather than summing a zero (#477).
+ */
+const UNTIMED_FAILURE_LINE = `${JSON.stringify({
+  kind: "event",
+  event: {
+    kind: "tool-refused",
+    atMs: 1_003,
+    stepId: "s2",
+    refusal: { class: "database-error", statementFingerprint: "fp_1", message: 'relation "custmers"' },
+  },
+})}\n`;
+
 const DRAFTED_LINE = `${JSON.stringify({
   kind: "event",
   event: {
@@ -148,9 +174,25 @@ const FINISHED_LINE = `${JSON.stringify({
 })}\n`;
 
 const DEFAULT_PROPS = {
-  connectionId: "seed:sales",
+  connectionId: { id: "seed:sales" },
   connectionName: "Sales",
 };
+
+/**
+ * The paragraph the route answers a refused engine start with, read from the same module
+ * the rail's amber card reads.
+ *
+ * Built rather than quoted, because the point of #513 is that ONE paragraph reaches the
+ * panel twice: a hand-copied second literal here would keep passing after the posture
+ * was reworded and stop being about the duplication at all. `tests/api/agent/runs.test.ts`
+ * builds the same fixture the same way, which is what keeps the two suites from drifting.
+ */
+const ENGINE_POSTURE_BODY = agentPosture({
+  mode: "agent",
+  engine: "libredb",
+  engineLabel: getDBConfig("libredb").label,
+  handover: false,
+}).body;
 
 /**
  * POST /api/agent/runs accepted, then a stream of whatever lines are given — including
@@ -349,6 +391,10 @@ describe("AgentRail", () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
     window.matchMedia = originalMatchMedia;
+    // The rail now stores the conversation a run belongs to (#518), and it is read at
+    // MOUNT — so a key left behind by one test puts an amber notice over the next test's
+    // first render, before any start it makes.
+    localStorage.clear();
     cleanup();
   });
 
@@ -375,6 +421,440 @@ describe("AgentRail", () => {
 
     expect(queryAllByTestId("agent-timeline-item")).toHaveLength(0);
     expect(getByTestId("agent-timeline-empty")).toBeTruthy();
+  });
+
+  /*
+    The conversation strip and the id the rail sends.
+
+    Every negative assertion below also asserts that the start it is about ACTUALLY
+    HAPPENED. Without that pairing, "no previousRunId was sent" passes just as well
+    when nothing was sent at all, which is a test that cannot fail for the reason it
+    was written.
+  */
+  test("the strip lists the conversation's steps and offers a way out of it", async () => {
+    mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE], {
+      runId: "arun_b",
+      status: "queued",
+      mode: "planning",
+      thread: { threadId: "arun_a", steps: [{ runId: "arun_a", objective: "count by department" }], text: "Step 1" },
+    });
+    const view = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "chart those" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+    await view.findByTestId("agent-thread");
+
+    expect(view.getByTestId("agent-thread-steps").textContent).toContain("count by department");
+    expect(view.getByTestId("agent-thread-steps").textContent).toContain("arun_a");
+    expect(view.queryByTestId("agent-thread-fresh-pending")).toBeNull();
+
+    // The control takes effect on a start that has not happened, so it owes a visible
+    // state line: without one the click looks like it missed.
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-thread-new"));
+    });
+    expect(view.getByTestId("agent-thread-fresh-pending")).toBeTruthy();
+  });
+
+  test("new conversation suppresses the id, and the start it applies to still happens", async () => {
+    const fetchMock = mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE], {
+      runId: "arun_b",
+      status: "queued",
+      mode: "planning",
+      thread: { threadId: "arun_a", steps: [{ runId: "arun_a", objective: "count by department" }], text: "Step 1" },
+    });
+    const view = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "chart those" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+    await waitFor(() => {
+      expect(view.getByTestId("agent-run-status").textContent).toBe("succeeded");
+    });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-thread-new"));
+    });
+
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "what is blocked" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+
+    const runCalls = (fetchMock.mock.calls as [RequestInfo | URL, RequestInit?][]).filter(
+      ([url]) => String(url) === "/api/agent/runs",
+    );
+    // Non-vacuous: the second start DID fire, so the absence below is about the
+    // conversation rather than about nothing having happened.
+    expect(runCalls).toHaveLength(2);
+    const body = JSON.parse(String(runCalls.at(-1)?.[1]?.body)) as Record<string, unknown>;
+    expect(body.previousRunId).toBeUndefined();
+  });
+
+  /*
+    Every reason the SERVER can decline a carry for, and the WHOLE sentence each one
+    gets. A `Record` over the union rather than a hand-written row list, and both halves
+    of that shape are load-bearing.
+
+    The KEYS are the gate the production `switch` cannot supply on its own. `TS2366`
+    there catches a fifth member that needs a sentence of its own, but a member folded
+    onto the shared `unavailable`/`error` return adds only a bare `case` label: no
+    executable line, so `typecheck` passes and the 100% line gate reads 100% with the
+    new code rendered by no test (measured 2026-08-27 — fifth member `"rotated"` folded
+    onto the shared arm: `typecheck` clean, 254 pass / 0 fail, `AgentRail.tsx` still
+    100.00% lines). Missing an entry here is `TS2741` IN THIS FILE, whatever arm the
+    reason is folded onto.
+
+    The VALUES are whole sentences because fragments let a reword through: three of
+    these four were `toContain` fragments, and prepending "MUTATED " to their arms one
+    at a time left the suite at 254 pass / 0 fail three times out of four. `toBe` also
+    subsumes the negative that used to ride along here — the rail's own "Connection
+    changed" sentence is not an acceptable answer to any of these rows, and now it is
+    not an acceptable answer to any of them character for character.
+
+    Since #512 the re-pointed connection carries its own code, because it is the only
+    decline that is not a failure — every check the route makes passed, and the server
+    refused the carry on purpose. Both halves of that sentence are pinned, because the
+    half that was wrong was the second one: it claimed the decline persists until the
+    connection is pointed back, and the route writes the CURRENT identity onto the run it
+    opens, so the next follow-up continues off THAT run and carries normally.
+
+    Not "could not be reached" for the five under `unavailable` either: the sentence
+    still has to be true of every cause it covers, and one of them is a predecessor that
+    simply has not ended yet, which can be reached perfectly well.
+  */
+  const DECLINE_SENTENCES: Record<NonNullable<AgentThreadContext["declined"]>, string> = {
+    disabled: "Conversation context is switched off on this server, so every question starts on its own.",
+    repointed:
+      "This connection was re-pointed after the earlier step ran, so this question started a new conversation. Follow-ups from here continue on the connection as it points now.",
+    unavailable: "The earlier step could not be carried into this question, so it started on its own.",
+    error: "The earlier step could not be carried into this question, so it started on its own.",
+  };
+
+  test.each(Object.entries(DECLINE_SENTENCES) as [NonNullable<AgentThreadContext["declined"]>, string][])(
+    "a %s conversation renders its own sentence",
+    async (declined, sentence) => {
+      mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE], {
+        runId: "arun_b",
+        status: "queued",
+        mode: "planning",
+        thread: { threadId: "arun_a", steps: [], text: "", declined },
+      });
+      const view = render(<AgentRail {...DEFAULT_PROPS} />);
+
+      fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "chart those" } });
+      await act(async () => {
+        fireEvent.click(view.getByTestId("agent-start"));
+      });
+      await view.findByTestId("agent-thread-notice");
+
+      const notice = view.getByTestId("agent-thread-notice").textContent ?? "";
+      expect(notice, declined).toBe(sentence);
+    },
+  );
+
+  /*
+    The persistence claim, pinned as an ABSENCE, because that is the shape the defect had:
+    the sentence's first half was true and its second half was not, and a test asserting
+    only the first half stayed green through it (#512).
+
+    The negative is anchored on the positive in the same assertion pair, so it cannot go
+    vacuous: rename the testid or the copy and the `toContain` fails before the `not`
+    can pass on an empty string.
+  */
+  test("the re-pointed sentence does not claim later questions keep being declined", async () => {
+    mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE], {
+      runId: "arun_b",
+      status: "queued",
+      mode: "planning",
+      thread: { threadId: "arun_a", steps: [], text: "", declined: "repointed" },
+    });
+    const view = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "chart those" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+    await view.findByTestId("agent-thread-notice");
+
+    const notice = view.getByTestId("agent-thread-notice").textContent ?? "";
+    expect(notice).toContain("Follow-ups from here continue on the connection as it points now");
+    // The exact false claim that shipped, and the family it belongs to: the run this
+    // question opens records the connection as it points NOW, so the follow-up after it
+    // matches and carries. Nothing here may promise otherwise.
+    expect(notice).not.toContain("keep starting");
+    expect(notice).not.toMatch(/until the connection/i);
+  });
+
+  test("a first question renders no conversation strip", async () => {
+    const fetchMock = mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE]);
+    const view = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+    await view.findByTestId("agent-run-id");
+
+    const runCalls = (fetchMock.mock.calls as [RequestInfo | URL, RequestInit?][]).filter(
+      ([url]) => String(url) === "/api/agent/runs",
+    );
+    // The start happened, so the absent strip is a decision rather than an accident.
+    expect(runCalls).toHaveLength(1);
+    expect(view.queryByTestId("agent-thread")).toBeNull();
+  });
+
+  /*
+    The transition a reload used to be silent about (#518).
+
+    The rail was honest about the RESULT — no thread, no strip — and said nothing about the
+    change: a user mid-conversation who reloaded was not told that what they were doing had
+    ended, and their next question was answered as a fresh one. The conversation id lives in
+    localStorage, the same per-browser store every other browser-local preference uses.
+  */
+  test("a conversation this browser was in is stated before the next question is asked", async () => {
+    localStorage.setItem("libredb_agent_thread", JSON.stringify({ threadId: "arun_a", steps: 3 }));
+    mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE]);
+    const view = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    const notice = await view.findByTestId("agent-thread-ended");
+    // The two facts a person can check against the strip they had been reading, and the
+    // consequence stated rather than left to be discovered from the next answer.
+    expect(notice.textContent).toContain("3 questions");
+    expect(notice.textContent).toContain("arun_a");
+    expect(notice.textContent).toContain("starts a new one");
+
+    // And it is about the ABSENCE of a live run, so opening one ends it.
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+    await view.findByTestId("agent-run-id");
+    expect(view.queryByTestId("agent-thread-ended")).toBeNull();
+  });
+
+  test("one question reads as one question, not as a plural nobody wrote", async () => {
+    localStorage.setItem("libredb_agent_thread", JSON.stringify({ threadId: "arun_a", steps: 1 }));
+    mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE]);
+    const view = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    expect((await view.findByTestId("agent-thread-ended")).textContent).toContain("(1 question,");
+  });
+
+  test("a start records the conversation it opened, counting itself", async () => {
+    // Counting itself is the point: the server reports the steps BEFORE this run, so
+    // storing that number verbatim would have the notice say "one question" about a
+    // conversation whose strip the user had just read as two.
+    mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE], {
+      runId: "arun_b",
+      status: "queued",
+      mode: "planning",
+      thread: { threadId: "arun_a", steps: [{ runId: "arun_a", objective: "count by department" }], text: "Step 1" },
+    });
+    const view = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "chart those" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+    await view.findByTestId("agent-thread");
+
+    expect(JSON.parse(localStorage.getItem("libredb_agent_thread") ?? "null")).toEqual({
+      threadId: "arun_a",
+      steps: 2,
+    });
+  });
+
+  test("a start that belongs to no conversation forgets the one stored", async () => {
+    // Otherwise the next mount would announce that a conversation had been interrupted
+    // when the run after it had already been answered on its own.
+    localStorage.setItem("libredb_agent_thread", JSON.stringify({ threadId: "arun_a", steps: 3 }));
+    mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE]);
+    const view = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+    await view.findByTestId("agent-run-id");
+
+    expect(localStorage.getItem("libredb_agent_thread")).toBeNull();
+  });
+
+  test("a store that refuses the write costs the notice, never the run", async () => {
+    // Safari private mode and a full quota both land here. The bookkeeping is a nudge; the
+    // run is the work, and the same policy is written into `star-prompt.ts`.
+    const realSetItem = localStorage.setItem.bind(localStorage);
+    localStorage.setItem = () => {
+      throw new Error("QuotaExceededError");
+    };
+    const fetchMock = mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE], {
+      runId: "arun_b",
+      status: "queued",
+      mode: "planning",
+      thread: { threadId: "arun_a", steps: [{ runId: "arun_a", objective: "count by department" }], text: "Step 1" },
+    });
+
+    try {
+      const view = render(<AgentRail {...DEFAULT_PROPS} />);
+      fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "chart those" } });
+      await act(async () => {
+        fireEvent.click(view.getByTestId("agent-start"));
+      });
+      await view.findByTestId("agent-run-id");
+      // The start happened, so the swallowed write is a decision rather than an accident.
+      expect(
+        (fetchMock.mock.calls as [RequestInfo | URL, RequestInit?][]).filter(
+          ([url]) => String(url) === "/api/agent/runs",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      localStorage.setItem = realSetItem;
+    }
+  });
+
+  test("a follow-up start names the run it follows on the same connection", async () => {
+    const fetchMock = mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE]);
+    const view = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+    await view.findByTestId("agent-run-id");
+    await waitFor(() => {
+      expect(view.getByTestId("agent-run-status").textContent).toBe("succeeded");
+    });
+
+    // The box emptied when the run opened; the follow-up is a new question in it.
+    fireEvent.change(view.getByTestId("agent-objective"), {
+      target: { value: "and how many of those are there?" },
+    });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+
+    const runCalls = (fetchMock.mock.calls as [RequestInfo | URL, RequestInit?][]).filter(
+      ([url]) => String(url) === "/api/agent/runs",
+    );
+    const lastBody = JSON.parse(String(runCalls.at(-1)?.[1]?.body)) as Record<string, unknown>;
+    expect(lastBody.previousRunId).toBe("arun_1");
+  });
+
+  test("a start after switching connection does not follow the old run", async () => {
+    const fetchMock = mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE]);
+    const view = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+    await view.findByTestId("agent-run-id");
+    await waitFor(() => {
+      expect(view.getByTestId("agent-run-status").textContent).toBe("succeeded");
+    });
+
+    view.rerender(<AgentRail {...DEFAULT_PROPS} connectionId={{ id: "seed:analytics" }} connectionName="Analytics" />);
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "what is blocked" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+
+    const runCalls = (fetchMock.mock.calls as [RequestInfo | URL, RequestInit?][]).filter(
+      ([url]) => String(url) === "/api/agent/runs",
+    );
+    // Non-vacuous: without this the assertion below passes just as well when the
+    // second start never fired, because the FIRST call carries no previousRunId
+    // either — a test that cannot fail for the reason it was written.
+    expect(runCalls).toHaveLength(2);
+    const lastBody = JSON.parse(String(runCalls.at(-1)?.[1]?.body)) as Record<string, unknown>;
+    expect(lastBody.previousRunId).toBeUndefined();
+  });
+
+  /*
+    The sentence the rail owns, and the only one of the four the rail writes for itself
+    (#513). It used to be asserted as a two-word `toContain` riding on the test above,
+    whose subject is `previousRunId` - so every rewording after the second word survived
+    it, and the arm it selects shared one expression with the other three, which is why
+    the coverage gate could not see the gap either.
+
+    `toBe` and not `toContain`, because the whole sentence is the claim: a connection the
+    user moved is deliberate and correct, and the server's vocabulary for a carry that
+    failed would be a lie about it.
+  */
+  test("a connection change gets the rail's own sentence, in full", async () => {
+    const fetchMock = mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE]);
+    const view = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+    await view.findByTestId("agent-run-id");
+    await waitFor(() => {
+      expect(view.getByTestId("agent-run-status").textContent).toBe("succeeded");
+    });
+
+    view.rerender(<AgentRail {...DEFAULT_PROPS} connectionId={{ id: "seed:analytics" }} connectionName="Analytics" />);
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "what is blocked" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+
+    // Non-vacuous: the second start DID fire, so the sentence below is about a
+    // connection the rail watched move rather than about a render that never happened.
+    const runCalls = (fetchMock.mock.calls as [RequestInfo | URL, RequestInit?][]).filter(
+      ([url]) => String(url) === "/api/agent/runs",
+    );
+    expect(runCalls).toHaveLength(2);
+    expect(view.getByTestId("agent-thread-notice").textContent).toBe(
+      "Connection changed, so this question started a new conversation.",
+    );
+  });
+
+  /*
+    The precedence, pinned in the only direction that can be wrong (#513): the rail's own
+    reason and one of the server's codes are both true of this render, and the rail's is
+    the one that must be said.
+
+    It wins because it is the specific one. `unavailable` collapses five causes the
+    server may not tell apart, while a connection the user moved is a fact the rail
+    watched happen - so the shared sentence's absence is asserted beside the presence of
+    the connection sentence, which is what keeps the negative from going vacuous.
+  */
+  test("the rail's own connection sentence outranks any code the server sent", async () => {
+    const fetchMock = mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE], {
+      runId: "arun_b",
+      status: "queued",
+      mode: "planning",
+      thread: { threadId: "arun_a", steps: [], text: "", declined: "unavailable" },
+    });
+    const view = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+    await view.findByTestId("agent-run-id");
+    await waitFor(() => {
+      expect(view.getByTestId("agent-run-status").textContent).toBe("succeeded");
+    });
+
+    view.rerender(<AgentRail {...DEFAULT_PROPS} connectionId={{ id: "seed:analytics" }} connectionName="Analytics" />);
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "what is blocked" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+
+    const runCalls = (fetchMock.mock.calls as [RequestInfo | URL, RequestInit?][]).filter(
+      ([url]) => String(url) === "/api/agent/runs",
+    );
+    expect(runCalls).toHaveLength(2);
+    const notice = view.getByTestId("agent-thread-notice").textContent ?? "";
+    expect(notice).toContain("Connection changed");
+    expect(notice).not.toContain("could not be carried into this question");
   });
 
   test("a run cannot start without an objective", () => {
@@ -623,7 +1103,9 @@ describe("AgentRail", () => {
   test("a connection the server cannot resolve is refused here, with the reason", () => {
     const fetchMock = mock(async () => jsonResponse({}, 202));
     globalThis.fetch = fetchMock as unknown as typeof fetch;
-    const { getByTestId } = render(<AgentRail connectionId={null} connectionName="Local scratch" />);
+    const { getByTestId } = render(
+      <AgentRail connectionId={{ id: null, reason: "browser-only" }} connectionName="Local scratch" />,
+    );
 
     fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
 
@@ -1282,6 +1764,59 @@ describe("AgentRail", () => {
   });
 
   /**
+   * `SheetContent` floats its own close button at `top-4 right-4`, over whatever the
+   * sheet holds. This rail's header is a full-bleed 36px row (the sheet is `p-0`), so
+   * that X landed ON the Plan/Agent toggle — measured at 390px: the X spanned
+   * 358-374 and the "Agent" pill 328-378.
+   *
+   * The rail therefore offers its own, in the header row where the other controls are,
+   * and takes the floating one down.
+   *
+   * Two assertions because two things have to hold, and jsdom computes no Tailwind: the
+   * rail's control is IN the header, and the sheet carries the rule that removes the
+   * floating one. `hidden` is `display:none`, so in a browser that also takes the
+   * duplicate out of the tab order and the accessibility tree rather than merely making
+   * it invisible — which is why hiding it is enough and a second visible X is not left
+   * behind. The rendered result is checked at 390px in Chrome, not here.
+   */
+  test("the sheet's close control sits in the header rather than over the mode toggle", async () => {
+    const onSheetOpenChange = mock(() => {});
+    media.setMatches(true);
+    const { findByTestId } = render(<AgentRail {...DEFAULT_PROPS} sheetOpen onSheetOpenChange={onSheetOpenChange} />);
+    const sheet = await findByTestId("agent-rail-sheet");
+
+    const own = sheet.querySelector('button[aria-label="Close agent"]');
+    expect(own).not.toBeNull();
+    const header = sheet.querySelector('[data-testid="agent-mode-agent"]')!.closest("div")!.parentElement!;
+    expect(header.contains(own)).toBe(true);
+
+    // `SheetContent`'s own close is its only DIRECT child button, which is what the
+    // rule targets; the rail's own lives deeper, inside the header.
+    expect(sheet.className).toContain("[&>button]:hidden");
+    expect(own!.parentElement).not.toBe(sheet);
+  });
+
+  test("that control closes the sheet", async () => {
+    const onSheetOpenChange = mock(() => {});
+    media.setMatches(true);
+    const { findByTestId, getByLabelText } = render(
+      <AgentRail {...DEFAULT_PROPS} sheetOpen onSheetOpenChange={onSheetOpenChange} />,
+    );
+    await findByTestId("agent-rail-sheet");
+
+    fireEvent.click(getByLabelText("Close agent"));
+
+    expect(onSheetOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  /** The desktop rail is a panel of the layout: there is nothing to close. */
+  test("the desktop rail offers no close control", () => {
+    const { getByTestId, queryByLabelText } = render(<AgentRail {...DEFAULT_PROPS} />);
+    expect(getByTestId("agent-rail-panel")).toBeTruthy();
+    expect(queryByLabelText("Close agent")).toBeNull();
+  });
+
+  /**
    * The window widening past `md` while the sheet is open is the case a CSS-only
    * split gets wrong: `SheetContent` can be told `md:hidden`, but Radix's overlay
    * cannot, and it also sets `pointer-events: none` on the body. The rail would be
@@ -1471,9 +2006,9 @@ describe("AgentRail", () => {
       const onSheetOpenChange = mock(() => {});
       const view = render(<AgentRail {...DEFAULT_PROPS} onSheetOpenChange={onSheetOpenChange} />);
 
-      // The breakpoint is crossed explicitly: `useIsMobile` reports false on its first
-      // render and resolves in an effect, so an ask applied in the mount commit could
-      // not yet know the panel it filled is display:none.
+      // The breakpoint is crossed explicitly, after the mount, so this test exercises a
+      // real transition rather than a rail that was already narrow when it mounted --
+      // that case is the one the "first render on a narrow viewport" test below owns.
       await act(async () => {
         media.setMatches(true);
       });
@@ -1510,12 +2045,12 @@ describe("AgentRail", () => {
      * was already narrow — which the T1 adversarial review named as a real defect this
      * suite had no test for.
      *
-     * `useIsMobile` seeds false and resolves in an effect, so that first commit reads
-     * as desktop no matter how narrow the window is. An ask that decided from the
-     * hook's value would ask nobody to open the sheet: it would land in the panel
-     * branch, which is `hidden md:flex`, and the user would see a shortcut that
-     * visibly did nothing. The rail asks the viewport itself instead, in an effect
-     * that runs after commit, where the platform's answer is exact.
+     * The rail asks the viewport itself (`isMobileViewport`), in an effect that runs
+     * after commit, where the platform's answer is exact at the instant the ask is
+     * served -- rather than from `useIsMobile`, which hands back the value of the
+     * render the effect closed over. The failure this pins is an ask that asks nobody
+     * to open the sheet and lands in the panel branch, `hidden md:flex`, where the
+     * user sees a shortcut that visibly did nothing.
      *
      * Today's wiring never produces that render — the shell starts at null and mounts
      * the rail behind the capability probe — but T2 and T3 wire entry points that are
@@ -1832,20 +2367,73 @@ describe("AgentRail", () => {
     });
 
     /**
-     * The ledger records less than the tracker charges, in three known ways
-     * (`docs/BACKLOG.md` B12 and B13) — the largest being that the run's schema
-     * capture reaches `executeAuditedOperation` without going through `runStep`, so
-     * its two-to-three catalog reads are paid for and never itemized. A meter that
-     * did not say so would read as exact while sitting two statements low from the
-     * first turn.
+     * The ledger records less than the tracker charges, in known ways. The largest used
+     * to be the run's schema capture: it reaches `executeAuditedOperation` without going
+     * through `runStep`, so its two-to-three catalog reads were paid for and never
+     * itemized, and a meter that did not say so read as exact while sitting two statements
+     * low from the first turn. The capture now carries the charge it was billed and the
+     * fold adds it. What is still uncounted is a call that failed while acquiring its
+     * provider (charged, but it settles no step, so nothing here can see it), the
+     * difference between an engine's own elapsed time and the span measured around the
+     * whole call, and a ledger written before #512, whose failed statements carry no
+     * duration at all.
      */
     test("the meter says its figures are a floor, and names what the ledger leaves out", () => {
       const { getByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
 
       const caveats = getByTestId("agent-budget-caveats").textContent ?? "";
       expect(caveats).toContain("schema capture's catalog reads are not itemized");
-      expect(caveats).toContain("records no duration");
       expect(caveats).toContain("a floor, never a ceiling");
+      /*
+        The blanket claim is GONE since #512: a failed statement now records the
+        duration the tracker charged it, and a caveat that still said otherwise would
+        be describing a defect the run does not have. What
+        replaces it is per-run and conditional, asserted below.
+      */
+      expect(caveats).not.toContain("records no duration");
+    });
+
+    /**
+     * #512's residue. A failed statement records its duration from
+     * here on, but a ledger written BEFORE it did carries none, and a fold cannot
+     * invent one — so the run says how many of its statements have no duration on
+     * record instead of summing them as zero and calling the total measured (#477).
+     */
+    test("a run holding a failed statement with no duration on record says so", async () => {
+      mockAgentFetch([OPENED_LINE, AGENT_STARTED_LINE, COMPLETED_LINE, UNTIMED_FAILURE_LINE]);
+      const { getByTestId, findByText } = render(<AgentRail {...DEFAULT_PROPS} />);
+      fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+      await act(async () => {
+        fireEvent.click(getByTestId("agent-start"));
+      });
+
+      // Two statements charged, and only one of them with a duration in the ledger.
+      await findByText(`2 / ${AGENT_WORKFLOW_BUDGETS.investigation.policy.budgets.maxStatementsPerRun}`);
+      const caveats = getByTestId("agent-budget-caveats").textContent ?? "";
+      // The count, and the app's own words for what it means. Written number-neutral on
+      // purpose — "that spend" reads the same for one statement and for five — so the
+      // sentence needs no plural branch nobody would test both sides of.
+      expect(caveats).toContain("holds no duration for 1 of this run's charged statements");
+      expect(caveats).toContain("not in the figure above");
+    });
+
+    /**
+     * And the sentence is NOT shown to a run whose every charged statement carries one:
+     * a caveat that always fires is one a reader learns to skip, and it would be making
+     * a claim about this run that is not true of it.
+     */
+    test("a run whose statements all carry a duration is told nothing about missing ones", async () => {
+      mockAgentFetch([OPENED_LINE, AGENT_STARTED_LINE, COMPLETED_LINE]);
+      const { getByTestId, findByText } = render(<AgentRail {...DEFAULT_PROPS} />);
+      fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+      await act(async () => {
+        fireEvent.click(getByTestId("agent-start"));
+      });
+
+      await findByText(`1 / ${AGENT_WORKFLOW_BUDGETS.investigation.policy.budgets.maxStatementsPerRun}`);
+      // The SAME phrase the test above proves this rail can render, so the absence is a
+      // fact about this run and not an artifact of a wording that moved.
+      expect(getByTestId("agent-budget-caveats").textContent ?? "").not.toContain("holds no duration for");
     });
 
     // Every ceiling is per drive (`docs/BACKLOG.md` B6), so a resumed run starts
@@ -2124,7 +2712,7 @@ describe("AgentRail", () => {
     /*
       The bound is real and is stated where a user reads the citations rather than
       only when a click fails: results live in process memory and are released when
-      the run ends (`docs/BACKLOG.md` B15), so a report read after its run finished
+      the run ends, so a report read after its run finished
       cites rows the server no longer holds.
     */
     test("the report says that stored rows outlive nothing, next to the controls that ask for them", async () => {
@@ -2633,8 +3221,17 @@ describe("AgentRail", () => {
       off the node rather than off the entry, so the entry may be empty.
     */
     const observed: { element: Element; notify: () => void }[] = [];
+    /*
+      How many observers the rail has BUILT, which `observed` cannot answer: an observer
+      that is torn down and rebuilt disconnects itself first, so the registration count
+      is 1 either way. The subscription effect names `pinToNewest` as a dependency, and
+      this is what says that dependency is a stable identity rather than a fresh arrow.
+    */
+    let constructedObservers = 0;
     class TestResizeObserver {
-      constructor(private readonly callback: () => void) {}
+      constructor(private readonly callback: () => void) {
+        constructedObservers += 1;
+      }
       observe(element: Element) {
         observed.push({ element, notify: this.callback });
       }
@@ -2651,6 +3248,7 @@ describe("AgentRail", () => {
 
     beforeEach(() => {
       observed.length = 0;
+      constructedObservers = 0;
       (globalThis as { ResizeObserver?: unknown }).ResizeObserver = TestResizeObserver;
     });
 
@@ -2777,6 +3375,31 @@ describe("AgentRail", () => {
       });
 
       expect(scroller.scrollTop).toBe(0);
+    });
+
+    /*
+      The observer is built once for the life of the panel, and entries arriving do not
+      rebuild it. The rail hands `pinToNewest` to `new ResizeObserver(...)` and names it
+      as the subscription effect's dependency, so this holds only while that function
+      keeps one identity across renders; a per-render arrow would tear the observer down
+      and build another on every ledger line. The assertions above cannot see that — they
+      read `scrollTop`, which a rebuilt observer still moves correctly — so the count is
+      asserted directly.
+    */
+    test("the observer is built once, however many entries arrive", async () => {
+      const { stream, scroller } = await startRun();
+      await act(async () => {
+        stream.push(OPENED_LINE);
+      });
+      await act(async () => {
+        stream.push(STARTED_LINE);
+      });
+      await act(async () => {
+        stream.push(FINISHED_LINE);
+      });
+
+      expect(constructedObservers).toBe(1);
+      expect(observed.filter((entry) => entry.element === scroller).length).toBe(1);
     });
 
     /**
@@ -3315,7 +3938,7 @@ describe("AgentRail", () => {
         view.rerender(
           <AgentRail
             {...DEFAULT_PROPS}
-            connectionId="seed:analytics"
+            connectionId={{ id: "seed:analytics" }}
             connectionName="Analytics"
             onRunStatement={onRunStatement}
             onApplyStatement={onApplyStatement}
@@ -3384,7 +4007,7 @@ describe("AgentRail", () => {
         view.rerender(
           <AgentRail
             {...DEFAULT_PROPS}
-            connectionId="seed:analytics"
+            connectionId={{ id: "seed:analytics" }}
             connectionName="Analytics"
             onRunStatement={onRunStatement}
             onApplyStatement={onApplyStatement}
@@ -4244,7 +4867,7 @@ describe("AgentRail", () => {
         view.rerender(
           <AgentRail
             {...DEFAULT_PROPS}
-            connectionId="seed:analytics"
+            connectionId={{ id: "seed:analytics" }}
             connectionName="Analytics"
             onRunStatement={() => {}}
           />,
@@ -4272,7 +4895,7 @@ describe("AgentRail", () => {
         view.rerender(
           <AgentRail
             {...DEFAULT_PROPS}
-            connectionId="seed:analytics"
+            connectionId={{ id: "seed:analytics" }}
             connectionName="Analytics"
             connectionType="postgres"
             onRunStatement={() => {}}
@@ -4298,7 +4921,9 @@ describe("AgentRail", () => {
         const view = render(<AgentRail {...DEFAULT_PROPS} />);
 
         await startWith(view, "what is blocked right now");
-        view.rerender(<AgentRail {...DEFAULT_PROPS} connectionId="seed:analytics" connectionName="Analytics" />);
+        view.rerender(
+          <AgentRail {...DEFAULT_PROPS} connectionId={{ id: "seed:analytics" }} connectionName="Analytics" />,
+        );
         await act(async () => {
           release?.();
         });
@@ -4628,6 +5253,61 @@ describe("AgentRail", () => {
         return { view, fetchMock };
       }
 
+      test("a replacement continues what the replaced run continued, not the run it replaces", async () => {
+        /*
+          Run B continues run A. Changing B's workflow throws B away, so B' has to
+          continue A — otherwise the conversation breaks on the one control whose whole
+          purpose is to re-ask the SAME question a different way, and the referent that
+          worked a moment ago silently stops resolving.
+
+          The predecessor comes off `run.thread.steps`, which is the server's own
+          record, so this also pins that the rail reads the thread rather than
+          remembering one.
+        */
+        let opened: Record<string, unknown> = {};
+        const fetchMock = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+          if (url === "/api/agent/classify") return jsonResponse(classified("query-optimization"));
+          if (url.endsWith("/stream")) return ndjsonResponse([openedLineFrom(opened), STARTED_LINE]);
+          if (url === "/api/agent/runs" && init?.method === "POST") opened = JSON.parse(String(init.body));
+          return jsonResponse(
+            {
+              runId: "arun_b",
+              status: "queued",
+              mode: "planning",
+              thread: {
+                threadId: "arun_a",
+                steps: [{ runId: "arun_a", objective: "count by department" }],
+                text: "Step 1: count by department",
+              },
+            },
+            202,
+          );
+        });
+        globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+        const view = render(<AgentRail {...DEFAULT_PROPS} />);
+        await startWith(view, "chart those");
+        await view.findByTestId("agent-opened-as");
+
+        const runCalls = () =>
+          (fetchMock.mock.calls as [RequestInfo | URL, RequestInit?][]).filter(
+            ([url]) => String(url) === "/api/agent/runs",
+          );
+        const before = runCalls().length;
+
+        fireEvent.click(view.getByTestId("agent-opened-as-change"));
+        await act(async () => {
+          fireEvent.click(view.getByTestId("agent-change-workflow-operations"));
+        });
+
+        // The replacement was actually opened, so the id below is about what it sent
+        // rather than about a start that never happened.
+        expect(runCalls().length).toBe(before + 1);
+        const body = JSON.parse(String(runCalls().at(-1)?.[1]?.body)) as Record<string, unknown>;
+        expect(body.previousRunId).toBe("arun_a");
+      });
+
       test("the two consequences are stated before the click, not after it", async () => {
         const { view } = await inferredRun();
 
@@ -4820,6 +5500,14 @@ describe("AgentRail", () => {
       });
       return view;
     }
+
+    /*
+      Counted rather than queried by id, because the defect this suite keeps catching is
+      never a testid: it is the same words rendered twice, and a reworded second copy
+      would be the same defect. Shared by the strip's suite (L7) and the engine notice's
+      (#513), which found the identical shape in a different register.
+    */
+    const occurrences = (haystack: string, needle: string): number => haystack.split(needle).length - 1;
 
     describe("the safety strip", () => {
       test("plan mode says it executes nothing, and says what its one reach is", () => {
@@ -5065,7 +5753,6 @@ describe("AgentRail", () => {
       amber engine notice — says something the strip does not.
     */
     describe("what pressing Start means, said once", () => {
-      const occurrences = (haystack: string, needle: string): number => haystack.split(needle).length - 1;
       /*
         Asserted as a boolean rather than with `toBeNull()`, and that is not style: this
         node lives deep inside the rail, and bun's inspector walks an element's parents
@@ -5184,6 +5871,156 @@ describe("AgentRail", () => {
         const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="mongodb" />);
 
         expect(view.queryByTestId("agent-engine-unsupported-notice")).toBeNull();
+      });
+
+      /*
+        #513, measured in Chrome on 2026-08-27: a refused agent start on the bundled
+        LibreDB sample rendered the posture's whole 406-character paragraph in the red
+        error line, while the amber card two elements above was showing the identical
+        paragraph. The operator was told the same four sentences twice, once as a standing
+        explanation and once as the outcome of the action they had just taken.
+
+        Reusing the posture is right - a third phrasing of one fact is worse - so what
+        these tests pin is the REGISTER: an error line owes the consequence and a pointer,
+        and the paragraph stays the card's.
+
+        Answering every request with the 400 is the shape `survives a start the server
+        refused` already uses: the classify call falls back to an unclassified
+        investigation, which is a statement-sending workflow, and the run POST is refused.
+      */
+      /*
+        The strip's claim node is taken out before counting, and that is a property of the
+        panel rather than a convenience: `SafetyStrip` renders the posture body into
+        `agent-safety-claim` on EVERY render - `sr-only` when shut, a popover when open -
+        because it is the `aria-describedby` target for the mode pill and may never be
+        reachable only by clicking. So on an unsupported engine in agent mode the paragraph
+        is in the DOM twice before any start is refused, once as that description and once
+        as the amber card's visible reading. #513 is about the THIRD copy, in the red line.
+      */
+      const panelOutsideSafetyClaim = (view: RenderResult): string => {
+        const clone = view.container.cloneNode(true) as HTMLElement;
+        clone.querySelector('[data-testid="agent-safety-claim"]')?.remove();
+        return clone.textContent ?? "";
+      };
+
+      async function refusedStart(startBody: unknown): Promise<RenderResult> {
+        globalThis.fetch = mock(async () => jsonResponse(startBody, 400)) as unknown as typeof fetch;
+        const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="libredb" />);
+        fireEvent.click(view.getByTestId("agent-mode-agent"));
+        fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+        await act(async () => {
+          fireEvent.click(view.getByTestId("agent-start"));
+        });
+        await view.findByTestId("agent-error");
+        return view;
+      }
+
+      test("a start refused for the engine says the request was refused, and the explanation is read once", async () => {
+        const view = await refusedStart({ error: ENGINE_POSTURE_BODY, refused: "engine-unsupported" });
+
+        expect(view.getByTestId("agent-error").textContent).toBe(
+          "No run was opened. The notice above says why, and what still runs on this engine.",
+        );
+        // The paragraph is the card's, and it is read once. Counted rather than queried by
+        // id, because the defect was not a testid: it was the same 406 characters rendered
+        // twice in two registers, and a reworded second copy would be the same defect.
+        expect(occurrences(panelOutsideSafetyClaim(view), ENGINE_POSTURE_BODY)).toBe(1);
+        expect(view.getByTestId("agent-engine-unsupported-reason").textContent).toBe(ENGINE_POSTURE_BODY);
+        // "The notice above" is a positional claim, and a positional claim is false for a
+        // reader who is not looking at the panel. The pointer is made real here, on
+        // exactly the branch where its target exists.
+        const described = view.getByTestId("agent-error").getAttribute("aria-describedby") ?? "";
+        expect(described).toBe("agent-engine-unsupported-reason");
+        // And it RESOLVES. Pinning the attribute's VALUE is not the same claim: with only
+        // that assertion, deleting the target paragraph's own `id` left the suite at 254
+        // pass / 0 fail (measured 2026-08-27) while every screen reader had a description
+        // pointing at nothing.
+        const target = view.container.ownerDocument.getElementById(described);
+        expect(target?.getAttribute("data-testid")).toBe("agent-engine-unsupported-reason");
+      });
+
+      test("it carries the whole explanation again once the card is gone", async () => {
+        const view = await refusedStart({ error: ENGINE_POSTURE_BODY, refused: "engine-unsupported" });
+
+        // The card's own way out, which unmounts the card and leaves the error line
+        // standing: `run.error` is cleared only by the next start. The short line points
+        // at a notice that is no longer there, so the paragraph has to come back - it is
+        // then the only copy on screen, which is correct and not a degradation.
+        fireEvent.click(view.getByTestId("agent-engine-unsupported-plan"));
+
+        expect(view.queryByTestId("agent-engine-unsupported-notice")).toBeNull();
+        expect(view.getByTestId("agent-error").textContent).toBe(ENGINE_POSTURE_BODY);
+        expect(view.getByTestId("agent-error").getAttribute("aria-describedby")).toBeNull();
+      });
+
+      /*
+        A `refused` value this build has no words for, which is the shape the NEXT server
+        version has if it grows a second code. The answer owed is the server's own sentence:
+        the consequence line says "the notice above says why", and the notice above does not
+        say why an unrecognised refusal happened.
+
+        What this pins is that the code gate EXISTS at all: dropping it, so the rail explains
+        every refusal that arrives while the card is up, fails here and in the no-code test
+        below (measured 2026-08-27: 254 pass / 2 fail). It does not pin either gate's
+        NARROWNESS, and nothing rendered can: `use-agent-run.ts`'s admit list and the rail's
+        comparison against `ENGINE_UNSUPPORTED_CODE` are in SERIES, so widening one alone
+        leaves this line exactly as it is (rail comparison widened to any non-null code: 256
+        pass / 0 fail). The admit list is driven at the hook below for that reason.
+
+        The card IS on screen, so this is not the no-code case: the refusal names a code, it
+        just is not this one.
+      */
+      test("a 400 naming a code this build has no words for still says what the server said", async () => {
+        const view = await refusedStart({ error: ENGINE_POSTURE_BODY, refused: "agent-credential-unusable" });
+
+        expect(view.getByTestId("agent-engine-unsupported-notice")).toBeTruthy();
+        expect(view.getByTestId("agent-error").textContent).toBe(ENGINE_POSTURE_BODY);
+        expect(view.getByTestId("agent-error").getAttribute("aria-describedby")).toBeNull();
+      });
+
+      /*
+        The admit list itself, driven at the hook, because the rail cannot see it: widening
+        `isStartRefusalCode` to any defined value changes nothing the rail renders (the
+        comparison then rejects the value the list admitted), so before this test the whole
+        component suite stayed green through it — 255 pass / 0 fail. With it: 255 pass / 1
+        fail, here.
+
+        What the list guarantees is a TYPE: `errorCode` never carries a code this build has
+        no words for, so a surface added later cannot read one out of it and act on a value
+        it cannot name.
+      */
+      test("an unknown code never reaches errorCode", async () => {
+        globalThis.fetch = mock(async () =>
+          jsonResponse(
+            { error: "the agent credential could not be applied", refused: "agent-credential-unusable" },
+            400,
+          ),
+        ) as unknown as typeof fetch;
+        const hook = renderHook(() => useAgentRun());
+
+        await act(async () => {
+          await hook.result.current.start({
+            mode: "agent",
+            objective: "why is checkout slow",
+            connectionId: "seed:sales",
+          });
+        });
+
+        expect(hook.result.current.error).toBe("the agent credential could not be applied");
+        expect(hook.result.current.errorCode).toBeNull();
+      });
+
+      test("a 400 that named no code still says what the server said", async () => {
+        // The card IS on screen and the refusal is NOT the engine's: 400 is also the
+        // status of every other cross-field refusal this route makes, so discriminating
+        // on the status alone would relabel this one as the engine's and withhold the
+        // only sentence that says what actually went wrong.
+        const view = await refusedStart({ error: "connection seed:sales no longer resolves" });
+
+        expect(view.getByTestId("agent-engine-unsupported-notice")).toBeTruthy();
+        const line = view.getByTestId("agent-error").textContent ?? "";
+        expect(line).toContain("no longer resolves");
+        expect(line).not.toContain("No run was opened");
       });
     });
 
@@ -5752,5 +6589,99 @@ describe("AgentRail", () => {
         expect(view.getByTestId("agent-answer-chip-fingerprint").textContent).toBe("ctx_drui");
       });
     });
+  });
+});
+
+/**
+ * B37 — what the rail says when the SERVER could not read its own seed configuration.
+ *
+ * Driven live on 2026-08-15: one malformed `seed-connections.yaml` made
+ * `GET /api/connections/managed` fail, the browser held no seed descriptors, and the rail
+ * therefore said of `Sample (Employees)` — a connection this application ships and seeds
+ * itself — that "its settings live in this browser". False twice, and it pointed the
+ * operator at the wrong file while the real cause reached the server log only.
+ *
+ * These two tests run the WHOLE path rather than the rail alone, because the defect was in
+ * the joint: a failed load and an empty list were the same value, so no component
+ * downstream could have told them apart. The endpoint is failed for real, the real hook
+ * reads it, and the real rule turns that into what the rail is handed.
+ */
+describe("a seed configuration the server could not read (B37)", () => {
+  const SERVED: ManagedConnectionPayload = {
+    id: "seed:employees",
+    seedId: "employees",
+    name: "Sample (Employees)",
+    type: "sqlite",
+    database: "data/sample-employees.db",
+    managed: false,
+    createdAt: "1970-01-01T00:00:00.000Z",
+  };
+  /** The editable copy `use-connection-manager` persists for that seed. */
+  const LOCAL_COPY: DatabaseConnection = { ...SERVED, createdAt: new Date(0) };
+
+  /** The rail, rendered on the copy, after the managed endpoint answered as given. */
+  const railAfterManaged = async (managed: { status?: number; json: unknown }) => {
+    mockGlobalFetch({
+      "/api/connections/managed": managed,
+      "/api/db/health": { json: { status: "healthy" } },
+      "/api/agent/config": { json: { enabled: true } },
+    });
+    const hook = renderHook(() => useConnectionManager(true));
+    await waitFor(() => {
+      expect(hook.result.current.servedSeeds).toBeDefined();
+    });
+    const seeds = hook.result.current.servedSeeds;
+    hook.unmount();
+    const resolved = resolveAgentRunConnectionId(LOCAL_COPY, seeds);
+    const view = render(<AgentRail connectionId={resolved} connectionName={LOCAL_COPY.name} />);
+    return { view, seeds, resolved };
+  };
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    restoreGlobalFetch();
+    cleanup();
+    localStorage.clear();
+  });
+
+  test("the rail names the server's configuration, not the connection", async () => {
+    const { view, seeds, resolved } = await railAfterManaged({
+      status: 500,
+      json: { error: "Failed to load managed connections", reason: SEED_CONFIG_UNREADABLE_REASON },
+    });
+
+    // The browser holds "I do not have the seed list", which is not an empty one.
+    expect(seeds).toEqual({ loaded: false });
+    expect(resolved).toEqual({ id: null, reason: SEED_CONFIG_UNREADABLE_REASON });
+
+    const notice = view.getByTestId("agent-seed-config-unreadable").textContent ?? "";
+    expect(notice).toContain("server");
+    expect(notice).toContain("configuration");
+    // The two false claims the entry was written about. The connection is not at fault
+    // and its settings do not live here.
+    expect(notice).not.toContain("this browser");
+    expect(view.queryByTestId("agent-unresolvable-connection")).toBeNull();
+    // Still refused, and still without asking the server for a run it cannot open.
+    expect((view.getByTestId("agent-start") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // The control arm. A server that legitimately serves NO seeds is answering, and the
+  // original sentence is the true one there: this copy exists in this browser and
+  // nowhere else. Without this test the fix could turn every empty list into a false
+  // alarm about a configuration that is fine.
+  test("a server that legitimately serves no seeds still gets the original sentence", async () => {
+    const { view, seeds, resolved } = await railAfterManaged({ json: { connections: [] } });
+
+    expect(seeds).toEqual({ loaded: true, seeds: [] });
+    expect(resolved).toEqual({ id: null, reason: "browser-only" });
+
+    const caveat = view.getByTestId("agent-unresolvable-connection").textContent ?? "";
+    expect(caveat).toContain("Sample (Employees)");
+    expect(caveat).toContain("this browser");
+    expect(view.queryByTestId("agent-seed-config-unreadable")).toBeNull();
+    expect((view.getByTestId("agent-start") as HTMLButtonElement).disabled).toBe(true);
   });
 });

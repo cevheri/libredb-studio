@@ -60,11 +60,14 @@ vendor the server never claimed. StarRocks and SingleStore are deliberately not 
 answer with a plain MySQL number and give nothing to key on.
 
 **`performance_schema` is OFF by default on MariaDB.** Measured on `mariadb:12.3`
-(`@@performance_schema` = 0): the `performance_schema` tables exist, so the metric queries do not
-fail — they return a row of NULLs. Cache-hit ratio, queries/sec and buffer-pool usage are therefore
-absent rather than zero, and the slow-query list is empty. `information_schema`, `PROCESSLIST`,
-`EXPLAIN FORMAT=JSON`, schema introspection, sizes and row counts are unaffected. Start the server
-with `performance_schema=ON` to get the monitoring figures.
+(`@@performance_schema` = 0, build `12.3.2-MariaDB-ubu2404`): the `performance_schema` tables exist,
+so the metric queries do not fail — they return a row of NULLs. Cache-hit ratio, queries/sec and
+buffer-pool usage are therefore absent rather than zero. The digest table behaves the same way: it is
+selectable and answers **0 rows**, so the slow-query list is empty rather than an error — re-measured
+2026-08-27, and true of the health line only since the fix below, which is what made the OFF state
+distinguishable from a broken read at all. `information_schema`, `PROCESSLIST`, `EXPLAIN
+FORMAT=JSON`, schema introspection, sizes and row counts are unaffected. Start the server with
+`performance_schema=ON` to get the monitoring figures.
 
 The one metric that goes the other way is `deadlocks`: it comes from `SHOW STATUS LIKE
 'Innodb_deadlocks'`, which MariaDB publishes and MySQL does not, so it is the single performance
@@ -311,11 +314,52 @@ options ([mysql.ts:114](../../src/lib/db/providers/sql/mysql.ts)):
 discrete-fields form** (the `connectionString` path bypasses it entirely). Note `disable` returns
 `undefined` (mysql2's "off"), not `false`:
 
-1. **Explicit `connection.ssl`** (`SSLConfig`): `disable` → `undefined`; `verify-ca`/`verify-full` →
-   `rejectUnauthorized: true` (otherwise `false`); `caCert`/`clientCert`/`clientKey` → `ca`/`cert`/`key`.
+1. **Explicit `connection.ssl`** (`SSLConfig`): `disable` → `undefined`; `require` →
+   `rejectUnauthorized: false` (the one mode that encrypts without verifying);
+   `verify-system`/`verify-ca`/`verify-full` → `rejectUnauthorized: true`;
+   `caCert`/`clientCert`/`clientKey` → `ca`/`cert`/`key`. `verify-system` passes **no** `ca`, so
+   mysql2 hands `tls.connect` Node's own trust store — that mode exists precisely so a managed
+   endpoint can be verified with no PEM to paste. mysql2 exposes no separate host-name check, so
+   `verify-ca` and `verify-full` build the same object.
 2. **`options.ssl === true` or cloud auto-detect** — `shouldEnableSSL()` (`options.ssl === true` *or*
    a known managed host) enables `{ rejectUnauthorized: false }`.
 3. Otherwise `undefined`.
+
+#### `ssl-mode` in a pasted URL
+
+The paste box ([`connection-string-parser.ts`](../../src/lib/connection-string-parser.ts)) reads the
+query string, so `mysql://host/db?ssl-mode=REQUIRED` arrives with SSL Mode already set. The values are
+matched case-insensitively (MySQL writes them upper-case) and `sslmode` is accepted as an alias:
+`DISABLED` → `disable`, `REQUIRED` → `require`, `VERIFY_CA` → `verify-ca`, `VERIFY_IDENTITY` →
+`verify-full` (it checks the hostname as well as the chain).
+
+The boolean spellings are read too, and mapped at both ends because a boolean has no opportunistic
+value: `?ssl=true`, `?ssl=1`, `?useSSL=true` → **`verify-system`**; `?ssl=false`, `?ssl=0`,
+`?useSSL=false` → `disable`. An explicit `ssl-mode` wins when a string carries both.
+
+The rule (D26, stated in `readBooleanTLS`) is that a boolean maps onto the mode matching what the
+engine's own driver does with it, never onto a weaker one — and the driver this provider uses is
+mysql2, which defaults `rejectUnauthorized` to `true` for any `ssl` object it is handed
+(`node_modules/mysql2/lib/connection_config.js:171`). `verify-system` is that behaviour exactly:
+verified, with no CA certificate to find. The mapping was `require` until `verify-system` existed —
+`rejectUnauthorized: false` ([mysql.ts](../../src/lib/db/providers/sql/mysql.ts)), encrypted with the
+chain unchecked — because the only verifying modes on the form were the two that demand a PEM.
+
+One spelling is now mapped **stronger** than its writer meant: Connector/J's `useSSL=true` leaves
+`verifyServerCertificate` off unless `sslMode` is `VERIFY_CA`/`VERIFY_IDENTITY`. That direction is the
+deliberate one — a connection refused for an unverifiable certificate says so on screen, while a
+silent downgrade to unverified TLS says nothing at all, and the SSL / TLS panel is one click away for
+a server presenting a self-signed certificate. mysql2's
+object form (`?ssl={"rejectUnauthorized":true}`) is not a boolean and is reported in the banner rather
+than guessed at.
+
+`PREFERRED` is **not** mapped, and neither is any spelling the map does not know. It means "encrypt if
+the server offers it", and mapping it onto `disable` would downgrade a connection that was in fact
+encrypted: measured over TCP against MySQL with its default self-signed certificate,
+`--ssl-mode=PREFERRED` negotiated `TLS_AES_128_GCM_SHA256` while `--ssl-mode=DISABLED` left
+`Ssl_cipher` empty. Mapping it onto `require` is the mirror-image guess. So the mode the form already
+holds is left alone and the paste banner names the parameter it declined to act on; choose SSL Mode
+yourself in the SSL / TLS panel.
 
 ---
 
@@ -496,7 +540,15 @@ All monitoring reads from `SHOW STATUS`/`SHOW VARIABLES`, `information_schema`, 
 | `getStorageStats()` | `information_schema.TABLES`, `SHOW BINARY LOGS` | Data size, Binary Logs (if enabled), InnoDB data file (size `N/A`) |
 
 **Graceful degradation — note the *different* failure modes:**
-- `getHealth()` slow-queries: try/catch → a single placeholder row (*"Performance schema not available"*).
+- `getHealth()` slow-queries: the digest rows, or **an empty list** — never a placeholder row, and
+  on this path **the reason is dropped**. It used to answer a single fabricated row
+  (*"Performance schema not available"*, `calls: 0`) whenever its statement threw, and its statement
+  threw on every server: see
+  [the slow-query line asked for a column the digest table does not have](#the-slow-query-line-asked-for-a-column-the-digest-table-does-not-have)
+  below. `HealthInfo.slowQueries` is a `SlowQuery[]` with no error field and no sibling carrying one,
+  so an unreadable source is indistinguishable here from a source that measured nothing. Empty is
+  the least-wrong shape, not a shape that carries the reason — the operator gets the reason from the
+  `getSlowQueries()` path below, which does have a channel for it.
 - `getHealth()` cache-hit ratio: `formatCacheHitRatio()` → `"N/A"` when nothing was measured, and
   `"N/A"` again — rather than a failed health read — when the ratio query THROWS. A tenant can be
   missing the `performance_schema` *database* instead of merely having the schema off, and then the
@@ -504,7 +556,16 @@ All monitoring reads from `SHOW STATUS`/`SHOW VARIABLES`, `information_schema`, 
   tenant through this provider, and reproduced on `mysql:latest` as `ERROR 1049 (42000): Unknown
   database '...'`. That one throw used to abort the whole of `getHealth()`, so the panel showed
   nothing where one unavailable metric was the honest answer.
-- `getSlowQueries()`: try/catch → **empty array** `[]`.
+- `getSlowQueries()`: **the digests, or the server's refusal — this one does not swallow.** It used
+  to `return []` on any throw, which made a source that cannot be read look like a source that
+  measured nothing. What throws here is never the `performance_schema`-is-off path — an off server
+  answers 0 rows without raising — it is the source being *unreadable*: no `performance_schema`
+  database (`ERROR 1049`), or the grant denied on it (`ERROR 1142`). Letting that reject is what
+  puts the reason on screen: `getMonitoringData()`
+  ([`base-provider.ts`](../../src/lib/db/base-provider.ts)) reads every panel with
+  `Promise.allSettled` and records a rejected one under `errors.slowQueries`, and `QueriesTab`
+  renders that through `PanelUnavailable` carrying the server's own sentence. One refused panel
+  costs only itself; that method throws only when all four core reads reject.
 - `getPerformanceMetrics()`: **every field is omitted rather than defaulted.** A server with
   `performance_schema` OFF answers the `global_status` sub-selects with NULL instead of failing, so
   each reading is taken through `measuredNumber()` and a field with nothing behind it is left out of
@@ -517,6 +578,122 @@ All monitoring reads from `SHOW STATUS`/`SHOW VARIABLES`, `information_schema`, 
 - `deadlocks` reads `Innodb_deadlocks`, which is **MariaDB's** status variable. MySQL does not publish
   it — measured as an empty `SHOW STATUS` result on both 8.0.46 and 26.7.0 — so the field is absent on
   MySQL and present on MariaDB. It is the one metric that survives `performance_schema` being off.
+
+### The slow-query line asked for a column the digest table does not have
+
+`getHealth()`'s slow-query line had its own statement, `LEFT(sql_text, 100)` over
+`performance_schema.events_statements_summary_by_digest`, wrapped in a bare try/catch that reported
+`[{ query: "Performance schema not available", calls: 0, avgTime: "N/A" }]`. **That table has no
+`sql_text` column.** `SQL_TEXT` belongs to `events_statements_current`/`_history`; the digest table
+carries the normalised `DIGEST_TEXT` — [MySQL 9.4 manual, Statement Summary
+Tables](https://dev.mysql.com/doc/refman/9.4/en/performance-schema-statement-summary-tables.html),
+and each server's own `information_schema.columns` confirms it. So the statement never returned a
+row on any server, and the catch reported an engine capability as absent while the panel beside it
+listed real statements from the same table.
+
+Measured 2026-08-27 through this provider, one container per arm (`--innodb-use-native-aio=0`;
+readiness gated on a real `SELECT 1`, not `mysqladmin ping`). The raw statement's answer on all four:
+
+```
+errno=1054 code=ER_BAD_FIELD_ERROR sqlState=42S22 Unknown column 'sql_text' in 'field list'
+```
+
+(MariaDB words the same error `Unknown column 'sql_text' in 'SELECT'`.)
+
+| Server | `@@performance_schema` | `getHealth().slowQueries` before | after | `getSlowQueries()` |
+|--------|------------------------|----------------------------------|-------|--------------------|
+| MySQL 26.7.0 (`mysql:latest`) | 1 | *"Performance schema not available"* | 5 real digests — ``SELECT COUNT ( * ) FROM `t` `` at `calls: 4`, `1.09ms` | 5 rows |
+| Percona Server 8.4.11-11 | 1 | *"Performance schema not available"* | 5 real digests | 5 rows |
+| MySQL 26.7.0, `--performance-schema=OFF` | 0 | *"Performance schema not available"* | `[]` | `[]` |
+| MariaDB 12.3.2 (ships it off) | 0 | *"Performance schema not available"* | `[]` | `[]` |
+
+Three decisions came out of those measurements, and one property of the reading that none of them
+changes.
+
+**One statement, not two.** The health line and `getSlowQueries()` now share
+`SLOW_QUERIES_BODY_SQL`, differing only in the interpolated `LIMIT` (5 for the health line, the
+caller's for the panel), and both map the row through the same `toSlowQueryStats()`. Two statements
+for one fact is what drifted, and the copy the health panel used was the one no test ever put in
+front of a server — the mysql2 mock invented a `query` column for any statement over this table, so
+a broken read looked like a working one for as long as it was only mocked. The mysql2 mock in
+`mysql-provider.test.ts` now refuses `sql_text` the way a server does, one test asserts the provider
+never asks for it, and a construction in the mock's single call funnel records any fixture that
+answers such a statement instead of refusing it ([§12.1](#121-how-the-tests-work)).
+
+**An empty list, not an "unavailable" marker, and the reason is that OFF does not raise.** A server
+with `@@performance_schema` = 0 keeps the digest table selectable and answers **0 rows** — measured
+on both arms above, and it is why MariaDB's default has always shown an empty Queries panel rather
+than an error. There is therefore no exception that means "the capability is off", and a marker
+keyed on the throw would be emitted for something other than what it says: the same defect one level
+up. What does reach the catch is the source being *unreadable* — no `performance_schema` database at
+all (`ERROR 1049`, the OceanBase tenant above) or the grant denied on it: measured on MySQL 26.7.0
+with a user granted only `SELECT ON d32.*` plus `PROCESS`,
+
+```
+errno=1142 code=ER_TABLEACCESS_DENIED_ERROR sqlState=42000
+SELECT command denied to user 'nops'@'172.17.0.1' for table 'events_statements_summary_by_digest'
+```
+
+and on that connection `getHealth()` still answered in full (`activeConnections: 1`, `databaseSize:
+"0.02 MB"`, `cacheHitRatio: "94.3"`, one active session) with `slowQueries: []`.
+
+**Why the refusal is not carried in this field: on the health path it is dropped.** A refusal must stay
+representable as a refusal (#477), and a row is the one shape it must not take: `calls: 0` is a
+figure nobody took, and the list was *counted* — the agent's curated health reading then forwarded
+`health.slowQueries.length` as `slowQueryCount`
+([`src/lib/agent/tools.ts`](../../src/lib/agent/tools.ts)), so the invented row told the model
+"1 slow query" about every MySQL-family server. That projection no longer carries any length, so a
+row invented here would now be silent rather than counted — which is a reason to keep it out, not a
+reason it could come back.
+
+Dropped is the honest word for it, and this paragraph says so rather than naming a carrier the
+reading does not have. `HealthInfo.slowQueries` is a `SlowQuery[]`: no error field, no sibling that carries one, so a
+refusal cannot be represented in this reading at all. Nothing renders it either — no component reads
+`HealthInfo.slowQueries` (the monitoring Queries and Overview tabs read `MonitoringData.slowQueries`,
+a different reading), and the one caller of `POST /api/db/health`, the 60s connection pulse in
+[`use-connection-manager.ts`](../../src/hooks/use-connection-manager.ts), reads `res.ok` and
+discards the body. `ProviderLabels.slowQueriesEmptyState` is **not** a carrier for it: `QueriesTab`
+renders that one fixed sentence for every empty list whatever produced it, which is why the sentence
+had to stop naming a cause (it used to end *"enable the Performance Schema to see them"* — the one
+cause that never reaches the failure path).
+
+The operator is not left without the reason, because the *panel* path has a channel:
+`getSlowQueries()` lets the refusal reject (it used to `return []`), `getMonitoringData()`
+([`base-provider.ts`](../../src/lib/db/base-provider.ts)) records it under `errors.slowQueries`, and
+`QueriesTab` renders it through `PanelUnavailable` with the server's own sentence. The
+grant-denied and `ERROR 1049` fixtures in `mysql-provider.test.ts` assert exactly that division: the
+health line empties, `getSlowQueries()` rejects, and `errors.slowQueries` names the table.
+
+**One property of the reading the repair does not change: the list is a cap, not a count.**
+`SLOW_QUERIES_BODY_SQL` has no slowness predicate anywhere — its only `WHERE` term is the connected
+schema, "slow" is the *ordering* (`SUM_TIMER_WAIT DESC`), and the health line's `LIMIT` is 5. So on
+any server with five or more digests for the schema, `health.slowQueries.length` is 5 permanently,
+and any consumer counting it reads the limit rather than a number of slow statements. Measured 2026-08-27
+on MySQL 26.7.0 (`libredb-mysql`): the digest table held **59 rows** for one connected schema, and
+the five this statement returns for it were **all Studio's own introspection statements** — the
+slow-query read itself first (`avg 79.11ms`, `calls 3`), then the database-size read, `SHOW STATUS
+LIKE ?` and two `PREPARE`s, between 1.15 ms and 7.78 ms. Nothing in that list is slow and none of it
+is the user's workload. Raising the limit would move the saturation point without making the figure a
+count; only a slowness threshold, or a differently named projection, would. The agent's curated
+health reading has since stopped projecting the length at all — it declares
+`activeConnections`, `databaseSize` and `cacheHitRatio` only, and the slow-query facts travel on the
+`slow-queries` reading, where the rows are visible
+([`src/lib/agent/tools.ts`](../../src/lib/agent/tools.ts)) — so this provider's part is that the cap
+and the missing threshold are stated at
+[`HEALTH_SLOW_QUERY_LIMIT`](../../src/lib/db/providers/sql/mysql.ts) and pinned by a test that reads
+the statement the health call actually issued.
+
+**Sibling engines.** All nine MySQL-protocol engines in
+[`compatibility.ts`](../../src/lib/db/compatibility.ts) — MariaDB, Percona Server for MySQL, TiDB,
+StarRocks, Apache Doris, Databend, Vitess, OceanBase, SingleStore — reach this exact code, so every
+one of them showed the sentence and none of them shows it now. MariaDB and Percona are the two
+measured above; on the other seven the health line now carries whatever their own
+`performance_schema.events_statements_summary_by_digest` publishes for the connected schema, and an
+empty list where it publishes nothing or the table cannot be read. OceanBase is the one whose reading
+changes shape without changing meaning: its tenants have no `performance_schema` database at all
+(`ERROR 1049`, measured 2026-08-20), so its health line goes from the fabricated row to `[]` — and
+its Queries panel, which took the same `[]` before, now shows the tenant's own `ERROR 1049` through
+`PanelUnavailable`, because `getSlowQueries()` no longer swallows it.
 
 **Index sizes: `mysql.innodb_index_stats`, and `indexSizeBytes` may be absent.** The per-index byte
 figure is `stat_value * @@innodb_page_size` for the `stat_name = 'size'` row of the InnoDB
@@ -563,6 +740,71 @@ are backtick-quoted via `escapeIdentifier()`:
 `getCapabilities().maintenanceOperations = ['analyze', 'optimize', 'check', 'kill']`. `kill`
 validates that the target parses as an integer connection id.
 
+### The verdict is in the result set, not in the absence of an exception
+
+`ANALYZE`, `OPTIMIZE` and `CHECK TABLE` answer a **result set** — one row per (table, message)
+with `Table` / `Op` / `Msg_type` / `Msg_text` — and a statement the server refuses resolves
+normally. Measured through the driver against MySQL 26.7.0 (`libredb-mysql`) on 2026-08-25:
+
+| Statement | Rows MySQL answers |
+|-----------|--------------------|
+| `OPTIMIZE TABLE \`real1\`` | `note` *"Table does not support optimize, doing recreate + analyze instead"*, then `status` *"OK"* |
+| `OPTIMIZE TABLE \`missing\`` | `Error` *"Table 'u9t.missing' doesn't exist"*, then `status` *"Operation failed"* |
+| `CHECK TABLE \`real1\`` | `status` *"OK"* |
+
+So `await runStatement(conn, sql); return { success: true }` reported a completed operation for
+a statement the server had rejected — `optimize u9t` answered
+`{"success":true,"message":"OPTIMIZE completed successfully"}` while the server's own answer was
+Error / *"Table 'u9t.missing' doesn't exist"* / *"Operation failed"* — and it discarded the
+`Msg_text` that is the entire point of `CHECK TABLE`, whose OK-or-corruption-report is the only
+thing the user asked for. `readMaintenanceReport()` reads those rows:
+
+- **any row with `Msg_type` = `error`** (matched case-insensitively; the server sends `Error`,
+  the manual documents the set in lower case) → `success: false`, and the message quotes those
+  rows **with their table names**, because the whole-database form names every table in one
+  statement and a per-table Error row is the only place the failure appears;
+- **otherwise** → `success: true`, and the message quotes the engine's own texts, deduplicated:
+  over forty tables the OK and InnoDB's *"doing recreate + analyze instead"* note repeat once
+  per table and say the same thing forty times.
+
+After the fix, through the provider: `check real1` → *"CHECK: OK"*, `optimize missing` →
+`success: false` *"OPTIMIZE failed: u9t.missing: Table 'u9t.missing' doesn't exist"*. This is the
+same read SQLite's `check` already did with `PRAGMA integrity_check`.
+
+**A database with no tables runs no statement.** `OPTIMIZE TABLE ${getAllTablesForMaintenance()}`
+string-joined an empty list, and MySQL answered *"You have an error in your SQL syntax … near
+''"* — measured through the provider against an empty database on 2026-08-25. Nothing to do is
+not a failure and it is not a syntax error either, so the whole-database form now answers
+`success: true` with *"OPTIMIZE: no tables in u9empty to run it on."* without sending anything.
+
+### Where each operation may be offered (`maintenanceOperationSpecs`)
+
+Declaring that an operation EXISTS is not enough to put a button on it: two engines that
+declare the same `MaintenanceType` take different kinds of target, so each provider also
+declares what its own operations may be pointed at. The monitoring Tables tab renders a
+per-row control only where `perEntity` is true, the admin Operations tab a whole-database
+card only where `global` is true, and both take the wording from `label` (#496).
+
+`POST /api/db/maintenance` reads the same declaration since #U20, and it is the one reader that
+REFUSES rather than hides: it takes the placement from whether the request carries a `target`
+(absent or empty means whole-database) and answers `400` when this provider marks that
+placement unavailable while the other one is available. On MySQL it never speaks: every
+declaration above is either both placements or neither, so no request can name a placement this
+provider offers in one place only.
+
+| Operation | Control label | Per-row | Global | Why |
+|-----------|---------------|---------|--------|-----|
+| `analyze` | Analyze Table | yes | yes | `ANALYZE TABLE <t>`, or every table via `getAllTablesForMaintenance()` |
+| `optimize` | Optimize Table | yes | yes | `OPTIMIZE TABLE <t>`, same loop without a target |
+| `check` | Check Table | yes | yes | `CHECK TABLE <t>`, same loop without a target |
+| `kill` | Kill Connection | no | no | the target is a connection id from the Sessions panel |
+
+MySQL has no `VACUUM`, and the base labels put *"Vacuum Table"* in the explorer's row menu
+and *"Run Vacuum" / "Reclaim Space"* on the Operations tab anyway. The labels now say
+*"Optimize Table"* / *"Run Optimize" / "Optimize Tables"*, and `vacuumActionOperation:
+'optimize'` is what makes the surfaces send `optimize` for them - the global card used to be
+gated on the literal `vacuum`, so MySQL's own wording was written and never shown (#496).
+
 ---
 
 ## 10. Capabilities & labels
@@ -577,7 +819,7 @@ validates that the target parses as an integer connection id.
 | `supportsExternalQueryLimiting` | `true` (from base) |
 | `supportsCreateTable` | `true` (from base) |
 | `supportsInlineRowEdit` | `true` — `UPDATE t SET c = v WHERE pk = v` is core MySQL DML |
-| `supportsTransactions` | `true` — the transaction runs on one held connection through the driver's own `beginTransaction()`, so the trio and the SANDBOX toggle are offered (#U13) |
+| `supportsTransactions` | `true` — the transaction runs on one held connection through the driver's own `beginTransaction()`, so the trio and the SANDBOX toggle are offered (#464) |
 | `declaresForeignKeys` | `true` — inherited from the base capabilities; InnoDB declares them, so an empty list means this schema (or this role) has none, not the engine |
 | `supportsMaintenance` | `true` |
 | `maintenanceOperations` | `['analyze', 'optimize', 'check', 'kill']` |
@@ -588,14 +830,23 @@ validates that the target parses as an integer connection id.
 ### Labels
 
 MySQL keeps the default SQL `getLabels()` from `BaseDatabaseProvider` (entity → *Table*, *Select Top
-50*, etc.) for everything a person clicks. (The default `analyzeAction`/`vacuumAction` wording is
-generic SQL phrasing; MySQL's actual maintenance verbs are optimize/check/analyze.)
+50*, etc.) for everything a person clicks. `analyzeAction` is one of them and is correct: MySQL runs
+`ANALYZE TABLE`. The vacuum slot is not, and is overridden.
 
-**One field is overridden** ([mysql.ts:346](../../src/lib/db/providers/sql/mysql.ts)):
+**The vacuum slot** ([mysql.ts](../../src/lib/db/providers/sql/mysql.ts)): `vacuumAction` →
+*"Optimize Table"*, `vacuumGlobalLabel` → *"Run Optimize"*, `vacuumGlobalTitle` → *"Optimize
+Tables"*, `vacuumGlobalDesc` → the OPTIMIZE TABLE sentence, and `vacuumActionOperation` →
+`optimize`. MySQL has no `VACUUM`, so the base default put *"Vacuum Table"* in the explorer's row
+menu and *"Run Vacuum" / "Reclaim Space"* on the admin Operations tab for an engine whose operations
+are analyze/optimize/check/kill — and because that card was gated on the literal `vacuum`, no
+wording MySQL could have declared would have been shown (#U9,
+[§9](#where-each-operation-may-be-offered-maintenanceoperationspecs)).
+
+**And one monitoring field** ([mysql.ts:346](../../src/lib/db/providers/sql/mysql.ts)):
 `slowQueriesEmptyState` → *"Query stats come from
 performance_schema.events_statements_summary_by_digest - enable the Performance Schema to see them."*
 The monitoring Queries panel's empty state was hardcoded to PostgreSQL's `pg_stat_statements` advice
-on every engine (`docs/BACKLOG.md` U12) — an extension MySQL does not have under any name, while the
+on every engine (#463) — an extension MySQL does not have under any name, while the
 digest table this provider actually reads ([§8](#8-monitoring--health)) is a server switch a DBA can
 act on.
 
@@ -636,10 +887,64 @@ The `mysql2/promise` module is replaced with an in-process mock via `mock.module
 **before** the provider is imported — there is no live MySQL in the suite. The mock's pool/connection
 returns canned `[rows, fields]` tuples, exercising the same provider code paths as a real server.
 
-Two mock shapes are load-bearing. A non-SELECT must be mocked as a **`ResultSetHeader` object with
+Three mock shapes are load-bearing. A non-SELECT must be mocked as a **`ResultSetHeader` object with
 `undefined` fields**, not as an array. An array-shaped mock is exactly what hid the
 `result.rows.map is not a function` defect described in [§5.1](#51-execution) — the whole suite was
 green while every DDL and DML statement failed against a real server.
+
+A mock must also refuse what a server refuses, and **every** fixture must, not just the one written
+for the defect. The default mock used to answer ANY statement over
+`performance_schema.events_statements_summary_by_digest` with an invented `query`/`calls`/`avgTime`
+row, which is how the broken health statement in
+[§8](#the-slow-query-line-asked-for-a-column-the-digest-table-does-not-have) stayed green for as long
+as it existed: it asked for a column no MySQL-family server has, and only the mock ever answered it.
+About a hundred of the tests in the file run against that fixture, so the unfaithfulness was the
+default condition of the suite rather than a gap in one test.
+
+`sqlTextRefusal()` is the corrective, and all three digest fixtures answer with it —
+`defaultMockExecute`, `perfSchemaDisabledMockExecute` and `digestTableMockExecute` — rejecting any
+statement that names `sql_text` with the real `ER_BAD_FIELD_ERROR` (1054, `42S22`, re-verified
+2026-08-27 against `libredb-mysql`) and otherwise returning the digest columns a server returns. The
+OFF fixture is the one that shows why it has to be all three: while it answered `[[], []]` to the
+broken statement too, *both* readings produced `[]`, so "the health line is empty on a server whose
+Performance Schema is off" passed with the fix reverted — it modelled a server that does not exist.
+On top of that, one test asserts independently of any fixture's kindness that no `getHealth()` read
+names `sql_text` at all, and one reads the statement the health call issued to pin its `LIMIT 5` and
+the absence of a slowness predicate.
+
+That corrective was still unpinned, though, and said so: reverting `defaultMockExecute` to its
+unfaithful shape left the suite at 111 pass / 0 fail, because every test that needs the refusal
+installs a dedicated fixture. So the rule now lives where no fixture can opt out of it.
+`UNANSWERABLE_STATEMENTS` is a list of statements no MySQL-family server accepts — one entry today,
+the `sql_text` digest read, and each entry has to be a *measured* refusal, because a rule that
+refuses what a server answers is the same defect with its sign flipped. It is evaluated in
+`recordCall`, the one funnel every fixture in the file goes through (named, delegating and inline
+alike). The match is a co-occurrence over the whole statement, which is wider than the measurement:
+a join of the digest table against `events_statements_current` — which *does* have `SQL_TEXT` —
+would trip it too. Nothing `mysql.ts` emits has that shape, so the over-match is recorded next to
+the rule rather than paid for; the day a statement does, the rule narrows rather than gaining an
+exception. A fixture that *answers* a listed statement is **recorded** rather than thrown at: a
+throw from there would arrive inside `getHealth()`'s per-panel catch as a panel error the test under
+way might legitimately be asserting, which is exactly where the original unfaithfulness did its
+damage. A file-scope `afterEach` — file scope because the file has five top-level `describe`s, and a
+hook inside one would leave four unguarded — drains the recorded violations and fails the single
+test that produced one.
+
+Because `mysql.ts` no longer emits any statement naming `sql_text`, nothing else in the suite can
+make that rule fire, so a `describe` at the end of the file drives it directly: one test installs an
+unfaithful fixture and asserts the violation is recorded, and one installs the shared fixture and
+asserts it *rejects* — which pins `defaultMockExecute`'s fidelity (deleting its refusal branch now
+fails that test by name **and** the file-scope hook) and simultaneously proves the guard's `.then`
+wrapper leaves a rejection a rejection.
+
+Its reach is exactly the rules it carries, and only over statements a test actually sends. Deleting
+`perfSchemaDisabledMockExecute`'s refusal branch, for instance, is **not** caught today: no test
+installs that fixture *and* sends a `sql_text` statement, so nothing asks it the question. The guard
+closes the door on a fixture that lies when asked; it does not interrogate fixtures nobody asks.
+The list stays in this file rather than in `tests/helpers/` until a second engine has a measured
+refusal of its own — the other fourteen provider test files would receive an empty rule list, which
+proves nothing about their fixtures and reads as coverage. That condition is recorded in the list's
+own docblock, where a second engine's implementer will meet it.
 
 And the mock connection answers **both `query` and `execute`**, recording which one each statement
 went through. A mock that only answered `execute` could not tell a statement routed to the text
@@ -726,7 +1031,8 @@ Over the API: `POST /api/db/query`, `POST /api/db/transaction`, `POST /api/db/ca
 - **`cancelQuery()` returns `true` on `KILL QUERY` success** without confirming the target was
   actually executing.
 - **Cloud SSL auto-detect uses `rejectUnauthorized: false`** — encrypted but **not** authenticated
-  (MITM-exposed). For verified TLS, set an explicit `connection.ssl` with mode `verify-ca`/`verify-full`
+  (MITM-exposed). For verified TLS, set an explicit `connection.ssl` with mode `verify-system` (nothing
+  to paste) or `verify-ca`/`verify-full`
   and a `caCert`.
 
 ---

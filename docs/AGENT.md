@@ -26,11 +26,15 @@ Three properties frame everything below, and each of them is load-bearing rather
   already allows, and it has no second path to a driver. The pipeline is **not** shared with the
   rest of the application: `src/lib/agent/tools.ts:844` is its only production call site, and the
   editor's `/api/db/query` reaches the provider directly (`src/app/api/db/query/route.ts:44`).
-- **Agent mode requires PostgreSQL or SQLite — except the `operations` workflow, which runs
-  anywhere.** They are the only providers implementing `queryReadOnly` (`postgres.ts:870`,
-  `sqlite.ts:397`), so any other engine fails profiled acquisition with
-  `PROFILE_UNSUPPORTED_BY_PROVIDER` and the run ends `engine-unsupported`
-  (`src/lib/agent/runtime.ts:199`). Surfaces that must *state* that reach — the login hero does,
+- **Agent mode requires PostgreSQL, SQLite or DuckDB — except the `operations` workflow, which runs
+  anywhere.** They are the only providers implementing `queryReadOnly` (`postgres.ts:915`,
+  `sqlite.ts:537`, `duckdb/index.ts:525`), so on any other engine an agent-mode run whose workflow sends a statement is
+  **refused when it is started**: `POST /api/agent/runs` answers `400` with the posture's own
+  paragraph before a run id exists or a model turn is spent (#512). The provider factory's gate sits
+  behind that one and is what refuses a run reaching the drive some other way - profiled acquisition
+  fails with `PROFILE_UNSUPPORTED_BY_PROVIDER` and the run ends `engine-unsupported`
+  (`src/lib/agent/runtime.ts:199`), which is what a run opened by an earlier build still does. Both
+  read the same fact, which is why the route can refuse without duplicating the decision. Surfaces that must *state* that reach — the login hero does,
   since #425 — read `AGENT_EXECUTION_ENGINES` (`src/lib/agent/engine-support.ts`), which mirrors the
   gate rather than replacing it: the factory keeps probing `typeof provider.queryReadOnly`, and
   `tests/unit/lib/agent/engine-support.test.ts` measures the provider prototypes so the constant
@@ -48,7 +52,7 @@ Three properties frame everything below, and each of them is load-bearing rather
   on which of its two readings it takes**: `agent-read-only` on the dialects `CATALOG_PLANS` serves,
   because it composes catalog statements, and `agent-operations` everywhere else, because asking a
   provider to describe its own schema sends nothing an engine has to plan. That is what lets grounding
-  reach the twelve the read-only profile refuses, and it still cannot narrow any workflow's
+  reach the fourteen the read-only profile refuses, and it still cannot narrow any workflow's
   reach: the profile whose acquisition would be refused is never the profile that capture asks for. Everything else about
   the three acquisitions is identical: the same `readOnly: true` open, the same optional
   least-privilege `agentUser`, and the same profiled cache, so neither an operations run nor an
@@ -130,6 +134,7 @@ run by asking `GET /api/agent/config`, the same way it discovers the storage mod
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `LIBREDB_AGENT_ENABLED` | unset (derive) | The explicit **off**-switch. `false`/`off`/`0` mean no agent even with AI configured — the supported way to keep the AI configuration and decline the agent. `true`/`on`/`1` are still accepted and mean the default; they cannot conjure a model, because an override that renders a rail whose Start must fail is the outcome deriving exists to prevent. An unrecognized value warns and is ignored. |
+| `LIBREDB_AGENT_THREAD_CONTEXT` | unset (on) | Whether a run may be told about the **conversation** it belongs to. A follow-up asked on the same connection continues the previous run's thread: the earlier steps' objectives and the most recent step's report are derived server-side from those runs' own ledgers and handed to the model fenced. Set `false`/`off`/`0` where no question's context may reach another. Every run then opens on its own and the rail SAYS so — a user who asks a follow-up is told the conversation is switched off on this server, rather than being left to infer it from an answer that does not resolve. `GET /api/agent/config` reports the state to an **admin** session, beside `modelTuning` and for the same reason: an operator who switches something off must not hear silence, and `curl` is how they check. It is deliberately not sent to every session — the sentence a USER needs comes from the run's own `thread.declined` at the moment their follow-up was not read as one, which is where it means something. An unrecognized value warns and is ignored, the same two-sided rule `LIBREDB_AGENT_ENABLED` follows: a typo must neither take a working surface away nor turn one on. It is the operator's counterpart to the control the user already has — the rail names the run being continued and offers "new conversation" beside it. |
 | `WORKFLOW_TARGET_WORLD` | unset (`local`) | Durable backend for run state. Exactly two values are accepted: `local` (zero-config, on-disk, **single instance**) and `@workflow/world-postgres` (opt-in, multi-replica, needs `WORKFLOW_POSTGRES_URL`). Anything else is **refused**, not defaulted. |
 | `AGENT_MODEL_TURN_TIMEOUT_MS` | unset (`90000`) | How long **one** model call may take before the drive stops waiting for it. Raise it for a LOCAL model: the default was chosen against hosted APIs, where a turn lands in seconds and a 90-second wait only ever means a request that is not coming back. Measured across 25 Ollama models on six surfaces, **nine** runs ended `model-timeout` with the model still working — one of them a reasoning model in plan mode, which holds no tools at all, cut 92 s into its **first** turn with a zero-event ledger. Those runs are scored as having answered nothing, which is a fact about this ceiling and not about the model. A value that is not a positive whole number is **ignored** and the default stands; a value is capped just under half the smallest workflow deadline, because a run has to be able to take two turns to finish. |
 | `AGENT_MODEL_TUNING_PATH` | unset | A JSON document of measured per-model settings, layered over the ones Studio ships with. Studio carries a document recording what specific models were measured under — turn limit, how many readings before it is asked to report, whether an empty turn is asked again — and a model not named in it is driven with the defaults, which is the honest treatment of a model nobody has measured. This is how a model Studio has never measured gets settings somebody else measured: mount a file in the same shape and restart, with no Studio release and no code change. Merged **per model and whole** — an entry here replaces the shipped entry for that model rather than contributing one field to it, because half of one measurement beside half of another is a configuration nobody has run. A file that is missing, unreadable or off-schema is **ignored** and the shipped measurements stand — which is the one setting here that fails **open**, so it is also the one that reports itself: `GET /api/agent/config` tells an **admin** session what became of the document (`{"modelTuning":{"state":"applied"\|"ignored"\|"unset",…}}`, with the path and the parser's reason), because an operator who mounts a file and is told nothing will believe it is in force. It carries numbers and switches only: the sentences the drive says to a model stay in Studio, so supplying this file cannot change what Studio tells a model. On Kubernetes the chart mounts it for you — see `agent.modelTuning.*` in [`charts/libredb-studio/README.md`](../charts/libredb-studio/README.md). The document's own contract — every setting, its bounds, what happens to a key this build does not implement, and the example to start from — is [`docs/llms/model-tuning.md`](llms/model-tuning.md). |
@@ -242,7 +247,7 @@ Which connections qualify is decided in the browser before a run is opened, by
   database is reached and as whom is compared, the optional agent credentials included;
   presentation-only edits (name, colour, group, environment) do not disqualify it. Note what that
   sentence does *not* say: the comparison is against a snapshot, so an operator who repoints a seed
-  server-side is not seen until the browser fetches again (`docs/BACKLOG.md` B23);
+  server-side is not seen until the browser fetches again;
 - nothing else. A connection the user typed in reaches the rail as unresolvable, and so does a seed
   copy edited to point elsewhere; the rail says so rather than opening a run.
 
@@ -250,11 +255,101 @@ The middle case is why this is a comparison and not a bare "has a seed id". The 
 `seed:<id>` to its OWN descriptor, so a run started on a copy the user had since pointed at another
 database would investigate the seed and report on it as though it were the one on screen.
 
+### The conversation a run belongs to
+
+**Every run belongs to a conversation**, and most belong to one of their own. A run opened on its own
+is a thread of ONE named after itself; a follow-up question asked on the same connection CONTINUES
+the thread the previous run belonged to. The rail sends that run's id, the route derives the context
+server-side from its ledger, and the new run's header records the result as `thread`
+([`src/lib/agent/thread-context.ts`](../src/lib/agent/thread-context.ts)).
+
+**The thread is a linked list in which every node carries its own prefix.** A run's header holds the
+whole chain before it, so following the tail yields the conversation entire and nothing has to
+enumerate anything — which matters, because the store has no enumeration to offer. Two consequences
+follow directly. The chain is **single-connection by induction**, since every link verified the
+connection at its own open. And **threads fork harmlessly**: two tabs continuing the same run both
+produce a thread whose prefix is that run, so the conversation becomes a tree in which each branch is
+self-consistent, with no shared mutable state to conflict over.
+
+**What a run is handed has two halves, drawn from different places.** The **spine** is every step's
+objective, oldest first, and it comes off the header for free. The **evidence** is the most recent
+step's report, and it comes off the record the route already loaded. Older steps' reports are
+deliberately not carried: that would be one ledger read per step for the half the spine already
+supplies — and the spine is the half a later step actually lacks, because a transformation step
+("chart those", "export it") has an objective that is itself a pronoun, so the plain statement of
+intent lives further back.
+
+The block is fenced when the model reads it, so a pronoun or a demonstrative ("those groups", "it")
+either resolves against the conversation or is refused for lack of a referent rather than answered as
+if the question were new. The model is also told, outside the fence, that earlier steps list only what
+was ASKED and not what was found — without that sentence this design would create its own false
+impression, since a listed step reads as a step whose findings are in hand.
+
+**Nothing is truncated silently.** `AGENT_THREAD_CONTEXT_MAX_CHARS` (4000) bounds the block, the spine
+may take at most 75% of it so the newest report always has room, `AGENT_THREAD_MAX_STEPS` (20) bounds
+the chain, and a carried objective is capped at `AGENT_THREAD_STEP_OBJECTIVE_MAX_CHARS` (200). Each of
+those is stated in the text where it applies. The budget is additionally an optional per-model key in
+`AGENT_MODEL_TUNING_PATH`, because the value that is right depends on the model's context window —
+and **no measured value ships for it**, so the compiled default drives every model until an operator
+measures their own.
+
+**Continuing a conversation is an enhancement, never a precondition.** `previousRunId` is attached by
+the rail on its own, so a predecessor that cannot be reached must not take down the question the user
+did type: a shape error refuses, and every runtime condition DEGRADES — the run opens carrying no
+conversation, and the header records `declined` as `"unavailable"` (the run does not exist, is not
+this session's, is on another connection, was established against another database, has not ended, or
+names an id the ledger refuses),
+`"disabled"` (`LIBREDB_AGENT_THREAD_CONTEXT`) or `"error"` (an unreadable ledger). The value is
+persisted rather than answered once, so a reload still has the notice to show, and the rail says which
+happened rather than going quiet.
+
+**A conversation is checked against the DATABASE, not the record.** Every link used to check
+`connectionId` at its own open, which is an identity check on the RECORD: a saved connection edited to
+address another server keeps its id, so a follow-up was handed the earlier steps' claims about the old
+database while reading the new one — nothing refused, nothing wrong to look at. Each run therefore
+records `connectionIdentity`, the same fingerprint the held context snapshot is filed under: engine,
+host, port, database, service, instance, role and the SSH tunnel the database is reached through, and
+deliberately not the password. A follow-up whose database does not match its predecessor's declines as
+`"unavailable"` rather than carrying it. Rotating a credential or renaming a connection is the same
+database and keeps the conversation, and a predecessor that recorded no identity at all is carried
+rather than refused — no conversation in flight across a deploy is ended by a silence. What is left of
+B67 is run history across threads.
+
 A run emits a closed set of **semantic events**, and they are the whole of what the UI renders:
-`run-started`, `context-captured`, `statement-drafted`, `plan-statement-drafted`, `tool-invoked`,
-`tool-completed`, `tool-refused`, `report-composed`, `closing-statement`, `run-finished`, plus the
-four a single workflow's own tool writes — `plan-comparison`, `recommendation`, `table-profiled` and
-`answer-composed`.
+`run-started`, `driver-resolved`, `context-captured`, `context-unavailable`, `statement-drafted`,
+`plan-statement-drafted`,
+`tool-invoked`, `tool-completed`, `tool-refused`, `report-composed`, `closing-statement`,
+`run-finished`, plus the four a single workflow's own tool writes — `plan-comparison`,
+`recommendation`, `table-profiled` and `answer-composed`.
+
+**`driver-resolved` says what drove the run**, and it exists because a finished run used to say
+nothing about that: no event and no record field carried the model id, so "these settings were
+measured" — the product's whole claim about a model — was not checkable from the run that used them.
+It carries the model, its provider, and where the settings came from: `bundled`, `operator` with the
+document's path and a digest of the bytes as read, or `operator-ignored` with the path when a
+document was configured and could not be used. The last is its own case on purpose — a run driven by
+the shipped settings because nobody configured a document, and one driven by them because the
+operator's could not be read, behave identically and mean opposite things.
+
+**`context-unavailable` says a capture was REFUSED**, and it is a separate kind rather than a
+`context-captured` carrying an absence. A refused capture read nothing, so it has no fingerprint and
+no table count - writing `tableCount: 0` would state that the database has no tables - and three
+readers take `context-captured` as proof an inventory exists (`reusableSnapshot`, the grounding check
+the tools layer applies to a citation, and the rail's own capture line). It carries the reason code,
+the capture's own one-sentence diagnosis, and, where the row budget is what refused the read, both
+numbers: rows projected against rows allowed. Before it, a plan run whose capture was refused left
+nothing at all between the drive starting and the run ending, so the rule this document's setup guide
+states about ledgers - that the ledger is the authority on what a run did - held only for captures
+that succeeded, in exactly the case an operator has to diagnose. The reason code and the sentence
+never depend on parsing anything; the two numbers are read back out of the provider's own refusal
+message, which is pinned by a test that drives a real over-budget read rather than by a copy of the
+sentence.
+
+It is written **once per drive** rather than once per run, because a resume picks the model up from
+the configuration as it stands then: a run resumed after an operator changed it carries one entry per
+stretch, and two that disagree are the fact worth finding. The rail renders the model and not the
+provenance — a mounted document's path is server topology, and it belongs to whoever reads
+`GET /api/agent/config` rather than to whoever asked the question.
 
 **`plan-statement-drafted` is planning mode's own**, and is deliberately not `statement-drafted`:
 that kind promises a `stepId` tying a draft to the tool invocation that sent it, and a toolless run
@@ -359,7 +454,7 @@ What a grounded plan run is given, and where each part comes from:
   which process happened to have read a catalog first. They are read from what the engine already
   holds — `pg_class.reltuples` and `pg_stats` on PostgreSQL, `sqlite_stat1` on SQLite — so no column
   is scanned and no value is read out of any row. `ESTIMATE_BUILDERS` serves those two dialects and
-  nothing else, and #414 added no engine to it: on the other twelve `readSchemaStatistics` answers
+  nothing else, and #414 added no engine to it: on the other fifteen `readSchemaStatistics` answers
   `DIALECT_HAS_NO_STATISTICS` — *"this engine does not hold statistics this run knows how to read"* —
   so **a known schema with no statistics is now the ORDINARY combination rather than a rare one**, and
   the two sentences the run is handed agree: the inventory is a record of what exists, and every
@@ -480,7 +575,7 @@ Three consequences worth stating plainly, because each is easy to assume the oth
 
 1. **A plan run costs statements now.** On PostgreSQL and SQLite grounding is catalog reads plus one
    statistics read (two on SQLite: the `sqlite_stat1` availability probe has to be its own statement,
-   because SQLite resolves table names at prepare time). On the other twelve it is **one** — the
+   because SQLite resolves table names at prepare time). On the other fifteen it is **one** — the
    single `db.schema.read` call, with no statistics read to add, since those dialects hold none this
    run knows how to read. They come out of the same per-run statement budget every other read does,
    and they are audited the same way. The ledger-reuse path saves the schema reading and deliberately
@@ -538,7 +633,7 @@ not in the inventory. Since #414 the WORDING varies with the engine's `queryLang
 not: on a `json` engine the run is asked for one statement or command in that engine's own language —
 a MongoDB aggregation rather than a SELECT — and told that this engine speaks no SQL, while the tag
 stays the canonical type-id in both arms. That is deliberate rather than an oversight: `isQueryFenceTag`
-is a total record over `DatabaseType`, so all fourteen ids pass it, whereas a draft the model fenced as
+is a total record over `DatabaseType`, so all seventeen ids pass it, whereas a draft the model fenced as
 ```` ```javascript ```` passes nothing and records no `plan-statement-drafted` event at all — the run
 would score as having drafted nothing while the user is looking at a statement. A run that cannot answer from the
 inventory takes the other legitimate ending: a line beginning `NO STATEMENT:` saying exactly what is
@@ -726,7 +821,7 @@ Two consequences worth stating:
   composed path has and the provider path cannot: reads audited statement by statement rather than as
   one opaque call; foreign keys, which no provider can report on an engine that declares none; and
   SQLite's inventory, which is parsed out of the DDL text the engine stored and which its provider
-  does not expose in the same shape. Collapsing the other twelve onto the composed one is the thing
+  does not expose in the same shape. Collapsing the other fifteen onto the composed one is the thing
   #414 exists because nobody can do: a catalog statement has to be written per dialect and verified
   against a live server, and until it is, refusing the dialect was the honest answer and reading the
   provider is a better one.
@@ -768,7 +863,7 @@ something that is not an estimating plan of this run, while `PLAN_RESULT_RELEASE
 was honest and the rows have expired — telling a model the first when the second happened would send
 it looking for a mistake it did not make.
 
-Its goal verifier is `agent-query-optimization.2`: the investigation baseline, **and** evidence that
+Its goal verifier is `agent-query-optimization.3`: the investigation baseline, **and** evidence that
 the change it proposes rests on what the engine actually does. The baseline dominates, so a run that
 never reported is told that rather than that it skipped a comparison.
 
@@ -781,6 +876,17 @@ attempted `CREATE INDEX ...; SELECT ...`, was refused as it should be, and was t
 the plan it **diagnosed**, cited by the recommendation itself: `no-plan-evidence` is an index
 recommendation that names no plan this run read. Not merely a plan somewhere on the ledger — the
 citation is what ties the index to the access path it changes.
+
+**A plan is exempt from the baseline's emptiness clause, which is the same lesson a third time.**
+A plan is a description of a statement, it arrives in one column, and the driver reports no
+row count for it - so the artifact is complete and its `rowCount: 0` measures nothing. Driven live on
+2026-08-17, every Optimize run in the drive ended `empty-evidence`, including one that compared real
+PostgreSQL costs, recommended the right index and offered it to the editor, because the plan was the
+only thing those reports had to cite: the product contradicted its own good answer, in its own voice,
+at the end of the run. The exemption is one artifact **kind** and nothing more - an empty bounded read
+cited by an optimization report still ends the run `empty-evidence`, because zero rows from a read is
+the answer that read gave - and it is this rule's alone: `agent-investigation.1` and the two verifiers
+composing on it are untouched, so the id bump is `agent-query-optimization.2` -> `.3`.
 
 ### The database-assessment template
 
@@ -841,10 +947,16 @@ and that is a reversal of a product decision rather than an oversight: epic #325
 set at three and #330 T3 reopened it. Its own id is what lets an operator see profiling in the audit
 stream, and deny it, without denying every read the agent makes.
 
-Three honest limits, each with a backlog entry: SQLite hides constraint-created indexes so
-`fk_unindexed` can fire on a covered key (**B25**); only an email shape is tested, because `LIKE`
-cannot express a digit run (**B26**); and a profile that times out reports the failure rather than
-falling back to catalog statistics (**B28**).
+One honest limit, with a backlog entry: a profile that times out reports the failure rather than
+falling back to catalog statistics (**B28**). Two others are closed. A digit run is now asked for in
+each dialect's own spelling — PostgreSQL `~ '[0-9]{9,}'`, SQLite `GLOB '*[0-9]...*'` — because `LIKE`
+can say "any character" but not "any digit", and testing an email shape alone was the consequence of
+that rather than a decision. And SQLite stores no DDL for the index
+it builds to enforce a `UNIQUE` constraint, so the composed index read cannot see it - the capture
+now reads those out of the table's own `CREATE TABLE` and lists them as `(unique constraint)`, plain
+words rather than a name that could be mistaken for a user's `CREATE INDEX`. `fk_unindexed` remains a
+prefix test: an index serves the column it LEADS on, so `UNIQUE (note, parent_id)` does not cover
+`parent_id`.
 
 ### The operations template
 
@@ -857,7 +969,7 @@ storage pressure — and it is the one workflow that is **not** built on the rea
 | `inspect_operations`, `recommend_change`, `compose_report` | `inspect_schema`, `run_read_query`, `inspect_plan`, `profile_table`, `compare_plans` |
 
 **Everything it leaves out is left out for one reason: those tools send SQL.** All three read-class
-tools reach the database through `provider.queryReadOnly`, which only PostgreSQL and SQLite
+tools reach the database through `provider.queryReadOnly`, which only PostgreSQL, SQLite and DuckDB
 implement, so offering any of them here would reintroduce — tool by tool — the exact engine
 restriction this workflow exists to escape. `compare_plans` is left out because it names two
 `inspect_plan` artifacts this run cannot produce: a tool that could only ever refuse is worse than
@@ -1488,7 +1600,7 @@ mid-run (B9).
 | --- | --- | --- |
 | `statementTimeoutMs` | 10 s | Per statement, clamped further by the run deadline. |
 | `maxResultRows` / `maxResultBytes` | 200 / 256 KiB | Compared after the driver has materialised the rows, so an oversized read is refused but still paid for at the database. |
-| `maxConcurrentExecutions` | 1 | The loop is sequential; a run cannot fan out. |
+| `maxConcurrentExecutions` | 1 | The loop is sequential; a run cannot fan out — and a second consequence rides on the same 1: a failed statement's recorded span is a DELTA over the run's charged total, so an execution in flight alongside it would have its time attributed to whichever one failed. |
 | One model call | 90 s | Whichever of this and the run's remaining time is smaller applies. Not per workflow: how long one request may hang is a property of the transport, not of the question. |
 | Repair attempts | 3 | Statements that failed **at the database**. |
 
@@ -1550,26 +1662,30 @@ denial cannot be re-fed to the model as though the SQL were malformed.
 
 ## Supported models
 
-Ten models run every agent surface. Each cleared all six — Investigate, Optimize, Assess, Operate,
+Twelve models run every agent surface. Each cleared all six — Investigate, Optimize, Assess, Operate,
 Analyze and Plan — five consecutive times, at the turn limit the product ships, which is 30 of 30
-runs. Each has a page of its own with its measured durations and whatever it needs that the others
-do not.
+runs.
 
-| Model | Served through | Median run | Slowest run |
-| --- | --- | --- | --- |
-| [`gemini-3.5-flash-lite`](models/gemini-3-5-flash-lite.md) | Gemini API | 10 s | 24 s |
-| [`granite4.1:8b`](models/granite4-1-8b.md) | Ollama | 10 s | 21 s |
-| [`ornith:9b`](models/ornith-9b.md) | Ollama | 25 s | 82 s |
-| [`qwen3.5:9b`](models/qwen3-5-9b.md) | Ollama | 25 s | 98 s |
-| [`granite4.1:30b`](models/granite4-1-30b.md) | Ollama | 26 s | 46 s |
-| [`qwen3:8b`](models/qwen3-8b.md) | Ollama | 32 s | 132 s |
-| [`qwen3:14b`](models/qwen3-14b.md) | Ollama | 39 s | 151 s |
-| [`gemma4:26b`](models/gemma4-26b.md) | Ollama | 46 s | 180 s |
-| [`qwen3.8:latest`](models/qwen3-8-latest.md) | Ollama | 62 s | 347 s |
-| [`qwen3:4b`](models/qwen3-4b.md) | Ollama | 75 s | 139 s |
+**The table lives in [`docs/llms/README.md`](llms/README.md)**, with each model's page beside it,
+and this page deliberately does not repeat it. There used to be a copy here, and its links pointed
+at a `docs/models/` directory that does not exist.
 
-The durations are from one machine and are comparable with each other rather than portable: every
-figure was taken the same way, on the same database, through the same six surfaces.
+Its numbers differed from the published ones in every row, and the reason is worth stating because
+it is not the one first written here: they were a DIFFERENT SWEEP, not a drift. Running all 300
+runs back to back takes about three and a half hours, and a machine under that load is slower —
+one model scored 1/5 on a surface at 87 to 93 seconds a run and 5/5 an hour later at 36. The cells
+that sweep lost were re-measured rested, and the rested figures are the published ones. So
+`gemma4:26b` at 46 s/180 s and at 36 s/92 s are both real: the first is what it did during a
+back-to-back sweep, the second what it does rested.
+
+Two tables of the same thing is still the defect, because neither said which sweep it was and a
+reader had no way to tell — while [`methodology.md`](llms/methodology.md) had said all along that
+sustained load is part of the measurement. The condition was documented; it was simply not
+attached to the numbers. One home, and that page is where the conditions belong.
+
+Which model to run, what each needs that the others do not, and how to measure one these pages do
+not cover, are all under [`docs/llms/`](llms/README.md).
+
 
 Nothing prevents another model from being configured — the capability probe below decides what any
 given endpoint can do, and there is no allow-list in the code. What the ten have is a measurement.
@@ -1695,7 +1811,7 @@ build until somebody decides what "answered" means for it.
 | --- | --- | --- |
 | `planning` | The run left non-empty closing prose, **and** that prose was its deliverable: a drafted statement on the ledger, or an explicit `NO STATEMENT:` refusal. That mode is toolless and can never cite evidence, so judging it by the investigation rule would fail every planning run that did its job — but prose alone was how a generic lecture scored `answered` for as long as it did. `operations` planning is exempt: its plan deliverable is prose by decision, and the exemption survives that workflow's rules welcoming a fenced reading — welcome is not required, and a run that produced no block may have answered its objective perfectly, so a bar asking for one would fail it. Which engines can express a reading as a statement is deliberately not the basis: a Redis Operate plan was observed writing `INFO memory` into a block its editor runs. | `no-plan`, `no-statement` |
 | `agent` (investigation) | The run composed at least one claim, **and** the claims do not rest entirely on empty results. | `no-report`, `empty-evidence` |
-| `agent` (query-optimization) | The baseline above, **and** either a plan comparison on the ledger or an index recommendation citing a plan this run read. `agent-query-optimization.2`. | the above, plus `no-plan-comparison`, `no-plan-evidence` |
+| `agent` (query-optimization) | The baseline above with **plans exempt from its emptiness clause** (a plan's row count measures nothing), **and** either a plan comparison on the ledger or an index recommendation citing a plan this run read. `agent-query-optimization.3`. | the above, plus `no-plan-comparison`, `no-plan-evidence` |
 | `agent` (database-assessment) | The baseline above, **and** a table profiled. `agent-database-assessment.1`. | the above, plus `no-table-profile` |
 | `agent` (operations) | A composed report, **and** at least one claim in it citing an artifact this run read. `agent-operations.2`. **Not** composed on the baseline: an empty reading is an answer, so the emptiness clause is dropped — and an empty reading still satisfies the citation arm, because the artifact exists. The arm was added by #411: the run gained a citable schema inventory, so "cite a reading" stopped being enforced by composition alone. See [The operations template](#the-operations-template). | `no-report`, `no-reading`, `cancelled` |
 | `agent` (data-analysis) | The baseline above, **and** an `answer-composed` entry: which result IS the answer, and how to show it — **and at least one claim citing that same artifact**, so the report is about the result it presented. `agent-data-analysis.1`. | the above, plus `no-answer`, `answer-uncited` |
@@ -1846,12 +1962,12 @@ model passed the capability probe**; for anybody else the answer is that there i
 | **Read live monitoring.** Autopilot's whole input came from `/api/db/monitoring`: slow queries, index usage, table statistics, cache and connection metrics. | **Restored, and bounded.** `inspect_operations` reads the same provider methods under the `db.operations.read` descriptor, and it reaches ONE workflow: a run opened to Operate. An investigation or an assessment is still offered nothing that reads monitoring, so "the agent can read monitoring" is only true of that workflow. The two deferrals that tracked this — the monitoring half of the M2 tooling entry, and the assessment's missing monitor snapshot — are closed and removed from the backlog. | `src/lib/agent/tools.ts`; `tests/evals/legacy-surface-coverage.test.ts` — the members and the operations they may name are asserted as a set, so a monitoring member under ANY name has to land there; `tests/evals/operations.test.ts` — the arc, on an engine that answers no statement. |
 | **A free-form markdown report**, opening with a performance score out of 100 and closing with configuration advice. | A report is claims, each citing an artifact this run read or the snapshot it captured, verified against the run's own ledger before it is recorded. A number cited to nothing cannot be reported — the citation is what is checked, never the claim's text, so a fabricated score citing a real artifact would be accepted. | `src/lib/agent/tools.ts` (`composeReportTool`); `tests/evals/legacy-surface-coverage.test.ts` — an invented correlation id is refused and the run ends `unanswered (no-report)`. |
 | **Maintenance tasks** — `VACUUM`, `ANALYZE`, reindexing — in the same report. | Nothing proposes them: the `change` card has two members and neither is maintenance. It stays where it was before the panels — the monitoring surface, and the user's own editor. | `src/lib/agent/tools.ts` (`recommendationSchema`). |
-| **Multi-turn conversation.** NL2SQL replayed the whole exchange on every request, so "and how many in the second one?" was answerable. | A run's objective is fixed when it starts and no ledger event records a later question. A follow-up is a NEW run: it re-reads the catalog and knows nothing the first one established. | `src/app/api/agent/runs/route.ts`; `src/lib/agent/types.ts` (`AgentRunEvent`); `tests/evals/legacy-surface-coverage.test.ts`. |
-| **MongoDB, MySQL and every other engine.** Both panels ran against whatever the connection was, and NL2SQL emitted Mongo query documents when the connection's query language was JSON. | The agent composes SQL for **two** dialects. `CATALOG_COMPOSERS` and `CATALOG_PLANS` carry `postgres` and `sqlite` only, and an unlisted dialect is never guessed at — since #414 it is read a different way instead of being refused. Nothing refuses the run at its start, so a run opened on another engine begins, and what it can then do differs by MODE. **Agent mode is still the two dialects**: its read-class tools reach the database through `provider.queryReadOnly`, so a schema-workflow run on any other engine still ends `engine-unsupported` with the same sentence. **Plan mode is now every engine**: its grounding acquires `agent-operations` and calls `provider.getSchema()` (`db.schema.read`), so a plan run on MongoDB is ordinarily grounded and is asked for one statement or command **in that engine's own language**, in a block still tagged with the canonical type-id. What the engine decides is no longer whether a plan is grounded but HOW — a composed catalog statement or a provider inventory, and whether estimated statistics exist at all — and the four prefaces say which. Where the reading itself fails, the run is steered to the `NO STATEMENT:` refusal with the capture's own diagnosis. **The `operations` workflow reaches every engine in both modes**, because it composes no SQL at all, and since #411 it is grounded under the same rule as everything else. | `src/lib/agent/composed-sql.ts`, `src/lib/agent/context-snapshot.ts` (`captureContextSnapshot`, `captureFromProvider`, `packOperationsInventory`), `src/lib/db/operations/descriptors.ts` (`db.schema.read`); `tests/unit/lib/agent/context-snapshot.test.ts` — the provider path, its timeout and its refusals; `tests/unit/lib/agent/composed-sql.test.ts` — `UNSUPPORTED_DIALECT`; `tests/evals/plan-grounding.test.ts` — a plan run whose provider cannot describe itself runs no statement and says it is ungrounded; `tests/isolated/agent-investigation.test.ts` — a plan run grounded through the engine's own schema inspection. |
+| **Multi-turn conversation.** NL2SQL replayed the whole exchange on every request, so "and how many in the second one?" was answerable. | **Largely restored, and differently.** A follow-up is still a NEW run — a run's objective is fixed when it starts, and no ledger event records a later question — but it now belongs to a CONVERSATION and is told about it: every earlier step's objective, and the most recent step's report, derived server-side from those runs' own ledgers and fenced before the model reads it. What is not restored is the replay: NL2SQL re-sent the whole exchange verbatim, while a conversation carries a bounded account of it, and only the newest step's findings. Two other differences are deliberate — the run still re-reads the catalog, because its inventory is its own evidence; and `LIBREDB_AGENT_THREAD_CONTEXT=false` turns the whole thing off, which no panel offered. See [the conversation a run belongs to](#the-conversation-a-run-belongs-to). | `src/lib/agent/thread-context.ts`; `src/app/api/agent/runs/route.ts`; `tests/evals/thread-context.test.ts` — a three-step conversation, and the fence the block arrives inside. |
+| **MongoDB, MySQL and every other engine.** Both panels ran against whatever the connection was, and NL2SQL emitted Mongo query documents when the connection's query language was JSON. | The agent composes SQL for **two** dialects. `CATALOG_COMPOSERS` and `CATALOG_PLANS` carry `postgres` and `sqlite` only, and an unlisted dialect is never guessed at — since #414 it is read a different way instead of being refused. **A run whose workflow sends statements is refused on another engine before it opens**: `POST /api/agent/runs` answers 400 with the posture's own sentence when the mode is agent and `AGENT_WORKFLOW_SENDS_STATEMENTS` holds for the requested workflow, so no run id and no model turn are spent on a refusal the connection's type already decided. What an engine that IS admitted can then do differs by MODE. **Agent mode is still the two dialects**: its read-class tools reach the database through `provider.queryReadOnly`, which is the same fact the refusal reads. **Plan mode is now every engine**: its grounding acquires `agent-operations` and calls `provider.getSchema()` (`db.schema.read`), so a plan run on MongoDB is ordinarily grounded and is asked for one statement or command **in that engine's own language**, in a block still tagged with the canonical type-id. What the engine decides is no longer whether a plan is grounded but HOW — a composed catalog statement or a provider inventory, and whether estimated statistics exist at all — and the four prefaces say which. Where the reading itself fails, the run is steered to the `NO STATEMENT:` refusal with the capture's own diagnosis. **The `operations` workflow reaches every engine in both modes**, because it composes no SQL at all, and since #411 it is grounded under the same rule as everything else. | `src/lib/agent/composed-sql.ts`, `src/lib/agent/context-snapshot.ts` (`captureContextSnapshot`, `captureFromProvider`, `packOperationsInventory`), `src/lib/db/operations/descriptors.ts` (`db.schema.read`); `tests/unit/lib/agent/context-snapshot.test.ts` — the provider path, its timeout and its refusals; `tests/unit/lib/agent/composed-sql.test.ts` — `UNSUPPORTED_DIALECT`; `tests/evals/plan-grounding.test.ts` — a plan run whose provider cannot describe itself runs no statement and says it is ungrounded; `tests/isolated/agent-investigation.test.ts` — a plan run grounded through the engine's own schema inspection. |
 
 One of these has since been restored under its own workflow (the monitoring row, which closed both
-deferrals that tracked it), and the first row is Phase 1's own boundary rather than a defect (B21 is
-its one residual). The rest are consequences
+deferrals that tracked it), and the first row is Phase 1's own boundary rather than a defect, and its one
+residual is recorded in the module map. The rest are consequences
 of the removal rather than work in progress: they are what the product decided not to do, and that
 decision is only honest while they are written down where a maintainer will find them.
 
@@ -1878,15 +1994,31 @@ absent, because the browser asks the probe.
 
 **What green from the ledger probe promises, stated exactly.** The probe runs the same four steps as
 `@workflow/world-local`'s own `ensureDataDir` — create, read-check, write a probe file, remove it —
-so a green answer means *that* check will pass. It does **not** mean the world will build: the world
-calls `initDataDir`, which runs a fifth step the probe does not, reading and parsing `version.txt` in
-an existing ledger. A corrupt or incompatible one throws there, after the rail has already been
-rendered, and the first Start is where the operator meets it (B30).
+and then the fifth step the world's `initDataDir` performs: it READS an existing `version.txt` and
+parses it exactly the way upstream does. A file whose content upstream would refuse — truncated,
+empty, or written by an incompatible release — is reported as `LEDGER_INCOMPATIBLE` before the rail
+renders, rather than throwing a step later with the operator meeting it at the first Start.
+
+Two properties bound that check, and both are load bearing. **It is read-only**: it never creates,
+repairs or rewrites the file, because the only upstream entry point that answers this question is
+`initDataDir`, which writes `version.txt` as a side effect — calling it would turn a page-load
+visibility probe into something that initialises the ledger. And **an ABSENT `version.txt` stays
+green**, because that is the case `initDataDir` itself initialises; a fresh install has no file, and
+refusing one would make every first run report an unavailable agent. A version that parses but
+differs from the running one is green too: upstream hands a mismatch to `upgradeVersion`, which logs
+and returns, so such a ledger builds a world successfully.
+
+The parse mirrors a contract that belongs to another package, which is the accepted cost — kept
+payable by staying as narrow as an equality (no version comparison, no package-name check, no
+repair), so a change upstream shows up as this probe refusing a ledger the world would have accepted,
+naming the file it read, rather than as a silent divergence. Green still does not promise a run
+SUCCEEDS: the ledger directory is shared, so it can be corrupted between this answer and the Start
+that follows. What green rules out is a fault that was already on disk when the rail rendered.
 
 | Route | Purpose |
 | --- | --- |
-| `GET /api/agent/config` | Whether this server runs agents, and if not, which condition failed: `{"enabled": true, "ledgerVerified": …}` or `{"enabled": false, "reason": …, "detail": "…"}`. The reason is one code per operator action — `OPERATOR_DISABLED`, `NO_MODEL_CONFIGURED`, `LEDGER_UNAVAILABLE`, `UNSANCTIONED_WORLD_TARGET`, `IMPLICIT_HOSTED_WORLD`. The last two are backend refusals and keep their own codes deliberately: neither is a disk problem, and `IMPLICIT_HOSTED_WORLD` fires before anything is asked of a filesystem at all. `ledgerVerified` distinguishes the two kinds of yes: `true` after the writable-path probe passed, `false` for the Postgres carve-out, where the backend is accepted without being contacted (B31). Session-verified. `enabled` is a literal boolean because the rail compares `=== true`. `reason` goes to every session — it names an operator action and no path — while `detail` goes to **admin sessions only**, because `LEDGER_UNAVAILABLE`'s detail carries an absolute server path and an OS error string; every other session gets one stable sentence instead, and loses nothing, since the rail renders nothing when the answer is no. Never 500s, and never names a key's value. The ledger half of the answer is memoised for a few seconds, in-flight promise included — the route sits outside the `ai` rate-limit bucket on purpose, so the memo is what stops an authenticated caller turning a page-load probe into a write per request, including a burst that arrives while one probe is still running. |
-| `POST /api/agent/runs` | Opens a run (mode, optional `workflowType`, objective, `connectionId`) and returns `202` with the run id and the PERSISTED mode and workflow type. An unrecognised `workflowType` is refused rather than defaulted. An inline connection in the body is refused. An agent run whose model was established as unable to call tools is refused `422` before any run is opened. |
+| `GET /api/agent/config` | Whether this server runs agents, and if not, which condition failed: `{"enabled": true, "ledgerVerified": …}` or `{"enabled": false, "reason": …, "detail": "…"}`. The reason is one code per operator action — `OPERATOR_DISABLED`, `NO_MODEL_CONFIGURED`, `LEDGER_UNAVAILABLE`, `LEDGER_INCOMPATIBLE`, `UNSANCTIONED_WORLD_TARGET`, `IMPLICIT_HOSTED_WORLD`. `LEDGER_INCOMPATIBLE` is separate from `LEDGER_UNAVAILABLE` deliberately: the path is writable and the action is removing or replacing one `version.txt`, so an operator sent to a permission would find nothing wrong with the directory. The last two are backend refusals and keep their own codes deliberately: neither is a disk problem, and `IMPLICIT_HOSTED_WORLD` fires before anything is asked of a filesystem at all. `ledgerVerified` distinguishes the two kinds of yes: `true` after the writable-path probe passed, `false` for the Postgres carve-out, where the backend is accepted without being contacted (B31). Session-verified. `enabled` is a literal boolean because the rail compares `=== true`. `reason` goes to every session — it names an operator action and no path — while `detail` goes to **admin sessions only**, because the ledger details carry an absolute server path plus an OS error string or a quoted fragment of a file on that disk; every other session gets one stable sentence instead, and loses nothing, since the rail renders nothing when the answer is no. Never 500s, and never names a key's value. The ledger half of the answer is memoised for a few seconds, in-flight promise included — the route sits outside the `ai` rate-limit bucket on purpose, so the memo is what stops an authenticated caller turning a page-load probe into a write per request, including a burst that arrives while one probe is still running. |
+| `POST /api/agent/runs` | Opens a run (mode, optional `workflowType`, objective, `connectionId`, and optional `previousRunId` to continue the conversation a run this session opened belongs to) and returns `202` with the run id, the PERSISTED mode and workflow type, and the `thread` the run actually belongs to. An unrecognised `workflowType` is refused rather than defaulted. An inline connection in the body is refused. A `previousRunId` that is not a non-empty string is refused `400`; one that cannot be reached does **not** refuse the start — the run opens with no conversation and `thread.declined` says so. An agent run whose workflow sends a statement is refused `400`, before any run is opened, when the connection's engine implements no read-only statement path - `operations` is admitted on every engine, and a planning run is never refused this way. An agent run whose model was established as unable to call tools is refused `422` before any run is opened. |
 | `GET /api/agent/runs/{runId}` | The run record, folded from its ledger. |
 | `DELETE /api/agent/runs/{runId}` | Requests a stop. Cancellation is enforced by the run loop's own persisted state, not by a driver cancel propagating — so this is "asked to stop", not "has stopped". |
 | `GET /api/agent/runs/{runId}/stream` | The ledger as NDJSON, one entry per line. |
@@ -1959,9 +2091,9 @@ so the ⓘ is never the only route to it.
 
 Both `blocked` readings are presentation of a refusal the provider factory already decides, and they
 gate nothing — **Start** stays live, because the `operations` workflow sends no statement and runs on
-every engine. What the strip does not do is make the offered-then-withdrawn run impossible: an agent
-run started there still spends a model turn before it ends `engine-unsupported`, which is what is
-left of B38.
+every engine. What the strip does not do is decide anything: the refusal it describes is now the route's, which
+answers 400 before a run id or a model turn is spent. **Start** stays live because `operations`
+sends no statement and is admitted on the same connection the strip warns about.
 
 **One module, two questions, because with a run open they stop having the same answer.** The strip
 says what the OPEN run does, and both of its axes come off that run (`describedMode` and
@@ -2073,8 +2205,11 @@ Two further rules govern it:
   (B11).
 - **The meter reports only what is actually enforced** — statements, database time, the run deadline,
   repair attempts — and states the SQLite non-preemption caveat rather than implying that an
-  overrunning statement is cut short. It reports no token budget because none is enforced (B10), and
-  two of its figures are honest undercounts (B12, B13).
+  overrunning statement is cut short. It reports no token budget because none is enforced. A statement that
+  failed at the database now carries the span the tracker charged for it, so the database-time figure
+  no longer counts completed reads only, and a schema capture contributes the statements and the span
+  the tracker charged it. What is left uncounted is the difference between an engine's elapsed time
+  and the span measured around the whole call, which is why the figure is still stated as a floor.
 
 Results the agent stored **hydrate the existing surfaces**: the results grid, the explain view and the
 charts view in the bottom panel, carrying a read-only provenance badge that names the run. There is
@@ -2089,9 +2224,10 @@ specification the model emitted is validated against the artifact's columns befo
 validated again in the browser against the rows actually delivered — two guards, because
 `DataCharts` turns a column it cannot read into `0` rather than into an error, and a chart of the
 wrong column draws a confident flat line rather than failing. A specification that does not survive the
-second check is dropped and the view's own inference draws the chart instead. Exporting a hydrated
-result is not wired (B34), and a run's stored results are released when the run ends, so a report can
-outlive the rows its citations point at (B15).
+second check is dropped and the view's own inference draws the chart instead. A hydrated result can be
+exported: the menu is retargeted rather than hidden, the file is named after the run that produced
+the rows, and the SQL forms are not attributed to the tab's own table. A run's stored results are
+still released when the run ends, so a report can outlive the rows its citations point at.
 
 **Those results live in process memory, and the store that holds them is bounded.** It keeps 180
 entries at once — the largest statement ceiling any workflow may be given (45) times the four
@@ -2105,7 +2241,7 @@ zero-config backend below being single-instance.
 per drive (B6), while a resumed run keeps its `runId` and its artifacts are keyed by it — so a run
 driven three times may hold up to three times its statement ceiling here, and a long-lived run can
 pass 180 on its own. Run-fair eviction then takes that run's *own* earliest results, which its report
-may still cite: a third way to reach the "the rows are not here" answer B15 describes, this time while
+may still cite: a third way to reach the "the rows are not here" answer a released result gives, this time while
 the run is still live. The ledger is unaffected — the claim and its citation are durable — and the
 gap is recorded as **B35** rather than closed with an artifact-only bound, because a ceiling that
 holds across drives is the mechanism B6 already names.
@@ -2241,7 +2377,7 @@ standalone-only. The reason is a comment above the interface, where a reader wou
 
 One residual: the shared `BottomPanel` component ships in the package with its agent-provenance
 branch present but inert — an optional prop the embedded shell never passes, on a component no entry
-point exports (B21).
+point exports.
 
 ## Module map
 
@@ -2256,7 +2392,7 @@ src/lib/agent/
 ├── runtime.ts            # composition root: the only place that assembles a tool context
 ├── tools.ts              # the four tools + server-side selection; the only database reach,
                           #   the model's tools and the server's own grounding reads alike
-├── composed-sql.ts       # the SQL the SERVER writes, per dialect — two of the fourteen
+├── composed-sql.ts       # the SQL the SERVER writes, per dialect — two of the seventeen
 ├── sqlite-ddl.ts         # reading SQLite's stored DDL back into an inventory
 ├── execution-policy.ts   # the frozen policy and the run-level ceilings
 ├── deadline.ts           # the wall-clock deadline and the timeout clamp
@@ -2300,34 +2436,18 @@ the role's own grants are the whole boundary (A3).
 
 **From this milestone:**
 
-- **B1** — a credential classification map kept module-private would be invisible to the state guard.
 - **B2** — the Anthropic kind is ratified and installed but not offered; serving it means giving the
   chat surface an Anthropic provider first.
-- **B3** — a scope allowlist on a target dimension denies every tool that cannot declare it.
 - **B4** — a mapped database error discards the text distinguishing a timeout cancel from an operator
   cancel.
 - **B5** — the ledger assumes one writer per run and cannot enforce it.
 - **B6** — every cost ceiling is per-drive, so N resumes can cost up to N times one drive's budget.
 - **B9** — nothing enqueues a drive, so an interrupted run is resumable but never resumed.
-- **B10** — no token budget is enforced, so the meter reports none.
 - **B11** — the rail can stop a run but cannot pause or resume one.
-- **B12** — a statement that failed at the database records no duration, so the meter's database time
-  counts completed reads only.
-- **B13** — three spends the ledger never records, so the meter reads low.
-- **B15** — a run's stored results are released when it ends, so a report's citations can outlive its
-  rows.
 - **B16** — the opt-in `@workflow/world-postgres` backend is not present in the standalone payload,
   so it cannot load in the container image or the npx payload.
-- **B20** — a Gemini deployment behind a proxy is not configurable: `LLM_API_URL` is unread for that
-  kind, in the chat surface as much as in the agent.
-- **B21** — the published package's `BottomPanel` carries the agent-provenance branch as dormant
-  markup.
-- **B23** — seed eligibility is decided against the browser's last descriptor fetch, so a seed
-  repointed server-side mid-session is not seen until the next fetch.
 - **B29** — an identifier the model quotes back into its own tool arguments reaches the transcript
   unfenced; an open injection path, bounded only by the server never handing it the raw marker.
-- **B30** — a green ledger probe promises `ensureDataDir` will pass, not that the world will build: a
-  corrupt or incompatible `version.txt` throws a step later, after the rail has rendered.
 - **B31** — the Postgres durable backend is reported available without being contacted, so an
   unreachable `WORKFLOW_POSTGRES_URL` still renders a rail whose first Start fails. Reported as a
   carve-out (`ledgerVerified: false`) rather than fixed; a real check is a connection attempt per page
@@ -2339,64 +2459,32 @@ the role's own grants are the whole boundary (A3).
 - **B33** — a run is observable only from its own ledger. There is no OpenTelemetry export and no
   metrics: the record described above is complete, and getting it into a stack the operator already
   runs is designed (#332) and deliberately unbuilt.
-- **B34** — a hydrated result cannot be exported: the Export menu serializes the tab's own rows, so it
-  is hidden while a run's result is shown.
-
-The entries below were found by driving the product against a live model in a browser, which is the
-only way any of them could have been found: every one of them passes every gate. A few were found
-later and by other routes, and are listed here because they are the same kind of thing — a defect no
-gate in this repository objects to. Several came from repeating that exercise against the inference
-surface (#407) — twenty-six runs over `docs/AGENT_DEMO.md`, which is also where the classifier's
-real-world agreement rate was measured. The count is deliberately not stated: entries leave this list
-as they are fixed, and a numeral here goes stale silently.
-
-- **B36** — a follow-up question is answered as if it were the first. Runs carry no memory of each
-  other, and neither the surface nor the model says so — the model picks a plausible referent and
-  answers a question nobody asked, with the citations a correct answer carries.
-- **B37** — a seed config the server cannot read disables the agent on every connection, and the rail
-  blames the connection: "its settings live in this browser", said of a connection this application
-  seeds itself. The browser cannot tell an empty seed list from a failed one.
-- **B38** — an engine with no read-only execution path is offered a run anyway, and refuses only after
-  the run has opened and spent a model turn. The rail withholds every other capability the host
-  cannot serve; this is the one it does not.
-- **B39** — a data-analysis run has no honest way to conclude that the question is not about this
-  database. Its only route to `answered` is a reading of the data, so a run that establishes the
-  question is unanswerable fabricates one — the #356 shape again, in a new place.
-- **B45** — every query-optimization run is scored `unanswered / empty-evidence`, including one that
-  compared two plans, priced both and wrote the correct `CREATE INDEX`. A `sql.explain.estimate`
-  artifact records `rowCount: 0` because a plan arrives in a single column, and
-  `verifyOptimizationGoal` composes on the investigation baseline, which carries the emptiness arm.
-  The operations template was exempted from exactly this, for a reason it states at length — holding
-  an operational reading to the emptiness rule is "precisely backwards" — and that argument applies
-  to a plan artifact verbatim. The #356 shape a third time: a rule stated in terms of an artifact
-  only one valid answer can produce.
-- **B48** — the two grounding paths fail differently. Since #414 a plan run on one of the nine
-  provider-path engines survives an unreachable host, a wrong password or a half-configured
-  `agentUser`: `captureFromProvider` converts a `DatabaseError` or an `ExecutionProfileError` raised
-  before the reading leaves into an unavailable capture, and the run answers ungrounded with that
-  diagnosis. The composed path — PostgreSQL and SQLite — still lets the same failure out, ending the
-  run `internal` or, on the profile error, `agent-credential-unusable`. Deliberate at #414, which had
-  no business changing how the two engines it did not touch fail, and an asymmetry a reader will
-  trip over until it is resolved.
-- **B49** — a **LibreDB** connection can never be grounded, and the reason is not the agent's.
-  `lib.open()` takes an exclusive lock on the file, and an execution-profile acquisition is a SECOND
-  provider under its own cache key — so once the connection's ordinary provider is open, which it is
-  from the moment anyone browses it, the grounding read fails to connect at all. Measured live on
-  2026-08-17 against `@libredb/libredb` 0.2.2: `ConnectionError` / `CONNECTION_ERROR`, *"LibreDB file
-  is already open by another process"*, converted by `captureFromProvider` into an honest ungrounded
-  run with no `context-captured` event. The same lock is what makes the connection-test modal report a
-  failed connection (`docs/BACKLOG.md` D3), so the two close together.
-- **B51** — the loop delivers three notices to a model (the reserve warning, the report reminder of
-  #416, the present-before-report notice of #417) and records none of them. `recordEvent` is called
-  for what the RUN did and never for what the server said to it, so a rescued run and a run that never
-  needed rescuing leave the same ledger — and a `compose_report` the loop withheld leaves no trace
-  that a call was made. That is a measurement problem first: [`docs/llms/`](./llms/) is built by
-  reading those ledgers, and its whole claim is that each figure comes from an observed run. Each
-  notice is sent once per DRIVE and not once per run, and the missing entry is why: the three booleans
-  live inside `runInvestigation`, which is also what resumes a run a dead process left running, so a
-  resumed drive starts with all three false. The guards are the part that keeps being got wrong —
-  both new notices shipped with a condition that named one thing and read another, and both were
-  caught in review rather than by a gate.
+- **B67** — there is no run history across conversations. The rail names the conversation a run
+  continues and lists its steps from the run's own header, but a user cannot see the conversations
+  they had yesterday or return to one: the store has no enumeration, there is no list route, and
+  pagination and retention have not been decided.
+- **B75** — a conversation's database is checked when a follow-up OPENS; a run already open is not
+  re-checked, so a resumed drive can read a repointed database while carrying a conversation and a
+  captured schema established against the old one. The record now carries the identity needed to close
+  it; what a run should DO when its connection moves under it is the undecided part.
+- **B70** — a run writes no summary for the step after it. The conversation carries the previous
+  step's claims verbatim and truncates at a claim boundary; a model-written `carryForward` sentence
+  was considered and declined, because a claim is evidence and a summary is a lossy compression of
+  it.
+- **B72** — plans are exempt from the emptiness census for `query-optimization` only. The
+  investigation, database-assessment and data-analysis verifiers still judge a plan-only report by a
+  row count that measures nothing, and `inspect_plan` is offered to all three. Closing it changes what
+  three released verifier ids mean, so it takes the id bumps that implies; the boundary is pinned by a
+  test rather than left ambiguous.
+- **B73** — a refused capture's reason code is structural, but its row-budget pair still travels as
+  prose inside a `QueryError` message and is recovered by regex, with two prose consumers reading the
+  same sentence. Doing it properly touches the error type every provider throws, so the change that
+  recorded the refusal kept the regex and pinned it with a test that drives a real over-budget read.
+- **B74** — `UNIQUE (a COLLATE NOCASE)` is listed as covering a foreign key on `a`, which it cannot
+  serve for a binary equality lookup. A false negative in the direction opposite the constraint-index
+  fix,
+  left unmodelled because the user-index reader drops `COLLATE` too and honouring it in one reader
+  only would make the inventory disagree with itself.
 - **B52** — the composed PostgreSQL grounding capture is refused by what the IMAGE ships rather
   than by a wide user schema, and it has now been measured on three different servers.
   `composeCatalogRead` projects one row per COLUMN against `maxResultRows: 200` and refuses rather
@@ -2430,55 +2518,61 @@ as they are fixed, and a numeral here goes stale silently.
   baseline, so it is PostgreSQL's privilege rule and not an AlloyDB property. The agent is therefore
   unusable out of the box on all three, and the same shape will appear on any PostgreSQL whose image
   ships wide catalogs or wide extension views before the user has created anything.
-- **B54** — a REFUSED grounding capture records nothing in the run's own ledger, so the failure above
-  cannot be diagnosed from the record. A capture that succeeds writes `context-captured` with its
-  fingerprint, table count and snapshot; the `capture.kind === "unavailable"` branch pushes the
-  ungrounded note into the model's prompt and returns without recording anything. Measured on the same
-  AlloyDB Omni run: the ledger holds four events - `run-opened`, `run-started`, `closing-statement`,
-  `run-finished` - and its 849 bytes name no catalog read, no reason code and no row count, while the
-  Vitess ledger beside it carries `context-captured` with `ctx_3ce059ca...` and `tableCount 2`. The
-  reason (`CATALOG_READ_REFUSED`, 536 against 200) is computed, handed to the model and dropped; it is
-  not in the server log either. So the only trace is the model's own sentence, and this repo has
-  already recorded why that is dangerous - a missing event reads as work that was not needed rather
-  than knowledge that was lost.
-- **B55** — a grounded LibreDB plan run drafts `GET users:*`, and `get` is an exact-key lookup with no
-  glob: the key does not exist, so the command answers zero rows and no error. The inventory's rows are
-  NAMED `users:*`, which reads as a glob the grammar does not have, and LibreDB declares no
-  `statementLanguage`, so the five verbs (`get`, `put`, `delete`, `prefix`, `range`) are left to be
-  guessed. MongoDB and Redis were fixed the same way in 0.13.1 - each declares the sentence its
-  statement form needs - and LibreDB's turn was deferred by the owner on 2026-08-22 until the other
-  providers are done.
-- **B56** — a planning run's grounding is HELD for the process lifetime, so a schema that changes is
-  invisible to plan mode until a restart. `holdSnapshotForConnection` keeps one inventory per
-  connection identity with no expiry, and it is consulted before any capture. Measured twice on
-  2026-08-22: after MongoDB's inference began expanding subdocuments, `schema/list` returned
-  `shipping.city` at once and the schema tree showed it, while two plan runs still grouped by
-  `$shipping.region` and recorded no `context-captured` event at all; a restart fixed it on the first
-  run. Redis showed the same shape, refusing an objective about keys that had just been seeded. The
-  design intent - a run reasons over the inventory its claims cite - is not the problem; a NEW run
-  inheriting it indefinitely is, and B54's gap means the ledger cannot tell "held, hours old" from
-  "captured just now".
-- **B57** — an operator's tuning document is refused WHOLE when any part of it fails. The argument
-  behind that is about merging (half of one measurement beside half of another is a configuration
-  nobody has run), and it justifies whole-**entry** replacement rather than whole-**document**
-  rejection: fifty models would be lost to a typo in the thirty-seventh.
-- **B58** — a run records the model it used and nothing about where that model's settings came from,
-  so once a document can arrive from outside Studio, "these settings were measured" is no longer
-  checkable from the run itself. `GET /api/agent/config` answers it for the server at the moment
-  somebody asks, which is not when the question is normally asked.
 - **B59** — per-model WORDING has nowhere to go. A sentence is a measured value here (twice a shared
   change won cells and lost others, and had to be reverted whole), and the per-model override is
   gone: the document refuses wording and nothing else can populate it. Refusing unsigned prompt text
   is right; refusing it forever is a decision that has not been taken, and the two objections behind
   it — marker drift and authorship — come apart.
-- **B60** — every bundled entry carries a `summary` that Studio never reads, duplicating the family
-  pages under `docs/llms/`. It is optional now, so it no longer stands between an operator and a
-  working measurement, but roughly half the shipped document is prose nothing renders.
-- **B62** — `schemaVersion` is a literal on both schemas, so the first bump to 2 refuses every
-  document in the field and reverts every model in it to the defaults. Deliberately not fixed while
-  only one version exists: an accepted range with one member is a knob nothing turns, and the
-  tolerant operator schema removes the pressure by letting Studio add settings without moving it.
+- **B65** — `retryUnreadStop` subsumes `retryEmptyTurn`. The gate asks what a stopping turn CALLED
+  and never what it said, so an empty completion reaches it too and a model's recorded
+  `retryEmptyTurn: false` decides nothing. Pinned as it behaves rather than narrowed, because the
+  narrowing would move behaviour five passing runs were measured under.
 
+**Settled as limits rather than as work.** The seven below have no entry in `docs/BACKLOG.md`, and
+that is the point: each is how the product behaves, stated where a reader of this document will meet
+it, rather than a queue item nobody was going to pick up. A limitation needs a record; it does not
+need a work item to hold that record.
+
+- **A scope allowlist on a target dimension denies every tool that cannot declare it.** No tool in
+  this layer declares the CATALOG dimension at all, and a selector-less `inspect_schema` declares no
+  schema, so a scope constraining either denies the natural first call — including the one the
+  run-start snapshot makes. It fails closed, which is the right direction. Nothing builds such a
+  scope today (`runtime.ts` calls `createTargetScope(connectionId)` with no dimensions), so this is
+  a property of the layer rather than a live defect, and the two ways out are written where the
+  declaration is made, in `src/lib/agent/tools.ts`.
+- **No token budget is enforced, so the meter reports none.** `AGENT_WORKFLOW_BUDGETS` is
+  statement-shaped, `maxModelTurns` bounds model TURNS rather than their size, and the run loop never
+  reads the SDK's `usage` at all. A token figure would be a number the server does not enforce shown
+  beside four that it does, which is the one thing the meter's bar forbids, so it states the turn
+  ceiling instead and says nothing about tokens.
+- **A run's stored results are released when it ends, so a report's citations can outlive its rows.**
+  `ExecutionArtifactStore` holds results in process memory and `releaseExecutionRun` drops everything
+  a run produced — the M1 decision that agent results never rest on disk. A report is composed as the
+  run's last step and usually read after the run has ended, so "Show result" on its citations answers
+  `410` with `reason: "released"` rather than rows, and the same is true of any run driven by another
+  replica. The route says which of the two happened, the rail offers "Show result" only while the run
+  is live, and the report section states the bound in words.
+- **Seed eligibility is decided against the browser's last descriptor fetch**, so a seed repointed
+  server-side mid-session is not seen until the next one. `resolveAgentRunConnectionId` compares
+  against the descriptors from the last `GET /api/connections/managed` while the run-start route
+  re-resolves `seed:<id>` through a loader with its own TTL (`SEED_CACHE_TTL_MS`, 60s by default). So
+  an operator who repoints a seed while a session is open leaves that session comparing against the
+  old descriptor: the rail still offers Start, and the run resolves the new target.
+- **A data-analysis run has no honest way to conclude that the question is not about this database.**
+  Its only route to `answered` is a reading of the data, so a run that establishes the question is
+  unanswerable fabricates one — driven live on 2026-08-15, a churn question against an employees
+  database was answered correctly, in 36 steps, by executing a `SELECT '<explanation>'` string
+  literal purely to produce the artifact `present_answer` requires.
+- **An unfenced plan statement with NO terminator still carries prose into the SQL.** The splitter
+  closed the demonstrated case (a statement, then its explanation on the next line, came back as one
+  statement with the prose in it) but has nothing to cut on without a semicolon, so the blank line
+  remains the only signal there. It matters because `plan-statement-drafted` is recorded on the
+  reader's verdict alone and the goal verifier reads that event as ANSWERED, so the run is scored
+  answered while its deliverable would not run.
+- **The re-pointed decline has never been reached from the UI.** In the default storage mode the only
+  server-held connections are the seeds, and editing a seed makes it browser-local, which the rail
+  refuses before any thread check. Reaching it takes a seed run, an edit of that seed's target on the
+  SERVER between two questions, and a second question with the rail mounted throughout.
 
 ## Related documentation
 

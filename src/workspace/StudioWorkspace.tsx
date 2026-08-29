@@ -18,6 +18,7 @@ import { useConnectionAdapter } from "@/workspace/hooks/use-connection-adapter";
 import { useQueryAdapter } from "@/workspace/hooks/use-query-adapter";
 import { type StudioWorkspaceProps, DEFAULT_WORKSPACE_FEATURES } from "@/workspace/types";
 import { cn } from "@/lib/utils";
+import { useIsMobile } from "@/hooks/use-mobile";
 import { ChunkBoundary, ViewLoading } from "@/components/LazyView";
 import { lazyRetry } from "@/lib/lazy";
 import { editorLanguageForTabType } from "@/lib/editor/tab-language";
@@ -210,8 +211,12 @@ export function StudioWorkspace({
     } else {
       conn.setSchema([]);
     }
+    // Keyed on the ID, not the object: `activeConnection` is derived from the
+    // host's `connections` prop, so a host that passes a fresh array on every
+    // render would otherwise re-fetch the schema on every render. The ID is the
+    // trigger this effect always meant — the active connection actually changing.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [conn.activeConnection]);
+  }, [conn.activeConnection?.id]);
 
   // === Modal / overlay state ===
   const [showDiagram, setShowDiagram] = useState(false);
@@ -277,6 +282,9 @@ export function StudioWorkspace({
   );
 
   // === No-op callbacks for disabled features ===
+  /** What the panel group may hold: below the breakpoint, only the body panel. */
+  const isMobile = useIsMobile();
+
   const noop = useCallback(() => {}, []);
 
   return (
@@ -291,30 +299,41 @@ export function StudioWorkspace({
       <ResizablePanelGroup id="workspace-main" orientation="horizontal" className="h-full">
         {/* Sizes are strings on purpose: react-resizable-panels 4 reads a bare
             number as pixels and a unitless string as a percentage. */}
-        <ResizablePanel id="workspace-sidebar" defaultSize="22" minSize="15" maxSize="35" className="hidden md:block">
-          <Sidebar
-            connections={conn.connections}
-            activeConnection={conn.activeConnection}
-            schema={conn.schema}
-            isLoadingSchema={conn.isLoadingSchema}
-            onSelectConnection={conn.setActiveConnection}
-            onDeleteConnection={noop}
-            onEditConnection={noop}
-            onAddConnection={noop}
-            onTableClick={onTableClick}
-            onGenerateSelect={tabMgr.handleGenerateSelect}
-            onCreateTableClick={undefined}
-            onShowDiagram={features.schemaDiagram ? () => setShowDiagram(true) : undefined}
-            isAdmin={false}
-            onOpenMaintenance={noop}
-            databaseType={conn.activeConnection?.type}
-            metadata={conn.metadata}
-            onProfileTable={features.codeGenerator ? (name: string) => setProfilerTable(name) : undefined}
-            onGenerateCode={features.codeGenerator ? (name: string) => setCodeGenTable(name) : undefined}
-            onGenerateTestData={features.testDataGenerator ? (name: string) => setTestDataTable(name) : undefined}
-          />
-        </ResizablePanel>
-        <ResizableHandle className="hidden md:flex w-1 bg-transparent hover:bg-blue-500/30 transition-colors" />
+        {/*
+          Out of the group below the breakpoint rather than hidden inside it:
+          react-resizable-panels 4 applies a `Panel`'s `className` to a NESTED div,
+          so `hidden md:block` hid the sidebar's CONTENTS while the panel itself kept
+          its 22% of the row — an empty column beside a squeezed body on a host's
+          phone viewport. `src/components/Studio.tsx` carries the same guard.
+        */}
+        {!isMobile && (
+          <>
+            <ResizablePanel id="workspace-sidebar" defaultSize="22" minSize="15" maxSize="35">
+              <Sidebar
+                connections={conn.connections}
+                activeConnection={conn.activeConnection}
+                schema={conn.schema}
+                isLoadingSchema={conn.isLoadingSchema}
+                onSelectConnection={conn.setActiveConnection}
+                onDeleteConnection={noop}
+                onEditConnection={noop}
+                onAddConnection={noop}
+                onTableClick={onTableClick}
+                onGenerateSelect={tabMgr.handleGenerateSelect}
+                onCreateTableClick={undefined}
+                onShowDiagram={features.schemaDiagram ? () => setShowDiagram(true) : undefined}
+                isAdmin={false}
+                onOpenMaintenance={noop}
+                databaseType={conn.activeConnection?.type}
+                metadata={conn.metadata}
+                onProfileTable={features.codeGenerator ? (name: string) => setProfilerTable(name) : undefined}
+                onGenerateCode={features.codeGenerator ? (name: string) => setCodeGenTable(name) : undefined}
+                onGenerateTestData={features.testDataGenerator ? (name: string) => setTestDataTable(name) : undefined}
+              />
+            </ResizablePanel>
+            <ResizableHandle className="w-1 bg-transparent hover:bg-blue-500/30 transition-colors" />
+          </>
+        )}
         <ResizablePanel id="workspace-body" defaultSize="78">
           <div className="flex-1 flex flex-col min-w-0 h-full bg-surface">
             {/* No desktop/mobile headers — platform provides its own */}
@@ -394,6 +413,7 @@ export function StudioWorkspace({
                             value={tabMgr.currentTab.query}
                             onContentChange={(val) => tabMgr.updateTabById(tabMgr.currentTab.id, { query: val })}
                             language={editorLanguageForTabType(tabMgr.currentTab.type)}
+                            databaseType={conn.activeConnection?.type}
                             schemaContext={conn.schemaContext}
                             capabilities={conn.metadata?.capabilities}
                           />

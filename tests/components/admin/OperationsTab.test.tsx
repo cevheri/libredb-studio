@@ -59,7 +59,7 @@ const defaultTables = [
 ];
 
 // The options the tab asked for, so a test can assert that a provider whose rows
-// are derived groupings never requests tables at all (#U5).
+// are derived groupings never requests tables at all (#459).
 let lastMonitoringOptions: Record<string, unknown> | undefined;
 
 mock.module("@/hooks/use-monitoring-data", () => ({
@@ -378,7 +378,7 @@ describe("OperationsTab", () => {
     expect(queryByText("Removes dead rows and returns space to the OS.")).not.toBeNull();
   });
 
-  test("renders the provider's own global reindex wording (#U6)", async () => {
+  test("renders the provider's own global reindex wording (#464)", async () => {
     // Couchbase's `reindex` builds deferred GSI indexes for one keyspace, which the
     // hardcoded PostgreSQL copy described in none of its three strings.
     mockMetadata = {
@@ -1329,7 +1329,7 @@ describe("OperationsTab", () => {
     expect(container.textContent).toContain("users");
     expect(container.textContent).toContain("1234");
   });
-  // ── Derived groupings have no Tables panel (#U5) ───────────────────────────
+  // ── Derived groupings have no Tables panel (#459) ──────────────────────────
   //
   // Redis and the embedded engine declare `tablesAreDerivedGroupings`: their rows
   // are prefix/namespace groupings, not addressable tables, so the panel could
@@ -1374,7 +1374,7 @@ describe("OperationsTab", () => {
     expect(lastMonitoringOptions?.includeTables).toBe(true);
   });
 
-  // ── A deep link from an Explorer row arrives selected (#U5) ────────────────
+  // ── A deep link from an Explorer row arrives selected (#459) ───────────────
 
   test("deep-linked table name arrives filtered and selected", async () => {
     monitoringOverride = { data: { activeSessions: defaultSessions, tables: multiTables } };
@@ -1436,6 +1436,40 @@ describe("OperationsTab", () => {
     expect(getByTestId("operations-sessions-empty").textContent).toBe("No active sessions found.");
   });
 
+  // #D48. The default sentence reads as "nothing is running right now", which is false
+  // on an engine whose session list does not exist. Both branches are pinned so the
+  // fallback cannot quietly become the only path again.
+  test("an engine declaring sessionsEmptyState replaces the empty-state copy", async () => {
+    const duckdb = "DuckDB publishes no session list - there is no duckdb_connections() table function.";
+    mockMetadata = {
+      capabilities: { supportsMaintenance: true, maintenanceOperations: ["analyze"] },
+      labels: { sessionsEmptyState: duckdb },
+    };
+    monitoringOverride = { data: { activeSessions: [], tables: defaultTables } };
+    let renderResult: ReturnType<typeof render>;
+    await act(async () => {
+      renderResult = render(<OperationsTab />);
+    });
+
+    expect(renderResult!.getByTestId("operations-sessions-empty").textContent).toBe(duckdb);
+  });
+
+  test("a refused read outranks the label, because a refusal is not an absence", async () => {
+    mockMetadata = {
+      capabilities: { supportsMaintenance: true, maintenanceOperations: ["analyze"] },
+      labels: { sessionsEmptyState: "DuckDB publishes no session list." },
+    };
+    monitoringOverride = {
+      data: { tables: defaultTables, errors: { activeSessions: "permission denied" } },
+    };
+    let renderResult: ReturnType<typeof render>;
+    await act(async () => {
+      renderResult = render(<OperationsTab />);
+    });
+
+    expect(renderResult!.getByTestId("operations-sessions-empty").textContent).toBe("permission denied");
+  });
+
   test("a refused tables read shows the engine's own sentence", async () => {
     monitoringOverride = {
       data: { activeSessions: defaultSessions, errors: { tables: "permission denied for relation pg_class" } },
@@ -1459,5 +1493,323 @@ describe("OperationsTab", () => {
     const { getByTestId } = renderResult!;
 
     expect(getByTestId("operations-tables-empty").textContent).toBe("No tables found.");
+  });
+  // ── Every control is gated and titled by the provider's own declaration (#496) ─
+  //
+  // #427 reverted a generic label-to-operation mapping, and the reason is here: two
+  // engines that declare the same `MaintenanceType` take different kinds of target,
+  // so only the provider can say what a control may be pointed at. These tests use
+  // the shapes the real providers declare.
+
+  const render_ = async () => {
+    let renderResult: ReturnType<typeof render>;
+    await act(async () => {
+      renderResult = render(<OperationsTab />);
+    });
+    return renderResult!;
+  };
+
+  const titlesIn = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll("button"))
+      .map((b) => b.getAttribute("title"))
+      .filter((t): t is string => t !== null);
+
+  test("MySQL renders its own maintenance words and never 'Vacuum Table'", async () => {
+    // MySQL has no VACUUM at all: the base default put "Run Vacuum / Reclaim Space"
+    // on this tab and "Vacuum" on every table row for an engine whose operations are
+    // analyze/optimize/check/kill.
+    mockMetadata = {
+      capabilities: {
+        supportsMaintenance: true,
+        maintenanceOperations: ["analyze", "optimize", "check", "kill"],
+        maintenanceOperationSpecs: {
+          analyze: { label: "Analyze Table", perEntity: true, global: true },
+          optimize: { label: "Optimize Table", perEntity: true, global: true },
+          check: { label: "Check Table", perEntity: true, global: true },
+          kill: { label: "Kill Connection", perEntity: false, global: false },
+        },
+      },
+      labels: {
+        analyzeGlobalLabel: "Run Analyze",
+        analyzeGlobalTitle: "Update Statistics",
+        analyzeGlobalDesc: "Runs ANALYZE TABLE over every table.",
+        vacuumActionOperation: "optimize",
+        vacuumGlobalLabel: "Run Optimize",
+        vacuumGlobalTitle: "Optimize Tables",
+        vacuumGlobalDesc: "Runs OPTIMIZE TABLE over every table in the database.",
+      },
+    };
+
+    const { queryByText, container } = await render_();
+
+    // The global card the provider's wording was written for now renders...
+    expect(queryByText("Run Optimize")).not.toBeNull();
+    expect(queryByText("Optimize Tables")).not.toBeNull();
+    // ...and the words for an operation MySQL does not have are gone.
+    expect(queryByText("Run Vacuum")).toBeNull();
+    expect(queryByText("Reclaim Space")).toBeNull();
+
+    const titles = titlesIn(container);
+    expect(titles).toContain("Analyze Table");
+    expect(titles).toContain("Optimize Table");
+    expect(titles).toContain("Check Table");
+    expect(titles).not.toContain("Vacuum");
+    expect(titles).not.toContain("Vacuum Table");
+    // `kill` declares neither placement: its target is a connection id, which only
+    // the Sessions panel below can supply.
+    expect(titles).not.toContain("Kill Connection");
+  });
+
+  test("the global card whose label was redirected SENDS the redirected operation", async () => {
+    // Sending `vacuum` to SQL Server, Oracle, MySQL or ClickHouse is a 400 from
+    // /api/db/maintenance: none of them declares it.
+    mockMetadata = {
+      capabilities: {
+        supportsMaintenance: true,
+        maintenanceOperations: ["analyze", "optimize", "kill"],
+        maintenanceOperationSpecs: {
+          analyze: { label: "Gather Statistics", perEntity: true, global: true },
+          optimize: { label: "Rebuild Indexes", perEntity: true, global: true },
+          kill: { label: "Kill Session", perEntity: false, global: false },
+        },
+      },
+      labels: { vacuumActionOperation: "optimize", vacuumGlobalLabel: "Rebuild Indexes" },
+    };
+
+    const { queryByText } = await render_();
+    const button = queryByText("Rebuild Indexes");
+    expect(button).not.toBeNull();
+
+    await act(async () => {
+      fireEvent.click(button!);
+    });
+
+    expect(mockRunMaintenance).toHaveBeenCalledWith("optimize", undefined);
+  });
+
+  test("an operation with no whole-database form gets no global card", async () => {
+    // ClickHouse: OPTIMIZE names one table, so the "Merge Parts" card would always
+    // have answered *"The optimize operation requires a target"*. Its analyze does
+    // take both, so the section itself still renders - which is what makes the
+    // absence of the optimize card a gate rather than a blanket denial.
+    mockMetadata = {
+      capabilities: {
+        supportsMaintenance: true,
+        maintenanceOperations: ["optimize", "analyze", "kill"],
+        maintenanceOperationSpecs: {
+          optimize: { label: "Optimize Table", perEntity: true, global: false },
+          analyze: { label: "Table Statistics", perEntity: true, global: true },
+          kill: { label: "Cancel Query", perEntity: false, global: false },
+        },
+      },
+      labels: {
+        vacuumActionOperation: "optimize",
+        vacuumGlobalLabel: "Optimize",
+        vacuumGlobalTitle: "Merge Parts",
+        analyzeGlobalLabel: "Table Statistics",
+      },
+    };
+
+    const { queryByText, container } = await render_();
+
+    expect(queryByText("Global Operations")).not.toBeNull();
+    expect(queryByText("Table Statistics")).not.toBeNull();
+    expect(queryByText("Optimize")).toBeNull();
+    expect(queryByText("Merge Parts")).toBeNull();
+    // The per-table control is the one that CAN succeed, so it stays.
+    expect(titlesIn(container)).toContain("Optimize Table");
+  });
+
+  test("Couchbase's global Reindex card is withheld and the per-collection item carries the target", async () => {
+    // The #U6 card rendered for every provider declaring `reindex` and answered
+    // *"The reindex operation requires a target"* on Couchbase, whose BUILD INDEX
+    // names one keyspace and has no whole-bucket form.
+    mockMetadata = {
+      capabilities: {
+        supportsMaintenance: true,
+        maintenanceOperations: ["analyze", "reindex", "kill"],
+        maintenanceOperationSpecs: {
+          analyze: { label: "Update Statistics", perEntity: true, global: false },
+          reindex: { label: "Build Deferred Indexes", perEntity: true, global: false },
+          kill: { label: "Cancel Request", perEntity: false, global: false },
+        },
+      },
+      labels: {
+        reindexGlobalLabel: "Build Indexes",
+        reindexGlobalTitle: "Build Deferred GSI Indexes",
+        analyzeGlobalLabel: "Update Statistics",
+      },
+    };
+
+    const { queryByText, container } = await render_();
+
+    // Not one global control can succeed here, so the whole section is absent.
+    expect(queryByText("Global Operations")).toBeNull();
+    expect(queryByText("Build Indexes")).toBeNull();
+    expect(queryByText("Update Statistics")).toBeNull();
+
+    const titles = titlesIn(container);
+    expect(titles).toContain("Build Deferred Indexes");
+    expect(titles).toContain("Update Statistics");
+
+    await act(async () => {
+      fireEvent.click(container.querySelector('button[title="Build Deferred Indexes"]')!);
+    });
+
+    // The target is what made this control honest: "users" is the collection row.
+    expect(mockRunMaintenance).toHaveBeenCalledWith("reindex", "users");
+  });
+
+  test("an operation that ignores its target gets no per-row control", async () => {
+    // Redis: `runMaintenance(type)` takes no target parameter at all, so a per-row
+    // "Key Info" answered with server-wide metrics for one key prefix (#427). Rows
+    // here are addressable, so nothing but the declaration withholds the control.
+    mockMetadata = {
+      capabilities: {
+        supportsMaintenance: true,
+        maintenanceOperations: ["analyze"],
+        maintenanceOperationSpecs: { analyze: { label: "Server Info", perEntity: false, global: true } },
+      },
+      labels: { analyzeGlobalLabel: "Run Info", analyzeGlobalTitle: "Server Info" },
+    };
+
+    const { queryByText, container } = await render_();
+
+    expect(queryByText("Run Info")).not.toBeNull();
+    expect(titlesIn(container)).not.toContain("Server Info");
+  });
+
+  test("a provider that declares no specs keeps the pre-#U9 controls", async () => {
+    // `maintenanceOperationSpecs` is optional on the published interface, so an
+    // implementation that declares nothing must behave exactly as it did.
+    mockMetadata = {
+      capabilities: { supportsMaintenance: true, maintenanceOperations: ["analyze", "vacuum", "reindex"] },
+    };
+
+    const { queryByText, container } = await render_();
+
+    expect(queryByText("Run Analyze")).not.toBeNull();
+    expect(queryByText("Run Vacuum")).not.toBeNull();
+    expect(queryByText("Run Reindex")).not.toBeNull();
+    const titles = titlesIn(container);
+    expect(titles).toContain("Analyze");
+    expect(titles).toContain("Vacuum");
+  });
+  // =========================================================================
+  // U22: the per-table operation a deep link asked for, with no row to run it on.
+  //
+  // The schema explorer's two maintenance items are DEEP LINKS: an admin clicking
+  // "Optimize Table" lands here (Studio.tsx `openMaintenance` pushes
+  // /admin/operations?table=...), and this page renders a per-table control only for
+  // a ROW it has statistics for. Every empty branch of the Tables panel therefore said
+  // nothing at all about the operation the operator arrived asking for.
+  // =========================================================================
+
+  /** MySQL's declaration: three per-table operations under the engine's own wording. */
+  const perTableSpecs = {
+    capabilities: {
+      supportsMaintenance: true,
+      maintenanceOperations: ["analyze", "optimize", "check", "kill"],
+      maintenanceOperationSpecs: {
+        analyze: { label: "Analyze Table", perEntity: true, global: true },
+        optimize: { label: "Optimize Table", perEntity: true, global: true },
+        check: { label: "Check Table", perEntity: true, global: true },
+        kill: { label: "Kill Connection", perEntity: false, global: false },
+      },
+    },
+  };
+
+  test("names the deep-linked table the page has no row for", async () => {
+    mockMetadata = perTableSpecs;
+    monitoringOverride = { data: { activeSessions: defaultSessions, tables: multiTables } };
+    setMockSearchParams(new URLSearchParams("table=archived_events"));
+
+    const { getByTestId } = await render_();
+
+    const note = getByTestId("operations-maintenance-unreachable").textContent ?? "";
+    // The engine's own wording, the same strings the per-row buttons would carry.
+    expect(note).toContain("Analyze Table");
+    expect(note).toContain("Optimize Table");
+    expect(note).toContain("Check Table");
+    // A connection id comes from the Sessions panel, so it was never on offer per table.
+    expect(note).not.toContain("Kill Connection");
+    // The name is a measurement here: it is the search param that seeded the filter.
+    expect(note).toContain("archived_events");
+  });
+
+  test("names the operations and the table when the engine refused the read", async () => {
+    mockMetadata = perTableSpecs;
+    monitoringOverride = {
+      data: { activeSessions: defaultSessions, errors: { tables: "permission denied for relation pg_class" } },
+    };
+    setMockSearchParams(new URLSearchParams("table=orders"));
+
+    const { getByTestId } = await render_();
+
+    // The engine's own refusal still carries the panel; the note adds what it costs.
+    expect(getByTestId("operations-tables-empty").textContent).toBe("permission denied for relation pg_class");
+    const note = getByTestId("operations-maintenance-unreachable").textContent ?? "";
+    expect(note).toContain("Optimize Table");
+    expect(note).toContain("orders");
+  });
+
+  test("names the operations without a table when no deep link carried one", async () => {
+    mockMetadata = perTableSpecs;
+    monitoringOverride = {
+      data: { activeSessions: defaultSessions, errors: { tables: "permission denied for relation pg_class" } },
+    };
+
+    const { getByTestId } = await render_();
+
+    const note = getByTestId("operations-maintenance-unreachable").textContent ?? "";
+    expect(note).toContain("Optimize Table");
+    expect(note).toContain("no row to run it on");
+    // Nothing named a table, so the sentence must not claim one was asked for.
+    expect(note).not.toContain("no row for");
+  });
+
+  test("says nothing on a database that genuinely holds no tables", async () => {
+    mockMetadata = perTableSpecs;
+    monitoringOverride = { data: { activeSessions: defaultSessions, tables: [], overview: { tableCount: 0 } } };
+
+    const { queryByTestId, getByTestId } = await render_();
+
+    expect(getByTestId("operations-tables-empty").textContent).toBe("No tables found.");
+    // Nothing to maintain is not a dead end, so the note would only be noise.
+    expect(queryByTestId("operations-maintenance-unreachable")).toBeNull();
+  });
+
+  test("says nothing where the engine declares no per-table maintenance", async () => {
+    mockMetadata = {
+      capabilities: {
+        supportsMaintenance: true,
+        maintenanceOperations: ["vacuum"],
+        maintenanceOperationSpecs: { vacuum: { label: "Vacuum Database", perEntity: false, global: true } },
+      },
+    };
+    monitoringOverride = {
+      data: { activeSessions: defaultSessions, errors: { tables: "permission denied for relation pg_class" } },
+    };
+    setMockSearchParams(new URLSearchParams("table=orders"));
+
+    const { queryByTestId } = await render_();
+
+    // Nothing was ever offered per table, so there is no per-table dead end to explain.
+    expect(queryByTestId("operations-maintenance-unreachable")).toBeNull();
+  });
+
+  test("says nothing once the operator's own filter is what empties the list", async () => {
+    mockMetadata = perTableSpecs;
+    monitoringOverride = { data: { activeSessions: defaultSessions, tables: multiTables } };
+    setMockSearchParams(new URLSearchParams("table=orders"));
+
+    const { queryByTestId, getByPlaceholderText } = await render_();
+
+    await act(async () => {
+      fireEvent.change(getByPlaceholderText("Filter..."), { target: { value: "zzz" } });
+    });
+
+    // The rows and their controls are there; the operator's own filter hid them.
+    expect(queryByTestId("operations-maintenance-unreachable")).toBeNull();
   });
 });

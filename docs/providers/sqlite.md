@@ -186,7 +186,7 @@ Unlike every networked SQL provider, SQLite exposes **no** `beginTransaction`/`c
 `queryInTransaction`, **no** `cancelQuery`, and **no** pool/`getPoolStats`. It is a single embedded
 handle. (`POST /api/db/transaction` and `/api/db/cancel` are therefore not applicable to SQLite.)
 
-Since `docs/BACKLOG.md` U13 the client can see that: `supportsTransactions: false`
+Since #464 the client can see that: `supportsTransactions: false`
 ([§9](#9-capabilities--labels)) is what withholds BEGIN/COMMIT/ROLLBACK and the auto-rolled-back
 SANDBOX toggle from the editor toolbar here. Before that flag existed the only gate was
 `isTransactionProvider(provider)` inside the route — a runtime shape check the browser cannot read —
@@ -426,6 +426,36 @@ and `reindex` targets are quoted via `escapeIdentifier()`:
 `kill` — SQLite has no sessions to terminate. Quoting the target prevents identifier injection in
 `ANALYZE`/`REINDEX` statements (which cannot use bind parameters for object names).
 
+### Where each operation may be offered (`maintenanceOperationSpecs`)
+
+Declaring that an operation EXISTS is not enough to put a button on it: two engines that
+declare the same `MaintenanceType` take different kinds of target, so each provider also
+declares what its own operations may be pointed at. The monitoring Tables tab renders a
+per-row control only where `perEntity` is true, the admin Operations tab a whole-database
+card only where `global` is true, and both take the wording from `label` (#496).
+
+`POST /api/db/maintenance` reads the same declaration since #U20, and it is the one reader that
+REFUSES rather than hides: it takes the placement from whether the request carries a `target`
+(absent or empty means whole-database) and answers `400` when this provider marks that
+placement unavailable while the other one is available - `{type:"vacuum", target:"users"}` is
+that request here.
+
+| Operation | Control label | Per-row | Global | Why |
+|-----------|---------------|---------|--------|-----|
+| `vacuum` | Vacuum Database | no | yes | `VACUUM` rewrites the whole file and `runMaintenance` drops the target, so a per-table control named one table and acted on the database |
+| `analyze` | Analyze Table | yes | yes | `ANALYZE [<t>]` |
+| `reindex` | Reindex Table | yes | yes | `REINDEX [<t>]` |
+| `check` | Integrity Check | no | yes | `PRAGMA integrity_check` reads the whole file, target ignored |
+
+**The schema explorer's row menu reads the same declaration.** It is the third surface that
+renders this wording, and it used to gate on `supportsMaintenance` alone — so it offered
+*"Vacuum Table"* for ONE table here while the monitoring Tables tab correctly withheld that
+control, and the click deep-linked to a page where no such control exists. `TableItem.tsx`
+now asks `maintenanceControl(capabilities, …, 'perEntity')` for each of its two items, so on
+SQLite the row menu offers *"Analyze Table"* and no vacuum item at all. Unknown capabilities
+read as a denial there, as they already did on the other two surfaces: `/api/db/provider-meta`
+answers with nothing both while it is in flight and when it failed.
+
 ---
 
 ## 9. Capabilities & labels
@@ -440,8 +470,9 @@ and `reindex` targets are quoted via `escapeIdentifier()`:
 | `supportsExternalQueryLimiting` | `true` (from base) |
 | `supportsCreateTable` | `true` (from base) |
 | `supportsInlineRowEdit` | `true` — `UPDATE t SET c = v WHERE pk = v` is core SQLite DML |
-| `supportsTransactions` | **`false`** — SQLite HAS `BEGIN`, but this provider holds no session across two requests, so `POST /api/db/transaction` refuses the call. The flag describes the provider's surface, not the engine, and the trio and SANDBOX toggle are withheld rather than offered and then failed (#U13) |
+| `supportsTransactions` | **`false`** — SQLite HAS `BEGIN`, but this provider holds no session across two requests, so `POST /api/db/transaction` refuses the call. The flag describes the provider's surface, not the engine, and the trio and SANDBOX toggle are withheld rather than offered and then failed (#464) |
 | `declaresForeignKeys` | `true` — inherited from the base capabilities; `PRAGMA foreign_key_list` reads them whether or not enforcement is on |
+| `singleWriterFile` | **absent (not `true`)** — SQLite is a file engine and is *not* single-writer at OPEN. Measured 2026-08-25 on `bun:sqlite`: a second `new Database(path, { readwrite: true })` on a WAL file this process already holds both opens and writes, because SQLite takes its file locks per transaction. LibreDB declares the flag and SQLite must not: the whole point of the agent profile here is a SECOND, `readonly: true` handle on the same file ([§12.1](#121-where-the-boundary-is)), and declaring it would have made the factory hand the agent the writable one instead |
 | `supportsMaintenance` | `true` |
 | `maintenanceOperations` | `['vacuum', 'analyze', 'reindex', 'check']` |
 | `supportsConnectionString` | **`false`** |
@@ -451,15 +482,18 @@ and `reindex` targets are quoted via `escapeIdentifier()`:
 ### Labels
 
 Default SQL labels — *Table* / *Select Top 50* / *Vacuum Table* / *Analyze Table*, which match
-SQLite's real `VACUUM`/`ANALYZE`.
+SQLite's real `VACUUM`/`ANALYZE`. `vacuumAction`'s *"Vacuum Table"* is the one word that is
+narrower than the statement: `VACUUM` is not per-table, which is what
+`vacuum: { perEntity: false, label: 'Vacuum Database' }` says, and the per-row surfaces take
+their wording from that `label` rather than from this field.
 
 One field is overridden: `slowQueriesEmptyState` → *"SQLite keeps no statistics about finished
 statements, so there is nothing to enable."* `getSlowQueries()` answers `[]` unconditionally
 ([§7](#7-monitoring--health)), so the monitoring Queries panel is always empty here, and its sentence
-was hardcoded to PostgreSQL's `pg_stat_statements` advice (`docs/BACKLOG.md` U12).
+was hardcoded to PostgreSQL's `pg_stat_statements` advice (#463).
 
 Two overrides in total. The second is the Operations tab's global Reindex card, hardcoded to
-PostgreSQL's *"Reconstructs all indexes in the database."* until `docs/BACKLOG.md` U6. The global card
+PostgreSQL's *"Reconstructs all indexes in the database."* until #464. The global card
 sends no target, so `runMaintenance('reindex')` here runs a bare `REINDEX`
 ([§8](#8-maintenance)), which rebuilds every index in the database **file**:
 

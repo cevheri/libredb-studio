@@ -15,6 +15,8 @@ import {
   OpenSearchIcon,
   TrinoIcon,
   CassandraIcon,
+  LibSQLIcon,
+  DuckDBIcon,
 } from "@/components/icons/db-icons";
 import type { DatabaseType } from "@/lib/types";
 
@@ -46,6 +48,9 @@ export interface DatabaseUIConfig {
   )[];
 }
 
+/** One addressing field, named by the same list that decides whether a save writes it. */
+export type ConnectionField = DatabaseUIConfig["connectionFields"][number];
+
 export const DB_UI_CONFIG: Record<DatabaseType, DatabaseUIConfig> = {
   postgres: {
     icon: PostgreSQLIcon,
@@ -71,6 +76,48 @@ export const DB_UI_CONFIG: Record<DatabaseType, DatabaseUIConfig> = {
     showConnectionStringToggle: false,
     connectionFields: ["database"],
   },
+  duckdb: {
+    icon: DuckDBIcon,
+    // DuckDB's own mark is a bright yellow (#FFF000), and `text-yellow-400` is already
+    // ClickHouse's. yellow-300 is the nearest free shade, and the distinct-colour
+    // assertion in tests/unit/lib/db-ui-config.test.ts rules a duplicate out.
+    color: "text-yellow-300",
+    label: "DuckDB",
+    // Embedded: nothing is listening anywhere, so there is no port to default.
+    defaultPort: "",
+    // No URI scheme exists to paste - DuckDB's own tooling takes a path - so the
+    // provider declares `supportsConnectionString: false` and this toggle stays off.
+    showConnectionStringToggle: false,
+    // Exactly `["database"]`, which is the shape `isFileBased()` below tests for: it
+    // is what makes ConnectionModal render "Database File Path" instead of a
+    // host/user/password section. One extra field here would silently take the file
+    // input away.
+    connectionFields: ["database"],
+  },
+  libsql: {
+    icon: LibSQLIcon,
+    // Turso's own mark is a bright mint green (#4FF8D2). emerald-300 is the nearest
+    // free shade - emerald-400 is MongoDB's, both teals are taken by Couchbase and
+    // Elasticsearch, and the distinct-colour assertion in
+    // tests/unit/lib/db-ui-config.test.ts rules a duplicate out.
+    color: "text-emerald-300",
+    // The protocol's name rather than the product's: one connection here reaches a
+    // self-hosted libSQL server OR Turso Cloud, and naming the managed product would
+    // read as though the self-hosted one belonged somewhere else.
+    label: "libSQL",
+    // sqld's own default HTTP port. A Turso Cloud connection names no port at all -
+    // it is TLS on 443, which the transport picks up from the ssl setting.
+    defaultPort: "8080",
+    // `libsql://<database>-<org>.turso.io?authToken=<jwt>` is the URL Turso's CLI
+    // prints, so there IS a canonical form to paste - unlike Trino's JDBC URL.
+    showConnectionStringToggle: true,
+    // No `user`: libSQL has no user names at all, and the credential is a token the
+    // server mints. No `database` either - the database IS the host on Turso Cloud,
+    // and a self-hosted server serves one per namespace hostname. The form labels
+    // `password` "Auth Token" (see ConnectionModal.tsx), because a field labelled
+    // Password invites a password that no libSQL server has.
+    connectionFields: ["host", "port", "password", "connectionString"],
+  },
   mongodb: {
     icon: MongoDBIcon,
     color: "text-emerald-400",
@@ -85,7 +132,12 @@ export const DB_UI_CONFIG: Record<DatabaseType, DatabaseUIConfig> = {
     label: "Redis",
     defaultPort: "6379",
     showConnectionStringToggle: false,
-    connectionFields: ["host", "port", "password", "database"],
+    // `user` is the Redis 6 ACL user. It belongs here because `RedisProvider.connect()`
+    // authenticates with it (as ioredis's `username`) and docs/providers/redis.md has
+    // documented it as a connection field all along - this list was the one place that
+    // disagreed, and since it decides what a save WRITES, the value never reached the
+    // driver that #502 taught to send it.
+    connectionFields: ["host", "port", "user", "password", "database"],
   },
   oracle: {
     icon: OracleIcon,
@@ -258,4 +310,18 @@ export function getDBColor(type: DatabaseType): string {
 export function isFileBased(type: DatabaseType): boolean {
   const fields = DB_UI_CONFIG[type].connectionFields;
   return fields.length === 1 && fields[0] === "database";
+}
+
+/**
+ * Whether this engine takes a given addressing field at all.
+ *
+ * One list, two readers: `buildConnection` writes a field only when this says so, and the
+ * connection modal renders an input for it only when this says so. They used to disagree -
+ * the modal drew Username and Database for every networked engine while the write list
+ * discarded them - so libSQL asked for a user name it has none of, and Druid and the two
+ * search engines asked for a database they do not take. A box whose value is thrown away is
+ * the UI equivalent of reporting an absence as a measurement.
+ */
+export function takesConnectionField(type: DatabaseType, field: ConnectionField): boolean {
+  return DB_UI_CONFIG[type].connectionFields.includes(field);
 }

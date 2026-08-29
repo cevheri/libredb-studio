@@ -166,10 +166,10 @@ directly; reshaping rows inside the transport would have broken schema loading. 
 
 ```typescript
 // Before:
-export type DatabaseType = 'postgres' | 'mysql' | 'sqlite' | 'mongodb' | 'redis' | 'oracle' | 'mssql' | 'libredb' | 'couchbase' | 'clickhouse' | 'druid' | 'elasticsearch' | 'opensearch' | 'trino' | 'cassandra';
+export type DatabaseType = 'postgres' | 'mysql' | 'sqlite' | 'libsql' | 'duckdb' | 'mongodb' | 'redis' | 'oracle' | 'mssql' | 'libredb' | 'couchbase' | 'clickhouse' | 'druid' | 'elasticsearch' | 'opensearch' | 'trino' | 'cassandra';
 
 // After (example: adding CockroachDB):
-export type DatabaseType = 'postgres' | 'mysql' | 'sqlite' | 'mongodb' | 'redis' | 'oracle' | 'mssql' | 'libredb' | 'couchbase' | 'clickhouse' | 'druid' | 'elasticsearch' | 'opensearch' | 'trino' | 'cassandra' | 'cockroachdb';
+export type DatabaseType = 'postgres' | 'mysql' | 'sqlite' | 'libsql' | 'duckdb' | 'mongodb' | 'redis' | 'oracle' | 'mssql' | 'libredb' | 'couchbase' | 'clickhouse' | 'druid' | 'elasticsearch' | 'opensearch' | 'trino' | 'cassandra' | 'cockroachdb';
 ```
 
 ### 1.2 — Add to `QueryTab.type` if needed
@@ -317,7 +317,7 @@ Then add the type to the selectable list that drives the ConnectionModal picker:
 // Append to the existing list - do not retype it, or you will drop a provider from the picker.
 const selectableTypes: DatabaseType[] = [
   'postgres', 'mysql', 'sqlite', 'oracle', 'mssql', 'mongodb', 'couchbase', 'redis', 'libredb',
-  'clickhouse', 'druid', 'elasticsearch', 'opensearch', 'trino', 'cassandra',
+  'clickhouse', 'druid', 'elasticsearch', 'opensearch', 'trino', 'cassandra', 'libsql', 'duckdb',
   'cockroachdb',
 ];
 ```
@@ -340,13 +340,22 @@ bun add <driver-package>
 # Apache Druid needs no driver — plain SQL over POST /druid/v2/sql (Router 8888 or Broker 8082)
 # Elasticsearch / OpenSearch need no driver — SQL over _sql / _plugins/_sql (port 9200)
 # Apache Trino needs no driver — SQL over its client protocol, POST /v1/statement (port 8080)
+# libSQL needs no driver — SQLite's dialect over the Hrana protocol, POST /v2/pipeline (port 8080)
 # bun add cassandra-driver  (Apache Cassandra — a binary protocol over TCP, so a driver is not
 #                            optional; this one is pure JS, which is the next best thing)
+# bun add @duckdb/node-api  (DuckDB — an embedded engine, so there is no protocol at all and no
+#                            HTTP alternative; this one is a NATIVE N-API addon)
 ```
 
 If your engine exposes a documented HTTP API, weigh it against the native driver before adding a
 dependency: a native module lands in the Docker image, every native distribution channel, and the
 `@libredb/studio` package that libredb-platform consumes.
+
+**DuckDB is the counter-example, and it is worth stating rather than hiding.** It has no first-class
+HTTP query API to weigh — the engine is a library, not a server — so the native `@duckdb/node-api`
+addon was the only route, and it costs about 68 MB of platform bindings per libc variant (measured:
+138.7 MiB uncompressed on a Linux tree carrying both glibc and musl, and the AppImage build prunes
+the musl half). Pay that only when there is genuinely nothing to weigh it against.
 
 ## Traps specific to HTTP databases
 
@@ -579,11 +588,11 @@ Every field and what it controls:
 | `supportsExternalQueryLimiting` | `boolean` | Whether route applies LIMIT to queries (SQL) or provider handles it (MongoDB) |
 | `supportsCreateTable` | `boolean` | "Create Table" button in SchemaExplorer |
 | `supportsInlineRowEdit` | `boolean?` | Whether the results grid offers inline row editing. `false` hides the EDIT toggle and every editable cell — set it where the engine has no `UPDATE <table> SET <col> = <val> WHERE <pk> = <val>` statement, which is what `use-inline-editing.ts` builds. Optional only because the interface is published and a required addition breaks external implementers; every provider here declares it, and an absent flag reads as unsupported |
-| `supportsTransactions` | `boolean?` | Whether THIS PROVIDER implements the interactive transaction session `POST /api/db/transaction` drives (`beginTransaction`/`commitTransaction`/`rollbackTransaction` over one held connection). `false` withholds the editor toolbar's BEGIN/COMMIT/ROLLBACK trio **and** the SANDBOX toggle, which auto-rolls-back through the same route. It is about the provider's surface, not the engine: SQLite has `BEGIN` and still declares `false`. Optional for the published-interface reason above; the UI gates on `=== true`, so an absent flag and an unresolved metadata fetch both read as no transactions (`docs/BACKLOG.md` U13) |
+| `supportsTransactions` | `boolean?` | Whether THIS PROVIDER implements the interactive transaction session `POST /api/db/transaction` drives (`beginTransaction`/`commitTransaction`/`rollbackTransaction` over one held connection). `false` withholds the editor toolbar's BEGIN/COMMIT/ROLLBACK trio **and** the SANDBOX toggle, which auto-rolls-back through the same route. It is about the provider's surface, not the engine: SQLite has `BEGIN` and still declares `false`. Optional for the published-interface reason above; the UI gates on `=== true`, so an absent flag and an unresolved metadata fetch both read as no transactions (#464) |
 | `declaresForeignKeys` | `boolean?` | Whether this engine has foreign keys in its model at all. `false` says an empty `TableSchema.foreignKeys` means "no such constraint exists here", not "this schema declares none" — set it on every engine without referential constraints. Optional for the published-interface reason above; consumers gate on `=== false`, so an absent flag reads as "may declare them" |
 | `tablesAreDerivedGroupings` | `boolean?` | Whether `getSchema()`'s rows are objects the engine holds, or groupings this server derived from a bounded scan. `true` on Redis and LibreDB only. Where it is true the schema explorer hides every menu item that *addresses* the row — `Profile Table`, `Generate Test Data`, and both per-row maintenance items, all of which name the row to a route that needs a real object — and keeps the ones that merely name it (`Select`, `Generate`, `Copy Name`, `Generate Code`). The agent layer states it to a plan run in one sentence. Consumers gate on `=== true`, so an absent flag reads as "ordinary objects" |
 | `supportsMaintenance` | `boolean` | Whether maintenance API accepts requests for this provider |
-| `maintenanceOperations` | `MaintenanceType[]` | Which global cards and per-table buttons the admin Operations tab renders. `/api/db/maintenance` rejects anything not in this list, so a surface that ignored it could only offer a control answering HTTP 400. The schema explorer's row menu does **not** read it — its per-row maintenance items are gated on `isAdmin` and on `tablesAreDerivedGroupings`; see `docs/BACKLOG.md` U9 for the mismatches that leaves |
+| `maintenanceOperations` | `MaintenanceType[]` | Which global cards and per-table buttons the admin Operations tab renders. `/api/db/maintenance` rejects anything not in this list, so a surface that ignored it could only offer a control answering HTTP 400. The schema explorer's row menu does **not** read it — its per-row maintenance items are gated on `isAdmin` and on `tablesAreDerivedGroupings`; see #496 for the mismatches that leaves |
 | `supportsConnectionString` | `boolean` | Used for future connection validation logic |
 | `defaultPort` | `number \| null` | Informational; actual UI port comes from `db-ui-config.ts` |
 | `schemaRefreshPattern` | `string` | Regex to detect write/DDL queries that should trigger schema reload |
@@ -601,8 +610,8 @@ comment. Three surfaces read labels today, plus the agent's prompt layer:
 | `rowName` / `rowNamePlural` | **Nothing reads these.** Declared, defaulted in `base-provider.ts`, set by several providers, consumed nowhere in `src/` |
 | `selectAction` | `TableItem` row menu, first item ("Select Top 50" / "Find Documents" / "Scan Keys") |
 | `generateAction` | `TableItem` row menu, second item ("Generate Query" / "Generate Find") |
-| `analyzeAction` | `TableItem` row menu only, and only where the rows are not derived groupings. The Operations tab's per-table Analyze button title is still the hardcoded "Analyze" (`docs/BACKLOG.md` U6) |
-| `vacuumAction` | `TableItem` row menu only, under the same derived-groupings gate as `analyzeAction`. The Operations tab's per-table button is gated on the literal `vacuum` and titled "Vacuum", so the four providers that point this label at `optimize`/`reindex` show a row item whose wording the tab does not repeat (`docs/BACKLOG.md` U9) |
+| `analyzeAction` | `TableItem` row menu only, and only where the rows are not derived groupings. **The Operations tab does not read it.** That tab's per-table button takes its wording from `maintenanceOperationSpecs.analyze.label` through `maintenanceControl()`, and falls back to the generic verb "Analyze" where the provider declares no spec (#496) |
+| `vacuumAction` | `TableItem` row menu only, under the same derived-groupings gate as `analyzeAction`, and not read by the Operations tab either. That button is gated on the literal `vacuum` and worded from `maintenanceOperationSpecs.vacuum.label`, so the four providers that point this label at `optimize`/`reindex` via `vacuumActionOperation` show a row item whose wording the tab does not repeat (#496) |
 | `searchPlaceholder` | `SchemaExplorer` search input placeholder text |
 | `analyzeGlobalLabel` | Admin Operations tab, analyze card's button text ("Run Analyze") |
 | `analyzeGlobalTitle` | Admin Operations tab, analyze card title ("Update Statistics") |
@@ -612,9 +621,9 @@ comment. Three surfaces read labels today, plus the agent's prompt layer:
 | `vacuumGlobalDesc` | Admin Operations tab, vacuum card description paragraph |
 | `reindexGlobalLabel` (optional) | Admin Operations tab, reindex card's button text. Absent = the hardcoded *"Run Reindex"* |
 | `reindexGlobalTitle` (optional) | Admin Operations tab, reindex card title. Absent = the hardcoded *"Rebuild Indexes"* |
-| `reindexGlobalDesc` (optional) | Admin Operations tab, reindex card description paragraph. Absent = the hardcoded *"Reconstructs all indexes in the database."* Declare the triad wherever that sentence is false — on Couchbase `reindex` is a deferred-GSI `BUILD INDEX`, not a table reindex (`docs/BACKLOG.md` U6) |
+| `reindexGlobalDesc` (optional) | Admin Operations tab, reindex card description paragraph. Absent = the hardcoded *"Reconstructs all indexes in the database."* Declare the triad wherever that sentence is false — on SQLite `reindex` is a bare `REINDEX`, which rebuilds every index in the file rather than reconstructing them per table (#464). Declaring it is pointless where the card cannot render: Couchbase's `reindex` spec sets `global: false`, so its triad reaches nothing |
 | `statementLanguage` (optional) | The agent's plan contract (`src/lib/agent/investigation.ts`), stated verbatim to the model. No UI surface reads it. Declared only where the engine's own name misleads a model about what a "statement" is here |
-| `slowQueriesEmptyState` (optional) | Monitoring **Queries** tab, the "Slowest Queries" empty state. Absent = PostgreSQL's *"Enable pg_stat_statements extension to see query stats."*, which is what the component hardcoded for every engine until `docs/BACKLOG.md` U12. Declare it wherever that sentence is false, and the panel drops the `pg_stat_statements required` badge as well |
+| `slowQueriesEmptyState` (optional) | Monitoring **Queries** tab, the "Slowest Queries" empty state. Absent = PostgreSQL's *"Enable pg_stat_statements extension to see query stats."*, which is what the component hardcoded for every engine until #463. Declare it wherever that sentence is false, and the panel drops the `pg_stat_statements required` badge as well |
 
 The `*Global*` triads reach only the card, never the per-table button, and only where the card
 renders: the analyze card is gated on `analyze`, the vacuum card on the **literal** `vacuum`, the
@@ -648,7 +657,7 @@ For the authoritative, code-verified reference for each shipped provider (extend
 driver, pooling, capabilities, labels, `prepareQuery` behaviour, and limitations), see the prime
 docs — they are the single source of truth and are kept in sync with the code:
 
-**[docs/providers/](./providers/README.md)** → postgres · mysql · oracle · mssql · sqlite · redis · mongodb · couchbase · clickhouse · druid · elasticsearch · opensearch · trino · libredb
+**[docs/providers/](./providers/README.md)** → postgres · mysql · oracle · mssql · sqlite · libsql · duckdb · redis · mongodb · couchbase · clickhouse · druid · elasticsearch · opensearch · trino · cassandra · libredb
 
 When implementing a new provider, the closest existing analogue is the best template: a pooled SQL
 provider (postgres/mysql), an embedded SQL provider (sqlite), a non-SQL provider (mongodb/redis), or
@@ -769,11 +778,14 @@ The integration points, all of which need an entry. This is the list the Strateg
       published engine count silently undercount; it is listed here because the count in `README.md`
       and `docs/BRAND_MESSAGING.md` is derived from it and has to move in the same PR
 - [ ] `package.json` — the driver, **if** it needs one. A driver-free provider leaves it untouched, and
-      six shipped ids do: `couchbase`, `clickhouse`, `druid`, `elasticsearch`, `opensearch` and `trino`
+      seven shipped ids do: `couchbase`, `clickhouse`, `druid`, `elasticsearch`, `opensearch`, `trino`
+      and `libsql`
       each add nothing here
 - [ ] `database-compose.yml` — a service, so the next person can repeat the live pass. A distributed
       engine contributes a `profiles: [...]` set instead, as Druid's seven services do, so the default
-      stack does not grow for everyone. Check what the image ships before writing a healthcheck: the
+      stack does not grow for everyone. An EMBEDDED engine gets no service at all — SQLite, DuckDB and
+      LibreDB are files rather than servers — but say so in a comment there, or the next reader reads
+      the absence as an oversight. Check what the image ships before writing a healthcheck: the
       ClickHouse image has no `curl` and the Trino image ships its own `health-check` script that waits
       for `"starting": false`, which a bare `curl /v1/info` would not
 
@@ -788,7 +800,11 @@ The integration points, all of which need an entry. This is the list the Strateg
       PostgreSQL-shaped, so check before assuming it fits
 - [ ] `src/lib/schema-diff/migration-generator.ts` — same shape, same hazard: the modified-column
       chain's trailing `else` is PostgreSQL DDL, so an unlisted id silently inherits it (#269). Give the
-      dialect a branch, or list it in `NO_COLUMN_MODIFICATION` to emit an honest comment instead
+      dialect a branch, or list it in `NO_COLUMN_MODIFICATION` to emit an honest comment instead. A new
+      id also needs a decision in `NO_TRANSACTION_WRAPPER` (#284): does `BEGIN;`/`COMMIT;` wrap this
+      engine's DDL at all, or does it belong in the set that gets no wrapper? An id absent from that
+      set inherits the PostgreSQL-shaped wrapper by default, which is silently wrong for a non-SQL or
+      non-transactional engine the same way the modified-column `else` used to be
 - [ ] `src/lib/sql/grammar.ts` — **two decisions, neither of which the compiler can force.** First,
       whether your engine's query text is SQL at all (`NON_SQL_DIALECTS`): an id absent from that set is
       declared to write SQL, and the confirmation gate then applies a SQL span reader to it — which for
@@ -802,6 +818,43 @@ The integration points, all of which need an entry. This is the list the Strateg
       guess. `tests/unit/sql/grammar.test.ts` holds `Record<DatabaseType, …>` maps for both decisions,
       so the compiler will at least stop you from *forgetting* that a decision exists
 
+**Published where a human reads it, and this is the block with the fewest gates.** `readme:check`
+compares the translated READMEs against `README.md` and `chart:check` compares versions. Nine of the
+catalog files below are now counted as well:
+[`tests/unit/lib/catalog-copy-engine-count.test.ts`](../tests/unit/lib/catalog-copy-engine-count.test.ts)
+walks them, refuses a numeral qualifying "engines" that is not `EXTERNAL_DATABASE_TYPES.length`, and
+where that numeral introduces a list, refuses a list that does not name every one of them by its
+`DB_UI_CONFIG` label (#D47 - added after three consecutive PRs corrected the same class by hand; the
+#511 review found all nine stale after libSQL had already landed everywhere the compiler looks). The
+files NOT in that walk have no gate at all, and an abridged list ("and more", or a "from X to Y"
+range) is still checked on its numeral only, deliberately, so that no numeral goes stale (#445):
+
+- [ ] `charts/libredb-studio/Chart.yaml` — the `description`, which is what **ArtifactHub** shows, AND
+      the `keywords` list, which is what ArtifactHub **searches**. An engine absent from the keywords is
+      an engine nobody finds; the chart's own comment says a new engine's keyword belongs in the release
+      that ships it, because #167 otherwise makes a keyword-only fix cost a chart version of its own.
+      Two names are often right — the type-id and the product a user would type (`libsql` and `turso`)
+- [ ] `operator/helm-charts/libredb-studio/Chart.yaml` — the operator's embedded copy, same edit
+- [ ] `operator/config/manifests/bases/libredb-studio-operator.clusterserviceversion.yaml` — the CSV
+      `description`, which is what **OperatorHub** shows. **Edit only this file and then run
+      `make -C operator bundle`**: `operator/bundle/manifests/...` is generated from it, and the
+      `Verify operator bundle is up to date` step re-runs the generator and diffs, so a hand-wrapped
+      YAML folded scalar fails the gate even when the text is identical to what it wants
+- [ ] `README.md` + `README_zh.md` + `README_ja.md`, `DOCKERHUB.md`, `docs/BRAND_MESSAGING.md` — the
+      engine tables and every prose numeral. **Separate the denominators before touching a numeral**:
+      type-ids the factory builds, external drivers (that set minus the embedded store), wire-compatible
+      relatives, and their sum. `connectableProductCount()` is the arithmetic's one definition — derive
+      from it, and re-read each sentence to see which of the four it counts. A mechanical replace is
+      how a correct number becomes wrong: the agent docs' "the other fifteen" counts type-ids minus
+      the two `CATALOG_PLANS` dialects and moved for a different reason than the driver count did.
+      DuckDB is the sharpest illustration: it moved the type-id count and the driver count, left
+      "the fourteen the read-only profile refuses" exactly where it was — because it implements
+      `queryReadOnly`, so numerator and denominator both grew by one — and moved the
+      `CATALOG_PLANS` remainder, because it is not one of those two dialects
+- [ ] the marketplace listings under `deploy/` — a claim that enumerates engines is bound to the file
+      that proves it, and the `marketplace-copy` test fails when a plan-capable engine is missing from
+      one
+
 **And the tests for every exhaustive map**, which are the real checklist — several are exhaustive
 *by construction* (`Record<DatabaseType, …>` in `db-ui-config`, `PICKER_COVERAGE` in the
 connection-form test), so the compiler and those tests refuse to pass until each is updated:
@@ -810,7 +863,9 @@ connection-form test), so the compiler and those tests refuse to pass until each
 `tests/unit/lib/query-generators.test.ts`, `tests/unit/seed/types.test.ts`,
 `tests/hooks/use-connection-form.test.ts`,
 `tests/unit/schema-diff/migration-generator.test.ts` (`MODIFIED_COLUMN_COVERAGE` — classify the new id
-as having its own dialect branch or as unable to express a column modification),
+as having its own dialect branch or as unable to express a column modification; and
+`TRANSACTION_WRAPPER_COVERAGE` — classify it as `"wrapped"` or `"unwrapped"`, matching whatever you
+chose in `NO_TRANSACTION_WRAPPER`),
 `tests/unit/sql/grammar.test.ts` (`GRAMMAR_COVERAGE` and `SQL_TEXT_COVERAGE` — record whether the id
 has an established grammar or reads at the default, and whether its query text is SQL).
 

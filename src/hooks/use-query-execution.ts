@@ -8,6 +8,7 @@ import { useToast } from "@/hooks/use-toast";
 import { storage } from "@/lib/storage";
 import { isDangerousQuery } from "@/components/QuerySafetyDialog";
 import { isMultiStatement } from "@/lib/sql/statement-splitter";
+import { resolveSqlGrammar } from "@/lib/sql/grammar";
 import { DEFAULT_QUERY_LIMIT } from "@/lib/db/utils/query-limiter";
 import { shouldRefreshSchema } from "@/lib/query-generators";
 import { ApiErrorCode } from "@/lib/api/error-codes";
@@ -105,7 +106,7 @@ export function useQueryExecution({
    * the common case (the plan still describes the results on screen) and wrong for
    * the one that mattered: run A finishes, run B runs and finishes, then A's slow
    * EXPLAIN resolves, finds nothing, and writes A's plan over B's results
-   * (docs/BACKLOG.md U1). This map is never cleared per run, so it answers for that
+   * (#422). This map is never cleared per run, so it answers for that
    * window too.
    */
   const lastRunRef = useRef(new Map<string, string>());
@@ -116,11 +117,21 @@ export function useQueryExecution({
   // torn down and re-attached on every character typed into the editor, and what
   // lets callers memoize on it.
   const tabsRef = useRef(tabs);
-  tabsRef.current = tabs;
   const currentTabRef = useRef(currentTab);
-  currentTabRef.current = currentTab;
   const activeTabIdRef = useRef(activeTabId);
-  activeTabIdRef.current = activeTabId;
+  // Refreshed after every commit, not during render: a ref is not render data
+  // (react.dev/learn/referencing-values-with-refs). Every reader is a callback
+  // that runs after the commit — `executeQuery` and `cancelQuery` — so "after
+  // render" is soon enough, and the `useRef` initializers already hold the first
+  // render's values. One effect for all three, with no dependency array on
+  // purpose: they all describe the same parent render, so they can never
+  // disagree about which render they came from, and a fourth ref added here
+  // cannot be forgotten in a dependency list.
+  useEffect(() => {
+    tabsRef.current = tabs;
+    currentTabRef.current = currentTab;
+    activeTabIdRef.current = activeTabId;
+  });
 
   // Nothing this hook started should outlive it: a fetch left running after the
   // studio unmounts resolves into a setState on a component that is gone. Every
@@ -149,11 +160,16 @@ export function useQueryExecution({
   // Capability honesty: if the active provider has no explainFormat (e.g. the
   // user switched connections), never leave the panel stuck on a hidden tab.
   // Keyed on explainFormat to match the BottomPanel tab filter and getExplainStrategy.
-  useEffect(() => {
-    if (bottomPanelMode === "explain" && metadata && !metadata.capabilities.explainFormat) {
-      setBottomPanelMode("results");
-    }
-  }, [bottomPanelMode, metadata]);
+  // Adjusted during render rather than in an effect: React re-runs this hook
+  // immediately and discards the render, so the panel never commits a frame
+  // showing the explain body with the explain tab already filtered out of the
+  // strip (react.dev/learn/you-might-not-need-an-effect). The state is still
+  // genuinely written — deriving it instead would let the panel snap back to a
+  // stale plan when the user returns to a provider that can explain. The
+  // condition is self-extinguishing, which is what keeps this out of a loop.
+  if (bottomPanelMode === "explain" && metadata && !metadata.capabilities.explainFormat) {
+    setBottomPanelMode("results");
+  }
 
   const { toast } = useToast();
 
@@ -307,7 +323,11 @@ export function useQueryExecution({
           !isPlaygroundRun &&
           !params &&
           dialectIsSql &&
-          isMultiStatement(queryToExecute);
+          // Under the connection's own dialect, the same record the gate above
+          // reads the statement with: whether a `;` is code depends on the
+          // engine's comment, quoting and bracket rules, and a fragment this
+          // disagrees about is a fragment the route RUNS (S1).
+          isMultiStatement(queryToExecute, resolveSqlGrammar(activeConnection.type));
 
         // Use transaction endpoint if a transaction is active or in playground mode
         const useTransaction = (transactionActive || isPlaygroundRun) && !isExplain;
@@ -389,7 +409,7 @@ export function useQueryExecution({
           const errorCode = error.code as string | undefined;
           // A 429's own body may say nothing about the wait, but its header always
           // carries one — name it, so the user retries when the budget is back instead
-          // of hammering a closed door (docs/BACKLOG.md H2). Only the 429 is rephrased:
+          // of hammering a closed door (#459). Only the 429 is rephrased:
           // a Retry-After on any other status says nothing about this query's failure.
           const retryAfter = response.status === 429 ? retryAfterSeconds(response) : null;
           const errorMessage =

@@ -351,22 +351,26 @@ function toQueryResult(result: SearchQueryResult, executionTime: number): QueryR
  * tree must not depend on, to answer a different question than the panel asks.
  *
  * A CLOSED index reports neither a document count nor a size (measured: both arrive
- * as JSON null while the listing still names the index), and `TableStats` has no way
- * to say "unknown" - both fields are required numbers. So a closed index reads as
- * zero here, and the schema tree is the surface that keeps the distinction: its
- * `rowCount` and `size` are optional, so it OMITS them instead.
+ * as JSON null while the listing still names the index). `TableStats.rowCount`,
+ * `totalSize` and `totalSizeBytes` are required numbers, so for those three a closed
+ * index has nowhere to read but zero. `tableSize` and `tableSizeBytes` are OPTIONAL,
+ * so they are OMITTED instead: a 0 there would be a fabricated measurement rather
+ * than a forced one. The cost is deliberate and cluster-wide - `StorageTab` gates its
+ * Data figure on `tables.every((t) => t.tableSizeBytes !== undefined)`, so ONE closed
+ * index takes that figure to N/A for every open index beside it - and that is what the
+ * optional field prescribes, because a partial sum reads as a measurement. The schema
+ * tree makes the same distinction with its own optional `rowCount` and `size`.
  */
 function toTableStats(index: SearchIndexInfo): TableStats {
-  const sizeBytes = index.sizeBytes ?? 0;
+  const { sizeBytes } = index;
 
   return {
     schemaName: SEARCH_SCHEMA_NAME,
     tableName: index.name,
     rowCount: index.docCount ?? 0,
-    tableSize: formatBytes(sizeBytes),
-    tableSizeBytes: sizeBytes,
-    totalSize: formatBytes(sizeBytes),
-    totalSizeBytes: sizeBytes,
+    ...(sizeBytes === null ? {} : { tableSize: formatBytes(sizeBytes), tableSizeBytes: sizeBytes }),
+    totalSize: formatBytes(sizeBytes ?? 0),
+    totalSizeBytes: sizeBytes ?? 0,
   };
 }
 
@@ -531,7 +535,7 @@ abstract class SearchProvider extends SQLBaseProvider {
       vacuumGlobalDesc:
         "A deleted document stays in its segment until the segments are merged. Merging is an index API on the cluster rather than a statement this SQL surface can send, so nothing runs from here.",
       // The monitoring Queries tab used to tell a search cluster to install a
-      // PostgreSQL extension (#U12). Both products keep a slow log; `getSlowQueries()`
+      // PostgreSQL extension (#463). Both products keep a slow log; `getSlowQueries()`
       // above says why neither is readable from here, and this is the same fact in the
       // panel's words.
       slowQueriesEmptyState:
@@ -811,7 +815,8 @@ abstract class SearchProvider extends SQLBaseProvider {
    *
    * `databaseSizeBytes` is the CLUSTER's store including replicas, which is what the
    * cluster occupies; the per-index sizes in the schema tree are primaries only, so
-   * they deliberately do not sum to this number.
+   * they deliberately do not sum to this number. It is ABSENT when the cluster
+   * published no store size at all, which is not the same claim as a measured zero.
    */
   public async getOverview(): Promise<DatabaseOverview> {
     const transport = this.requireTransport();
@@ -837,16 +842,33 @@ abstract class SearchProvider extends SQLBaseProvider {
         // computed from something else. A "0s" here would claim the cluster booted
         // this instant.
         uptime: SEARCH_UNKNOWN_TEXT,
-        // Zero means "not published", the same encoding `mssql.ts` and `druid` use.
-        // A search cluster has no sessions and no connection pool: it counts open
-        // HTTP connections per node in its stats API, which is not part of this
-        // seam, and the shard and node counts that ARE here would be a different
-        // number wearing this field's name. The Connections card reads a zero
-        // maximum as "no limit published" rather than dividing by it.
-        activeConnections: 0,
+        // `activeConnections` is ABSENT, not 0. A search cluster has no sessions and no
+        // connection pool: it counts open HTTP connections per node in its stats API,
+        // which is not part of this seam, and the shard and node counts that ARE here
+        // would be a different number wearing this field's name. So nothing was read,
+        // and `DatabaseOverview.activeConnections` is optional precisely so that can be
+        // said - `mssql.ts`, `oracle.ts`, `mongodb.ts` and `cassandra` all omit it for
+        // the same reason, and this provider held the last unconditional
+        // `activeConnections: 0` in the codebase - but not the last zero of any kind.
+        // Trino, Druid, ClickHouse and Couchbase still coerce a REFUSED read to 0. Each
+        // degrades an unavailable monitoring surface to no rows, then maps the absent row
+        // to zero through `nonNegative`, a local `asNumber` or a `?? 0`: the same encoding
+        // reached by a different route, and invisible because the refusal was swallowed a
+        // layer earlier (docs/BACKLOG.md D51).
+        //
+        // Zero still means "not published" for the CEILING beside it, and only for that:
+        // `maxConnections` treats 0 and absence as one fact, which is why `druid` and
+        // `trino` cite `mssql.ts` for it. The Connections card reads a zero maximum as
+        // "no limit published" rather than dividing by it.
         maxConnections: 0,
         databaseSize: sizeBytes === null ? SEARCH_UNKNOWN_TEXT : formatBytes(sizeBytes),
-        databaseSizeBytes: sizeBytes ?? 0,
+        // Absent rather than `?? 0` for the same distinction: `storeSizeBytes()` returns
+        // null when `_cluster/stats` is refused, and a 0 here said "0 bytes" in the same
+        // object whose `databaseSize` above already said "N/A" from the identical input.
+        // `StorageTab.tsx` keys its own refusal off the missing key, so it now draws that
+        // instead of a 0.0% breakdown over a total the cluster never reported. A cluster
+        // that really stores nothing publishes a real 0 and keeps it.
+        ...(sizeBytes === null ? {} : { databaseSizeBytes: sizeBytes }),
         tableCount: indices.filter((index) => !isSystemIndex(index)).length,
         indexCount: 0,
       };
@@ -964,10 +986,10 @@ abstract class SearchProvider extends SQLBaseProvider {
     const overview = await this.getOverview();
 
     return {
-      // Both DatabaseOverview.activeConnections and HealthInfo.activeConnections
-      // are optional; this provider's overview never omits it, so the value just
-      // passes through unchanged.
-      activeConnections: overview.activeConnections,
+      // No `activeConnections`. Both DatabaseOverview.activeConnections and
+      // HealthInfo.activeConnections are optional, the overview above publishes no
+      // count for the reason stated there, and there is no second source to read it
+      // from: composing a key here would invent the figure this seam cannot measure.
       databaseSize: overview.databaseSize,
       cacheHitRatio: formatCacheHitRatio(undefined),
       slowQueries: [],

@@ -78,6 +78,78 @@ export interface AgentModelProfile {
    */
   readonly retryEmptyTurn?: boolean;
   /**
+   * Whether a run that stopped WITHOUT CALLING ANYTHING is told to read the database itself.
+   *
+   * A different loss from the empty turn above, and from the report reminder: this model says
+   * something, and what it says is a request. `nemotron3:33b` lost query-optimization to it
+   * twice — once recorded in its own file as "asking for the SQL of the statement it was sent
+   * to diagnose", then again ten seconds into a later run, asking the user to paste the
+   * statement while holding `inspect_schema` and `inspect_plan`. There is nobody to answer: a
+   * run has no correspondent, so the question is a stop dressed as a turn.
+   *
+   * `remindToReport` cannot reach it. That notice tells a run to file what it established and
+   * is gated on `anyToolCalled` for good reason — a run that read nothing has nothing to file.
+   * The sentence this one needs is the other half: not "report what you found" but "find it".
+   *
+   * Free, which is the whole safety argument. `compose_report` is one of the run's tools, so a
+   * run that called nothing composed no report and has already earned `no-report`; the turn is
+   * spent on a run that has lost. It cannot cost a pass, only recover a failure.
+   *
+   * Off by default even so. The ten models locked at 300/300 were measured without it, and a
+   * drive-wide change is twice how this repository has handed back cells it had won.
+   *
+   * It SUBSUMES `retryEmptyTurn`, and that is a property of the gate rather than of the name.
+   * The condition is "called nothing", with no test on what was said, so an empty completion
+   * reaches it too and a model carrying both switches spends two extra turns rather than one.
+   * Where this is true `retryEmptyTurn` decides nothing, whatever the entry records - measured
+   * on `nemotron3:33b`, whose entry says `false` and whose empty turns are asked again anyway.
+   * Written down rather than fixed: narrowing the gate to a non-empty turn would change the
+   * behaviour the five passing runs were measured under, and this repository does not move a
+   * measured cell without re-measuring it. See `docs/BACKLOG.md`.
+   */
+  readonly retryUnreadStop?: boolean;
+
+  /**
+   * Whether this model's PLAN turn asks the endpoint for no reasoning at all.
+   *
+   * Measured on `muse-glimmer:latest`, whose plan cell was 0/5 with every loss a `model-timeout`
+   * at exactly 90 seconds — an empty ledger, no tool invoked, the turn spent thinking rather than
+   * answering. With `reasoning_effort: "none"` the same five runs finish in 16 to 21 seconds.
+   * `qwen3.6:27b` and `gemma4:12b` were measured on the same shape and carry it too.
+   *
+   * PLAN ONLY, and gated on the run's MODE rather than on whether it was handed tools: an
+   * agent run on the prompted protocol is toolless too, and that is the path four of the
+   * twenty-five measured models take. The five agent cells were measured WITH reasoning, and
+   * a setting applied where nothing was measured is a guess wearing a measurement's clothes.
+   *
+   * It reaches the OPENAI-COMPATIBLE adapter only. `providerOptions` is keyed `openai`, which
+   * is right for the three kinds `provider-registry.ts` builds through `@ai-sdk/openai`
+   * (`openai`, `ollama`, `custom`) and reaches nothing on `gemini`, which is `@ai-sdk/google`
+   * and reads its own key. So this is a no-op on the one hosted provider Studio ships an
+   * adapter for, silently — stated here because every model measured with it is local, and
+   * an operator who sets it on a Gemini model is owed the sentence rather than the silence.
+   */
+  readonly suppressPlanReasoning?: boolean;
+  /**
+   * Whether this model's AGENT turns ask the endpoint for no reasoning at all.
+   *
+   * The same remedy as the field above, on the surfaces it deliberately does not reach, and a
+   * separate switch rather than a widening of it: a model measured needing quiet on plan was not
+   * measured needing it while holding tools, and reading one field for both would move cells
+   * nobody re-measured. `muse-glimmer:latest` carried the plan one for a whole branch before a
+   * measurement earned it this one, and must not acquire either by association.
+   *
+   * Measured on `gemma4:12b`, whose investigate cell read 5/5 at 9 seconds and, on a later
+   * serving engine, 1/5: four losses spending the whole turn without invoking a single tool
+   * before the clock ended them, against passing runs that still finish in 9. Bimodal — it
+   * either answers at once or thinks until the wall — which is the shape this addresses and
+   * `turnTimeoutMs` does not: a turn spent thinking finds the new wall too.
+   *
+   * Reaches the OPENAI-COMPATIBLE adapter only, exactly as its sibling does, and is silently a
+   * no-op on `gemini`.
+   */
+  readonly suppressAgentReasoning?: boolean;
+  /**
    * How many times a report may be held to ask for the answer that belongs beside it.
    *
    * One is enough for a model that forgot. One evaluated model did not forget: held once
@@ -101,6 +173,20 @@ export interface AgentModelProfile {
    * user's patience on a model they may not be running.
    */
   readonly turnTimeoutMs?: number;
+
+  /**
+   * How much of a CONVERSATION this model may be handed, in characters.
+   *
+   * Absent everywhere it ships, and deliberately so: this is the one setting here that
+   * carries no measurement at all. It exists because the value that is right is a
+   * function of the model's context window — what a hosted 200k-window model can carry
+   * is not what a small local one can — and this document is how an operator who HAS
+   * measured their own supplies it without a Studio release.
+   *
+   * Absent resolves to `AGENT_THREAD_CONTEXT_MAX_CHARS`, which is what drives every
+   * model today.
+   */
+  readonly threadContextMaxChars?: number;
 
   /**
    * Whether a refused call is handed a worked example built from this run's ledger.
@@ -127,6 +213,8 @@ export interface AgentNotices {
   readonly planStatement: string;
   /** An answer-presenting run about to report a result it read but never presented. */
   readonly presentBeforeReport: string;
+  /** A run that stopped without calling anything, having asked for what it could have read. */
+  readonly unreadStop: string;
 }
 
 /**
@@ -166,6 +254,32 @@ export const DEFAULT_REFUSAL_EXAMPLES = false;
  * the work already done earns the retry.
  */
 export const DEFAULT_RETRY_EMPTY_TURN = false;
+
+/**
+ * A run that stops having called nothing keeps its ending, unless a model's ledger asked.
+ *
+ * Off despite being free to grant — the turn is spent on a run whose verdict is already
+ * `no-report` — because "free" is an argument about cost, not about wording. The sentence sent
+ * is read by the model and acted on by it, so it is a measured value like every other, and it
+ * belongs to the models measured with it rather than to all of them at once.
+ */
+export const DEFAULT_RETRY_UNREAD_STOP = false;
+
+/**
+ * Off, because every model but one was measured thinking and passing.
+ *
+ * A drive-wide change here is how this repository has twice handed back cells it had already
+ * won, so the switch stays per-model and per-mode.
+ */
+export const DEFAULT_SUPPRESS_PLAN_REASONING = false;
+
+/**
+ * Off, for the same reason and with the same blast radius as its sibling above.
+ *
+ * Separate from it rather than one field read twice: a model measured needing quiet on plan was
+ * not measured needing it while holding tools, and the two populations are not the same one.
+ */
+export const DEFAULT_SUPPRESS_AGENT_REASONING = false;
 
 /**
  * One, which is what every locked answer-presenting cell was measured against.

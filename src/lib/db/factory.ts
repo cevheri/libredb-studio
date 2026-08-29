@@ -14,6 +14,7 @@ import { DatabaseConfigError, ExecutionProfileError } from "./errors";
 import { createSSHTunnel, closeSSHTunnel, hasTunnel } from "@/lib/ssh/tunnel";
 import { readSecret } from "@/lib/storage/encryption";
 import { logger } from "@/lib/logger";
+import * as path from "path";
 
 // ============================================================================
 // Provider Factory
@@ -83,6 +84,16 @@ export async function createDatabaseProvider(
     case "sqlite": {
       const { SQLiteProvider } = await import("./providers/sql/sqlite");
       return new SQLiteProvider(connection, options, execution);
+    }
+
+    case "duckdb": {
+      const { DuckDBProvider } = await import("./providers/sql/duckdb");
+      return new DuckDBProvider(connection, options, execution);
+    }
+
+    case "libsql": {
+      const { LibSQLProvider } = await import("./providers/sql/libsql");
+      return new LibSQLProvider(connection, options);
     }
 
     case "oracle": {
@@ -172,7 +183,7 @@ export async function createDatabaseProvider(
         // This list is NOT type-checked against the union - a new case above with no
         // entry here is silent - so it is kept in the same order as the cases and
         // tests/unit/db/factory.test.ts pins individual names in it by regex.
-        `Unknown database type: ${connection.type}. Supported types: postgres, mysql, sqlite, oracle, mssql, clickhouse, druid, trino, cassandra, elasticsearch, opensearch, mongodb, couchbase, redis, libredb`,
+        `Unknown database type: ${connection.type}. Supported types: postgres, mysql, sqlite, duckdb, libsql, oracle, mssql, clickhouse, druid, trino, cassandra, elasticsearch, opensearch, mongodb, couchbase, redis, libredb`,
         connection.type,
       );
   }
@@ -237,9 +248,87 @@ export async function withOneShotTunnel<T>(
 interface CachedProvider {
   provider: DatabaseProvider;
   lastUsed: number;
+  /**
+   * The file this entry holds open, when the provider declares
+   * `ProviderCapabilities.singleWriterFile` - see `findOpenSingleWriterProvider`.
+   * `null` on every other provider, which is all of them but one.
+   */
+  singleWriterFile?: string | null;
 }
 
 const providerCache = new Map<string, CachedProvider>();
+
+// ============================================================================
+// Single-writer file reuse (#498)
+// ============================================================================
+
+/**
+ * The identity of a database FILE: the engine type plus the resolved absolute path.
+ *
+ * The path is what identifies the open handle, not the connection id, because the
+ * second opener is usually a different connection record pointing at the same file -
+ * which is exactly how D3 reproduced (the built-in "Sample (LibreDB)" holds the file
+ * while the dialog tests the edited copy under a fresh id). The type is in the key so
+ * two engines can never collide over one path.
+ *
+ * `null` when the connection carries no file path at all, which is every
+ * client-server connection, every connection-string one, and every ANONYMOUS
+ * IN-MEMORY one.
+ *
+ * That last case is not a nicety. `path.resolve(":memory:")` is a path in the working
+ * directory, so two unrelated in-memory connections came out with ONE identity and the
+ * second borrowed the first's open handle - reading a database nobody pointed it at.
+ * It fires on the engines that declare `singleWriterFile`, which is where the borrow
+ * lives: DuckDB accepts `:memory:` (LibreDB does not). An anonymous in-memory database
+ * is per-handle by definition - there is no file to share, no lock to work around, and
+ * therefore nothing a borrow could buy.
+ *
+ * The comparison is EXACT, matching `DuckDBProvider.getDatabasePath()` character for
+ * character: that method treats `:memory:` and nothing else as in-memory, and resolves
+ * every other spelling - `:MEMORY:`, ` :memory:`, DuckDB's own `:memory:named` - as a
+ * relative file path. Two connections spelling one of those the same way really do
+ * point at one file, and must keep matching. The narrowing here is only ever as wide as
+ * the provider's own reading of the value.
+ */
+const ANONYMOUS_IN_MEMORY_DATABASE = ":memory:";
+
+function fileIdentity(connection: DatabaseConnection): string | null {
+  if (!connection.database) return null;
+  if (connection.database === ANONYMOUS_IN_MEMORY_DATABASE) return null;
+  return `${connection.type}::${path.resolve(connection.database)}`;
+}
+
+/**
+ * The connected provider that already holds this connection's file, if there is one.
+ *
+ * Only a provider whose engine declares `ProviderCapabilities.singleWriterFile` ever
+ * registers a file identity here (`getOrCreateProvider` below), so a match means the
+ * engine admits ONE handle per file and the caller's alternative is not a second,
+ * lesser handle - it is no handle at all. Borrowers must NOT disconnect what they get
+ * back: the returned provider is owned by the writable cache and serves the user's
+ * live connection.
+ *
+ * Deliberately reads only the writable cache. The reverse direction - handing an
+ * editor request a provider opened under an execution profile - stays forbidden, so
+ * profiled entries are not offered here.
+ *
+ * The cost of that is real and is paid by the editor. If an agent run reaches a
+ * single-writer connection nobody has browsed yet, `acquireExecutionProfileProvider`
+ * opens the file and caches the handle under the PROFILED key; `getOrCreateProvider`
+ * then fails on the lock, so browsing that connection in the sidebar is refused until
+ * the profiled entry is evicted (30 minutes idle). Lifting it would mean serving an
+ * editor request a provider opened under an execution profile, which is the isolation
+ * invariant `acquireExecutionProfileProvider` exists to keep - so the lockout is the
+ * chosen side of that trade, not an oversight.
+ */
+export function findOpenSingleWriterProvider(connection: DatabaseConnection): DatabaseProvider | null {
+  const identity = fileIdentity(connection);
+  if (identity === null) return null;
+  for (const entry of providerCache.values()) {
+    if (entry.singleWriterFile === identity && entry.provider.isConnected()) return entry.provider;
+  }
+  return null;
+}
 
 // ============================================================================
 // Execution-profile provider cache (#328)
@@ -401,8 +490,10 @@ export async function getOrCreateProvider(
     throw error;
   }
 
-  // Cache it
-  providerCache.set(cacheKey, { provider, lastUsed: Date.now() });
+  // Cache it, remembering the file when this engine admits only one handle on it -
+  // that is what lets the callers that would otherwise open a second one find this.
+  const singleWriterFile = provider.getCapabilities().singleWriterFile === true ? fileIdentity(connection) : null;
+  providerCache.set(cacheKey, { provider, lastUsed: Date.now(), singleWriterFile });
 
   // Start idle sweep if not already running
   startIdleSweep();
@@ -531,6 +622,35 @@ export async function acquireExecutionProfileProvider(
   }
 
   const credential = resolveAgentCredential(connection);
+  const acquisition = PROFILE_ACQUISITION[profile];
+
+  /*
+    The single-writer exception (B49), and why it is safe HERE and nowhere else.
+
+    On an engine that declares `singleWriterFile` the file admits one open handle, so
+    opening a second one for this acquisition does not produce a less privileged
+    handle - it throws, and the run continues silently ungrounded (a `ConnectionError`
+    becomes an unavailable capture). Every agent grounding read on a LibreDB
+    connection was lost that way from the moment anyone browsed it in the sidebar.
+
+    Two bounds keep the isolation invariant intact. It is scoped to the profile that
+    sends NO statement of the model's: `agent-operations` calls the curated reporting
+    methods only, so there is nothing here for a read-only statement path to bound,
+    and `agent-read-only` / `agent-handover` are still refused on such an engine
+    rather than served the writable handle. And it is refused when the connection
+    configures an agent credential, because the borrowed handle was opened under the
+    connection's own - a reuse cannot silently substitute one principal for another.
+
+    The provider is returned WITHOUT being cached under the profiled key: it is
+    borrowed, and an entry there would let this cache's idle sweep - or a
+    `removeProvider` for any connection sharing the file - close the file under the
+    session that opened it.
+  */
+  if (!acquisition.requiresReadOnlyStatements && credential === null) {
+    const open = findOpenSingleWriterProvider(connection);
+    if (open) return open;
+  }
+
   let effectiveConnection: DatabaseConnection = credential
     ? { ...connection, user: credential.user, password: credential.password }
     : connection;
@@ -549,7 +669,6 @@ export async function acquireExecutionProfileProvider(
     if (tunnel && !tunnelPreexisted) await tunnel.close().catch(() => {});
   };
 
-  const acquisition = PROFILE_ACQUISITION[profile];
   const provider = await createDatabaseProvider(effectiveConnection, options, acquisition.context);
   if (acquisition.requiresReadOnlyStatements && typeof provider.queryReadOnly !== "function") {
     await closeFreshTunnel();

@@ -49,6 +49,69 @@ generic components render Redis-appropriate wording.
 | `runMaintenance('analyze')` | Server info snapshot | `INFO` |
 | Indexes / table stats | Not applicable | returns `[]` |
 
+### Valkey, DragonflyDB, KeyDB and Garnet
+
+This provider is what a Valkey connection uses: there is no `valkey` type id, and choosing Redis in
+the connection dialog is the documented way to reach it. `ioredis` speaks the protocol all five
+servers share, and the connection dialog's wire-compatibility hint names the engines this driver has
+been measured against, from the same data
+([`compatibility.ts`](../../src/lib/db/compatibility.ts)). The full per-engine table is in
+[`README.md`](./README.md#wire-compatible-engines); three behaviours belong here because they are
+this provider's code, not the engine's.
+
+**The overview reports the emulation level, not the product.** `getOverview()` reads
+`parsed.redis_version` ([`redis.ts:581`](../../src/lib/db/providers/keyvalue/redis.ts)) — the one
+version field this whole family publishes — and passes it through as the server gave it. Valkey
+9.1.1 therefore shows **7.2.4** and DragonflyDB df-v1.40.1 shows **7.4.0**: each server's declared
+Redis compatibility level rather than its own release. KeyDB 6.3.4 publishes no version field of its
+own at all, so its overview cannot be told apart from a Redis 6 server. **Garnet 2.1.5 is the one
+relative where the real version WAS available and goes unread**: its `INFO` carries
+`garnet_version:2.1.5` and `server_name:garnet` beside `redis_version:7.4.3`, and this read takes
+the compatibility level like everywhere else, so the overview says Redis 7.4.3. On the other three
+the displayed version is the best reading available; here it is a choice, and the reason it stays
+that way is the sentence below - a per-engine branch is what this provider does not do. Nothing here renames the
+server, for the same reason the MySQL provider does not
+([mysql.md §1.1](./mysql.md#11-mariadb-and-the-other-mysql-protocol-engines)): the alternative is
+asserting a product the `INFO` reply never claimed.
+
+**`maxclients` is not universal.** `maxConnections` comes from `parsed.maxclients` and falls back to
+`0`. Redis, Valkey and KeyDB each publish `maxclients:10000`; neither Dragonfly's nor
+Garnet's `INFO` carries a `maxclients` line at all, so the panel reads 0 — an absent limit shown as
+a zero, not a measured one. **Garnet extends that to two more numbers**: it publishes no
+`used_memory`, so `getOverview().databaseSize` and the memory storage panel read `0 B` for a
+populated server, and neither `keyspace_hits` nor `keyspace_misses`, so the cache hit ratio reads
+the `: 100` fallback and the dashboard rates it *Excellent* (recorded as D14 in
+[`../BACKLOG.md`](../BACKLOG.md)). Its `connected_clients` also stays 0 with a client attached,
+though `CLIENT LIST` itself answers correctly - the session list is right while the count above it
+is not.
+
+**Every `CLIENT LIST` field is optional, and the absent ones surface as defaults.**
+`getActiveSessions()` ([`redis.ts:623`](../../src/lib/db/providers/keyvalue/redis.ts)) splits each
+line into `key=value` pairs and substitutes a default for anything missing: the session's user is
+`name` falling back to `default`, its pid `id` falling back to `0`, its state `flags` falling back
+to `N`, its command `cmd` falling back to `idle`. A relative that omits a field therefore produces a
+plausible-looking row rather than an error. Note that the user column reads `name`, not the `user`
+field Redis also publishes, and `name=` is empty until a client calls `CLIENT SETNAME` — so
+`default` is what every engine here shows, Redis included, rather than a relative's quirk.
+
+Three relatives diverge, all measured on the versions above:
+
+- **Dragonfly fills `name` with the connection id**, so the user column shows a number (`8`) rather
+  than falling back to `default` — the fallback is never reached. Its line also carries no `cmd=`
+  and no `flags=` at all, so the query column reads `idle` and the state column `N` for every
+  session, whatever that session is doing.
+- **KeyDB reports a command without its subcommand** (`cmd=client` where Redis and Valkey both send
+  `cmd=client|list`), which the query column shows verbatim.
+- **Garnet answers `CLIENT LIST` in full** - the session row is complete and correct - so the
+  divergence there is not in this reply but in the counters above it, listed under `maxclients`.
+
+Valkey is otherwise the closest of the four: every surface in this document answered against
+Valkey 9.1.1, with the version panel the single caveat. Garnet answers every surface too, and its
+key browser grouped 71 keys into `user:*`, `session:*` and `queue:*` exactly as Redis does — what
+separates it is the three numbers above, not a missing surface. It also keeps nothing on disk: a
+restart empties it (measured, `dbsize` 71 before and 0 after), so a fixture there has to be
+re-seeded rather than restarted into.
+
 ---
 
 ## 2. Architecture
@@ -87,8 +150,9 @@ RedisProvider (redis.ts)
 
 `RedisProvider` extends `BaseDatabaseProvider` directly (unlike the SQL providers, which extend an
 intermediate `SQLBaseProvider`). It overrides every abstract method plus the three metadata hooks
-(`getCapabilities`, `getLabels`, `prepareQuery`). It inherits `getMonitoringData()`, which fans the
-individual monitoring methods out in parallel — see [`base-provider.ts:99`](../../src/lib/db/base-provider.ts).
+(`getCapabilities`, `getLabels`, `prepareQuery`). It inherits `getMonitoringData()` from
+[`base-provider.ts`](../../src/lib/db/base-provider.ts), which fans the individual monitoring methods
+out in parallel.
 
 ### 2.3 What the base class gives you for free
 
@@ -201,6 +265,14 @@ This mirrors the embedded LibreDB provider, and exists so the commented cheatshe
 explorer inserts is directly runnable: selecting one command runs it, and running the whole buffer
 runs its first one (#427).
 
+Since S8 the **execution confirmation gate reads a buffer the same way**:
+`src/lib/db/destructive-commands.ts` drops `#` lines and takes the first block as above, dispatches
+on a leading `{` as §3.4 does, and asks before running any command in its Redis destructive
+vocabulary - key, expiry, string, hash, list, set, sorted-set and stream writes, the scripting
+entry points, and the server and access commands, with container commands such as `CONFIG SET`
+matched on their two-token spelling - while a body it cannot read (broken JSON, a JSON body whose
+`command` is not a string) asks rather than staying silent.
+
 ### 3.5 Reply normalisation into the shared grid
 
 Redis replies are heterogeneous (status strings, integers, nil, flat arrays, hash arrays, bulk
@@ -227,6 +299,7 @@ Redis uses the discrete-field form of `DatabaseConnection` (not `connectionStrin
 |-------|----------|-------|
 | `host` | ✅ | Validated in `validate()` — throws `DatabaseConfigError` if missing |
 | `port` | — | Defaults to `6379` |
+| `user` | — | The **Redis 6 ACL user**, sent as ioredis's `username`; empty means `default` ([§4.1a](#41a-acl-users-d29)) |
 | `password` | — | Sent as `password`; omit for unauthenticated instances |
 | `database` | — | Logical DB index, parsed as int; defaults to `0` |
 | `ssl` | — | `SSLConfig`; becomes the ioredis `tls` option ([§4.3](#43-ssl--tls)) |
@@ -238,11 +311,55 @@ const connection = {
   type: 'redis',
   host: 'localhost',
   port: 6379,
+  user: 'analytics',    // optional — the ACL user; omit to authenticate as `default`
   password: 'secret',   // optional
   database: '0',         // logical DB index
   createdAt: new Date(),
 };
 ```
+
+### 4.1a ACL users (D29)
+
+The modal's **Username** field is the Redis 6 ACL user. `connect()` passes it as ioredis's
+`username` (the field is `user` on the connection, `username` in `RedisOptions`), and passes
+**nothing at all** when it is empty — a plain `requirepass` server has no ACL user to name, and
+ioredis only authenticates as `default` when `username` is absent. A pasted
+`redis://analytics:pw@host:6379/0` fills the same field: `parseGenericURL`
+([`src/lib/connection-string-parser.ts`](../../src/lib/connection-string-parser.ts)) decomposes the
+userinfo into `user` / `password` ([§4.2](#42-connection-string-nuance)).
+
+**A connection saved before the field was writable keeps authenticating as `default`, and there is
+nothing to migrate.** `connectionFields` in [`src/lib/db-ui-config.ts`](../../src/lib/db-ui-config.ts)
+decides what a save WRITES, and it omitted `user` for `redis` until the settlement round of
+2026-08-27 — so the ACL user a person typed was discarded between the box and the driver, and the
+value simply was never captured. No migration can restore a credential that was never stored: an
+existing connection authenticates as `default` until someone opens it and types a user name, which
+now persists. What the same change also stopped is an EDIT losing one: `user` is form-owned rather
+than preserved (`FIELD_OWNERSHIP` in [`src/hooks/use-connection-form.ts`](../../src/hooks/use-connection-form.ts)),
+so a connection that had a `user` from a pasted URL had it loaded into the box, shown, and then
+dropped on save. It is written now.
+
+Measured 2026-08-26 against `redis:latest`, with `default` left `on nopass ~* &* +@all` and a second
+user defined `on >probepw ~* +@all -info`, both arms:
+
+```text
+{host, port, password}            -> ACL WHOAMI = default | INFO succeeds
+{host, port, username, password}  -> ACL WHOAMI = probe   | INFO refused: NOPERM
+```
+
+The first arm is the defect this replaced: the configured principal was dropped silently, the
+session ran as `default`, and health went green under someone else's permissions. Both arms together
+are what make it a measurement — the value was collected by the form and stored on the connection
+already; only `connect()` ignored it.
+
+**A restricted user costs the INFO-derived surfaces.** ioredis's own ready check calls `INFO`, and on
+`NOPERM` it logs *"Skipping the ready check"* and connects anyway — which is the wanted behaviour: a
+least-privilege user must still be able to connect and browse keys. But `getHealth()`,
+`getOverview()` and `getPerformanceMetrics()` all read `INFO` ([§7](#7-monitoring--health)), so for a
+user without `+info` they raise the server's own `NOPERM` sentence rather than answering with
+fabricated zeros. `POST /api/db/test-connection` reports that as a **degraded** (amber) result, not a
+green tick and not a failure: the connection is real, the health read is not. Grant `+info`,
+or expect the monitoring panels to stay empty for that user.
 
 ### 4.2 Connection-string nuance ⚠️
 
@@ -250,8 +367,9 @@ const connection = {
 discrete fields. However, the UI connection-string parser
 ([`src/lib/connection-string-parser.ts`](../../src/lib/connection-string-parser.ts)) *does*
 recognise `redis://` and `rediss://` URLs and **decomposes** them into `host` / `port` (default
-`6379`) / `password` / `database` before they reach the provider. So a user can paste a
-`redis://:pw@host:6379/0` URL into the modal, but the provider never sees the raw string.
+`6379`) / `user` / `password` / `database` before they reach the provider. So a user can paste a
+`redis://:pw@host:6379/0` URL into the modal, but the provider never sees the raw string. A userinfo
+name becomes the ACL user ([§4.1a](#41a-acl-users-d29)).
 
 Because the raw string is dropped, the scheme's TLS intent has to travel as a field: the parser
 returns `sslMode: 'require'` for `rediss://` and `sslMode: 'disable'` for `redis://`, which the
@@ -269,12 +387,16 @@ under Node's own names — the same mapping the PostgreSQL, MySQL and Couchbase 
 |------------|--------------|
 | absent / `disable` | **not present at all** — ioredis negotiates TLS whenever `tls` is set, `{}` included |
 | `require` | `{ rejectUnauthorized: false }` |
+| `verify-system` | `{ rejectUnauthorized: true }`, with no `ca` — the runtime's own trust store |
 | `verify-ca` / `verify-full` | `{ rejectUnauthorized: true }` |
 
 `caCert` / `clientCert` / `clientKey` become `ca` / `cert` / `key` when set, each independently — a
 server can demand mutual TLS while presenting a self-signed certificate itself. An explicit
 `ssl.rejectUnauthorized` always wins over the mode. `require` does not check the chain because a
-self-hosted Redis presents a self-signed certificate by default.
+self-hosted Redis presents a self-signed certificate by default; every other mode does check it, and
+`verify-system` (D26) checks it against the trust store the runtime already has, so a managed Redis
+whose certificate a public root signs needs no PEM pasted at all. ioredis exposes no separate
+host-name check, so `verify-ca` and `verify-full` build the same object.
 
 Measured against a TLS-only server on 2026-08-23 (`redis:latest --port 0 --tls-port 6380`, so no
 plaintext port exists): `disable` is refused with *"Connection is closed."* and `require` connects in
@@ -284,8 +406,12 @@ does, so the pair is what distinguishes a wired path from a documented shape.
 > A pasted `rediss://` URL arrives with `mode: 'require'` and a `redis://` one with `disable`
 > ([§4.2](#42-connection-string-nuance)), so the scheme picks the mode and the panel is only needed
 > to go *further* than `require` - a verifying mode, or certificate material. `require` rather than
-> `verify-full` because that is what the ordinary `--tls-port` deployment can satisfy: a paste
-> encrypts, and never silently claims to have checked a chain.
+> `verify-system`/`verify-full` because that is what the ordinary `--tls-port` deployment can satisfy:
+> a paste encrypts, and never silently claims to have checked a chain. That is a claim about the
+> SCHEME, and it is not the rule for a boolean TLS *parameter* (D26, see
+> [postgres.md](./postgres.md#sslmode-in-a-pasted-url)): `rediss://` says only "TLS", while
+> `?ssl=true` says what a specific driver does with it. The scheme mapping is unchanged, and whether
+> it should follow the same rule is an open question on the backlog rather than a settled one.
 >
 > Measured through the parser and the provider together on 2026-08-23, against
 > `redis:latest --port 0 --tls-port 6390` with a self-signed certificate:
@@ -521,6 +647,29 @@ Info"* / *"Server Info"* / *"Get Redis server information and statistics."* — 
 query-planner copy. Those `analyzeGlobal*` fields had been declared and set for a long time and read
 by no component (#427).
 
+### Where each operation may be offered (`maintenanceOperationSpecs`)
+
+Declaring that an operation EXISTS is not enough to put a button on it: two engines that
+declare the same `MaintenanceType` take different kinds of target, so each provider also
+declares what its own operations may be pointed at. The monitoring Tables tab renders a
+per-row control only where `perEntity` is true, the admin Operations tab a whole-database
+card only where `global` is true, and both take the wording from `label` (#496).
+
+`POST /api/db/maintenance` reads the same declaration since #U20, and it is the one reader that
+REFUSES rather than hides: it takes the placement from whether the request carries a `target`
+(absent or empty means whole-database) and answers `400` when this provider marks that
+placement unavailable while the other one is available - `{type:"analyze", target:"session:"}`
+is that request here, and it is the only one this provider can refuse.
+
+| Operation | Control label | Per-row | Global | Why |
+|-----------|---------------|---------|--------|-----|
+| `analyze` | Server Info | **no** | yes | `runMaintenance(type)` takes no target parameter at all - the operation is `INFO`, which reports on the server and cannot be pointed at a key prefix |
+
+A per-row control here answered with server-wide metrics for one grouping, which is the
+dead end #427 reported for *"Key Info"*. The Operations tab's global card carries Redis's
+own *"Run Info" / "Server Info"* wording. *"Memory Doctor"* names no declared operation, so
+no control offers it.
+
 ---
 
 ## 9. Capabilities & labels
@@ -535,7 +684,7 @@ by no component (#427).
 | `supportsExternalQueryLimiting` | `false` |
 | `supportsCreateTable` | `false` |
 | `supportsInlineRowEdit` | `false` — Redis commands are not SQL, so there is no `UPDATE ... SET` for the results grid's inline editor to emit |
-| `supportsTransactions` | `false` — `MULTI`/`EXEC` exists in Redis and is not exposed through this provider, so the transaction trio and SANDBOX are not offered (#U13) |
+| `supportsTransactions` | `false` — `MULTI`/`EXEC` exists in Redis and is not exposed through this provider, so the transaction trio and SANDBOX are not offered (#464) |
 | `declaresForeignKeys` | `false` — Redis has no constraints at all, and the "tables" here are key prefixes this provider grouped rather than objects anyone declared |
 | `tablesAreDerivedGroupings` | `true` — `getSchema()` SCANs a bounded slice of the keyspace and groups the real key names it found by their prefix, so a `user:*` row is this server's own summary and not a key any command can be given. The agent layer states this to a plan run, in one sentence, so a grounded run does not draft a command against a grouping |
 | `supportsMaintenance` | `true` |
@@ -578,7 +727,7 @@ a `prefix:*` row is this server's grouping, not a key, so a prefix is reached wi
 slowlog-log-slower-than."*) is the monitoring Queries panel's empty state. It exists for the same
 reason the `analyzeGlobal*` triad had to be read rather than merely declared (#427): that panel's
 sentence was hardcoded to PostgreSQL's `pg_stat_statements` advice on every engine
-(`docs/BACKLOG.md` U12), while what is empty here is the `SLOWLOG` (§7).
+(#463), while what is empty here is the `SLOWLOG` (§7).
 
 `analyzeGlobalLabel` / `analyzeGlobalTitle` / `analyzeGlobalDesc` (*"Run Info"*, *"Server Info"*,
 *"Get Redis server information and statistics."*) are rendered by the admin Operations tab. The
@@ -633,7 +782,10 @@ formats (JSON, plain, empty, `HGETALL`, `INFO`, nil), error handling (malformed 
 `command`, Redis-side error, disconnected provider), schema scanning, health, overview, performance,
 slow queries, active sessions, table/index/storage stats, `getMonitoringData`, maintenance, a
 battery of common commands (`KEYS`, `SET`, `DEL`, `PING`, `DBSIZE`), and **every `ssl.mode` branch**
-asserted against the options object the `Redis` constructor received.
+asserted against the options object the `Redis` constructor received. The same captured options carry
+the **ACL user** assertions ([§4.1a](#41a-acl-users-d29)) — `username` present for a named user,
+absent for both an empty string and an unset field — and a refused `INFO` is asserted to raise the
+server's own `NOPERM` sentence out of `getHealth()`.
 
 ### 11.3 Run it
 
@@ -653,6 +805,16 @@ development:
 ```bash
 docker run --rm -p 6379:6379 redis:7-alpine
 # then point a connection at localhost:6379 in the Studio UI and run e.g. `INFO`, `SCAN 0`
+```
+
+To reproduce the ACL rig of [§4.1a](#41a-acl-users-d29) — a user that can browse keys but not read
+`INFO`:
+
+```bash
+docker run --rm -d --name redis-acl -p 6389:6379 redis:latest
+docker exec redis-acl redis-cli ACL SETUSER probe on '>probepw' '~*' +@all -info
+# Username `probe`, password `probepw`: keys browse, and health reports degraded (amber).
+# Leave Username empty and the same password authenticates as `default`, whose INFO succeeds.
 ```
 
 ---

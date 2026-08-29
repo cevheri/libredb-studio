@@ -47,6 +47,7 @@ import { createHash } from "node:crypto";
 import { type ModelMessage, Output, type ToolSet, streamText, tool } from "ai";
 import { z } from "zod";
 import {
+  type AgentContextCapture,
   captureContextSnapshot,
   connectionIdentity,
   heldSnapshotForConnection,
@@ -56,11 +57,15 @@ import {
   reusableSnapshot,
 } from "./context-snapshot";
 import { agentModelTurnTimeoutMs } from "./config";
+import { tuningProvenance } from "./model-tuning";
 import { BASELINE_NOTICES } from "./models/notices";
 import {
   ceilingFor,
   presentReminderLimitFor,
   retriesEmptyTurn,
+  retriesUnreadStop,
+  suppressesAgentReasoning,
+  suppressesPlanReasoning,
   turnTimeoutMsFor,
   planStatementRetriesFor,
   reportReminderLimitFor,
@@ -118,6 +123,7 @@ import {
 import {
   AGENT_WORKFLOW_PRESENTS_ANSWER,
   type AgentContextSnapshot,
+  type AgentGuidanceNotice,
   type AgentReportClaim,
   type AgentRunEvent,
   type AgentRunMode,
@@ -956,7 +962,7 @@ const PLAN_DELIVERABLES: Readonly<Record<AgentRunWorkflowType, PlanDeliverable>>
  * `language` arrived with #414 and every sentence that assumed SQL is now written
  * twice. The tag does NOT vary with it and that is the point of taking the language
  * separately: the tag is the canonical type-id in both arms, because it is what
- * `isQueryFenceTag` accepts (a total record over `DatabaseType`, so all fourteen pass)
+ * `isQueryFenceTag` accepts (a total record over `DatabaseType`, so all seventeen pass)
  * and what `rich-text.tsx` and `readPlanStatement` key the editor hand-off on. A draft
  * a model fenced as ```` ```javascript ```` produces no `plan-statement-drafted` event
  * at all — the run would be scored as having drafted nothing while the user is looking
@@ -1900,6 +1906,38 @@ function describePriorProgress(record: AgentRunRecord): string | null {
   return `${preamble}\n${lines.join("\n")}`;
 }
 
+/**
+ * What a run is told about the conversation it continues.
+ *
+ * The content is prose a user and a model wrote, across more than one run, so
+ * the whole block is fenced rather than narrated in the server's voice — the
+ * same rule the database-error and profile summaries follow.
+ *
+ * The instruction half states three things, and the third is REQUIRED by the way
+ * the context is built rather than being a caution. The conversation carries
+ * every step's objective but only the most recent step's report, so a model told
+ * about step 1 knows what was asked there and not what was found. Left unsaid,
+ * this design would create its own false impression: a listed step reads as a
+ * step whose findings are in hand.
+ *
+ * `null` when the run starts a conversation rather than continuing one, which is
+ * the ordinary case.
+ */
+function describeThreadContext(record: AgentRunRecord): string | null {
+  if (record.thread.text.length === 0) return null;
+  const fenced = fenceUntrustedContent(record.thread.text, {
+    label: "earlier steps",
+    operationId: "agent/thread",
+    reference: record.thread.threadId,
+  });
+  return [
+    "This run continues a conversation. Its earlier steps are listed below, oldest first, with the most recent step's report.",
+    'When this objective refers to something an earlier step established — "those groups", "it", "that result", "those rows" — resolve the referent against the conversation below.',
+    "Earlier steps may list only what was ASKED, not what was found. If the conversation gives no referent for the words in this objective, say so plainly and refuse to guess: answering a different question is worse than not answering.",
+    fenced,
+  ].join("\n");
+}
+
 const indeterminateText = (stepId: string, toolName: string): string =>
   `Step ${stepId} (${toolName}) was started before this run was interrupted and its outcome was never recorded, so whether it reached the database cannot be known. It will not be repeated. Draft a different call if you still need what it would have produced.`;
 
@@ -2188,6 +2226,15 @@ function toolSetOf(definitions: readonly AgentToolDefinition[]): ToolSet | undef
 }
 
 /**
+ * What a plan turn asks for when this model's thinking is the thing that loses the cell.
+ *
+ * A REQUEST FIELD and not a word in the prompt, which is the whole reason it is acceptable:
+ * every planning rule above is wording a measured cell depends on, and nothing here touches
+ * it. The in-prompt `/no_think` marker was tried first and abandoned - see the model's entry.
+ */
+export const PLAN_NO_REASONING_EFFORT = "none";
+
+/**
  * One turn. The stream is read part by part rather than awaited as a result, for
  * the reason `capability-probe.ts` records: after a failed request the result
  * promises reject with the SDK's own wrapper, which hides the error this
@@ -2222,6 +2269,17 @@ async function takeTurn(
     run to reach one field would undo that.
   */
   workflow: AgentRunWorkflowType | undefined,
+  /*
+    The run's PERSISTED mode, and the reasoning switch below is gated on it rather than on the
+    tool set.
+
+    Gating on `tools === undefined` is wrong in a way a unit test does not show: `tools` is
+    undefined for a planning run AND for every turn of an agent run on the prompted protocol,
+    which four of the twenty-five measured models take because they cannot emit `tool_calls`.
+    A switch documented as PLAN ONLY would then reach agent turns of exactly the models most
+    likely to be running locally, and a single-protocol test would pass anyway.
+  */
+  mode: AgentRunMode,
 ): Promise<ModelTurn> {
   /*
     Sampling is per MODEL now, not one number for all 25 of them.
@@ -2239,6 +2297,18 @@ async function takeTurn(
     measured on; a model appears there only when a measurement forced it to.
   */
   const sampling = samplingFor(agentModel.modelId, workflow);
+  /*
+    Keyed `openai`, whatever this provider is called.
+
+    `provider-registry.ts` builds ollama, openai and custom through one `@ai-sdk/openai`
+    adapter, and that adapter reads its options under its OWN key. Keying them by the
+    provider's name passed the unit test - the scripted model is configured as `openai` - and
+    sent nothing at all on the first real ollama run, which then timed out at 94 seconds.
+  */
+  // Two switches, one per mode, and neither implies the other: a model measured needing quiet on
+  // its plan turn was not measured needing it while holding tools. See both fields in `profile.ts`.
+  const quiet =
+    mode === "agent" ? suppressesAgentReasoning(agentModel.modelId) : suppressesPlanReasoning(agentModel.modelId);
   const stream = streamText({
     model: agentModel.model,
     temperature: sampling.temperature,
@@ -2253,6 +2323,7 @@ async function takeTurn(
     instructions,
     messages: [...messages],
     ...(tools === undefined ? {} : { tools }),
+    ...(quiet ? { providerOptions: { openai: { reasoningEffort: PLAN_NO_REASONING_EFFORT } } } : {}),
     maxRetries: 0,
     // Real-time backstop for ONE call, sized by what the run has left. The
     // deadline object remains the authority — it is what the loop reads between
@@ -2345,6 +2416,44 @@ type CallResult =
  *         anything — cannot reach the database at all. Same reasoning: the run stays
  *         running because the failure is not the run's own decision.
  */
+/**
+ * How many times each notice has already been delivered to this run (B51).
+ *
+ * The half of B51 that makes "once" mean once. Every notice bound is a `let` inside
+ * `runInvestigation`, and that function is also what RESUMES a run a dead process left
+ * running — so a resumed drive started with every flag false and could deliver a notice
+ * the previous drive had already delivered. Two of the three had a partial durable guard
+ * by accident, and only by accident: the present-before-report notice read `answer-composed`
+ * off the ledger, which meant a run whose `present_answer` was REFUSED writes no event and
+ * was told again.
+ *
+ * It reads BOTH kinds that carry a notice id, because a delivery lands on the entry that
+ * records what happened to the call: a sentence sent as a `user` message writes
+ * `guidance-issued`, and one sent INSTEAD of running a call is the `notice` on that hold.
+ * A `call-held` with no notice on it — a verdict-preview hold, or an entry written before
+ * the field existed — counts towards nothing, which is the honest reading: it says a hold
+ * happened, not which sentence it carried.
+ *
+ * A total record rather than a lookup that can answer `undefined`, so a new notice id
+ * cannot be added to `AgentGuidanceNotice` and silently read as "never delivered" here.
+ */
+export function guidanceDelivered(events: readonly AgentRunEvent[]): Readonly<Record<AgentGuidanceNotice, number>> {
+  const counts: Record<AgentGuidanceNotice, number> = {
+    "report-reminder": 0,
+    "plan-statement": 0,
+    "report-reserve": 0,
+    "unread-stop": 0,
+    "present-before-report": 0,
+    "cite-what-you-read": 0,
+    "compare-before-report": 0,
+  };
+  for (const event of events) {
+    if (event.kind === "guidance-issued") counts[event.notice] += 1;
+    else if (event.kind === "call-held" && event.notice !== undefined) counts[event.notice] += 1;
+  }
+  return counts;
+}
+
 export async function runInvestigation(
   runId: string,
   options: AgentInvestigationOptions,
@@ -2391,6 +2500,23 @@ export async function runInvestigation(
     }
 
     const record = resumed.record.status === "queued" ? await service.markRunning(runId) : resumed.record;
+
+    /*
+      What this stretch is about to be driven with, before it is driven with it.
+
+      Written per DRIVE and not inside `markRunning`, which fires once: a resume picks the model up
+      from the configuration as it stands now, so a run resumed after an operator changed it ran on
+      two different things and a single entry would name only the first. Each stretch says what it
+      ran on, and a reader who finds two that disagree has found the fact worth finding.
+
+      Before the first turn rather than after the last, because a run that fails or is cancelled is
+      exactly the run somebody asks this question about.
+    */
+    await service.recordDriver(runId, {
+      modelId: model.modelId,
+      provider: model.provider,
+      tuning: tuningProvenance(model.modelId),
+    });
 
     // Read from the record and not from a module constant: the turn ceiling is one of
     // the four figures the decision table varies per workflow, and a drive that used
@@ -2443,6 +2569,13 @@ export async function runInvestigation(
      */
     const notice = (text: string): string => (prompted ? `${text} ${PROMPTED_PROTOCOL_REMINDER}` : text);
     const messages: ModelMessage[] = [{ role: "user", content: record.objective }];
+    // The conversation this run continues, stated before anything the model does. A
+    // USER message rather than part of `systemPrompt` for the same reason the prompted
+    // contract is: the context carries prose a user and a model wrote, and the prose
+    // path's own guidance keeps every instruction in user messages. It is also fenced
+    // inside `describeThreadContext`, because none of it is the server's voice.
+    const threadContext = describeThreadContext(record);
+    if (threadContext !== null) messages.push({ role: "user", content: threadContext });
     /*
       The contract is a USER message, not an addition to the instructions, and that is the
       vendor's own guidance rather than a preference: the model card for the reasoning family
@@ -2487,6 +2620,15 @@ export async function runInvestigation(
     let narrowedAtEvent = Number.POSITIVE_INFINITY;
     /** Whether this drive has already re-asked an empty turn; see `retryEmptyTurn`. */
     let emptyTurnRetried = false;
+    /*
+    Every notice this run has already been delivered, read once (B51). The counters it
+    seeds are declared in two places — this one and the block before the turn loop — and
+    both are bounds on the RUN rather than on the drive, which is the whole point of
+    reading them back.
+    */
+    const delivered = guidanceDelivered(record.events);
+    /** Whether this RUN has already answered a stop that read nothing; see `retryUnreadStop`. */
+    let unreadStopRetried = delivered["unread-stop"] > 0;
     const priorProgress = describePriorProgress(record);
     if (priorProgress !== null) messages.push({ role: "user", content: priorProgress });
 
@@ -2559,6 +2701,38 @@ export async function runInvestigation(
      * honest: `grounding.schemaKnown` is what decides whether the model is told to
      * write against an inventory or told it has not seen this database at all.
      */
+    /**
+     * The capture that did NOT happen, written down (B54).
+     *
+     * Both refusal paths call this — the planning one and the agent/operations one —
+     * because the gap was identical on each: the branch pushed its note into the prompt
+     * and returned, so the ledger of an ungrounded run held nothing between the drive
+     * starting and the run ending. The rule `docs/llms/setup.md` states about ledgers
+     * ("that is the authority on what a run did") was therefore true only of a capture
+     * that SUCCEEDED, in exactly the case an operator has to diagnose.
+     *
+     * Before the note, not after it, and for the same reason the successful capture
+     * records before it packs: what the run tells the model about its own grounding has
+     * to be something already durably part of the run's history.
+     *
+     * The reason code and the sentence are the capture's own — this function invents
+     * nothing and measures nothing, so there is no count, no fingerprint and no noun
+     * here. A refused capture read no rows, and stating a number about rows nobody read
+     * is the absence failure this repository keeps re-finding (#477).
+     */
+    const recordRefusedCapture = async (capture: AgentContextCapture & { kind: "unavailable" }): Promise<void> => {
+      await service.recordEvent(runId, {
+        kind: "context-unavailable",
+        reasonCode: capture.reasonCode,
+        detail: capture.detail,
+        ...(capture.rowBudget === undefined ? {} : { rowBudget: capture.rowBudget }),
+        // What the refused reading cost anyway (B13). Spread rather than defaulted: a
+        // capture that carries no measurement records none, because a zero here would
+        // say the refusal was free.
+        ...(capture.charged === undefined ? {} : { charged: capture.charged }),
+      });
+    };
+
     const establishPlanningContext = async (): Promise<void> => {
       const recorded = reusableSnapshot(record.events, record.connectionId);
       const held = recorded === null ? heldSnapshotForConnection(connectionIdentity(context.connection)) : null;
@@ -2568,9 +2742,37 @@ export async function runInvestigation(
       // self-description of exactly the kind this mode keeps being caught in.
       const readBy: PlanningGrounding["readBy"] = held === null ? "this-run" : "earlier-run";
 
+      if (held !== null) {
+        /*
+          The reading this run took instead of taking one of its own, written down (B56).
+
+          `heldSnapshotForConnection` has no expiry, so a plan run can be grounded on an
+          inventory read before the user added the collection they are asking about — and
+          until this entry such a run's ledger held NOTHING between the drive starting and
+          the run ending, which reads as a run that needed no grounding. The model is
+          already told (`readBy: "earlier-run"`); this tells the record, with the one fact
+          the model is not given because it cannot act on it: how old the reading is.
+
+          The age is measured HERE, against this drive's own clock, because the entry is
+          about the moment of reuse. `Math.max` guards the only way in a negative could
+          arrive — a clock reading that went backwards — rather than recording an age that
+          says the reading has not been taken yet.
+        */
+        await service.recordEvent(runId, {
+          kind: "context-reused",
+          fingerprint: held.fingerprint,
+          tableCount: held.tables.length,
+          ageMs: Math.max(0, (context.clock?.() ?? Date.now()) - held.capturedAtMs),
+          // The same noun the capture entry records, and from the same source: what this
+          // engine calls these rows is part of what the run was shown.
+          noun: engine.noun,
+        });
+      }
+
       if (snapshot === null) {
         const capture = await captureContextSnapshot(context);
         if (capture.kind === "unavailable") {
+          await recordRefusedCapture(capture);
           messages.push({
             role: "user",
             content: operations
@@ -2588,6 +2790,9 @@ export async function runInvestigation(
           // The same noun this run's own prompt blocks are written with, recorded
           // where the timeline can read it: the rail has no provider to ask.
           noun: engine.noun,
+          // And what the reading cost, so the meter is not short by the two or three
+          // catalog statements this run has already spent (B13).
+          ...(capture.charged === undefined ? {} : { charged: capture.charged }),
         });
       }
       // After the ledger on the capture path, for the reason the agent path records:
@@ -2730,6 +2935,7 @@ export async function runInvestigation(
 
       const capture = await captureContextSnapshot(context);
       if (capture.kind === "unavailable") {
+        await recordRefusedCapture(capture);
         // The capture's own words send a model to `inspect_schema`, which an operations
         // run does not hold: naming a tool the run has not got is the #350 failure, and
         // this workflow is the one that reaches engines where the capture always fails.
@@ -2748,6 +2954,8 @@ export async function runInvestigation(
         // As on the planning path: what the engine calls these rows is part of what was
         // read, so it is written down with the reading rather than guessed at later.
         noun: engine.noun,
+        // As on the planning path, and for the same reason (B13).
+        ...(capture.charged === undefined ? {} : { charged: capture.charged }),
       });
       // After the ledger, never before it: what a plan run may later be handed is an
       // inventory that is durably part of some run's own history, not one this process
@@ -2760,16 +2968,21 @@ export async function runInvestigation(
     let turns = 0;
     let text = "";
     /*
-    The three notice flags below are one-shots per DRIVE, not per run, and the
-    distinction is worth stating where they are declared: this function is also what
-    RESUMES a run a dead process left running (`service.resume`, at its head), so a
-    resumed drive starts with all three false and can say again what the previous drive
-    already said. Nothing durable bounds them, because a delivery writes no ledger entry
-    — `docs/BACKLOG.md` B51 records both halves as one item, since recording delivery is
-    what would make "once" mean once.
+    The notice bounds below are per RUN and not per drive, and that is what B51 changed.
+
+    This function is also what RESUMES a run a dead process left running (`service.resume`,
+    at its head), so every one of these used to start false on a resumed drive and could
+    say again what the previous drive already said — and nothing durable bounded them,
+    because a delivery wrote no ledger entry at all. Now every delivery is recorded under a
+    name from one vocabulary (`AgentGuidanceNotice`) and the counters are SEEDED from what
+    this run's ledger already holds. A drive that is not a resume reads zeroes, which is
+    exactly what it used to start with.
+
+    What is NOT seeded is `anyToolCalled` and the narrowing: those are read from the run's
+    own settled steps and its event count, and are not deliveries.
     */
-    /** The reserve notice is a one-shot: a drive tells the run once that it is out of room. */
-    let reserveAnnounced = false;
+    /** The reserve notice is a one-shot: a run is told once that it is out of room. */
+    let reserveAnnounced = delivered["report-reserve"] > 0;
     /** Whether a tool this run HOLDS has been called; see `remindToReport`. */
     let anyToolCalled = false;
     /**
@@ -2783,17 +2996,17 @@ export async function runInvestigation(
      * A count rather than a flag because the limit is the model's, not the drive's:
      * `reportReminderLimitFor` reads it, and it is 1 for every model but one.
      */
-    let reportReminders = 0;
-    /** The present-before-report notice, once per drive; see `notices.presentBeforeReport`. */
-    let presentReminders = 0;
-    /** The compare-before-report notice, once per drive; see `compareBeforeReportNotice`. */
-    let compareReminders = 0;
-    /** The cite-what-you-read notice, once per drive; see `citeWhatYouReadNotice`. */
-    let citeReminded = false;
+    let reportReminders = delivered["report-reminder"];
+    /** The present-before-report notice; see `notices.presentBeforeReport`. */
+    let presentReminders = delivered["present-before-report"];
+    /** The compare-before-report notice, once per run; see `compareBeforeReportNotice`. */
+    let compareReminders = delivered["compare-before-report"];
+    /** The cite-what-you-read notice, once per run; see `citeWhatYouReadNotice`. */
+    let citeReminded = delivered["cite-what-you-read"] > 0;
     /** How many times a report has been held for the verdict it would earn; see `shortfallsIfReported`. */
     let previewHolds = 0;
-    /** How many times this drive has asked a PLAN run for its statement; see `askForPlanStatement`. */
-    let planStatementAsks = 0;
+    /** How many times this run has been asked for its statement; see `askForPlanStatement`. */
+    let planStatementAsks = delivered["plan-statement"];
     /**
      * Whether the run has been narrowed to what would finish it; see
      * `AGENT_NARROWED_EXTRA_TOOLS`. Set once and never cleared — a run narrowed for
@@ -2803,6 +3016,23 @@ export async function runInvestigation(
     let narrowed = false;
     /** Tool calls made so far, which is what this model's own ceiling is read against. */
     let toolCallsMade = 0;
+
+    /**
+     * Records a sentence the drive said on a turn where it refused nothing (B51).
+     *
+     * One function for all of them, because the fields are not the caller's to choose:
+     * every such delivery is the same fact — this notice, at this point in the run — and a
+     * site that recorded the id and forgot where it landed would be the gap this closes
+     * reopening one field at a time. A hold is the other delivery shape and records itself,
+     * on the `call-held` entry that says the call was not run.
+     *
+     * The counters are the drive's own at the moment of delivery, which is what makes the
+     * entry answer the question `docs/llms/` asks of a ledger: a reminder on the second
+     * turn and one on the last are different facts about a model.
+     */
+    const issueGuidance = async (notice: AgentGuidanceNotice): Promise<void> => {
+      await service.recordEvent(runId, { kind: "guidance-issued", notice, atTurn: turns, toolCalls: toolCallsMade });
+    };
 
     /**
      * Tells the run, once, that it has come within the reserve of a ceiling.
@@ -2818,7 +3048,7 @@ export async function runInvestigation(
       if (maxTurns - turns > AGENT_REPORT_RESERVE_TURNS && remainingMs > AGENT_REPORT_RESERVE_MS) return;
       reserveAnnounced = true;
       messages.push({ role: "user", content: notice(AGENT_REPORT_RESERVE_NOTICE) });
-      await service.recordEvent(runId, { kind: "guidance-issued", notice: "report-reserve" });
+      await issueGuidance("report-reserve");
     };
 
     /**
@@ -2844,12 +3074,25 @@ export async function runInvestigation(
      * It cost real time to lack: a notice measured as having no effect on two models could
      * not be told apart from a notice that never fired, because neither leaves a trace.
      */
-    const holdCall = async (tool: AgentToolName, reason: string, shortfall?: AgentGoalShortfall): Promise<void> => {
+    const holdCall = async (
+      tool: AgentToolName,
+      reason: string,
+      shortfall?: AgentGoalShortfall,
+      /*
+        Which NOTICE the hold answered with (B51). The three purpose-written sentences are
+        deliveries of a named notice and are bounded across a resume by this entry; the
+        verdict-preview holds speak for a `shortfall` instead and pass none, which is why
+        this is a parameter and not derived from `reason` — two of the three name artifact
+        ids, so the prose cannot be matched against later.
+      */
+      notice?: AgentGuidanceNotice,
+    ): Promise<void> => {
       await service.recordEvent(runId, {
         kind: "call-held",
         tool,
         reason,
         ...(shortfall === undefined ? {} : { shortfall }),
+        ...(notice === undefined ? {} : { notice }),
       });
     };
 
@@ -2865,7 +3108,7 @@ export async function runInvestigation(
       narrowed = true;
       messages.push(...assistant);
       messages.push({ role: "user", content: notice(BASELINE_NOTICES.reportReminder) });
-      await service.recordEvent(runId, { kind: "guidance-issued", notice: "report-reminder" });
+      await issueGuidance("report-reminder");
       return true;
     };
 
@@ -2890,7 +3133,7 @@ export async function runInvestigation(
       planStatementAsks += 1;
       messages.push(...assistant);
       messages.push({ role: "user", content: notice(BASELINE_NOTICES.planStatement) });
-      await service.recordEvent(runId, { kind: "guidance-issued", notice: "plan-statement" });
+      await issueGuidance("plan-statement");
       return true;
     };
 
@@ -3022,6 +3265,7 @@ export async function runInvestigation(
         // the model, not the wiring.
         undefined,
         record.workflowType,
+        record.mode,
       );
       text = turn.text;
       if (turn.aborted) return conclude("failed", turnBudgetMs < remainingMs ? "model-timeout" : "deadline-exceeded");
@@ -3131,6 +3375,45 @@ export async function runInvestigation(
             text: turn.text.trim().slice(0, 2_000),
           });
         }
+        /*
+          The stop that asked a question. Measured on `nemotron3:33b`, which ended a
+          query-optimization run ten seconds in by asking the user to paste the statement it
+          was sent to diagnose — holding, at that moment, the two instruments that would have
+          found it. There is no user on the other end of a run, so the question is a stop.
+
+          `remindToReport` above cannot serve it: it is gated on `anyToolCalled`, correctly,
+          because a run that read nothing has nothing to file. This sentence is the other half
+          — not "file what you found" but "go and find it", naming the instruments.
+
+          Granted only where the run has lost anyway. `compose_report` is one of the tools
+          `anyToolCalled` counts, so a run reaching here with it false composed no report and
+          has already earned `no-report`; the turn cannot cost a pass. Once, and only for a
+          model whose ledger asked twice.
+        */
+        if (
+          record.mode === "agent" &&
+          !anyToolCalled &&
+          !unreadStopRetried &&
+          turns < maxTurns &&
+          resources.deadline.remainingMs() > 0 &&
+          // The sentence NAMES `inspect_schema` AND `inspect_plan`, so it may only reach a run
+          // that holds BOTH. Every set but one is `AGENT_MODE_TOOLS` today, which makes the two
+          // checks equivalent - and that equivalence is the thing a future set would break
+          // silently, so it is asserted rather than relied on.
+          // `operations` is the one agent set built on a different four, because the
+          // read-class tools need `queryReadOnly`, which only two providers implement. Told to
+          // call a tool it has not got, a run calls it, is answered "there is no such tool",
+          // and spends the very turn this retry bought: the #350/#356 defect, paid for once.
+          holdsTool("inspect_schema") &&
+          holdsTool("inspect_plan") &&
+          retriesUnreadStop(model.modelId)
+        ) {
+          unreadStopRetried = true;
+          messages.push(...turn.assistantMessages);
+          messages.push({ role: "user", content: notice(BASELINE_NOTICES.unreadStop) });
+          await issueGuidance("unread-stop");
+          return null;
+        }
         return conclude("succeeded", "model-stopped");
       }
 
@@ -3144,7 +3427,7 @@ export async function runInvestigation(
         if (reportReminders === 0) {
           reportReminders += 1;
           messages.push({ role: "user", content: notice(BASELINE_NOTICES.reportReminder) });
-          await service.recordEvent(runId, { kind: "guidance-issued", notice: "report-reminder" });
+          await issueGuidance("report-reminder");
         }
       }
 
@@ -3222,7 +3505,7 @@ export async function runInvestigation(
             // This model's own wording, from its own file.
             const text = BASELINE_NOTICES.presentBeforeReport;
             presentReminders += 1;
-            await holdCall(call.toolName, text);
+            await holdCall(call.toolName, text, undefined, "present-before-report");
             messages.push(prompted ? promptedResultMessage(call, notice(text)) : toolResultMessage(call, text));
             continue;
           }
@@ -3325,7 +3608,7 @@ export async function runInvestigation(
             const offer = useful.length > 0 ? useful : [...held.keys()];
             citeReminded = true;
             const text = citeWhatYouReadNotice(offer, citedOnlyEmpty);
-            await holdCall(call.toolName, text);
+            await holdCall(call.toolName, text, undefined, "cite-what-you-read");
             messages.push(prompted ? promptedResultMessage(call, notice(text)) : toolResultMessage(call, text));
             continue;
           }
@@ -3371,7 +3654,7 @@ export async function runInvestigation(
                 : compareBeforeReportNotice(before, after);
           if (text !== null) {
             compareReminders += 1;
-            await holdCall(call.toolName, text);
+            await holdCall(call.toolName, text, undefined, "compare-before-report");
             messages.push(prompted ? promptedResultMessage(call, notice(text)) : toolResultMessage(call, text));
             continue;
           }

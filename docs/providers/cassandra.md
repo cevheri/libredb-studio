@@ -169,7 +169,7 @@ node, the monitoring **Tables** tab still summarised the empty `getTableStats()`
 *0 rows*, *Size* `0 B` over *Total*, and *Vacuum* `0` over *OK*, in the very frame where the Overview
 tab read *Tables 6 / 2 indexes* out of `system_schema`: the `0 B` was the sentinel this section had
 just deleted, surviving one component over, and the *OK* was a clean bill of health for an operation
-Cassandra does not have at all ([§7.4](#74-the-panels-that-report-nothing)). Two other engines are
+Cassandra does not have at all ([§7.4](#74-the-panels-that-report-nothing--and-how-they-say-so)). Two other engines are
 recorded in `compatibility.ts` as failures for doing the opposite (Citus and TimescaleDB report row
 counts and sizes that are wrong rather than missing), and this provider is not going to join them.
 
@@ -304,13 +304,17 @@ own proposal got wrong and a measurement caught. Measured 2026-08-24 through the
 A virtual keyspace is not in `system_schema` on either engine, so keying on that catalog would have
 emptied all five panels on the engine that answers them. `readServerFacts()` in
 [`introspect.ts`](../../src/lib/db/providers/sql/cassandra/introspect.ts) therefore reads the virtual
-catalog and resolves one boolean, `hasVirtualTables`:
+catalog and resolves `virtualTablesAbsence` — **not** a boolean but the REASON, absent when the
+virtual tables are readable, because it is the text the two panels whose only source is a virtual table
+report in place of rows ([§7.4](#74-the-panels-that-report-nothing--and-how-they-say-so)) and the three
+causes send the reader to three different places:
 
-- the catalog answered → the **name** `system_views` is in the list, or it is not;
+- the catalog answered → the **name** `system_views` is in the list, or it is not — and when it is not,
+  the reason says exactly that;
 - the catalog was refused as `invalid` (**code**, not text) → there is no virtual schema, so there are
-  no virtual tables. This is ScyllaDB;
+  no virtual tables. This is ScyllaDB, and the reason names the missing catalog;
 - the catalog was refused as `permission` (8448) → a role that may not read the virtual schema may not
-  read `system_views` either, and the per-read permission arm already answers those panels empty;
+  read `system_views` either, and the reason says it is a grant rather than a dialect;
 - **anything else** — a client timeout, an unreachable host — claims no absence: the reads go out and
   their own failure is what the caller sees, exactly as before the probe existed. The probe therefore
   cannot fail a `connect()`.
@@ -440,7 +444,7 @@ is reported as the server spelled it rather than guessed into a CQL word.
 | `localDataCenter` | **Yes** | [§3.4](#34-localdatacenter-is-a-required-connection-field-and-nothing-else-here-has-one) |
 | `database` | No | The **keyspace**. Without it there is no schema tree |
 | `user` / `password` | No | Sent only when a user is set. A stock install runs `AllowAllAuthenticator` and ignores credentials entirely (measured: supplying them to an open server connects fine) |
-| `ssl` | No | Any mode but `disable` sends `sslOptions`: `rejectUnauthorized` from the mode, plus the form's CA (`ca`) and client keypair (`cert` / `key`) under Node's own TLS names, which is the same mapping the PostgreSQL, MySQL and Couchbase adapters use — the driver hands `sslOptions` to `tls.connect`. **Not exercised against a TLS cluster** — the probe instances speak plaintext — so it is the driver's documented option shape and no claim about a verified path, mutual TLS included |
+| `ssl` | No | Any mode but `disable` sends `sslOptions`: `rejectUnauthorized` from the mode (`false` for `require`, `true` for `verify-system`/`verify-ca`/`verify-full` — `verify-system` is simply the one that pastes no CA, leaving Node's own trust store to check the chain), plus the form's CA (`ca`) and client keypair (`cert` / `key`) under Node's own TLS names, which is the same mapping the PostgreSQL, MySQL and Couchbase adapters use — the driver hands `sslOptions` to `tls.connect`. **Not exercised against a TLS cluster** — the probe instances speak plaintext — so it is the driver's documented option shape and no claim about a verified path, mutual TLS included |
 
 ### 4.2 There is no connection string, and why that is not fixable by inventing one
 
@@ -520,13 +524,22 @@ SELECT * FROM probe.customers LIMIT 3 -- note\n    -> 3 rows
 SELECT * FROM probe.customers LIMIT 3 // note\n    -> 3 rows
 ```
 
-`//` is a line comment in CQL and the shared span readers know nothing about it. Both facts break the
-limiter's insert-before-trailing-trivia rule (#280) in different ways: for `--` it re-attaches the
-comment after the clause and the trim drops the newline that closed it, turning a **valid** statement
-into a syntax error; for `//` it appends the clause *inside* the comment. So a statement whose
-rewritten form would end inside a line comment is **left exactly as written**, `wasLimited: false`.
-The check walks the shared span reader, so a `//` inside a string literal (`WHERE url =
-'http://x'`) is not mistaken for a comment.
+`//` is a line comment in CQL, and that half **is** a shared grammar fact — `doubleSlashComment` in
+[`src/lib/sql/grammar.ts`](../../src/lib/sql/grammar.ts), measured over the native protocol on
+Cassandra 5.0.9 and ScyllaDB 2026.2.4. It used to be a private scan inside this provider, and while
+it was, the shared readers were blind to it: the statement splitter cut
+`SELECT id FROM probe.customers // note; DROP TABLE probe.customers` — **one** statement to this
+server, the `;` and the write both inside the comment — into a read and a bare `DROP`, and
+`/api/db/multi-query` runs every fragment it is handed.
+
+What stays local to this engine is the OTHER half: neither comment form may be closed by end of
+input. That is a fact about where a statement may **end**, not about what a run is, so both comment
+forms now break the limiter's insert-before-trailing-trivia rule (#280) the same way — the clause
+goes in before the comment and `sql.trim()` drops the newline that closed it, turning a **valid**
+statement into a syntax error. So a statement whose rewritten form would end inside a line comment is
+**left exactly as written**, `wasLimited: false`. The check walks the shared span reader, which is
+also what keeps a `//` inside a string literal (`WHERE url = 'http://x'`) from being read as a
+comment.
 
 **One shape is knowingly left unbounded.** A statement whose last clause is `PER PARTITION LIMIT n`
 reads as already bounded to the shared reader, so nothing is injected — `... PER PARTITION LIMIT 2
@@ -783,19 +796,45 @@ node's request threads.
 keyspace, a driver name and a protocol version — but no statement and no duration, so it is a
 connection list rather than a session list.
 
-### 7.4 The panels that report nothing
+### 7.4 The panels that report nothing — and how they say so
 
-Each of these returns an empty list, and the second column is why. The third is what the panel does
-with it: an empty list is the only way a required field can decline, so a panel that reduces one into
-a total publishes a figure the engine refused to give — which is what the Tables and Queries tabs did
-here until the rule of [§3.2](#32-there-is-no-honest-row-count-and-no-honest-size) reached them.
+**ABSENT is not EMPTY.** `getMonitoringData` reads the seven panels independently, so a panel whose
+read rejects is left out of the payload with the engine's own sentence recorded under
+`MonitoringData.errors`, and `PanelUnavailable` renders that sentence in its place. An empty array
+means the opposite: the engine looked and measured nothing. Until 2026-08-25 this provider answered
+`[]` for three panels it could never fill and for two more on a build with no `system_views`, which
+claimed a measurement in every one of those five cases. The browser showed the cost on ScyllaDB
+2026.2.4: the Sessions tab read *Active 0 / Idle 0 / Wait 0 / Sessions (0) / No active sessions
+found.* for a question that build cannot answer at all.
 
-| Panel | Why empty | What it renders |
+**Three panels are refused on every build.** The objects exist — the schema tree lists the tables and
+the secondary indexes — so what is missing is the figures, and each panel now carries that sentence:
+
+| Panel | The sentence it carries | Statements sent |
 |---|---|---|
-| Slow queries | There is no aggregate of finished statements anywhere CQL can read. `system_views.system_logs` is a tail of the node's log file (0 rows on this image), and the slow-query threshold that exists writes to that log. **No statement is sent** to discover this | *Queries*, *Avg Time* and *Slow* all read `N/A`. They used to read `0`, `0.00ms` and `0`, and an average over no statements is not zero milliseconds |
-| Table statistics | `TableStats` needs a row count and a byte size; see [§3.2](#32-there-is-no-honest-row-count-and-no-honest-size). **No statement is sent** | *Tables* and *Size* read `N/A`, and the list below them says *No table statistics available.* rather than *No tables found.* The tab separates the two cases by the **required** `overview.tableCount`, which `system_schema` fills honestly (6 here): tables the engine knows about, with statistics for none of them, means the figures are not knowable rather than that the keyspace is empty |
-| Index statistics | `system_schema.indexes` gives a name, a table and a target column — all of which the tree already shows — and `IndexStats` also wants a size and a scan count. Nothing reachable from CQL reports either, and a zeroed scan count reads as "never used" | There is no index panel; `IndexStats` feeds the Storage tab's *Indexes* card, which reads `N/A` on the absent `databaseSizeBytes` rather than on this list ([§3.2](#32-there-is-no-honest-row-count-and-no-honest-size)) |
-| Storage statistics | The only storage figures a statement can read are whole mebibytes per table, so `databaseSizeBytes` is omitted rather than zeroed and the tab says so in words ([§3.2](#32-there-is-no-honest-row-count-and-no-honest-size)) | Both size cards read `N/A` with no percentage, and the breakdown is replaced by *No storage size information available.* |
+| Table statistics | A row count would have to come from `system.size_estimates`, which counts **partitions** per token range from flushed SSTables only (measured: 143 for a 500-row clustered table, 525 for a 500-row one), and a size from `system_views.disk_usage`, which reports whole mebibytes (measured: 1 MiB for a 19,476-byte table). See [§3.2](#32-there-is-no-honest-row-count-and-no-honest-size) | none |
+| Index statistics | `system_schema.indexes` names an index, its table and its target column — all of which the tree already shows — and nothing reachable from CQL reports a secondary index's size or how often it was used | none |
+| Storage statistics | `disk_usage`, `max_partition_size` and `max_sstable_size` are whole mebibytes per table, and multiplying a rounded mebibyte would report a 19 KB table as a confident 1 MB | none |
+
+**Two more are refused only where `system_views` is absent** — the performance panel
+(`system_views.caches`) and the sessions panel (`system_views.queries`). The sentence names the
+virtual table AND which of the three measured causes applies: this build has no
+`system_virtual_schema` catalog (every ScyllaDB), its catalog lists no `system_views`, or the
+connected role may not read the catalog. Three causes, three sentences, because they send the reader
+to three different places. See [§3.6](#36-a-monitoring-surface-degrades-on-a-denial-and-on-one-absent-keyspace).
+
+**One panel stays EMPTY on purpose.** Slow queries: there is no aggregate of finished statements
+anywhere CQL can read (`system_views.system_logs` is a tail of the node's log file, 0 rows on this
+image), **no statement is sent**, and `ProviderLabels.slowQueriesEmptyState` already carries
+Cassandra's own sentence into the panel — *"Cassandra keeps no aggregate of finished statements: the
+slow-query threshold writes to the node's log file rather than to a table."* Converting it would move
+the same sentence from a label the tab renders to an error entry, and buy nothing.
+
+`getHealth()` does **not** refuse: it degrades exactly as before, because
+`POST /api/db/test-connection` calls it and the connection dialog's save is gated on that request. A
+throwing health check would lock the whole ScyllaDB family out of the product
+([§3.6](#36-a-monitoring-surface-degrades-on-a-denial-and-on-one-absent-keyspace)). A monitoring
+panel has the opposite obligation — it is the surface that must say what it could not read.
 
 ---
 
@@ -837,7 +876,7 @@ because there are no table statistics to list at all.)
   supportsExternalQueryLimiting: true,
   supportsCreateTable: false,        // the modal cannot emit valid CQL, and a diff cannot derive the partition key (§5.5)
   supportsInlineRowEdit: false,      // one guessed key column is not a CQL primary key (§5.5)
-  supportsTransactions: false,       // CQL has no transaction; BATCH is not one (#U13)
+  supportsTransactions: false,       // CQL has no transaction; BATCH is not one (#464)
   declaresForeignKeys: false,        // the clause does not exist (§6.2)
   supportsMaintenance: false,        // every operation is a nodetool action (§8)
   maintenanceOperations: [],
@@ -861,7 +900,7 @@ SQL, and each of those three is a syntax error here.
 slow-query threshold writes to the node's log file rather than to a table."* — because
 `getSlowQueries()` is empty by design ([§7](#7-monitoring--health)), so the monitoring Queries panel
 is **always** empty here, and its hardcoded sentence used to tell the reader to enable
-`pg_stat_statements` (`docs/BACKLOG.md` U12).
+`pg_stat_statements` (#463).
 
 ---
 
@@ -947,9 +986,12 @@ latency.
 
 Two changes, and the second is not about Cassandra at all.
 
-**The five reads degrade.** A monitoring read that needs `system_views` answers empty — without being
-sent — on a build whose virtual-keyspace catalog does not list `system_views`, which is every ScyllaDB
-build. The discriminator was a match on the refusal's wording when this section was written and is a
+**The five reads degrade.** A monitoring read that needs `system_views` is not sent at all on a build
+whose virtual-keyspace catalog does not list `system_views`, which is every ScyllaDB build. It
+answered EMPTY when this section was written; since 2026-08-25 a read whose whole panel depends on a
+virtual table reports that panel ABSENT with the reason instead
+([§11.2](#112-an-empty-panel-was-still-a-claim-d24)), while a read that only contributes a FIELD — the
+connection count — still omits the field and lets the panel answer. The discriminator was a match on the refusal's wording when this section was written and is a
 catalog read since **2026-08-24**; both, the four measured error spellings that are now only a
 regression pin, and the one case it cannot separate are in
 [§3.6](#36-a-monitoring-surface-degrades-on-a-denial-and-on-one-absent-keyspace).
@@ -979,14 +1021,38 @@ then the provider, against both servers:
 
 | Read (connection pinned to the `system` keyspace) | Cassandra 5.0.9 | ScyllaDB 2026.2.4 |
 |---|---|---|
-| `readServerFacts()` | `{ hasVirtualTables: true }`, 4.5 ms | `{ hasVirtualTables: false }`, 1.6 ms |
+| `readServerFacts()` | virtual tables present, 4.5 ms | virtual tables absent, 1.6 ms |
 | `getOverview` | `Apache Cassandra 5.0.9`, uptime `12.49h`, 23 tables, 1 index, connections 1 | `Apache Cassandra 3.0.8`, uptime `12.50h`, 60 tables, 0 indexes, `activeConnections` key **absent** |
 | `getPerformanceMetrics` | `{ cacheHitRatio: 86.97 }` | `{}` |
 | `getActiveSessions` | 1 running statement | `[]` |
-| `getHealth` | `cacheHitRatio` `86.97%`, connections 1 | `cacheHitRatio` `N/A`, no connections key, no sessions |
+| `getHealth` | `cacheHitRatio` `86.97%`, connections 1 | `cacheHitRatio` `N/A`, `activeConnections` with no value, no sessions |
 | `getMonitoringData` | answers with data | answers, `performance: {}` |
 | `getSchema` | answers | answers |
 | `system_views` statements sent per monitoring refresh | 3 | **0** |
+
+The fact was a boolean when this table was written and is a REASON since 2026-08-25
+([§11.2](#112-an-empty-panel-was-still-a-claim-d24)); the readings above are unchanged, only the shape
+of what carries them.
+
+### 11.2 An empty panel was still a claim (D24)
+
+The degradation above stopped the five reads from FAILING. It did not stop them from answering, and
+what they answered was a measurement: `performance: {}` and `activeSessions: []` say the engine looked.
+Re-measured **2026-08-25** through the provider against both live servers, after the panels were
+converted to report absence ([§7.4](#74-the-panels-that-report-nothing--and-how-they-say-so)):
+
+| Surface | Cassandra 5.0.9 | ScyllaDB 2026.2.4 |
+|---|---|---|
+| `getPerformanceMetrics` | `{ cacheHitRatio: 87.19 }` | **refused** — *"This panel is read from system_views.caches, and this server has no system_virtual_schema catalog at all …"* |
+| `getActiveSessions` | 1 running statement | **refused**, same sentence naming `system_views.queries` |
+| `getTableStats` / `getIndexStats` / `getStorageStats` | **refused** with their own reasons | **refused**, identically — the cause is the engine, not the build |
+| `getSlowQueries` | `[]` | `[]` — the panel whose label already carries the sentence |
+| `getHealth` | `cacheHitRatio 87.19%`, 1 connection, 6 sessions | answers: `cacheHitRatio N/A`, `activeConnections` with no value, no sessions |
+| `getMonitoringData` panels PRESENT | `overview`, `performance`, `slowQueries`, `activeSessions` | `overview`, `slowQueries` |
+| `getMonitoringData` `errors` keys | `tables`, `indexes`, `storage` | `performance`, `activeSessions`, `tables`, `indexes`, `storage` |
+
+Both servers still answer `getHealth()`, which is what the connection dialog's save is gated on — the
+regression this section's own §11 records. A panel refuses; the health surface does not.
 
 And the four spellings, re-sent through `provider.query()` — the user's own path, which degrades
 nothing — on the same day, which is what keeps them a live pin rather than a remembered one:
@@ -1003,19 +1069,27 @@ too.** `DatabaseOverview.activeConnections` is optional, and this provider omits
 send a fabricated 0 on a build with no `system_views` keyspace — the same omission a permission-denied
 role has always needed and, until that change, never got either. `OverviewTab` renders the absence as "not
 published" instead of "0 connections". `HealthInfo.activeConnections` is optional too now: `getHealth`
-composes it straight from the overview with no `?? 0` seam, so the omission survives to the agent's
+composes it straight from the overview with no `?? 0` seam, so the absence survives to the agent's
 curated health reading (`src/lib/agent/tools.ts`), which reports it to the model as `null` rather than
-telling an LLM "0 connections" about a server it could not measure.
+telling an LLM "0 connections" about a server it could not measure. Note the exact shape this
+provider produces differs from mssql/oracle/mongodb, which spread the key conditionally: `getOverview`
+omits `activeConnections` entirely, while `getHealth` writes the key with the value `undefined`. Every
+consumer discriminates on `undefined` rather than on key presence, and `JSON.stringify` drops such a
+key, so the two are indistinguishable to the API body, the fleet-health chip and the agent — but a
+reader inspecting the object with `in` will find the key on `getHealth()`.
 
 What works:
 
 - `connect`, `query`, `getSchema`, `disconnect` — the editor and the object browser in full, columns
   and index metadata included.
-- `getSlowQueries`, `getTableStats`, `getIndexStats` and `getStorageStats` pass by sending nothing,
-  exactly as they do on Cassandra ([§3.2](#32-there-is-no-honest-row-count-and-no-honest-size),
-  [§7.4](#74-the-panels-that-report-nothing)). They are passes, not working panels: row counts, sizes
-  and the slow-query figures read `N/A` here for the same reason they do on Cassandra, rather than a
-  fabricated zero.
+- `getSlowQueries` answers `[]` and `getTableStats`, `getIndexStats` and `getStorageStats` REFUSE with
+  their reason, both without sending a statement, exactly as they do on Cassandra
+  ([§3.2](#32-there-is-no-honest-row-count-and-no-honest-size),
+  [§7.4](#74-the-panels-that-report-nothing--and-how-they-say-so)). None of the four is a working
+  panel: row counts, sizes and the slow-query figures are not knowable here for the same reason they
+  are not on Cassandra, and the three refusals say so in words rather than as a fabricated zero. They
+  were `[]` when this gate ran (2026-08-24) and were converted on 2026-08-25
+  ([§11.2](#112-an-empty-panel-was-still-a-claim-d24)).
 - All **18 CQL types round-tripped byte-identically** to the 5.0.9 baseline, compared field by field:
   `bigint` 9007199254740993 as a string, `decimal` 1.25, `duration` `3h20m`, `varint`
   123456789012345678901234567890, `blob` `0x00ff` (the stored value; both engines now report it as

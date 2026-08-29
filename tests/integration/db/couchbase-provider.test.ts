@@ -284,6 +284,14 @@ describe("CouchbaseProvider metadata", () => {
       declaresForeignKeys: false,
       supportsMaintenance: true,
       maintenanceOperations: ["analyze", "reindex", "kill"],
+      // All three go through `requireTarget`, so all three are per-keyspace only.
+      // The global Reindex card that #U6 wired up answered *"The reindex operation
+      // requires a target"* on every click, which is what `global: false` withholds.
+      maintenanceOperationSpecs: {
+        analyze: { label: "Update Statistics", perEntity: true, global: false },
+        reindex: { label: "Build Deferred Indexes", perEntity: true, global: false },
+        kill: { label: "Cancel Request", perEntity: false, global: false },
+      },
       supportsConnectionString: true,
       defaultPort: 8091,
       schemaRefreshPattern: "\\b(CREATE|DROP|ALTER)\\s+(COLLECTION|SCOPE|INDEX)\\b",
@@ -321,7 +329,7 @@ describe("CouchbaseProvider metadata", () => {
   // The Operations tab's global Reindex card was hardcoded to PostgreSQL's "Run
   // Reindex / Rebuild Indexes / Reconstructs all indexes in the database." Couchbase's
   // `reindex` is `BUILD INDEX` over the DEFERRED GSI indexes of one keyspace
-  // (`buildDeferredIndexes()`), so none of those three strings described it (#U6).
+  // (`buildDeferredIndexes()`), so none of those three strings described it (#464).
   test("names the deferred GSI build, not a table reindex, in the global reindex card", () => {
     const labels = new CouchbaseProvider(makeConnection()).getLabels();
 

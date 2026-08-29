@@ -1,7 +1,11 @@
 import { describe, test, expect } from "bun:test";
-import { getDBConfig, getDBIcon, getDBColor, isFileBased } from "@/lib/db-ui-config";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import path from "node:path";
+import { getDBConfig, getDBIcon, getDBColor, isFileBased, takesConnectionField } from "@/lib/db-ui-config";
 import { SHOWCASE_DATABASE_ORDER, SHOWCASE_RANK, listShowcaseDatabases } from "@/lib/db-showcase";
 import type { DatabaseType } from "@/lib/types";
+
+const ROOT = path.resolve(import.meta.dir, "../../..");
 
 const ALL_TYPES: DatabaseType[] = [
   "postgres",
@@ -19,6 +23,8 @@ const ALL_TYPES: DatabaseType[] = [
   "opensearch",
   "trino",
   "cassandra",
+  "libsql",
+  "duckdb",
 ];
 
 describe("db-ui-config", () => {
@@ -51,7 +57,10 @@ describe("db-ui-config", () => {
       // full URI for; everything else is field-based. Druid is field-based on purpose:
       // it has no URI convention for its HTTP SQL API (its JDBC driver uses
       // `jdbc:avatica:remote:url=...`), so there is no string a user could paste.
-      const withToggle = new Set<DatabaseType>(["mongodb", "couchbase", "clickhouse"]);
+      // libSQL joins them: `libsql://<database>-<org>.turso.io?authToken=<jwt>` is the
+      // URL Turso's own CLI prints, so there is a real string to paste here - unlike
+      // Trino, whose canonical form is a JDBC URL.
+      const withToggle = new Set<DatabaseType>(["mongodb", "couchbase", "clickhouse", "libsql"]);
       for (const type of ALL_TYPES) {
         expect(getDBConfig(type).showConnectionStringToggle).toBe(withToggle.has(type));
       }
@@ -150,6 +159,23 @@ describe("db-ui-config", () => {
       expect(getDBConfig("cassandra").showConnectionStringToggle).toBe(false);
     });
 
+    test("duckdb is file-based, so the modal renders a path input and no host section", () => {
+      // The exact triple `isFileBased` tests for. One extra connection field here and
+      // the "Database File Path" input silently becomes a host/user/password form for
+      // an engine that has no host at all.
+      const config = getDBConfig("duckdb");
+
+      expect(config.connectionFields).toEqual(["database"]);
+      expect(isFileBased("duckdb")).toBe(true);
+      expect(config.defaultPort).toBe("");
+    });
+
+    test("duckdb offers no connection-string paste, because a DuckDB connection is a path", () => {
+      // There is no `duckdb://` scheme in any DuckDB tooling, so the toggle would
+      // promise a paste `connection-string-parser.ts` has no branch for.
+      expect(getDBConfig("duckdb").showConnectionStringToggle).toBe(false);
+    });
+
     test("every provider carries a distinct colour class", () => {
       const colors = ALL_TYPES.map((type) => getDBConfig(type).color);
       expect(new Set(colors).size).toBe(colors.length);
@@ -194,6 +220,119 @@ describe("db-ui-config", () => {
       expect(isFileBased("druid")).toBe(false);
     });
   });
+
+  /*
+    `connectionFields` decides what a save WRITES: `buildConnection` in
+    `src/hooks/use-connection-form.ts` spreads `host`/`port`/`user`/`password`/`database`
+    only when this list names them. So an engine whose provider authenticates with a field
+    the list omits discards the value between the box the user typed it into and the driver
+    that needed it, and nothing fails - the connection simply acts as a principal the user
+    did not choose.
+
+    That is not hypothetical. #502 taught `RedisProvider.connect()` to pass `config.user` to
+    ioredis as `username`, measured on both arms against `redis:latest` (without it
+    `ACL WHOAMI` answered `default` and a restricted principal reported full health). The
+    repair was correct and unreachable: `redis` did not name `user` here, so the form threw
+    the value away before the provider could ever see it.
+
+    These tests derive the answer rather than restating the table: the factory says which
+    module implements each type-id, and the module (with its directory siblings, for the
+    providers split across files) says whether it ever reads the field. Comments and
+    docblocks are stripped first, so a docblock that merely DISCUSSES `config.user` does not
+    count as a read.
+
+    Two ways the `config.<field>` pattern can be wrong, and they are not symmetric:
+
+    - A FALSE POSITIVE - the token inside a SQL string literal, say - makes this test fail
+      loudly with a name in the message. Someone reads it and adds the exclusion. Safe.
+    - A FALSE NEGATIVE is the dangerous one: a provider reading the field some other way
+      (`const { user } = this.config`, or `this.config` bound to a local first) would be
+      seen as not reading it, and a list that omits the field would pass. Measured
+      2026-08-27 across every provider directory: there are no destructured reads of `user`
+      or `database` and `this.config` is never aliased to a bare variable, so the pattern
+      catches every real read today. If you add one of those shapes, widen this first.
+  */
+  describe("the write list names every addressing field its provider reads", () => {
+    const FACTORY = readFileSync(path.join(ROOT, "src/lib/db/factory.ts"), "utf8");
+
+    /** `case "redis": ... await import("./providers/keyvalue/redis")` */
+    const moduleForType = (type: DatabaseType): string => {
+      const pattern = new RegExp(`case "${type}":[\\s\\S]{0,400}?await import\\("\\./providers/([^"]+)"\\)`);
+      const match = pattern.exec(FACTORY);
+      if (match === null) throw new Error(`factory.ts declares no module for ${type}`);
+      return match[1].replace(/\/index$/, "");
+    };
+
+    const providerSource = (type: DatabaseType): string => {
+      const base = path.join(ROOT, "src/lib/db/providers", moduleForType(type));
+      const files = existsSync(`${base}.ts`)
+        ? [`${base}.ts`]
+        : readdirSync(base, { recursive: true, encoding: "utf8" })
+            .map((entry) => path.join(base, entry))
+            .filter((entry) => entry.endsWith(".ts"));
+      const source = files.map((file) => readFileSync(file, "utf8")).join("\n");
+      return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    };
+
+    test("the factory names a readable module for every type", () => {
+      // Every assertion below is vacuously true if the source comes back empty.
+      for (const type of ALL_TYPES) expect(providerSource(type).length).toBeGreaterThan(200);
+    });
+
+    test.each(["user", "database"] as const)("a provider that reads config.%s is given it", (field) => {
+      const diverging = ALL_TYPES.filter(
+        (type) =>
+          new RegExp(`config\\.${field}\\b`).test(providerSource(type)) !==
+          getDBConfig(type).connectionFields.includes(field),
+      );
+      expect(diverging).toEqual([]);
+    });
+
+    /*
+      The predicate the modal reads. It has to be exercised here rather than through
+      `ConnectionModal`, because both component test files mock `@/lib/db-ui-config` - so a
+      test driving the modal never runs this function at all, and the coverage gate is what
+      said so.
+    */
+    describe("takesConnectionField", () => {
+      test("answers for the engines whose field set is not the networked default", () => {
+        // libSQL: a token, not a user name; and the database IS the host.
+        expect(takesConnectionField("libsql", "user")).toBe(false);
+        expect(takesConnectionField("libsql", "database")).toBe(false);
+        expect(takesConnectionField("libsql", "host")).toBe(true);
+        expect(takesConnectionField("libsql", "password")).toBe(true);
+
+        // The three HTTP-Basic engines take a credential but name their datasource or
+        // index in the statement.
+        for (const type of ["druid", "elasticsearch", "opensearch"] as const) {
+          expect(takesConnectionField(type, "user")).toBe(true);
+          expect(takesConnectionField(type, "database")).toBe(false);
+        }
+
+        // Redis takes both, which is the fix this round made.
+        expect(takesConnectionField("redis", "user")).toBe(true);
+        expect(takesConnectionField("redis", "database")).toBe(true);
+      });
+
+      test("agrees with the list it reads, for every type and every field", () => {
+        // Derived rather than enumerated: the predicate must not develop an opinion of its
+        // own about any engine.
+        const FIELDS = ["host", "port", "user", "password", "database", "connectionString"] as const;
+        for (const type of ALL_TYPES) {
+          for (const field of FIELDS) {
+            expect(takesConnectionField(type, field)).toBe(getDBConfig(type).connectionFields.includes(field));
+          }
+        }
+      });
+    });
+
+    test("redis names the ACL user, because its provider authenticates with it", () => {
+      // Pinned by name as well as by the rule above: this is the one the rule was written
+      // for, and a rule can be weakened by a future edit without anyone noticing which
+      // case it existed to catch.
+      expect(getDBConfig("redis").connectionFields).toContain("user");
+    });
+  });
 });
 
 describe("db-showcase", () => {
@@ -224,6 +363,9 @@ describe("db-showcase", () => {
         "postgres",
         "mysql",
         "sqlite",
+        // Immediately after SQLite: the two file-based engines read together, and
+        // DuckDB is the best-known name of the analytical group.
+        "duckdb",
         "mongodb",
         "redis",
         "oracle",
@@ -235,6 +377,7 @@ describe("db-showcase", () => {
         "clickhouse",
         "druid",
         "trino",
+        "libsql",
         "libredb",
       ]);
     });

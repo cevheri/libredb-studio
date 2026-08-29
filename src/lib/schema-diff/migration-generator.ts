@@ -8,25 +8,42 @@
  * - Dialect-aware: the modified-column path, which branches per engine and names
  *   the limitation in a comment where an engine has no such statement (#269); the
  *   `ADD` / `DROP` keyword, which CQL spells without `COLUMN`; `CREATE TABLE`,
- *   which is refused outright for Cassandra (see CASSANDRA_NO_CREATE_TABLE); and,
- *   for Cassandra only, the transaction wrapper and the foreign-key statements,
- *   both of which CQL has no grammar for.
- * - Not yet: the transaction wrapper for everyone ELSE (`BEGIN;` / `COMMIT;` is
- *   only valid for PostgreSQL and MySQL — MSSQL spells it `BEGIN TRANSACTION`,
- *   Oracle opens a PL/SQL block and auto-commits DDL anyway, and five remaining
- *   type ids have no transactional DDL at all), the rest of `ADD COLUMN` and
- *   `DROP COLUMN`, and the index/FK fallbacks that emit `DROP INDEX IF EXISTS`.
+ *   which is refused outright for Cassandra (see CASSANDRA_NO_CREATE_TABLE); the
+ *   transaction wrapper (see NO_TRANSACTION_WRAPPER), which twelve of the
+ *   seventeen type ids do without, each for its own named reason; and the foreign-key
+ *   statements, which CQL has no grammar for at all and which SQLite's grammar
+ *   takes only inside `CREATE TABLE` (see FOREIGN_KEY_ONLY_IN_CREATE_TABLE).
+ * - Not yet: MSSQL and Oracle's own transaction-wrapper forms (`BEGIN;` is not
+ *   `BEGIN TRANSACTION;`, and Oracle DDL auto-commits regardless of what wraps
+ *   it) — both still get today's PostgreSQL-shaped `BEGIN;`/`COMMIT;`, because
+ *   settling their real forms wants checking against a live server first, the
+ *   way #264 and #265 did, and that measurement is the tracked follow-up to this
+ *   fix rather than part of it.
  *
- * Cassandra is ahead of the others here for a reason worth stating: it is the one
- * dialect whose OTHER statements were each measured against a live server, so the
- * wrapper and the FK lines would have been the only unrunnable lines in an
- * otherwise runnable migration. Elsewhere they are one problem among several, and
- * the emitted forms still want checking against a live server first.
+ *   Two more MSSQL/Oracle questions surfaced while checking the rest of this
+ *   docstring's claims, and both belong in that same follow-up rather than
+ *   being guessed at here: the `ADD COLUMN` keyword — the modified-column path
+ *   a few lines below already spells Oracle's own ALTER as `MODIFY (...)`,
+ *   with no `COLUMN` keyword in its grammar at all, and MSSQL's documented
+ *   `ADD` clause has none either, yet the generic added-column branch hands
+ *   both the same literal `ADD COLUMN` every other engine gets; and whether
+ *   `DROP TABLE`/`DROP INDEX`/`DROP CONSTRAINT ... IF EXISTS` are valid there
+ *   at all — Oracle had no conditional DDL clause before 23ai. Both are
+ *   internal inconsistencies or open questions this pass surfaced rather than
+ *   fresh guesses, but neither is fixed here.
  *
- * So the output is correct for PostgreSQL, largely correct for MySQL and SQLite,
- * and can be unrunnable elsewhere. Tracked rather than fixed here because the
- * emitted forms want checking against a live MSSQL and Oracle before they are
- * settled, the way #264 and #265 did.
+ *   For every OTHER dialect, `ADD`/`DROP COLUMN` and the index/FK `IF EXISTS`
+ *   fallbacks were checked against the same questions and found to already
+ *   agree with each one's documented grammar via the existing
+ *   Cassandra/SQLite/libSQL/DuckDB/MySQL branches, so nothing there needed
+ *   changing in this pass.
+ *
+ * Cassandra is ahead of MSSQL and Oracle here for a reason worth stating (see
+ * NO_TRANSACTION_WRAPPER for the measurement): it is a dialect whose OTHER
+ * statements were each measured against a live server too, so its wrapper and FK
+ * lines would have been the only unrunnable lines in an otherwise runnable
+ * migration. For MSSQL and Oracle they are one problem among several, and the
+ * emitted forms still want checking against a live server first.
  */
 import type { DatabaseType } from "@/lib/types";
 // The shared quoter, which also escapes an embedded closing quote character — this
@@ -71,6 +88,25 @@ function clickhouseDefaultKind(value: string): string {
  * this file spell their engine out the same way.
  */
 const NO_COLUMN_MODIFICATION: Partial<Record<DatabaseType, { label: string; reason: string }>> = {
+  // Measured over Hrana on sqld 0.24.33, and the entry exists because the PostgreSQL
+  // branch this id would otherwise inherit emits text libSQL cannot parse:
+  // `ALTER TABLE t ALTER COLUMN c TYPE integer` is "unexpected end of input" and the
+  // MySQL spelling `MODIFY COLUMN` is "syntax error around `MODIFY`". No SQLite has a
+  // column TYPE change, and libSQL is SQLite - unlike DROP COLUMN and RENAME COLUMN,
+  // which it DOES accept (both measured), so this row is narrower than the `sqlite`
+  // branch below and deliberately so. Nullability is the one exception and it does not
+  // reach libSQL: SQLite gained `ALTER COLUMN ... SET/DROP NOT NULL` in 3.53.0 (measured
+  // 2026-08-27 on 3.53.0 - it rewrites the stored schema and is enforced on insert),
+  // while sqld 0.24.33 ships 3.47.0, so declining every modification is still right here.
+  // The `sqlite` branch below declines it too, and deliberately: that provider runs on
+  // whichever SQLite its runtime bundles - `bun:sqlite` or `node:sqlite`, chosen at runtime
+  // with `LIBREDB_SQLITE_DRIVER` as an override - so emitting the statement would write a
+  // migration file that succeeds on one deployment and fails on another. A file handed to a
+  // human to run elsewhere makes that guess worse than the decline.
+  libsql: {
+    label: "libSQL",
+    reason: "SQLite cannot retype a column; recreate the table and copy the rows.",
+  },
   couchbase: {
     label: "Couchbase",
     reason: "Collections hold schemaless JSON documents, so there is no column definition to change.",
@@ -133,6 +169,70 @@ const NO_COLUMN_MODIFICATION: Partial<Record<DatabaseType, { label: string; reas
   },
 };
 
+/**
+ * Canonical type ids whose migration text carries no transaction wrapper, because no
+ * `BEGIN;` this generator could emit would be both valid and meaningful for them (#284).
+ *
+ * `sqlite` runs its own transaction, and `libsql` is SQLite - the same reasoning, with
+ * one addition of its own: this provider closes its Hrana stream in the same request as
+ * each statement, so a BEGIN it emitted could not be continued by the app that generated
+ * the file. `cassandra` has no transaction at all - measured on 5.0.9, `BEGIN;` is "line
+ * 1:5 mismatched input ';' expecting K_BATCH" and `COMMIT;` is "no viable alternative at
+ * input 'COMMIT'". The only grouping CQL has is `BEGIN BATCH ... APPLY BATCH`, which is
+ * not a transaction and takes no DDL, so there is nothing to translate the wrapper INTO -
+ * it can only be left out. Unlike the other two, Cassandra's OTHER statements in this
+ * generator were each measured against a live server too, so the wrapper would have been
+ * the only unrunnable line in an otherwise runnable migration.
+ *
+ * The other nine are new, and each reuses a fact this module (or `src/lib/sql/grammar.ts`)
+ * already established for a different fallback rather than asserting a fresh one:
+ * `mongodb` and `redis` write no SQL text at all (`NON_SQL_DIALECTS` in `grammar.ts`), and
+ * wrapping non-SQL command text in SQL statements is wrong regardless of Mongo's own
+ * driver-level transaction API; `libredb` "speaks a JSON command grammar, not SQL DDL"
+ * (`NO_COLUMN_MODIFICATION`'s own words); `couchbase` HAS distributed ACID transactions,
+ * but spells one `BEGIN TRANSACTION` and answers with a `txid` that every following
+ * statement has to carry as a request parameter (`docs/providers/couchbase.md` §13) - a
+ * shape a flat migration file cannot express at all, so `BEGIN;` is both the wrong
+ * keyword and the wrong mechanism; `druid` has no transaction concept to translate the
+ * wrapper into ("Druid SQL has no ALTER TABLE", `NO_COLUMN_MODIFICATION`; a datasource is
+ * rewritten by an MSQ task, not by a bracketed statement list); `elasticsearch` and
+ * `opensearch` do not have `BEGIN` in their grammar at all - the parse error quoted in
+ * `NO_COLUMN_MODIFICATION` lists every statement Elasticsearch SQL accepts and `BEGIN` is
+ * not among them, and OpenSearch 3.8.0 was measured separately
+ * (`docs/providers/opensearch.md` §9); `trino`'s transactional semantics are the CONNECTOR's answer, not a
+ * property of Trino itself (`NO_COLUMN_MODIFICATION`), so no portable `BEGIN;`/`COMMIT;`
+ * exists; and `clickhouse`'s transaction support is experimental and setting-gated rather
+ * than a safe default — this set is what removes it from the wrapper it used to inherit.
+ *
+ * What none of these nine reasons is: "this generator emits nothing for that id anyway".
+ * It has no capability gate - `supportsCreateTable` is read by the schema explorer, not
+ * here - so its added-table branch emits a real `CREATE TABLE` for every id except
+ * `cassandra` (see CASSANDRA_NO_CREATE_TABLE). The wrapper this set removes was bracketing
+ * runnable DDL for these ids, not just comments, which is what makes removing it a fix.
+ * `tests/unit/schema-diff/migration-generator.test.ts` drives the coverage table over an
+ * added-table diff as well as a modified-table one so that stays measured.
+ *
+ * `mssql` and `oracle` are deliberately ABSENT from this set — they still get the
+ * PostgreSQL-shaped wrapper, UNCHANGED, because their real forms (`BEGIN TRANSACTION;`
+ * for MSSQL; whether Oracle needs a wrapper at all, given DDL there auto-commits) want
+ * checking against a live server first, the way #264 and #265 were, and remain tracked
+ * in the module docstring above as the follow-up this PR does not attempt.
+ */
+const NO_TRANSACTION_WRAPPER: ReadonlySet<DatabaseType> = new Set<DatabaseType>([
+  "sqlite",
+  "libsql",
+  "cassandra",
+  "mongodb",
+  "redis",
+  "libredb",
+  "couchbase",
+  "druid",
+  "clickhouse",
+  "elasticsearch",
+  "opensearch",
+  "trino",
+]);
+
 function generateColumnDef(col: ColumnDiff, dialect: DatabaseType): string {
   const type = col.targetType || col.sourceType || "TEXT";
   // A CQL column definition is a name and a type, full stop. Measured on 5.0.9:
@@ -173,6 +273,50 @@ function generateColumnDef(col: ColumnDiff, dialect: DatabaseType): string {
 const CASSANDRA_NO_CREATE_TABLE =
   "A CQL primary key splits into a partition key and clustering columns, and a schema diff records neither role, so the partitioning cannot be derived; write the CREATE TABLE by hand.";
 
+/**
+ * Canonical type ids whose grammar declares a foreign key ONLY as a `CREATE TABLE` table constraint,
+ * with the label each one's comments carry. `sqlite` is the engine and `libsql` is a fork of it, so
+ * the two answer identically; the labels are spelled out per id anyway, because a reader wants the
+ * name of the engine they connected to (the same reason the neighbouring libSQL branches exist).
+ *
+ * SQLite's ALTER TABLE page enumerates every schema change the engine has - "rename table", "rename
+ * column", "add column", "drop column", plus SET/DROP NOT NULL since 3.53.0 - and adding a constraint
+ * is not among them; it routes such a change through its own 12-step table-recreation procedure.
+ * Measured on sqlite3 3.53.3: `ALTER TABLE "users" ADD CONSTRAINT "fk_users_dept_id" FOREIGN KEY
+ * ("dept_id") REFERENCES "departments"("id")` is `near "FOREIGN": syntax error` - the parser has
+ * already taken `CONSTRAINT` for a column name and the quoted name for its type - and the same
+ * statement over Hrana on sqld 0.24.33 is `near CONSTRAINT ... syntax error`. Two tokens, one verdict.
+ *
+ * Both emission paths read this map and answer it DIFFERENTLY, which is the point of naming the fact
+ * once (#515). `generateCreateTable` is building the table right there, so it moves the key
+ * INSIDE the statement, where SQLite's grammar does take it; `generateAlterTable` has no such place
+ * to put it and declines with a comment. Declining on both paths would throw away a key the engine
+ * can perfectly well hold.
+ */
+const FOREIGN_KEY_ONLY_IN_CREATE_TABLE: Partial<Record<DatabaseType, { label: string; reason: string }>> = {
+  sqlite: {
+    label: "SQLite",
+    reason: "A foreign key is declarable only as a CREATE TABLE constraint; recreate the table and copy the rows.",
+  },
+  libsql: {
+    label: "libSQL",
+    reason: "SQLite declares one only in CREATE TABLE; recreate the table and copy the rows.",
+  },
+  // Measured on DuckDB v1.5.5, both arms. The table constraint this map selects is
+  // accepted and readable back - `CREATE TABLE "users" (..., PRIMARY KEY ("id"),
+  // FOREIGN KEY ("dept_id") REFERENCES "departments"("id"))` lands, and
+  // `duckdb_constraints()` then reports it. The trailing ALTER the other ids get is
+  // NOT: `ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES u(id)` answers
+  // "Not implemented Error: No support for that ALTER TABLE option yet!", which is
+  // exactly what `generateAlterTable` already declines to emit for this id. Without
+  // this entry the two halves disagreed: the created-table path emitted the very
+  // statement the modified-table path documents as refused.
+  duckdb: {
+    label: "DuckDB",
+    reason: "ALTER TABLE cannot add one yet; recreate the table and copy the rows.",
+  },
+};
+
 function generateCreateTable(table: TableDiff, dialect: DatabaseType): string {
   const lines: string[] = [];
   const id = escapeIdentifier(table.tableName, dialect);
@@ -187,10 +331,33 @@ function generateCreateTable(table: TableDiff, dialect: DatabaseType): string {
   // Add primary key constraint
   const pkCols = table.columns.filter((c) => c.targetIsPrimary).map((c) => escapeIdentifier(c.columnName, dialect));
 
+  // A key the target can only declare here has to be emitted here, so the closing paren is not
+  // written until the constraint list is complete.
+  const addedForeignKeys = table.foreignKeys.filter((fk) => fk.action === "added");
+  const keyIsTableConstraint = FOREIGN_KEY_ONLY_IN_CREATE_TABLE[dialect] !== undefined;
+
   lines.push(`CREATE TABLE ${id} (`);
   lines.push(colDefs.join(",\n"));
   if (pkCols.length > 0) {
     lines.push(`,  PRIMARY KEY (${pkCols.join(", ")})`);
+  }
+  if (keyIsTableConstraint) {
+    // SQLite's CREATE TABLE takes "one or more column definitions, optionally followed by a list of
+    // table constraints", one of which is `FOREIGN KEY ( column-name, ... ) REFERENCES ...`. Hence
+    // the position: after the columns AND after the PRIMARY KEY line, never before them - the same
+    // constraint placed ahead of a column definition is `near "FOREIGN": syntax error` (measured on
+    // sqlite3 3.53.3, where the form below is accepted and `PRAGMA foreign_key_list` then reports the
+    // key).
+    //
+    // The `fk_<table>_<column>` name the other dialects carry is dropped rather than translated into
+    // a `CONSTRAINT name` prefix, which SQLite would also accept: the name is this generator's own
+    // invention rather than anything the diff recorded, and SQLite never reads a foreign key's name
+    // back out - `PRAGMA foreign_key_list` has no name column - so it could only ever be write-only.
+    addedForeignKeys.forEach((fk) => {
+      lines.push(
+        `,  FOREIGN KEY (${escapeIdentifier(fk.columnName, dialect)}) REFERENCES ${escapeIdentifier(fk.targetReferencedTable || "", dialect)}(${escapeIdentifier(fk.targetReferencedColumn || "", dialect)})`,
+      );
+    });
   }
   lines.push(");");
 
@@ -203,14 +370,15 @@ function generateCreateTable(table: TableDiff, dialect: DatabaseType): string {
       lines.push(`CREATE ${unique}INDEX ${escapeIdentifier(idx.indexName, dialect)} ON ${id} (${cols});`);
     });
 
-  // Foreign keys
-  table.foreignKeys
-    .filter((fk) => fk.action === "added")
-    .forEach((fk) => {
+  // Foreign keys. Already emitted above for the ids that can only declare one inside the statement;
+  // for everyone else this separate ALTER is the shape that has always been emitted here.
+  if (!keyIsTableConstraint) {
+    addedForeignKeys.forEach((fk) => {
       lines.push(
         `ALTER TABLE ${id} ADD CONSTRAINT ${escapeIdentifier(`fk_${table.tableName}_${fk.columnName}`, dialect)} FOREIGN KEY (${escapeIdentifier(fk.columnName, dialect)}) REFERENCES ${escapeIdentifier(fk.targetReferencedTable || "", dialect)}(${escapeIdentifier(fk.targetReferencedColumn || "", dialect)});`,
       );
     });
+  }
 
   return lines.join("\n");
 }
@@ -369,6 +537,21 @@ function generateAlterTable(table: TableDiff, dialect: DatabaseType): string {
         );
         return;
       }
+      // No ALTER adds a foreign key on these ids, so the honest line names the table recreation
+      // instead (see FOREIGN_KEY_ONLY_IN_CREATE_TABLE for the three measurements). For `sqlite` and
+      // `libsql` it is SQLite's grammar; for `duckdb` it is a refusal at execution -
+      // `ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES u(id)` parses and then answers
+      // "Not implemented Error: No support for that ALTER TABLE option yet!" (v1.5.5), as does the
+      // UNIQUE form, while `ADD CONSTRAINT ... PRIMARY KEY` is the one arm that lands. Unlike the
+      // created-table path, there is nothing to move the key into: the table already exists, and
+      // this generator does not write the recreation.
+      const declined = FOREIGN_KEY_ONLY_IN_CREATE_TABLE[dialect];
+      if (declined) {
+        lines.push(
+          `-- ${declined.label}: Cannot add a foreign key on ${escapeIdentifier(fk.columnName, dialect)}. ${declined.reason}`,
+        );
+        return;
+      }
       lines.push(
         `ALTER TABLE ${id} ADD CONSTRAINT ${constraintName} FOREIGN KEY (${escapeIdentifier(fk.columnName, dialect)}) REFERENCES ${escapeIdentifier(fk.targetReferencedTable || "", dialect)}(${escapeIdentifier(fk.targetReferencedColumn || "", dialect)});`,
       );
@@ -383,6 +566,18 @@ function generateAlterTable(table: TableDiff, dialect: DatabaseType): string {
         lines.push(`ALTER TABLE ${id} DROP FOREIGN KEY ${constraintName};`);
       } else if (dialect === "sqlite") {
         lines.push(`-- SQLite: Cannot drop foreign key directly. Requires table recreation.`);
+      } else if (dialect === "libsql") {
+        // The generic `DROP CONSTRAINT` branch below is not parseable here, measured on
+        // sqld 0.24.33: `ALTER TABLE t DROP CONSTRAINT fk_x` is "near CONSTRAINT …
+        // syntax error". Same limit as SQLite, named separately so the comment names
+        // the engine the reader connected to.
+        lines.push(`-- libSQL: Cannot drop a foreign key directly. Requires table recreation.`);
+      } else if (dialect === "duckdb") {
+        // The generic branch below is refused here too, measured on v1.5.5: `ALTER
+        // TABLE t DROP CONSTRAINT IF EXISTS fk_x` is "Not implemented Error: No
+        // support for that ALTER TABLE option yet!" - and a `Not implemented` is not
+        // an `IF EXISTS` no-op, so the line would fail a migration rather than skip.
+        lines.push(`-- DuckDB: Cannot drop a foreign key directly. Requires table recreation.`);
       } else if (dialect === "cassandra") {
         // `DROP CONSTRAINT IF EXISTS fk_x` is "mismatched input 'IF' expecting EOF"
         // (measured), and dropping what was never declarable is not a statement.
@@ -410,17 +605,8 @@ export function generateMigrationSQL(diff: SchemaDiff, dialect: DatabaseType): s
 
   // ONE definition, read twice: the opening and the closing halves of this wrapper used
   // to be two independent conditions, which is a shape that can diverge into a `BEGIN;`
-  // with no `COMMIT;`.
-  //
-  // SQLite runs its own transaction; Cassandra has no transaction at all. Measured on
-  // 5.0.9: `BEGIN;` is "line 1:5 mismatched input ';' expecting K_BATCH" and `COMMIT;`
-  // is "no viable alternative at input 'COMMIT'". The only grouping CQL has is
-  // `BEGIN BATCH ... APPLY BATCH`, which is not a transaction and takes no DDL, so
-  // there is nothing to translate the wrapper INTO - it can only be left out. The
-  // wrapper is still wrong for the other engines named in the module docstring; that
-  // stays tracked there, and unlike them Cassandra emits DDL this generator was taught
-  // to spell correctly, so the wrapper would be the only unrunnable line in it.
-  const wrapsInTransaction = dialect !== "sqlite" && dialect !== "cassandra";
+  // with no `COMMIT;`. See NO_TRANSACTION_WRAPPER for why each excluded id is excluded.
+  const wrapsInTransaction = !NO_TRANSACTION_WRAPPER.has(dialect);
 
   if (wrapsInTransaction) {
     sections.push("BEGIN;");

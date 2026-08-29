@@ -814,6 +814,25 @@ describe("generateMigrationSQL: Cassandra spells ADD and DROP without the COLUMN
     expect(sql).toContain("-- Apache Cassandra: Cannot add a foreign key");
     expect(sql).toContain("-- Apache Cassandra: Cannot drop a foreign key");
   });
+
+  test("libSQL declines both directions too, because SQLite declares a key only in CREATE TABLE", () => {
+    // Measured over Hrana on sqld 0.24.33: `ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY
+    // (c) REFERENCES u(id)` is "near CONSTRAINT ... syntax error", and so is the DROP.
+    // The generic branch would emit both, so both are declined here - and the column
+    // statements around them are NOT: libSQL accepts ADD COLUMN and DROP COLUMN, which
+    // is what makes this narrower than the sqlite branch beside it.
+    const sql = generateMigrationSQL(makeModifiedTableDiff(), "libsql");
+
+    expect(sql).not.toContain("ADD CONSTRAINT");
+    expect(sql).not.toContain("DROP CONSTRAINT");
+    expect(sql).toContain("-- libSQL: Cannot add a foreign key");
+    expect(sql).toContain("-- libSQL: Cannot drop a foreign key");
+    expect(sql).toContain("ADD COLUMN");
+    expect(sql).toContain("DROP COLUMN");
+    // SQLite runs its own transaction and this provider could not continue one it
+    // emitted, so the file carries no wrapper.
+    expect(sql).not.toContain("BEGIN;");
+  });
 });
 
 describe("generateMigrationSQL: Cassandra declines CREATE TABLE rather than guess the partitioning", () => {
@@ -852,15 +871,164 @@ describe("generateMigrationSQL: Cassandra declines CREATE TABLE rather than gues
 });
 
 /**
+ * #515. Both directions, both ids, because the generator got each of the four cases from a different
+ * place and only one of them was right.
+ *
+ * SQLite's ALTER TABLE page enumerates every schema change the engine has - "rename table", "rename
+ * column", "add column", "drop column", plus SET/DROP NOT NULL since 3.53.0 - and adding a constraint
+ * is not among them; the page routes such a change through its own 12-step table-recreation
+ * procedure. Measured on sqlite3 3.53.3: `ALTER TABLE "users" ADD CONSTRAINT "fk_users_dept_id"
+ * FOREIGN KEY ("dept_id") REFERENCES "departments"("id");` is `near "FOREIGN": syntax error` - the
+ * parser has already taken `CONSTRAINT` for a column name and the quoted name for its type - and the
+ * same statement over Hrana on sqld 0.24.33 is `near CONSTRAINT ... syntax error`. Two tokens, one
+ * verdict.
+ *
+ * The two emission paths still want DIFFERENT answers. In `CREATE TABLE` the key IS expressible, as a
+ * table constraint: SQLite's CREATE TABLE grammar takes "one or more column definitions, optionally
+ * followed by a list of table constraints", one of which is `FOREIGN KEY ( column-name, ... )
+ * REFERENCES ...`. Measured on 3.53.3: the created form below is accepted and `PRAGMA
+ * foreign_key_list("users")` then reports the key, while the same constraint placed BEFORE a column
+ * definition is `near "FOREIGN": syntax error` - which is what the ordering assertion pins. So the
+ * created-table path emits the key and only the alter-table path declines.
+ */
+describe("generateMigrationSQL: SQLite's grammar declares a foreign key only inside CREATE TABLE", () => {
+  function addedTableWithForeignKey(): SchemaDiff {
+    const diff = makeAddedTableDiff();
+    diff.tables[0].foreignKeys = [
+      {
+        action: "added",
+        columnName: "dept_id",
+        targetReferencedTable: "departments",
+        targetReferencedColumn: "id",
+        changes: ["Added FK"],
+      },
+    ];
+    return diff;
+  }
+
+  /**
+   * Total by construction, in the same spirit as `MODIFIED_COLUMN_COVERAGE` below. The
+   * implementation's map is a `Partial<Record<DatabaseType, ...>>`, so a third id added there
+   * typechecks either way and introduces no line of its own - both arms are already covered by these
+   * two dialects, and a per-line coverage gate structurally cannot see an arm that adds no line. This
+   * total `Record` is the mechanism that does notice: a new `DatabaseType` fails typecheck here until
+   * it is classified. The two other states are asserted too, so that moving an EXISTING id into the
+   * implementation's map is red as well: `"key-follows-in-an-alter"` means the key is emitted as a
+   * trailing `ADD CONSTRAINT` statement instead, and `"engine-has-no-foreign-key"` is `cassandra`,
+   * whose whole `CREATE TABLE` is declined ahead of any constraint.
+   *
+   * `distinguishingClause` is the half of each reason that the two ids do NOT share: pinning only the
+   * common "recreate the table and copy the rows" tail would stay green if the two reasons were
+   * swapped between the two ids, which is exactly the confusion the wording exists to prevent.
+   */
+  const GRAMMAR: Record<
+    DatabaseType,
+    { label: string; distinguishingClause: string } | "key-follows-in-an-alter" | "engine-has-no-foreign-key"
+  > = {
+    sqlite: {
+      label: "SQLite",
+      distinguishingClause: "A foreign key is declarable only as a CREATE TABLE constraint;",
+    },
+    libsql: { label: "libSQL", distinguishingClause: "SQLite declares one only in CREATE TABLE;" },
+    // Not an inheritance from the two SQLite ids but a measurement of its own: DuckDB
+    // v1.5.5 accepts the table constraint and reports it back through
+    // `duckdb_constraints()`, and answers the trailing ALTER with "Not implemented
+    // Error: No support for that ALTER TABLE option yet!".
+    duckdb: { label: "DuckDB", distinguishingClause: "ALTER TABLE cannot add one yet;" },
+    postgres: "key-follows-in-an-alter",
+    mysql: "key-follows-in-an-alter",
+    oracle: "key-follows-in-an-alter",
+    mssql: "key-follows-in-an-alter",
+    clickhouse: "key-follows-in-an-alter",
+    couchbase: "key-follows-in-an-alter",
+    druid: "key-follows-in-an-alter",
+    trino: "key-follows-in-an-alter",
+    elasticsearch: "key-follows-in-an-alter",
+    opensearch: "key-follows-in-an-alter",
+    cassandra: "engine-has-no-foreign-key",
+    mongodb: "key-follows-in-an-alter",
+    redis: "key-follows-in-an-alter",
+    libredb: "key-follows-in-an-alter",
+  };
+
+  for (const [dialectId, entry] of Object.entries(GRAMMAR)) {
+    const dialect = dialectId as DatabaseType;
+    if (entry === "engine-has-no-foreign-key") continue;
+    if (entry === "key-follows-in-an-alter") {
+      // The counter-arm, and the reason a third id cannot be added to the implementation's map
+      // unnoticed: for every id NOT under the grammar rule the key leaves the CREATE TABLE and
+      // becomes a statement of its own, so classifying an id here and adding it there is a conflict
+      // one of the two tests reports.
+      test(`${dialect}: the key is a trailing ALTER statement, not a CREATE TABLE constraint`, () => {
+        const sql = generateMigrationSQL(addedTableWithForeignKey(), dialect);
+
+        const createEnd = sql.indexOf("\n);") + 3;
+        expect(sql.slice(sql.indexOf("CREATE TABLE"), createEnd)).not.toContain("FOREIGN KEY");
+        expect(sql.slice(createEnd)).toContain("ADD CONSTRAINT");
+        expect(sql.slice(createEnd)).toContain("FOREIGN KEY");
+      });
+      continue;
+    }
+    const { label, distinguishingClause } = entry;
+    test(`${dialect}: a created table carries the key as a table constraint, not a following ALTER`, () => {
+      const sql = generateMigrationSQL(addedTableWithForeignKey(), dialect);
+
+      const createStatement = sql.slice(sql.indexOf('CREATE TABLE "users" ('), sql.indexOf("\n);") + 3);
+      expect(createStatement).toContain('FOREIGN KEY ("dept_id") REFERENCES "departments"("id")');
+      // The grammar's ordering rule: every table constraint follows every column definition.
+      expect(createStatement.indexOf('"email" varchar(255)')).toBeLessThan(createStatement.indexOf("FOREIGN KEY"));
+      // Not the trailing statement the generic branch emits, in any spelling.
+      expect(sql).not.toContain("ADD CONSTRAINT");
+      expect(sql).not.toContain("ALTER TABLE");
+      // And no synthesized constraint name: `fk_<table>_<column>` is this generator's invention
+      // rather than anything the diff carried, and SQLite never reads a foreign key's name back out
+      // (measured: `PRAGMA foreign_key_list` has no name column), so naming it would be write-only.
+      expect(sql).not.toContain("fk_users_dept_id");
+    });
+
+    test(`${dialect}: an existing table's added key is declined, because no ALTER can carry it`, () => {
+      const sql = generateMigrationSQL(makeModifiedTableDiff(), dialect);
+
+      // The whole line, clause included, so the reason cannot be swapped onto the other id.
+      expect(sql).toContain(
+        `-- ${label}: Cannot add a foreign key on "dept_id". ${distinguishingClause} recreate the table and copy the rows.`,
+      );
+      expect(sql).not.toContain("ADD CONSTRAINT");
+      expect(sql).not.toContain("FOREIGN KEY (");
+      // The refusal is confined to the constraint: both ids accept ADD COLUMN, so the rest of the
+      // migration is still emitted rather than the whole table being declined.
+      expect(sql).toContain('ALTER TABLE "users" ADD COLUMN "phone" varchar(20);');
+    });
+  }
+});
+
+/**
  * Exhaustive by construction, in the spirit of `PICKER_COVERAGE` in
  * `tests/hooks/use-connection-form.test.ts`: a new `DatabaseType` fails typecheck here until it is
  * classified, so it cannot silently re-inherit the generator's PostgreSQL branch — which is the whole
  * of #269. `"has-own-branch"` means the modified-column chain answers that id in its own dialect.
  */
-const MODIFIED_COLUMN_COVERAGE: Record<DatabaseType, { label: string; reason: string } | "has-own-branch"> = {
+const MODIFIED_COLUMN_COVERAGE: Record<
+  DatabaseType,
+  { label: string; reason: string } | "has-own-branch" | "postgres-branch-measured"
+> = {
   postgres: "has-own-branch",
   mysql: "has-own-branch",
   sqlite: "has-own-branch",
+  // NOT "has-own-branch": libSQL accepts DROP COLUMN and RENAME COLUMN (measured on
+  // sqld 0.24.33), so it takes the generic branch for those and only the column
+  // MODIFICATION is inexpressible - which is what NO_COLUMN_MODIFICATION records.
+  libsql: {
+    label: "libSQL",
+    reason: "SQLite cannot retype a column; recreate the table and copy the rows.",
+  },
+  // The third answer, and DuckDB is the first id to need it: the PostgreSQL branch is
+  // reached AND every statement it emits was measured running on v1.5.5 - `ALTER
+  // COLUMN "a" TYPE BIGINT`, `SET NOT NULL`, `DROP NOT NULL`, `SET DEFAULT 1` and
+  // `DROP DEFAULT` all answered OK. So this is not the silent inheritance #269 closed;
+  // it is a measured decision that the shared arm is correct here, and the test below
+  // pins the DDL rather than a comment.
+  duckdb: "postgres-branch-measured",
   oracle: "has-own-branch",
   mssql: "has-own-branch",
   clickhouse: "has-own-branch",
@@ -888,9 +1056,119 @@ const MODIFIED_COLUMN_COVERAGE: Record<DatabaseType, { label: string; reason: st
   libredb: { label: "LibreDB", reason: "JSON command grammar" },
 };
 
+/**
+ * DuckDB is the one id that reaches the PostgreSQL arm on purpose and is refused on the
+ * two foreign-key ones. Every expectation below is a statement measured on v1.5.5
+ * through `@duckdb/node-api` 1.5.5-r.4, so this block is where the measurement is
+ * pinned rather than only described in a comment.
+ */
+describe("generateMigrationSQL: duckdb", () => {
+  test("a modified column emits the real ALTER COLUMN DDL, not a limitation comment", () => {
+    const sql = generateMigrationSQL(makeModifiedTableDiff(), "duckdb");
+
+    expect(sql).toContain('ALTER TABLE "users" ALTER COLUMN "name" TYPE varchar(255);');
+    expect(sql).toContain('ALTER TABLE "users" ALTER COLUMN "name" SET NOT NULL;');
+    expect(sql).toContain('ALTER TABLE "users" ALTER COLUMN "name" SET DEFAULT \'unknown\';');
+    expect(sql).not.toContain("Cannot alter column");
+  });
+
+  test("added and dropped columns take the standard spelling, which DuckDB accepts", () => {
+    const sql = generateMigrationSQL(makeModifiedTableDiff(), "duckdb");
+
+    expect(sql).toContain('ALTER TABLE "users" ADD COLUMN "phone" varchar(20);');
+    expect(sql).toContain('ALTER TABLE "users" DROP COLUMN "legacy_col";');
+  });
+
+  test("an added foreign key is declined in words, because ADD CONSTRAINT ... FOREIGN KEY is not implemented", () => {
+    const sql = generateMigrationSQL(makeModifiedTableDiff(), "duckdb");
+
+    expect(sql).toContain('-- DuckDB: Cannot add a foreign key on "dept_id".');
+    expect(sql).toContain("recreate the table and copy the rows");
+    // The words `ADD CONSTRAINT` appear in the comment itself, so the assertion is that
+    // no STATEMENT carries them - not that the text does not.
+    expect(sql).not.toMatch(/^ALTER TABLE .*ADD CONSTRAINT/m);
+  });
+
+  test("a removed foreign key is declined too, since DROP CONSTRAINT is not an IF EXISTS no-op here", () => {
+    const sql = generateMigrationSQL(makeModifiedTableDiff(), "duckdb");
+
+    expect(sql).toContain("-- DuckDB: Cannot drop a foreign key directly. Requires table recreation.");
+    expect(sql).not.toContain("DROP CONSTRAINT");
+  });
+
+  test("the migration is still wrapped in a transaction, because DuckDB DDL is transactional", () => {
+    const sql = generateMigrationSQL(makeModifiedTableDiff(), "duckdb");
+
+    expect(sql).toContain("BEGIN;");
+    expect(sql).toContain("COMMIT;");
+  });
+
+  /*
+    The created-table half of the same measurement, and the reason `duckdb` had to join
+    FOREIGN_KEY_ONLY_IN_CREATE_TABLE: without an entry there the generator emitted the very
+    `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY` that this engine answers with "Not
+    implemented Error", one screen away from the modified-table path that declines to emit it.
+
+    The statement is not merely asserted, it is EXECUTED against a real embedded DuckDB - the
+    only assertion that can tell a runnable migration from a plausible-looking one - and the
+    key is then read back out of `duckdb_constraints()` to prove the engine kept it rather
+    than parsed and dropped it.
+  */
+  test("an added table declares its foreign key inside CREATE TABLE, and the engine accepts it", async () => {
+    const diff = makeAddedTableDiff();
+    // The shared fixture declares no `dept_id`, and the two string-only tests above never
+    // needed one. An executing assertion does: DuckDB answers `Binder Error: column
+    // "dept_id" named in key does not exist` for a key over a column the statement omits,
+    // which is itself a small proof that the engine is really reading this SQL.
+    diff.tables[0].columns.push({
+      action: "added",
+      columnName: "dept_id",
+      targetType: "integer",
+      targetNullable: true,
+      targetIsPrimary: false,
+      changes: ['Added column "dept_id"'],
+    });
+    diff.tables[0].foreignKeys = [
+      {
+        action: "added",
+        columnName: "dept_id",
+        targetReferencedTable: "departments",
+        targetReferencedColumn: "id",
+        changes: ["Added FK"],
+      },
+    ];
+    const sql = generateMigrationSQL(diff, "duckdb");
+
+    expect(sql).toContain('FOREIGN KEY ("dept_id") REFERENCES "departments"("id")');
+    expect(sql).not.toContain("ADD CONSTRAINT");
+
+    const { DuckDBInstance } = await import("@duckdb/node-api");
+    const instance = await DuckDBInstance.create(":memory:");
+    const connection = await instance.connect();
+    try {
+      // The parent the generated statement references; the diff carries only the child.
+      await connection.run('CREATE TABLE "departments" ("id" integer NOT NULL, PRIMARY KEY ("id"))');
+      // Only the table body: the migration's own BEGIN/COMMIT and comment lines are not the
+      // subject here, and `run` takes one statement.
+      const createTable = sql.slice(sql.indexOf('CREATE TABLE "users"'), sql.indexOf("\n);") + 3);
+      await connection.run(createTable);
+
+      const declared = await connection.runAndReadAll(
+        "SELECT table_name, constraint_column_names, referenced_table FROM duckdb_constraints() WHERE constraint_type = 'FOREIGN KEY'",
+      );
+      expect(declared.getRowObjectsJson()).toEqual([
+        { table_name: "users", constraint_column_names: ["dept_id"], referenced_table: "departments" },
+      ]);
+    } finally {
+      connection.disconnectSync();
+      instance.closeSync();
+    }
+  });
+});
+
 describe("generateMigrationSQL: dialects that cannot modify a column", () => {
   for (const [dialect, expected] of Object.entries(MODIFIED_COLUMN_COVERAGE)) {
-    if (expected === "has-own-branch") continue;
+    if (typeof expected === "string") continue;
 
     test(`${dialect}: modified column emits a comment naming the limitation, never PostgreSQL DDL`, () => {
       const sql = generateMigrationSQL(makeModifiedTableDiff(), dialect as DatabaseType);
@@ -900,6 +1178,91 @@ describe("generateMigrationSQL: dialects that cannot modify a column", () => {
       expect(sql).not.toContain("MODIFY COLUMN");
       expect(sql).not.toContain("MODIFY (");
     });
+  }
+});
+
+/**
+ * Exhaustive by construction, same spirit as `MODIFIED_COLUMN_COVERAGE` above: a new
+ * `DatabaseType` fails typecheck here until it is classified, so it cannot silently
+ * inherit the wrapper meant for PostgreSQL and MySQL (#284).
+ *
+ * `"wrapped"` — the dialect's DDL is bracketed in `BEGIN;` / `COMMIT;`.
+ * `"unwrapped"` — no wrapper reaches the migration text. mssql and oracle are
+ * deliberately absent from this table's classification of "unwrapped" — they still
+ * read `"wrapped"` here, UNCHANGED from today's behaviour, because the module
+ * docstring and the issue itself say their real wrapper forms (`BEGIN TRANSACTION;`
+ * for MSSQL; whether Oracle needs one at all, given DDL there auto-commits) want
+ * checking against a live server before they are settled, the way #264/#265 were -
+ * and this PR does not have one available. Tracked as the named follow-up rather than
+ * guessed here.
+ */
+const TRANSACTION_WRAPPER_COVERAGE: Record<DatabaseType, "wrapped" | "unwrapped"> = {
+  postgres: "wrapped",
+  mysql: "wrapped",
+  // Measured live via @duckdb/node-api 1.5.5-r.4 (DuckDB v1.5.5, in-process, no server
+  // needed): `BEGIN;` / `BEGIN TRANSACTION;` both open a real transaction around DDL,
+  // and a `CREATE TABLE` issued inside one is undone by `ROLLBACK;` — pinned further in
+  // the "generateMigrationSQL: duckdb" describe block above.
+  duckdb: "wrapped",
+  // UNCHANGED — see this table's own doc comment above.
+  mssql: "wrapped",
+  oracle: "wrapped",
+  sqlite: "unwrapped", // runs its own transaction (module docstring)
+  libsql: "unwrapped", // SQLite fork, same reasoning, plus its own Hrana-stream note (module docstring)
+  cassandra: "unwrapped", // CQL has no BEGIN/COMMIT — measured on 5.0.9 (module docstring)
+  // The remaining nine each have a recorded reason for having no `BEGIN;` to emit, in this
+  // same module (`NO_COLUMN_MODIFICATION`), in `src/lib/sql/grammar.ts` (`NON_SQL_DIALECTS`)
+  // or in the provider doc named on the line — this table applies those established facts to
+  // the wrapper fallback rather than asserting fresh ones, so none of the nine needs a new
+  // live probe. What none of them means is "the wrapper bracketed nothing": see the
+  // added-table fixture below.
+  mongodb: "unwrapped", // not SQL text at all (`NON_SQL_DIALECTS`); wrapping non-SQL in SQL statements is wrong regardless of Mongo's own transaction API
+  redis: "unwrapped", // same: command-line grammar, not SQL (`NON_SQL_DIALECTS`)
+  libredb: "unwrapped", // "a JSON command grammar, not SQL DDL" (NO_COLUMN_MODIFICATION's own words)
+  couchbase: "unwrapped", // has transactions, but spells them `BEGIN TRANSACTION` + a txid every later statement must carry — not something a flat file expresses (docs/providers/couchbase.md §13)
+  druid: "unwrapped", // "Druid SQL has no ALTER TABLE" and no transaction concept at all (NO_COLUMN_MODIFICATION)
+  clickhouse: "unwrapped", // ClickHouse's transaction support is experimental and setting-gated, not a safe default; today's code wraps it anyway, which this fixes
+  elasticsearch: "unwrapped", // `BEGIN` is not in the grammar (NO_COLUMN_MODIFICATION's measured statement list; docs/providers/elasticsearch.md §9)
+  opensearch: "unwrapped", // same, measured separately on OpenSearch 3.8.0 (docs/providers/opensearch.md §9)
+  trino: "unwrapped", // connector-dependent at best; no portable BEGIN/COMMIT (NO_COLUMN_MODIFICATION)
+};
+
+/**
+ * Two fixtures, because one of them alone cannot see the thing that matters here.
+ *
+ * `generateMigrationSQL` reads NO provider capability — not `supportsCreateTable`, not
+ * anything else — so its added-table branch emits a real `CREATE TABLE` for every id
+ * except `cassandra`, which is the one the generator refuses outright
+ * (`CASSANDRA_NO_CREATE_TABLE`). A modified-table diff on an id in
+ * `NO_COLUMN_MODIFICATION` really does reduce to comments, so a table driven only by
+ * that fixture would let "this dialect never gets DDL, so the wrapper bracketed nothing"
+ * stand unchallenged. It is false: the wrapper this set removes was bracketing runnable
+ * DDL for those ids too, which is why removing it is a fix rather than a tidy-up.
+ */
+const WRAPPER_FIXTURES = [
+  { label: "a modified table", makeDiff: makeModifiedTableDiff, emitsCreateTable: false },
+  { label: "an added table", makeDiff: makeAddedTableDiff, emitsCreateTable: true },
+] as const;
+
+describe("generateMigrationSQL: transaction wrapper by dialect", () => {
+  for (const [dialect, expected] of Object.entries(TRANSACTION_WRAPPER_COVERAGE)) {
+    for (const fixture of WRAPPER_FIXTURES) {
+      test(`${dialect}: ${expected === "wrapped" ? "wraps DDL in BEGIN;/COMMIT;" : "emits no transaction wrapper"} for ${fixture.label}`, () => {
+        const sql = generateMigrationSQL(fixture.makeDiff(), dialect as DatabaseType);
+        // Non-vacuity guard: on the added-table fixture the wrapper assertion below is
+        // about text that brackets a real statement, not an empty run of comments.
+        if (fixture.emitsCreateTable && dialect !== "cassandra") {
+          expect(sql).toMatch(/^CREATE TABLE /m);
+        }
+        if (expected === "wrapped") {
+          expect(sql).toContain("BEGIN;");
+          expect(sql).toContain("COMMIT;");
+        } else {
+          expect(sql).not.toContain("BEGIN;");
+          expect(sql).not.toContain("COMMIT;");
+        }
+      });
+    }
   }
 });
 

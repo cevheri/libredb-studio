@@ -1,6 +1,7 @@
 import "../setup-dom";
 
 import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
+import { useEffect, useRef } from "react";
 import { renderHook, act } from "@testing-library/react";
 import { mockGlobalFetch, restoreGlobalFetch } from "../helpers/mock-fetch";
 
@@ -16,6 +17,28 @@ const DEFAULT_PORTS: Record<string, string> = {
   couchbase: "8091",
 };
 
+// The engines whose addressing fields diverge from the networked default. Spelled out
+// rather than collapsed to "everything but the file-based ones": `connectionFields` is what
+// `buildConnection` writes from, so a mock that hands every type the full set cannot fail
+// when the real list is wrong - which is how Redis came to have its ACL user discarded by a
+// list that omitted `user` while the provider authenticated with it. The real table is the
+// authority; tests/unit/lib/db-ui-config.test.ts derives it from the provider sources.
+const MOCK_CONNECTION_FIELDS: Record<string, string[]> = {
+  sqlite: ["database"],
+  libredb: ["database"],
+  duckdb: ["database"],
+  libsql: ["host", "port", "password", "connectionString"],
+  // Named explicitly even though it matches the default: it is the one this table exists
+  // for, and `user` being present here is a statement about the real config, not a
+  // convenience.
+  redis: ["host", "port", "user", "password", "database"],
+  druid: ["host", "port", "user", "password"],
+  elasticsearch: ["host", "port", "user", "password"],
+  opensearch: ["host", "port", "user", "password"],
+};
+const mockFields = (type: string): string[] =>
+  MOCK_CONNECTION_FIELDS[type] ?? ["host", "port", "user", "password", "database"];
+
 mock.module("@/lib/db-ui-config", () => ({
   getDBConfig: (type: string) => ({
     label: type.charAt(0).toUpperCase() + type.slice(1),
@@ -28,9 +51,9 @@ mock.module("@/lib/db-ui-config", () => ({
     // else. A mock that gave every type the full network field set would hide what
     // the editor does to a SQLite or LibreDB connection, which is exactly where it
     // went wrong.
-    connectionFields:
-      type === "sqlite" || type === "libredb" ? ["database"] : ["host", "port", "user", "password", "database"],
+    connectionFields: mockFields(type),
   }),
+  takesConnectionField: (type: string, field: string) => mockFields(type).includes(field),
 }));
 
 import { useConnectionForm } from "@/hooks/use-connection-form";
@@ -109,6 +132,49 @@ describe("useConnectionForm", () => {
     expect(result.current.environment).toBe("staging");
   });
 
+  // ── The edit target is applied before the first commit ────────────────────
+
+  /**
+   * The population happens DURING the render that first sees `editConnection`, not
+   * in an effect afterwards. The difference is invisible to a test that reads
+   * `result.current` (React Testing Library has already flushed the effects by
+   * then), so this one snapshots the values as of the first commit: with an effect
+   * they are the postgres defaults, and the user sees a frame of them.
+   */
+  test("applies the edit target in the first committed render", () => {
+    const editConn: DatabaseConnection = {
+      id: "edit-first-commit",
+      name: "Committed First",
+      type: "mysql",
+      host: "db.first-commit.example",
+      port: 3306,
+      createdAt: new Date(),
+    };
+
+    const firstCommit: { type?: string; host?: string; name?: string } = {};
+
+    renderHook(() => {
+      const form = useConnectionForm({ ...defaultProps, editConnection: editConn });
+      const recorded = useRef(false);
+      // The guard, not an empty dependency array, is what pins this to the FIRST
+      // commit: the effect is allowed to re-run when the values change, but only the
+      // first reading is kept — which is exactly what an effect-based population
+      // would have got wrong, by committing the defaults before repopulating.
+      useEffect(() => {
+        if (recorded.current) return;
+        recorded.current = true;
+        firstCommit.type = form.type;
+        firstCommit.host = form.host;
+        firstCommit.name = form.name;
+      }, [form.type, form.host, form.name]);
+      return form;
+    });
+
+    expect(firstCommit.type).toBe("mysql");
+    expect(firstCommit.host).toBe("db.first-commit.example");
+    expect(firstCommit.name).toBe("Committed First");
+  });
+
   // ── Reset form when modal closes ──────────────────────────────────────────
 
   test("resets form when modal closes (isOpen false)", () => {
@@ -136,6 +202,126 @@ describe("useConnectionForm", () => {
     expect(result.current.type).toBe("postgres");
     expect(result.current.host).toBe("localhost");
     expect(result.current.port).toBe("5432");
+  });
+
+  /**
+   * A dialog can mount already closed with an edit target — the shell renders this hook
+   * whether or not the dialog is on screen — and that mount must apply the target, in
+   * the first committed render, exactly as the open one does.
+   *
+   * The first-commit reading is the whole point: a plain `result.current` check passes
+   * against the effect-based population too (React Testing Library has flushed the
+   * effects by then), so it would pin nothing. Reading the first commit is what
+   * separates the two — with the population in an effect, this mount commits the
+   * postgres/localhost defaults first, the same frame of wrong values the open dialog
+   * was fixed for.
+   */
+  test("a dialog mounted closed with an edit target applies it in the first committed render", () => {
+    const editConn: DatabaseConnection = {
+      id: "edit-closed",
+      name: "Closed But Editing",
+      type: "mysql",
+      host: "closed.example.com",
+      port: 3306,
+      database: "closeddb",
+      createdAt: new Date(),
+    };
+
+    const firstCommit: { name?: string; host?: string; database?: string } = {};
+
+    const { result } = renderHook(() => {
+      const form = useConnectionForm({ ...defaultProps, isOpen: false, editConnection: editConn });
+      const recorded = useRef(false);
+      useEffect(() => {
+        if (recorded.current) return;
+        recorded.current = true;
+        firstCommit.name = form.name;
+        firstCommit.host = form.host;
+        firstCommit.database = form.database;
+      }, [form.name, form.host, form.database]);
+      return form;
+    });
+
+    expect(firstCommit.name).toBe("Closed But Editing");
+    expect(firstCommit.host).toBe("closed.example.com");
+    expect(firstCommit.database).toBe("closeddb");
+    expect(result.current.name).toBe("Closed But Editing");
+  });
+
+  /**
+   * The other half of the reset's guard, now that the edit target's absence is itself a
+   * trigger: closing the dialog on a connection that is STILL being edited must leave
+   * its fields alone. The trigger fires on that transition too, and only the guard
+   * stops it from blanking the connection the dialog will reopen on.
+   */
+  test("closing the dialog while the edit target remains keeps that connection's fields", () => {
+    const editConn: DatabaseConnection = {
+      id: "edit-still-open",
+      name: "Still Editing",
+      type: "postgres",
+      host: "still.example.com",
+      port: 5432,
+      user: "pgadmin",
+      password: "pgpass",
+      database: "stilldb",
+      createdAt: new Date(),
+    };
+
+    const { result, rerender } = renderHook((props) => useConnectionForm(props), {
+      initialProps: { ...defaultProps, isOpen: true, editConnection: editConn },
+    });
+
+    rerender({ ...defaultProps, isOpen: false, editConnection: editConn });
+
+    expect(result.current.name).toBe("Still Editing");
+    expect(result.current.user).toBe("pgadmin");
+    expect(result.current.password).toBe("pgpass");
+    expect(result.current.database).toBe("stilldb");
+    expect(result.current.host).toBe("still.example.com");
+  });
+
+  /**
+   * The credentials of the connection last edited must not open the NEXT dialog.
+   *
+   * `Studio.tsx` happens to clear `editConnection` and `isOpen` in the same handler
+   * today, so `isOpen` co-changes and the close transition does the clearing — but a
+   * caller that drops the edit target on its own is not doing anything wrong, and the
+   * price of the hook not covering it is another connection's user, password and
+   * database sitting in the Add-Connection dialog when it opens.
+   */
+  test("dropping the edit target while closed clears the credentials before the dialog reopens", () => {
+    const editConn: DatabaseConnection = {
+      id: "edit-dropped",
+      name: "Prod PG",
+      type: "postgres",
+      host: "prod.example.com",
+      port: 5432,
+      user: "pgadmin",
+      password: "pgpass",
+      database: "prod",
+      createdAt: new Date(),
+    };
+
+    const { result, rerender } = renderHook((props) => useConnectionForm(props), {
+      // Widened deliberately: the point of this test is the rerender that drops the
+      // target, and inferring the initial props from `editConn` alone would type the
+      // field as non-nullable.
+      initialProps: { ...defaultProps, isOpen: false, editConnection: editConn as DatabaseConnection | null },
+    });
+
+    expect(result.current.user).toBe("pgadmin");
+    expect(result.current.password).toBe("pgpass");
+
+    // The edit target goes away while the dialog is still closed…
+    rerender({ ...defaultProps, isOpen: false, editConnection: null });
+    // …and only then does it open, as the Add-Connection dialog.
+    rerender({ ...defaultProps, isOpen: true, editConnection: null });
+
+    expect(result.current.name).toBe("");
+    expect(result.current.user).toBe("");
+    expect(result.current.password).toBe("");
+    expect(result.current.database).toBe("");
+    expect(result.current.host).toBe("localhost");
   });
 
   // ── handleTestConnection calls POST ────────────────────────────────────────
@@ -172,7 +358,7 @@ describe("useConnectionForm", () => {
     });
 
     expect(result.current.testResult).not.toBeNull();
-    expect(result.current.testResult!.success).toBe(true);
+    expect(result.current.testResult!.tone).toBe("success");
     expect(result.current.testResult!.message).toContain("Connected successfully");
     expect(result.current.testResult!.latency).toBe(25);
   });
@@ -191,7 +377,7 @@ describe("useConnectionForm", () => {
     });
 
     expect(result.current.testResult).not.toBeNull();
-    expect(result.current.testResult!.success).toBe(false);
+    expect(result.current.testResult!.tone).toBe("error");
     expect(result.current.testResult!.message).toBe("Connection refused");
   });
 
@@ -255,7 +441,7 @@ describe("useConnectionForm", () => {
     // alone would not have caught this, because the earlier eligibility tests built
     // their "edited" copy by hand rather than through the editor that produces it.
     const served = { ...seedCopy, createdAt: seedCopy.createdAt.toISOString() };
-    expect(resolveAgentRunConnectionId(saved, [served])).toBe("seed:sample");
+    expect(resolveAgentRunConnectionId(saved, { loaded: true, seeds: [served] })).toEqual({ id: "seed:sample" });
   });
 
   /*
@@ -305,7 +491,9 @@ describe("useConnectionForm", () => {
     expect(saved.password).toBeUndefined();
 
     const served = { ...sqliteSeed, createdAt: sqliteSeed.createdAt.toISOString() };
-    expect(resolveAgentRunConnectionId(saved, [served])).toBe("seed:sqlite-embedded-sample");
+    expect(resolveAgentRunConnectionId(saved, { loaded: true, seeds: [served] })).toEqual({
+      id: "seed:sqlite-embedded-sample",
+    });
   });
 
   // Preserving must not resurrect what the user turned OFF: the form owns TLS and
@@ -387,7 +575,7 @@ describe("useConnectionForm", () => {
 
     expect(onConnect).not.toHaveBeenCalled();
     expect(result.current.testResult).not.toBeNull();
-    expect(result.current.testResult!.success).toBe(false);
+    expect(result.current.testResult!.tone).toBe("error");
   });
 
   /*
@@ -425,7 +613,10 @@ describe("useConnectionForm", () => {
     });
 
     // Nothing saved yet - but the user is told what was found, in the server's words.
+    // The sentence asks the user to click again, which is neither a success nor a
+    // failure, so it renders neither (#498): the warning tone, not the green tick.
     expect(onConnect).not.toHaveBeenCalled();
+    expect(result.current.testResult!.tone).toBe("warning");
     expect(result.current.testResult!.message).toContain("Keyspace system_views does not exist");
     expect(result.current.testResult!.message).toContain("again");
 
@@ -478,7 +669,7 @@ describe("useConnectionForm", () => {
     });
 
     expect(onConnect).not.toHaveBeenCalled();
-    expect(result.current.testResult!.success).toBe(false);
+    expect(result.current.testResult!.tone).toBe("error");
   });
 
   test("Test Connection reports the degradation rather than a bare success", async () => {
@@ -490,9 +681,10 @@ describe("useConnectionForm", () => {
       await result.current.handleTestConnection();
     });
 
-    // It connected, so the result is a success - and the sentence says what is missing
-    // instead of the "Connected successfully" that hid it.
-    expect(result.current.testResult!.success).toBe(true);
+    // It connected, so this is not an error - but it is not a plain success either:
+    // the sentence says what is missing instead of the "Connected successfully" that
+    // hid it, so it gets the warning tone (#498).
+    expect(result.current.testResult!.tone).toBe("warning");
     expect(result.current.testResult!.message).toContain("no health data");
   });
 
@@ -539,6 +731,7 @@ describe("useConnectionForm", () => {
       await result.current.handleConnect();
     });
     expect(onConnect).not.toHaveBeenCalled();
+    expect(result.current.testResult!.tone).toBe("warning");
     expect(result.current.testResult!.message).toContain("no monitoring here");
 
     await act(async () => {
@@ -568,7 +761,7 @@ describe("useConnectionForm", () => {
     expect(result.current.password).toBe("secret");
     expect(result.current.database).toBe("parsed-db");
     expect(result.current.testResult).not.toBeNull();
-    expect(result.current.testResult!.success).toBe(true);
+    expect(result.current.testResult!.tone).toBe("success");
     expect(result.current.testResult!.message).toContain("parsed successfully");
   });
 
@@ -638,6 +831,145 @@ describe("useConnectionForm", () => {
     expect(result.current.sslMode).toBe("require");
   });
 
+  // ── TLS carried in the pasted string's query string ────────────────────────
+
+  test("handlePasteConnectionString applies a postgres sslmode from the query string", () => {
+    const { result } = renderHook(() => useConnectionForm(defaultProps));
+
+    act(() => {
+      result.current.setPasteInput("postgresql://u:p@pg.example.com:5432/app?sslmode=verify-full");
+    });
+    act(() => {
+      result.current.handlePasteConnectionString();
+    });
+
+    expect(result.current.sslMode).toBe("verify-full");
+    expect(result.current.testResult!.message).toContain("parsed successfully");
+    expect(result.current.testResult!.message).not.toContain("SSL Mode");
+  });
+
+  test("handlePasteConnectionString applies MySQL's ssl-mode=REQUIRED", () => {
+    const { result } = renderHook(() => useConnectionForm(defaultProps));
+
+    act(() => {
+      result.current.setPasteInput("mysql://root:pw@my.example.com/app?ssl-mode=REQUIRED");
+    });
+    act(() => {
+      result.current.handlePasteConnectionString();
+    });
+
+    expect(result.current.sslMode).toBe("require");
+  });
+
+  test("handlePasteConnectionString reads Encrypt out of an ADO.NET string", () => {
+    const { result } = renderHook(() => useConnectionForm(defaultProps));
+
+    act(() => {
+      result.current.setPasteInput("Server=sql.example.com,1433;Database=db;Encrypt=True;TrustServerCertificate=True;");
+    });
+    act(() => {
+      result.current.handlePasteConnectionString();
+    });
+
+    expect(result.current.type).toBe("mssql");
+    expect(result.current.sslMode).toBe("require");
+  });
+
+  // The caution has to be VISIBLE, and visible in the right colour. The paste itself
+  // worked - every other field was filled in - so this is not a red refusal (that was
+  // the affordance-contradicts-the-sentence defect of #449 in the other direction: a
+  // green tick over "your TLS setting was dropped"); it is the amber warning tone
+  // #U19 added, because the parse both worked AND lost something.
+  test("handlePasteConnectionString warns when it refuses to map an opportunistic sslmode", () => {
+    const { result } = renderHook(() => useConnectionForm(defaultProps));
+
+    act(() => {
+      result.current.setPasteInput("postgres://u:p@pg.example.com/app?sslmode=prefer");
+    });
+    act(() => {
+      result.current.handlePasteConnectionString();
+    });
+
+    expect(result.current.sslMode).toBe("disable");
+    expect(result.current.testResult!.tone).toBe("warning");
+    expect(result.current.testResult!.message).toContain("sslmode=prefer");
+    expect(result.current.testResult!.message).toContain("SSL Mode");
+    // The banner must not read as a plain, unqualified success in its own text either.
+    expect(result.current.testResult!.message).not.toContain("parsed successfully");
+  });
+
+  test("an unmapped TLS parameter does not overwrite a mode the form already holds", () => {
+    const { result } = renderHook(() => useConnectionForm(defaultProps));
+
+    act(() => {
+      result.current.setSSLMode("verify-ca");
+    });
+    act(() => {
+      result.current.setPasteInput("mysql://root:pw@my.example.com/app?ssl-mode=PREFERRED");
+    });
+    act(() => {
+      result.current.handlePasteConnectionString();
+    });
+
+    expect(result.current.sslMode).toBe("verify-ca");
+    expect(result.current.testResult!.tone).toBe("warning");
+    expect(result.current.testResult!.message).toContain("ssl-mode=PREFERRED");
+    expect(result.current.testResult!.message).toContain("verify-ca");
+    // The fields WERE filled, and the banner must not leave the user thinking otherwise.
+    expect(result.current.host).toBe("my.example.com");
+    expect(result.current.testResult!.message).toContain("other fields");
+  });
+
+  // A pasted MySQL URL carrying only the boolean spelling used to reach the form with no
+  // mode AND no banner. Both ends of a boolean are mappable, so this one is applied, not
+  // refused - and the banner stays the plain success.
+  test("handlePasteConnectionString applies MySQL's boolean useSSL=true", () => {
+    const { result } = renderHook(() => useConnectionForm(defaultProps));
+
+    act(() => {
+      result.current.setPasteInput("mysql://root:pw@my.example.com/app?useSSL=true");
+    });
+    act(() => {
+      result.current.handlePasteConnectionString();
+    });
+
+    expect(result.current.sslMode).toBe("verify-system");
+    expect(result.current.testResult!.tone).toBe("success");
+    expect(result.current.testResult!.message).toContain("parsed successfully");
+  });
+
+  // D26: the paste has to land on a mode the user can actually connect with. verify-system
+  // verifies AND asks for no certificate file, so a Neon/Supabase URL is complete as pasted.
+  test("a managed PostgreSQL URL's ssl=true lands on a verifying mode that needs no CA file", () => {
+    const { result } = renderHook(() => useConnectionForm(defaultProps));
+
+    act(() => {
+      result.current.setPasteInput("postgres://user:pw@ep-cool-1.eu-central-1.aws.neon.tech/neondb?ssl=true");
+    });
+    act(() => {
+      result.current.handlePasteConnectionString();
+    });
+
+    expect(result.current.sslMode).toBe("verify-system");
+    expect(result.current.caCert).toBe("");
+    expect(result.current.testResult!.tone).toBe("success");
+  });
+
+  // The banner names the modes it could not match the parameter to, so the list has to be
+  // the real one - a mode missing from the sentence is a mode the user does not know exists.
+  test("the unmapped-parameter banner names verify-system among the modes on offer", () => {
+    const { result } = renderHook(() => useConnectionForm(defaultProps));
+
+    act(() => {
+      result.current.setPasteInput("postgres://u:p@pg.example.com/app?sslmode=prefer");
+    });
+    act(() => {
+      result.current.handlePasteConnectionString();
+    });
+
+    expect(result.current.testResult!.message).toContain("verify-system");
+  });
+
   // ── handlePasteConnectionString shows error for invalid string ─────────────
 
   test("handlePasteConnectionString shows error for invalid string", () => {
@@ -652,7 +984,7 @@ describe("useConnectionForm", () => {
     });
 
     expect(result.current.testResult).not.toBeNull();
-    expect(result.current.testResult!.success).toBe(false);
+    expect(result.current.testResult!.tone).toBe("error");
     expect(result.current.testResult!.message).toContain("Could not parse");
   });
 
@@ -735,6 +1067,8 @@ describe("useConnectionForm", () => {
     opensearch: true,
     trino: true,
     cassandra: true,
+    libsql: true,
+    duckdb: true,
   };
 
   test("dbTypes offers every database type a connection can carry", () => {
@@ -779,7 +1113,7 @@ describe("useConnectionForm", () => {
     });
 
     expect(result.current.testResult).not.toBeNull();
-    expect(result.current.testResult!.success).toBe(false);
+    expect(result.current.testResult!.tone).toBe("error");
     expect(result.current.testResult!.message).toContain("Network error");
   });
 
@@ -1346,7 +1680,7 @@ describe("useConnectionForm", () => {
     });
 
     expect(result.current.testResult).not.toBeNull();
-    expect(result.current.testResult!.success).toBe(false);
+    expect(result.current.testResult!.tone).toBe("error");
     expect(result.current.testResult!.message).toContain("Network error");
   });
 
@@ -1422,7 +1756,7 @@ describe("useConnectionForm", () => {
     // The adapter replaces the built-in fetch entirely
     expect(onTestConnection).toHaveBeenCalledTimes(1);
     expect(fetchMock).not.toHaveBeenCalled();
-    expect(result.current.testResult?.success).toBe(true);
+    expect(result.current.testResult?.tone).toBe("success");
     expect(result.current.testResult?.message).toBe("Connected successfully (42ms)");
     expect(result.current.testResult?.latency).toBe(42);
   });
@@ -1437,7 +1771,7 @@ describe("useConnectionForm", () => {
       await result.current.handleTestConnection();
     });
 
-    expect(result.current.testResult?.success).toBe(false);
+    expect(result.current.testResult?.tone).toBe("error");
     expect(result.current.testResult?.message).toBe("Auth failed");
   });
 
@@ -1460,5 +1794,72 @@ describe("useConnectionForm", () => {
     expect(defaultProps.onConnect).toHaveBeenCalledTimes(1);
     // Form is reset after a successful connect
     expect(result.current.name).toBe("");
+  });
+
+  // ── an addressing field is written when, and only when, the engine takes it ───
+
+  test("a Redis ACL username reaches the saved connection", async () => {
+    // `RedisProvider.connect()` passes `config.user` to ioredis as `username`, and its
+    // docblock records the two-arm measurement behind it (#502): without it `ACL WHOAMI`
+    // answered `default`, so a restricted principal reported full health. That repair is
+    // only reachable if the write list names the field, and it did not - the value was
+    // discarded between the box the user typed it into and the driver that needed it.
+    //
+    // What this test pins is the MECHANISM: given a list that names `user`, the field
+    // survives the save. It cannot pin the list itself, because this file mocks
+    // `@/lib/db-ui-config` - that is what
+    // tests/unit/lib/db-ui-config.test.ts does, deriving each engine's fields from
+    // whether its provider source ever reads them.
+    mockGlobalFetch({
+      "/api/db/test-connection": { ok: true, json: { success: true, latency: 5 } },
+    });
+
+    const onConnect = mock(() => {});
+    const { result } = renderHook(() => useConnectionForm({ ...defaultProps, onConnect }));
+
+    act(() => {
+      result.current.setType("redis");
+      result.current.setUser("probe");
+      result.current.setPassword("probepw");
+    });
+
+    await act(async () => {
+      await result.current.handleConnect();
+    });
+
+    const saved = (onConnect.mock.calls as unknown[][])[0][0] as DatabaseConnection;
+    expect(saved.user).toBe("probe");
+    expect(saved.password).toBe("probepw");
+  });
+
+  test("a user name and database typed for libSQL are not saved, because it takes neither", async () => {
+    // The modal renders no box for either now, so this is the write half of the same
+    // rule: were a value to arrive anyway - a stale form state, a future edit to the
+    // modal - nothing carries it onto a libSQL connection. The engine authenticates with
+    // a token the server minted and is addressed entirely by URL.
+    mockGlobalFetch({
+      "/api/db/test-connection": { ok: true, json: { success: true, latency: 5 } },
+    });
+
+    const onConnect = mock(() => {});
+    const { result } = renderHook(() => useConnectionForm({ ...defaultProps, onConnect }));
+
+    act(() => {
+      result.current.setType("libsql");
+      result.current.setUser("ignored");
+      result.current.setDatabase("also-ignored");
+      result.current.setHost("db.turso.io");
+    });
+
+    await act(async () => {
+      await result.current.handleConnect();
+    });
+
+    const saved = (onConnect.mock.calls as unknown[][])[0][0] as DatabaseConnection;
+    expect(saved.user).toBeUndefined();
+    expect(saved.database).toBeUndefined();
+    // Non-vacuous: the connection WAS built, and the fields libSQL does take survived.
+    expect(saved.host).toBe("db.turso.io");
+    expect(saved.type).toBe("libsql");
   });
 });

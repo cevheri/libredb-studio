@@ -529,6 +529,16 @@ export class ClickHouseProvider extends SQLBaseProvider {
       declaresForeignKeys: false,
       supportsMaintenance: true,
       maintenanceOperations: ["optimize", "analyze", "kill"],
+      // `OPTIMIZE TABLE ... FINAL` names ONE table and `dispatchMaintenance` requires
+      // that target, so the whole-database form is withheld: ClickHouse has no
+      // "optimize database", and looping every table would merge the entire dataset
+      // behind one click (#496). `describeParts` deliberately accepts no target as
+      // well as one, which is why analyze is offered in both placements.
+      maintenanceOperationSpecs: {
+        optimize: { label: "Optimize Table", perEntity: true, global: false },
+        analyze: { label: "Table Statistics", perEntity: true, global: true },
+        kill: { label: "Cancel Query", perEntity: false, global: false },
+      },
       supportsConnectionString: true,
       defaultPort: 8123,
       schemaRefreshPattern: "\\b(CREATE|DROP|ALTER|RENAME|TRUNCATE|ATTACH|DETACH)\\b",
@@ -545,17 +555,30 @@ export class ClickHouseProvider extends SQLBaseProvider {
       ...super.getLabels(),
       analyzeAction: "Table Statistics",
       vacuumAction: "Optimize Table",
+      // The vacuum slot names `optimize`, not a vacuum ClickHouse does not have. The
+      // global card stays withheld even so - `optimize` declares `global: false`
+      // above, because OPTIMIZE names one table - and this is what stops the surface
+      // reading the slot as a `vacuum` this provider rejects (#496).
+      vacuumActionOperation: "optimize",
       analyzeGlobalLabel: "Table Statistics",
       analyzeGlobalTitle: "Table Statistics",
       analyzeGlobalDesc:
         "ClickHouse has no ANALYZE: a MergeTree's statistics are its parts and are always current, so this reports them rather than computing anything.",
+      // DELIBERATELY UNREACHABLE, and kept as the honest thing to inherit rather than
+      // PostgreSQL's "Removes dead rows and returns space to the operating system",
+      // which describes a statement ClickHouse does not have. The global vacuum card
+      // is the `vacuumActionOperation` above, and `optimize` declares `global: false`,
+      // so no surface can render these three - asserted in
+      // tests/integration/db/clickhouse-provider.test.ts rather than left as a claim.
+      // ProviderLabels requires all three, so "drop them" is not available; what U9
+      // removed was wording that was written and never shown WITHOUT saying so.
       vacuumGlobalLabel: "Optimize",
       vacuumGlobalTitle: "Merge Parts",
       vacuumGlobalDesc:
         "Runs OPTIMIZE TABLE ... FINAL, which merges a table's parts and applies pending mutations. ClickHouse reclaims space by merging, so there is no VACUUM equivalent.",
       // `getSlowQueries()` reads system.query_log, which records nothing while
       // `log_queries` is off - a different fact from the PostgreSQL extension the panel
-      // used to advertise (#U12).
+      // used to advertise (#463).
       slowQueriesEmptyState: "Query stats come from system.query_log, which records nothing while log_queries is off.",
     };
   }

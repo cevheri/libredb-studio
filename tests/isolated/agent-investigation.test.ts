@@ -11,6 +11,8 @@ import {
   AGENT_CITATION_RULE,
   AGENT_REPORT_RESERVE_NOTICE,
   type AgentToolResources,
+  guidanceDelivered,
+  PLAN_NO_REASONING_EFFORT,
   runInvestigation,
 } from "@/lib/agent/investigation";
 import type { AgentModel } from "@/lib/agent/model-adapter";
@@ -332,6 +334,7 @@ describe("a fresh run drives the investigation arc", () => {
     expect(result.turns).toBe(2);
     expect(kindsOf(await eventsOf(b.store, run.runId))).toEqual([
       "run-started",
+      "driver-resolved",
       // The drive's own schema capture, before the model was asked anything.
       "context-captured",
       "statement-drafted",
@@ -420,6 +423,7 @@ describe("a fresh run drives the investigation arc", () => {
     const events = await eventsOf(b.store, run.runId);
     expect(kindsOf(events)).toEqual([
       "run-started",
+      "driver-resolved",
       "context-captured",
       "tool-invoked",
       "tool-completed",
@@ -1198,6 +1202,56 @@ describe("planning mode runs no statement of the user's", () => {
         expect.stringContaining("pg_stats") as unknown as string,
       ]);
       expect(result.status).toBe("succeeded");
+    });
+
+    /*
+      The reuse, on the ledger, with the age of the reading (B56).
+
+      `holdSnapshotForConnection` has no expiry: newest reading wins, eviction is by use,
+      nothing re-reads. Measured 2026-08-22 — MongoDB's schema inference was changed, the
+      schema tree showed the new dotted paths at once, and two plan runs afterwards still
+      grouped by the old field with ledgers carrying no context event at all. So the record
+      could not tell "held, hours old" from "captured just now", and the only diagnosis
+      available was restarting the process.
+
+      Two hours are expressed as two clock readings rather than as a wait: the age is
+      measured against the drive's own clock, which is the seam these runs are given.
+    */
+    test("it records the reading it reused, and how old that reading was when it took it", async () => {
+      const capturedAtMs = 1_000_000;
+      const reader = boot(freshDataDir(), { answer: catalog });
+      const readerRun = await startRun(reader, "agent");
+      const readerScript = scriptedModel(answersProse("understood"));
+      await runInvestigation(readerRun.runId, {
+        service: reader.service,
+        model: await modelOver(readerScript.fetch),
+        resources: { ...reader.resources, clock: () => capturedAtMs },
+      });
+      const capture = (await eventsOf(reader.store, readerRun.runId)).find(
+        (event) => event.kind === "context-captured",
+      );
+
+      const b = boot(freshDataDir(), { answer: catalog });
+      const run = await startRun(b, "planning");
+      const script = scriptedModel(answersProse("a plan"));
+      await runInvestigation(run.runId, {
+        service: b.service,
+        model: await modelOver(script.fetch),
+        resources: { ...b.resources, clock: () => capturedAtMs + 7_200_000 },
+      });
+
+      const events = await eventsOf(b.store, run.runId);
+      const reused = events.find((event) => event.kind === "context-reused");
+      expect(reused).toBeDefined();
+      expect(reused?.ageMs).toBe(7_200_000);
+      // The reading it names is the one the earlier run recorded, which is what makes the
+      // entry provenance rather than a note that something was reused.
+      expect(reused?.fingerprint).toBe(capture?.fingerprint);
+      expect(reused?.tableCount).toBe(2);
+      // And it is NOT recorded as this run's own capture: no catalog was read here, and an
+      // entry saying otherwise would let a later drive re-derive an inventory this run
+      // never took.
+      expect(kindsOf(events)).not.toContain("context-captured");
     });
 
     /*
@@ -3087,6 +3141,124 @@ describe("a run reserves its last turns for its report", () => {
   });
 });
 
+describe("a run that stops having read nothing is told to read it itself", () => {
+  /*
+    A distinct loss from the one below, and the reminder there cannot reach it: that notice
+    is for a run that CALLED its tools and then narrated, and it is gated on exactly that
+    (`if (!anyToolCalled) return false`). The run measured here called nothing at all. It
+    read the objective, stopped after ten seconds, and asked the user for the statement it
+    had been sent to diagnose — while holding the instruments that would have found it.
+
+    Free to retry, and that is why it may exist. `compose_report` is itself one of the run's
+    tools, so a run that called nothing composed no report and its verdict is already
+    `no-report`. The extra turn is spent on a run that has lost; it cannot turn a pass into
+    a failure, only a failure into another attempt.
+
+    Per-model all the same, and off by default: the ten models locked at 300/300 were
+    measured without it, and a drive-wide change is how this repository has twice handed
+    back cells it had already won.
+  */
+  const asksTheUser = answersProse("Could you please share the exact SQL statement you are running?");
+
+  test("the model is told which instrument to call, and gets the turn back", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(asksTheUser, answersProse("Understood."));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", "nemotron3:33b"),
+      resources: b.resources,
+    });
+
+    expect(script.turns.length).toBe(2);
+    // Names the instrument, not the rule: the measured defect class here is a model told
+    // WHAT it did wrong and never WHAT to call instead.
+    expect(script.turns[1]?.transcript).toContain("inspect_schema");
+  });
+
+  test("a model that was not measured needing it is left alone", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(asksTheUser, answersProse("Understood."));
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(script.turns.length).toBe(1);
+    expect(result.stopReason).toBe("model-stopped");
+  });
+
+  test("an operations run is not told to call the two instruments it does not hold", async () => {
+    /*
+      The sentence NAMES `inspect_schema` and `inspect_plan`, and `operations` is the one agent
+      set built on a different three - `inspect_operations`, `recommend_change`,
+      `compose_report` - because the read-class tools need `queryReadOnly`, which only two
+      providers implement.
+
+      So the retry is gated on the run actually holding what the sentence names. Told to call a
+      tool it has not got, a run calls it, is answered "there is no such tool", and spends the
+      very turn this retry bought: the #350/#356 defect, already paid for once. The three tests
+      above use the default workflow, which is the one where the sentence happens to be true.
+    */
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "operations");
+    const script = scriptedModel(asksTheUser, answersProse("Understood."));
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", "nemotron3:33b"),
+      resources: b.resources,
+    });
+
+    expect(script.turns.length).toBe(1);
+    expect(result.stopReason).toBe("model-stopped");
+  });
+
+  test("an EMPTY stopping turn spends it too, so this switch subsumes retryEmptyTurn", async () => {
+    /*
+      The gate asks whether anything was CALLED, not what was said, so a turn with no text at
+      all reaches it as well as the question this was measured on. `nemotron3:33b` records
+      `retryEmptyTurn: false` and its empty turns are asked again regardless - pinned here
+      because it is the behaviour, not the wording, that a reader of the entry would get wrong.
+
+      Not narrowed to a non-empty turn, which is the obvious repair: that would change what the
+      five passing runs were measured under, and a measured cell does not move without being
+      re-measured. Recorded in `docs/BACKLOG.md` instead.
+    */
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(answersProse(""), answersProse("Understood."));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", "nemotron3:33b"),
+      resources: b.resources,
+    });
+
+    expect(script.turns.length).toBe(2);
+    expect(script.turns[1]?.transcript).toContain("inspect_schema");
+  });
+
+  test("it is spent once, so a run that stops again is not asked a third time", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(asksTheUser, asksTheUser, answersProse("Understood."));
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", "nemotron3:33b"),
+      resources: b.resources,
+    });
+
+    expect(script.turns.length).toBe(2);
+    expect(result.stopReason).toBe("model-stopped");
+  });
+});
+
 describe("a run that used its tools and then narrated is reminded once", () => {
   /*
     The `no-report` shortfall, measured on three models: each called this run's tools,
@@ -3182,6 +3354,88 @@ describe("a run that used its tools and then narrated is reminded once", () => {
     expect((await eventsOf(b.store, run.runId)).map((event) => event.kind)).toContain("report-composed");
   });
 
+  /*
+    Once per RUN and not once per drive (B51).
+
+    Every notice bound was a `let` inside `runInvestigation` — which is also what RESUMES a
+    run a dead process left running — so a resumed drive started with every flag false and
+    could deliver a notice the previous drive had already delivered. Nothing durable bounded
+    them, because a delivery wrote no ledger entry at all: `docs/llms/` is built by reading
+    run ledgers, and its whole claim is that each figure comes from an observed run, so an
+    unattributable rescue is worse than an unrecorded one.
+
+    Driven as two drives over one data directory, which is what a resume is in this suite.
+    The first drive dies where the loop cannot decide (a 401 leaves the run running), so
+    the second is a genuine resume with its own counters.
+  */
+  test("a resumed drive is not told to report again, because the delivery is on the ledger", async () => {
+    const dataDir = freshDataDir();
+    const first = boot(dataDir);
+    const run = await startRun(first);
+    const firstScript = scriptedModel(
+      callsTool("run_read_query", { sql: "SELECT id FROM orders", rationale: "read it" }),
+      // Prose after a tool call, which is what earns the reminder — and the turn is taken
+      // again, so the third scripted answer is what the reminded turn gets.
+      answersProse("Orders were read."),
+      () => endpointError(401, "invalid api key"),
+    );
+
+    await expect(
+      runInvestigation(run.runId, {
+        service: first.service,
+        model: await modelOver(firstScript.fetch),
+        resources: first.resources,
+      }),
+    ).rejects.toBeInstanceOf(LLMAuthError);
+    const delivered = guidanceDelivered(await eventsOf(first.store, run.runId));
+    expect(delivered["report-reminder"]).toBe(1);
+
+    // A second process over the same ledger. It calls a tool of its own, so `anyToolCalled`
+    // is true here too and the only thing standing between it and a second reminder is what
+    // the ledger says.
+    const second = boot(dataDir);
+    const secondScript = scriptedModel(
+      callsTool("run_read_query", { sql: "SELECT id FROM customers", rationale: "read it" }, "call_2"),
+      answersProse("Customers were read."),
+    );
+
+    const result = await runInvestigation(run.runId, {
+      service: second.service,
+      model: await modelOver(secondScript.fetch),
+      resources: second.resources,
+    });
+
+    // Two turns and not three: the run narrated and stopped, un-nudged.
+    expect(result.turns).toBe(2);
+    expect(guidanceDelivered(await eventsOf(second.store, run.runId))["report-reminder"]).toBe(1);
+    const sent = secondScript.turns.flatMap((turn) => JSON.stringify(turn.body.messages ?? []));
+    expect(sent.some((messages) => messages.includes("written your findings as prose"))).toBe(false);
+  });
+
+  test("a delivery records where in the run it landed, not only that it happened", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(
+      callsTool("run_read_query", { sql: "SELECT id FROM orders", rationale: "read it" }),
+      answersProse("Orders were read."),
+      reportOn("Orders were read."),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const issued = (await eventsOf(b.store, run.runId)).find((event) => event.kind === "guidance-issued");
+    expect(issued?.notice).toBe("report-reminder");
+    // The reminder rides the SECOND turn, after one tool call: a nudge on the second turn
+    // and one on the last are different facts about a model, and the ledger could say
+    // neither.
+    expect(issued?.atTurn).toBe(2);
+    expect(issued?.toolCalls).toBe(1);
+  });
+
   test("the reminder is sent once, so a model that narrates again still stops", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b);
@@ -3199,6 +3453,44 @@ describe("a run that used its tools and then narrated is reminded once", () => {
 
     expect(result.stopReason).toBe("model-stopped");
     expect(result.turns).toBe(3);
+  });
+});
+
+/*
+  The fold that makes "once" mean once (B51).
+
+  Driven directly as well as through a drive, because what it has to get right is a reading
+  of two DIFFERENT entry kinds: a notice sent as a `user` message writes `guidance-issued`,
+  and one sent instead of running a call is the `notice` on that call's hold.
+*/
+describe("guidanceDelivered", () => {
+  const at = (event: AgentRunEvent): AgentRunEvent => event;
+
+  test("counts both entry kinds, because a delivery lands on whichever records the call", () => {
+    const counts = guidanceDelivered([
+      at({ kind: "guidance-issued", atMs: 1, notice: "report-reminder" }),
+      at({ kind: "guidance-issued", atMs: 2, notice: "report-reminder", atTurn: 4, toolCalls: 2 }),
+      at({ kind: "call-held", atMs: 3, tool: "compose_report", reason: "cite it", notice: "cite-what-you-read" }),
+    ]);
+
+    expect(counts["report-reminder"]).toBe(2);
+    expect(counts["cite-what-you-read"]).toBe(1);
+    // Every id is answered, and a notice nobody delivered is a zero it measured: the
+    // record is total, so a new id cannot read as "never delivered" by being absent.
+    expect(counts["report-reserve"]).toBe(0);
+    expect(Object.values(counts).reduce((sum, count) => sum + count, 0)).toBe(3);
+  });
+
+  test("a hold carrying no notice counts towards nothing, which is what it says", () => {
+    // A verdict-preview hold speaks for a `shortfall` rather than for a named notice, and
+    // so does every hold written before the field existed. Counting it as one would bound
+    // a notice nobody sent.
+    const counts = guidanceDelivered([
+      at({ kind: "call-held", atMs: 1, tool: "compose_report", reason: "profile a table", shortfall: "no-report" }),
+      at({ kind: "context-captured", atMs: 2, fingerprint: "ctx_1", tableCount: 1 }),
+    ]);
+
+    expect(Object.values(counts).every((count) => count === 0)).toBe(true);
   });
 });
 
@@ -3516,7 +3808,75 @@ describe("the run reads its schema context through the catalog tool", () => {
     expect(catalogStatements(b)[1]).toContain("pg_constraint");
     expect(catalogStatements(b)[2]).toContain("pg_index");
     expect(b.acquireProvider).toHaveBeenCalledTimes(CONTEXT_READS);
-    expect(kindsOf(await eventsOf(b.store, run.runId))[1]).toBe("context-captured");
+    /*
+      "Before the first turn" as an ORDER rather than an index. This read `kinds[1]`, which said
+      the same thing only for as long as exactly one event preceded it — and the day another
+      opening record was added the assertion failed while the property it names still held.
+
+      The property is that nothing the model did comes first: the inventory is captured, and only
+      then does the run have anything to say. Asserted against every event that represents model
+      activity rather than against a position, so a new opening record cannot break it and a
+      capture that genuinely slipped past the first turn cannot pass.
+    */
+    const kinds = kindsOf(await eventsOf(b.store, run.runId));
+    const captured = kinds.indexOf("context-captured");
+    expect(captured).toBeGreaterThan(-1);
+    for (const activity of ["tool-invoked", "statement-drafted", "closing-statement", "report-composed"]) {
+      const at = kinds.indexOf(activity);
+      if (at !== -1) expect(captured).toBeLessThan(at);
+    }
+  });
+
+  /*
+    What the capture SPENT, on the entry (B13).
+
+    Its reads reach `executeAuditedOperation` through `captureContextSnapshot` and never
+    through `runStep`, the only writer of `tool-completed` — so the whole cost of
+    grounding a run was charged against the ceilings the rail displays and folded to
+    nothing: a drive with no reusable snapshot showed "0 statements" with three already
+    spent, before the model's first turn.
+  */
+  test("the capture records the statements the tracker charged it, and not a count of its plan", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(answersProse("understood"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const captured = (await eventsOf(b.store, run.runId)).find((event) => event.kind === "context-captured");
+    expect(captured?.charged?.statements).toBe(CONTEXT_READS);
+    // And the entry is the only place that figure survives: the run has ended, so
+    // `releaseExecutionRun` has dropped its accounting and the tracker now answers zero
+    // for it. Reading the meter from the tracker instead of the ledger is the alternative
+    // B13 records as not a drop-in, and this is why.
+    expect(b.resources.tracker.usage(run.runId).executedStatements).toBe(0);
+  });
+
+  test("a capture that was REFUSED records what it paid anyway", async () => {
+    // The engine refuses the third read, so two answered and one did not — and all three
+    // were admitted and charged before the refusal was known.
+    const b = boot(freshDataDir(), {
+      answer: async (sql: string) => {
+        if (sql.includes("pg_index")) throw new QueryError("permission denied for relation pg_index");
+        return queryResult();
+      },
+    });
+    const run = await startRun(b);
+    const script = scriptedModel(answersProse("understood"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const refused = (await eventsOf(b.store, run.runId)).find((event) => event.kind === "context-unavailable");
+    expect(refused?.reasonCode).toBe("CATALOG_READ_REFUSED");
+    expect(refused?.charged?.statements).toBe(CONTEXT_READS);
   });
 
   test("the packed inventory reaches the model fenced, carrying the fingerprint a claim can cite", async () => {
@@ -3797,6 +4157,39 @@ describe("a run that would report an answer it never presented", () => {
     // And the answer was recorded BEFORE the report, which is the ordering the
     // shortfall is about.
     expect(kinds.indexOf("answer-composed")).toBeLessThan(kinds.indexOf("report-composed"));
+  });
+
+  /*
+    The hold's own entry says WHICH notice it answered with (B51).
+
+    A held delivery has always written `call-held`, so this one was never invisible — what
+    it lacked was a name. `reason` is the prose the model was sent and names artifact ids in
+    two of the three cases, so a resumed drive reading it back to decide whether a notice
+    had already been delivered would be pattern-matching a paragraph.
+  */
+  test("the hold records which notice it answered with, in the vocabulary every delivery shares", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "data-analysis", true);
+    const script = scriptedModel(
+      callsTool("run_read_query", { sql: "SELECT id FROM orders", rationale: "the question, in SQL" }),
+      reportOn("Orders were read."),
+      presentsRead(),
+      reportOn("Orders were read."),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const events = await eventsOf(b.store, run.runId);
+    const held = events.find((event) => event.kind === "call-held");
+    expect(held?.tool).toBe("compose_report");
+    expect(held?.notice).toBe("present-before-report");
+    // And the same fold that bounds a `user`-message notice across a resume counts this
+    // one, which is the whole reason the id is on the hold rather than in a second entry.
+    expect(guidanceDelivered(events)["present-before-report"]).toBe(1);
   });
 
   test("the notice is sent once, so a model that ignores it still reports", async () => {
@@ -4631,5 +5024,152 @@ describe("a run is told to report only when it holds something to report from", 
     const view = await b.store.read(run.runId);
     const declined = view?.record.events.find((event) => event.kind === "call-declined");
     expect(declined?.kind === "call-declined" && declined.detail).toContain("one of index, rewrite");
+  });
+});
+
+describe("a model that thinks instead of answering is told not to", () => {
+  /*
+    `muse-glimmer:latest` locks five surfaces with the settings it carries and lost the sixth to its own reasoning:
+    asked for one statement it returns 13 188 characters of thinking against 1 165 of content,
+    and the five plan runs spent 90, 170 and 179 seconds against a 90-second turn, each leaving
+    an empty ledger.
+
+    `reasoning_effort` is what the OpenAI-compatible endpoint the agent drives actually reads -
+    `think: false` is Ollama's own API and is ignored here, as is `enable_thinking`. The
+    in-prompt `/no_think` marker looked right on ONE run and did not reproduce: 38 s in the
+    system prompt, 51 s in the user message, and 1/5 in a real sweep.
+
+    A REQUEST FIELD, not a word in the prompt: nothing is spliced into what Studio says to a
+    model, and no cell's measured wording moves.
+  */
+  test.each(["ollama", "openai"] as const)(
+    "the field reaches a model configured as %s, because the adapter is the same one",
+    async (provider) => {
+      /*
+        BOTH providers, and ollama first, because that is where this broke. The options were
+        keyed by the provider's own name; the scripted model is `openai` by default, so a
+        single-provider test passed while every real ollama run sent nothing and timed out.
+      */
+      const b = boot(freshDataDir());
+      const run = await startRun(b, "planning");
+      const script = scriptedModel(answersProse("```sqlite\nSELECT 1\n```"));
+
+      await runInvestigation(run.runId, {
+        service: b.service,
+        model: await modelOver(script.fetch, "https://api.openai.com/v1", "muse-glimmer:latest", provider),
+        resources: b.resources,
+      });
+
+      expect(script.turns[0]?.body?.reasoning_effort).toBe(PLAN_NO_REASONING_EFFORT);
+    },
+  );
+
+  test("a model nobody measured thinking at is left thinking", async () => {
+    // Off by default: a drive-wide change here is how this repository has twice handed back
+    // cells it had already won.
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "planning");
+    const script = scriptedModel(answersProse("```sqlite\nSELECT 1\n```"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", "gemma4:26b"),
+      resources: b.resources,
+    });
+
+    expect(script.turns[0]?.body?.reasoning_effort).toBeUndefined();
+  });
+
+  test.each(["native", "prompted"] as const)(
+    "an AGENT run of the same model is left alone, on the %s protocol",
+    async (protocol) => {
+      /*
+        BOTH protocols, and the prompted one is why this runs twice.
+
+        Gating on `tools === undefined` is true for a planning run AND for every turn of an
+        agent run that asks for its tools in prose - the path four of the twenty-five measured
+        models take, because none of them can emit `tool_calls`. So a setting documented as
+        PLAN ONLY would reach agent turns of exactly the models most likely to be running
+        locally, and a single-protocol test would pass anyway because `startRun` defaults to
+        `native`. It is gated on the run's MODE, which is what it was always about.
+      */
+      const b = boot(freshDataDir());
+      const run = await startRun(b, "agent", undefined, undefined, protocol);
+      const script = scriptedModel(answersProse("nothing to add"));
+
+      await runInvestigation(run.runId, {
+        service: b.service,
+        model: await modelOver(script.fetch, "https://api.openai.com/v1", "muse-glimmer:latest"),
+        resources: b.resources,
+      });
+
+      expect(script.turns[0]?.body?.reasoning_effort).toBeUndefined();
+    },
+  );
+});
+
+describe("a model that thinks instead of CALLING is told not to, on its agent turns too", () => {
+  /*
+    `gemma4:12b` is the measured case, and it is a different one from the plan-only setting
+    above. Its investigate cell read 5/5 at 9 seconds; on a later serving engine it reads 1/5,
+    and four of the five losses spend the WHOLE turn without invoking a single tool before the
+    clock ends them — 90 seconds, empty ledger, `no-report`. The passing runs still finish in 9.
+    Bimodal: it either answers at once or thinks until the wall.
+
+    That is the same illness `suppressPlanReasoning` was measured on and the same remedy, on a
+    surface that setting deliberately does not reach. So it is a SECOND switch rather than a
+    widening of the first: a model measured needing quiet on plan was not measured needing it
+    while holding tools, and reading one field for both would move cells nobody re-measured.
+
+    Off by default, like its sibling, and for the reason its sibling records: a drive-wide change
+    here is how this repository has twice handed back cells it had already won.
+  */
+  test.each(["native", "prompted"] as const)(
+    "the field reaches an agent turn of a model measured needing it, on the %s protocol",
+    async (protocol) => {
+      // Both protocols, because a prompted agent turn is handed no tools and would otherwise be
+      // indistinguishable from a planning turn at the gate.
+      const b = boot(freshDataDir());
+      const run = await startRun(b, "agent", undefined, undefined, protocol);
+      const script = scriptedModel(answersProse("nothing to add"));
+
+      await runInvestigation(run.runId, {
+        service: b.service,
+        model: await modelOver(script.fetch, "https://api.openai.com/v1", "gemma4:12b"),
+        resources: b.resources,
+      });
+
+      expect(script.turns[0]?.body?.reasoning_effort).toBe(PLAN_NO_REASONING_EFFORT);
+    },
+  );
+
+  test("a model measured needing quiet only on PLAN keeps its agent turns thinking", async () => {
+    // The two switches are separate, and this is the test that says so: a model may carry the
+    // plan one and must not acquire the agent one by association.
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent");
+    const script = scriptedModel(answersProse("nothing to add"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", "muse-glimmer:latest"),
+      resources: b.resources,
+    });
+
+    expect(script.turns[0]?.body?.reasoning_effort).toBeUndefined();
+  });
+
+  test("a model nobody measured is left thinking on both", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent");
+    const script = scriptedModel(answersProse("nothing to add"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", "gemma4:26b"),
+      resources: b.resources,
+    });
+
+    expect(script.turns[0]?.body?.reasoning_effort).toBeUndefined();
   });
 });

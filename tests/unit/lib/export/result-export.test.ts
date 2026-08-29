@@ -1,5 +1,10 @@
-import { describe, test, expect } from "bun:test";
-import { buildResultExport, deriveTableName, FALLBACK_TABLE_NAME } from "@/lib/export/result-export";
+import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import {
+  buildResultExport,
+  deriveTableName,
+  FALLBACK_TABLE_NAME,
+  resultExportFileName,
+} from "@/lib/export/result-export";
 
 const source = (over: Partial<Parameters<typeof buildResultExport>[1]> = {}) => ({
   rows: [{ id: 1, name: "Ada" }],
@@ -405,6 +410,18 @@ describe("buildResultExport — a binary value in a statement", () => {
     expect(file.content).toContain("VALUES (HEXTORAW('0102deadbeef'));");
   });
 
+  // The trap this row exists for: DuckDB is Postgres-shaped everywhere else in this
+  // file, and the standard `X'…'` form PARSES here - it is just not a binary literal.
+  // Measured on v1.5.5, `SELECT typeof(X'0102')` answers `VARCHAR` and `SELECT X'0102'`
+  // answers the five characters `x0102`, so the standard spelling would write TEXT into
+  // a BLOB column and the file would replay wrong rather than fail.
+  test("writes DuckDB's unhex, because its X'…' is a string and not six bytes", () => {
+    const file = buildResultExport("sql-insert", source({ ...binaryRow(wire), dialect: "duckdb" }));
+
+    expect(file.content).toContain("VALUES (unhex('0102deadbeef'));");
+    expect(file.content).not.toContain("X'");
+  });
+
   test("writes ClickHouse's unhex", () => {
     const file = buildResultExport("sql-insert", source({ ...binaryRow(wire), dialect: "clickhouse" }));
 
@@ -440,6 +457,11 @@ describe("buildResultExport — a binary value in a statement", () => {
     );
     expect(buildResultExport("sql-insert", source({ ...binaryRow(empty), dialect: "oracle" })).content).toContain(
       "VALUES (HEXTORAW(''));",
+    );
+    // `unhex('')` really inserts the zero-length blob on DuckDB: measured, the row
+    // reads back with `octet_length(payload)` 0 rather than NULL.
+    expect(buildResultExport("sql-insert", source({ ...binaryRow(empty), dialect: "duckdb" })).content).toContain(
+      "VALUES (unhex(''));",
     );
   });
 
@@ -737,6 +759,30 @@ describe("buildResultExport — the bare names the remaining reachable dialects 
     expect(ddl({ c: "decimal" }, "trino")).toContain('"c" DOUBLE PRECISION');
   });
 
+  // Measured on DuckDB v1.5.5, read back out of `duckdb_columns().data_type`. The
+  // seven character spellings all resolve to an unbounded `VARCHAR`, the four byte ones
+  // to `BLOB` and the four moment ones to `TIMESTAMP` - so a declared type survives a
+  // DuckDB target as it was spelled.
+  test("keeps the names DuckDB stores unnarrowed", () => {
+    for (const bare of ["varchar", "nvarchar", "char", "text", "bytea", "varbinary", "datetime", "timestamp"]) {
+      expect(ddl({ c: bare }, "duckdb")).toContain(`"c" ${bare}`);
+    }
+  });
+
+  test("re-spells what DuckDB does not have, and the two names it would silently narrow", () => {
+    // `Catalog Error: Type with name … does not exist!` for each of these.
+    expect(ddl({ c: "VARCHAR2" }, "duckdb")).toContain('"c" TEXT');
+    expect(ddl({ c: "longtext" }, "duckdb")).toContain('"c" TEXT');
+    expect(ddl({ c: "CLOB" }, "duckdb")).toContain('"c" TEXT');
+    expect(ddl({ c: "NUMBER" }, "duckdb")).toContain('"c" DOUBLE PRECISION');
+    expect(ddl({ c: "BINARY_DOUBLE" }, "duckdb")).toContain('"c" DOUBLE PRECISION');
+    // The narrowing pair, and the reason they are absent from the row above rather
+    // than kept: DuckDB ACCEPTS both and stores `DECIMAL(18,3)`, which rounds away
+    // every value past the third decimal the column existed for.
+    expect(ddl({ c: "numeric" }, "duckdb")).toContain('"c" DOUBLE PRECISION');
+    expect(ddl({ c: "decimal" }, "duckdb")).toContain('"c" DOUBLE PRECISION');
+  });
+
   // Measured on Cassandra 5.0.9, read back out of `system_schema.columns`: exactly
   // five of the candidate names are in CQL's grammar, and all five are unbounded —
   // `varchar` is an alias stored as `text`, and `decimal` is arbitrary-precision.
@@ -861,5 +907,111 @@ describe("buildResultExport — Cassandra DDL needs a PRIMARY KEY to run at all"
       expect(lines[i].startsWith("--")).toBe(true);
     }
     expect(file.content.endsWith(";")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Oracle date/timestamp literals (D23)
+// ---------------------------------------------------------------------------
+
+describe("buildResultExport - Oracle date and timestamp literals", () => {
+  // CI runs at UTC, where a local-field literal and an ISO one are the same string and
+  // the assertions below would pass against either (a developer machine sets no TZ
+  // either way). Held at a real offset for this block so they cannot.
+  const runnerZone = process.env.TZ;
+  beforeAll(() => {
+    process.env.TZ = "Asia/Tokyo";
+  });
+  afterAll(() => {
+    if (runnerZone === undefined) delete process.env.TZ;
+    else process.env.TZ = runnerZone;
+  });
+
+  // `oracledb` builds the `Date` for a naive DATE/TIMESTAMP by reading the stored wall
+  // clock in the Node process's zone, so the literal that replays it is the one that
+  // spells those same LOCAL fields back. Under the +09:00 held above this instant is
+  // 2026-08-24 10:11:12.345 locally and 01:11:12.345 in ISO, so the two spellings cannot
+  // be confused for each other.
+  const naive = new Date("2026-08-24T01:11:12.345Z");
+  const instant = new Date("2026-08-24T17:11:12.345Z");
+
+  const oracle = (columnTypes?: Record<string, string>, value: unknown = naive) =>
+    buildResultExport("sql-insert", source({ rows: [{ at: value }], fields: ["at"], dialect: "oracle", columnTypes }))
+      .content;
+
+  test("writes a TIMESTAMP column as TO_TIMESTAMP of its local fields, milliseconds kept", () => {
+    expect(oracle({ at: "TIMESTAMP" })).toContain(
+      `VALUES (TO_TIMESTAMP('2026-08-24 10:11:12.345', 'YYYY-MM-DD HH24:MI:SS.FF3'));`,
+    );
+  });
+
+  test("writes a DATE column as TO_DATE, which is the type that carries no fraction", () => {
+    expect(oracle({ at: "DATE" })).toContain(`VALUES (TO_DATE('2026-08-24 10:11:12', 'YYYY-MM-DD HH24:MI:SS'));`);
+  });
+
+  test("writes a zoned column as the UTC instant through FROM_TZ, not as a fabricated offset", () => {
+    const expected = `VALUES (FROM_TZ(TO_TIMESTAMP('2026-08-24 17:11:12.345', 'YYYY-MM-DD HH24:MI:SS.FF3'), 'UTC'));`;
+    expect(oracle({ at: "TIMESTAMP WITH TIME ZONE" }, instant)).toContain(expected);
+    expect(oracle({ at: "timestamp with local time zone" }, instant)).toContain(expected);
+  });
+
+  test("falls back to the timestamp form when the result declared no type for the column", () => {
+    expect(oracle(undefined)).toContain(
+      `VALUES (TO_TIMESTAMP('2026-08-24 10:11:12.345', 'YYYY-MM-DD HH24:MI:SS.FF3'));`,
+    );
+    expect(oracle({ other: "DATE" })).toContain(
+      `VALUES (TO_TIMESTAMP('2026-08-24 10:11:12.345', 'YYYY-MM-DD HH24:MI:SS.FF3'));`,
+    );
+  });
+
+  test("pads every field, so a single-digit month and a sub-100 millisecond still parse", () => {
+    expect(oracle({ at: "TIMESTAMP" }, new Date("2026-01-01T18:04:05.006Z"))).toContain(
+      `VALUES (TO_TIMESTAMP('2026-01-02 03:04:05.006', 'YYYY-MM-DD HH24:MI:SS.FF3'));`,
+    );
+  });
+
+  test("reads no declared type off the prototype for a column named after one", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({ rows: [{ constructor: naive }], fields: ["constructor"], dialect: "oracle", columnTypes: {} }),
+    );
+
+    expect(file.content).toContain(`VALUES (TO_TIMESTAMP('2026-08-24 10:11:12.345', 'YYYY-MM-DD HH24:MI:SS.FF3'));`);
+  });
+
+  test("leaves every other dialect on the ISO literal", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({ rows: [{ at: instant }], fields: ["at"], dialect: "postgres", columnTypes: { at: "DATE" } }),
+    );
+    expect(file.content).toContain(`VALUES ('2026-08-24T17:11:12.345Z');`);
+  });
+});
+
+describe("resultExportFileName", () => {
+  test("names a file the user's own query produced after the result", () => {
+    expect(resultExportFileName("csv")).toBe("query_result_export.csv");
+  });
+
+  // B34: a file carrying an agent run's rows must not be indistinguishable from one
+  // the user ran, so the run it came from is in the name.
+  test("names a run's own file after the run", () => {
+    expect(resultExportFileName("json", "arun_7f3c")).toBe("agent_run_arun_7f3c_export.json");
+  });
+
+  test("keeps a run id out of the path and off the extension", () => {
+    expect(resultExportFileName("csv", "../../etc/passwd")).toBe("agent_run_etc-passwd_export.csv");
+    expect(resultExportFileName("csv", "run.2026/08")).toBe("agent_run_run-2026-08_export.csv");
+  });
+
+  test("still says the file came from a run when the id contributes nothing nameable", () => {
+    // The attribution is the point; a run id made entirely of characters a file name
+    // cannot carry leaves the attribution and drops the id.
+    expect(resultExportFileName("csv", "///")).toBe("agent_run_export.csv");
+  });
+
+  test("caps how much of a run id reaches the name", () => {
+    const name = resultExportFileName("csv", "r".repeat(200));
+    expect(name).toBe(`agent_run_${"r".repeat(64)}_export.csv`);
   });
 });

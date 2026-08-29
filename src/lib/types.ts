@@ -32,7 +32,38 @@ export type DatabaseType =
   // schema level. PrestoDB is deliberately NOT this id - the transport builds its
   // header names from a dialect descriptor's prefix, so that fork is a descriptor away
   // rather than a rewrite.
-  | "trino";
+  | "trino"
+  // libSQL (issue #424 Phase 5). SQLite's dialect over a network: a self-hosted
+  // libSQL server (`sqld`) and Turso Cloud are the SAME id, because they speak the
+  // same protocol and embed the same SQLite - the cloud is that server managed, and
+  // a connection to either differs only in host and token. It is separate from
+  // `sqlite` for the reason the two cannot share a provider: the SQLite one holds a
+  // FILE handle through a synchronous driver, and this one holds no handle at all.
+  // The credential is a token rather than a password, so the form labels it that
+  // way, and the server refuses `VACUUM`, `ANALYZE` and `PRAGMA query_only` - which
+  // is why this id offers fewer maintenance operations than `sqlite` does.
+  //
+  // Turso Database, the Rust rewrite, is NOT this id and has no row anywhere yet: it
+  // publishes no server image (`tursodatabase/turso`, `tursodb` and `turso-server`
+  // were all unpullable on 2026-08-27) and ships as an in-process npm engine, so
+  // there is nothing to connect to and #424 publishes no name it has not connected
+  // to.
+  | "libsql"
+  // DuckDB (issue #424). An EMBEDDED analytical engine: the whole connection is a
+  // file path (or `:memory:`), there is nothing listening on a port, and the driver
+  // is a native N-API addon this app loads in its own process. It is separate from
+  // `sqlite` for the reason those two cannot share a provider even though both open
+  // a local file: the dialects disagree (`[1,2][1]` is a list index here, not a
+  // quoted identifier; block comments nest; `X'…'` is a STRING rather than a blob),
+  // the catalog is DuckDB's own `duckdb_*` table functions rather than
+  // `sqlite_master`, and the file admits exactly ONE operating-system process - a
+  // second one is refused even in read-only mode, which is why this provider
+  // declares `singleWriterFile`.
+  //
+  // MotherDuck (`md:`), Quack and DuckLake are NOT this id and have no row anywhere
+  // yet: each is a different connection story than a local path, and #424 publishes
+  // no name it has not connected to.
+  | "duckdb";
 
 export type ConnectionEnvironment = "production" | "staging" | "development" | "local" | "other";
 
@@ -52,7 +83,35 @@ export const ENVIRONMENT_LABELS: Record<ConnectionEnvironment, string> = {
   other: "",
 };
 
-export type SSLMode = "disable" | "require" | "verify-ca" | "verify-full";
+/**
+ * How much TLS a connection asks for.
+ *
+ * `disable` sends plaintext. `require` encrypts and verifies NOTHING: every provider that
+ * has the knob maps it to `rejectUnauthorized: false`, because a self-hosted server
+ * ordinarily presents a self-signed certificate and refusing it would make the ordinary
+ * local TLS deployment unreachable.
+ *
+ * `verify-system` encrypts AND verifies, with nothing to paste: the chain is checked against
+ * the trust store the runtime already has (Node's bundled roots plus whatever the host adds)
+ * and the certificate must name the host we dialled - `rejectUnauthorized: true` with no
+ * `ca`. It is deliberately NOT "verify-ca with the field left blank": `verify-ca` and
+ * `verify-full` exist to pin a chain against a `caCert` PEM the user supplies, which is the
+ * only way to reach a server whose certificate no public root signs, and a form that asks
+ * for a file the user does not have is a connection they cannot complete. `verify-system` is
+ * what a managed endpoint (Neon, Supabase, Atlas, RDS, Capella) can satisfy as pasted, which
+ * is why it is the mode a boolean `?ssl=true` / `?tls=true` in a connection string maps onto
+ * (see `readBooleanTLS` in src/lib/connection-string-parser.ts for the rule).
+ *
+ * `verify-ca` checks the chain and `verify-full` also the server name. That split is honoured
+ * only where the driver exposes the name check on its own - Oracle's `sslServerDNMatch` is
+ * the one that does; the Node TLS drivers cannot separate the two, so both land on
+ * `rejectUnauthorized: true` there and each provider doc says so.
+ *
+ * Adding a member here widens a published type (src/exports/types.ts), so every switch and
+ * lookup table over SSLMode has to answer for it: the providers listed above, the seed schema
+ * (src/lib/seed/types.ts), the PostgreSQL storage backend and the connection form.
+ */
+export type SSLMode = "disable" | "require" | "verify-system" | "verify-ca" | "verify-full";
 
 export interface SSLConfig {
   mode: SSLMode;
@@ -71,6 +130,15 @@ export interface SSHTunnelConfig {
   password?: string;
   privateKey?: string;
   passphrase?: string;
+  /**
+   * The bastion host key this connection trusts, in OpenSSH's presentation
+   * (`SHA256:` + unpadded base64, exactly what `ssh-keygen -lf` prints).
+   *
+   * The durable half of the trust-on-first-use policy in `src/lib/ssh/tunnel.ts`: when
+   * set it is authoritative and a bastion offering any other key fails the connection.
+   * Public key material, so it is stored and displayed in the clear.
+   */
+  hostKeyFingerprint?: string;
 }
 
 export interface DatabaseConnection {

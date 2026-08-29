@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useMemo, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -29,17 +29,66 @@ import {
   Database,
   ShieldAlert,
   LoaderCircle,
+  Wrench,
+  ShieldCheck,
   CircleCheck,
   CircleX,
   Table2,
+  type LucideIcon,
 } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import { useMonitoringData } from "@/hooks/use-monitoring-data";
 import { storage } from "@/lib/storage";
 import { useAllConnections } from "@/hooks/use-all-connections";
-import type { DatabaseConnection } from "@/lib/types";
-import type { ActiveSessionDetails, MaintenanceType } from "@/lib/db/types";
+import { maintenanceControl, type ActiveSessionDetails, type MaintenanceType } from "@/lib/db/types";
 import { useProviderMetadata } from "@/hooks/use-provider-metadata";
+
+/**
+ * The per-row maintenance controls this tab can render, in display order, with the
+ * generic verb each one falls back to where the provider declares no
+ * `maintenanceOperationSpecs`.
+ *
+ * `optimize` and `check` are candidates because five providers declare those
+ * operations and no per-row control anywhere offered them; each is filtered out again
+ * wherever the provider says its statement takes no object (SQL Server's
+ * `DBCC CHECKDB`, SQLite's `VACUUM`) - see `maintenanceControl` (#496).
+ */
+const TABLE_ACTIONS: { type: MaintenanceType; label: string; Icon: LucideIcon; hover: string }[] = [
+  { type: "analyze", label: "Analyze", Icon: Search, hover: "hover:text-yellow-500" },
+  { type: "vacuum", label: "Vacuum", Icon: HardDrive, hover: "hover:text-blue-500" },
+  { type: "optimize", label: "Optimize", Icon: Wrench, hover: "hover:text-blue-500" },
+  { type: "reindex", label: "Reindex", Icon: RefreshCw, hover: "hover:text-purple-500" },
+  { type: "check", label: "Check", Icon: ShieldCheck, hover: "hover:text-green-500" },
+];
+
+/**
+ * Why no per-table maintenance control is anywhere on this page.
+ *
+ * The schema explorer's two maintenance items are DEEP LINKS, and for an admin they
+ * land HERE - `openMaintenance` in src/components/Studio.tsx pushes
+ * /admin/operations?table=... - not on the monitoring Tables panel. They are gated on
+ * what the OPERATION declares (`maintenanceControl(..., "perEntity")`), which is a
+ * different question from whether this page has a ROW to hang the control on: the
+ * controls render per row of `filteredTables` only, so every empty branch of the panel
+ * below rendered nothing at all about the operation the operator arrived asking for
+ * (U22).
+ *
+ * Unlike the monitoring panel, this page HAS the requested table's name - the `?table=`
+ * search param that seeded the filter - so naming it is a measurement rather than an
+ * invention. It is named only while the filter still holds that param: once the operator
+ * types something else, that table is no longer why the list is empty.
+ */
+function TableMaintenanceUnreachableNote({
+  actions,
+  missingTable,
+}: Readonly<{ actions: string[]; missingTable: string | null }>) {
+  const where = missingTable === null ? "no row to run it on" : `no row for "${missingTable}" to run it on`;
+  return (
+    <p className="px-4 pb-4 text-xs text-fg-muted leading-relaxed" data-testid="operations-maintenance-unreachable">
+      {`Per-table maintenance (${actions.join(", ")}) is run from a row of this list, and this page has ${where}.`}
+    </p>
+  );
+}
 
 interface OperationLogEntry {
   id: string;
@@ -52,8 +101,18 @@ interface OperationLogEntry {
 }
 
 export function OperationsTab() {
-  const [connections, setConnections] = useState<DatabaseConnection[]>([]);
-  const [selectedConnection, setSelectedConnection] = useState<DatabaseConnection | null>(null);
+  // Only the operator's CHOICE is state; the list and the selected object are both
+  // calculated during render from it. `useAllConnections` is read here, above the
+  // hooks that take `selectedConnection` as an argument, because the derivation has
+  // to happen before they run.
+  const { connections } = useAllConnections();
+  const [selectedId, setSelectedId] = useState<string | null>(() => storage.getActiveConnectionId());
+  // The explicit length check rather than `?? connections[0] ?? null`:
+  // noUncheckedIndexedAccess is off, so `connections[0]` types as non-optional and a
+  // bare `??` chain would claim this can never be null while being undefined on an
+  // empty list.
+  const selectedConnection =
+    connections.find((c) => c.id === selectedId) ?? (connections.length > 0 ? connections[0] : null);
   const [operationLog, setOperationLog] = useState<OperationLogEntry[]>([]);
   const [confirmKill, setConfirmKill] = useState<ActiveSessionDetails | null>(null);
   const [killingPid, setKillingPid] = useState<number | string | null>(null);
@@ -61,7 +120,7 @@ export function OperationsTab() {
 
   // The row an Explorer deep link named (`onOpenMaintenance("tables", name)` →
   // /admin/operations?table=...). It seeds the filter and marks the row, so the
-  // named row is the one the operator lands on (#U5).
+  // named row is the one the operator lands on (#459).
   const deepLinkedTable = useSearchParams().get("table");
 
   // Offer only the maintenance the connected provider declares it can perform:
@@ -95,34 +154,48 @@ export function OperationsTab() {
     selectedConnection,
     monitoringOptions,
   );
-  const canRun = (type: MaintenanceType) =>
-    metadata?.capabilities.supportsMaintenance === true && metadata.capabilities.maintenanceOperations.includes(type);
-  const anyMaintenance = canRun("analyze") || canRun("vacuum") || canRun("reindex");
+  // Both maintenance surfaces ask ONE question - `maintenanceControl` in
+  // src/lib/db/types.ts - so that neither can offer a control the other's engine
+  // rejects. `capabilities` may be undefined here (provider-meta in flight, or its
+  // request failed), which that helper reads as a denial.
+  const capabilities = metadata?.capabilities;
+  const offers = (type: MaintenanceType, placement: "perEntity" | "global") =>
+    maintenanceControl(capabilities, type, placement).offered;
   // The six analyze/vacuum global ProviderLabels fields were declared, set by
   // seven providers, and read by no component, so every engine rendered
   // Postgres's query-planner copy (#427).
   //
-  // Which card each provider's wording actually reaches follows from the gates
-  // below, not from the labels: the analyze card renders for every provider that
-  // declares `analyze`, so Redis now says "Server Info" and MongoDB "Validate
-  // Collections"; the GLOBAL vacuum card is gated on the literal `vacuum`, which
-  // among the providers that ship vacuum wording only MongoDB declares.
+  // Which card each provider's wording reaches follows from the gates below, not from
+  // the labels: the analyze card renders wherever `analyze` has a whole-database form,
+  // so Redis says "Server Info" and MongoDB "Validate Collections", while the vacuum
+  // card follows `vacuumActionOperation` and now reaches SQL Server's, Oracle's and
+  // MySQL's own wording too.
   //
   // The `??` fallbacks stay: `metadata` may carry capabilities without labels.
   const labels = metadata?.labels;
+  // The vacuum CARD is the provider's vacuum wording, and four engines point that
+  // wording at an operation that is not `vacuum` (`vacuumActionOperation`, #U9). It is
+  // the operation - not the label - that decides whether the card renders and what the
+  // button sends: gating the card on the literal `vacuum` is what kept SQL Server's,
+  // Oracle's, MySQL's and ClickHouse's own words written and never shown, and sending
+  // `vacuum` to any of those four is a 400 from /api/db/maintenance.
+  const vacuumOperation = labels?.vacuumActionOperation ?? "vacuum";
+  const globalAnalyze = offers("analyze", "global");
+  const globalVacuum = offers(vacuumOperation, "global");
+  // Never twice: where the vacuum slot already names `reindex`, this card would send
+  // the same operation under a second set of words.
+  const globalReindex = vacuumOperation !== "reindex" && offers("reindex", "global");
+  const anyMaintenance = globalAnalyze || globalVacuum || globalReindex;
 
-  const { connections: allConns } = useAllConnections();
-  useEffect(() => {
-    if (allConns.length === 0) return;
-    setConnections(allConns);
-    const savedId = storage.getActiveConnectionId();
-    const saved = savedId ? allConns.find((c) => c.id === savedId) : null;
-    setSelectedConnection(saved ?? allConns[0]);
-  }, [allConns]);
+  // The per-row controls, in the provider's own words.
+  const tableActions = TABLE_ACTIONS.flatMap((action) => {
+    const control = maintenanceControl(capabilities, action.type, "perEntity");
+    return control.offered ? [{ ...action, label: control.label ?? action.label }] : [];
+  });
 
   const handleConnectionChange = (id: string) => {
     const conn = connections.find((c) => c.id === id);
-    if (conn) setSelectedConnection(conn);
+    if (conn) setSelectedId(conn.id);
   };
 
   const addLogEntry = useCallback(
@@ -188,6 +261,25 @@ export function OperationsTab() {
   const tablesUnavailable = data?.tables === undefined ? data?.errors?.tables : undefined;
   const [tableSearch, setTableSearch] = useState(deepLinkedTable ?? "");
   const filteredTables = tables.filter((t) => t.tableName.toLowerCase().includes(tableSearch.toLowerCase()));
+
+  // U22. Both halves have to be true for the dead end: the engine declares a control
+  // that takes ONE table, and this page has no row to offer it on. Which absence it is
+  // decides what the note may say:
+  //  - the deep link named a table and no row here matches it, so the name can be stated;
+  //  - or the read was refused / the engine published no statistics while its own
+  //    overview counts tables - the same reading `TablesTab` uses - and no name is known.
+  // A database that genuinely holds no tables is neither: there is nothing to maintain
+  // and nothing to explain. An empty list the operator's OWN filter produced is neither
+  // either, which is why the deep-link arm requires the filter to still hold the param.
+  const deepLinkRowMissing =
+    deepLinkedTable !== null &&
+    deepLinkedTable !== "" &&
+    tableSearch === deepLinkedTable &&
+    filteredTables.length === 0;
+  const tableStatsAbsent =
+    tablesUnavailable !== undefined || (tables.length === 0 && (data?.overview?.tableCount ?? 0) > 0);
+  const maintenanceUnreachable =
+    tableActions.length > 0 && filteredTables.length === 0 && (deepLinkRowMissing || tableStatsAbsent);
 
   const activeCount = sessions.filter((s) => s.state === "active").length;
   const idleCount = sessions.filter((s) => s.state === "idle").length;
@@ -279,7 +371,10 @@ export function OperationsTab() {
         <div className="rounded-xl border border-red-500/20 bg-red-500/5 p-4 text-red-400 text-sm">{error}</div>
       )}
 
-      {/* Global Operations — hidden entirely where the provider declares none */}
+      {/* Global Operations — hidden entirely where not one operation has a
+          whole-database form. On Couchbase every operation needs a keyspace, so this
+          section is absent rather than three cards that answer "requires a
+          target" (#496). */}
       {anyMaintenance && (
         <div>
           <div className="flex items-center gap-2 mb-3">
@@ -288,7 +383,7 @@ export function OperationsTab() {
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
             {/* Analyze */}
-            {canRun("analyze") && (
+            {globalAnalyze && (
               <div className="p-4 rounded-xl border border-hairline bg-fill-subtle hover:bg-fill transition-colors">
                 <div className="flex items-start justify-between mb-3">
                   <div className="w-8 h-8 rounded-lg bg-yellow-500/10 border border-yellow-500/20 flex items-center justify-center">
@@ -313,7 +408,7 @@ export function OperationsTab() {
             )}
 
             {/* Vacuum */}
-            {canRun("vacuum") && (
+            {globalVacuum && (
               <div className="p-4 rounded-xl border border-hairline bg-fill-subtle hover:bg-fill transition-colors">
                 <div className="flex items-start justify-between mb-3">
                   <div className="w-8 h-8 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center">
@@ -323,10 +418,12 @@ export function OperationsTab() {
                     size="sm"
                     variant="outline"
                     className="h-7 text-xs border-hairline-strong hover:bg-blue-500/10 hover:text-blue-500"
-                    onClick={() => handleRunMaintenance("vacuum")}
+                    onClick={() => handleRunMaintenance(vacuumOperation)}
                     disabled={!!actionLoading || !selectedConnection}
                   >
-                    {actionLoading === "vacuum-global" ? <RefreshCw className="w-3 h-3 animate-spin mr-1" /> : null}
+                    {actionLoading === `${vacuumOperation}-global` ? (
+                      <RefreshCw className="w-3 h-3 animate-spin mr-1" />
+                    ) : null}
                     {labels?.vacuumGlobalLabel ?? "Run Vacuum"}
                   </Button>
                 </div>
@@ -339,8 +436,10 @@ export function OperationsTab() {
 
             {/* Reindex — the triad is OPTIONAL on ProviderLabels (only the three
                 providers that declare the `reindex` operation set it), so the
-                hardcoded strings below stay as the fallback (#U6). */}
-            {canRun("reindex") && (
+                hardcoded strings below stay as the fallback (#464). Withheld where the
+                vacuum slot above already names `reindex`: one operation, two sets of
+                words, is a second card that does the same thing (#496). */}
+            {globalReindex && (
               <div className="p-4 rounded-xl border border-hairline bg-fill-subtle hover:bg-fill transition-colors">
                 <div className="flex items-start justify-between mb-3">
                   <div className="w-8 h-8 rounded-lg bg-purple-500/10 border border-purple-500/20 flex items-center justify-center">
@@ -437,44 +536,35 @@ export function OperationsTab() {
                         </div>
                       </div>
                       <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                        {canRun("analyze") && (
+                        {tableActions.map(({ type, label, Icon, hover }) => (
                           <Button
+                            key={type}
                             size="icon"
                             variant="ghost"
-                            className="w-7 h-7 text-fg-muted hover:text-yellow-500"
-                            title="Analyze"
-                            onClick={() => handleRunMaintenance("analyze", table.tableName)}
+                            className={`w-7 h-7 text-fg-muted ${hover}`}
+                            title={label}
+                            onClick={() => handleRunMaintenance(type, table.tableName)}
                             disabled={!!actionLoading}
                           >
-                            {actionLoading === `analyze-${table.tableName}` ? (
+                            {actionLoading === `${type}-${table.tableName}` ? (
                               <LoaderCircle className="w-3 h-3 animate-spin" />
                             ) : (
-                              <Search className="w-3 h-3" />
+                              <Icon className="w-3 h-3" />
                             )}
                           </Button>
-                        )}
-                        {canRun("vacuum") && (
-                          <Button
-                            size="icon"
-                            variant="ghost"
-                            className="w-7 h-7 text-fg-muted hover:text-blue-500"
-                            title="Vacuum"
-                            onClick={() => handleRunMaintenance("vacuum", table.tableName)}
-                            disabled={!!actionLoading}
-                          >
-                            {actionLoading === `vacuum-${table.tableName}` ? (
-                              <LoaderCircle className="w-3 h-3 animate-spin" />
-                            ) : (
-                              <HardDrive className="w-3 h-3" />
-                            )}
-                          </Button>
-                        )}
+                        ))}
                       </div>
                     </div>
                   ))}
                 </div>
               )}
             </div>
+            {maintenanceUnreachable && (
+              <TableMaintenanceUnreachableNote
+                actions={tableActions.map((a) => a.label)}
+                missingTable={deepLinkRowMissing ? deepLinkedTable : null}
+              />
+            )}
           </div>
         )}
 
@@ -519,7 +609,10 @@ export function OperationsTab() {
               </div>
             ) : sessions.length === 0 ? (
               <div className="p-8 text-center text-fg-subtle text-sm" data-testid="operations-sessions-empty">
-                {sessionsUnavailable ?? "No active sessions found."}
+                {/* The order is deliberate: `sessionsUnavailable` is set only when the
+                    READ failed, while `sessionsEmptyState` explains an engine that
+                    publishes no session list at all (#518). */}
+                {sessionsUnavailable ?? labels?.sessionsEmptyState ?? "No active sessions found."}
               </div>
             ) : (
               <Table>

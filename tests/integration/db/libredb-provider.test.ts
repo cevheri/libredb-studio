@@ -5,7 +5,13 @@
  * so this suite is exempt from the mock-isolation hazard in CLAUDE.md.
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { LibreDBProvider } from "@/lib/db/providers/embedded/libredb";
+import {
+  LIBREDB_ACTIVE_SESSIONS_REFUSAL,
+  LIBREDB_INDEX_STATS_REFUSAL,
+  LIBREDB_MAX_KEY_SCAN,
+  LIBREDB_TABLE_STATS_TRUNCATED,
+  LibreDBProvider,
+} from "@/lib/db/providers/embedded/libredb";
 import { ConnectionError, QueryError } from "@/lib/db/errors";
 import type { DatabaseConnection } from "@/lib/types";
 import { open, kv, doc, table } from "@libredb/libredb";
@@ -117,7 +123,7 @@ describe("LibreDBProvider — lifecycle & metadata", () => {
     // The query language is a small JSON command grammar, not SQL, so the inline
     // row editor's `UPDATE ... SET` cannot be expressed here (#269).
     expect(caps.supportsInlineRowEdit).toBe(false);
-    // The command grammar has no transaction verb at all (#U13).
+    // The command grammar has no transaction verb at all (#464).
     expect(caps.supportsTransactions).toBe(false);
     // The catalog declares namespaces and columns and nothing that references
     // another namespace, so there is no foreign key to read (#414).
@@ -126,6 +132,10 @@ describe("LibreDBProvider — lifecycle & metadata", () => {
     // prefix, so they are this server's summary of what one scan reached rather than
     // objects the engine declares (#414).
     expect(caps.tablesAreDerivedGroupings).toBe(true);
+    // `lib.open({ path })` takes an exclusive `<path>.lock`, so this engine admits ONE
+    // handle per file - the fact the connection test and the agent's grounding read
+    // both borrow the open one instead of opening a second (D3, B49).
+    expect(caps.singleWriterFile).toBe(true);
     expect(caps.supportsExplain).toBe(false);
     expect(caps.explainFormat).toBeUndefined();
     expect(caps.supportsExplain).toBe(caps.explainFormat !== undefined);
@@ -145,6 +155,32 @@ describe("LibreDBProvider — lifecycle & metadata", () => {
 
     expect(slowQueriesEmptyState).toContain("LibreDB keeps no statistics");
     expect(slowQueriesEmptyState).not.toContain("pg_stat_statements");
+  });
+
+  // `statementLanguage` is the sentence the agent's plan contract states verbatim
+  // (`ProviderLabels.statementLanguage`), and this engine needs one for the reason
+  // Redis did: a plan run on 2026-08-22, asked to list every entry under the `users`
+  // prefix, drafted `GET users:*`. `dispatchCommand` gives `get` exactly one meaning
+  // - `kv.get(parts[1])`, an exact-key lookup with no glob - so that command answers
+  // zero rows and no error, which on a key-value store reads as "nothing stored
+  // there" (#518). So the sentence names all five verbs AND says a key is exact,
+  // because the inventory's rows are named `users:*` and that reads as a wildcard
+  // the grammar does not have.
+  test("getLabels() declares the five verbs as the statement language and that a key is exact", () => {
+    const { statementLanguage } = new LibreDBProvider(makeConn(tmpFile)).getLabels();
+
+    expect(statementLanguage).toBeString();
+    // Every verb `dispatchCommand` matches; a verb left out is one a model must guess.
+    for (const verb of ["get", "put", "delete", "prefix", "range"]) {
+      expect(statementLanguage).toContain(verb);
+    }
+    // The two words that stop `users:*` being read as a pattern, and the runnable
+    // form for that objective - the one `generateTableQuery` already emits.
+    expect(statementLanguage).toContain("exact");
+    expect(statementLanguage).toContain("no wildcard");
+    expect(statementLanguage).toContain("prefix users:");
+    // Neither SQL nor a shell: the grammar is line-oriented and one command per line.
+    expect(statementLanguage).toContain("SQL");
   });
 });
 
@@ -523,13 +559,125 @@ describe("LibreDBProvider — monitoring", () => {
     await provider.disconnect();
   });
 
-  test("slow-query/session/table/index stats are honest empty defaults", async () => {
+  test("getSlowQueries stays empty - the label, not an error, carries LibreDB's sentence", async () => {
     const provider = new LibreDBProvider(makeConn(tmpFile));
     await provider.connect();
+    // The one panel that is legitimately empty: `QueriesTab` renders
+    // `ProviderLabels.slowQueriesEmptyState` in place of an empty list, and this provider
+    // declares one, so LibreDB's own sentence already reaches the user here.
     expect(await provider.getSlowQueries()).toEqual([]);
-    expect(await provider.getActiveSessions()).toEqual([]);
-    expect(await provider.getTableStats()).toEqual([]);
-    expect(await provider.getIndexStats()).toEqual([]);
+    expect(provider.getLabels().slowQueriesEmptyState).toMatch(/keeps no statistics/i);
+    await provider.disconnect();
+  });
+
+  test("getActiveSessions is refused with its reason, not answered as an empty session list", async () => {
+    const provider = new LibreDBProvider(makeConn(tmpFile));
+    await provider.connect();
+    await expect(provider.getActiveSessions()).rejects.toThrow(LIBREDB_ACTIVE_SESSIONS_REFUSAL);
+    // Health must keep answering: /api/db/test-connection calls it and the connection
+    // dialog's save is gated on that request (#455).
+    expect((await provider.getHealth()).activeSessions).toEqual([]);
+    await provider.disconnect();
+  });
+
+  test("getIndexStats is refused: this engine has no index object to count", async () => {
+    const provider = new LibreDBProvider(makeConn(tmpFile));
+    await provider.connect();
+    await expect(provider.getIndexStats()).rejects.toThrow(LIBREDB_INDEX_STATS_REFUSAL);
+    await provider.disconnect();
+  });
+
+  test("getTableStats counts every namespace's keys and names the lens it belongs to", async () => {
+    rmDbFile(tmpFile);
+    seedWithCatalog(tmpFile);
+    const provider = new LibreDBProvider(makeConn(tmpFile));
+    await provider.connect();
+
+    const stats = await provider.getTableStats();
+    const byName = new Map(stats.map((s) => [s.tableName, s]));
+    // The same groups the schema tree shows, with the same counts - both read one scan.
+    expect(byName.get("employees:*")?.rowCount).toBe(2);
+    expect(byName.get("articles:*")?.rowCount).toBe(1);
+    expect(byName.get("user:*")?.rowCount).toBe(2);
+    expect(byName.get("order:*")?.rowCount).toBe(1);
+    expect(byName.get("config")?.rowCount).toBe(1);
+    // LibreDB has no schema namespace, so the column carries the namespace's lens - the
+    // one thing the catalog does declare about it.
+    expect(byName.get("employees:*")?.schemaName).toBe("relational");
+    expect(byName.get("articles:*")?.schemaName).toBe("document");
+    expect(byName.get("config")?.schemaName).toBe("kv");
+
+    // No per-namespace bytes exist in the file format, so the byte fields stay ABSENT
+    // rather than carrying a zero the Storage tab would sum as a measurement.
+    for (const row of stats) {
+      expect(row.tableSizeBytes).toBeUndefined();
+      expect(row.indexSizeBytes).toBeUndefined();
+      expect(row.totalSize).toBe("N/A");
+    }
+    await provider.disconnect();
+  });
+
+  test("getTableStats reports an empty cataloged namespace as a real zero", async () => {
+    rmDbFile(tmpFile);
+    const db = open({ path: tmpFile });
+    table(db, "empty_table", { primaryKey: "id", columns: { id: "string" } });
+    db.close();
+
+    const provider = new LibreDBProvider(makeConn(tmpFile));
+    await provider.connect();
+    const stats = await provider.getTableStats();
+    // The catalog declares the table and the scan found none of its keys: zero rows is
+    // the measurement here, which is exactly what an empty answered panel may mean.
+    expect(stats).toEqual([
+      {
+        schemaName: "relational",
+        tableName: "empty_table:*",
+        rowCount: 0,
+        totalSize: "N/A",
+        totalSizeBytes: 0,
+      },
+    ]);
+    await provider.disconnect();
+  });
+
+  test("getTableStats refuses rather than under-count when the key scan hits its cap", async () => {
+    rmDbFile(tmpFile);
+    // One kernel transaction, so seeding past the cap costs ~30ms instead of ~12s: the
+    // kv lens fsyncs per set(), the kernel's own transact() commits the batch once.
+    const db = open({ path: tmpFile });
+    const encoder = new TextEncoder();
+    db.transact((tx) => {
+      for (let i = 0; i < LIBREDB_MAX_KEY_SCAN + 500; i++) {
+        tx.set(encoder.encode(`bulk:${i}`), encoder.encode("x"));
+      }
+    });
+    db.close();
+
+    const provider = new LibreDBProvider(makeConn(tmpFile));
+    await provider.connect();
+    // Assert the exported sentence itself: a regex over a fragment would keep passing if
+    // the user-facing wording drifted, and `knip` fails on an export nothing consumes.
+    await expect(provider.getTableStats()).rejects.toThrow(LIBREDB_TABLE_STATS_TRUNCATED);
+    expect(LIBREDB_TABLE_STATS_TRUNCATED).toContain("10,000 keys");
+    // The schema tree still renders - it is a list of namespaces, not a count.
+    expect((await provider.getSchema()).map((s) => s.name)).toEqual(["bulk:*"]);
+    await provider.disconnect();
+  });
+
+  test("getMonitoringData leaves the two refused panels absent with their sentences", async () => {
+    rmDbFile(tmpFile);
+    seedWithCatalog(tmpFile);
+    const provider = new LibreDBProvider(makeConn(tmpFile));
+    await provider.connect();
+
+    const data = await provider.getMonitoringData();
+    expect(data.activeSessions).toBeUndefined();
+    expect(data.indexes).toBeUndefined();
+    expect(data.errors?.activeSessions).toBe(LIBREDB_ACTIVE_SESSIONS_REFUSAL);
+    expect(data.errors?.indexes).toBe(LIBREDB_INDEX_STATS_REFUSAL);
+    // The panel that fabricated zero tables on a database with tables now answers.
+    expect(data.tables?.length).toBe(5);
+    expect(data.errors?.tables).toBeUndefined();
     await provider.disconnect();
   });
 
