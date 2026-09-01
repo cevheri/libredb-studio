@@ -28,6 +28,7 @@
   Also listed in official
   <a href="https://redis.io/docs/latest/develop/tools/#libredb-studio">Redis</a>,
   <a href="https://clickhouse.com/docs/integrations/connectors/tools/gui#libredb-studio">ClickHouse</a>
+  <a href="https://mariadb.com/docs/server/clients-and-utilities/graphical-and-enhanced-clients/libredb-studio">MariaDB</a>
   and
   <a href="https://druid.apache.org/libraries">Apache Druid</a>
   docs
@@ -41,7 +42,7 @@
   <a href="https://github.com/libredb/libredb-studio"><img src="https://img.shields.io/github/stars/libredb/libredb-studio?style=social" alt="GitHub stars"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
   <a href="https://sonarcloud.io/project/overview?id=libredb_libredb-studio"><img src="https://sonarcloud.io/api/project_badges/measure?project=libredb_libredb-studio&metric=alert_status" alt="Quality Gate"></a>
-  <a href="#testing"><img src="https://img.shields.io/badge/coverage-100%25-brightgreen" alt="Coverage 100%"></a>
+  <a href="https://codecov.io/github/libredb/libredb-studio"><img src="https://codecov.io/github/libredb/libredb-studio/graph/badge.svg?token=VA6CO9R7IH" alt="Coverage"></a>
   <a href="https://deepwiki.com/libredb/libredb-studio"><img src="https://img.shields.io/badge/Docs-DeepWiki-blue?logo=gitbook" alt="DeepWiki Docs"></a>
   <a href="https://artifacthub.io/packages/helm/libredb-studio/libredb-studio"><img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/libredb-studio" alt="Artifact Hub"></a>
 </p>
@@ -64,7 +65,7 @@
 
 ## Quick Start
 
-Run a full SQL IDE in one command, no clone, no build:
+Run a full Database Editor in one command, no clone, no build:
 
 ```bash
 # Docker (recommended)
@@ -915,6 +916,13 @@ extraEnvFrom:
 | [Adding a Provider](docs/ADDING_A_PROVIDER.md) | Step-by-step guide to adding a database, and how to tell whether it needs a driver at all |
 | [Backlog](docs/BACKLOG.md) | Known defects and deferred work that is not yet filed as an issue |
 
+### Cross-browser testing
+
+The product is a browser application, so a browser bug is a product bug. CI runs Playwright against
+desktop Chromium, which is the limit of what a headless runner sees: Safari and older WebKit
+regressions, mobile layout, and the WebKitGTK engine behind the Linux desktop build need real
+devices. This project is tested with BrowserStack.
+
 ---
 
 ## Support
@@ -933,6 +941,21 @@ development of the open-source edition.
 <!-- sponsors-start -->
 _Be the first to sponsor libredb-studio!_
 <!-- sponsors-end -->
+
+---
+
+## Supporters
+
+Distinct from the sponsors above: these are open-source programmes that cover a
+running cost of the project. A place here cannot be bought, and nothing here is
+an endorsement of libredb-studio by the company named. The full list, what each
+one covers and what attribution is owed in return are at
+[libredb.org/supporters](https://libredb.org/supporters/).
+
+- **[Tailscale](https://tailscale.com/opensource)** — the Community on GitHub
+  plan behind the private network maintainers use to reach the database probe
+  hosts, so testing against real engines does not mean exposing database ports
+  to the internet. Since 2026-09-01.
 
 ---
 
