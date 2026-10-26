@@ -1,14 +1,16 @@
 import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
-  AgentComposedSqlError,
   composeCatalogRead,
   composeEstimatingExplain,
   composeStatisticsAvailabilityProbe,
-  MAX_CATALOG_SELECTOR_LENGTH,
 } from "@/lib/agent/composed-sql";
+import { AgentComposedSqlError, MAX_CATALOG_SELECTOR_LENGTH } from "@/lib/agent/composed-sql-primitives";
+import { withoutExtensionOwnershipTest } from "@/lib/agent/languages/sql/engines/postgres";
 import { agentReadSqlInput, inspectAgentStatement } from "@/lib/db/operations/statement-guard";
-import { mkdtempSync, rmSync } from "node:fs";
+import { AGENT_STATEMENT_LANGUAGE } from "@/lib/agent/agent-manifest";
+import { SHIPPED_DATABASE_TYPES } from "@/lib/db/compatibility";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { quoteLiteral } from "@/lib/sql/values";
@@ -70,6 +72,97 @@ describe("composeCatalogRead — PostgreSQL", () => {
   test("orders the rows, so two identical inventories serialise identically", () => {
     expect(composeCatalogRead("postgres", {})).toContain("ORDER BY");
   });
+
+  test("aggregates the columns per table, one row per object (B52)", () => {
+    const sql = composeCatalogRead("postgres", {});
+
+    expect(sql).toContain("json_agg");
+    expect(sql).toContain("json_build_object");
+    expect(sql).toContain("GROUP BY table_schema, table_name");
+    expect(sql).toContain("ORDER BY ordinal_position");
+    // The projection is per table: the column names sit only inside the aggregated
+    // object, never as top-level select items.
+    expect(sql).not.toContain("column_name, data_type, is_nullable");
+  });
+
+  test("excludes the engine's own schemas the provider's browser already excludes (B76)", () => {
+    const sql = composeCatalogRead("postgres", {});
+
+    // The full engine-builtin list, not just pg_catalog/information_schema: a
+    // TimescaleDB chunk schema and Cloudberry's gp_toolkit are grounding noise too.
+    for (const schema of [
+      "pg_toast",
+      "mz_catalog",
+      "mz_unsafe",
+      "mz_catalog_unstable",
+      "rw_catalog",
+      "crdb_internal",
+      "pg_extension",
+      "_timescaledb_internal",
+      "gp_toolkit",
+      "pg_ext_aux",
+    ]) {
+      expect(sql, schema).toContain(`'${schema}'`);
+    }
+  });
+
+  test("excludes schemas an extension created, by ownership and not by name (B76)", () => {
+    const sql = composeCatalogRead("postgres", {});
+
+    expect(sql).toContain("pg_depend");
+    expect(sql).toContain("'pg_namespace'::regclass");
+    expect(sql).toContain("deptype = 'e'");
+  });
+
+  test("excludes relations an extension created, so AlloyDB's public extension views drop out (B76)", () => {
+    const sql = composeCatalogRead("postgres", {});
+
+    // The sharp case: no schema filter reaches an object installed into `public`.
+    expect(sql).toContain("(table_schema, table_name) NOT IN");
+    expect(sql).toContain("'pg_class'::regclass");
+    expect(sql).toContain("deptype = 'e'");
+  });
+
+  test("does not use a blanket table_type filter, so a user's own views survive (B76)", () => {
+    const sql = composeCatalogRead("postgres", {});
+
+    // A table_type filter would also drop the user's views. The ownership test
+    // drops only what an extension created.
+    expect(sql).not.toContain("table_type");
+  });
+
+  test("every PostgreSQL kind carries the relation ownership test (B76)", () => {
+    for (const kind of ["columns", "relations", "indexes", "statistics"] as const) {
+      const sql = composeCatalogRead("postgres", { kind });
+
+      // The relation test is the only thing in any composed statement that names
+      // `pg_class` ownership, so its presence is what pins the test to the kind.
+      expect(sql, kind).toContain("'pg_class'::regclass");
+      expect(sql, kind).toContain("deptype = 'e'");
+      expect(guardAccepts(sql), kind).toBe(true);
+    }
+  });
+
+  test("the extension ownership tests strip down to the fixed schema list (fallback for unprobed engines)", () => {
+    for (const kind of ["columns", "relations", "indexes", "statistics"] as const) {
+      const sql = composeCatalogRead("postgres", { kind });
+      const stripped = withoutExtensionOwnershipTest(sql);
+
+      // The ownership joins are gone, the fixed list remains, and the stripped
+      // statement is still one the bounded-read guard admits. `pg_extension` stays
+      // as a schema name in the fixed list (CockroachDB); the JOIN against it is
+      // what must disappear.
+      expect(stripped, kind).not.toContain("pg_depend");
+      expect(stripped, kind).not.toContain("regclass");
+      expect(stripped, kind).not.toContain("JOIN pg_extension");
+      expect(stripped, kind).toContain("'pg_catalog'");
+      expect(guardAccepts(stripped), kind).toBe(true);
+    }
+  });
+
+  test("stripping a statement without the ownership tests is a no-op", () => {
+    expect(withoutExtensionOwnershipTest("SELECT 1")).toBe("SELECT 1");
+  });
 });
 
 describe("composeCatalogRead — SQLite", () => {
@@ -99,6 +192,25 @@ describe("composeCatalogRead — SQLite", () => {
 
   test("narrows on a table selector", () => {
     expect(composeCatalogRead("sqlite", { table: "orders" })).toContain("name = 'orders'");
+  });
+
+  test("narrows every kind on a table selector, the indexes on the table they index", () => {
+    // Exact text as composed at 9a11f1252, the base of #1821 PR 2: the golden composes no SQLite read with a table.
+    const objects =
+      "SELECT name, type, sql FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite@_%' " +
+      "ESCAPE '@' AND name = 'orders' ORDER BY type, name";
+    const selector = { schema: "MAIN", table: "orders" } as const;
+    expect(composeCatalogRead("sqlite", selector)).toBe(objects);
+    expect(composeCatalogRead("sqlite", { ...selector, kind: "relations" })).toBe(objects);
+    expect(composeCatalogRead("sqlite", { ...selector, kind: "indexes" })).toBe(
+      "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL AND name NOT LIKE " +
+        "'sqlite@_%' ESCAPE '@' AND tbl_name = 'orders' ORDER BY tbl_name, name",
+    );
+    expect(composeCatalogRead("sqlite", { ...selector, kind: "statistics" })).toBe(
+      "SELECT m.name AS table_name, s.idx AS index_name, s.stat AS stat FROM sqlite_master m LEFT JOIN sqlite_stat1 " +
+        "s ON s.tbl = m.name WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite@_%' ESCAPE '@' AND m.name = 'orders' " +
+        "ORDER BY m.name, s.idx",
+    );
   });
 
   test("accepts SQLite's only schema name and refuses any other", () => {
@@ -315,7 +427,7 @@ describe("composeCatalogRead — the relation and index inventories (#329 T8)", 
 
   test("an unserved dialect is refused for every kind, never composed on a guess", () => {
     for (const kind of ["columns", "relations", "indexes", "statistics"] as const) {
-      expect(() => composeCatalogRead("mysql", { kind }), kind).toThrow(AgentComposedSqlError);
+      expect(() => composeCatalogRead("oracle", { kind }), kind).toThrow(AgentComposedSqlError);
     }
   });
 
@@ -415,7 +527,7 @@ describe("composeCatalogRead — the statistics inventory", () => {
   });
 
   test("an unserved dialect is refused with UNSUPPORTED_DIALECT rather than composed on a guess", () => {
-    for (const dialect of ["mysql", "oracle", "mssql", "mongodb", "redis"] as const) {
+    for (const dialect of ["oracle", "mongodb", "redis"] as const) {
       try {
         composeCatalogRead(dialect, { kind: "statistics" });
         throw new Error(`expected a refusal for ${dialect}`);
@@ -450,7 +562,7 @@ describe("composeStatisticsAvailabilityProbe", () => {
 
   test("an unserved dialect is refused rather than answered with null", () => {
     try {
-      composeStatisticsAvailabilityProbe("mysql");
+      composeStatisticsAvailabilityProbe("oracle");
       throw new Error("expected a refusal");
     } catch (error) {
       expect(error).toBeInstanceOf(AgentComposedSqlError);
@@ -569,14 +681,14 @@ describe("composeCatalogRead — a hostile selector becomes a literal, never sta
 
 describe("composeCatalogRead — dialects this milestone does not serve", () => {
   test("refuses rather than composing SQL it has not verified", () => {
-    for (const dialect of ["mysql", "oracle", "mssql", "mongodb", "redis"] as const) {
+    for (const dialect of ["oracle", "mongodb", "redis"] as const) {
       expect(() => composeCatalogRead(dialect, {}), dialect).toThrow(AgentComposedSqlError);
     }
   });
 
   test("the refusal carries the UNSUPPORTED_DIALECT code", () => {
     try {
-      composeCatalogRead("mysql", {});
+      composeCatalogRead("oracle", {});
       throw new Error("expected a refusal");
     } catch (error) {
       expect((error as AgentComposedSqlError).reasonCode).toBe("UNSUPPORTED_DIALECT");
@@ -586,7 +698,7 @@ describe("composeCatalogRead — dialects this milestone does not serve", () => 
 
 describe("composeEstimatingExplain", () => {
   test("PostgreSQL gets the estimating form, never the executing one", () => {
-    const sql = composeEstimatingExplain("postgres", "SELECT id FROM orders");
+    const sql = composeEstimatingExplain("postgres", "SELECT id FROM orders").sql;
 
     expect(sql).toBe("EXPLAIN (FORMAT JSON) SELECT id FROM orders");
     expect(sql.toUpperCase()).not.toContain("ANALYZE");
@@ -594,27 +706,27 @@ describe("composeEstimatingExplain", () => {
   });
 
   test("SQLite gets EXPLAIN QUERY PLAN, which describes without running", () => {
-    expect(composeEstimatingExplain("sqlite", "SELECT id FROM orders")).toBe(
+    expect(composeEstimatingExplain("sqlite", "SELECT id FROM orders").sql).toBe(
       "EXPLAIN QUERY PLAN SELECT id FROM orders",
     );
   });
 
   test("both composed forms are accepted by the plan-inspection input contract", () => {
     for (const dialect of ["postgres", "sqlite"] as const) {
-      const sql = composeEstimatingExplain(dialect, "SELECT id FROM orders");
+      const sql = composeEstimatingExplain(dialect, "SELECT id FROM orders").sql;
       expect(agentReadSqlInput.safeParse({ sql }).success, dialect).toBe(true);
     }
   });
 
   test("a CTE is explainable on both engines", () => {
     for (const dialect of ["postgres", "sqlite"] as const) {
-      const sql = composeEstimatingExplain(dialect, "WITH t AS (SELECT 1 AS n) SELECT n FROM t");
+      const sql = composeEstimatingExplain(dialect, "WITH t AS (SELECT 1 AS n) SELECT n FROM t").sql;
       expect(agentReadSqlInput.safeParse({ sql }).success, dialect).toBe(true);
     }
   });
 
   test("a write the model smuggled in is refused by the guard rather than explained", () => {
-    const sql = composeEstimatingExplain("postgres", "DROP TABLE users");
+    const sql = composeEstimatingExplain("postgres", "DROP TABLE users").sql;
     const parsed = agentReadSqlInput.safeParse({ sql });
 
     expect(parsed.success).toBe(false);
@@ -622,13 +734,13 @@ describe("composeEstimatingExplain", () => {
   });
 
   test("an ANALYZE the model wrote itself is still refused for the estimating descriptor", () => {
-    const sql = composeEstimatingExplain("sqlite", "SELECT id FROM orders; ANALYZE");
+    const sql = composeEstimatingExplain("sqlite", "SELECT id FROM orders; ANALYZE").sql;
 
     expect(agentReadSqlInput.safeParse({ sql }).success).toBe(false);
   });
 
   test("refuses a dialect whose estimating EXPLAIN this milestone has not verified", () => {
-    expect(() => composeEstimatingExplain("mysql", "SELECT 1")).toThrow(AgentComposedSqlError);
+    expect(() => composeEstimatingExplain("oracle", "SELECT 1")).toThrow(AgentComposedSqlError);
   });
 
   test("refuses a blank statement rather than composing a bare EXPLAIN", () => {
@@ -654,16 +766,16 @@ describe("composeEstimatingExplain", () => {
     trims whitespace without asking.
   */
   test("a statement the model already prefixed with the estimating EXPLAIN is not double-prefixed", () => {
-    expect(composeEstimatingExplain("sqlite", "EXPLAIN QUERY PLAN SELECT id FROM orders")).toBe(
+    expect(composeEstimatingExplain("sqlite", "EXPLAIN QUERY PLAN SELECT id FROM orders").sql).toBe(
       "EXPLAIN QUERY PLAN SELECT id FROM orders",
     );
-    expect(composeEstimatingExplain("sqlite", "EXPLAIN SELECT id FROM orders")).toBe(
+    expect(composeEstimatingExplain("sqlite", "EXPLAIN SELECT id FROM orders").sql).toBe(
       "EXPLAIN QUERY PLAN SELECT id FROM orders",
     );
-    expect(composeEstimatingExplain("postgres", "EXPLAIN SELECT id FROM orders")).toBe(
+    expect(composeEstimatingExplain("postgres", "EXPLAIN SELECT id FROM orders").sql).toBe(
       "EXPLAIN (FORMAT JSON) SELECT id FROM orders",
     );
-    expect(composeEstimatingExplain("postgres", "EXPLAIN (FORMAT JSON) SELECT id FROM orders")).toBe(
+    expect(composeEstimatingExplain("postgres", "EXPLAIN (FORMAT JSON) SELECT id FROM orders").sql).toBe(
       "EXPLAIN (FORMAT JSON) SELECT id FROM orders",
     );
   });
@@ -672,11 +784,60 @@ describe("composeEstimatingExplain", () => {
     // A different request, and one this run may not make. Stripping it would quietly turn a
     // refused execution into an accepted estimate — the guard that refuses it must still see
     // it. Composing here is what puts the word in front of the policy layer.
-    expect(composeEstimatingExplain("postgres", "EXPLAIN ANALYZE SELECT id FROM orders")).toContain("ANALYZE");
+    expect(composeEstimatingExplain("postgres", "EXPLAIN ANALYZE SELECT id FROM orders").sql).toContain("ANALYZE");
+  });
+
+  /*
+    SQL Server has no `EXPLAIN` keyword and no statement prefix that produces an estimating
+    plan: its plan is a SESSION MODE (`SET SHOWPLAN_ALL ON`), which must be its own batch
+    and has to be turned off again on the same connection. So this dialect composes NO
+    prefix and says so in the mode instead, and the provider answers it. The plan that
+    comes back is the one the admission step compiled, which is a stronger pairing than a
+    separately composed statement.
+  */
+  test("SQL Server composes no prefix and asks for the plan as a session mode", () => {
+    const plan = composeEstimatingExplain("mssql", "SELECT id FROM orders");
+
+    expect(plan).toEqual({ sql: "SELECT id FROM orders", mode: "estimate-plan" });
+    expect(agentReadSqlInput.safeParse({ sql: plan.sql }).success).toBe(true);
+  });
+
+  test("the prefix engines ask for execution, because their prefix IS the plan request", () => {
+    for (const dialect of ["postgres", "sqlite", "duckdb"] as const) {
+      expect(composeEstimatingExplain(dialect, "SELECT id FROM orders").mode, dialect).toBe("execute");
+    }
+  });
+
+  test("a prefix the model wrote is still stripped on SQL Server, which has no prefix of its own", () => {
+    // The strip is about what the MODEL wrote, not about what this layer adds: a model
+    // that prefixed `EXPLAIN` on an engine whose grammar has no such word would otherwise
+    // send it to the server as part of the statement.
+    expect(composeEstimatingExplain("mssql", "EXPLAIN SELECT id FROM orders").sql).toBe("SELECT id FROM orders");
+  });
+
+  test("a write the model smuggled in is refused by the guard on SQL Server too", () => {
+    const plan = composeEstimatingExplain("mssql", "DROP TABLE users");
+
+    expect(agentReadSqlInput.safeParse({ sql: plan.sql }).success).toBe(false);
+    // A DIFFERENT refusal from the prefix engines', and an earlier one: with no prefix in
+    // front of it the statement's own operative keyword is `DROP`, so the guard stops at
+    // "this is not a read" instead of reaching the side-effect scan the prefixed form
+    // leaves it to. The composition is what decides which of the two fires.
+    expect(inspectAgentStatement(plan.sql)).toBe("NON_READ_STATEMENT");
+  });
+
+  test("a locking table hint is refused, because no engine-side control refuses it", () => {
+    // Measured on SQL Server 2022: `WITH (TABLOCKX, HOLDLOCK)` compiles to ONE root of
+    // type SELECT, so the provider's admission admits it, and it then blocks every writer
+    // on the table for the life of the agent's transaction. No isolation level refuses it.
+    const plan = composeEstimatingExplain("mssql", "SELECT id FROM orders WITH (TABLOCKX, HOLDLOCK)");
+
+    expect(agentReadSqlInput.safeParse({ sql: plan.sql }).success).toBe(false);
+    expect(inspectAgentStatement(plan.sql)).toBe("SIDE_EFFECT_KEYWORD");
   });
 
   test("a statement that merely mentions explain in a value is untouched", () => {
-    expect(composeEstimatingExplain("sqlite", "SELECT 'EXPLAIN' AS word FROM orders")).toBe(
+    expect(composeEstimatingExplain("sqlite", "SELECT 'EXPLAIN' AS word FROM orders").sql).toBe(
       "EXPLAIN QUERY PLAN SELECT 'EXPLAIN' AS word FROM orders",
     );
   });
@@ -969,7 +1130,7 @@ describe("composeEstimatingExplain — DuckDB", () => {
    * hazard worse, not better.
    */
   test("gets the estimating form, and it describes without running", async () => {
-    const sql = composeEstimatingExplain("duckdb", "SELECT id FROM sales.orders");
+    const sql = composeEstimatingExplain("duckdb", "SELECT id FROM sales.orders").sql;
 
     expect(sql).toBe("EXPLAIN (FORMAT JSON) SELECT id FROM sales.orders");
     expect(sql.toUpperCase()).not.toContain("ANALYZE");
@@ -982,7 +1143,7 @@ describe("composeEstimatingExplain — DuckDB", () => {
   });
 
   test("an INSERT the model smuggled in is refused by the guard rather than explained", () => {
-    const sql = composeEstimatingExplain("duckdb", "INSERT INTO child VALUES (9, 9, 'x')");
+    const sql = composeEstimatingExplain("duckdb", "INSERT INTO child VALUES (9, 9, 'x')").sql;
 
     expect(agentReadSqlInput.safeParse({ sql }).success).toBe(false);
     expect(inspectAgentStatement(sql)).toBe("SIDE_EFFECT_KEYWORD");
@@ -995,11 +1156,461 @@ describe("the composers are reachable, which is the defect that put this file he
    * so they were dead code that typecheck, lint and the whole test suite all passed
    * over - only the 100% line-coverage gate saw them. This test fails if the
    * registration is removed again, whatever the functions themselves still say.
+   *
+   * It walks the shipped engines whose statement language is SQL, read from
+   * `AGENT_STATEMENT_LANGUAGE`, rather than a name, because the defect was never about
+   * DuckDB: the docblock of `CATALOG_COMPOSERS`, now each engine overlay's `catalogRead`, asserted that
+   * every SQL engine agent mode reads statements on has an entry there, and until this loop existed NOTHING enforced
+   * it - a hardcoded `"duckdb"` passes for ever while another SQL variant joins with no
+   * composer and `inspect_schema`, `profile_table` and `inspect_plan` can only refuse on
+   * it. Every SQL variant requires the composers; an engine whose language is not SQL
+   * is executed through its own tools and is not walked here.
    */
-  test("every kind composes rather than refusing UNSUPPORTED_DIALECT", () => {
-    for (const kind of ["columns", "relations", "indexes", "statistics"] as const) {
-      expect(() => composeCatalogRead("duckdb", { kind }), kind).not.toThrow(AgentComposedSqlError);
+  test("every SQL execution engine composes every kind rather than refusing UNSUPPORTED_DIALECT", () => {
+    for (const dialect of SHIPPED_DATABASE_TYPES.filter((type) => AGENT_STATEMENT_LANGUAGE[type] === "sql")) {
+      for (const kind of ["columns", "relations", "indexes", "statistics"] as const) {
+        expect(() => composeCatalogRead(dialect, { kind }), `${dialect}/${kind}`).not.toThrow(AgentComposedSqlError);
+      }
+      expect(() => composeEstimatingExplain(dialect, "SELECT 1"), dialect).not.toThrow(AgentComposedSqlError);
     }
-    expect(() => composeEstimatingExplain("duckdb", "SELECT 1")).not.toThrow(AgentComposedSqlError);
+  });
+});
+
+/**
+ * The kind, selected by the statement rather than bought with a fourth read (#789).
+ *
+ * The fakes the agent suites drive dispatch on statement CONTENT, so a behavioural
+ * assertion cannot see a change to the statement itself (ruling 5b): a projection that
+ * stopped selecting `relkind` would leave every consumer's rows exactly as the fixture
+ * wrote them and every one of those suites green. These pin the text.
+ */
+describe("composeCatalogRead — the PostgreSQL column read carries what each relation IS", () => {
+  test("projects relkind, joined from pg_class by namespace and name", () => {
+    const sql = composeCatalogRead("postgres", {});
+
+    expect(sql).toContain("kc.relkind AS relkind");
+    expect(sql).toContain("LEFT JOIN pg_catalog.pg_class kc ON kc.relnamespace = kn.oid");
+    // Grouped by it as well, or the aggregate below refuses the statement outright.
+    expect(sql).toContain("GROUP BY table_schema, table_name, kc.relkind");
+  });
+
+  test("both joins are LEFT joins, so an engine without the row loses the KIND and not the table", () => {
+    // The driver serves PostgreSQL-wire engines nobody here has run. An inner join would
+    // drop a relation whose `pg_class` row is missing out of the whole inventory, and a
+    // missing table is the absence #414 measured; a missing relkind is an unknown kind,
+    // which this path already knows how to say.
+    const sql = composeCatalogRead("postgres", {});
+
+    expect(sql).toContain("LEFT JOIN pg_catalog.pg_namespace kn ON kn.nspname::text = table_schema::text");
+    // Nothing in the statement joins a catalog any other way.
+    expect(/(?<!LEFT )JOIN pg_catalog\./.test(sql)).toBe(false);
+  });
+
+  test("the join comparisons are cast to text, which is the one shape that holds either way", () => {
+    // `information_schema` identifiers are a domain over `name` on PostgreSQL 12 and
+    // later and over `character varying` before it.
+    const sql = composeCatalogRead("postgres", {});
+
+    expect(sql).toContain("kn.nspname::text = table_schema::text");
+    expect(sql).toContain("kc.relname::text = table_name::text");
+  });
+
+  test("the statement still satisfies the M1 input guard with the join in it", () => {
+    expect(guardAccepts(composeCatalogRead("postgres", { kind: "columns" }))).toBe(true);
+  });
+
+  test("and the extension-ownership rewrite still strips both tests from it", () => {
+    // `withoutExtensionOwnershipTest` anchors on the two subqueries by text. The join
+    // sits between the FROM and the WHERE, so it must survive a rewrite that removes
+    // them — and both of its own aliases must be left alone.
+    const repaired = withoutExtensionOwnershipTest(composeCatalogRead("postgres", {}));
+
+    expect(repaired).not.toContain("pg_depend");
+    expect(repaired).toContain("kc.relkind AS relkind");
+    expect(repaired).toContain("LEFT JOIN pg_catalog.pg_class kc");
+    expect(guardAccepts(repaired)).toBe(true);
+  });
+});
+
+describe("composeCatalogRead — the agent's exclusion set cannot drift from the provider's (B76)", () => {
+  const quotedNames = (block: string | undefined): string[] =>
+    block === undefined ? [] : [...block.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+
+  const readSource = (relativePath: string): string => readFileSync(join(process.cwd(), relativePath), "utf8");
+
+  test("POSTGRES_SYSTEM_SCHEMAS is the same list the provider ships", () => {
+    const providerSchemas = quotedNames(
+      /const SYSTEM_SCHEMAS = \[([\s\S]*?)\] as const;/.exec(readSource("src/lib/db/providers/sql/postgres.ts"))?.[1],
+    );
+    const agentSchemas = quotedNames(
+      /const POSTGRES_SYSTEM_SCHEMAS = \[([\s\S]*?)\] as const;/.exec(
+        readSource("src/lib/agent/languages/sql/engines/postgres.ts"),
+      )?.[1],
+    );
+
+    // Non-vacuity first: a regex that stops matching silently turns both lists
+    // empty and the assertion below into a tautology.
+    expect(providerSchemas.length).toBeGreaterThan(0);
+    expect(agentSchemas).toEqual(providerSchemas);
+  });
+
+  test("the extension-owned schema query is the provider's, verbatim", () => {
+    const providerQuery = /const EXTENSION_OWNED_SCHEMAS_SQL =([\s\S]*?);/.exec(
+      readSource("src/lib/db/providers/sql/postgres.ts"),
+    )?.[1];
+    const agentQuery = /const POSTGRES_EXTENSION_OWNED_SCHEMAS_SQL =([\s\S]*?);/.exec(
+      readSource("src/lib/agent/languages/sql/engines/postgres.ts"),
+    )?.[1];
+
+    const normalize = (query: string | undefined): string => (query ?? "").replace(/\s+/g, " ").trim();
+
+    expect(normalize(providerQuery).length).toBeGreaterThan(0);
+    expect(normalize(agentQuery)).toBe(normalize(providerQuery));
+  });
+});
+
+/**
+ * The four T-SQL composers, pinned by their load-bearing predicates.
+ *
+ * Until these existed the only test that touched the SQL Server arms was the
+ * reachability loop above, which asserts that composing does not THROW. Measured
+ * rather than argued: replacing all four bodies with `return "SELECT 1"` left the
+ * whole suite green, 18,123 passing, so every predicate below could have been deleted
+ * without a gate noticing. The agent suites drive fakes that dispatch on statement
+ * CONTENT, so a behavioural assertion cannot see a change to the statement itself
+ * (ruling 5b) - these pin the text, the way the PostgreSQL, SQLite and DuckDB arms are
+ * pinned.
+ *
+ * No live engine runs here: SQL Server is a container the unit layer does not have.
+ * The row counts in the docblocks are what the fixture answered, and each is cited
+ * beside the predicate that produces it.
+ */
+describe("composeCatalogRead — SQL Server columns", () => {
+  test("reads sys.objects rather than INFORMATION_SCHEMA, which is permission-filtered", () => {
+    const sql = composeCatalogRead("mssql", {});
+
+    expect(guardAccepts(sql)).toBe(true);
+    expect(sql).toContain("FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id");
+    expect(sql).not.toContain("INFORMATION_SCHEMA.");
+  });
+
+  test("admits user tables and views only, and drops everything the product shipped", () => {
+    const sql = composeCatalogRead("mssql", {});
+
+    // `o.type` is the engine's own word for the kind, and the two admitted here are the
+    // two the inventory can address. Without it the read would also carry constraints,
+    // procedures and internal tables.
+    expect(sql).toContain("WHERE o.type IN ('U', 'V')");
+    // `is_ms_shipped` is the engine's OWN answer to "did this come with the product",
+    // which is why the schema exclusion below is only two names long.
+    expect(sql).toContain("o.is_ms_shipped = 0");
+    expect(sql).toContain("s.name NOT IN ('sys', 'INFORMATION_SCHEMA')");
+  });
+
+  test("builds the per-object column list with FOR JSON PATH, the engine's own serialiser", () => {
+    const sql = composeCatalogRead("mssql", {});
+
+    // One row per OBJECT rather than per column (B52), and the nesting is the engine's
+    // to quote: a column named with a quote, a bracket or a newline is escaped by SQL
+    // Server rather than by this layer.
+    expect(sql).toContain("FOR JSON PATH) AS columns");
+    expect(sql).toContain("FROM sys.columns c WHERE c.object_id = o.object_id ORDER BY c.column_id");
+    expect(sql).not.toContain("STRING_AGG");
+  });
+
+  /**
+   * SQL Server ALIAS types are ordinary in a real schema and everywhere in AdventureWorks:
+   * measured, `Person.PersonPhone.PhoneNumber` answers `Phone` for `user_type_id` and
+   * `nvarchar` for `system_type_id`, and `Person.Person.FirstName` answers `Name` over
+   * `nvarchar`. Nothing downstream knows an alias, so the obvious spelling is the wrong
+   * one: `table-profile.ts` matches this string against BASE-type spellings to decide which
+   * columns get a text shape test and which are excluded from `count(DISTINCT …)`, and with
+   * the alias name `profile_table` emitted no shape test for `PhoneNumber` - the one column
+   * in that table the PII shapes exist to find.
+   */
+  test("reports each column's BASE type, because an alias type is invisible to everything that reads it", () => {
+    const sql = composeCatalogRead("mssql", {});
+
+    expect(sql).toContain("COALESCE(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)) AS [type]");
+  });
+
+  /**
+   * The base spelling alone is NULL for the system CLR types, which all share
+   * `system_type_id` 240: measured, `Person.Address.SpatialLocation` answers NULL for the
+   * base and `geography` for the alias, and `Production.Document.DocumentNode` the same
+   * with `hierarchyid`. `FOR JSON PATH` omits a NULL property, so such a column would reach
+   * the snapshot with NO type, and a column with no type matches none of table-profile's
+   * exclusions: `count(DISTINCT [SpatialLocation])` would be composed and the whole table's
+   * profile would fail with Msg 8117.
+   */
+  test("falls back to the type's own name where there is no base type, which is every CLR type", () => {
+    const sql = composeCatalogRead("mssql", {});
+
+    expect(sql).toContain("COALESCE(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id))");
+    expect(sql).not.toContain("TYPE_NAME(c.user_type_id) AS [type]");
+  });
+
+  test("trims the padded char(2) kind, so 'U ' and 'U' are not two kinds", () => {
+    expect(composeCatalogRead("mssql", {})).toContain("RTRIM(o.type) AS relkind");
+  });
+
+  test("projects the column inventory a snapshot needs", () => {
+    const sql = composeCatalogRead("mssql", {});
+
+    for (const projected of ["table_schema", "table_name", "relkind", "[name]", "[type]", "[nullable]"]) {
+      expect(sql, projected).toContain(projected);
+    }
+  });
+
+  test("orders the rows, so two identical inventories serialise identically", () => {
+    expect(composeCatalogRead("mssql", {})).toContain("ORDER BY s.name, o.name");
+  });
+});
+
+describe("composeCatalogRead — SQL Server relations", () => {
+  /**
+   * B8's defect on this engine. `INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS` exposes no
+   * ordinal, so a composite key's two sides would come back as their cross-product.
+   * `sys.foreign_key_columns` carries `constraint_column_id` on the row itself, which is
+   * what pairs position 1 with position 1 and nothing else.
+   *
+   * Measured on AdventureWorks2022: 91 rows.
+   */
+  test("pairs a composite key by ordinal, from sys.foreign_key_columns", () => {
+    const sql = composeCatalogRead("mssql", { kind: "relations" });
+
+    expect(guardAccepts(sql)).toBe(true);
+    expect(sql).toContain("FROM sys.foreign_key_columns fkc");
+    expect(sql).toContain("pc.column_id = fkc.parent_column_id");
+    expect(sql).toContain("rc.column_id = fkc.referenced_column_id");
+    expect(sql).toContain("ORDER BY s.name, o.name, fkc.constraint_object_id, fkc.constraint_column_id");
+    expect(sql).not.toContain("REFERENTIAL_CONSTRAINTS");
+  });
+
+  test("matches each side by object id, so two same-named constraints cannot cross-match", () => {
+    const sql = composeCatalogRead("mssql", { kind: "relations" });
+
+    expect(sql).toContain("o.object_id = fkc.parent_object_id");
+    expect(sql).toContain("ro.object_id = fkc.referenced_object_id");
+    expect(sql).not.toContain("constraint_name");
+  });
+
+  test("carries the same six projected names as the PostgreSQL read, so one reader folds both", () => {
+    const sql = composeCatalogRead("mssql", { kind: "relations" });
+
+    for (const projected of [
+      "table_schema",
+      "table_name",
+      "column_name",
+      "referenced_schema",
+      "referenced_table",
+      "referenced_column",
+    ]) {
+      expect(sql, projected).toContain(projected);
+    }
+  });
+
+  test("excludes the engine's own objects on the referencing side", () => {
+    const sql = composeCatalogRead("mssql", { kind: "relations" });
+
+    expect(sql).toContain("WHERE o.is_ms_shipped = 0 AND s.name NOT IN ('sys', 'INFORMATION_SCHEMA')");
+  });
+});
+
+describe("composeCatalogRead — SQL Server indexes", () => {
+  /**
+   * Two predicates decide what this inventory MEANS, and neither is cosmetic.
+   *
+   * `i.type <> 0` drops the heap: `sys.indexes` carries a row of type 0 for a table
+   * with no clustered index, and it is not an index at all. `ic.is_included_column = 0`
+   * keeps a covering index's INCLUDE columns out of its KEY list, which is the
+   * distinction the PostgreSQL arm cannot make on older servers.
+   *
+   * Measured on AdventureWorks2022 with no selector: 228 rows, one per (index, key
+   * column) pair.
+   */
+  test("drops the heap and keeps INCLUDE columns out of the key list", () => {
+    const sql = composeCatalogRead("mssql", { kind: "indexes" });
+
+    expect(guardAccepts(sql)).toBe(true);
+    expect(sql).toContain("WHERE i.type <> 0 AND ic.is_included_column = 0");
+    expect(sql).toContain("o.is_ms_shipped = 0");
+    expect(sql).toContain("s.name NOT IN ('sys', 'INFORMATION_SCHEMA')");
+  });
+
+  test("joins index_columns on BOTH the object and the index, and orders by key position", () => {
+    const sql = composeCatalogRead("mssql", { kind: "indexes" });
+
+    // On the object alone, every index of a table would take every other index's
+    // columns: the pair is what makes a row one index's own key position.
+    expect(sql).toContain("ic.object_id = i.object_id AND ic.index_id = i.index_id");
+    expect(sql).toContain("c.object_id = ic.object_id AND c.column_id = ic.column_id");
+    expect(sql).toContain("ORDER BY s.name, o.name, i.name, ic.key_ordinal");
+  });
+
+  test("projects uniqueness and primary-key membership, which is the rest of the inventory", () => {
+    const sql = composeCatalogRead("mssql", { kind: "indexes" });
+
+    for (const projected of ["index_name", "is_unique", "is_primary", "column_name"]) {
+      expect(sql, projected).toContain(projected);
+    }
+  });
+});
+
+describe("composeCatalogRead — SQL Server statistics", () => {
+  /**
+   * The estimate the engine already holds, read without scanning anything, which is
+   * what lets a plan run be pointed at production.
+   *
+   * `index_id IN (0, 1)` is the heap or the clustered index, which is what SQL Server
+   * itself reports as a table's size; any other `index_id` is a nonclustered index and
+   * would count the same rows again. The SUM is because a PARTITIONED table has one
+   * such row per partition, so reporting the first would understate it by however many
+   * partitions it has.
+   *
+   * Measured on AdventureWorks2022: 72 rows, one per user table.
+   */
+  test("sums the heap or clustered partition rows and scans nothing", () => {
+    const sql = composeCatalogRead("mssql", { kind: "statistics" });
+
+    expect(guardAccepts(sql)).toBe(true);
+    expect(sql).toContain("SUM(p.rows) AS estimated_rows");
+    expect(sql).toContain("p.index_id IN (0, 1)");
+    expect(sql).toContain("GROUP BY s.name, o.name");
+    // A scan is what this composition exists to avoid, and UPDATE STATISTICS is a write.
+    expect(sql.toUpperCase()).not.toContain("COUNT(");
+    expect(sql.toUpperCase()).not.toContain("UPDATE STATISTICS");
+    expect(sql.toUpperCase()).not.toContain("DBCC");
+  });
+
+  test("counts tables only, because a view has no partitions to sum", () => {
+    const sql = composeCatalogRead("mssql", { kind: "statistics" });
+
+    expect(sql).toContain("WHERE o.type = 'U'");
+    expect(sql).toContain("o.is_ms_shipped = 0");
+    expect(sql).toContain("s.name NOT IN ('sys', 'INFORMATION_SCHEMA')");
+  });
+
+  test("keys its rows the way the inventory addresses a table, so the two join", () => {
+    const sql = composeCatalogRead("mssql", { kind: "statistics" });
+
+    expect(sql).toContain("s.name AS table_schema");
+    expect(sql).toContain("o.name AS table_name");
+  });
+});
+
+describe("composeCatalogRead — the SQL Server selector is a Unicode literal", () => {
+  /**
+   * `sys.schemas.name` and `sys.objects.name` are `sysname`, which is `nvarchar(128)`,
+   * and SQL Server parses a BARE literal in the DATABASE's collation code page.
+   *
+   * Measured on SQL Server 2022 CU26 against AdventureWorks2022, collation
+   * `SQL_Latin1_General_CP1_CI_AS` (code page 1252), with schemas `Müşteri` and
+   * `Müsteri` both present: `… WHERE s.name = 'Müşteri'` matched `Müsteri.Siparis`,
+   * the WRONG object, because `ş` (U+015F) is not in 1252 and the server best-fits it
+   * to `s`; `… WHERE s.name = N'Müşteri'` matched `Müşteri.Sipariş`. With no `Müsteri`
+   * present the bare form matched NOTHING. Both failures are silent, which is why the
+   * prefix is pinned here and in `src/lib/sql/values.ts` rather than left to a reader.
+   */
+  test("every kind narrows with an N-prefixed literal", () => {
+    for (const kind of ["columns", "relations", "indexes", "statistics"] as const) {
+      const sql = composeCatalogRead("mssql", { kind, schema: "Müşteri", table: "Sipariş" });
+
+      expect(sql, `${kind} schema`).toContain("AND s.name = N'Müşteri'");
+      expect(sql, `${kind} table`).toContain("AND o.name = N'Sipariş'");
+      expect(guardAccepts(sql), kind).toBe(true);
+    }
+  });
+
+  test("a quote in a selector is doubled inside the Unicode literal, and cannot close it", () => {
+    const sql = composeCatalogRead("mssql", { table: "orders'; DROP TABLE users --" });
+
+    expect(inspectAgentStatement(sql)).toBeNull();
+    expect(sql).toContain("N'orders''; DROP TABLE users --'");
+  });
+
+  test("the composed statement stays a single bounded read under an injection attempt", () => {
+    for (const table of ["a'--", "a''", "a';SELECT 1;--", "a\nb", "a/*b*/c", "a;b"]) {
+      const sql = composeCatalogRead("mssql", { table });
+      expect(inspectAgentStatement(sql), `table ${JSON.stringify(table)}`).toBeNull();
+    }
+  });
+
+  test("an absent selector adds no predicate at all", () => {
+    const sql = composeCatalogRead("mssql", {});
+
+    expect(sql).not.toContain("s.name = N'");
+    expect(sql).not.toContain("o.name = N'");
+  });
+});
+
+// ─── the MySQL arm (#1612) ───────────────────────────────────────────────────
+
+/*
+  One statement per kind, pinned by text because the statement IS the deliverable:
+  every spelling below was measured on MySQL 26.7.0 and MariaDB 13.0.2 as the
+  least-privilege account `libredb_agent` (docker/mysql-init and
+  docker/mariadb-init 02-agent-principal.sql), which is the only account the
+  read-only path ever runs as. The column list is GROUP_CONCAT rather than
+  JSON_ARRAYAGG because MySQL answers 1064 for ORDER BY inside that aggregate
+  and MariaDB accepts it - GROUP_CONCAT is the one spelling both take.
+*/
+describe("composeCatalogRead — the MySQL arm (#1612)", () => {
+  test("the column inventory is one row per object, columns in ordinal order", () => {
+    const sql = composeCatalogRead("mysql", { kind: "columns", schema: "app", table: "orders" });
+    expect(sql).toContain("information_schema.columns c");
+    expect(sql).toContain("JOIN information_schema.tables t");
+    expect(sql).toContain("t.table_type AS relkind");
+    expect(sql).toContain(
+      "GROUP_CONCAT(JSON_OBJECT('name', c.column_name, 'type', c.data_type, 'nullable', c.is_nullable) ORDER BY c.ordinal_position SEPARATOR ',')",
+    );
+    expect(sql).toContain("c.table_schema = 'app'");
+    expect(sql).toContain("c.table_name = 'orders'");
+    // Qualified: `tables t` carries a `table_schema` too, and an unqualified one is
+    // refused with 1052 on both engines (measured on 26.7.0 and 12.3.2).
+    expect(sql).toContain("c.table_schema NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys')");
+    expect(sql).not.toMatch(/(?<!\.)\btable_schema NOT IN/);
+  });
+
+  test("every kind names its columns in lower case, because MySQL answers information_schema in upper case", () => {
+    // Measured: MySQL 26.7.0 returns `TABLE_SCHEMA` for an unaliased
+    // information_schema column, MariaDB returns `table_schema`. The alias is what
+    // makes the two engines hand back the same keys.
+    for (const kind of ["columns", "relations", "indexes", "statistics"] as const) {
+      const sql = composeCatalogRead("mysql", { kind });
+      expect(sql, kind).toMatch(/table_schema AS table_schema/);
+      expect(sql, kind).toMatch(/table_name AS table_name/);
+    }
+  });
+
+  test("the foreign keys read pairs position with position, on key_column_usage", () => {
+    const sql = composeCatalogRead("mysql", { kind: "relations" });
+    expect(sql).toContain("information_schema.key_column_usage kcu");
+    expect(sql).toContain("kcu.referenced_table_name IS NOT NULL");
+    expect(sql).toContain("kcu.table_name");
+    expect(sql).toContain("ORDER BY kcu.table_schema, kcu.table_name, kcu.constraint_name, kcu.ordinal_position");
+  });
+
+  test("the index inventory answers is_primary by the PRIMARY name", () => {
+    const sql = composeCatalogRead("mysql", { kind: "indexes" });
+    expect(sql).toContain("information_schema.statistics");
+    expect(sql).toContain("NOT non_unique AS is_unique");
+    expect(sql).toContain("index_name = 'PRIMARY' AS is_primary");
+    expect(sql).toContain("seq_in_index");
+  });
+
+  test("the statistics inventory carries the engine's own estimate, table_rows", () => {
+    const sql = composeCatalogRead("mysql", { kind: "statistics" });
+    expect(sql).toContain("information_schema.tables");
+    expect(sql).toContain("table_rows AS estimated_rows");
+    expect(sql).toContain("table_type = 'BASE TABLE'");
+  });
+});
+
+describe("composeEstimatingExplain — the MySQL arm (#1612)", () => {
+  test("the plan is a statement prefix, EXPLAIN FORMAT=JSON, executed under the budget", () => {
+    const composed = composeEstimatingExplain("mysql", "SELECT id FROM app.orders");
+    expect(composed.sql).toBe("EXPLAIN FORMAT=JSON SELECT id FROM app.orders");
+    expect(composed.mode).toBe("execute");
   });
 });

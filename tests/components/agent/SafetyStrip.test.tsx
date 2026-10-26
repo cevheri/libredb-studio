@@ -73,6 +73,30 @@ function renderStrip(input: StripCase) {
   );
 }
 
+describe("SafetyStrip on a connection that was refused", () => {
+  test("renders the refusal's posture, and a strip told of no refusal keeps the engine's", () => {
+    const refusal =
+      "The database user this run would execute as holds privileges the read-only boundary cannot contain.";
+    const refused = render(
+      <SafetyStrip
+        mode="agent"
+        engine="mongodb"
+        engineLabel={labelFor("mongodb")}
+        handover={false}
+        refusedHere={refusal}
+      />,
+    );
+    expect(refused.getByTestId("agent-safety-headline").textContent).toBe("Refused on this connection");
+    expect(refused.getByTestId("agent-safety-claim").textContent).toContain(refusal);
+    refused.unmount();
+
+    const plain = render(
+      <SafetyStrip mode="agent" engine="mongodb" engineLabel={labelFor("mongodb")} handover={false} />,
+    );
+    expect(plain.getByTestId("agent-safety-headline").textContent).toBe("Reads only");
+  });
+});
+
 describe("SafetyStrip renders the posture whole", () => {
   test("the pill carries the headline and the qualifier sits beside it, visible", () => {
     const { getByTestId } = renderStrip(PLAN);
@@ -84,6 +108,20 @@ describe("SafetyStrip renders the posture whole", () => {
     // compression the posture module's header says overclaims.
     expect(getByTestId("agent-safety-qualifier").className).not.toContain("sr-only");
     expect(getByTestId("agent-safety-qualifier").getAttribute("aria-hidden")).toBeNull();
+  });
+
+  test("on a cluster the strip renders the cluster's own posture, naming Studio's allowlist and RBAC", () => {
+    const CLUSTER: StripCase = { mode: "agent", engine: "kubernetes", handover: false };
+    const { getByTestId } = renderStrip(CLUSTER);
+    const expected = postureFor(CLUSTER);
+
+    expect(getByTestId("agent-safety-strip").getAttribute("data-tone")).toBe("reads");
+    expect(getByTestId("agent-safety-strip").textContent).toBe(
+      `${expected.headline}${expected.qualifier}${expected.title}${expected.body}`,
+    );
+    expect(getByTestId("agent-safety-qualifier").textContent).toContain("Studio's request allowlist");
+    expect(getByTestId("agent-safety-claim").textContent).toContain("RBAC");
+    expect(getByTestId("agent-safety-claim").textContent).not.toContain("the database enforces");
   });
 
   test("plan mode's headline is the reviewed one, so a strip rendering the wrong field fails", () => {

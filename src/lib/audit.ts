@@ -16,12 +16,55 @@ export type AuditEventType =
    * to run (#328).
    */
   | "agent_operation"
+  /**
+   * An MCP endpoint operation (#246): for a tool call, one event for the decision and, when the
+   * decision allowed the call, one for its outcome, joined by one correlation id; for minting a
+   * token, one event before the token is signed. Distinct from agent_operation on purpose: an MCP
+   * call comes from a client of the user's own with a token of its own, and an operator has to be
+   * able to tell it from an agent run and from an editor statement. The user field carries the
+   * token's verified username, never client text.
+   */
+  | "mcp_operation"
+  /**
+   * A tree-driven DDL: one event for the decision to apply an edited definition and one for
+   * what the engine did with it, joined by one correlation id (#789 Phase 3).
+   *
+   * Distinct from `query_execution` on purpose, and the distinction is measured rather than
+   * argued: three DDL statements through `POST /api/db/query` added ZERO events to this ring
+   * while one VACUUM on the same connection in the same minute added exactly one, so this arm is
+   * the first record of a user's WRITE anywhere in this product and an operator filtering the log
+   * has to be able to tell it from an editor statement.
+   *
+   * The claim it makes is narrow and deliberately so: it records that an edit was applied AT THIS
+   * ADDRESS, with this strategy, and with this outcome. What it does NOT claim is WHICH statements
+   * the round trip carried, and the reason is measured rather than argued (D76).
+   *
+   * The day-one PostgreSQL unit is a multi-statement simple query with the reader's text
+   * concatenated into it, and no reader in `src/lib/sql/` can count the statements in a routine
+   * body: a dollar-quoted body may carry any number of semicolons and a `BEGIN ATOMIC` body
+   * carries them by construction. So the count is not taken here, it is ASKED OF THE ENGINE, on
+   * both sides of the plan. `buildObjectEdit` parses the reader's submitted text alone as a named
+   * prepared statement inside a transaction block it has already poisoned, and refuses a text
+   * PostgreSQL answers `42601 cannot insert multiple commands` for; `applyObjectEdit` counts the
+   * results the round trip answered, one per statement, and reports `interrupted` with
+   * `committed: "unknown"` rather than a plain `applied` when that count is not the number of
+   * statements the plan is made of.
+   *
+   * So an `applied` event is now as wide as the write in the one way a count can make it. It still
+   * says how many statements ran and never which, and it still describes one statement whose
+   * effects reach past the addressed routine by the plan's own consequence list, which for this
+   * strategy is empty. `docs/SECURITY.md` control 3.6 carries both limits, and this docblock is
+   * the shipped source's copy of them: if one moves, move the other in the same commit.
+   */
+  | "object_edit"
   // Phase 1 auth events
   | "login_success"
   | "login_failure"
   | "logout"
   | "permission_denied"
-  | "rate_limit_exceeded";
+  | "rate_limit_exceeded"
+  /** A change to a stored local account: create, role, disable, delete, password, TOTP. */
+  | "account";
 
 /**
  * Why a reason is a closed union and never free text: it is the mechanism that makes redaction
@@ -30,6 +73,19 @@ export type AuditEventType =
  */
 export type AuditReason =
   | "bad_credentials"
+  /**
+   * A correct password on a TOTP-protected local account, with no code presented yet. Recorded
+   * even though it is a normal step of the two-request flow, because in the abnormal case it is
+   * the highest-value line in this log: it says someone holds a working password for that
+   * account and was stopped only by the second factor.
+   */
+  | "mfa_required"
+  /** A correct password, but the second factor did not verify — a wrong, expired or replayed code. */
+  | "bad_totp"
+  /** A stored local account was created, changed, or removed. The verb is `action`; the subject is `target`. */
+  | "account_changed"
+  /** An admin's create, change or delete of a stored account was refused: bad input, no such account, or the last enabled admin. */
+  | "account_refused"
   | "malformed_body"
   | "no_session"
   | "insufficient_role"
@@ -40,6 +96,110 @@ export type AuditReason =
   | "oidc_no_claims"
   | "oidc_failed"
   | "oidc_config"
+  /**
+   * The login route's configuration was complete, but the provider did not answer discovery: an
+   * issuer that does not resolve, a TLS failure, a response that is not JSON or names a different
+   * issuer. (openid-client checks nothing else in the document, so one that parses but lacks an
+   * endpoint fails later, as `oidc_failed`.) Kept apart from
+   * `oidc_config` because Studio cannot tell up front whether .env is to blame (a mistyped issuer
+   * host lands here too; only the scheme is checked before discovery), and from `oidc_failed`
+   * because the login page tells the user something different for each.
+   */
+  | "oidc_discovery"
+  /**
+   * The provider authenticated the account, but with OIDC_USER_ROLES set its role claim holds none
+   * of OIDC_ADMIN_ROLES or OIDC_USER_ROLES, so no session was created. The record names the account,
+   * which the provider vouched for, so an operator can tell whose role assignment is missing.
+   */
+  | "oidc_no_role"
+  /**
+   * The provider authenticated the account, but its role claim held more than 20 claim roles matching
+   * OIDC_ROLE_PREFIX or a claim role longer than 64 characters, so no session was created.
+   */
+  | "oidc_role_overflow"
+  /**
+   * Under governance (docs/GOVERNANCE.md#sign-in), the provider authenticated the account, but the governance source
+   * revoked its subject's sessions at or after this second, so every request would refuse the session the callback
+   * was about to mint and none was minted. The record names the account, which the provider vouched for.
+   */
+  | "oidc_session_revoked"
+  /**
+   * A `POST /api/auth/login` under governance (docs/GOVERNANCE.md), where the identity provider is the only way in.
+   * Refused before the body is read, so the record names no submitted account and the actor is anonymous.
+   */
+  | "password_login_disabled"
+  /**
+   * Under governance (docs/GOVERNANCE.md), a request named a connection the session's identity provider subject holds
+   * no grant on: one that does not exist, one granted to someone else, an expired grant or a row Studio did not admit,
+   * which the 404 CONNECTION_NOT_FOUND it answers leaves indistinguishable. The record names the id that was asked for.
+   */
+  | "connection_not_granted"
+  // Passkey sign-in and management (#785). Each code has one meaning, so an operator can tell a
+  // cloned authenticator from a replay or a stale cookie without the export.
+  /**
+   * The ceremony cookie was missing, forged, expired, issued for the other ceremony, for another
+   * account or session version (including one that moved while the ceremony ran), or for another RP ID.
+   * A first registration that lost the race to another first registration of the same account lands
+   * here too: its ceremony carries a user handle the account no longer has, and no cookie is at fault.
+   */
+  | "passkey_ceremony_invalid"
+  /**
+   * A response made on another origin than PASSKEY_ORIGIN: a non-browser client, a modified client,
+   * or a page on a subdomain of Studio's host. Studio's own UI never produces it in a real browser,
+   * so it is not a configuration symptom; a wrong PASSKEY_ORIGIN shows as a missing passkey button.
+   */
+  | "passkey_origin_mismatch"
+  /** No credential with that ID for the configured RP ID, or the assertion carried no user handle. */
+  | "passkey_unknown"
+  /**
+   * WebAuthn verification refused the response: challenge, RP ID, flags, signature, attestation
+   * format, cross-origin use, a credential ID that is not the attested one, or a user handle or
+   * backup eligibility that does not match the stored credential.
+   */
+  | "passkey_rejected"
+  /**
+   * The signature counter did not increase, a possible cloned authenticator; the sign-in was refused
+   * and the account is not locked.
+   */
+  | "passkey_counter"
+  /** The challenge of an already successful ceremony was presented again. */
+  | "passkey_replayed"
+  /** A valid passkey of an account that is disabled or gone. */
+  | "passkey_account_unavailable"
+  /** A registration presented a credential ID already registered to an account. */
+  | "passkey_duplicate"
+  // Launch-token sign-in (docs/LAUNCH.md), each a `login_failure` reason on POST /api/auth/launch.
+  // One code per refusal, so an operator can tell a launch secret the platform and Studio no longer
+  // share from a slow click or a replay without the export. The token itself is never recorded.
+  /** Not a compact JWS, unparseable, or a claim missing or of the wrong shape. */
+  | "launch_token_malformed"
+  /** A header typ other than exactly libredb-launch+jwt, or none: another kind of JWT, such as a Studio session. */
+  | "launch_token_type"
+  /** Signed with an algorithm other than HS256, with none, or with a key other than LAUNCH_TOKEN_SECRET. */
+  | "launch_token_signature"
+  /** Issued by an issuer other than LAUNCH_TOKEN_ISSUER. */
+  | "launch_token_issuer"
+  /** Issued for an audience other than LAUNCH_TOKEN_AUDIENCE. */
+  | "launch_token_audience"
+  /** Past its expiry by more than the clock tolerance. */
+  | "launch_token_expired"
+  /** Issued, or valid from, further in the future than the clock tolerance allows: the two clocks disagree. */
+  | "launch_token_premature"
+  /** Issued for longer than the 60 seconds a launch token may live. */
+  | "launch_token_lifetime"
+  /** A token whose jti this process has already accepted. */
+  | "launch_token_replayed"
+  /** A valid token refused while this process remembers as many unexpired launch tokens as it holds. */
+  | "launch_capacity_exceeded"
+  /** A valid launch token for an account that is disabled in the server store. */
+  | "launch_account_disabled"
+  /**
+   * A valid launch token for an account a launch cannot sign in to: one with a password, an authenticator or
+   * a passkey, or one a launch created for another platform identity (issuer and subject).
+   */
+  | "launch_identity_mismatch"
+  /** A valid launch token for another account than the one this browser is signed in as; the session stays. */
+  | "launch_session_conflict"
   // Agent execution path (#328). The thirteen `agent_*` codes below mirror
   // `PolicyDenyCode` one-for-one, plus the two outcomes that are not policy
   // denials: an operation that may only ever require approval, and a provider
@@ -74,7 +234,63 @@ export type AuditReason =
   // single-purpose credential. Distinct from `no_session` on purpose: this path
   // never wanted a session, so recording one vocabulary for both would make a
   // forged drive token indistinguishable in the trail from an expired login.
-  | "no_agent_drive_token";
+  | "no_agent_drive_token"
+  // The MCP endpoint (#246). The first three are its identity refusals, written by src/proxy.ts
+  // or by the route when the proxy was bypassed: a bearer that is missing, malformed, forged,
+  // expired, revoked or foreign (one code covers missing and invalid, as no_agent_drive_token
+  // does); any bearer while LIBREDB_MCP_TOKEN_LABEL is unset, or a token that verifies while
+  // LIBREDB_MCP_URL is unset or invalid; and a Host the loopback-bind check refused.
+  | "mcp_token_invalid"
+  | "mcp_channel_unconfigured"
+  | "mcp_host_not_allowed"
+  // The OIDC bearer channel (src/lib/oidc-bearer.ts), written by src/proxy.ts: an access token that is malformed,
+  // forged, expired, an ID token, for another audience, issuer or client; one whose account holds no role while
+  // OIDC_USER_ROLES is set; and one that carries no sub, or neither email nor preferred_username.
+  | "bearer_token_invalid"
+  | "bearer_no_role"
+  | "bearer_no_identity"
+  // The rest are mcp_operation reasons, each with one meaning. Arguments that failed the tool's
+  // input schema, which the SDK refuses before any handler runs and the route records.
+  | "mcp_invalid_arguments"
+  // A connection id outside the token's opted-in connections, the same for one that exists and
+  // one that does not.
+  | "mcp_connection_not_visible"
+  // A statement the execution fence refused before any provider was reached.
+  | "mcp_statement_refused"
+  // A named schema the connection does not have; an outcome, since the lookup needs the provider.
+  | "mcp_schema_not_found"
+  // offset above zero on a query the provider did not rewrite, so it could not be paged.
+  | "mcp_offset_unsupported"
+  // The request's signal aborted before or during the call.
+  | "mcp_cancelled"
+  // The call's deadline passed, including a provider's time-budget refusal and any failure that
+  // settled after the deadline.
+  | "mcp_timeout"
+  // A provider budget refusal (rows, bytes, a value SQL Server cut, a serialised result), or one
+  // row larger than the result cap.
+  | "mcp_result_too_large"
+  // Any other provider or acquisition failure.
+  | "mcp_execution_failed"
+  // The seed file could not be loaded, so no connection could be resolved.
+  | "mcp_connections_unreadable"
+  // The object edit path (#789 Phase 3). Eight codes for one apply's decidable outcomes, mapped
+  // from `ObjectEditOutcome` by a total record in src/lib/db/object-edit.ts, so a new outcome
+  // with no reading here fails to compile. `object_edit_plan_invalid` is the analogue of
+  // `no_agent_drive_token` and exists for the same recorded reason: without it a forged or
+  // tampered plan is indistinguishable in the trail from an ordinary failure.
+  | "object_edit_collateral_loss"
+  | "object_edit_applied_elsewhere"
+  | "object_edit_conflict"
+  | "object_edit_concurrent_update"
+  | "object_edit_refused"
+  | "object_edit_guard_refused"
+  | "object_edit_interrupted"
+  | "object_edit_plan_invalid"
+  // `POST /api/db/maintenance` when the provider's `runMaintenance` THREW (#1091 review, R04 G8).
+  // Kept apart from the reasonless failure row an engine's own `success: false` writes: a thrown
+  // run may have reached the engine before it failed, so its disposition is not the engine's
+  // answer, and an operator reading the log needs to tell the two apart.
+  | "maintenance_execution_failed";
 
 export interface AuditEvent {
   id: string;
@@ -82,6 +298,24 @@ export interface AuditEvent {
   type: AuditEventType;
   action: string;
   target: string;
+  /**
+   * The CONTAINER the target was addressed in, when the request named one: the schema of a
+   * PostgreSQL table, the database on ClickHouse, the bucket on a document store. It is what
+   * tells `app.orders` apart from `public.orders` in this log (#1091 review), so a maintenance
+   * row is two facts rather than one.
+   *
+   * Optional, and set only by the maintenance route: every other event's `target` already names
+   * a route rather than an object, and a field that claimed a container there would be a value
+   * its writer never meant. `toAuditLine` omits it entirely when it is unset, the way `reason`
+   * and `bucket` are omitted, so the line's shape does not grow a null.
+   */
+  container?: string;
+  /**
+   * The engine principal a maintenance run acted as, when its provider names one through the optional
+   * `DatabaseProvider.engineUser()` (spec 3.11): a user name, never any part of a secret. Set by the maintenance route
+   * only, and omitted by `toAuditLine` when unset, as `container` is.
+   */
+  engineUser?: string;
   connectionName?: string;
   user: string;
   result: "success" | "failure";
@@ -105,10 +339,15 @@ export interface AuditEvent {
    * decision allowed it, the execution outcome. Server-generated per execution
    * (src/lib/db/operations/execution.ts) and opaque — it identifies an
    * execution, never a session, a user or a token, so it stays safe to log
-   * while remaining the key an operator groups by. Only `agent_operation`
-   * events set it.
+   * while remaining the key an operator groups by.
+   *
+   * Set by `agent_operation` events, by `object_edit` events, and by `mcp_operation` tool events,
+   * the three paths that emit a decision and an outcome as two records of one action (#789 Phase 3,
+   * #246).
    */
   correlationId?: string;
+  /** The internal id of the passkey the event concerns, never the WebAuthn credential ID. */
+  passkey?: string;
 }
 
 const MAX_EVENTS = 1000;
@@ -125,6 +364,8 @@ interface AuditFilterOptions {
   result?: "success" | "failure";
   connectionName?: string;
   since?: string;
+  /** Keep at most this many of the newest matches. Absent, NaN or negative means all of them. */
+  limit?: number;
 }
 
 export class AuditRingBuffer {
@@ -152,18 +393,30 @@ export class AuditRingBuffer {
     return [...this.events];
   }
 
+  /**
+   * The newest `count` events, newest first. The buffer appends, so it is stored oldest
+   * first; the people reading it (Admin > Audit and its exports) want the event that just
+   * happened at the top, not below a page of sign-ins from when the server started.
+   */
   getRecent(count: number): AuditEvent[] {
-    return this.events.slice(-count);
+    return this.newestFirst(this.events, count);
   }
 
+  /** Every match, newest first, capped to `opts.limit` of the newest when one is given. */
   filter(opts: AuditFilterOptions): AuditEvent[] {
-    return this.events.filter((e) => {
+    const matches = this.events.filter((e) => {
       if (opts.type && e.type !== opts.type) return false;
       if (opts.result && e.result !== opts.result) return false;
       if (opts.connectionName && e.connectionName !== opts.connectionName) return false;
       if (opts.since && e.timestamp < opts.since) return false;
       return true;
     });
+    return this.newestFirst(matches, opts.limit);
+  }
+
+  private newestFirst(chronological: AuditEvent[], limit?: number): AuditEvent[] {
+    const reversed = [...chronological].reverse();
+    return limit !== undefined && limit >= 0 ? reversed.slice(0, limit) : reversed;
   }
 
   clear() {
@@ -206,8 +459,11 @@ const AUDIT_SCHEMA = "libredb.audit.v1";
 export const MAX_AUDIT_FIELD_LENGTH = 254;
 /** The address derivation's "no usable signal" placeholder; never recorded as if it were one. */
 const UNKNOWN_ADDRESS = "unknown";
-/** Redaction marker for a URI's userinfo segment. Never a value real credentials could equal. */
-const CREDENTIAL_REDACTION = "[REDACTED]";
+/**
+ * Redaction marker for a URI's userinfo segment. Never a value real credentials could equal.
+ * Exported for the query event redactor, which writes the same marker for every credential it masks.
+ */
+export const CREDENTIAL_REDACTION = "[REDACTED]";
 /**
  * Where a connection string's userinfo can be collapsed before the value reaches either
  * destination. Once the `scheme://` boundary is found, everything to the end of the string is in
@@ -261,7 +517,8 @@ function isLetter(ch: string): boolean {
   return (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z");
 }
 
-function redactUriCredentials(value: string): string {
+/** Exported for the query event redactor (`src/lib/query-events/redact.ts`), which applies the same rule to a statement. */
+export function redactUriCredentials(value: string): string {
   let searchFrom = 0;
   for (;;) {
     const delimiter = value.indexOf("://", searchFrom);
@@ -405,9 +662,12 @@ interface AuditLogLine {
   reason?: AuditReason;
   ip?: string;
   connection?: string;
+  container?: string;
+  engine_user?: string;
   duration_ms?: number;
   bucket?: string;
   correlation_id?: string;
+  passkey?: string;
 }
 
 function toAuditLine(event: AuditEvent): AuditLogLine {
@@ -423,6 +683,13 @@ function toAuditLine(event: AuditEvent): AuditLogLine {
     ...(event.reason ? { reason: event.reason } : {}),
     ...(event.ip && event.ip !== UNKNOWN_ADDRESS ? { ip: event.ip } : {}),
     ...(event.connectionName ? { connection: event.connectionName } : {}),
+    // The container beside the route, and omitted on the same terms: an event that named none
+    // must not publish a `container: null` a parser would read as a value (#1091 review).
+    ...(event.container ? { container: event.container } : {}),
+    // The engine principal beside the container, omitted on the same terms (spec 3.11).
+    ...(event.engineUser ? { engine_user: event.engineUser } : {}),
+    // Omitted when unset, like container: most events concern no passkey.
+    ...(event.passkey ? { passkey: event.passkey } : {}),
     ...(event.bucket ? { bucket: event.bucket } : {}),
     ...(event.correlationId ? { correlation_id: event.correlationId } : {}),
     // Number.isFinite excludes NaN and +/-Infinity: JSON.stringify(NaN) silently produces `null`,
@@ -437,8 +704,10 @@ function toAuditLine(event: AuditEvent): AuditLogLine {
  *
  * 1. Pushes to the ring buffer the admin UI reads. That buffer is per process and holds 1000
  *    events, oldest dropped. It is a CONVENIENCE VIEW, not the durable record - an event emitted
- *    from proxy() may land in a different instance than the admin API reads, because the proxy is
- *    a separately compiled entry and instance sharing is unverified.
+ *    from proxy() ALWAYS lands in a different instance than the admin API reads, measured in #851:
+ *    Next compiles proxy.ts as its own entry which can run outside the main runtime, so the two
+ *    have separate module graphs and therefore separate buffers. Every denial proxy() records is
+ *    absent from the Admin Audit tab, which discloses that; the stdout channel below carries them.
  * 2. Writes one JSON line to stdout. This is the authoritative channel: it works identically in
  *    all 27 distribution channels with no dependency, and it is what a log pipeline consumes.
  *

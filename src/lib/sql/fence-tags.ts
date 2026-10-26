@@ -47,6 +47,10 @@ const ENGINE_FENCE_TAGS: Readonly<Record<DatabaseType, true>> = Object.freeze({
   mongodb: true,
   redis: true,
   oracle: true,
+  // A ```db2 block holds a statement this editor runs against a Db2 LUW connection (#786). No
+  // alias is registered below: `sqlpl` names Db2's procedural language rather than the product,
+  // and an alias that names the WRONG engine is worse here than a missing one.
+  db2: true,
   mssql: true,
   libredb: true,
   couchbase: true,
@@ -71,6 +75,74 @@ const ENGINE_FENCE_TAGS: Readonly<Record<DatabaseType, true>> = Object.freeze({
   // is not: CQL is a language, and ScyllaDB speaks it too, so reading `cql` as
   // "this was written for Cassandra" would put a claim in the model's mouth.
   cassandra: true,
+  // A ```prometheus block holds a PromQL expression the editor sends unchanged to
+  // `/api/v1/query` (#1085), and it is the tag the planning contract asks a model for. The
+  // `promql` alias below spells the language, and it still names this engine: see its entry.
+  prometheus: true,
+  // A ```kafka block holds a JSON read request the editor sends to the provider as it is
+  // (#1088). No alias is registered below: `json` is the tempting one and it is the wrong one,
+  // because a MongoDB document is JSON too, and `fenceTagEngine` is what decides whether a plan's
+  // deliverable was written for THIS connection.
+  kafka: true,
+  // An ```etcd block holds one etcdctl command the editor runs as it is (#1089). No alias is
+  // registered below: `sh`, `bash` and `shell` name no engine, which is the reason `sql` maps to
+  // no engine in `ALIAS_ENGINES`, and `etcdctl`, which names etcd alone, is left out until plan
+  // runs show a model writing it.
+  etcd: true,
+  // A ```neo4j block holds one read-only Cypher statement the editor runs as it is (Neo4j spec 6.4). The
+  // `cypher` alias below spells the language, and it still names this engine: see its entry.
+  neo4j: true,
+  // A ```milvus block holds one Milvus console request the editor runs as it is (vector-family spec 5.7). No alias
+  // is registered below: `json` is a MongoDB document as often, `http` and `rest` name no engine, and
+  // `fenceTagEngine` is what decides whether a plan's deliverable was written for THIS connection.
+  milvus: true,
+  // A ```qdrant block holds one Qdrant console request the editor runs as it is (vector-family spec 6.7). No alias
+  // is registered below: `json` is a MongoDB document as often, `http` and `rest` name no engine, and
+  // `fenceTagEngine` is what decides whether a plan's deliverable was written for THIS connection.
+  qdrant: true,
+  // An ```influxdb block holds one InfluxQL statement the editor runs as it is. The `influxql` alias below
+  // spells the language, and it still names this engine: see its entry. No `flux` tag is registered anywhere:
+  // no type-id runs Flux, and an alias would make a Flux block look runnable on `influxdb`.
+  influxdb: true,
+  // An ```influxdb3 block holds one DataFusion SQL statement. No alias is registered below: `sql` names no
+  // engine, and `influxql` and `flux` are not this type-id's language.
+  influxdb3: true,
+  // A ```oxia block holds one `oxia client` read command the editor runs as it is (O14). No alias: `oxia` already
+  // names the engine and its CLI.
+  oxia: true,
+  // A ```databend block holds one statement in Databend's SQL, sent as it is to `POST /v1/query`. No alias: `sql`
+  // names no engine, and `mysql` names the MySQL-wire driver Databend no longer connects through.
+  databend: true,
+  bigquery: true,
+  // A ```snowflake block holds one statement in Snowflake's SQL, sent as it is through the SQL API. No alias:
+  // `snowsql` names Snowflake's command-line client, not a dialect.
+  snowflake: true,
+  // A ```spark block holds one statement in Spark SQL, sent as it is over Spark Connect. No alias.
+  spark: true,
+  // A ```s3 block holds one AWS CLI subset read command the editor runs as it is. No alias: `aws` names every AWS
+  // service, and `sh`, `bash` and `shell` name no engine.
+  s3: true,
+  // A ```kubernetes block holds one statement of the kubectl subset the editor runs as it is. The `kubectl` alias below
+  // spells the command, and it still names this engine. No `yaml` or `sh` tag is registered: neither names an engine.
+  kubernetes: true,
+  mqtt: true,
+  // A ```firestore block holds one statement of the console's read-only Admin SDK subset. No alias: `firebase` names a
+  // platform of many products, and `js` and `javascript` name a language, not an engine.
+  firestore: true,
+  // A ```rabbitmq block holds one JSON read request the editor runs as it is.
+  rabbitmq: true,
+  // An ```opcua block holds one JSON read request, which the console runs as it is.
+  opcua: true,
+  // An ```mtconnect block holds one request line in the agent's own URL grammar, which the console runs as it is.
+  mtconnect: true,
+  // A ```modbus block holds one JSON read request, which the console runs as it is.
+  modbus: true,
+  // A ```netconf block holds one JSON read request naming a datastore, a path and a limit, which
+  // the console runs as it is. The device's own language is XML and nothing here writes any.
+  netconf: true,
+  snmp: true,
+  // An ```sparkplug block holds one read request in the JSON shape the console runs as it is.
+  sparkplug: true,
 });
 
 /**
@@ -96,10 +168,17 @@ const QUERY_FENCE_ALIASES: ReadonlySet<string> = new Set([
   "mongo",
   "n1ql",
   "cql",
+  "promql",
+  "cypher",
+  "influxql",
+  "kubectl",
 ]);
 
 /**
  * The aliases that name ONE engine, and which one.
+ *
+ * An entry names the type-id a block's text runs on, which is not always the product the
+ * tag spells: `mariadb` names `mysql`, the type-id MariaDB connects through.
  *
  * `sql` is deliberately absent: it names no engine, and mapping it to the connection's
  * would turn a generic tag into a claim the model never made.
@@ -117,6 +196,22 @@ const ALIAS_ENGINES: Readonly<Record<string, DatabaseType>> = Object.freeze({
   sqlserver: "mssql",
   mongo: "mongodb",
   n1ql: "couchbase",
+  // A language rather than a product, and still ONE type-id: every PromQL server this product
+  // reaches, VictoriaMetrics included, connects through `prometheus` (#1085). Left out of this
+  // record, a ```promql block contradicted no connection and was recorded as a PostgreSQL
+  // run's statement. A second type-id that runs PromQL is the moment to revisit this entry.
+  // `cql` is absent on a reason the same rule does not leave standing, since ScyllaDB connects
+  // through `cassandra` too; docs/BACKLOG.md B86 records it.
+  promql: "prometheus",
+  // The `promql` rule again: Cypher is a language, and `neo4j` is the only type-id that runs it. Left
+  // out of this record, a ```cypher block contradicted no connection and was recorded as a PostgreSQL
+  // run's statement. A second graph type-id that runs Cypher is the moment to revisit this entry.
+  cypher: "neo4j",
+  // The `promql` rule again: InfluxQL is a language, and `influxdb` is the only type-id that runs it
+  // (`influxdb3` runs SQL). A second InfluxQL type-id is the moment to revisit this entry.
+  influxql: "influxdb",
+  // The command the Kubernetes console speaks, and `kubernetes` is the only type-id that runs it.
+  kubectl: "kubernetes",
 });
 
 /**

@@ -1,13 +1,20 @@
 import type { ExplainFormat } from "@/lib/db/types";
 import type { ExplainPlanInput, ExplainStrategy, StoredExplainPlan } from "./types";
 import { postgresJsonStrategy } from "./postgres-json";
+import { postgresTextAnalyzeStrategy, postgresTextStrategy } from "./postgres-text";
 import { mysqlJsonStrategy } from "./mysql-json";
+import { mysqlTextStrategy } from "./mysql-text";
 import { sqliteQueryplanStrategy } from "./sqlite-queryplan";
 import { couchbaseJsonStrategy } from "./couchbase-json";
 import { clickhouseJsonStrategy } from "./clickhouse-json";
 import { druidNativeStrategy } from "./druid-native";
 import { trinoJsonStrategy } from "./trino-json";
 import { duckdbJsonStrategy } from "./duckdb-json";
+import { databendTextStrategy } from "./databend-text";
+import { bigqueryDryRunStrategy } from "./bigquery-dryrun";
+import { firestoreExplainStrategy } from "./firestore-explain";
+import { snowflakeJsonStrategy } from "./snowflake-json";
+import { sparkTextStrategy } from "./spark-text";
 
 export type { ExplainMode, ExplainStrategy } from "./types";
 export type { ExplainPlanInput } from "./types";
@@ -16,13 +23,21 @@ export type { ExplainPlanInput } from "./types";
 // registry entry is a compile error.
 const registry: Record<ExplainFormat, ExplainStrategy> = {
   "postgres-json": postgresJsonStrategy,
+  "postgres-text": postgresTextStrategy,
+  "postgres-text-analyze": postgresTextAnalyzeStrategy,
   "mysql-json": mysqlJsonStrategy,
+  "mysql-text": mysqlTextStrategy,
   "sqlite-queryplan": sqliteQueryplanStrategy,
   "couchbase-json": couchbaseJsonStrategy,
   "clickhouse-json": clickhouseJsonStrategy,
   "druid-native": druidNativeStrategy,
   "trino-json": trinoJsonStrategy,
   "duckdb-json": duckdbJsonStrategy,
+  "databend-text": databendTextStrategy,
+  "bigquery-dryrun": bigqueryDryRunStrategy,
+  "snowflake-json": snowflakeJsonStrategy,
+  "firestore-explain": firestoreExplainStrategy,
+  "spark-text": sparkTextStrategy,
 };
 
 export function getExplainStrategy(format: ExplainFormat | undefined): ExplainStrategy | null {

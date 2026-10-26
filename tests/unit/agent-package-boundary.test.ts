@@ -42,7 +42,8 @@ import path from "node:path";
 import { describe, expect, test } from "bun:test";
 import { DEFAULT_WORKSPACE_FEATURES } from "@/workspace/types";
 
-const ROOT = process.cwd();
+// Anchored to this file, not to process.cwd(): the test is then correct whoever launches it.
+const ROOT = path.resolve(import.meta.dir, "../..");
 const SRC = path.join(ROOT, "src");
 
 // ---------------------------------------------------------------------------
@@ -199,7 +200,12 @@ function reExportClosure(): Set<string> {
   return exported;
 }
 
-const relative = (file: string): string => path.relative(ROOT, file);
+// path.relative returns the platform separator, so on Windows this would be
+// "src\\exports\\components.ts". Every literal compared against it below is POSIX-shaped, and
+// isAgentModule() matches on "/" - a backslash path makes that regex match nothing, so the
+// boundary gate at "no agent module reaches the package surface" would pass vacuously while a
+// real violation went unreported. Normalise once here, at the only place a path becomes a string.
+const relative = (file: string): string => path.relative(ROOT, file).split(path.sep).join("/");
 
 /** What the bundler emits as code. */
 const emitted = walkFrom("only-values");
@@ -216,11 +222,30 @@ const declared = walkFrom("values-and-types");
  * `AgentRail.tsx` filed outside an `agent/` directory both match. Deliberately
  * over-broad — a false positive here is a conversation, a false negative is the
  * hole this file exists to close — and it costs nothing today: no module under
- * `src/` matches it except the agent modules themselves.
+ * `src/` matches it except the agent modules themselves and the ones
+ * `NOT_AGENT_CODE` names.
  */
 function isAgentModule(file: string): boolean {
-  return /(^|\/)(agent|use-agent)/i.test(relative(file));
+  const name = relative(file);
+  return !NOT_AGENT_CODE.has(name) && /(^|\/)(agent|use-agent)/i.test(name);
 }
+
+/**
+ * The false positives that conversation settled, by exact path rather than by
+ * category, so a second one is looked at rather than waved through. Each is
+ * provider code under `src/lib/db`, which imports nothing from `src/lib/agent`:
+ * only its own name is excused, and every module it reaches is still walked and
+ * still checked. The Kubernetes provider's curated readings answer the agent's
+ * `cluster.usage.read` and ship in the package with the provider. The MongoDB
+ * provider's read-only profile (its bounded read and the boundary it proves at
+ * open) is `queryReadOnly`'s own code, split out of `mongodb/index.ts`, and
+ * ships with the provider the same way.
+ */
+const NOT_AGENT_CODE: ReadonlySet<string> = new Set([
+  "src/lib/db/providers/platform/kubernetes/agent-readings.ts",
+  "src/lib/db/providers/document/mongodb/agent-read.ts",
+  "src/lib/db/providers/document/mongodb/agent-boundary.ts",
+]);
 
 // ---------------------------------------------------------------------------
 // The scanner itself, before anything is concluded from it
@@ -312,6 +337,9 @@ describe("the scanner reads what it claims to read", () => {
     for (const ordinaryFile of [
       "src/components/studio/BottomPanel.tsx",
       "src/lib/db/operations/execution.ts",
+      "src/lib/db/providers/platform/kubernetes/agent-readings.ts",
+      "src/lib/db/providers/document/mongodb/agent-read.ts",
+      "src/lib/db/providers/document/mongodb/agent-boundary.ts",
       "src/workspace/StudioWorkspace.tsx",
     ]) {
       expect(isAgentModule(path.join(ROOT, ordinaryFile))).toBe(false);
@@ -411,5 +439,43 @@ describe("the embedded workspace declares no agent capability", () => {
       "testDataGenerator",
       "transactions",
     ]);
+  });
+});
+
+describe("no MCP server module or package reaches the published package (#246)", () => {
+  /**
+   * The MCP server is standalone-only: its modules live under src/lib/mcp/, its routes and its
+   * settings page under src/app/, and its screen under src/components/mcp/, and none of them,
+   * nor any @modelcontextprotocol package, may be reached from a tsup entry point. Asserted on
+   * the source graph for the reason the header of this file gives. Two edits of the MCP work do
+   * reach the package and are expected to: src/lib/db/factory.ts, which the package re-exports,
+   * and the AuditEvent type of src/lib/audit.ts.
+   */
+  const MCP_OWNED = [/^src\/lib\/mcp\//, /^src\/app\//, /^src\/components\/mcp\//];
+  const isMcpOwned = (file: string): boolean => MCP_OWNED.some((pattern) => pattern.test(relative(file)));
+
+  test("the walk reaches the factory the package re-exports, so an empty walk cannot pass", () => {
+    expect([...emitted.reached].map(relative)).toContain("src/lib/db/factory.ts");
+  });
+
+  test("the path rule recognises an MCP module, so the assertions below can fail", () => {
+    expect(isMcpOwned(path.join(ROOT, "src/lib/mcp/server.ts"))).toBe(true);
+    expect(isMcpOwned(path.join(ROOT, "src/app/api/mcp/route.ts"))).toBe(true);
+    expect(isMcpOwned(path.join(ROOT, "src/components/mcp/McpSettings.tsx"))).toBe(true);
+    expect(isMcpOwned(path.join(ROOT, "src/lib/db/factory.ts"))).toBe(false);
+  });
+
+  test.each([
+    ["code", emitted],
+    ["declarations", declared],
+  ] as const)("no file the %s walk reaches is an MCP module", (_kind, walk) => {
+    expect([...walk.reached].filter(isMcpOwned).map(relative)).toEqual([]);
+  });
+
+  test.each([
+    ["code", emitted],
+    ["declarations", declared],
+  ] as const)("no package the %s walk reaches is an @modelcontextprotocol package", (_kind, walk) => {
+    expect([...walk.packages].filter((name) => name.startsWith("@modelcontextprotocol/"))).toEqual([]);
   });
 });

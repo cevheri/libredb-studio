@@ -6,24 +6,41 @@ import { afterAll, describe, expect, test } from "bun:test";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { pathToFileURL } from "url";
 import {
   artifactName,
+  startupUrl,
   assertReleaseVersion,
   assessNodeRuntime,
   assessProvenance,
   extractArchive,
   extractionCommand,
   LauncherUsageError,
+  mcpUrlFor,
   parseLauncherArgs,
   parseSha256Sums,
+  PATH_VARIABLES,
   preservePayloadData,
   releaseDownloadUrl,
+  resolveBindAddress,
   resolveCacheDir,
   resolveLedgerDir,
+  resolvePathVariables,
   sha256File,
+  URL_PATH_VARIABLES,
 } from "../../bin/lib/launcher-utils.mjs";
+import { describeIf, missingUnixTool, resolveUnixTool } from "../helpers/posix-tools";
+import { howItFailed } from "../helpers/spawn-outcome";
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "launcher-utils-test-"));
+/*
+  Resolved rather than spawned by bare name: `Bun.spawnSync` THROWS ("Executable not found in
+  $PATH", measured in this worktree) when a name does not resolve, which would take the whole file
+  down instead of failing one assertion. tar is not POSIX-only here - Windows 11 ships bsdtar as
+  System32\tar.exe, which both writes the fixture .tar.gz and honours the --strip-components the
+  launcher passes - so the archive case runs everywhere a tar exists.
+*/
+const TAR = resolveUnixTool("tar");
 
 afterAll(() => {
   fs.rmSync(tempDir, { recursive: true, force: true });
@@ -387,7 +404,7 @@ describe("preservePayloadData", () => {
   });
 });
 
-describe("extractArchive", () => {
+describeIf(missingUnixTool("tar"), "extractArchive", () => {
   // Release tarballs are packed with a top-level libredb-studio-<version>/
   // root (issue #133, scripts/lib/pack-standalone-tarball.sh) instead of a
   // tarbomb; extractArchive must strip that one path component so the
@@ -403,11 +420,12 @@ describe("extractArchive", () => {
     fs.writeFileSync(path.join(versionedRoot, "nested", "file.txt"), "nested contents");
 
     const tarballPath = path.join(sourceDir, "fixture.tar.gz");
-    const result = Bun.spawnSync(["tar", "-czf", tarballPath, "-C", sourceDir, rootName], {
+    const result = Bun.spawnSync([TAR!, "-czf", tarballPath, "-C", sourceDir, rootName], {
       stdout: "pipe",
       stderr: "pipe",
     });
-    if (result.exitCode !== 0) throw new Error(`failed to build fixture tarball: ${result.stderr.toString()}`);
+    if (result.exitCode !== 0)
+      throw new Error(`building the fixture tarball ${howItFailed(result)}: ${result.stderr.toString()}`);
     return tarballPath;
   }
 
@@ -564,5 +582,429 @@ describe("assessProvenance", () => {
     const result = assess({ stderr: POLICY_MISMATCH, version: "0.9.0" });
     expect(result.action).toBe("fail");
     expect(result.message).toContain(ARTIFACT);
+  });
+});
+
+describe("startupUrl", () => {
+  test.each([
+    ["0.0.0.0", "4000", "http://127.0.0.1:4000"],
+    ["::", "4000", "http://[::1]:4000"],
+    ["[::]", "4000", "http://[::1]:4000"],
+    ["fe80::1", "4000", "http://[fe80::1]:4000"],
+    ["[fe80::1]", "4000", "http://[fe80::1]:4000"],
+    ["127.0.0.1", "4000", "http://127.0.0.1:4000"],
+    ["example.internal", "4000", "http://example.internal:4000"],
+    ["", "4000", "http://127.0.0.1:4000"],
+    [undefined, undefined, "http://127.0.0.1:3000"],
+    [null, null, "http://127.0.0.1:3000"],
+    ["127.0.0.1", "", "http://127.0.0.1:3000"],
+    ["127.0.0.1", 4000, "http://127.0.0.1:4000"],
+  ])("formats host %s and port %s", (host, port, expected) => {
+    expect(startupUrl(host, port)).toBe(expected);
+  });
+});
+
+describe("mcpUrlFor (#246)", () => {
+  test.each([
+    ["127.0.0.1", "3000", "http://127.0.0.1:3000/api/mcp"],
+    ["::", "3000", "http://[::1]:3000/api/mcp"],
+    ["0.0.0.0", "4123", "http://127.0.0.1:4123/api/mcp"],
+    [undefined, undefined, "http://127.0.0.1:3000/api/mcp"],
+  ])("derives the canonical MCP URL for host %p and port %p", (host, port, expected) => {
+    expect(mcpUrlFor(host, port)).toBe(expected);
+  });
+});
+
+describe("resolvePathVariables", () => {
+  const cwd = path.resolve(tempDir, "invoked-from");
+
+  test.each(PATH_VARIABLES.map((name) => [name]))("resolves a relative %s against the invoking directory", (name) => {
+    expect(resolvePathVariables({ [name]: "./data/x" }, cwd)[name]).toBe(path.join(cwd, "data", "x"));
+  });
+
+  test("resolves a bare relative name, not only one starting with ./", () => {
+    expect(resolvePathVariables({ SEED_CONFIG_PATH: "seed.yaml" }, cwd).SEED_CONFIG_PATH).toBe(
+      path.join(cwd, "seed.yaml"),
+    );
+  });
+
+  test("resolves a relative GOOGLE_APPLICATION_CREDENTIALS, the key file the Google providers read on the server's opt-in", () => {
+    // Under `npx @libredb/studio` the server runs from the payload cache, so `keys/sa.json` typed beside the command
+    // would otherwise name a file in that cache.
+    expect(PATH_VARIABLES).toContain("GOOGLE_APPLICATION_CREDENTIALS");
+    expect(
+      resolvePathVariables({ GOOGLE_APPLICATION_CREDENTIALS: "keys/sa.json" }, cwd).GOOGLE_APPLICATION_CREDENTIALS,
+    ).toBe(path.join(cwd, "keys", "sa.json"));
+    const absolute = path.resolve(tempDir, "sa.json");
+    expect(resolvePathVariables({ GOOGLE_APPLICATION_CREDENTIALS: absolute }, cwd).GOOGLE_APPLICATION_CREDENTIALS).toBe(
+      absolute,
+    );
+  });
+
+  test("leaves an absolute value untouched", () => {
+    const absolute = path.resolve(os.tmpdir(), "seed.yaml");
+    expect(resolvePathVariables({ SEED_CONFIG_PATH: absolute }, cwd).SEED_CONFIG_PATH).toBe(absolute);
+  });
+
+  test.each([[""], ["   "]])(
+    "leaves an empty value %p untouched, so the server's own default still applies",
+    (value) => {
+      expect(resolvePathVariables({ STORAGE_SQLITE_PATH: value }, cwd).STORAGE_SQLITE_PATH).toBe(value);
+    },
+  );
+
+  test("never resolves a URL path, even a relative-looking one", () => {
+    const env = { BASE_PATH: "tools/libredb", NEXT_PUBLIC_MONACO_VS_PATH: "monaco/vs", SEED_CONFIG_PATH: "s.yaml" };
+    const resolved = resolvePathVariables(env, cwd);
+    expect(resolved.BASE_PATH).toBe("tools/libredb");
+    expect(resolved.NEXT_PUBLIC_MONACO_VS_PATH).toBe("monaco/vs");
+    // The control: the same call did resolve a filesystem path.
+    expect(resolved.SEED_CONFIG_PATH).toBe(path.join(cwd, "s.yaml"));
+  });
+
+  test("copies every other variable through and does not mutate its input", () => {
+    const env = { SEED_CONFIG_PATH: "s.yaml", JWT_SECRET: "./not-a-path" };
+    const resolved = resolvePathVariables(env, cwd);
+    expect(resolved.JWT_SECRET).toBe("./not-a-path");
+    expect(resolved).not.toHaveProperty("STORAGE_SQLITE_PATH");
+    expect(env.SEED_CONFIG_PATH).toBe("s.yaml");
+  });
+
+  /*
+    The guard that keeps the list honest: a new *_PATH, *_DIR or *_FILE variable documented in
+    .env.example must be classified here, either resolved (PATH_VARIABLES) or left alone with a
+    reason (URL_PATH_VARIABLES), so it cannot silently keep the old cwd-relative behaviour.
+  */
+  test("every *_PATH, *_DIR or *_FILE variable in .env.example is classified", () => {
+    const example = fs.readFileSync(path.resolve(import.meta.dir, "../../.env.example"), "utf8");
+    const documented = [...example.matchAll(/^#?\s*([A-Z][A-Z0-9_]*_(?:PATH|DIR|FILE))=/gm)].map((m) => m[1]);
+    // The control: the pattern does find the variables this fix was written for.
+    expect(documented).toContain("SEED_CONFIG_PATH");
+    expect(documented).toContain("BASE_PATH");
+    const classified = new Set([...PATH_VARIABLES, ...Object.keys(URL_PATH_VARIABLES)]);
+    expect(documented.filter((name) => !classified.has(name))).toEqual([]);
+  });
+
+  test("no variable is both resolved and excluded", () => {
+    expect(PATH_VARIABLES.filter((name) => Object.hasOwn(URL_PATH_VARIABLES, name))).toEqual([]);
+  });
+});
+
+describe("resolveBindAddress (issue #813)", () => {
+  /*
+    Named rather than numbered, because the rows move: the pair carrying the issue
+    is "an inherited value equal to the machine name" - what Docker's
+    <container-id> and a kubelet's <pod-name> look like from inside, and the value
+    the launcher used to bind verbatim. The rows after it are the other side of
+    the contract: the documented opt-ins have to keep working, or the fix trades a
+    dead port for a server that cannot be exposed at all. "a named container
+    escapes that ambiguity" is the case @cevheri raised on #813 - the one shape
+    step 3 costs - and LIBREDB_BIND is the way out of it.
+  */
+  test.each([
+    ["--host wins over LIBREDB_BIND", "::", "0.0.0.0", "46db4676bb04", "46db4676bb04", "::"],
+    ["--host wins over an injected HOSTNAME", "0.0.0.0", undefined, "46db4676bb04", "46db4676bb04", "0.0.0.0"],
+    ["--host wins over a deliberate HOSTNAME", "::", undefined, "0.0.0.0", "laptop", "::"],
+    ["LIBREDB_BIND wins over an injected HOSTNAME", null, "0.0.0.0", "46db4676bb04", "46db4676bb04", "0.0.0.0"],
+    ["LIBREDB_BIND wins over a deliberate HOSTNAME", null, "::", "0.0.0.0", "laptop", "::"],
+    ["LIBREDB_BIND on its own is the address", null, "0.0.0.0", undefined, "laptop", "0.0.0.0"],
+    [
+      "a LIBREDB_BIND with surrounding whitespace is returned trimmed",
+      null,
+      "  0.0.0.0  ",
+      undefined,
+      "laptop",
+      "0.0.0.0",
+    ],
+    ["an empty LIBREDB_BIND falls through to HOSTNAME", null, "", "0.0.0.0", "laptop", "0.0.0.0"],
+    ["a whitespace-only LIBREDB_BIND falls through to HOSTNAME", null, "   ", "0.0.0.0", "laptop", "0.0.0.0"],
+    [
+      "an inherited value equal to the machine name is not a choice (container id)",
+      null,
+      undefined,
+      "46db4676bb04",
+      "46db4676bb04",
+      "127.0.0.1",
+    ],
+    [
+      "an inherited value equal to the machine name is not a choice (pod name)",
+      null,
+      undefined,
+      "studio-7d9f",
+      "studio-7d9f",
+      "127.0.0.1",
+    ],
+    ["a value differing from the machine name is the operator's", null, undefined, "0.0.0.0", "laptop", "0.0.0.0"],
+    ["an IPv6 literal differing from the machine name is honoured", null, undefined, "::", "laptop", "::"],
+    ["an unset HOSTNAME falls back to loopback", null, undefined, undefined, "laptop", "127.0.0.1"],
+    ["an empty HOSTNAME falls back to loopback", null, undefined, "", "laptop", "127.0.0.1"],
+    ["a whitespace-only HOSTNAME falls back to loopback", null, undefined, "   ", "laptop", "127.0.0.1"],
+    ["whitespace is trimmed before the comparison", null, undefined, " laptop ", "laptop", "127.0.0.1"],
+    ["a deliberate value is returned trimmed", null, undefined, "  0.0.0.0  ", "laptop", "0.0.0.0"],
+    [
+      "a host named after the address it also pins is indistinguishable, and documentedly so",
+      null,
+      undefined,
+      "0.0.0.0",
+      "0.0.0.0",
+      "127.0.0.1",
+    ],
+    ["a named container escapes that ambiguity through LIBREDB_BIND", null, "0.0.0.0", "studio", "studio", "0.0.0.0"],
+    ["an unreadable machine hostname keeps the inherited value", null, undefined, "0.0.0.0", undefined, "0.0.0.0"],
+    [
+      "an unreadable machine hostname with no HOSTNAME still lands on loopback",
+      null,
+      undefined,
+      undefined,
+      undefined,
+      "127.0.0.1",
+    ],
+  ])("%s", (_name, host, libredbBind, hostnameEnv, systemHostname, expected) => {
+    expect(resolveBindAddress({ host, libredbBind, hostnameEnv, systemHostname })).toBe(expected);
+  });
+});
+
+/**
+ * The pure table above covers every formatting rule; these three cases cover the
+ * wiring, that `bin/studio.js` passes the real HOSTNAME and PORT through the helper
+ * and leaves the bind address alone. They spawn the launcher, so they need an
+ * ambient `node` at or above its floor: the `Unit & Integration Tests` job pins
+ * Node 24 for exactly this reason (.github/workflows/ci.yml). Originally written by
+ * @mikevillari in #709 and removed there while that job still ran on the runner's
+ * default Node 22.
+ */
+describe("launcher startup URL", () => {
+  test.each([
+    ["0.0.0.0", "http://127.0.0.1:3000"],
+    ["::", "http://[::1]:3000"],
+    ["127.0.0.1", "http://127.0.0.1:3000"],
+  ])("prints a usable URL for %s without changing the bind address", (host, url) => {
+    const node = Bun.which("node");
+    expect(node).not.toBeNull();
+    // Below the floor the launcher refuses and exits 1, which reads here as a bare
+    // exit code with no reason. Ask the launcher's own check first so the failure
+    // arrives as its sentence instead.
+    const ambient = Bun.spawnSync([node!, "-p", "process.versions.node"]).stdout.toString().trim();
+    expect(assessNodeRuntime(ambient).message).toBeNull();
+
+    const home = fs.mkdtempSync(path.join(tempDir, "startup-"));
+    const root = path.resolve(import.meta.dir, "../..");
+    const version = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version;
+    const payload = path.join(home, ".libredb-studio", version, "payload");
+    fs.mkdirSync(payload, { recursive: true });
+    fs.writeFileSync(path.join(payload, "server.js"), 'console.log("BIND=" + process.env.HOSTNAME);');
+    const preload = path.join(home, "home-fixture.mjs");
+    fs.writeFileSync(
+      preload,
+      'import os from "node:os"; import { syncBuiltinESMExports } from "node:module"; ' +
+        `os.homedir = () => ${JSON.stringify(home)}; syncBuiltinESMExports();`,
+    );
+    /*
+      The environment is kept and only what would change the answer is removed. The launcher reads
+      PORT for the URL it prints and LIBREDB_STUDIO_ARCHIVE to skip the download, so a contributor
+      who exports either would see this fail for a reason that is not the test's.
+
+      It used to pass `{ PATH: process.env.PATH }`, which drops SystemRoot, windir, TEMP and TMP: a
+      node child started without SystemRoot can fail to initialise on Windows, and the failure
+      arrives as a bare non-zero exit code - exactly the opaque shape the assertion above tries to
+      avoid.
+    */
+    const env = { ...process.env };
+    delete env.PORT;
+    delete env.LIBREDB_STUDIO_ARCHIVE;
+    /*
+      The preload goes to `--import` as a file: URL, not as the path it is. `--import` resolves its
+      value by ESM rules, where an absolute Windows path is not a path at all: it parses as a URL
+      whose scheme is the drive letter. Measured with node 24.14.0, `--import 'C:\tmp\fixture.mjs'`
+      dies at startup with ERR_UNSUPPORTED_ESM_URL_SCHEME ("Received protocol 'c:'") before reading
+      a line of bin/studio.js, while the same argument on Linux fails to parse as a URL and falls
+      back to a path - which is why this spawned fine everywhere but Windows.
+    */
+    const run = Bun.spawnSync(
+      [node!, "--import", pathToFileURL(preload).href, path.join(root, "bin/studio.js"), "--host", host],
+      { env, stdout: "pipe", stderr: "pipe" },
+    );
+    // The launcher's own stderr rides on the exit code: node reports a startup failure there and
+    // nowhere else, and "Received: 1" on its own sends the next reader back to a machine they may
+    // not have.
+    expect(run.exitCode, `launcher stderr: ${run.stderr.toString()}`).toBe(0);
+    const output = run.stdout.toString();
+    expect(output).toContain(`Starting LibreDB Studio ${version} on ${url}\n`);
+    expect(output).toContain(`BIND=${host}\n`);
+    expect(output.match(/^Starting LibreDB Studio ([0-9][0-9.]*) /m)?.[1]).toBe(version);
+  });
+});
+
+/**
+ * The bind address the launcher hands the server (issue #813), read back from a
+ * real launcher process rather than from a mock.
+ *
+ * Same harness as `launcher startup URL` above, with `--host` left off, because
+ * the inherited environment is the thing under test: the first case reproduces
+ * the container shape on any host by exporting this machine's own hostname, which
+ * is what a container runtime injects. The second is the other half of the
+ * contract - a value nobody else would write still reaches the server untouched.
+ * The third is the override @cevheri asked for on #813, asserted where it has to
+ * hold: on the process, not only in the pure table.
+ */
+describe("launcher bind address", () => {
+  /**
+   * Run the real launcher against a stub payload that prints the address it was
+   * given, and return its stdout.
+   *
+   * `PORT`, `LIBREDB_STUDIO_ARCHIVE` and `LIBREDB_BIND` are dropped from the
+   * ambient environment before `overrides` is applied: the launcher reads all
+   * three, so a contributor who exports one would otherwise watch this file decide
+   * something the test never asked it to.
+   *
+   * @param {{ HOSTNAME: string, LIBREDB_BIND?: string }} overrides
+   */
+  function startWith(overrides: { HOSTNAME: string; LIBREDB_BIND?: string }) {
+    const node = Bun.which("node");
+    expect(node).not.toBeNull();
+    // Below the floor the launcher refuses and exits 1 with its own sentence on
+    // stderr, which is asserted below; ask its own check first so the failure
+    // arrives as that sentence rather than as a bare exit code.
+    const ambient = Bun.spawnSync([node!, "-p", "process.versions.node"]).stdout.toString().trim();
+    expect(assessNodeRuntime(ambient).message).toBeNull();
+
+    const home = fs.mkdtempSync(path.join(tempDir, "bind-"));
+    const root = path.resolve(import.meta.dir, "../..");
+    const version = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version;
+    const payload = path.join(home, ".libredb-studio", version, "payload");
+    fs.mkdirSync(payload, { recursive: true });
+    fs.writeFileSync(path.join(payload, "server.js"), 'console.log("BIND=" + process.env.HOSTNAME);');
+    const preload = path.join(home, "home-fixture.mjs");
+    fs.writeFileSync(
+      preload,
+      'import os from "node:os"; import { syncBuiltinESMExports } from "node:module"; ' +
+        `os.homedir = () => ${JSON.stringify(home)}; syncBuiltinESMExports();`,
+    );
+    const env = { ...process.env };
+    delete env.PORT;
+    delete env.LIBREDB_STUDIO_ARCHIVE;
+    delete env.LIBREDB_BIND;
+    delete env.HOSTNAME;
+    Object.assign(env, overrides);
+    const run = Bun.spawnSync([node!, "--import", pathToFileURL(preload).href, path.join(root, "bin/studio.js")], {
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(run.exitCode, `launcher stderr: ${run.stderr.toString()}`).toBe(0);
+    return run.stdout.toString();
+  }
+
+  test("an inherited HOSTNAME equal to this machine's own hostname never becomes the bind address", () => {
+    expect(startWith({ HOSTNAME: os.hostname() })).toContain("BIND=127.0.0.1\n");
+  });
+
+  test("a HOSTNAME differing from this machine's own hostname still reaches the server", () => {
+    expect(startWith({ HOSTNAME: "0.0.0.0" })).toContain("BIND=0.0.0.0\n");
+  });
+
+  test("LIBREDB_BIND reaches the server and outranks a container-shaped HOSTNAME", () => {
+    // The container named after itself, which is the one shape the HOSTNAME rule
+    // costs (#813, @cevheri).
+    expect(startWith({ HOSTNAME: os.hostname(), LIBREDB_BIND: "0.0.0.0" })).toContain("BIND=0.0.0.0\n");
+  });
+});
+
+/**
+ * The MCP address the launcher hands the server (#246), read back from a real launcher process,
+ * on the harness of `launcher bind address` above: the stub payload prints what it was given.
+ */
+describe("launcher MCP URL", () => {
+  function launch(args: string[], overrides: Record<string, string> = {}): string {
+    const node = Bun.which("node");
+    expect(node).not.toBeNull();
+    const ambient = Bun.spawnSync([node!, "-p", "process.versions.node"]).stdout.toString().trim();
+    expect(assessNodeRuntime(ambient).message).toBeNull();
+
+    const home = fs.mkdtempSync(path.join(tempDir, "mcp-url-"));
+    const root = path.resolve(import.meta.dir, "../..");
+    const version = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version;
+    const payload = path.join(home, ".libredb-studio", version, "payload");
+    fs.mkdirSync(payload, { recursive: true });
+    fs.writeFileSync(path.join(payload, "server.js"), 'console.log("MCP_URL=" + process.env.LIBREDB_MCP_URL);');
+    const preload = path.join(home, "home-fixture.mjs");
+    fs.writeFileSync(
+      preload,
+      'import os from "node:os"; import { syncBuiltinESMExports } from "node:module"; ' +
+        `os.homedir = () => ${JSON.stringify(home)}; syncBuiltinESMExports();`,
+    );
+    const env = { ...process.env };
+    for (const name of ["PORT", "LIBREDB_STUDIO_ARCHIVE", "LIBREDB_BIND", "HOSTNAME", "LIBREDB_MCP_URL"])
+      delete env[name];
+    Object.assign(env, overrides);
+    const run = Bun.spawnSync(
+      [node!, "--import", pathToFileURL(preload).href, path.join(root, "bin/studio.js"), ...args],
+      { env, stdout: "pipe", stderr: "pipe" },
+    );
+    expect(run.exitCode, `launcher stderr: ${run.stderr.toString()}`).toBe(0);
+    return run.stdout.toString();
+  }
+
+  test("derives it from --host and --port when the operator set none", () => {
+    expect(launch(["--host", "0.0.0.0", "--port", "4123"])).toContain("MCP_URL=http://127.0.0.1:4123/api/mcp\n");
+  });
+
+  test("follows the bind address, so a changed --host changes it", () => {
+    expect(launch(["--host", "::"])).toContain("MCP_URL=http://[::1]:3000/api/mcp\n");
+  });
+
+  test("treats a whitespace-only LIBREDB_MCP_URL as unset and derives it", () => {
+    expect(launch(["--port", "4123"], { LIBREDB_MCP_URL: "   " })).toContain("MCP_URL=http://127.0.0.1:4123/api/mcp\n");
+  });
+
+  test("leaves an operator's own LIBREDB_MCP_URL untouched", () => {
+    const own = "https://studio.example.com/tools/libredb/api/mcp";
+    expect(launch(["--port", "4123"], { LIBREDB_MCP_URL: own })).toContain(`MCP_URL=${own}\n`);
+  });
+});
+
+/**
+ * Relative path variables, read back from a real launcher process started from a directory of the
+ * test's choosing, on the harness of `launcher bind address` above. This is the reported shape: the
+ * server runs with its cwd in the payload cache, so SEED_CONFIG_PATH=./seed-connections.yaml used to
+ * point into the cache and seed connections were silently skipped.
+ */
+describe("launcher path variables", () => {
+  test("resolves a relative path against the directory the launcher was run from", () => {
+    const node = Bun.which("node");
+    expect(node).not.toBeNull();
+    const ambient = Bun.spawnSync([node!, "-p", "process.versions.node"]).stdout.toString().trim();
+    expect(assessNodeRuntime(ambient).message).toBeNull();
+
+    const home = fs.mkdtempSync(path.join(tempDir, "path-vars-"));
+    const invokedFrom = fs.mkdtempSync(path.join(tempDir, "invoked-"));
+    const root = path.resolve(import.meta.dir, "../..");
+    const version = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version;
+    const payload = path.join(home, ".libredb-studio", version, "payload");
+    fs.mkdirSync(payload, { recursive: true });
+    fs.writeFileSync(
+      path.join(payload, "server.js"),
+      'console.log("SEED=" + process.env.SEED_CONFIG_PATH); console.log("BASE=" + process.env.BASE_PATH);',
+    );
+    const preload = path.join(home, "home-fixture.mjs");
+    fs.writeFileSync(
+      preload,
+      'import os from "node:os"; import { syncBuiltinESMExports } from "node:module"; ' +
+        `os.homedir = () => ${JSON.stringify(home)}; syncBuiltinESMExports();`,
+    );
+    const env = { ...process.env };
+    for (const name of ["PORT", "LIBREDB_STUDIO_ARCHIVE", "LIBREDB_BIND", "HOSTNAME"]) delete env[name];
+    Object.assign(env, { SEED_CONFIG_PATH: "./seed-connections.yaml", BASE_PATH: "/tools/libredb" });
+    const run = Bun.spawnSync([node!, "--import", pathToFileURL(preload).href, path.join(root, "bin/studio.js")], {
+      cwd: invokedFrom,
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(run.exitCode, `launcher stderr: ${run.stderr.toString()}`).toBe(0);
+    const output = run.stdout.toString();
+    // realpath: on macOS the temp directory is a symlink, and process.cwd() reports its target.
+    expect(output).toContain(`SEED=${path.join(fs.realpathSync(invokedFrom), "seed-connections.yaml")}\n`);
+    expect(output).toContain("BASE=/tools/libredb\n");
   });
 });

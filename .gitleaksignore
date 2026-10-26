@@ -76,3 +76,121 @@ dfb4a9af0dcf58a7042b138d9d710a011041fb1a:docs/kubernetes-helm-chart-artifacthub-
 # credential in source. Matched twice on the same line, once per half.
 5135a9c606e9e42c1b4ae0bdc31725718758f2b4:database-compose.yml:curl-auth-user:83
 5135a9c606e9e42c1b4ae0bdc31725718758f2b4:database-compose.yml:curl-auth-user:122
+
+# #708's ApiKey-header test: a fabricated apiKeyId/apiKeySecret pair
+# ("EWkMhKACjF5eHMlg6Car" / "y9cTq7AQ4u16CO_sKM0Knp") asserting the transport
+# builds `ApiKey base64(id:secret)`. Neither value has ever authenticated
+# against a real Elasticsearch cluster.
+#
+# HISTORY ONLY. The working tree no longer holds those literals: the fixture was
+# changed to a low-entropy pair the rule does not fire on, so nothing but the
+# commit below needs suppressing. Keep the line anyway - the commit stays in
+# history after the merge, and `--all` on main scans it.
+5d7f7a2a6745dfae0ca58f908303feed4b690839:tests/integration/db/elasticsearch-provider.test.ts:generic-api-key:1239
+
+# A placeholder JWT secret written twice into the release runbook's smoke phase
+# ("verify-jwt-secret-at-least-32-characters-long"), which is the literal naming
+# its own role, not a credential: it was typed to start a throwaway container
+# against a throwaway PostgreSQL and nothing ever read it again. Added in
+# 2ff08e3a and removed in the commit carrying these lines, where the runbook now
+# generates the value with `openssl rand -base64 32` instead, since the phase
+# never needs to know it. History keeps the commit, so the two findings stay.
+2ff08e3ac284bfbd9e3275f6b6c04b5dcf3081f6:.claude/skills/cut-release/SKILL.md:generic-api-key:247
+2ff08e3ac284bfbd9e3275f6b6c04b5dcf3081f6:.claude/skills/cut-release/SKILL.md:generic-api-key:307
+
+# The S3 provider, squash-merged in 11717b7e (#1654). Every value below is
+# either an S3 list cursor or a published test vector, and none authenticates
+# anything. The rule fires on the cursors only after gitleaks decodes the
+# base64 starting token that carries them (`{"ContinuationToken": "..."}`).
+#
+# ListObjectsV2 continuation tokens: opaque, per-listing cursors that MinIO,
+# RustFS and Silo returned for a throwaway fixture bucket, kept in the console
+# captures, plus the same kind of cursor, a toy "abc" one and the AWS CLI's
+# null token in the console tests that check Studio reads the CLI's
+# starting-token format. A cursor names a position in one listing; it grants
+# no access.
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/fixtures/s3/captures/minio-2026-10-10-RELEASE.2025-10-15T17-29-55Z/console-list-objects-v2-token.json:generic-api-key:285
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/fixtures/s3/captures/minio-2026-10-10-RELEASE.2025-10-15T17-29-55Z/console-list-objects-v2-token.json:generic-api-key:306
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/fixtures/s3/captures/minio-region-2026-10-10-RELEASE.2025-10-15T17-29-55Z/console-list-objects-v2-token.json:generic-api-key:305
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/fixtures/s3/captures/minio-region-2026-10-10-RELEASE.2025-10-15T17-29-55Z/console-list-objects-v2-token.json:generic-api-key:326
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/fixtures/s3/captures/rustfs-2026-10-10-1.0.1/console-list-objects-v2-token.json:generic-api-key:285
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/fixtures/s3/captures/rustfs-2026-10-10-1.0.1/console-list-objects-v2-token.json:generic-api-key:306
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/fixtures/s3/captures/silo-2026-10-10-RELEASE.2026-09-16T00-00-00Z/console-list-objects-v2-token.json:generic-api-key:285
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/fixtures/s3/captures/silo-2026-10-10-RELEASE.2026-09-16T00-00-00Z/console-list-objects-v2-token.json:generic-api-key:306
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/unit/db/s3/console-commands.test.ts:generic-api-key:66
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/unit/db/s3/console-commands.test.ts:generic-api-key:848
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/unit/db/s3/console-commands.test.ts:generic-api-key:851
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/unit/db/s3/console-execute.test.ts:generic-api-key:231
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/unit/db/s3/console-token.test.ts:generic-api-key:19
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/unit/db/s3/console-token.test.ts:generic-api-key:24
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/unit/db/s3/console-token.test.ts:generic-api-key:29
+
+# The S3 capture sets re-recorded under the reworded blocked-host sentence,
+# squash-merged in eb6b696a (#1685): the same kind of ListObjectsV2
+# continuation cursor as the block above, returned by the same throwaway
+# fixture buckets.
+eb6b696af19d6b6ac7b53406bbd4201fb0890058:tests/fixtures/s3/captures/minio-2026-10-12-RELEASE.2025-10-15T17-29-55Z/console-list-objects-v2-token.json:generic-api-key:285
+eb6b696af19d6b6ac7b53406bbd4201fb0890058:tests/fixtures/s3/captures/minio-2026-10-12-RELEASE.2025-10-15T17-29-55Z/console-list-objects-v2-token.json:generic-api-key:306
+eb6b696af19d6b6ac7b53406bbd4201fb0890058:tests/fixtures/s3/captures/minio-region-2026-10-12-RELEASE.2025-10-15T17-29-55Z/console-list-objects-v2-token.json:generic-api-key:305
+eb6b696af19d6b6ac7b53406bbd4201fb0890058:tests/fixtures/s3/captures/minio-region-2026-10-12-RELEASE.2025-10-15T17-29-55Z/console-list-objects-v2-token.json:generic-api-key:326
+eb6b696af19d6b6ac7b53406bbd4201fb0890058:tests/fixtures/s3/captures/rustfs-2026-10-12-1.0.1/console-list-objects-v2-token.json:generic-api-key:285
+eb6b696af19d6b6ac7b53406bbd4201fb0890058:tests/fixtures/s3/captures/rustfs-2026-10-12-1.0.1/console-list-objects-v2-token.json:generic-api-key:306
+eb6b696af19d6b6ac7b53406bbd4201fb0890058:tests/fixtures/s3/captures/silo-2026-10-12-RELEASE.2026-09-16T00-00-00Z/console-list-objects-v2-token.json:generic-api-key:285
+eb6b696af19d6b6ac7b53406bbd4201fb0890058:tests/fixtures/s3/captures/silo-2026-10-12-RELEASE.2026-09-16T00-00-00Z/console-list-objects-v2-token.json:generic-api-key:306
+
+# The AWS SigV4 test suite's published `post-sts-header-before` vector: its
+# `x-amz-security-token` and expected signature are the example values AWS
+# ships with the suite (AKIDEXAMPLE), checked by the signer's tests.
+11717b7e56f0dc8d293e834a1327b01aa2a4e342:tests/fixtures/s3/sigv4-suite.json:generic-api-key:252
+
+# The CFRG HPKE test vector of the lsb1 suite, squash-merged in 173d9679
+# (#1785): base mode with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and
+# AES-256-GCM, copied unchanged from the test-vectors.json of the
+# draft-irtf-cfrg-hpke repository, whose URL and SHA-256 the fixture's header
+# records. The rule fires on the vector's shared_secret, key_schedule_context,
+# secret, key and exporter_secret: values the CFRG publishes, derived from its
+# published test keys, which open nothing but the vector's own sample
+# ciphertexts.
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/hpke-cfrg-x25519-sha256-aes256gcm.json:generic-api-key:21
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/hpke-cfrg-x25519-sha256-aes256gcm.json:generic-api-key:22
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/hpke-cfrg-x25519-sha256-aes256gcm.json:generic-api-key:23
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/hpke-cfrg-x25519-sha256-aes256gcm.json:generic-api-key:24
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/hpke-cfrg-x25519-sha256-aes256gcm.json:generic-api-key:26
+
+# The lsb1 test vectors, squash-merged in 173d9679 (#1785): the fixed
+# ephemeral private key of each of the 21 vectors in
+# tests/fixtures/governance/lsb1-vectors.json, one per vector. Each is the
+# SHA-256 of a published label ("libredb lsb1 test vectors, test only:
+# ephemeral key of <id>"), so anyone can derive it, and it seals only that
+# vector's sample credential to a recipient key derived the same way.
+# scripts/generate-governance-vectors.ts writes the file, and a published lsb1
+# vector never changes, so these lines never move.
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:37
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:71
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:111
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:155
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:203
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:250
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:293
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:335
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:387
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:433
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:479
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:525
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:571
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:617
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:663
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:709
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:755
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:801
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:847
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:893
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/fixtures/governance/lsb1-vectors.json:generic-api-key:940
+
+# The placeholder password of the fixture DDL's unit test, squash-merged in
+# 173d9679 (#1785): sequential hex filler, the sixteen digits 0 to f written
+# twice, in the lowercase hex shape buildFixtureDdl requires. The test only
+# compares the DDL text it builds and never opens a database, and the live
+# check that does run the DDL draws a random password instead, so the literal
+# authenticates nothing.
+173d9679af01674d83d53ec9e22b453a88b8a4ab:tests/unit/governance-fixture-ddl.test.ts:generic-api-key:28

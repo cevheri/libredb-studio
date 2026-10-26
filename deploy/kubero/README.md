@@ -17,7 +17,7 @@ source of truth.
 ## Install
 
 From a running Kubero instance (see the
-[Kubero install docs](https://docs.kubero.dev/docs/Getting-Started/Installation/)
+[Kubero install docs](https://docs.kubero.dev/docs/category/getting-started/)
 to set one up):
 
 1. **Open your Kubero dashboard** → create or pick a pipeline/app, then browse
@@ -67,7 +67,8 @@ Add these variables on the app to extend the deployment:
 - **PostgreSQL storage backend** (multi-node) — `STORAGE_PROVIDER=postgres`,
   `STORAGE_POSTGRES_URL=...`.
 - **AI** — `LLM_PROVIDER` (`gemini` | `openai` | `ollama` | `custom`),
-  `LLM_API_KEY`, `LLM_MODEL`, `LLM_API_URL`.
+  `LLM_API_KEY`, `LLM_MODEL`, `LLM_API_URL`, and for `openai` only
+  `LLM_MODEL_EFFORT` (`none` through `max`; unset keeps the model's default).
 
 ## Version bumps
 

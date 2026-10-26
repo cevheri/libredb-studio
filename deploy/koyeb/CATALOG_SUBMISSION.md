@@ -38,7 +38,7 @@ a backup.
 | Repository | https://github.com/libredb/libredb-studio |
 | Website | https://libredb.org |
 | Docker image | `ghcr.io/libredb/libredb-studio` (GHCR, multi-arch) |
-| Pinned tag | `0.9.23` (bump on each release) |
+| Pinned tag | `1.0.0` (bump on each release) |
 | Port | `3000` (HTTP) |
 | Health check | `GET /api/db/health` |
 | Storage default | `local` (browser); `postgres` for persistence |
@@ -51,9 +51,9 @@ a backup.
 > Hi Koyeb team,
 >
 > We maintain **LibreDB Studio**, an open-source, web-based SQL IDE for
-> cloud-native teams (PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, SQL Server,
+> cloud-native teams (PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, Db2 LUW, SQL Server,
 > MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch,
-> Apache Trino, Apache Cassandra, with AI-assisted querying). It's free and Apache/MIT-style open source:
+> Trino, Databend, Snowflake, Apache Spark, Apache Cassandra, Prometheus, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Apache Kafka, etcd, Neo4j, Milvus, Qdrant, Oxia, S3-compatible object storage, Kubernetes, MQTT, RabbitMQ, OPC UA, with AI-assisted querying). It's free and MIT licensed:
 > https://github.com/libredb/libredb-studio
 >
 > We already ship a working **Deploy to Koyeb** button (prebuilt GHCR image

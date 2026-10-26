@@ -5,6 +5,7 @@
 
 import { GoogleGenerativeAI, type GenerateContentStreamResult } from "@google/generative-ai";
 import { BaseLLMProvider } from "../base-provider";
+import type { RetryOptions } from "../utils/retry";
 import {
   type LLMConfig,
   type LLMStreamOptions,
@@ -23,8 +24,8 @@ import { encodeText, streamFromAsyncIterable } from "../utils/streaming";
 export class GeminiProvider extends BaseLLMProvider {
   private client: GoogleGenerativeAI;
 
-  constructor(config: LLMConfig) {
-    super(config);
+  constructor(config: LLMConfig, retryOptions?: RetryOptions) {
+    super(config, retryOptions);
     this.validate();
     this.client = new GoogleGenerativeAI(this.ensureApiKey());
   }
@@ -33,30 +34,33 @@ export class GeminiProvider extends BaseLLMProvider {
    * Stream completion from Gemini
    */
   public async stream(options: LLMStreamOptions): Promise<ReadableStream<Uint8Array>> {
-    return this.streamWithRetry(async () => {
-      const model = this.getModel(options);
-      const systemInstruction = this.getSystemMessage(options);
-      const messages = this.getNonSystemMessages(options);
+    return this.streamWithRetry(
+      async () => {
+        const model = this.getModel(options);
+        const systemInstruction = this.getSystemMessage(options);
+        const messages = this.getNonSystemMessages(options);
 
-      // Build the prompt from messages
-      const prompt = messages.map((m) => m.content).join("\n\n");
+        // Build the prompt from messages
+        const prompt = messages.map((m) => m.content).join("\n\n");
 
-      try {
-        const generativeModel = this.client.getGenerativeModel(
-          { model, systemInstruction },
-          // B20: `LLM_API_URL` reaches this SDK only here — the constructor takes
-          // the key and nothing else. An unset value leaves `baseUrl` undefined,
-          // which is what selects the SDK's own Google endpoint.
-          { baseUrl: resolveGeminiChatBaseUrl(this.config.apiUrl) },
-        );
+        try {
+          const generativeModel = this.client.getGenerativeModel(
+            { model, systemInstruction },
+            // B20: `LLM_API_URL` reaches this SDK only here: the constructor takes
+            // the key and nothing else. An unset value leaves `baseUrl` undefined,
+            // which is what selects the SDK's own Google endpoint.
+            { baseUrl: resolveGeminiChatBaseUrl(this.config.apiUrl) },
+          );
 
-        const result = await generativeModel.generateContentStream(prompt);
+          const result = await generativeModel.generateContentStream(prompt, { signal: options.signal });
 
-        return this.createStreamFromResult(result);
-      } catch (error) {
-        throw this.mapError(error);
-      }
-    });
+          return this.createStreamFromResult(result);
+        } catch (error) {
+          throw this.mapError(error);
+        }
+      },
+      { signal: options.signal },
+    );
   }
 
   /**

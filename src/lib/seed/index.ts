@@ -1,8 +1,10 @@
 import * as fs from "fs";
-import { loadConfig } from "./config-loader";
-import { resolveAllCredentials } from "./credential-resolver";
-import { filterByRoles, mergeDefaults } from "./connection-filter";
+import { governanceEnabled } from "@/lib/governance/config";
+import { filterByRoles } from "./connection-filter";
+import { getDiscoveredConnections } from "./discovery-loader";
 import { isSampleEnabled, resolveSamplePath, buildSampleConnection } from "./libredb-sample";
+import { loadOperatorSources } from "./operator-loader";
+import type { OperatorEntry } from "./sources/types";
 import {
   isSqliteSampleEnabled,
   resolveSqliteSamplePath,
@@ -13,34 +15,69 @@ import {
 import type { ManagedConnection } from "./types";
 
 export type { ManagedConnection } from "./types";
-export { resetCache } from "./config-loader";
+export { resetCache } from "./operator-loader";
+export { seedRolesOf } from "./roles";
 
-async function loadAndResolve(): Promise<ManagedConnection[]> {
-  const config = await loadConfig();
-  if (!config) return [];
-  const withDefaults = config.connections.map((conn) => mergeDefaults(conn, config.defaults));
-  const resolved = resolveAllCredentials(withDefaults);
-  return filterByRoles(resolved, ["*", "admin", "user"]);
+/**
+ * The operator entries these roles may see, in source order.
+ *
+ * The operator loader (operator-loader.ts) has resolved every `${NAME}` of a non-literal entry in its cache fill, and
+ * a `${vault:...}` is left for `resolveConnection` to read when the connection is opened. An entry that fill read as
+ * literal (every file-like entry while SEED_LITERAL_VALUES is on) carries the literal marker, which
+ * `resolveConnection` honours by skipping Vault, so no value of it is resolved anywhere. The marker is set after
+ * filterByRoles, because filterByRoles copies a fixed field list and SeedConnectionSchema strips an undeclared key,
+ * so a marker set any earlier would not survive; filterByRoles builds a new object for every connection, so setting
+ * it never reaches the loader's cache.
+ */
+function projectOperatorEntries(entries: readonly OperatorEntry[], roles: string[]): ManagedConnection[] {
+  return entries.flatMap((entry) =>
+    filterByRoles([entry.connection], roles).map((conn) =>
+      entry.literal ? Object.assign(conn, { literal: true as const }) : conn,
+    ),
+  );
 }
 
+/**
+ * The seed connections these roles may see: the operator entries, then the discovered connections, then the samples.
+ *
+ * Governance mode (`GOVERNANCE_SOURCE`, docs/GOVERNANCE.md) replaces all three with the governance source, so under it
+ * this reads no source at all and answers an empty list, whatever the environment says: not the seed file at its
+ * default path, which Studio reads while SEED_CONFIG_PATH is unset, not the discovery export and not a sample. The
+ * boot preflight refuses an environment that turns any of them on, and this holds on a server where it was bypassed.
+ */
 export async function getManagedConnections(roles: string[]): Promise<ManagedConnection[]> {
-  const config = await loadConfig();
-  const fromConfig = config
-    ? filterByRoles(
-        resolveAllCredentials(config.connections.map((conn) => mergeDefaults(conn, config.defaults))),
-        roles,
-      )
-    : [];
+  if (governanceEnabled()) return [];
+  const operator = await loadOperatorSources();
+  const fromOperators = projectOperatorEntries(operator.entries, roles);
 
-  const out = [...fromConfig];
+  /*
+    Discovered connections (CapRover auto-connect spec 9.5 and 9.7) come after the operator entries and before the
+    built-in samples. They never pass through the operator loader's resolution: their values are the literal text
+    another app on the platform network carries, so a `${NAME}` in them is not Studio's to resolve, and a plaintext
+    password in them is not the operator's to be warned about. The literal marker is set here, after filterByRoles,
+    for the reason projectOperatorEntries gives. getSeedConnectionByIdUnfiltered below does not include them, so the
+    unfiltered lookup never confirms to a caller that a discovered id exists.
+
+    A discovered connection whose id an operator source declares is dropped, whichever role the operator entry is
+    for, and also when the fill dropped that entry for an undefined variable: declaredIds holds every id a source
+    declared. The discovery loader applies the same rule when it recomputes, but its cache and the operator cache
+    expire independently, so for up to one SEED_CACHE_TTL_MS it can still list an id an operator source has just
+    gained, and the list would carry that id twice.
+  */
+  const discovered = filterByRoles(await getDiscoveredConnections(), roles)
+    .filter((conn) => !operator.declaredIds.has(conn.seedId))
+    .map((conn) => Object.assign(conn, { literal: true as const }));
+
+  const out = [...fromOperators, ...discovered];
 
   /*
     The SQLite sample leads the built-ins, and the order is the point: a client with
     no persisted active connection selects the first of this list, so whichever sample
-    comes first is what a brand-new user lands on. The agent runtime targets
-    PostgreSQL and SQLite; the LibreDB engine has no database-native read-only
-    execution profile, so leading with it put every zero-config user on the one
-    connection an agent run can never execute against. An operator's own seed config
+    comes first is what a brand-new administrator lands on. Agent mode executes statements on
+    PostgreSQL, SQLite, DuckDB, SQL Server, MySQL, Kubernetes and MongoDB; the LibreDB engine's provider
+    implements no read-only statement path, so leading with it put every
+    zero-config administrator on the one connection an agent run can never execute
+    against. An operator's own seed config
     still leads both — those are already in `out`.
 
     In a test run, only consider a sample when its explicit path override is set, so
@@ -48,7 +85,7 @@ export async function getManagedConnections(roles: string[]): Promise<ManagedCon
     (NODE_ENV==='test' guard mirrors the existing pattern in src/lib/db/factory.ts.)
   */
   const sqliteSampleConsidered = process.env.NODE_ENV !== "test" || !!process.env.SQLITE_EMBEDDED_SAMPLE_PATH;
-  if (isSqliteSampleEnabled() && sqliteSampleConsidered) {
+  if (isSqliteSampleEnabled() && sqliteSampleConsidered && roles.includes("admin")) {
     try {
       if (fs.existsSync(resolveSqliteSamplePath())) {
         out.push(buildSqliteSampleConnection());
@@ -76,7 +113,8 @@ export async function getManagedConnections(roles: string[]): Promise<ManagedCon
  * Seed ids whose async seeding is still in flight — advertised by the managed
  * connections API so clients poll until the sample appears (or seeding ends).
  * Empty when nothing is seeding: embedded in platform, instrumentation never
- * runs, the state stays "idle", and clients never poll.
+ * runs, the state stays "idle", and clients never poll. Empty under governance
+ * too, where the SQLite sample is off.
  */
 export function getPendingSeeds(): string[] {
   if (isSqliteSampleEnabled() && getSqliteSampleSeedState() === "seeding") {
@@ -90,7 +128,13 @@ export async function getSeedConnectionById(seedId: string, roles: string[]): Pr
   return all.find((c) => c.seedId === seedId) ?? null;
 }
 
+/**
+ * The operator entries only: no discovered connection and no sample, so a 403 never confirms a discovered id. Under
+ * governance none at all, because no source is read (see getManagedConnections).
+ */
 export async function getSeedConnectionByIdUnfiltered(seedId: string): Promise<ManagedConnection | null> {
-  const all = await loadAndResolve();
+  if (governanceEnabled()) return null;
+  const operator = await loadOperatorSources();
+  const all = projectOperatorEntries(operator.entries, ["*", "admin", "user"]);
   return all.find((c) => c.seedId === seedId) ?? null;
 }

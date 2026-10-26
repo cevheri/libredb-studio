@@ -4,13 +4,24 @@ import "../helpers/mock-navigation";
 
 import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { renderHook, act, waitFor } from "@testing-library/react";
-import { mockGlobalFetch, restoreGlobalFetch } from "../helpers/mock-fetch";
+import { mockGlobalFetch, restoreGlobalFetch, type MockFetchResponse } from "../helpers/mock-fetch";
 
-import { useConnectionManager } from "@/hooks/use-connection-manager";
-import type { ManagedConnectionPayload } from "@/hooks/use-connection-payload";
+import {
+  MANAGED_REFRESH_DEFAULT_FLOOR_MS,
+  MANAGED_REFRESH_MAX_MS,
+  managedRefreshIntervalMs,
+  useConnectionManager,
+} from "@/hooks/use-connection-manager";
+import { SEED_CONFIG_UNREADABLE_REASON, type ManagedConnectionPayload } from "@/hooks/use-connection-payload";
+import { useTabManager } from "@/hooks/use-tab-manager";
 import { logger } from "@/lib/logger";
 import { storage } from "@/lib/storage";
-import type { DatabaseConnection, TableSchema } from "@/lib/types";
+import type { DatabaseConnection } from "@/lib/types";
+import { rowWritableObjects } from "@/lib/db/detailed-object";
+import { S3_OBJECT_KINDS } from "@/lib/db/providers/objectstore/s3/objects";
+import { s3CompletionBucketsOf } from "@/lib/editor/s3-completions";
+import type { ObjectReadRange, ProviderCapabilities } from "@/lib/db/types";
+import { SAMPLED_MARKER } from "../fixtures/sampled-schema";
 
 // ── Test Data ───────────────────────────────────────────────────────────────
 
@@ -27,26 +38,117 @@ const makeConnection = (overrides: Partial<DatabaseConnection> = {}): DatabaseCo
   ...overrides,
 });
 
-const makeSchema = (): TableSchema[] => [
+/**
+ * What PostgreSQL 18 really declares, copied from `provider.getCapabilities().objectKinds`
+ * on the live container (libredb-postgres, measured 2026-09-12). Seven kinds, of which
+ * three carry `role: "relation"` - the ratio the cost finding is about.
+ */
+const PG_OBJECT_KINDS = [
+  { id: "table", role: "relation", label: "Table", labelPlural: "Tables", acceptsRowWrites: true },
+  { id: "view", role: "relation", label: "View", labelPlural: "Views" },
+  { id: "materialized_view", role: "relation", label: "Materialized View", labelPlural: "Materialized Views" },
+  { id: "sequence", role: "config", label: "Sequence", labelPlural: "Sequences" },
+  { id: "function", role: "routine", label: "Function", labelPlural: "Functions" },
+  { id: "procedure", role: "routine", label: "Procedure", labelPlural: "Procedures" },
+  { id: "trigger", role: "attached", label: "Trigger", labelPlural: "Triggers", attachedTo: "table" },
+];
+
+const PG_RELATION_KINDS = ["table", "view", "materialized_view"];
+
+/** MySQL 26.7.0, same source. Six kinds, two of them relations. */
+const MYSQL_OBJECT_KINDS = [
+  { id: "table", role: "relation", label: "Table", labelPlural: "Tables", acceptsRowWrites: true },
+  { id: "view", role: "relation", label: "View", labelPlural: "Views" },
+  { id: "procedure", role: "routine", label: "Procedure", labelPlural: "Procedures" },
+  { id: "function", role: "routine", label: "Function", labelPlural: "Functions" },
+  { id: "trigger", role: "attached", label: "Trigger", labelPlural: "Triggers", attachedTo: "table" },
+  { id: "event", role: "config", label: "Event", labelPlural: "Events" },
+];
+
+const providerMeta = (objectKinds: unknown = PG_OBJECT_KINDS) => ({
+  ok: true,
+  json: { capabilities: { queryLanguage: "sql", containerLevels: [{ id: "schema" }], objectKinds }, labels: {} },
+});
+
+type InventoryObject = {
+  name: string;
+  kind: string;
+  path: string[];
+  rowCount?: number;
+  readRanges?: readonly ObjectReadRange[];
+};
+
+/** The two tables every schema test below reads, as the object surface answers them. */
+const OBJECTS: InventoryObject[] = [
+  { name: "users", kind: "table", path: ["public", "users"], rowCount: 100 },
+  { name: "orders", kind: "table", path: ["public", "orders"], rowCount: 500 },
+];
+
+const DETAILS = [
   {
-    name: "users",
+    path: ["public", "users"],
     columns: [
       { name: "id", type: "integer", nullable: false, isPrimary: true },
       { name: "email", type: "varchar", nullable: false, isPrimary: false },
     ],
     indexes: [{ name: "users_pkey", columns: ["id"], unique: true }],
-    rowCount: 100,
+    foreignKeys: [],
   },
   {
-    name: "orders",
+    path: ["public", "orders"],
     columns: [
       { name: "id", type: "integer", nullable: false, isPrimary: true },
       { name: "user_id", type: "integer", nullable: false, isPrimary: false },
     ],
     indexes: [{ name: "orders_pkey", columns: ["id"], unique: true }],
-    rowCount: 500,
+    foreignKeys: [{ columnName: "user_id", referencedTable: "users", referencedColumn: "id" }],
   },
 ];
+
+/** The same objects as the hook holds them once the two halves are joined on the path. */
+const joined = (objects: InventoryObject[] = OBJECTS, details = DETAILS) =>
+  objects.map((object) => {
+    const detail = details.find((entry) => entry.path.join("/") === object.path.join("/"));
+    return {
+      name: object.name,
+      kind: object.kind,
+      path: object.path,
+      columns: detail?.columns ?? [],
+      indexes: detail?.indexes ?? [],
+      foreignKeys: detail?.foreignKeys ?? [],
+      ...(object.rowCount === undefined ? {} : { rowCount: object.rowCount }),
+    };
+  });
+
+/**
+ * The inventory route's own kind resolution, in four lines: an absent `kinds` means every
+ * declared kind, and a named one is answered exactly. Bodies are recorded so a test can
+ * assert WHAT was asked for as well as what came back.
+ */
+const inventoryRoute =
+  (
+    objects: InventoryObject[],
+    bodies: { kinds?: string[]; includeColumns?: boolean }[] = [],
+    extra: Record<string, unknown> = {},
+    declared: { id: string }[] = PG_OBJECT_KINDS,
+    details: unknown[] = DETAILS,
+  ) =>
+  async (req: Request) => {
+    const body = (await req.json()) as { kinds?: string[]; includeColumns?: boolean };
+    bodies.push(body);
+    const kinds = body.kinds ?? declared.map((kind) => kind.id);
+    const answered = objects.filter((object) => kinds.includes(object.kind));
+    return {
+      ok: true,
+      json: { objects: answered, ...(body.includeColumns === true ? { details } : {}), ...extra },
+    };
+  };
+
+/** The two requests a catalog read makes, answered so the join produces `joined()`. */
+const catalogRoutes = (objects: InventoryObject[] = OBJECTS) => ({
+  "/api/db/provider-meta": providerMeta(),
+  "/api/db/objects/inventory": inventoryRoute(objects),
+});
 
 // =============================================================================
 // useConnectionManager Tests
@@ -73,7 +175,6 @@ describe("useConnectionManager", () => {
     expect(result.current.activeConnection).toBeNull();
     expect(result.current.schema).toEqual([]);
     expect(result.current.isLoadingSchema).toBe(false);
-    expect(result.current.connectionPulse).toBeNull();
   });
 
   // ── Load from localStorage ────────────────────────────────────────────────
@@ -143,43 +244,98 @@ describe("useConnectionManager", () => {
 
   // ── fetchSchema success ───────────────────────────────────────────────────
 
-  test("fetchSchema calls /api/db/schema POST and sets schema", async () => {
-    const schemaData = makeSchema();
+  /*
+    ONE catalog read, not three (#789).
 
+    It was `/api/db/schema/list` for names and columns, `/api/db/objects/inventory` for the
+    kind and the address, and `/api/db/schema/relations` for foreign keys and indexes, held
+    together by a join on the display NAME. The flat reading is deleted, so the inventory
+    answers both halves and they are joined on the PATH inside the hook.
+  */
+
+  test("fetchSchema reads the object inventory with its columns, and holds the joined objects", async () => {
+    const bodies: { kinds?: string[]; includeColumns?: boolean }[] = [];
     const fetchMock = mockGlobalFetch({
-      "/api/db/schema": { ok: true, json: schemaData },
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS, bodies),
     });
 
     const { result } = renderHook(() => useConnectionManager(true));
 
-    const conn = makeConnection();
     await act(async () => {
-      await result.current.fetchSchema(conn);
+      await result.current.fetchSchema(makeConnection());
     });
 
-    expect(result.current.schema).toEqual(schemaData);
+    expect(result.current.schema).toEqual(joined());
     expect(result.current.isLoadingSchema).toBe(false);
+    // The columns are asked for, and only the relation kinds are: a routine or a trigger in
+    // this list is a row the diagram and the import target cannot use.
+    expect(bodies[0].includeColumns).toBe(true);
+    expect(bodies[0].kinds).toEqual(PG_RELATION_KINDS);
 
-    // Verify fetch was called with POST and connection body
-    const schemaCall = fetchMock.mock.calls.find(
-      (call) => typeof call[0] === "string" && call[0].includes("/api/db/schema"),
+    const inventoryCall = fetchMock.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].includes("/api/db/objects/inventory"),
     );
-    expect(schemaCall).toBeDefined();
-    expect(schemaCall![1]?.method).toBe("POST");
+    expect(inventoryCall).toBeDefined();
+    expect(inventoryCall![1]?.method).toBe("POST");
+  });
+
+  test("the session's default container is held with the schema and cleared with it (#1397)", async () => {
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS, [], { defaultContainer: ["public"] }),
+    });
+    const { result } = renderHook(() => useConnectionManager(true));
+    expect(result.current.defaultContainer).toBeUndefined();
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+    expect(result.current.defaultContainer).toEqual(["public"]);
+
+    // A failed read describes no connection's catalog, so the default goes with the objects.
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": async () => ({ ok: false, json: { error: "boom" } }),
+    });
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+    expect(result.current.defaultContainer).toBeUndefined();
+  });
+
+  test("an object the read described nothing for keeps empty columns rather than vanishing", async () => {
+    // A routine has no columns and a bounded read can stop before a folder: both reach the
+    // hook as an object with no detail, and neither may cost the object its row.
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS, [], {}, PG_OBJECT_KINDS, [DETAILS[0]]),
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(result.current.schema.map((object) => [object.name, object.columns.length])).toEqual([
+      ["users", 2],
+      ["orders", 0],
+    ]);
   });
 
   // ── fetchSchema error ─────────────────────────────────────────────────────
 
   test("fetchSchema shows toast on error", async () => {
     mockGlobalFetch({
-      "/api/db/schema": { ok: false, status: 500, json: { error: "Connection refused" } },
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": { ok: false, status: 500, json: { error: "Connection refused" } },
     });
 
     const { result } = renderHook(() => useConnectionManager(true));
 
-    const conn = makeConnection();
     await act(async () => {
-      await result.current.fetchSchema(conn);
+      await result.current.fetchSchema(makeConnection());
     });
 
     expect(result.current.schema).toEqual([]);
@@ -189,14 +345,60 @@ describe("useConnectionManager", () => {
     expect(mockToastError).toHaveBeenCalledWith("Schema Error", { description: "Connection refused" });
   });
 
+  test("metadata that could not be read is the engine's own failure, and is reported as one", async () => {
+    mockGlobalFetch({
+      "/api/db/provider-meta": { ok: false, status: 503, json: { error: "Connection refused" } },
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(result.current.schemaError).toBe("Connection refused");
+  });
+
+  test("an engine that declares no relation kind holds nothing, and that is not an error", async () => {
+    // A true statement about the engine: nothing declared a kind whose rows this list
+    // renders, so there is nothing to ask for. No reading failed, so nothing is reported
+    // as a failure and no toast is raised.
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta([{ id: "function", role: "routine", label: "F", labelPlural: "Fs" }]),
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(result.current.schema).toEqual([]);
+    expect(result.current.schemaError).toBeNull();
+    expect(mockToastError).not.toHaveBeenCalled();
+  });
+
+  test("an inventory body that is not a list of objects is refused rather than rendered", async () => {
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": { ok: true, json: { objects: "everything" } },
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(result.current.schema).toEqual([]);
+    expect(result.current.schemaError).toBe("The object inventory answered a body this list cannot render");
+  });
+
   // A failing read must not leave the PREVIOUS connection's tables on screen (D31).
   // The assertion above is vacuous on its own — `schema` starts empty — so this one
   // loads a schema first and then fails the next read, which is the measured sequence.
   test("a failed read clears the schema loaded for the previous connection", async () => {
-    mockGlobalFetch({
-      "/api/db/schema/list": { ok: true, json: makeSchema() },
-      "/api/db/schema/relations": { ok: false, status: 500, json: {} },
-    });
+    mockGlobalFetch(catalogRoutes());
 
     const { result } = renderHook(() => useConnectionManager(true));
 
@@ -208,7 +410,8 @@ describe("useConnectionManager", () => {
 
     restoreGlobalFetch();
     mockGlobalFetch({
-      "/api/db/schema/list": { ok: false, status: 500, json: { error: "'(' expected" } },
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": { ok: false, status: 500, json: { error: "'(' expected" } },
     });
 
     await act(async () => {
@@ -223,7 +426,8 @@ describe("useConnectionManager", () => {
 
   test("a read that succeeds after a failure drops the previous error", async () => {
     mockGlobalFetch({
-      "/api/db/schema/list": { ok: false, status: 500, json: { error: "Prepare is not support in Databend" } },
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": { ok: false, status: 500, json: { error: "Prepare is not support in Databend" } },
     });
 
     const { result } = renderHook(() => useConnectionManager(true));
@@ -234,10 +438,7 @@ describe("useConnectionManager", () => {
     expect(result.current.schemaError).toBe("Prepare is not support in Databend");
 
     restoreGlobalFetch();
-    mockGlobalFetch({
-      "/api/db/schema/list": { ok: true, json: makeSchema() },
-      "/api/db/schema/relations": { ok: false, status: 500, json: {} },
-    });
+    mockGlobalFetch(catalogRoutes());
 
     await act(async () => {
       await result.current.fetchSchema(makeConnection({ id: "conn-2" }));
@@ -247,42 +448,13 @@ describe("useConnectionManager", () => {
     expect(result.current.schema.map((t) => t.name)).toEqual(["users", "orders"]);
   });
 
-  // ── Two-phase schema loading (list + relations) ───────────────────────────
-  // The schema fetch was split so a slow/failing FK+index query can never block
-  // (or wipe) the table list. These tests lock in that contract.
-
-  // A list-phase payload: tables + columns + PKs, with relations intentionally
-  // absent (indexes empty, no foreignKeys) — exactly what /schema/list returns.
-  const makeListSchema = (): TableSchema[] => [
-    {
-      name: "users",
-      columns: [{ name: "id", type: "integer", nullable: false, isPrimary: true }],
-      indexes: [],
-      foreignKeys: [],
-      rowCount: 100,
-    },
-    {
-      name: "orders",
-      columns: [{ name: "id", type: "integer", nullable: false, isPrimary: true }],
-      indexes: [],
-      foreignKeys: [],
-      rowCount: 500,
-    },
-  ];
-
-  test("phase 1 renders the table list, phase 2 merges FKs/indexes by table name", async () => {
-    const relations = [
-      { name: "users", foreignKeys: [], indexes: [{ name: "users_pkey", columns: ["id"], unique: true }] },
-      {
-        name: "orders",
-        foreignKeys: [{ columnName: "user_id", referencedTable: "users", referencedColumn: "id" }],
-        indexes: [{ name: "orders_pkey", columns: ["id"], unique: true }],
-      },
-    ];
-
+  test("a truncated inventory is logged, and the objects it did carry are still rendered", async () => {
+    const warn = spyOn(logger, "warn").mockImplementation(() => {});
     mockGlobalFetch({
-      "/api/db/schema/list": { ok: true, json: makeListSchema() },
-      "/api/db/schema/relations": { ok: true, json: relations },
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS, [], {
+        truncated: { limit: 5000, reason: "inventory limit reached" },
+      }),
     });
 
     const { result } = renderHook(() => useConnectionManager(true));
@@ -291,95 +463,63 @@ describe("useConnectionManager", () => {
       await result.current.fetchSchema(makeConnection());
     });
 
-    const orders = result.current.schema.find((t) => t.name === "orders")!;
-    expect(orders.foreignKeys).toEqual([{ columnName: "user_id", referencedTable: "users", referencedColumn: "id" }]);
-    expect(orders.indexes).toEqual([{ name: "orders_pkey", columns: ["id"], unique: true }]);
-
-    // Columns from phase 1 survive the merge.
-    expect(orders.columns[0].name).toBe("id");
-    expect(result.current.isLoadingSchema).toBe(false);
-  });
-
-  test("relations failure does NOT wipe the table list and shows no error toast", async () => {
-    // This is the whole reason for the split: FK/index introspection is the slow,
-    // timeout-prone query. If it fails the user must still see their tables.
-    const listData = makeListSchema();
-
-    mockGlobalFetch({
-      "/api/db/schema/list": { ok: true, json: listData },
-      "/api/db/schema/relations": { ok: false, status: 500, json: { error: "statement timeout" } },
-    });
-
-    const { result } = renderHook(() => useConnectionManager(true));
-
-    await act(async () => {
-      await result.current.fetchSchema(makeConnection());
-    });
-
-    // Table list is fully intact (relations merge never ran).
-    expect(result.current.schema).toEqual(listData);
-    expect(result.current.isLoadingSchema).toBe(false);
-    // Relations are best-effort — failure is logged, never surfaced as a toast.
-    expect(mockToastError).not.toHaveBeenCalled();
-  });
-
-  test("phase 1 failure short-circuits — relations endpoint is never called", async () => {
-    const fetchMock = mockGlobalFetch({
-      "/api/db/schema/list": { ok: false, status: 503, json: { error: "Connection refused" } },
-      "/api/db/schema/relations": { ok: true, json: [] },
-    });
-
-    const { result } = renderHook(() => useConnectionManager(true));
-
-    await act(async () => {
-      await result.current.fetchSchema(makeConnection());
-    });
-
-    expect(result.current.schema).toEqual([]);
-    expect(mockToastError).toHaveBeenCalledWith("Schema Error", { description: "Connection refused" });
-
-    // The expensive phase 2 must be skipped entirely when the list fails.
-    const relationsCalled = fetchMock.mock.calls.some(
-      (call) => typeof call[0] === "string" && call[0].includes("/api/db/schema/relations"),
+    expect(result.current.schema.map((t) => t.name)).toEqual(["users", "orders"]);
+    expect(warn).toHaveBeenCalledWith(
+      "Object inventory truncated; objects beyond the limit are not listed",
+      expect.objectContaining({ limit: 5000, reason: "inventory limit reached" }),
     );
-    expect(relationsCalled).toBe(false);
-  });
-
-  test("tables absent from the relations payload are left unchanged", async () => {
-    // Only 'orders' comes back from relations; 'users' must keep its list-phase shape.
-    mockGlobalFetch({
-      "/api/db/schema/list": { ok: true, json: makeListSchema() },
-      "/api/db/schema/relations": {
-        ok: true,
-        json: [
-          {
-            name: "orders",
-            foreignKeys: [{ columnName: "user_id", referencedTable: "users", referencedColumn: "id" }],
-            indexes: [],
-          },
-        ],
-      },
-    });
-
-    const { result } = renderHook(() => useConnectionManager(true));
-
-    await act(async () => {
-      await result.current.fetchSchema(makeConnection());
-    });
-
-    const users = result.current.schema.find((t) => t.name === "users")!;
-    expect(users.foreignKeys).toEqual([]);
-    const orders = result.current.schema.find((t) => t.name === "orders")!;
-    expect(orders.foreignKeys!.length).toBe(1);
+    warn.mockRestore();
   });
 
   // ── schemaContext derived value ────────────────────────────────────────────
 
   test("schemaContext is JSON string of schema", async () => {
-    const schemaData = makeSchema();
+    mockGlobalFetch(catalogRoutes());
 
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(result.current.schemaContext).toBe(JSON.stringify(joined()));
+  });
+
+  /**
+   * etcd spec 3.4 and E13: a group's readable ranges are the connection's own grants, and a piece
+   * can be a single key. The schema keeps them, because the two generators read them off the
+   * schema entry, and `schemaContext` is what the AI panels post to the model, so it is the same
+   * JSON with the ranges left out.
+   */
+  test("schemaContext leaves out the readable ranges the schema itself keeps", async () => {
+    const ranges: readonly ObjectReadRange[] = [
+      { key: "grant-key-a" },
+      { prefix: "grant-prefix-b/" },
+      { start: "grant-start-c", end: "grant-end-d" },
+    ];
+    mockGlobalFetch(catalogRoutes([{ ...OBJECTS[0], readRanges: ranges }, OBJECTS[1]]));
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(result.current.schema[0]?.readRanges).toEqual(ranges);
+    expect(result.current.schemaContext).toBe(JSON.stringify(joined()));
+    expect(result.current.schemaContext).not.toContain("grant-");
+  });
+
+  /**
+   * A column the provider only inferred from sampled data stays in `schema`, which the human
+   * views read, and never reaches `schemaContext`, which the AI panels send to a model.
+   */
+  test("schemaContext leaves out a column the engine only inferred from sampled data", async () => {
+    const sampled = { name: SAMPLED_MARKER, type: "text", nullable: true, isPrimary: false, provenance: "sampled" };
+    const details = [{ ...DETAILS[0], columns: [...DETAILS[0].columns, sampled] }, DETAILS[1]];
     mockGlobalFetch({
-      "/api/db/schema": { ok: true, json: schemaData },
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS, [], {}, PG_OBJECT_KINDS, details),
     });
 
     const { result } = renderHook(() => useConnectionManager(true));
@@ -388,7 +528,9 @@ describe("useConnectionManager", () => {
       await result.current.fetchSchema(makeConnection());
     });
 
-    expect(result.current.schemaContext).toBe(JSON.stringify(schemaData));
+    expect(result.current.schema[0]?.columns.map((column) => column.name)).toContain(SAMPLED_MARKER);
+    expect(result.current.schemaContext).not.toContain(SAMPLED_MARKER);
+    expect(result.current.schemaContext).toBe(JSON.stringify(joined()));
   });
 
   // ── isLoadingSchema during fetch ──────────────────────────────────────────
@@ -399,12 +541,12 @@ describe("useConnectionManager", () => {
       resolveSchema = resolve;
     });
 
-    mockGlobalFetch({});
+    mockGlobalFetch({ "/api/db/provider-meta": providerMeta() });
 
     const originalMockedFetch = globalThis.fetch;
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      if (url.includes("/api/db/schema")) {
+      if (url.includes("/api/db/objects/inventory")) {
         return schemaPromise;
       }
       return originalMockedFetch(input, init);
@@ -423,7 +565,7 @@ describe("useConnectionManager", () => {
 
     // Resolve the schema request
     resolveSchema!(
-      new Response(JSON.stringify(makeSchema()), {
+      new Response(JSON.stringify({ objects: OBJECTS, details: DETAILS }), {
         status: 200,
         headers: { "content-type": "application/json" },
       }),
@@ -474,62 +616,30 @@ describe("useConnectionManager", () => {
     expect(result.current.connections[1].name).toBe("Beta");
   });
 
-  // ── connectionPulse healthy ───────────────────────────────────────────────
+  // ── No connection pulse ───────────────────────────────────────────────
 
-  test("connectionPulse is healthy when health check succeeds", async () => {
+  // The pulse is `useConnectionPulse`'s, which waits for the provider's declaration before it may
+  // send anything; a post from here would reach a connection whose compute it wakes and bills.
+  test("posts no /api/db/health and reports no pulse of its own", async () => {
     const conn = makeConnection();
     storage.saveConnection(conn);
 
-    mockGlobalFetch({
+    const fetchMock = mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects": { json: { objects: OBJECTS } },
       "/api/db/health": { ok: true, json: { status: "healthy" } },
     });
 
     const { result } = renderHook(() => useConnectionManager(true));
 
     await waitFor(() => {
-      expect(result.current.connectionPulse).toBe("healthy");
+      expect(result.current.activeConnection?.id).toBe("conn-1");
     });
-  });
-
-  // ── Connection pulse degraded ──────────────────────────────────────────
-
-  test("connectionPulse is degraded when health check returns non-ok", async () => {
-    const conn = makeConnection();
-    storage.saveConnection(conn);
-
-    mockGlobalFetch({
-      "/api/db/health": { ok: false, status: 503, json: { error: "Service Unavailable" } },
-    });
-
-    const { result } = renderHook(() => useConnectionManager(true));
-
     await waitFor(() => {
-      expect(result.current.connectionPulse).toBe("degraded");
+      expect(result.current.isLoadingSchema).toBe(false);
     });
-  });
-
-  // ── Connection pulse error on fetch failure ────────────────────────────
-
-  test("connectionPulse is error when health check throws", async () => {
-    const conn = makeConnection();
-    storage.saveConnection(conn);
-
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      if (url.includes("/api/db/health")) {
-        throw new Error("Network error");
-      }
-      return new Response(JSON.stringify({ error: "Not found" }), { status: 404 });
-    }) as typeof fetch;
-
-    const { result } = renderHook(() => useConnectionManager(true));
-
-    await waitFor(() => {
-      expect(result.current.connectionPulse).toBe("error");
-    });
-
-    globalThis.fetch = originalFetch;
+    expect(fetchMock.mock.calls.filter((call) => String(call[0]).includes("/api/db/health"))).toHaveLength(0);
+    expect("connectionPulse" in result.current).toBe(false);
   });
 
   // ── fetchSchema error with non-JSON response ──────────────────────────
@@ -538,7 +648,10 @@ describe("useConnectionManager", () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      if (url.includes("/api/db/schema")) {
+      if (url.includes("/api/db/provider-meta")) {
+        return new Response(JSON.stringify(providerMeta().json), { status: 200 });
+      }
+      if (url.includes("/api/db/objects/inventory")) {
         return new Response("Internal Server Error", { status: 500 });
       }
       return new Response(JSON.stringify({ error: "Not found" }), { status: 404 });
@@ -563,7 +676,10 @@ describe("useConnectionManager", () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      if (url.includes("/api/db/schema")) {
+      if (url.includes("/api/db/provider-meta")) {
+        return new Response(JSON.stringify(providerMeta().json), { status: 200 });
+      }
+      if (url.includes("/api/db/objects/inventory")) {
         throw "non-error string";
       }
       return new Response("{}", { status: 404 });
@@ -608,20 +724,15 @@ describe("useConnectionManager", () => {
   // ── Managed (seed) connection merging ────────────────────────────────────
 
   test("fetchSchema for regular connection success shows schema", async () => {
-    const schemaData = makeSchema();
-
-    mockGlobalFetch({
-      "/api/db/schema": { ok: true, json: schemaData },
-    });
+    mockGlobalFetch(catalogRoutes());
 
     const { result } = renderHook(() => useConnectionManager(true));
 
-    const conn = makeConnection({ id: "pg-1" });
     await act(async () => {
-      await result.current.fetchSchema(conn);
+      await result.current.fetchSchema(makeConnection({ id: "pg-1" }));
     });
 
-    expect(result.current.schema).toEqual(schemaData);
+    expect(result.current.schema).toEqual(joined());
     expect(result.current.isLoadingSchema).toBe(false);
   });
 
@@ -1010,5 +1121,2132 @@ describe("useConnectionManager", () => {
       getConnectionsSpy.mockRestore();
       warnSpy.mockRestore();
     }
+  });
+  // ── Managed refresh interval (#1502) ──────────────────────────────────────
+
+  describe("managed refresh interval", () => {
+    afterEach(() => {
+      delete process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS;
+    });
+
+    test("follows the server's cacheHint above the floor", () => {
+      expect(managedRefreshIntervalMs(12000)).toBe(12000);
+    });
+
+    test("never refreshes faster than the floor, which defaults to five seconds", () => {
+      expect(MANAGED_REFRESH_DEFAULT_FLOOR_MS).toBe(5000);
+      expect(managedRefreshIntervalMs(null)).toBe(5000);
+      expect(managedRefreshIntervalMs(1000)).toBe(5000);
+      expect(managedRefreshIntervalMs(0)).toBe(5000);
+    });
+
+    test("never waits longer than the cap", () => {
+      expect(MANAGED_REFRESH_MAX_MS).toBe(60000);
+      expect(managedRefreshIntervalMs(600000)).toBe(60000);
+    });
+
+    test("NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS moves the floor, and the cap still holds", () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      expect(managedRefreshIntervalMs(null)).toBe(25);
+      expect(managedRefreshIntervalMs(40)).toBe(40);
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "90000";
+      expect(managedRefreshIntervalMs(null)).toBe(60000);
+    });
+
+    test("a floor that is not a number falls back to the default", () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "soon";
+      expect(managedRefreshIntervalMs(null)).toBe(5000);
+    });
+  });
+  // ── Managed connection refresh (#1502) ────────────────────────────────────
+
+  const firstManaged = () =>
+    makeManagedConnection({ id: "managed-1", managed: true, seedId: "seed-1", name: "First DB" });
+  const secondManaged = () =>
+    makeManagedConnection({ id: "managed-2", managed: true, seedId: "seed-2", name: "Second DB" });
+  const healthy = { ok: true, json: { status: "healthy" } };
+  const focusWindow = () => {
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+  };
+  const announceVisibility = () => {
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+  };
+  /** happy-dom always reports "visible"; an own accessor shadows its prototype getter until removed. */
+  const setVisibility = (state: DocumentVisibilityState) => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+  };
+
+  describe("managed connection refresh", () => {
+    afterEach(() => {
+      delete process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS;
+      Reflect.deleteProperty(document, "visibilityState");
+    });
+
+    test("a new managed connection appears when the window regains focus", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      let managedCalls = 0;
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return {
+            ok: true,
+            json: { connections: managedCalls === 1 ? [firstManaged()] : [firstManaged(), secondManaged()] },
+          };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(1);
+      });
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.connections.map((c) => c.id)).toEqual(["managed-1", "managed-2"]);
+      });
+      expect(managedCallCount(fetchMock)).toBe(2);
+    });
+
+    test("a new managed connection appears on the interval, with no event at all", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      let managedCalls = 0;
+      mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return { ok: true, json: { connections: managedCalls === 1 ? [] : [firstManaged()] } };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(
+        () => {
+          expect(result.current.connections.map((c) => c.id)).toEqual(["managed-1"]);
+        },
+        { timeout: 3000 },
+      );
+      expect(result.current.activeConnection?.id).toBe("managed-1");
+    });
+
+    test("the interval follows the server's cacheHint when it is above the floor", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": { ok: true, json: { connections: [firstManaged()], cacheHint: 60000 } },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(1);
+      });
+
+      await sleep(200);
+      expect(managedCallCount(fetchMock)).toBe(1);
+    });
+
+    test("the document becoming visible refreshes at once, and becoming hidden does not", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      let managedCalls = 0;
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return {
+            ok: true,
+            json: { connections: managedCalls === 1 ? [firstManaged()] : [firstManaged(), secondManaged()] },
+          };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(1);
+      });
+
+      setVisibility("hidden");
+      announceVisibility();
+      await sleep(50);
+      expect(managedCallCount(fetchMock)).toBe(1);
+
+      setVisibility("visible");
+      announceVisibility();
+      await waitFor(() => {
+        expect(result.current.connections.map((c) => c.id)).toEqual(["managed-1", "managed-2"]);
+      });
+      expect(managedCallCount(fetchMock)).toBe(2);
+    });
+
+    test("nothing is fetched while the tab is hidden, and the interval resumes once it is visible", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": { ok: true, json: { connections: [firstManaged()] } },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(1);
+      });
+
+      setVisibility("hidden");
+      await sleep(50);
+      const hiddenCount = managedCallCount(fetchMock);
+      await sleep(200);
+      expect(managedCallCount(fetchMock)).toBe(hiddenCount);
+      focusWindow();
+      await sleep(50);
+      expect(managedCallCount(fetchMock)).toBe(hiddenCount);
+
+      setVisibility("visible");
+      await waitFor(
+        () => {
+          expect(managedCallCount(fetchMock)).toBeGreaterThan(hiddenCount);
+        },
+        { timeout: 3000 },
+      );
+    });
+
+    test("a refresh in flight absorbs further triggers until it answers", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      let release = () => {};
+      const held = new Promise<void>((resolve) => {
+        release = () => resolve();
+      });
+      let managedCalls = 0;
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": async () => {
+          managedCalls += 1;
+          const connections = managedCalls === 1 ? [firstManaged()] : [firstManaged(), secondManaged()];
+          if (managedCalls === 2) await held;
+          return { ok: true, json: { connections } };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(1);
+      });
+
+      focusWindow();
+      focusWindow();
+      focusWindow();
+      await sleep(50);
+      expect(managedCallCount(fetchMock)).toBe(2);
+
+      release();
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(2);
+      });
+      focusWindow();
+      await waitFor(() => {
+        expect(managedCallCount(fetchMock)).toBe(3);
+      });
+    });
+
+    test("nothing is fetched before storage is ready", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": { ok: true, json: { connections: [firstManaged()] } },
+        "/api/db/health": healthy,
+      });
+
+      renderHook(() => useConnectionManager(false));
+      focusWindow();
+      announceVisibility();
+      await sleep(150);
+      expect(managedCallCount(fetchMock)).toBe(0);
+    });
+
+    test("no refresh starts after an initial fetch that answered non-OK", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": { status: 503, json: { error: "warming up" } },
+        "/api/db/health": healthy,
+      });
+
+      renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(managedCallCount(fetchMock)).toBe(1);
+      });
+      await sleep(150);
+      focusWindow();
+      await sleep(50);
+      expect(managedCallCount(fetchMock)).toBe(1);
+    });
+
+    test("no refresh starts after an initial fetch that threw", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": () => {
+          throw new Error("offline");
+        },
+        "/api/db/health": healthy,
+      });
+
+      renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(managedCallCount(fetchMock)).toBe(1);
+      });
+      await sleep(150);
+      focusWindow();
+      await sleep(50);
+      expect(managedCallCount(fetchMock)).toBe(1);
+    });
+
+    test("a failed refresh changes nothing, served seeds included", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      const debugSpy = spyOn(logger, "debug").mockImplementation(() => {});
+      let managedCalls = 0;
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          if (managedCalls === 1) return { ok: true, json: { connections: [firstManaged()] } };
+          if (managedCalls === 2) {
+            return {
+              status: 500,
+              json: { error: "Failed to load managed connections", reason: SEED_CONFIG_UNREADABLE_REASON },
+            };
+          }
+          throw new Error("network down");
+        },
+        "/api/db/health": healthy,
+      });
+
+      try {
+        const { result } = renderHook(() => useConnectionManager(true));
+        await waitFor(() => {
+          expect(result.current.connections).toHaveLength(1);
+        });
+        const before = result.current.connections;
+
+        // A non-OK answer, attributed to the seed configuration: a quiet refresh never records that
+        // (only the initial load and the pending-seed poll may), so the served seeds stay loaded and the
+        // list stays the same object.
+        focusWindow();
+        await waitFor(() => {
+          expect(managedCallCount(fetchMock)).toBe(2);
+        });
+        await sleep(50);
+        expect(result.current.connections).toBe(before);
+        expect(result.current.servedSeeds).toEqual({ loaded: true, seeds: [firstManaged()] });
+
+        // A rejected request: logged, nothing else.
+        focusWindow();
+        await waitFor(() => {
+          expect(debugSpy).toHaveBeenCalledWith("Managed connection refresh failed", {
+            route: "use-connection-manager",
+            error: "network down",
+          });
+        });
+        expect(result.current.connections).toBe(before);
+        expect(result.current.servedSeeds).toEqual({ loaded: true, seeds: [firstManaged()] });
+      } finally {
+        debugSpy.mockRestore();
+      }
+    });
+
+    test("unmount removes the focus and visibility listeners and the timer", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "25";
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": { ok: true, json: { connections: [firstManaged()] } },
+        "/api/db/health": healthy,
+      });
+
+      const { result, unmount } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(1);
+      });
+      unmount();
+
+      const atUnmount = managedCallCount(fetchMock);
+      await sleep(150);
+      focusWindow();
+      announceVisibility();
+      await sleep(50);
+      expect(managedCallCount(fetchMock)).toBe(atUnmount);
+    });
+  });
+  describe("managed connection withdrawal", () => {
+    afterEach(() => {
+      delete process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS;
+    });
+
+    test("an empty managed list withdraws the managed entries and leaves only the user's own", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      storage.saveConnection(makeConnection({ id: "plain-1", name: "Plain" }));
+      let managedCalls = 0;
+      mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return { ok: true, json: { connections: managedCalls === 1 ? [firstManaged()] : [] } };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.connections.map((c) => c.id)).toEqual(["managed-1", "plain-1"]);
+      });
+      expect(result.current.activeConnection?.id).toBe("managed-1");
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.connections.map((c) => c.id)).toEqual(["plain-1"]);
+      });
+      expect(result.current.activeConnection?.id).toBe("plain-1");
+      expect(mockToastSuccess).toHaveBeenCalledTimes(1);
+      expect(mockToastSuccess).toHaveBeenCalledWith("Connection removed", {
+        description: "First DB is no longer available.",
+      });
+    });
+
+    test("the active connection keeps its object identity while it is still listed", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      let managedCalls = 0;
+      mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return {
+            ok: true,
+            json: { connections: managedCalls === 1 ? [firstManaged()] : [firstManaged(), secondManaged()] },
+          };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("managed-1");
+      });
+      const activeBefore = result.current.activeConnection;
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.connections).toHaveLength(2);
+      });
+      // A new object for the same id would reset the transaction, discard edits and re-read
+      // the schema in Studio's connection-change effect.
+      expect(result.current.activeConnection).toBe(activeBefore);
+      // The list carries that same object: every way of picking a connection passes the list's entry to
+      // setActiveConnection, so a fresh copy there would re-run Studio's effect on a click on the open one.
+      expect(result.current.connections.find((c) => c.id === "managed-1")).toBe(
+        result.current.activeConnection ?? undefined,
+      );
+      expect(mockToastSuccess).not.toHaveBeenCalled();
+    });
+
+    test("the user's own active connection stays the list's entry after a refresh with no managed connection", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      storage.saveConnection(makeConnection({ id: "plain-1", name: "Plain" }));
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": { ok: true, json: { connections: [] } },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("plain-1");
+      });
+      const activeBefore = result.current.activeConnection;
+      const listBefore = result.current.connections;
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.connections).not.toBe(listBefore);
+      });
+      expect(managedCallCount(fetchMock)).toBe(2);
+      expect(result.current.activeConnection).toBe(activeBefore);
+      expect(result.current.connections.find((c) => c.id === "plain-1")).toBe(
+        result.current.activeConnection ?? undefined,
+      );
+    });
+
+    test("a withdrawn active connection falls back to the first remaining one with exactly one notice", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      storage.setActiveConnectionId("managed-2");
+      let managedCalls = 0;
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return {
+            ok: true,
+            json: { connections: managedCalls === 1 ? [firstManaged(), secondManaged()] : [firstManaged()] },
+          };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("managed-2");
+      });
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("managed-1");
+      });
+      expect(result.current.connections.map((c) => c.id)).toEqual(["managed-1"]);
+      expect(mockToastSuccess).toHaveBeenCalledTimes(1);
+      expect(mockToastSuccess).toHaveBeenCalledWith("Connection removed", {
+        description: "Second DB is no longer available.",
+      });
+
+      // The next refresh finds the new active connection listed and says nothing more.
+      focusWindow();
+      await waitFor(() => {
+        expect(managedCallCount(fetchMock)).toBe(3);
+      });
+      await sleep(50);
+      expect(mockToastSuccess).toHaveBeenCalledTimes(1);
+    });
+
+    test("withdrawing the last connection leaves none active, with exactly one notice", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      let managedCalls = 0;
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return { ok: true, json: { connections: managedCalls === 1 ? [firstManaged()] : [] } };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("managed-1");
+      });
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.connections).toEqual([]);
+      });
+      expect(result.current.activeConnection).toBeNull();
+      expect(mockToastSuccess).toHaveBeenCalledTimes(1);
+      expect(mockToastSuccess).toHaveBeenCalledWith("Connection removed", {
+        description: "First DB is no longer available.",
+      });
+
+      // Two more refreshes find nothing to withdraw and say nothing more.
+      focusWindow();
+      await waitFor(() => {
+        expect(managedCallCount(fetchMock)).toBe(3);
+      });
+      focusWindow();
+      await waitFor(() => {
+        expect(managedCallCount(fetchMock)).toBe(4);
+      });
+      await sleep(50);
+      expect(result.current.activeConnection).toBeNull();
+      expect(mockToastSuccess).toHaveBeenCalledTimes(1);
+    });
+
+    test("withdrawing another connection keeps the active one, wherever it sits in the list, with no notice", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      storage.saveConnection(makeConnection({ id: "plain-1", name: "Plain" }));
+      storage.setActiveConnectionId("plain-1");
+      let managedCalls = 0;
+      mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return {
+            ok: true,
+            json: { connections: managedCalls === 1 ? [firstManaged(), secondManaged()] : [firstManaged()] },
+          };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("plain-1");
+      });
+      const activeBefore = result.current.activeConnection;
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.connections.map((c) => c.id)).toEqual(["managed-1", "plain-1"]);
+      });
+      expect(result.current.activeConnection).toBe(activeBefore);
+      expect(mockToastSuccess).not.toHaveBeenCalled();
+    });
+  });
+
+  // ALLOW_CUSTOM_CONNECTIONS off (contract A3.4): the refresh keeps, falls back to and makes active
+  // only a connection the policy view lists, so it never opens one the server refuses.
+  describe("managed connection refresh under the custom connections policy", () => {
+    afterEach(() => {
+      delete process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS;
+    });
+
+    // Seeds as the route lists them, in the `seed:` namespace the policy keeps.
+    const ordersSeed = () =>
+      makeManagedConnection({ id: "seed:orders", managed: true, seedId: "orders", name: "Orders" });
+    const billingSeed = () =>
+      makeManagedConnection({ id: "seed:billing", managed: true, seedId: "billing", name: "Billing" });
+    const refusingPolicy = { ok: true, json: { customConnections: false } };
+    const sandboxCopy = () =>
+      makeConnection({ id: "seed:sandbox", seedId: "sandbox", name: "Sandbox copy", managed: false });
+
+    test("a refresh lists the seeds it finds and keeps the user's own connections stored but hidden", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      storage.saveConnection(makeConnection({ id: "plain-1", name: "Plain" }));
+      let managedCalls = 0;
+      mockGlobalFetch({
+        "/api/connections/policy": refusingPolicy,
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return {
+            ok: true,
+            json: { connections: managedCalls === 1 ? [ordersSeed()] : [ordersSeed(), billingSeed()] },
+          };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("seed:orders");
+      });
+      expect(result.current.connections.map((c) => c.id)).toEqual(["seed:orders"]);
+      const active = result.current.activeConnection;
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.connections.map((c) => c.id)).toEqual(["seed:orders", "seed:billing"]);
+      });
+      expect(result.current.activeConnection).toBe(active);
+      expect(storage.getConnections().map((c) => c.id)).toEqual(["plain-1"]);
+      expect(mockToastSuccess).not.toHaveBeenCalled();
+    });
+
+    test("a withdrawn active seed falls back to the first remaining connection the policy shows, never to a hidden one", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      // Stored first, so it heads the user's own list that the empty answer leaves.
+      storage.saveConnection(makeConnection({ id: "plain-1", name: "Plain" }));
+      storage.saveConnection(sandboxCopy());
+      let managedCalls = 0;
+      mockGlobalFetch({
+        "/api/connections/policy": refusingPolicy,
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          return { ok: true, json: { connections: managedCalls === 1 ? [ordersSeed()] : [] } };
+        },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("seed:orders");
+      });
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("seed:sandbox");
+      });
+      expect(result.current.connections.map((c) => c.id)).toEqual(["seed:sandbox"]);
+      expect(mockToastSuccess).toHaveBeenCalledTimes(1);
+      expect(mockToastSuccess).toHaveBeenCalledWith("Connection removed", {
+        description: "Orders is no longer available.",
+      });
+      expect(storage.getConnections().map((c) => c.id)).toEqual(["plain-1", "seed:sandbox"]);
+    });
+
+    test("a hidden connection made active counts as none, so a refresh makes the first connection the policy shows active", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      const own = makeConnection({ id: "plain-1", name: "Plain" });
+      storage.saveConnection(own);
+      mockGlobalFetch({
+        "/api/connections/policy": refusingPolicy,
+        "/api/connections/managed": { ok: true, json: { connections: [ordersSeed()] } },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("seed:orders");
+      });
+
+      // The shell can still hand over a connection the policy hides, from a dialog opened before
+      // the policy answered; the raw state then holds it while the view reports none.
+      act(() => {
+        result.current.setActiveConnection(own);
+      });
+      expect(result.current.activeConnection).toBeNull();
+
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("seed:orders");
+      });
+      expect(result.current.connections.map((c) => c.id)).toEqual(["seed:orders"]);
+      expect(mockToastSuccess).not.toHaveBeenCalled();
+    });
+
+    test("with nothing active, a refresh makes the first connection the policy shows active, never a hidden one", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      storage.saveConnection(makeConnection({ id: "plain-1", name: "Plain" }));
+      mockGlobalFetch({
+        "/api/connections/policy": refusingPolicy,
+        "/api/connections/managed": { ok: true, json: { connections: [] } },
+        "/api/db/health": healthy,
+      });
+
+      const { result } = renderHook(() => useConnectionManager(true));
+      // The first load answered, so the refresh is listening, and it found nothing the policy shows.
+      await waitFor(() => {
+        expect(result.current.servedSeeds).toEqual({ loaded: true, seeds: [] });
+      });
+      expect(result.current.connections).toEqual([]);
+      expect(result.current.activeConnection).toBeNull();
+
+      // An unmanaged seed's copy reaches storage behind the hidden connection, so the user's own
+      // list the next empty answer leaves is [plain-1, seed:sandbox].
+      storage.saveConnection(sandboxCopy());
+      focusWindow();
+      await waitFor(() => {
+        expect(result.current.activeConnection?.id).toBe("seed:sandbox");
+      });
+      expect(result.current.connections.map((c) => c.id)).toEqual(["seed:sandbox"]);
+      expect(mockToastSuccess).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("managed connection refresh and the open editor", () => {
+    afterEach(() => {
+      delete process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS;
+    });
+
+    // Studio's connection-change effect resets the transaction, discards pending edits and reads
+    // the schema again whenever the active connection's object changes (src/components/Studio.tsx),
+    // and the tab manager reloads its tabs whenever that connection's id changes
+    // (src/hooks/use-tab-manager.ts), so a refresh that changes nothing, or fails, has to hand back
+    // the same active object.
+    test("a refresh that changes nothing, or fails, leaves the open connection, its tabs and the user's own connections as they were, and says nothing", async () => {
+      process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+      const debugSpy = spyOn(logger, "debug").mockImplementation(() => {});
+      storage.saveConnection(makeConnection({ id: "plain-1", name: "Plain" }));
+      // The route stamps createdAt afresh on every request, so an unchanged list still differs there.
+      const unchanged = { ...firstManaged(), createdAt: "2026-01-02T00:00:05.000Z" };
+      let managedCalls = 0;
+      const fetchMock = mockGlobalFetch({
+        "/api/connections/managed": () => {
+          managedCalls += 1;
+          if (managedCalls === 1) return { ok: true, json: { connections: [firstManaged()] } };
+          if (managedCalls === 2) return { ok: true, json: { connections: [unchanged] } };
+          if (managedCalls === 3) return { status: 503, json: { error: "warming up" } };
+          if (managedCalls === 4) {
+            return {
+              status: 500,
+              json: { error: "Failed to load managed connections", reason: SEED_CONFIG_UNREADABLE_REASON },
+            };
+          }
+          throw new Error("network down");
+        },
+        "/api/db/health": healthy,
+      });
+
+      try {
+        const { result } = renderHook(() => {
+          const conn = useConnectionManager(true);
+          const tabs = useTabManager({
+            activeConnection: conn.activeConnection,
+            metadata: null,
+            schema: conn.schema,
+            persistWorkspace: true,
+          });
+          return { conn, tabs };
+        });
+        await waitFor(() => {
+          expect(result.current.conn.activeConnection?.id).toBe("managed-1");
+        });
+        act(() => result.current.tabs.addTab());
+        act(() => result.current.tabs.updateCurrentTab({ query: "SELECT 1" }));
+        const { tabs, activeTabId } = result.current.tabs;
+        const active = result.current.conn.activeConnection;
+        const stored = storage.getConnections();
+        expect(tabs).toHaveLength(2);
+
+        const refreshAndSettle = async (calls: number) => {
+          focusWindow();
+          await waitFor(() => {
+            expect(managedCallCount(fetchMock)).toBe(calls);
+          });
+          await sleep(50);
+        };
+        // One unchanged answer, then three failures in a row: a non-OK answer, one the server
+        // blames on its seed configuration, and a request that fails outright.
+        await refreshAndSettle(2);
+        await refreshAndSettle(3);
+        await refreshAndSettle(4);
+        await refreshAndSettle(5);
+
+        expect(result.current.conn.activeConnection).toBe(active);
+        // The list hands the same object to whatever picks the connection again.
+        expect(active).toBe(result.current.conn.connections[0]);
+        expect(result.current.conn.connections.map((c) => c.id)).toEqual(["managed-1", "plain-1"]);
+        expect(result.current.conn.servedSeeds).toEqual({ loaded: true, seeds: [unchanged] });
+        expect(storage.getConnections()).toEqual(stored);
+        expect(storage.getActiveConnectionId()).toBe("managed-1");
+        expect(result.current.tabs.tabs).toBe(tabs);
+        expect(result.current.tabs.activeTabId).toBe(activeTabId);
+        expect(result.current.tabs.currentTab.query).toBe("SELECT 1");
+        expect(mockToastSuccess).not.toHaveBeenCalled();
+        expect(mockToastError).not.toHaveBeenCalled();
+      } finally {
+        debugSpy.mockRestore();
+      }
+    });
+  });
+});
+
+// =============================================================================
+// The no-scan escape hatch (#765, #789)
+// =============================================================================
+//
+// `skipObjectScan` on a connection means ZERO catalog reads when it opens. The
+// reporter of #765 asked for exactly this, in their own words: "not preloading
+// anything using command line option or at db connection level". A connection whose
+// owner holds tens of thousands of objects froze the whole editor behind one
+// `/api/db/objects/inventory`, and the tree's two cheap reads are worth deferring as well.
+//
+// Every assertion below COUNTS requests by path rather than checking that something
+// rendered, and every zero is paired with a control that makes the same counter see
+// the requests: an assertion that nothing was requested is vacuous while the reason
+// might be that the counter cannot see requests at all.
+describe("deferring the object scan", () => {
+  // A sibling describe inherits nothing from the one above it, so the fetch mock and
+  // the storage this block installs are restored here or they leak into the next file.
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    restoreGlobalFetch();
+  });
+
+  /** Catalog reads only. `/api/db/health` is the connection pulse and reads no catalog. */
+  const catalogPaths = (fetchMock: ReturnType<typeof mockGlobalFetch>): string[] =>
+    fetchMock.mock.calls
+      .map((call) => new URL(String(call[0]), "http://localhost:3000").pathname)
+      .filter((path) => path.startsWith("/api/db/schema") || path.startsWith("/api/db/objects"));
+
+  const installSchemaRoutes = () => mockGlobalFetch(catalogRoutes());
+
+  /**
+   * What a connection that reads its catalog asks for. `/api/db/provider-meta` is not in the
+   * list because `catalogPaths` filters it out: it opens no connection and reads no catalog,
+   * which is the whole reason the inventory's kinds can be resolved from it.
+   */
+  const FULL_READ = ["/api/db/objects/inventory"];
+
+  test("a connection that defers its scan reads no catalog at all", async () => {
+    const fetchMock = installSchemaRoutes();
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection({ skipObjectScan: true }));
+    });
+
+    expect(catalogPaths(fetchMock)).toEqual([]);
+    expect(result.current.isLoadingSchema).toBe(false);
+  });
+
+  /**
+   * D31, which this file already states at the top: the previous connection's list is not
+   * evidence about this one. A deferred connection reads nothing, so it has NO objects,
+   * and the four surfaces fed from here - `schemaContext` into the AI panels and the agent
+   * rail, the ER diagram, the mobile explorer, and the profiler/codegen/test-data lookups -
+   * must not be handed the last connection's tables under this connection's name. Feeding
+   * them to a model as grounding is the failure class #414 measured.
+   *
+   * The assertion this replaces was vacuous: `schema` is `[]` from mount, so asserting
+   * emptiness after a deferred read proved nothing. The scan of A is the control.
+   */
+  test("deferring a connection drops the tables the PREVIOUS connection loaded", async () => {
+    const fetchMock = installSchemaRoutes();
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection({ id: "conn-a" }));
+    });
+    expect(result.current.schema.map((table) => table.name)).toEqual(["users", "orders"]);
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection({ id: "conn-b", skipObjectScan: true }));
+    });
+
+    expect(result.current.schema).toEqual([]);
+    expect(result.current.schemaContext).toBe("[]");
+    // Nothing failed either, so nothing may be reported as a failure: an empty panel that
+    // blames the engine for a read nobody issued is worse than an empty panel.
+    expect(result.current.schemaError).toBeNull();
+    expect(catalogPaths(fetchMock)).toEqual(FULL_READ);
+  });
+
+  test("deferring a connection also drops the PREVIOUS connection's failure", async () => {
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": { ok: false, status: 500, json: { error: "'(' expected" } },
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection({ id: "conn-a" }));
+    });
+    expect(result.current.schemaError).toBe("'(' expected");
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection({ id: "conn-b", skipObjectScan: true }));
+    });
+
+    expect(result.current.schemaError).toBeNull();
+  });
+
+  // The control for the assertion above. Same hook, same routes, same counter, and
+  // the ONLY difference is the flag.
+  test("control: the same read without the flag issues both schema requests", async () => {
+    const fetchMock = installSchemaRoutes();
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(catalogPaths(fetchMock)).toEqual(FULL_READ);
+    expect(result.current.schema.map((table) => table.name)).toEqual(["users", "orders"]);
+  });
+
+  test("objectScanDeferred answers for the ACTIVE connection, and is null-safe", async () => {
+    installSchemaRoutes();
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    expect(result.current.objectScanDeferred).toBe(false);
+
+    await act(async () => {
+      result.current.setActiveConnection(makeConnection({ skipObjectScan: true }));
+    });
+    expect(result.current.objectScanDeferred).toBe(true);
+
+    await act(async () => {
+      result.current.setActiveConnection(makeConnection({ id: "conn-2" }));
+    });
+    expect(result.current.objectScanDeferred).toBe(false);
+  });
+
+  test("loadObjects performs the read the connection deferred, and stops deferring", async () => {
+    const fetchMock = installSchemaRoutes();
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      result.current.setActiveConnection(makeConnection({ skipObjectScan: true }));
+    });
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection({ skipObjectScan: true }));
+    });
+    expect(catalogPaths(fetchMock)).toEqual([]);
+
+    await act(async () => {
+      result.current.loadObjects();
+    });
+
+    await waitFor(() => expect(result.current.objectScanDeferred).toBe(false));
+    await waitFor(() => expect(result.current.schema.map((table) => table.name)).toEqual(["users", "orders"]));
+    expect(catalogPaths(fetchMock)).toEqual(FULL_READ);
+  });
+
+  // The state is the connection the reader asked for BY ID, derived rather than reset
+  // in an effect. A boolean would leave the next deferred connection already loaded.
+  test("switching to another deferred connection defers again", async () => {
+    installSchemaRoutes();
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      result.current.setActiveConnection(makeConnection({ skipObjectScan: true }));
+    });
+    await act(async () => {
+      result.current.loadObjects();
+    });
+    await waitFor(() => expect(result.current.objectScanDeferred).toBe(false));
+
+    await act(async () => {
+      result.current.setActiveConnection(makeConnection({ id: "conn-9", skipObjectScan: true }));
+    });
+
+    expect(result.current.objectScanDeferred).toBe(true);
+  });
+
+  // A statement's own refresh goes through `fetchSchema` too (use-query-execution.ts),
+  // so the guard has to hold for it: a reader who deferred the scan did not ask for a
+  // full catalog read after every DDL statement either.
+  test("a deferred connection stays deferred across a later fetchSchema", async () => {
+    const fetchMock = installSchemaRoutes();
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    const conn = makeConnection({ skipObjectScan: true });
+    await act(async () => {
+      await result.current.fetchSchema(conn);
+      await result.current.fetchSchema(conn);
+    });
+
+    expect(catalogPaths(fetchMock)).toEqual([]);
+  });
+
+  test("loadObjects with no active connection reads nothing", async () => {
+    const fetchMock = installSchemaRoutes();
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      result.current.loadObjects();
+    });
+
+    expect(catalogPaths(fetchMock)).toEqual([]);
+    expect(result.current.objectScanDeferred).toBe(false);
+  });
+});
+
+// =============================================================================
+// A restore that would resume billed compute (CL-CORE-2)
+// =============================================================================
+//
+// Measured on Databend Cloud: signing in, with no click, opened the restored connection and read its inventory twice,
+// which resumes and bills a suspended warehouse. A connection the page made active by itself, whose provider declares
+// `resumesBilledCompute`, now reads nothing past its declaration until the person uses it: picks it, loads its
+// objects, or sends it a statement. `/api/db/provider-meta` opens no connection, so it still runs.
+describe("a restore of a connection whose requests resume billed compute", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    restoreGlobalFetch();
+  });
+
+  const BILLED_ID = "billed";
+  const billed = makeConnection({ id: BILLED_ID, name: "Cloud", type: "databend", port: 443 });
+  const plain = makeConnection({ id: "plain", name: "Local" });
+
+  /** The declaration read: the billed connection declares the capability, any other does not. */
+  const declaration = (gate?: Promise<void>) => async (req: Request) => {
+    const body = (await req.json()) as { connection?: { id?: string } };
+    await gate;
+    const capabilities = {
+      queryLanguage: "sql",
+      containerLevels: [{ id: "schema" }],
+      objectKinds: PG_OBJECT_KINDS,
+      ...(body.connection?.id === BILLED_ID ? { resumesBilledCompute: true } : {}),
+    };
+    return { ok: true, json: { capabilities, labels: {} } };
+  };
+
+  const install = (gate?: Promise<void>) =>
+    mockGlobalFetch({
+      "/api/db/provider-meta": declaration(gate),
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS),
+    });
+
+  const pathsOf = (fetchMock: ReturnType<typeof mockGlobalFetch>, prefix: string): string[] =>
+    fetchMock.mock.calls
+      .map((call) => new URL(String(call[0]), "http://localhost:3000").pathname)
+      .filter((path) => path.startsWith(prefix));
+
+  /** Sign in with `stored` saved and `active` the connection open last time, then the read Studio's effect asks for. */
+  const restore = async (fetchMock: ReturnType<typeof mockGlobalFetch>, active: DatabaseConnection) => {
+    storage.saveConnection(billed);
+    storage.saveConnection(plain);
+    storage.setActiveConnectionId(active.id);
+    const hook = renderHook(() => useConnectionManager(true));
+    await waitFor(() => expect(hook.result.current.activeConnection?.id).toBe(active.id));
+    await act(async () => {
+      await hook.result.current.fetchSchema(hook.result.current.activeConnection!);
+    });
+    expect(pathsOf(fetchMock, "/api/db/provider-meta").length).toBeGreaterThan(0);
+    return hook;
+  };
+
+  test("a restored connection that resumes billed compute reads nothing past its declaration", async () => {
+    const fetchMock = install();
+
+    const { result } = await restore(fetchMock, billed);
+
+    expect(pathsOf(fetchMock, "/api/db/objects")).toEqual([]);
+    expect(result.current.activeAwaitsUse).toBe(true);
+    expect(result.current.schema).toEqual([]);
+    expect(result.current.schemaError).toBeNull();
+    expect(result.current.isLoadingSchema).toBe(false);
+  });
+
+  test("control: a restored connection whose provider bills nothing per request is read as before", async () => {
+    const fetchMock = install();
+
+    const { result } = await restore(fetchMock, plain);
+
+    expect(pathsOf(fetchMock, "/api/db/objects")).toEqual(["/api/db/objects/inventory"]);
+    expect(result.current.schema.map((table) => table.name)).toEqual(["users", "orders"]);
+    expect(result.current.activeAwaitsUse).toBe(true);
+  });
+
+  test("picking the restored connection again reads what the restore held, once", async () => {
+    const fetchMock = install();
+    const { result } = await restore(fetchMock, billed);
+
+    await act(async () => {
+      result.current.setActiveConnection(result.current.activeConnection);
+    });
+
+    await waitFor(() => expect(result.current.schema.map((table) => table.name)).toEqual(["users", "orders"]));
+    expect(pathsOf(fetchMock, "/api/db/objects")).toEqual(["/api/db/objects/inventory"]);
+    expect(result.current.activeAwaitsUse).toBe(false);
+
+    // Picked again, it has been read: nothing more is sent.
+    await act(async () => {
+      result.current.setActiveConnection(result.current.activeConnection);
+    });
+    expect(pathsOf(fetchMock, "/api/db/objects")).toEqual(["/api/db/objects/inventory"]);
+  });
+
+  test("loading its objects reads what the restore held", async () => {
+    const fetchMock = install();
+    const { result } = await restore(fetchMock, billed);
+
+    await act(async () => {
+      result.current.loadObjects();
+    });
+
+    await waitFor(() => expect(result.current.schema.map((table) => table.name)).toEqual(["users", "orders"]));
+    expect(result.current.activeAwaitsUse).toBe(false);
+  });
+
+  test("a statement sent to it reads what the restore held, and a second one reads nothing more", async () => {
+    const fetchMock = install();
+    const { result } = await restore(fetchMock, billed);
+
+    await act(async () => {
+      result.current.markActiveUsed();
+    });
+
+    await waitFor(() => expect(result.current.schema.map((table) => table.name)).toEqual(["users", "orders"]));
+    expect(result.current.activeAwaitsUse).toBe(false);
+    await act(async () => {
+      result.current.markActiveUsed();
+    });
+    expect(pathsOf(fetchMock, "/api/db/objects")).toEqual(["/api/db/objects/inventory"]);
+  });
+
+  test("a connection the person picks is read at once, though it resumes billed compute", async () => {
+    const fetchMock = install();
+    const { result } = await restore(fetchMock, plain);
+
+    await act(async () => {
+      result.current.setActiveConnection(billed);
+    });
+    await act(async () => {
+      await result.current.fetchSchema(billed);
+    });
+
+    expect(pathsOf(fetchMock, "/api/db/objects")).toEqual(["/api/db/objects/inventory", "/api/db/objects/inventory"]);
+    expect(result.current.activeAwaitsUse).toBe(false);
+  });
+
+  // The person can pick the connection while its declaration is still being read: that read then reads on, and the
+  // pick sends no second one.
+  test("a pick made while the declaration is being read is honoured by that read", async () => {
+    let open: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    storage.saveConnection(billed);
+    storage.setActiveConnectionId(BILLED_ID);
+    const fetchMock = install(gate);
+    const { result } = renderHook(() => useConnectionManager(true));
+    await waitFor(() => expect(result.current.activeConnection?.id).toBe(BILLED_ID));
+
+    let read: Promise<void> = Promise.resolve();
+    act(() => {
+      read = result.current.fetchSchema(result.current.activeConnection!);
+    });
+    await act(async () => {
+      result.current.setActiveConnection(result.current.activeConnection);
+    });
+    await act(async () => {
+      open();
+      await read;
+    });
+
+    expect(pathsOf(fetchMock, "/api/db/objects")).toEqual(["/api/db/objects/inventory"]);
+    expect(result.current.schema.map((table) => table.name)).toEqual(["users", "orders"]);
+  });
+
+  // D31: nothing read for this connection may stay on screen as its objects.
+  test("a held read drops the objects of the connection read before it", async () => {
+    const { result } = await restore(install(), plain);
+    expect(result.current.schema).toHaveLength(2);
+
+    await act(async () => {
+      await result.current.fetchSchema(billed);
+    });
+
+    expect(result.current.schema).toEqual([]);
+    expect(result.current.schemaContext).toBe("[]");
+  });
+
+  // Deleting the open connection makes the first one left active. The page chose it, not the person, so it is held as a
+  // restored one is, though the person used the one they deleted; picking it reads it.
+  test("the connection a delete falls back to is held, though the person used the deleted one", async () => {
+    const fetchMock = install();
+    const { result } = await restore(fetchMock, plain);
+    await act(async () => {
+      result.current.setActiveConnection(result.current.activeConnection);
+    });
+    expect(result.current.activeAwaitsUse).toBe(false);
+
+    await act(async () => {
+      result.current.activateFallback(billed);
+    });
+    await act(async () => {
+      await result.current.fetchSchema(result.current.activeConnection!);
+    });
+
+    expect(result.current.activeConnection?.id).toBe(BILLED_ID);
+    expect(result.current.activeAwaitsUse).toBe(true);
+    expect(pathsOf(fetchMock, "/api/db/objects")).toEqual(["/api/db/objects/inventory"]);
+    expect(result.current.schema).toEqual([]);
+
+    await act(async () => {
+      result.current.setActiveConnection(result.current.activeConnection);
+    });
+
+    await waitFor(() => expect(result.current.schema.map((table) => table.name)).toEqual(["users", "orders"]));
+    expect(result.current.activeAwaitsUse).toBe(false);
+  });
+
+  test("nothing is held, and nothing is marked used, with no active connection", async () => {
+    const fetchMock = install();
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      result.current.markActiveUsed();
+    });
+
+    expect(result.current.activeAwaitsUse).toBe(false);
+    expect(pathsOf(fetchMock, "/api/db/objects")).toEqual([]);
+  });
+});
+
+// =============================================================================
+// The object surface's kinds and paths (#789, Task 25c)
+// =============================================================================
+//
+// Every consumer filter Task 25a wrote reads `kind`, and the flat schema reading carries
+// none, so until this hook asks the object surface for one the filters keep everything and
+// the behaviour is byte-identical to the flat model. These tests are what make the
+// difference observable: each one names the object that must NOT survive a filter, and the
+// mutation that removes the tagging turns them red.
+//
+// The inventory fake below answers the way the ROUTE answers, kinds filter included, rather
+// than replaying one fixed list. `resolveKinds` in `src/lib/api/object-route.ts` returns
+// EVERY enumerable kind when the body names none, so a fake that ignored the field would be
+// green for a request that asks for all seven kinds and for one that asks for three, which
+// is exactly the difference the fix round exists to make.
+describe("the object inventory the explorer reads", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    // A sibling describe inherits no beforeEach, and a toast left over from the block above
+    // would make the "no toast" assertion below report another test's call.
+    mockToastError.mockClear();
+  });
+
+  afterEach(() => {
+    restoreGlobalFetch();
+  });
+
+  /** Catalog and metadata requests, in order, by path. */
+  const requestPaths = (fetchMock: ReturnType<typeof mockGlobalFetch>): string[] =>
+    fetchMock.mock.calls
+      .map((call) => new URL(String(call[0]), "http://localhost:3000").pathname)
+      .filter((path) => path.startsWith("/api/db/objects") || path.startsWith("/api/db/provider-meta"));
+
+  /*
+    THE INVENTORY IS ASKED FOR RELATION KINDS ONLY.
+
+    Measured on the live MySQL 26.7.0 container rather than invented, because standing
+    ruling 3 already records that a table, a procedure, a function, a trigger and an event
+    called `foo` coexist in one MySQL database. Asking for every declared kind would put
+    four objects this list cannot render beside the one it can, and each one costs a
+    sequential `listObjects` round trip per container inside the route.
+  */
+  test("the inventory names the relation kinds, so the fan-out is three listings per container and not seven", async () => {
+    const bodies: { kinds?: string[] }[] = [];
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS, bodies),
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].kinds).toEqual(PG_RELATION_KINDS);
+    // Derived from the declaration rather than restated: a hardcoded list here would pass
+    // while the hook asked for something else entirely.
+    expect(PG_RELATION_KINDS).toEqual(
+      PG_OBJECT_KINDS.filter((kind) => kind.role === "relation").map((kind) => kind.id),
+    );
+  });
+
+  test("a routine declared beside a relation is never asked for", async () => {
+    const bodies: { kinds?: string[] }[] = [];
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(MYSQL_OBJECT_KINDS),
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS, bodies, {}, MYSQL_OBJECT_KINDS),
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(bodies[0].kinds).toEqual(["table", "view"]);
+  });
+
+  test("an engine whose capabilities cannot be read is not asked for an inventory at all", async () => {
+    const fetchMock = mockGlobalFetch({
+      "/api/db/provider-meta": { ok: false, status: 503, json: { error: "Connection refused" } },
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS),
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    // Asking for every kind is the defect the kind filter exists to prevent, so with no
+    // declaration the request is not sent rather than sent unfiltered.
+    expect(requestPaths(fetchMock)).toEqual(["/api/db/provider-meta"]);
+  });
+
+  test("an S3 connection declares no relation kind, so its schema holds no bucket for the editor's completion", async () => {
+    const fetchMock = mockGlobalFetch({
+      "/api/db/provider-meta": {
+        ok: true,
+        json: { capabilities: { queryLanguage: "json", queryDialect: "s3", objectKinds: S3_OBJECT_KINDS }, labels: {} },
+      },
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS),
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection({ type: "s3", port: 9000, database: "" }));
+    });
+
+    expect(requestPaths(fetchMock)).toEqual(["/api/db/provider-meta"]);
+    expect(result.current.schema).toEqual([]);
+    expect(result.current.schemaContext).toBe("[]");
+    expect(s3CompletionBucketsOf(JSON.parse(result.current.schemaContext))).toEqual([]);
+  });
+
+  test("the inventory is addressed the way the object routes require, never as a bare body", async () => {
+    // `/api/db/objects/*` refuses a body that names neither `connection` nor `connectionId`
+    // with a 400, so a request built as a bare connection object would be refused on every
+    // connection.
+    const bodies: unknown[] = [];
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": async (req: Request) => {
+        bodies.push(await req.json());
+        return { ok: true, json: { objects: OBJECTS, details: DETAILS } };
+      },
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    const conn = makeConnection();
+    await act(async () => {
+      await result.current.fetchSchema(conn);
+    });
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection({ id: "seeded", managed: true, seedId: "sample" }));
+    });
+
+    expect(bodies).toEqual([
+      // `createdAt` arrives as the ISO string JSON carries, not as the Date the caller held.
+      {
+        connection: { ...conn, createdAt: conn.createdAt.toISOString() },
+        kinds: PG_RELATION_KINDS,
+        includeColumns: true,
+      },
+      { connectionId: "seed:sample", kinds: PG_RELATION_KINDS, includeColumns: true },
+    ]);
+  });
+
+  // ---------------------------------------------------------------------------
+  // A connection switch mid-read (review Minor 8)
+  // ---------------------------------------------------------------------------
+  //
+  // A read used to write the schema under whichever connection was on screen when its
+  // answer landed. Connection A's objects under connection B's name tag nothing where the
+  // names differ and tag WRONGLY where they coincide, and `rowWritableObjects` then offers
+  // an import into a view on the strength of a declaration about A.
+  test("a connection switch mid-read leaves the newer connection's list alone", async () => {
+    // Both connections hold an object called `orders`, which is what makes a stale write
+    // VISIBLE rather than merely wasted: on A it is a table and on B it is a view.
+    let releaseFirstInventory: (() => void) | null = null;
+    const firstInventory = new Promise<void>((resolve) => {
+      releaseFirstInventory = resolve;
+    });
+    let inventoryCalls = 0;
+
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": async () => {
+        inventoryCalls += 1;
+        if (inventoryCalls === 1) {
+          await firstInventory;
+          return { ok: true, json: { objects: [{ name: "orders", kind: "table", path: ["public", "orders"] }] } };
+        }
+        return { ok: true, json: { objects: [{ name: "orders", kind: "view", path: ["public", "orders"] }] } };
+      },
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    let first: Promise<void> = Promise.resolve();
+    await act(async () => {
+      first = result.current.fetchSchema(makeConnection({ id: "conn-a" }));
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection({ id: "conn-b", name: "B" }));
+    });
+    expect(result.current.schema.map((object) => [object.name, object.kind])).toEqual([["orders", "view"]]);
+
+    await act(async () => {
+      releaseFirstInventory?.();
+      await first;
+    });
+
+    // A's answer landed after B's whole read. B's view stays a view.
+    expect(result.current.schema.map((object) => [object.name, object.kind])).toEqual([["orders", "view"]]);
+
+    const capabilities = {
+      queryLanguage: "sql",
+      objectKinds: [
+        { id: "table", role: "relation", label: "Table", labelPlural: "Tables", acceptsRowWrites: true },
+        { id: "view", role: "relation", label: "View", labelPlural: "Views" },
+      ],
+    } as unknown as ProviderCapabilities;
+    expect(rowWritableObjects(result.current.schema, capabilities)).toEqual([]);
+  });
+
+  test("a superseded read does not report the newer one as finished", async () => {
+    let releaseFirst: (() => void) | null = null;
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let calls = 0;
+
+    let releaseSecond: (() => void) | null = null;
+    const secondGate = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": async () => {
+        calls += 1;
+        await (calls === 1 ? gate : secondGate);
+        return { ok: true, json: { objects: OBJECTS, details: DETAILS } };
+      },
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    let first: Promise<void> = Promise.resolve();
+    await act(async () => {
+      first = result.current.fetchSchema(makeConnection({ id: "conn-a" }));
+      await Promise.resolve();
+    });
+
+    let second: Promise<void> = Promise.resolve();
+    await act(async () => {
+      second = result.current.fetchSchema(makeConnection({ id: "conn-b" }));
+      await Promise.resolve();
+    });
+    expect(result.current.isLoadingSchema).toBe(true);
+
+    // The superseded read finishes first. It owns no flag, so the newer read is still
+    // reported as in flight.
+    await act(async () => {
+      releaseFirst?.();
+      await first;
+    });
+    expect(result.current.isLoadingSchema).toBe(true);
+
+    await act(async () => {
+      releaseSecond?.();
+      await second;
+    });
+    expect(result.current.isLoadingSchema).toBe(false);
+  });
+
+  test("moving to a deferred connection stops reporting the superseded read as in flight", async () => {
+    let releaseFirst: (() => void) | null = null;
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": async () => {
+        await gate;
+        return { ok: true, json: { objects: OBJECTS, details: DETAILS } };
+      },
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    let first: Promise<void> = Promise.resolve();
+    await act(async () => {
+      first = result.current.fetchSchema(makeConnection({ id: "conn-a" }));
+      await Promise.resolve();
+    });
+    expect(result.current.isLoadingSchema).toBe(true);
+
+    // The deferred connection issues no request, so it is the only party that can clear the
+    // flag: the read it superseded asks whether it is still current and it is not.
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection({ id: "conn-b", skipObjectScan: true }));
+    });
+    expect(result.current.isLoadingSchema).toBe(false);
+
+    await act(async () => {
+      releaseFirst?.();
+      await first;
+    });
+    expect(result.current.isLoadingSchema).toBe(false);
+    expect(result.current.schema).toEqual([]);
+  });
+
+  test("a failed read for the connection left behind reports nothing under the new one", async () => {
+    let releaseFirst: (() => void) | null = null;
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let calls = 0;
+
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMeta(),
+      "/api/db/objects/inventory": async () => {
+        calls += 1;
+        if (calls === 1) {
+          await gate;
+          return { ok: false, status: 500, json: { error: "Connection refused" } };
+        }
+        return { ok: true, json: { objects: OBJECTS, details: DETAILS } };
+      },
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    let first: Promise<void> = Promise.resolve();
+    await act(async () => {
+      first = result.current.fetchSchema(makeConnection({ id: "conn-a" }));
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection({ id: "conn-b" }));
+    });
+
+    await act(async () => {
+      releaseFirst?.();
+      await first;
+    });
+
+    // The failure belongs to a connection nobody is looking at. Naming it would blame the
+    // current connection for a read never issued against it.
+    expect(result.current.schema.map((object) => object.name)).toEqual(["users", "orders"]);
+    expect(result.current.schemaError).toBeNull();
+    expect(mockToastError).not.toHaveBeenCalled();
+  });
+});
+
+// =============================================================================
+// Scoping the connect-time read to the session default on a two-level engine (#1402)
+// =============================================================================
+//
+// Left to `/api/db/objects/inventory`'s own enumeration, a two-level engine (catalog → schema)
+// is walked whole on every connect: one listing per schema of every catalog. The hook instead
+// makes one cheap top-level listing first and, when it marks a session default, a second
+// listing scoped to that one catalog - the explicit `containers` it then hands the inventory
+// route. A single-level engine (postgres, used everywhere else in this file) has nothing to
+// scope and never makes either request, which the bodies/paths assertions below also cover.
+describe("scoping the connect-time read to the session default", () => {
+  afterEach(() => {
+    restoreGlobalFetch();
+  });
+
+  const providerMetaTwoLevel = () => ({
+    ok: true,
+    json: {
+      capabilities: {
+        queryLanguage: "sql",
+        containerLevels: [{ id: "catalog" }, { id: "schema" }],
+        objectKinds: PG_OBJECT_KINDS,
+      },
+      labels: {},
+    },
+  });
+
+  /** `/api/db/objects/containers`: the top level with no `parent`, a level's children otherwise. */
+  const containersRoute =
+    (
+      topLevel: { path: string[]; isSessionDefault?: boolean }[],
+      children: Record<string, { path: string[]; isSessionDefault?: boolean }[]> = {},
+    ) =>
+    async (req: Request) => {
+      const body = (await req.json()) as { parent?: string[] };
+      if (body.parent === undefined) return { ok: true, json: topLevel };
+      return { ok: true, json: children[JSON.stringify(body.parent)] ?? [] };
+    };
+
+  test("scopes to the pinned catalog's schemas when the top level marks a default", async () => {
+    const bodies: { kinds?: string[] }[] = [];
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMetaTwoLevel(),
+      "/api/db/objects/containers": containersRoute(
+        [{ path: ["memory"], isSessionDefault: true }, { path: ["tpch"] }],
+        {
+          '["memory"]': [{ path: ["memory", "default"], isSessionDefault: true }, { path: ["memory", "app"] }],
+        },
+      ),
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS, bodies),
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(bodies[0]).toMatchObject({
+      containers: [
+        ["memory", "default"],
+        ["memory", "app"],
+      ],
+    });
+    // `tpch`, the other catalog, was never descended into - no listing for it was made.
+    expect(result.current.defaultContainer).toEqual(["memory", "default"]);
+  });
+
+  test("declines a default schema on a tie, same as the unscoped route would (#1592)", async () => {
+    const bodies: { kinds?: string[] }[] = [];
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMetaTwoLevel(),
+      "/api/db/objects/containers": containersRoute([{ path: ["memory"], isSessionDefault: true }], {
+        '["memory"]': [
+          { path: ["memory", "default"], isSessionDefault: true },
+          { path: ["memory", "app"], isSessionDefault: true },
+        ],
+      }),
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS, bodies),
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(bodies[0]).toMatchObject({
+      containers: [
+        ["memory", "default"],
+        ["memory", "app"],
+      ],
+    });
+    expect(result.current.defaultContainer).toBeUndefined();
+  });
+
+  test("falls back to the route's own enumeration when nothing is pinned", async () => {
+    const bodies: { kinds?: string[] }[] = [];
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMetaTwoLevel(),
+      "/api/db/objects/containers": containersRoute([{ path: ["memory"] }, { path: ["tpch"] }]),
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS, bodies),
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(bodies[0]).not.toHaveProperty("containers");
+  });
+
+  test("falls back to the route's own enumeration when the pinned catalog has no schemas of its own", async () => {
+    const bodies: { kinds?: string[] }[] = [];
+    mockGlobalFetch({
+      "/api/db/provider-meta": providerMetaTwoLevel(),
+      "/api/db/objects/containers": containersRoute([{ path: ["empty"], isSessionDefault: true }], {
+        '["empty"]': [],
+      }),
+      "/api/db/objects/inventory": inventoryRoute(OBJECTS, bodies),
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    expect(bodies[0]).not.toHaveProperty("containers");
+  });
+
+  test("a single-level engine never calls the containers route at all", async () => {
+    const fetchMock = mockGlobalFetch(catalogRoutes());
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+
+    const paths = fetchMock.mock.calls.map((call) => new URL(String(call[0]), "http://localhost:3000").pathname);
+    expect(paths).not.toContain("/api/db/objects/containers");
+  });
+});
+
+// =============================================================================
+// ALLOW_CUSTOM_CONNECTIONS: what the editor lists and makes active
+// =============================================================================
+//
+// The server refuses a connection of the user's own while custom connections are off, so the
+// hook lists only what the server opens and never makes anything else active. Seeds stay,
+// the editable copy of an unmanaged seed included, because its id is still `seed:<id>`.
+describe("the custom connections policy", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    restoreGlobalFetch();
+  });
+
+  const managedSeed = {
+    id: "seed:orders",
+    seedId: "orders",
+    name: "Orders",
+    type: "postgres",
+    host: "orders-db",
+    createdAt: "2026-10-01T00:00:00.000Z",
+    managed: true,
+  };
+  const editableSeed = {
+    id: "seed:sandbox",
+    seedId: "sandbox",
+    name: "Sandbox",
+    type: "postgres",
+    host: "sandbox-db",
+    createdAt: "2026-10-01T00:00:00.000Z",
+    managed: false,
+  };
+  const own = makeConnection({ id: "own-1", name: "My own", host: "anywhere.example" });
+
+  const routes = (policy: { status?: number; json: unknown }) => ({
+    "/api/connections/policy": policy,
+    "/api/connections/managed": { json: { connections: [managedSeed, editableSeed] } },
+    "/api/db/health": { json: { status: "healthy" } },
+  });
+
+  test("a server that refuses custom connections lists the seeds only, the editable one included", async () => {
+    storage.saveConnection(own);
+    mockGlobalFetch(routes({ json: { customConnections: false } }));
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await waitFor(() => {
+      expect(result.current.connections.map((c) => c.id)).toEqual(["seed:orders", "seed:sandbox"]);
+    });
+    expect(result.current.customConnections).toBe(false);
+    expect(storage.getConnections().some((c) => c.id === "own-1")).toBe(true);
+  });
+
+  test("the first active connection is one the server will open, whatever was saved", async () => {
+    storage.saveConnection(own);
+    storage.setActiveConnectionId("own-1");
+    mockGlobalFetch(routes({ json: { customConnections: false } }));
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await waitFor(() => {
+      expect(result.current.activeConnection?.id).toBe("seed:orders");
+    });
+  });
+
+  test("without the managed list, the stored connections obey the policy too", async () => {
+    storage.saveConnection(own);
+    storage.saveConnection(
+      makeConnection({ id: "seed:sandbox", seedId: "sandbox", name: "Sandbox copy", managed: false }),
+    );
+    mockGlobalFetch({
+      "/api/connections/policy": { json: { customConnections: false } },
+      "/api/connections/managed": { status: 404, json: { error: "Not found" } },
+      "/api/db/health": { json: { status: "healthy" } },
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await waitFor(() => {
+      expect(result.current.activeConnection?.id).toBe("seed:sandbox");
+    });
+    expect(result.current.connections.map((c) => c.id)).toEqual(["seed:sandbox"]);
+  });
+
+  test("a refused connection made active later is reported as none", async () => {
+    storage.saveConnection(own);
+    mockGlobalFetch(routes({ json: { customConnections: false } }));
+
+    const { result } = renderHook(() => useConnectionManager(true));
+    await waitFor(() => {
+      expect(result.current.activeConnection?.id).toBe("seed:orders");
+    });
+
+    act(() => {
+      result.current.setActiveConnection(own);
+    });
+
+    expect(result.current.activeConnection).toBeNull();
+    expect(result.current.objectScanDeferred).toBe(false);
+  });
+
+  test("a server that allows them lists every connection, as before", async () => {
+    storage.saveConnection(own);
+    mockGlobalFetch(routes({ json: { customConnections: true } }));
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await waitFor(() => {
+      expect(result.current.connections.map((c) => c.id)).toEqual(["seed:orders", "seed:sandbox", "own-1"]);
+    });
+    expect(result.current.customConnections).toBe(true);
+  });
+
+  // An operator who switches custom connections off on a Studio whose users already saved
+  // connections of their own hides those connections and refuses them, and deletes nothing: their
+  // records, and the favorite, order and group entries that name them, are still in storage after
+  // a load under the refusal, and the first load after the switch is back on lists them again and
+  // opens one when it is chosen. The load may add the unmanaged seed's editable copy and move the
+  // saved active id to a seed, as it does with the switch on; nothing that belongs to the user's
+  // own connections changes.
+  test("switched off, the user's stored connections are hidden and refused but never deleted, and switched back on they are listed again", async () => {
+    const second = makeConnection({ id: "own-2", name: "My second", host: "elsewhere.example" });
+    storage.saveConnection(own);
+    storage.saveConnection(second);
+    storage.setActiveConnectionId("own-1");
+    storage.toggleFavoriteConnection("own-1");
+    storage.setConnectionOrder(["own-2", "own-1"]);
+    storage.setConnectionGroups([{ id: "group-1", name: "Mine", collapsed: false, connectionIds: ["own-2"] }]);
+    const storedOwn = storage.getConnections();
+    const expectOwnStateKept = () => {
+      expect(storage.getConnections().filter((c) => !c.id.startsWith("seed:"))).toEqual(storedOwn);
+      expect(storage.getFavoriteConnectionIds()).toEqual(["own-1"]);
+      expect(storage.getConnectionOrder()).toEqual(["own-2", "own-1"]);
+      expect(storage.getConnectionGroups()).toEqual([
+        { id: "group-1", name: "Mine", collapsed: false, connectionIds: ["own-2"] },
+      ]);
+    };
+
+    mockGlobalFetch(routes({ json: { customConnections: false } }));
+    const switchedOff = renderHook(() => useConnectionManager(true));
+    await waitFor(() => {
+      expect(switchedOff.result.current.activeConnection?.id).toBe("seed:orders");
+    });
+    expect(switchedOff.result.current.connections.map((c) => c.id)).toEqual(["seed:orders", "seed:sandbox"]);
+    await act(async () => {
+      switchedOff.result.current.setActiveConnection(second);
+    });
+    expect(switchedOff.result.current.activeConnection).toBeNull();
+    expectOwnStateKept();
+    switchedOff.unmount();
+    restoreGlobalFetch();
+
+    mockGlobalFetch(routes({ json: { customConnections: true } }));
+    const switchedOn = renderHook(() => useConnectionManager(true));
+    await waitFor(() => {
+      expect(switchedOn.result.current.connections.map((c) => c.id)).toEqual([
+        "seed:orders",
+        "seed:sandbox",
+        "own-1",
+        "own-2",
+      ]);
+    });
+    await act(async () => {
+      switchedOn.result.current.setActiveConnection(second);
+    });
+    expect(switchedOn.result.current.activeConnection?.id).toBe("own-2");
+    expect(switchedOn.result.current.customConnections).toBe(true);
+    expectOwnStateKept();
+  });
+
+  test("the policy is read once per mount", async () => {
+    const fetchMock = mockGlobalFetch(routes({ json: { customConnections: false } }));
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await waitFor(() => {
+      expect(result.current.customConnections).toBe(false);
+    });
+    await waitFor(() => {
+      expect(result.current.activeConnection?.id).toBe("seed:orders");
+    });
+    expect(fetchMock.mock.calls.filter((call) => String(call[0]).includes("/api/connections/policy"))).toHaveLength(1);
+  });
+});
+
+// The managed route under governance (docs/GOVERNANCE.md): an outage answers 503
+// GOVERNANCE_UNAVAILABLE, which the hook reports as a state of its own rather than as an empty list.
+describe("connection access under governance", () => {
+  const governedSeed = {
+    id: "seed:orders",
+    seedId: "orders",
+    name: "Orders",
+    type: "postgres",
+    host: "orders-db",
+    createdAt: "2026-10-01T00:00:00.000Z",
+    managed: true,
+  };
+  const unavailable = {
+    status: 503,
+    json: { error: "Connection access is temporarily unavailable", code: "GOVERNANCE_UNAVAILABLE" },
+  };
+  const governedPolicy = { json: { customConnections: false, governance: true } };
+  const focus = () => {
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+  };
+  const managedCalls = (fetchMock: ReturnType<typeof mockGlobalFetch>) =>
+    fetchMock.mock.calls.filter((c) => String(c[0]).includes("/api/connections/managed")).length;
+
+  beforeEach(() => {
+    localStorage.clear();
+    process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS = "60000";
+  });
+
+  afterEach(() => {
+    restoreGlobalFetch();
+    delete process.env.NEXT_PUBLIC_MANAGED_REFRESH_FLOOR_MS;
+  });
+
+  test("a 503 GOVERNANCE_UNAVAILABLE from the managed route sets the unavailable state", async () => {
+    let calls = 0;
+    const fetchMock = mockGlobalFetch({
+      "/api/connections/policy": governedPolicy,
+      "/api/connections/managed": () => {
+        calls += 1;
+        return calls === 1 ? unavailable : { json: { connections: [governedSeed] } };
+      },
+      "/api/db/health": { json: { status: "healthy" } },
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+
+    await waitFor(() => {
+      expect(result.current.connectionAccessUnavailable).toBe(true);
+    });
+    expect(result.current.governance).toBe(true);
+    expect(result.current.connections).toEqual([]);
+    expect(result.current.activeConnection).toBeNull();
+
+    // The outage keeps the refresh listening, so the list comes back without a reload.
+    focus();
+    await waitFor(() => {
+      expect(result.current.connections.map((c) => c.id)).toEqual(["seed:orders"]);
+    });
+    expect(result.current.connectionAccessUnavailable).toBe(false);
+    expect(result.current.activeConnection?.id).toBe("seed:orders");
+    expect(managedCalls(fetchMock)).toBe(2);
+  });
+
+  test("an outage during a refresh keeps the list and sets the unavailable state", async () => {
+    let calls = 0;
+    const fetchMock = mockGlobalFetch({
+      "/api/connections/policy": governedPolicy,
+      "/api/connections/managed": () => {
+        calls += 1;
+        return calls === 1 ? { json: { connections: [governedSeed] } } : unavailable;
+      },
+      "/api/db/health": { json: { status: "healthy" } },
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+    await waitFor(() => {
+      expect(result.current.connections.map((c) => c.id)).toEqual(["seed:orders"]);
+    });
+    expect(result.current.connectionAccessUnavailable).toBe(false);
+    const before = result.current.connections;
+
+    focus();
+    await waitFor(() => {
+      expect(result.current.connectionAccessUnavailable).toBe(true);
+    });
+    expect(managedCalls(fetchMock)).toBe(2);
+    expect(result.current.connections).toBe(before);
+  });
+
+  test("without governance a 503 is an unanswered list, as before, and no unavailable state", async () => {
+    const fetchMock = mockGlobalFetch({
+      "/api/connections/policy": { json: { customConnections: true } },
+      "/api/connections/managed": { status: 503, json: { error: "Service unavailable" } },
+      "/api/db/health": { json: { status: "healthy" } },
+    });
+
+    const { result } = renderHook(() => useConnectionManager(true));
+    await waitFor(() => {
+      expect(managedCalls(fetchMock)).toBe(1);
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    expect(result.current.governance).toBe(false);
+    expect(result.current.connectionAccessUnavailable).toBe(false);
+    // An unanswered first load starts no refresh, as before.
+    focus();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(managedCalls(fetchMock)).toBe(1);
+  });
+});
+
+// =============================================================================
+// A server-level connection reads one database (#1530)
+// =============================================================================
+describe("useConnectionManager on a server-level connection (#1530)", () => {
+  const SERVER = makeConnection({ id: "srv-1", name: "Server", database: "" });
+  const serverMeta = {
+    ok: true,
+    json: {
+      capabilities: {
+        queryLanguage: "sql",
+        catalogSessions: true,
+        containerLevels: [{ id: "catalog" }, { id: "schema" }],
+        objectKinds: PG_OBJECT_KINDS,
+      },
+      labels: {},
+    },
+  };
+  const databases = (...names: string[]) => ({ ok: true, json: names.map((name) => ({ path: [name], name })) });
+  const publicOf = (parent: string[]): MockFetchResponse => ({
+    ok: true,
+    json: [{ path: [...parent, "public"], name: "public", isSessionDefault: true }],
+  });
+  // The databases for no `parent`, one database's schemas under one.
+  const routes = (
+    containers: MockFetchResponse,
+    bodies: { containers?: string[][] }[] = [],
+    schemas: (parent: string[]) => MockFetchResponse = publicOf,
+  ) => ({
+    "/api/db/health": { ok: true, json: { status: "healthy" } },
+    "/api/db/provider-meta": serverMeta,
+    "/api/db/objects/containers": async (req: Request) => {
+      const { parent } = (await req.json()) as { parent?: string[] };
+      return parent === undefined ? containers : schemas(parent);
+    },
+    "/api/db/objects/inventory": inventoryRoute(OBJECTS, bodies as { kinds?: string[] }[]),
+  });
+
+  beforeEach(() => {
+    localStorage.clear();
+    storage.saveConnection(SERVER);
+    storage.setActiveConnectionId(SERVER.id);
+  });
+
+  afterEach(() => {
+    restoreGlobalFetch();
+  });
+
+  async function readSchema(hook: { current: ReturnType<typeof useConnectionManager> }) {
+    await waitFor(() => expect(hook.current.activeConnection?.id).toBe(SERVER.id));
+    await act(async () => {
+      await hook.current.fetchSchema(hook.current.activeConnection!);
+    });
+  }
+
+  test("reads the remembered database while listed, else the first, and a new choice is remembered", async () => {
+    const bodies: { containers?: string[][] }[] = [];
+    mockGlobalFetch(routes(databases("analytics", "shop"), bodies));
+    storage.setActiveCatalog(SERVER.id, "shop");
+    const { result } = renderHook(() => useConnectionManager(true));
+    await readSchema(result);
+    expect(result.current.activeCatalog).toBe("shop");
+    expect(bodies.at(-1)?.containers).toEqual([["shop", "public"]]);
+    expect(result.current.defaultContainer).toEqual(["shop", "public"]);
+
+    storage.setActiveCatalog(SERVER.id, "dropped_since");
+    await readSchema(result);
+    expect(result.current.activeCatalog).toBe("analytics");
+
+    act(() => result.current.setActiveCatalog("shop"));
+    await waitFor(() => expect(bodies.at(-1)?.containers).toEqual([["shop", "public"]]));
+    expect(storage.getActiveCatalog(SERVER.id)).toBe("shop");
+  });
+
+  test("no database to open holds no objects, and a refused list is the schema error", async () => {
+    mockGlobalFetch(routes(databases()));
+    const { result } = renderHook(() => useConnectionManager(true));
+    await readSchema(result);
+    expect(result.current.activeCatalog).toBeUndefined();
+    expect(result.current.schemaError).toBeNull();
+
+    mockGlobalFetch(routes({ ok: false, status: 503, json: { error: "the server is unreachable" } }));
+    await readSchema(result);
+    expect(result.current.schemaError).toBe("the server is unreachable");
+    mockGlobalFetch(routes({ ok: false, status: 500, text: "not json" }));
+    await readSchema(result);
+    expect(result.current.schemaError).toBe("Failed to list the server's databases");
+
+    // A database with no schema holds no objects; its schemas refused is the schema error.
+    mockGlobalFetch(routes(databases("empty"), [], () => ({ ok: true, json: [] })));
+    await readSchema(result);
+    expect(result.current.schema).toEqual([]);
+    expect(result.current.schemaError).toBeNull();
+    mockGlobalFetch(routes(databases("shop"), [], () => ({ ok: false, status: 500, text: "not json" })));
+    await readSchema(result);
+    expect(result.current.schemaError).toBe("Failed to list the database's schemas");
+  });
+
+  test("a connection naming its own database lists none, and a choice with no connection does nothing", async () => {
+    localStorage.clear();
+    mockGlobalFetch({ ...catalogRoutes(), "/api/db/health": { ok: true, json: { status: "healthy" } } });
+    const { result } = renderHook(() => useConnectionManager(true));
+    act(() => result.current.setActiveCatalog("shop"));
+    await act(async () => {
+      await result.current.fetchSchema(makeConnection());
+    });
+    expect(result.current.activeCatalog).toBeUndefined();
+    expect(storage.getActiveCatalog("conn-1")).toBeNull();
   });
 });

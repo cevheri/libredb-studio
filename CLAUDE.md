@@ -6,13 +6,14 @@ Guidance for Claude Code in this repo — conventions, rules, and gotchas only. 
 
 ## Project Overview
 
-Web-based SQL IDE for cloud-native teams: 17 engines — the `DatabaseType` union in [`src/lib/types.ts`](src/lib/types.ts) is the list, never a prose enumeration — plus AI query assistance. It runs **two ways** — standalone Next.js app and published npm package — and the two render different chrome, so a UI change verified in one is not verified in the other.
+Web-based SQL IDE for cloud-native teams: forty-one external engines, plus the embedded LibreDB store (`EXTERNAL_DATABASE_TYPES` in [`src/lib/db/compatibility.ts`](src/lib/db/compatibility.ts) is the external-engine list, never a prose enumeration), plus AI query assistance.
+It runs **two ways**, as a standalone Next.js app and as a published npm package, and the two render different chrome, so a UI change verified in one is not verified in the other.
 
 ## Branching & PRs
 
 > **Trunk-based: feature branch → `main` → tag.** Open every PR with `gh pr create --base main`; there is no `dev` branch and no long-lived `release/*` branches. `main` is protected: PRs required, and `Lint, Typecheck and Build`, `Unit & Integration Tests` and `Secret Scan` must pass (SonarCloud runs but is not required — fork PRs cannot produce it).
 >
-> **Tag namespace.** Product releases are bare semver tags on `main` — **no `v` prefix**; the `v`-prefixed tags below 0.9.28 are frozen history, and chart releases use a separate `libredb-studio-<chart version>` namespace. So `git tag | tail` is not "the latest release". Cutting one is the user-invoked `/cut-release` skill ([`.claude/skills/cut-release/SKILL.md`](.claude/skills/cut-release/SKILL.md)) — ask for it, never improvise.
+> **Tag namespace.** Product releases are bare semver tags on `main` — **no `v` prefix**; the `v`-prefixed tags below 0.9.28 are frozen history, and chart releases use a separate `libredb-studio-<chart version>` namespace, and the VS Code extension `vscode-extension-<version>` ([`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md), "VS Code extension (Marketplace)"). So `git tag | tail` is not "the latest release". Cutting one is the user-invoked `/cut-release` skill ([`.claude/skills/cut-release/SKILL.md`](.claude/skills/cut-release/SKILL.md)) — ask for it, never improvise.
 >
 > **Two version gates, both enforced by the required check.** A PR bumping the `package.json` version must also run `bun run chart:bump` **and `make -C operator bundle`** and commit both (#138; the OLM CSV takes its version and controller image tag from `package.json`) — tag only once both are on `main`, since the tag ref is what the operator image and bundle build from. A PR changing any packaged file under `charts/libredb-studio/` must ALSO bump `Chart.yaml version` **by hand** when the current chart version is already released (#167) — `chart:bump` skips it while `appVersion` is in sync — plus the README `--version` examples.
 
@@ -32,7 +33,8 @@ bun run format           # Biome formatter check (format:fix to write); CSS/JSON
 bun run lint             # oxlint (fast, syntactic) then ESLint 9
 bun run lint:oxc         # oxlint only
 bun run typecheck        # TypeScript strict
-bun run test             # all layers: unit + api + integration + hooks + security + evals + components
+bun run test             # every test file under tests/ (except tests/live/), one bun process per file
+bun run test:unit        # one layer; also test:api, test:integration, test:hooks, test:security, test:evals, test:components
 bun run test:e2e         # Playwright (builds and starts its own servers; see playwright.config.ts)
 bun run test:coverage    # coverage report (merged lcov)
 bun run coverage:check   # enforce 100% line coverage on the merged lcov
@@ -43,22 +45,28 @@ bun run chart:check              # chart version sync guard (#138; CI sets CHART
 bun run channels:showcase:check  # login channel showcase drift guard (#425)
 bun run readme:check             # localized README drift guard (#317)
 bun run security:check           # security posture drift guard
+# VS Code extension (vscode-extension/, npm; after the root bun install; docs/TOOLCHAIN.md "VS Code extension")
+(cd vscode-extension && npm ci --ignore-scripts && npm run build)   # host and child bundles, metafile checks, notices
+(cd vscode-extension && npm run test:unit && npm run coverage:check) # its own 100% gate, unit leg only
+(cd vscode-extension && LIBREDB_BACKEND_RUNTIME=node npm run test:integration)  # or =vscode (P5)
+(cd vscode-extension && xvfb-run -a npm run test:e2e && npm run package)        # e2e needs a display on Linux
 ```
 
 > **Toolchain rationale (Biome formatter-only, oxlint in front of ESLint, the narrow type-aware layer, attw) lives in [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md).** Read it before changing any lint, format or packaging config.
 
 > **Run `build:lib` after changing anything reachable from `src/exports/`** (workspace, providers, components, security, …) — `bun run build` (Next.js) does NOT update the package dist.
 
-> **Tests — always `bun run test`, never bare `bun test`.** Component tests need isolated execution groups (`tests/run-components.sh`) to avoid `mock.module()` cross-contamination.
+> **Tests, always `bun run test`, never bare `bun test` over a directory.** The runner ([`tests/run-tests.ts`](tests/run-tests.ts)) discovers every test file and runs each one in its own bun process, several at a time (`--jobs=N`, `--list`). `bun test tests/api` puts all of them in one process instead, where one file's `mock.module()` becomes every file's, because bun's module mocks are process-wide with no undo. To run one file, name it: `bun tests/run-tests.ts tests/unit/x.test.ts`.
 
-> **Coverage isolation:** `bun`'s `mock.module()` is process-wide, so `test:coverage:core` runs each core test file in its own process (`tests/run-core.sh`) and `test:coverage` merges the per-file lcov. Do NOT collapse it into one `bun test` invocation. Rationale: [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md).
+> **Coverage:** `bun run test:coverage` is the same runner with `--coverage --merge-into=coverage/lcov.info`: one lcov per test file, merged by `scripts/merge-lcov.mjs`. Two files run without coverage on purpose; they are `COVERAGE_EXEMPT_FILES` in [`tests/runner/discover.ts`](tests/runner/discover.ts), with the reason in its docblock. Rationale: [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md).
 
 ## Pre-Commit Verification (MANDATORY)
 
 Run the required-check gate set locally before claiming done. [`.github/workflows/ci.yml`](.github/workflows/ci.yml) is the authority — this list mirrors it and can fall behind it:
 
 ```bash
-bun run format && bun run lint && bun run typecheck && bun run knip \
+(cd vscode-extension && npm ci --ignore-scripts) \
+  && bun run format && bun run lint && bun run typecheck && bun run knip \
   && bun run chart:check && bun run channels:showcase:check \
   && bun run readme:check && bun run security:check \
   && bun run test && bun run build
@@ -70,20 +78,22 @@ A clean local pass is still not a guarantee: the same job also runs `build:lib` 
 
 ## Architecture
 
-- **DB drivers:** `pg`, `mysql2`, `cassandra-driver`, `oracledb`, `mssql`, `mongodb`, `ioredis` — all external in both build configs. Two traps: SQLite is **`bun:sqlite`/`node:sqlite`** for the DB provider (runtime-selected, `LIBREDB_SQLITE_DRIVER` overrides) but `better-sqlite3` for the storage layer; `@duckdb/node-api` is a native N-API addon (~68 MB of bindings per libc variant), external too.
+- **DB drivers:** the two build configs do NOT externalize the same set, so read [`next.config.ts`](next.config.ts) and [`tsup.config.ts`](tsup.config.ts) rather than any prose list. `pg`, `mysql2`, `cassandra-driver`, `mongodb` and `oracledb` are external in both; `mssql` and `ioredis` are external in the library build only and Turbopack bundles them into the server chunk. That is not always harmless: `oracledb` was in exactly that position until #538, and bundling rewrote its `__dirname` to `/ROOT/...`, so Thick mode could never load its native addon. Two traps: SQLite is **`bun:sqlite`/`node:sqlite`** for the DB provider (runtime-selected, `LIBREDB_SQLITE_DRIVER` overrides) but `better-sqlite3` for the storage layer; `@duckdb/node-api` is a native N-API addon (~68 MB of bindings per libc variant), external too.
 - **Layout:** tree + data flow in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Key dirs: `src/lib/db` (providers), `src/lib/llm`, `src/lib/storage`, `src/workspace` + `src/exports` (the npm-package library surface), `src/proxy.ts` (RBAC middleware).
 
 ### Rules & patterns
 
 > **⚠️ Providers are the lifeblood of this project — keep the triad in lockstep: code ↔ docs ↔ tests**, 1:1 per canonical type-id — the type-id set is the `DatabaseType` union in [`src/lib/types.ts`](src/lib/types.ts), which is the only list:
 > - Code: `src/lib/db/providers/<family>/<type-id>.ts`, or `.../<type-id>/index.ts` when the provider is split across modules · Docs: `docs/providers/<type-id>.md` · Tests: `tests/integration/db/<type-id>-provider.test.ts`
-> - **One directory may serve two type-ids** — `sql/search/` is both `elasticsearch` and `opensearch` (#424). Docs and tests stay 1:1 anyway: the invariant is per type-id.
+> - **One directory may serve two type-ids** — `sql/search/` is both `elasticsearch` and `opensearch` (#424), and `timeseries/influxdb/` is both `influxdb` and `influxdb3`, two classes on two bases.
+>   Docs and tests stay 1:1 anyway: the invariant is per type-id.
+> - **Agent leg.** A type-id whose `AGENT_STATEMENT_LANGUAGE` row is non-null also keeps, in the same PR: Code: `src/lib/agent/languages/<statement-language>/engines/<type-id>.ts` plus its client row in `languages/<statement-language>/engines/client.ts` · Docs: the `Agent language pack` subsection of `docs/providers/<type-id>.md`, naming the statement-language family and every overlay member · Tests: `tests/unit/lib/agent/engine-docs.test.ts`, which holds that subsection to the overlay, plus the engine's cases in `engine-overlays.test.ts` and `engine-pack-contract.test.ts`.
 > - Any change to one side MUST sync the others **in the same PR**. The doc mirrors the code and the code mirrors the doc — never let them drift.
 
-- **DB abstraction:** Strategy Pattern. SQL-dialect providers extend `SQLBaseProvider`; the non-SQL ones (`mongodb`, `redis`, `couchbase`, `libredb`) extend `BaseDatabaseProvider` directly, and `SQLBaseProvider` itself extends it. Inside `src/lib/db`, never branch on the type id — drive behaviour through capabilities/labels. Three `=== "mongodb"` branches survive in the UI layer as known debt (`src/hooks/use-connection-form.ts`, `src/lib/editor/tab-language.ts`, `src/components/ConnectionModal.tsx`); do not add a fourth.
+- **DB abstraction:** Strategy Pattern. SQL-dialect providers extend `SQLBaseProvider`; the non-SQL ones (`mongodb`, `redis`, `couchbase`, `firestore`, `prometheus`, `influxdb`, `kafka`, `mqtt`, `etcd`, `oxia`, `milvus`, `qdrant`, `s3`, `kubernetes`, `rabbitmq`, `libredb`) extend `BaseDatabaseProvider` directly, `neo4j` extends `GraphBaseProvider` (`src/lib/db/graph/`), and `SQLBaseProvider` and `GraphBaseProvider` themselves extend it. Inside `src/lib/db`, never branch on the type id; drive behaviour through capabilities/labels. Outside the provider layer, a per-engine fact is a row of a contract registry, never a type-id branch: the `src/lib/db/connection-string/`, `src/lib/db/execution-ui/`, `src/lib/db/sql-grammar/`, `src/lib/db/migration-ddl/` and `src/lib/db/sql-writing/` rows are declared beside each provider, and `CONNECTION_FIELDS` and `SEED_ONLY_FIELDS` are central UI-free tables in `src/lib/db/connection-fields.ts`; `tests/unit/lib/no-engine-branches.test.ts` fails on any other type-id branch, and its debt list is empty, so a new branch is moved into a contract rather than listed.
 - **Auth:** `NEXT_PUBLIC_AUTH_PROVIDER` = `local` (email/password) or `oidc` (PKCE → the same JWT cookie); `src/proxy.ts` enforces RBAC (admin vs user). [`docs/OIDC.md`](docs/OIDC.md).
 - **Storage:** write-through cache — localStorage serves reads, `useStorageSync` pushes mutations to the server (debounced). `STORAGE_PROVIDER` (server-side only) = `local` | `sqlite` | `postgres`. [`docs/STORAGE.md`](docs/STORAGE.md).
-- **API routes:** all backend in `src/app/api/`; JWT-protected except the public set in [`src/proxy.ts`](src/proxy.ts) — `/login`, `/api/auth/*`, `/api/db/health`, `/api/storage/config`, `/_next`, `/favicon.ico` and static assets — plus an agent-drive path gated by a bearer token instead of the JWT. `src/proxy.ts` is the authority; do not restate the list elsewhere.
+- **API routes:** all backend in `src/app/api/`, except `/health`, which is a route at the app root so the plainest liveness path exists; JWT-protected except the public set in [`src/proxy.ts`](src/proxy.ts) — `/login`, `/launch`, `/api/auth/*`, `/health`, `/api/health`, `/api/db/health`, `/api/ready`, `/api/storage/config`, `/_next`, `/favicon.ico` and static assets — plus two machine paths gated by bearer credentials of their own instead of the JWT: the agent drive callback and /api/mcp. `src/proxy.ts` is the authority; do not restate the list elsewhere.
 
 ## Configuration
 

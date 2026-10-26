@@ -21,10 +21,21 @@
  * - `FORMAT`/`SETTINGS` are TRAILING clauses, so appending `LIMIT n` after one
  *   is a hard syntax error.
  */
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import {
+  callerBoundTruncationReason,
+  isSourcePartUnavailable,
+  sourceBoundTruncationReason,
+} from "@/lib/db/object-kinds";
+import type { DatabaseProvider, ObjectSourceDocument } from "@/lib/db/types";
 import type { DatabaseConnection, DatabaseType } from "@/lib/types";
 import { ClickHouseProvider } from "@/lib/db/providers/sql/clickhouse";
+import { generateTableQuery } from "@/lib/query-generators";
+import { CLICKHOUSE_CONTAINER_LEVELS, CLICKHOUSE_OBJECT_KINDS } from "@/lib/db/providers/sql/clickhouse/objects";
 import { maintenanceControl } from "@/lib/db/types";
+import { assertObjectSurface } from "../../helpers/object-surface-conformance";
 import {
   AuthenticationError,
   ConnectionError,
@@ -33,6 +44,7 @@ import {
   QueryError,
   TimeoutError,
 } from "@/lib/db/errors";
+import { comparePaths } from "@/lib/db/object-path";
 
 // ============================================================================
 // Connection
@@ -267,10 +279,15 @@ let sentAuth: (string | null)[] = [];
 let networkFailure: Error | null = null;
 let replyFor: (sql: string) => Reply;
 
-/** The JSON envelope, verbatim in shape: meta, data, rows, statistics. */
+/**
+ * The JSONCompact envelope, verbatim in shape: meta, data, rows, statistics. Each
+ * fixture row is written as an object for readability and sent as the array of its
+ * values in `meta` order, the way the server sends it.
+ */
 function envelope(rows: Record<string, unknown>[], meta?: { name: string; type: string }[]): string {
   const columns = meta ?? Object.keys(rows[0] ?? {}).map((name) => ({ name, type: "String" }));
-  return JSON.stringify({ meta: columns, data: rows, rows: rows.length, statistics: { elapsed: 0.0012 } });
+  const data = rows.map((row) => columns.map((column) => row[column.name]));
+  return JSON.stringify({ meta: columns, data, rows: rows.length, statistics: { elapsed: 0.0012 } });
 }
 
 function jsonReply(rows: Record<string, unknown>[], meta?: { name: string; type: string }[]): Reply {
@@ -304,7 +321,7 @@ const DENIED = () =>
 
 function toResponse(reply: Reply): Response {
   const headers = new Headers({ "content-type": "application/json" });
-  const format = reply.format === undefined ? "JSON" : reply.format;
+  const format = reply.format === undefined ? "JSONCompact" : reply.format;
   if (format !== null) headers.set("x-clickhouse-format", format);
   const summary = reply.summary === undefined ? { written_rows: "0", elapsed_ns: "1200000" } : reply.summary;
   if (summary !== null) headers.set("x-clickhouse-summary", JSON.stringify(summary));
@@ -425,8 +442,12 @@ describe("ClickHouseProvider metadata", () => {
       supportsExplain: true,
       explainFormat: "clickhouse-json",
       supportsExternalQueryLimiting: true,
-      supportsCreateTable: false,
       supportsInlineRowEdit: false,
+      supportsTestDataGeneration: false,
+      // `LIMIT n OFFSET m` from the shared limiter (#816). A statement ending in
+      // `FORMAT` or `SETTINGS` comes back `wasLimited: false`, and the route's
+      // `hasMore` requires that, so those offer no Load More without a type branch.
+      supportsResultPagination: true,
       supportsTransactions: false,
       declaresForeignKeys: false,
       supportsMaintenance: true,
@@ -440,15 +461,22 @@ describe("ClickHouseProvider metadata", () => {
       },
       supportsConnectionString: true,
       defaultPort: 8123,
+      // #789. Asserted in full in the `object surface` block below; repeated here only
+      // so this exhaustive comparison stays exhaustive.
+      containerLevels: CLICKHOUSE_CONTAINER_LEVELS,
+      containerPathShapes: "exact",
+      objectKinds: CLICKHOUSE_OBJECT_KINDS,
       schemaRefreshPattern: "\\b(CREATE|DROP|ALTER|RENAME|TRUNCATE|ATTACH|DETACH)\\b",
     });
   });
 
-  test("keeps supportsCreateTable false because the modal's default output is invalid here", () => {
-    // Live-verified, and the reason the flag is not an oversight: the modal's
-    // default column emits `id SERIAL PRIMARY KEY` (code 50, unknown data type
-    // family) and its UNIQUE checkbox emits `UNIQUE` (code 62, syntax error).
-    expect(new ClickHouseProvider(makeConnection()).getCapabilities().supportsCreateTable).toBe(false);
+  test("declares no createTable because the modal's default output is invalid here", () => {
+    // Live-verified, and the reason no createTable is declared: the modal's
+    // default column emits an auto-increment primary key (measured as `id SERIAL
+    // PRIMARY KEY`, code 50, unknown data type family; #648 made that spelling
+    // per-engine and added no ClickHouse row) and its UNIQUE checkbox emits `UNIQUE`
+    // (code 62, syntax error).
+    expect(new ClickHouseProvider(makeConnection()).getCapabilities().createTable).toBeUndefined();
   });
 
   test("keeps supportsInlineRowEdit false because a bare UPDATE ... SET is not implemented here", () => {
@@ -718,7 +746,7 @@ describe("ClickHouseProvider query", () => {
   });
 
   test("surfaces a format the user chose as one synthetic text column", async () => {
-    // Live-verified: an explicit FORMAT in the user's SQL beats the JSON the
+    // Live-verified: an explicit FORMAT in the user's SQL beats the JSONCompact the
     // transport asked for, so the body is TSV. The user asked for that
     // deliberately, so it is shown rather than thrown away or parsed.
     const provider = await connectProvider();
@@ -776,6 +804,26 @@ describe("ClickHouseProvider query", () => {
     expect(Object.keys(result.columnTypes ?? {})).toEqual(result.fields);
   });
 
+  test("numbers a column the server declares twice, keeping each value under its own name", async () => {
+    // Measured on 26.7.1.1315: the engine qualifies a joined column itself (`b.x`),
+    // and that name can collide with a column already called `b.x`, so `meta`
+    // names it twice with two different values. Under `default_format=JSON` the
+    // row object named the key twice and JSON.parse kept only 3; the body below is
+    // the live JSONCompact answer, which keeps both by position.
+    const provider = await connectProvider();
+    replyFor = () => ({
+      body:
+        '{"meta":[{"name":"x","type":"UInt8"},{"name":"b.x","type":"UInt8"},{"name":"b.x","type":"UInt8"}],' +
+        '"data":[[1,2,3]],"rows":1,"statistics":{"elapsed":0.0012}}',
+    });
+
+    const result = await provider.query("SELECT a.x, b.x, 3 AS `b.x` FROM (SELECT 1 AS x) a, (SELECT 2 AS x) b");
+
+    expect(result.fields).toEqual(["x", "b.x", "b.x (2)"]);
+    expect(result.rows).toEqual([{ x: 1, "b.x": 2, "b.x (2)": 3 }]);
+    expect(result.columnTypes).toEqual({ x: "UInt8", "b.x": "UInt8", "b.x (2)": "UInt8" });
+  });
+
   test("leaves the type channel absent for a write, which declares no columns", async () => {
     const provider = await connectProvider();
     replyFor = () => writeReply("2");
@@ -798,6 +846,74 @@ describe("ClickHouseProvider query", () => {
     expect(result.columnTypes).toBeUndefined();
   });
 
+  test("keeps a Decimal past double precision exact, as the digits the server printed", async () => {
+    // Measured on 26.9.9.28: without `output_format_json_quote_decimals` a
+    // Decimal(38,10) arrives as the UNQUOTED number below and JSON.parse rounds it
+    // to 12345678901234567000 with no error. The fake answers the way the server
+    // does, quoting only when the request asked it to, so a transport that stopped
+    // asking would put the rounded value back in the grid.
+    const provider = await connectProvider();
+    replyFor = () => {
+      const quoted =
+        new URL(sentUrls[sentUrls.length - 1]).searchParams.get("output_format_json_quote_decimals") === "1";
+      const amount = quoted ? '"12345678901234567890.1234567891"' : "12345678901234567890.1234567891";
+      const small = quoted ? '"12.34"' : "12.34";
+      return {
+        body:
+          '{"meta":[{"name":"id","type":"UInt32"},{"name":"amount","type":"Decimal(38, 10)"},' +
+          '{"name":"small","type":"Decimal(10, 2)"},{"name":"f","type":"Float64"}],' +
+          `"data":[[1,${amount},${small},1.5]],"rows":1,"statistics":{"elapsed":0.001}}`,
+      };
+    };
+
+    const result = await provider.query("SELECT id, amount, small, f FROM t1");
+
+    // A small Decimal is a string as well, the way the `pg` driver hands over
+    // NUMERIC; UInt32 and Float64 stay numbers.
+    expect(result.rows).toEqual([{ id: 1, amount: "12345678901234567890.1234567891", small: "12.34", f: 1.5 }]);
+  });
+
+  test("shows a Float's inf, -inf and nan as their words, by the declared type, nested ones included (SF-045)", async () => {
+    // Measured on 26.9.18.11: without `output_format_json_quote_denormals` the server
+    // writes each of them as `null`, so a non-Nullable Float64 holding inf showed NULL and
+    // replayed as 0. The fake answers the way the server does, quoting only when asked.
+    const provider = await connectProvider();
+    replyFor = () => {
+      const quoted =
+        new URL(sentUrls[sentUrls.length - 1]).searchParams.get("output_format_json_quote_denormals") === "1";
+      const word = (text: string) => (quoted ? `"${text}"` : "null");
+      return {
+        body:
+          '{"meta":[{"name":"f","type":"Float64"},{"name":"n","type":"Nullable(Float32)"},' +
+          '{"name":"b","type":"BFloat16"},{"name":"a","type":"Array(Array(Nullable(Float64)))"},' +
+          '{"name":"t","type":"Tuple(x Float32, y Float64, z String)"},{"name":"u","type":"Tuple(Float64, String)"},' +
+          '{"name":"m","type":"Map(String, Float64)"},{"name":"lc","type":"LowCardinality(Nullable(Float64))"},' +
+          '{"name":"s","type":"String"},{"name":"v","type":"Variant(Float64, String)"}],' +
+          `"data":[[${word("inf")},${word("-inf")},${word("nan")},[[${word("inf")},1.5,null]],` +
+          `{"x":${word("-inf")},"y":2.5,"z":"inf"},[${word("nan")},"nan"],{"k":${word("inf")},"__proto__":${word("nan")}},` +
+          `null,"inf","inf"]],"rows":1,"statistics":{"elapsed":0.001}}`,
+      };
+    };
+
+    const result = await provider.query("SELECT * FROM t1");
+
+    expect(result.rows).toHaveLength(1);
+    const [row] = result.rows;
+    expect(row.f).toBe("Infinity");
+    expect(row.n).toBe("-Infinity");
+    expect(row.b).toBe("NaN");
+    expect(row.a).toEqual([["Infinity", 1.5, null]]);
+    expect(row.t).toEqual({ x: "-Infinity", y: 2.5, z: "inf" });
+    expect(row.u).toEqual(["NaN", "nan"]);
+    expect(Object.keys(row.m as object)).toEqual(["k", "__proto__"]);
+    expect((row.m as Record<string, unknown>).k).toBe("Infinity");
+    expect(Object.getOwnPropertyDescriptor(row.m, "__proto__")?.value).toBe("NaN");
+    expect(row.lc).toBeNull();
+    // A String, and a Variant that declares no single element type, keep the text as sent.
+    expect(row.s).toBe("inf");
+    expect(row.v).toBe("inf");
+  });
+
   test("leaves the type channel absent when the envelope described no columns at all", async () => {
     const provider = await connectProvider();
     replyFor = () => ({ body: JSON.stringify({ meta: [], data: [] }) });
@@ -811,6 +927,117 @@ describe("ClickHouseProvider query", () => {
 // ============================================================================
 // Error mapping
 // ============================================================================
+
+// ============================================================================
+// Cancellation (#1364)
+// ============================================================================
+
+describe("ClickHouseProvider cancelQuery", () => {
+  const LONG = "SELECT count() FROM numbers(200000000000) WHERE sipHash64(number) % 7 = 3";
+
+  /**
+   * Hold the long statement's answer until the test releases it, and answer the KILL
+   * with `kill`. Measured on 26.9.9.28: a KILL that reached the statement answers one
+   * row with `kill_status` `finished`, and one that matched nothing answers 200 with an
+   * empty body.
+   */
+  function holdLongStatement(kill: () => Reply) {
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const sql = String(init?.body);
+      sentUrls.push(String(input));
+      sentSql.push(sql);
+      if (sql === LONG) {
+        await held;
+        return toResponse(exceptionReply(394, "QUERY_WAS_CANCELLED", "Query was cancelled", 500));
+      }
+      if (sql.startsWith("KILL QUERY")) {
+        const reply = kill();
+        release();
+        return toResponse(reply);
+      }
+      return toResponse(defaultReply(sql));
+    }) as typeof fetch;
+    return () => release();
+  }
+
+  const KILLED = (killStatus: string) =>
+    jsonReply([{ kill_status: killStatus, query_id: "q-1", user: "default", query: LONG }]);
+
+  // ClickHouse keeps a query id unique per server USER only, so the caller's id (which any
+  // Studio user chooses) must not become it: two users on one ClickHouse account could then
+  // share an id, and one KILL would stop both.
+  test("runs the statement under a query id it generates, never the caller's", async () => {
+    const provider = await connectProvider();
+
+    await provider.query("SELECT count() FROM orders", undefined, "q-1");
+    await provider.query("SELECT 2");
+
+    const serverId = new URL(urlWith("count()")).searchParams.get("query_id");
+    expect(serverId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    expect(serverId).not.toBe("q-1");
+    // Without an id the server picks its own, as before.
+    expect(new URL(urlWith("SELECT 2")).searchParams.has("query_id")).toBe(false);
+  });
+
+  test("kills the running statement by that id and says so once the server stopped it", async () => {
+    holdLongStatement(() => KILLED("finished"));
+    const provider = await connectProvider();
+
+    const running = provider.query(LONG, undefined, "q-1").catch((error: unknown) => error);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(await provider.cancelQuery("q-1")).toBe(true);
+    // The KILL names the id the statement was sent under, not the caller's.
+    const serverId = new URL(urlWith("sipHash64")).searchParams.get("query_id");
+    expect(sqlWith("KILL QUERY")).toBe(`KILL QUERY WHERE query_id = '${serverId}' SYNC`);
+    expect((await running) as Error).toBeInstanceOf(QueryCancelledError);
+  });
+
+  test("answers false when the KILL reached nothing, or could not stop it", async () => {
+    for (const reply of [() => writeReply("0"), () => KILLED("cant_cancel")]) {
+      const release = holdLongStatement(reply);
+      const provider = await connectProvider();
+      const running = provider.query(LONG, undefined, "q-1").catch(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(await provider.cancelQuery("q-1")).toBe(false);
+      release();
+      await running;
+    }
+  });
+
+  test("answers false when the KILL itself fails", async () => {
+    const release = holdLongStatement(() => DENIED());
+    const provider = await connectProvider();
+    const running = provider.query(LONG, undefined, "q-1").catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      expect(await provider.cancelQuery("q-1")).toBe(false);
+    } finally {
+      logged.mockRestore();
+      release();
+      await running;
+    }
+  });
+
+  // An id this provider is not running is refused before anything is sent: the KILL
+  // would otherwise reach whichever session on the server runs under that id.
+  test("sends nothing for an id it is not running, including one that has finished", async () => {
+    const provider = await connectProvider();
+    await provider.query("SELECT 1", undefined, "q-done");
+    sentSql = [];
+
+    expect(await provider.cancelQuery("q-done")).toBe(false);
+    expect(await provider.cancelQuery("q-never")).toBe(false);
+    expect(sentSql).toEqual([]);
+  });
+});
 
 describe("ClickHouseProvider error mapping", () => {
   test("a missing grant becomes an AuthenticationError even though its prose says neither denied nor permission", async () => {
@@ -899,7 +1126,48 @@ describe("ClickHouseProvider error mapping", () => {
 
     await expect(provider.query("SELECT 1")).rejects.toThrow(/aborted/);
   });
+
+  test("a connection that never opened stays a ConnectionError naming the address (#1431)", async () => {
+    // Node's connect timeout. Its text says "timed out", which the shared message-based mapping
+    // reads as a slow query; the transport's failure kind keeps it a connection problem.
+    const provider = await connectProvider();
+    networkFailure = connectTimeout();
+
+    const failure = provider.query("SELECT 1");
+
+    await expect(failure).rejects.toBeInstanceOf(ConnectionError);
+    await expect(failure).rejects.toThrow("127.0.0.1:8123");
+  });
+
+  test("connect reports a connection that never opened without query advice (#1431)", async () => {
+    networkFailure = connectTimeout();
+    const provider = new ClickHouseProvider(makeConnection());
+
+    const failure = provider.connect();
+
+    await expect(failure).rejects.toBeInstanceOf(ConnectionError);
+    await expect(failure).rejects.toThrow("127.0.0.1:8123");
+    await expect(failure).rejects.not.toThrow(/query timeout/i);
+  });
+
+  test("a client-side deadline stays a TimeoutError", async () => {
+    const provider = await connectProvider();
+    networkFailure = new DOMException("The operation timed out.", "TimeoutError");
+
+    await expect(provider.query("SELECT 1")).rejects.toBeInstanceOf(TimeoutError);
+  });
 });
+
+/** What Node's fetch throws when the TCP connect itself times out: the code on the cause. */
+function connectTimeout(): Error {
+  const cause = Object.assign(
+    new Error("Connect Timeout Error (attempted address: 127.0.0.1:8123, timeout: 10000ms)"),
+    {
+      code: "UND_ERR_CONNECT_TIMEOUT",
+    },
+  );
+  return new TypeError("fetch failed", { cause });
+}
 
 // ============================================================================
 // Query preparation (the trailing-clause override)
@@ -932,6 +1200,37 @@ describe("ClickHouseProvider query preparation", () => {
     expect(prepared.query).toBe(sql);
     expect(prepared.wasLimited).toBe(false);
     expect(prepared.limit).toBe(25);
+  });
+
+  /**
+   * WHERE ISSUE #264's HAZARD WENT (#816).
+   *
+   * The generator used to write `SELECT * FROM events LIMIT 50;` and a test in
+   * `tests/unit/lib/query-generators.test.ts` pinned that bound as the LAST clause,
+   * because `... FORMAT TSV LIMIT 1` is a hard syntax error. #816 removed the generated
+   * bound, so that guard had nothing left to guard, and the hazard now lives here: the
+   * preview is `SELECT * FROM events;`, and a user who appends `FORMAT TSV` to it makes a
+   * statement the limiter DECLINES to rewrite at any offset.
+   *
+   * Two consequences, both deliberate and both asserted below. The statement runs with no
+   * row bound at all, which on a large table costs more than it used to. And because it
+   * comes back `wasLimited: false`, the route's `hasMore` is false whatever the row count,
+   * so no Load More is offered for a statement that would answer every click with page
+   * one. The second is the point of the change; the first is its price.
+   */
+  test("the generated preview plus a user FORMAT clause runs unbounded and cannot be paged", () => {
+    const generated = generateTableQuery(["events"], provider().getCapabilities());
+    expect(generated).toBe("SELECT * FROM events;");
+
+    const edited = "SELECT * FROM events FORMAT TSV";
+    for (const offset of [0, 50]) {
+      const prepared = provider().prepareQuery(edited, { limit: 50, offset });
+
+      expect(prepared.query).toBe(edited);
+      // No bound reached the engine, and the limiter says so. `hasMore` requires
+      // `wasLimited`, so the grid offers nothing to click.
+      expect(prepared.wasLimited).toBe(false);
+    }
   });
 
   test.each([
@@ -1181,109 +1480,6 @@ describe("ClickHouseProvider query preparation", () => {
 // ============================================================================
 // Schema
 // ============================================================================
-
-describe("ClickHouseProvider schema", () => {
-  test("getSchema reports every non-system database, qualifying only the ones outside the pin", async () => {
-    const provider = await connectProvider();
-
-    const schema = await provider.getSchema();
-
-    expect(schema.map((table) => table.name)).toEqual(["default.audit", "daily_events", "orders", "users"]);
-    expect(schema[3].columns).toEqual([
-      { name: "id", type: "UInt32", nullable: false, isPrimary: true, defaultValue: undefined },
-      { name: "full_name", type: "Nullable(String)", nullable: true, isPrimary: false, defaultValue: undefined },
-    ]);
-  });
-
-  test("getSchema reports the sparse primary index and the data-skipping indexes, none of them unique", async () => {
-    // ClickHouse's primary key is a real sparse index but enforces nothing
-    // (live-verified: three identical values were accepted into a table declared
-    // PRIMARY KEY (a)), and a data-skipping index only prunes granules.
-    const provider = await connectProvider();
-
-    const schema = await provider.getSchema();
-
-    expect(schema[2].indexes).toEqual([
-      { name: "PRIMARY KEY", columns: ["user_id", "order_id"], unique: false },
-      { name: "idx_status", columns: ["status"], unique: false },
-    ]);
-  });
-
-  test("getSchema reports ORDER BY separately only when the sorting key extends the primary key", async () => {
-    const provider = await connectProvider();
-
-    const schema = await provider.getSchema();
-
-    expect(schema[0].indexes).toEqual([
-      { name: "PRIMARY KEY", columns: ["tenant"], unique: false },
-      { name: "ORDER BY", columns: ["tenant", "ts"], unique: false },
-    ]);
-  });
-
-  test("getSchema leaves a view's row count and size unknown rather than zero", async () => {
-    const provider = await connectProvider();
-
-    const schema = await provider.getSchema();
-
-    expect(schema[1].rowCount).toBeUndefined();
-    expect(schema[1].size).toBeUndefined();
-    expect(schema[2].rowCount).toBe(5);
-    expect(schema[2].size).toBe("2.55 KB");
-  });
-
-  test("getSchema never invents a foreign key, because ClickHouse has none", async () => {
-    const provider = await connectProvider();
-
-    const schema = await provider.getSchema();
-
-    expect(schema.every((table) => table.foreignKeys?.length === 0)).toBe(true);
-  });
-
-  test("getSchemaList skips the index catalog so the table list is never blocked by it", async () => {
-    const provider = await connectProvider();
-
-    const tables = await provider.getSchemaList();
-
-    expect(tables.map((table) => table.name)).toEqual(["default.audit", "daily_events", "orders", "users"]);
-    expect(tables.every((table) => table.indexes.length === 0)).toBe(true);
-    expect(sentSql.some((sql) => sql.includes("system.data_skipping_indices"))).toBe(false);
-  });
-
-  test("getSchemaRelations returns an entry for every table, empty lists included", async () => {
-    const provider = await connectProvider();
-
-    const relations = await provider.getSchemaRelations();
-
-    expect(relations.map((relation) => relation.name)).toEqual(["default.audit", "daily_events", "orders", "users"]);
-    expect(relations[1].indexes).toEqual([]);
-    expect(relations[1].foreignKeys).toEqual([]);
-  });
-
-  test("getTables lists the display names", async () => {
-    const provider = await connectProvider();
-
-    expect(await provider.getTables()).toEqual(["default.audit", "daily_events", "orders", "users"]);
-  });
-
-  test("a denied index catalog still yields a schema tree", async () => {
-    // Live-verified: system.tables and system.columns are pre-filtered to what
-    // the user may read, but system.data_skipping_indices needs its own grant.
-    // Losing the whole tree over that would punish a usable connection.
-    const provider = await connectProvider();
-    replyFor = (sql) => (sql.includes("system.data_skipping_indices") ? DENIED() : defaultReply(sql));
-
-    const schema = await provider.getSchema();
-
-    expect(schema[2].indexes).toEqual([{ name: "PRIMARY KEY", columns: ["user_id", "order_id"], unique: false }]);
-  });
-
-  test("a real catalog failure propagates instead of showing an empty tree", async () => {
-    const provider = await connectProvider();
-    replyFor = () => exceptionReply(SYNTAX_ERROR, "SYNTAX_ERROR", "Syntax error", 400);
-
-    await expect(provider.getSchema()).rejects.toBeInstanceOf(QueryError);
-  });
-});
 
 // ============================================================================
 // Monitoring
@@ -1583,6 +1779,76 @@ describe("ClickHouseProvider maintenance", () => {
     expect(sqlWith("OPTIMIZE")).toBe('OPTIMIZE TABLE "demo"."we""ird" FINAL');
   });
 
+  // #772: `schemaName` is the DATABASE on ClickHouse, so a container replaces the split of
+  // the name rather than being recovered from it - which is the ambiguity that matters for a
+  // name containing a dot.
+  test("a container is the database outright, and the name is not split", async () => {
+    const provider = await connectProvider();
+
+    await provider.runMaintenance("optimize", "audit", "default");
+
+    expect(sqlWith("OPTIMIZE")).toBe('OPTIMIZE TABLE "default"."audit" FINAL');
+  });
+
+  test("a container is used whole even when it contains a dot", async () => {
+    const provider = await connectProvider();
+
+    await provider.runMaintenance("optimize", "audit", "my.db");
+
+    expect(sqlWith("OPTIMIZE")).toBe('OPTIMIZE TABLE "my.db"."audit" FINAL');
+  });
+
+  test("a bare target with no container keeps the pinned-database reading", async () => {
+    const provider = await connectProvider();
+
+    await provider.runMaintenance("optimize", "users");
+
+    expect(sqlWith("OPTIMIZE")).toBe('OPTIMIZE TABLE "demo"."users" FINAL');
+  });
+
+  // 3c. escapeIdentifier() dialect override (#1091 review)
+  //
+  // A backslash inside a quoted identifier is processed as an ESCAPE on this engine, so the
+  // inherited escaper - which doubles only the quote character - let a name ENDING in a backslash
+  // swallow its own closing quote and the rest of the statement was reparsed around it. The
+  // override escapes the backslash first, the order `literal()` in objects.ts uses.
+  test("escapeIdentifier doubles a backslash as well as the quote", () => {
+    const provider = new ClickHouseProvider(makeConnection());
+
+    const escape = (identifier: string) =>
+      (provider as unknown as { escapeIdentifier(identifier: string): string }).escapeIdentifier(identifier);
+
+    expect(escape("users")).toBe('"users"');
+    expect(escape('we"ird')).toBe('"we""ird"');
+    // The trailing backslash is the whole point: a run-based escaper that only doubles a
+    // backslash with a character after it leaves this one swallowing the closing quote.
+    expect(escape("x\\")).toBe('"x\\\\"');
+    expect(escape('a\\"b')).toBe('"a\\\\""b"');
+  });
+
+  test("a target ending in a backslash keeps its closing quote", async () => {
+    const provider = await connectProvider();
+
+    await provider.runMaintenance("optimize", "bs_one\\");
+
+    expect(sqlWith("OPTIMIZE")).toBe('OPTIMIZE TABLE "demo"."bs_one\\\\" FINAL');
+  });
+
+  test("a container ending in a backslash cannot swallow the quote that closes it", async () => {
+    // The request from the review: container `x\` with a target that reads as trailing clauses.
+    // Emitted through the inherited escaper, the container's closing quote was consumed by the
+    // backslash and the target became part of the identifier rather than a second segment.
+    const provider = await connectProvider();
+
+    await provider.runMaintenance("optimize", ".t FINAL SETTINGS optimize_throw_if_noop = 1 --", "x\\");
+
+    const sent = sqlWith("OPTIMIZE");
+    expect(sent).toBe('OPTIMIZE TABLE "x\\\\".".t FINAL SETTINGS optimize_throw_if_noop = 1 --" FINAL');
+    // The naive spelling - one backslash, so the quote after it is escaped rather than closing -
+    // is what the override exists to prevent.
+    expect(sent).not.toContain('"x\\".');
+  });
+
   test("analyze reports the part statistics ClickHouse keeps instead of computing new ones", async () => {
     // There is no ANALYZE: a MergeTree's statistics are its parts, and they are
     // always current. Reporting them is the honest equivalent of the operation.
@@ -1694,5 +1960,2244 @@ describe("ClickHouseProvider maintenance", () => {
     denyEverything();
 
     await expect(provider.runMaintenance("optimize", "users")).rejects.toBeInstanceOf(AuthenticationError);
+  });
+});
+
+// ============================================================================
+// The object surface (#789)
+// ----------------------------------------------------------------------------
+// Every payload below was captured from ClickHouse 26.7.1.1315 (`task15-clickhouse`,
+// host port 18123, the same image `database-compose.yml` pins) against a database
+// built to hold one instance of every declared kind PLUS the three shapes that break
+// a naive implementation:
+//
+//   - `.inner_id.<uuid of mv_inner>`, the implicit inner table a `TO`-less
+//     materialised view owns, which must appear in NEITHER the count nor the listing;
+//   - `.inner_id.fake`, a table a PERSON created under that same prefix, which proves
+//     a name-pattern exclusion would hide a user's own table (measured: the CREATE
+//     succeeds);
+//   - `mv_target`, the explicit `TO` target of `mv_to`, which is an ordinary user
+//     table and must stay visible.
+// ============================================================================
+
+/**
+ * `system.tables` exactly as the server answers it for the fixture database, before
+ * any exclusion. The provider's own statement carries the exclusion, so these rows
+ * are what a naive `SELECT ... FROM system.tables` sees.
+ */
+const OBJECT_DATABASE = "analytics";
+
+const MV_INNER_UUID = "0ec1eae5-fa15-41b8-98bb-9a0a01d5df45";
+const MV_INNER_TABLE = `.inner_id.${MV_INNER_UUID}`;
+
+/** What the provider's kind-tagged subquery answers once its exclusion has run. */
+const OBJECT_ROWS = [
+  // A user-created table under the reserved-looking prefix. It survives.
+  { objectName: ".inner_id.fake", objectKind: "table", objectRows: "0", objectBytes: "0" },
+  { objectName: "dict_users", objectKind: "dictionary", objectRows: null, objectBytes: null },
+  // A CONFIG-FILE dictionary. It has no `system.tables` row at all (measured), so the
+  // provider unions `system.dictionaries` in to reach it, the same way it unions
+  // `system.functions` in for an object no database owns.
+  { objectName: "dict_regions_config", objectKind: "dictionary", objectRows: null, objectBytes: null },
+  { objectName: "events", objectKind: "table", objectRows: "3", objectBytes: "1024" },
+  { objectName: "events_view", objectKind: "view", objectRows: null, objectBytes: null },
+  { objectName: "mv_inner", objectKind: "materialized_view", objectRows: "2", objectBytes: "512" },
+  { objectName: "mv_target", objectKind: "table", objectRows: "0", objectBytes: "0" },
+  { objectName: "mv_to", objectKind: "materialized_view", objectRows: null, objectBytes: null },
+  { objectName: "probe_double", objectKind: "function", objectRows: null, objectBytes: null },
+];
+
+/**
+ * The counts, GROUPED from `OBJECT_ROWS` rather than written out a second time.
+ *
+ * A hand-written count fixture is a SECOND fixture, and two fixtures agreeing is
+ * something a person maintains rather than something the shape guarantees. Standing
+ * ruling 5f is that the listing contains exactly what the count counted; deriving the
+ * counts here is the behavioural half of that rule, which no statement-shape assertion
+ * can give: change a row in `OBJECT_ROWS` and the fake server cannot disagree with
+ * itself.
+ */
+function groupedCountRows(sql?: string): { objectKind: string; objectCount: string }[] {
+  const counts = new Map<string, number>();
+  const dictionaryKnown = sql?.includes("t.name IN");
+  for (const row of OBJECT_ROWS) {
+    let kind = row.objectKind;
+    // With system.tables alone, a table whose engine is Dictionary stays a table (dict_users has a table row;
+    // dict_regions_config is config-only and not in system.tables at all).
+    if (!dictionaryKnown && row.objectName === "dict_users") kind = "table";
+    else if (!dictionaryKnown && row.objectName === "dict_regions_config") continue;
+    if (sql?.includes("objectKind != 'dictionary'") && kind === "dictionary") continue;
+    counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([objectKind, count]) => ({ objectKind, objectCount: String(count) }))
+    .sort((left, right) => (left.objectKind < right.objectKind ? -1 : 1));
+}
+
+const CONTAINER_ROWS = [
+  { containerName: OBJECT_DATABASE, isSessionDefault: 1 },
+  { containerName: "default", isSessionDefault: 0 },
+  { containerName: "demo", isSessionDefault: 0 },
+];
+
+const OBJECT_COLUMN_ROWS = [
+  { columnName: "id", columnType: "UInt64", isPrimaryKey: 1, defaultKind: "", defaultExpression: "" },
+  { columnName: "day", columnType: "Date", isPrimaryKey: 0, defaultKind: "", defaultExpression: "" },
+  {
+    columnName: "amount",
+    columnType: "LowCardinality(Nullable(String))",
+    isPrimaryKey: 0,
+    defaultKind: "DEFAULT",
+    defaultExpression: "''",
+  },
+];
+
+const OBJECT_INDEX_ROWS = [{ indexName: "idx_amount", indexExpression: "amount" }];
+
+/**
+ * `system.columns` for the whole fixture, keyed by the table it answers for.
+ *
+ * Per object rather than one shared row set, and that is what makes the bulk read's join
+ * non-trivial: a batch that answered every object the same columns would satisfy every
+ * "the two readings agree" assertion while joining nothing. `events` keeps the rows the
+ * single-read assertions above were written against.
+ */
+const OBJECT_COLUMNS_BY_TABLE: Readonly<Record<string, typeof OBJECT_COLUMN_ROWS>> = {
+  events: OBJECT_COLUMN_ROWS,
+  ".inner_id.fake": [{ columnName: "x", columnType: "UInt8", isPrimaryKey: 1, defaultKind: "", defaultExpression: "" }],
+  mv_target: [
+    { columnName: "customer_id", columnType: "UInt64", isPrimaryKey: 1, defaultKind: "", defaultExpression: "" },
+    { columnName: "total", columnType: "Decimal(12, 2)", isPrimaryKey: 0, defaultKind: "", defaultExpression: "" },
+  ],
+  events_view: [
+    { columnName: "customer", columnType: "String", isPrimaryKey: 0, defaultKind: "", defaultExpression: "" },
+  ],
+  mv_inner: [
+    { columnName: "customer_id", columnType: "UInt64", isPrimaryKey: 1, defaultKind: "", defaultExpression: "" },
+  ],
+  mv_to: [
+    { columnName: "total", columnType: "Decimal(12, 2)", isPrimaryKey: 0, defaultKind: "", defaultExpression: "" },
+  ],
+};
+
+/** `system.data_skipping_indices`, keyed the same way. Only `events` declares one. */
+const OBJECT_INDEXES_BY_TABLE: Readonly<Record<string, typeof OBJECT_INDEX_ROWS>> = { events: OBJECT_INDEX_ROWS };
+
+/**
+ * What `system.dictionaries` answers for a dictionary, one row per key and attribute.
+ * The provider flattens the four parallel arrays in SQL, so the transport still sees
+ * scalar columns.
+ */
+const DICTIONARY_COLUMN_ROWS = [
+  { columnName: "id", columnType: "UInt64", isKeyColumn: 1 },
+  { columnName: "name", columnType: "Nullable(String)", isKeyColumn: 0 },
+];
+
+/** The same, keyed by dictionary, so the bulk read's answer can be told apart per object. */
+const DICTIONARY_COLUMNS_BY_NAME: Readonly<Record<string, typeof DICTIONARY_COLUMN_ROWS>> = {
+  dict_regions_config: DICTIONARY_COLUMN_ROWS,
+  dict_users: [
+    { columnName: "id", columnType: "UInt64", isKeyColumn: 1 },
+    { columnName: "label", columnType: "String", isKeyColumn: 0 },
+  ],
+};
+
+/**
+ * The FLAT reading, over the SAME objects the object reading publishes (#789).
+ *
+ * Without it `getSchema()` here answers the monitoring fixture's `probe_*` tables, which
+ * share no name with any object this fixture lists, so the conformance helper's join guard
+ * could only report the two readings as two populations - which is the fixture defect that
+ * guard exists to catch.
+ *
+ * Three rows are deliberately NOT the object reading's:
+ *  - `.inner_id.<uuid>`, the implicit inner table, which the flat read has no exclusion for
+ *    and therefore SEES. The object surface excludes it structurally, by the view's own
+ *    uuid, so this is a real divergence and it is kept rather than smoothed away.
+ *  - `default.audit` and `demo.daily_events`, in other databases, because `getSchema()`
+ *    spans every non-system database while a folder is one database. They are spelled
+ *    qualified, which is what `displayName()` does for anything outside the pinned one.
+ */
+const FLAT_TABLE_ROWS = [
+  { database: OBJECT_DATABASE, name: ".inner_id.fake", total_rows: "0", total_bytes: "0" },
+  { database: OBJECT_DATABASE, name: MV_INNER_TABLE, total_rows: "2", total_bytes: "512" },
+  { database: OBJECT_DATABASE, name: "events", total_rows: "3", total_bytes: "1024" },
+  { database: OBJECT_DATABASE, name: "events_view", total_rows: null, total_bytes: null },
+  { database: OBJECT_DATABASE, name: "mv_inner", total_rows: "2", total_bytes: "512" },
+  { database: OBJECT_DATABASE, name: "mv_target", total_rows: "0", total_bytes: "0" },
+  { database: OBJECT_DATABASE, name: "mv_to", total_rows: null, total_bytes: null },
+  { database: "default", name: "audit", total_rows: "1", total_bytes: "64" },
+  { database: "demo", name: "daily_events", total_rows: "1", total_bytes: "64" },
+].map((row) => ({ ...row, sorting_key: "id", primary_key: "id" }));
+
+const FLAT_COLUMN_ROWS = FLAT_TABLE_ROWS.flatMap((table) =>
+  (OBJECT_COLUMNS_BY_TABLE[table.name] ?? OBJECT_COLUMN_ROWS).map((column) => ({
+    database: table.database,
+    table: table.name,
+    name: column.columnName,
+    type: column.columnType,
+    is_in_primary_key: column.isPrimaryKey,
+    default_kind: column.defaultKind,
+    default_expression: column.defaultExpression,
+  })),
+);
+
+/**
+ * Routes the object-surface statements, keyed on the aliases the provider itself
+ * chose, and falls back to `defaultReply` for everything else so a test in this block
+ * still gets the monitoring and schema fixtures.
+ */
+/** The name a detail statement embeds as a literal, for the column it filters on. */
+function literalFor(sql: string, column: string): string | undefined {
+  return new RegExp(`${column} = '([^']*)'`).exec(sql)?.[1];
+}
+
+/**
+ * The BULK column read's statements, answered off the SAME `OBJECT_ROWS` fixture (#789).
+ *
+ * One arm rather than three, because all of them carry the same target subquery and the
+ * point of the fake is that they describe the SAME set: the target is derived once here and
+ * the detail statements are answered against it. The `ORDER BY` and the `LIMIT` are applied
+ * rather than assumed, so dropping either from a statement changes what this answers.
+ *
+ * What it cannot see is a rewrite of the SQL itself (standing ruling 5b), which is why the
+ * whole method was also run against a live clickhouse-server 26.7.1.1315 holding
+ * `docker/clickhouse-init/01-object-fixture.sql` - see docs/providers/clickhouse.md.
+ */
+function bulkObjectReply(sql: string): Reply | null {
+  if (!sql.includes("AS objectName") || !sql.includes("IN (SELECT objectName")) {
+    // The bulk TARGET is the one statement that projects `objectName` alone.
+    if (!/^SELECT objectName FROM \(/.test(sql)) return null;
+  }
+  const kind = /objectKind = '([a-z_]+)'/.exec(sql)?.[1];
+  if (kind === undefined) return null;
+  const limit = /LIMIT (\d+)/.exec(sql)?.[1];
+  const dictionaryKnown = sql.includes("t.name IN");
+  const named = OBJECT_ROWS.filter((row) => {
+    let rowKind = row.objectKind;
+    if (kind === "table" && !dictionaryKnown && row.objectName === "dict_users") rowKind = "table";
+    return rowKind === kind;
+  }).map((row) => row.objectName);
+  const ordered = /ORDER BY objectName ASC/.test(sql) ? [...named].sort(byteOrder) : named;
+  const targets = limit === undefined ? ordered : ordered.slice(0, Number(limit));
+
+  if (sql.includes("AS isKeyColumn")) {
+    return jsonReply(
+      targets.flatMap((name) =>
+        (DICTIONARY_COLUMNS_BY_NAME[name] ?? []).map((column) => ({ objectName: name, ...column })),
+      ),
+    );
+  }
+  if (sql.includes("AS columnName")) {
+    return jsonReply(
+      targets.flatMap((name) =>
+        (OBJECT_COLUMNS_BY_TABLE[name] ?? []).map((column) => ({ objectName: name, ...column })),
+      ),
+    );
+  }
+  if (sql.includes("AS indexName")) {
+    return jsonReply(
+      targets.flatMap((name) => (OBJECT_INDEXES_BY_TABLE[name] ?? []).map((index) => ({ objectName: name, ...index }))),
+    );
+  }
+  return jsonReply(targets.map((objectName) => ({ objectName })));
+}
+
+function objectReply(sql: string): Reply {
+  const bulk = bulkObjectReply(sql);
+  if (bulk !== null) return bulk;
+  if (sql.includes("containerName")) return jsonReply(CONTAINER_ROWS);
+  if (sql.includes("FROM system.dictionaries") && !sql.includes("isKeyColumn") && !sql.includes("objectSource")) {
+    const dictRows = [
+      {
+        objectDatabase: OBJECT_DATABASE,
+        objectName: "dict_users",
+        objectKind: "dictionary",
+        objectRows: null,
+        objectBytes: null,
+      },
+      {
+        objectDatabase: "",
+        objectName: "dict_regions_config",
+        objectKind: "dictionary",
+        objectRows: null,
+        objectBytes: null,
+      },
+    ];
+    if (sql.includes(`WHERE database = '${OBJECT_DATABASE}'`) && !sql.includes("OR database = ''")) {
+      return jsonReply(dictRows.filter((row) => row.objectDatabase === OBJECT_DATABASE));
+    }
+    return jsonReply(dictRows);
+  }
+  if (sql.includes("objectCount")) return jsonReply(groupedCountRows(sql));
+  if (sql.includes("objectKind")) {
+    // The listing filters the same subquery the count grouped, so the fake server
+    // applies the same filter rather than carrying a second fixture. Ruling 5f holds
+    // in the fixture for the same reason it holds in the provider.
+    const match = /objectKind = '([a-z_]+)'/.exec(sql);
+    if (match === null) return jsonReply(OBJECT_ROWS);
+    const dictionaryKnown = sql.includes("t.name IN");
+    return jsonReply(
+      OBJECT_ROWS.filter((row) => {
+        let kind = row.objectKind;
+        if (!dictionaryKnown && row.objectName === "dict_users") kind = "table";
+        return kind === match[1];
+      }),
+    );
+  }
+  // Each keyed by the name the statement filters on, so a detail read of one object cannot
+  // be satisfied by another object's rows.
+  if (sql.includes("isKeyColumn")) return jsonReply(DICTIONARY_COLUMNS_BY_NAME[literalFor(sql, "name") ?? ""] ?? []);
+  if (sql.includes("columnName")) return jsonReply(OBJECT_COLUMNS_BY_TABLE[literalFor(sql, "c.table") ?? ""] ?? []);
+  if (sql.includes("indexName") && sql.includes("data_skipping_indices")) {
+    return jsonReply(OBJECT_INDEXES_BY_TABLE[literalFor(sql, "i.table") ?? ""] ?? []);
+  }
+  // The FLAT reading, over the same objects. See FLAT_TABLE_ROWS for what it deliberately
+  // does not share with the object reading.
+  if (sql.includes("FROM system.tables") && sql.includes("sorting_key")) return jsonReply(FLAT_TABLE_ROWS);
+  if (sql.includes("FROM system.columns") && sql.includes("is_in_primary_key")) return jsonReply(FLAT_COLUMN_ROWS);
+  if (sql.includes("FROM system.data_skipping_indices") && sql.includes("expr")) return jsonReply([]);
+  return defaultReply(sql);
+}
+
+/**
+ * Two names in the order ClickHouse's own `ORDER BY` puts them, which is the UTF-8 BYTE
+ * order and not JavaScript's UTF-16 code-unit order.
+ */
+function byteOrder(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+function installObjectReplies(): void {
+  replyFor = objectReply;
+}
+
+describe("object surface", () => {
+  test("declares one database container level and the five kinds ClickHouse has", async () => {
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    const capabilities = provider.getCapabilities();
+
+    expect(capabilities.containerLevels).toEqual([{ id: "schema", label: "Database", labelPlural: "Databases" }]);
+    expect((capabilities.objectKinds ?? []).map((kind) => ({ id: kind.id, role: kind.role }))).toEqual([
+      { id: "table", role: "relation" },
+      { id: "view", role: "relation" },
+      { id: "materialized_view", role: "relation" },
+      { id: "dictionary", role: "config" },
+      { id: "function", role: "routine" },
+    ]);
+
+    // ClickHouse has no trigger and no stored procedure, so neither is DECLARED. A
+    // declared kind draws a folder, and a folder for a concept the engine does not
+    // have is a lie its 0 badge makes look like a fact (standing ruling 4).
+    const ids = (capabilities.objectKinds ?? []).map((kind) => kind.id);
+    expect(ids).not.toContain("trigger");
+    expect(ids).not.toContain("procedure");
+
+    // A row write here is `ALTER TABLE ... UPDATE`, not the statement the inline row
+    // editor builds, so no kind accepts one.
+    expect((capabilities.objectKinds ?? []).every((kind) => kind.acceptsRowWrites === undefined)).toBe(true);
+    await provider.disconnect();
+  });
+
+  test("declares source on exactly the kinds that have a definition text", async () => {
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    const kinds = provider.getCapabilities().objectKinds ?? [];
+
+    const declared = kinds
+      .filter((kind) => kind.hasSource === true)
+      .map((kind) => [kind.id, kind.sourceLanguage] as const)
+      .sort();
+    expect(declared).toEqual([
+      ["dictionary", "sql"],
+      ["function", "sql"],
+      ["materialized_view", "sql"],
+      ["table", "sql"],
+      ["view", "sql"],
+    ]);
+
+    // The other direction, so a kind added later cannot quietly gain a Source tab. Every
+    // kind ClickHouse declares has a definition text: the four table-backed ones read
+    // `system.tables.create_table_query` and a function reads `system.functions.create_query`
+    // (probe 10, #789), so this list is empty and the assertion is the pairing rather than a
+    // population.
+    expect(
+      kinds
+        .filter((kind) => kind.hasSource !== true)
+        .map((kind) => kind.id)
+        .sort(),
+    ).toEqual([]);
+    await provider.disconnect();
+  });
+
+  test("declares columns on exactly the four kinds a catalog describes, and the engine agrees", async () => {
+    // The declaration is NOT `role === "relation"` here, and this engine is one of the five
+    // cases in the fleet that refute the role: a dictionary is `role: "config"` and still
+    // answers its structure, out of `system.dictionaries` (#789, and `describeDictionary()`
+    // in `clickhouse/objects.ts` carries the measurement). A function is the other side:
+    // `CLICKHOUSE_OBJECT_CATALOGS` has no entry a column could come from, so it answers
+    // three empty arrays without a round trip and must declare nothing.
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    const kinds = provider.getCapabilities().objectKinds ?? [];
+
+    expect(
+      kinds
+        .filter((kind) => kind.hasColumns === true)
+        .map((kind) => kind.id)
+        .sort(),
+    ).toEqual(["dictionary", "materialized_view", "table", "view"]);
+    // The other direction, so a kind added later cannot quietly gain a twisty. Absent is
+    // the abstention, and `false` is not written anywhere: `kindHasColumns` reads both the
+    // same way and one spelling keeps the census readable.
+    expect(kinds.filter((kind) => kind.hasColumns !== true).map((kind) => kind.id)).toEqual(["function"]);
+    expect(kinds.every((kind) => kind.hasColumns !== false)).toBe(true);
+
+    // Each declaration against the engine's own answer, at one object per kind, because a
+    // declaration checked against a transcription is checked against nothing. Both fields
+    // are asserted: the tree feeds `column.name` to `pathKey`, which calls `replaceAll` on
+    // it, and splits `column.type` in the row.
+    const samples = [
+      { kind: "table", name: "events" },
+      { kind: "view", name: "events_view" },
+      { kind: "materialized_view", name: "mv_to" },
+      { kind: "dictionary", name: "dict_users" },
+    ] as const;
+    for (const sample of samples) {
+      const detail = await provider.describeObject([OBJECT_DATABASE, sample.name], sample.kind);
+      expect(detail.columns.length).toBeGreaterThan(0);
+      for (const column of detail.columns) {
+        expect(typeof column.name).toBe("string");
+        expect(column.name.trim()).not.toBe("");
+        expect(typeof column.type).toBe("string");
+        expect(column.type.trim()).not.toBe("");
+      }
+    }
+
+    // The abstaining kind, from the same provider, so the negative direction is a read and
+    // not an omission.
+    const fn = await provider.describeObject([OBJECT_DATABASE, "probe_double"], "function");
+    expect(fn.columns).toEqual([]);
+    await provider.disconnect();
+  });
+
+  test("satisfies the shared object surface contract", async () => {
+    // The source statements are routed too, because the helper reads a document for every
+    // source-bearing kind it counts above zero and this provider declares all five.
+    replyFor = (sql) => sourceReply(sql) ?? objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await assertObjectSurface(provider, {
+      containers: [[OBJECT_DATABASE], ["default"], ["demo"]],
+      kinds: { table: 3, view: 1, materialized_view: 2, dictionary: 2, function: 1 },
+      sampleObject: { path: [OBJECT_DATABASE, "events"], kind: "table" },
+      // An authored path whose last segment names nothing. The absence must RAISE rather
+      // than answer a refusal part, and the helper's own positive control is that it has
+      // already read a `table` document through the same bind.
+      absentSource: { path: [OBJECT_DATABASE, "no_such_table"], kind: "table" },
+    });
+    await provider.disconnect();
+  });
+});
+
+/**
+ * The rest of the object surface: the catalog reads behind each kind, the detail rows,
+ * the refusals and the two derivations standing ruling 5g names. Kept OUT of the
+ * `object surface` describe above so `-t "object surface"` still runs exactly the two
+ * conformance tests.
+ */
+describe("object surface internals", () => {
+  test("the container listing is bound to nothing and marks the session's own database", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const containers = await provider.listContainers();
+
+    expect(containers).toEqual([
+      { path: [OBJECT_DATABASE], name: OBJECT_DATABASE, level: 0, isSessionDefault: true },
+      { path: ["default"], name: "default", level: 0, isSessionDefault: false },
+      { path: ["demo"], name: "demo", level: 0, isSessionDefault: false },
+    ]);
+    // The server's own answer for which container the session is in, never the
+    // configured string, which is what a person typed into a form.
+    expect(sqlWith("containerName")).toContain("name = currentDatabase()");
+    // The system databases are excluded, and `information_schema` really does exist
+    // twice, once in each case (live-verified).
+    expect(sqlWith("containerName")).toContain("name NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')");
+    await provider.disconnect();
+  });
+
+  test("nothing nests under a database, so a parent path answers empty without a read", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    expect(await provider.listContainers([OBJECT_DATABASE])).toEqual([]);
+    // The control: no statement was sent at all, so this is an answer rather than an
+    // empty read.
+    expect(sentSql.filter((sql) => sql.includes("containerName"))).toEqual([]);
+    await provider.disconnect();
+  });
+
+  test("a container row with no usable name is skipped rather than addressed as empty", async () => {
+    replyFor = (sql) =>
+      sql.includes("containerName") ? jsonReply([{ containerName: "", isSessionDefault: 0 }]) : objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    expect(await provider.listContainers()).toEqual([]);
+    await provider.disconnect();
+  });
+
+  test("the count and the listing read ONE subquery, which is what makes them agree", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await provider.countObjects([OBJECT_DATABASE]);
+    await provider.listObjects([OBJECT_DATABASE], "view");
+
+    const counting = sqlWith("objectCount");
+    const listing = sqlWith("objectKind = 'view'");
+    // Standing ruling 5f, held by construction rather than by two statements agreeing:
+    // the count GROUPs the same text the listing FILTERs, so there is no second WHERE
+    // clause for the two to drift apart in. Oracle and MySQL both failed 5f on their
+    // first pass, and both had a count and a listing reading different catalogs.
+    const subquery = [
+      "FROM system.tables AS t",
+      `WHERE t.database = '${OBJECT_DATABASE}'`,
+      "AND (t.database, t.name) NOT IN (",
+    ].join(" ");
+    expect(counting).toContain(subquery);
+    expect(listing).toContain(subquery);
+    await provider.disconnect();
+  });
+
+  test("the implicit inner table of a TO-less materialized view is excluded STRUCTURALLY", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await provider.listObjects([OBJECT_DATABASE], "table");
+    const listing = sqlWith("objectKind = 'table'");
+
+    // Measured on 26.7.1.1315 rather than assumed: a materialised view with no `TO`
+    // clause owns `.inner_id.<its own uuid>`, and its `target_table` names that table
+    // exactly. The uuid equality is the half that separates an inner table from an
+    // explicit `TO` target, which is an ordinary user table.
+    expect(listing).toContain("FROM system.tables AS mv");
+    expect(listing).toContain("WHERE mv.engine = 'MaterializedView'");
+    expect(listing).toContain("AND mv.target_table = concat('.inner_id.', toString(mv.uuid))");
+
+    // And NOT by name. `CREATE TABLE analytics.`.inner_id.fake`` succeeds on this
+    // engine (measured), so a `LIKE '.inner%'` predicate would hide a table a person
+    // created. The fixture carries that table and the listing returns it.
+    expect(listing).not.toContain("LIKE");
+    const tables = await provider.listObjects([OBJECT_DATABASE], "table");
+    expect(tables.map((object) => object.name)).toEqual([".inner_id.fake", "events", "mv_target"]);
+    // `mv_target` is the explicit `TO` target of `mv_to` and stays visible; the real
+    // inner table is absent from the same listing.
+    expect(tables.map((object) => object.name)).not.toContain(MV_INNER_TABLE);
+    await provider.disconnect();
+  });
+
+  test("a user-defined function is enumerated by EXCLUDING the engine's own origin", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const functions = await provider.listObjects([OBJECT_DATABASE], "function");
+
+    expect(functions).toEqual([{ path: [OBJECT_DATABASE, "probe_double"], name: "probe_double", kind: "function" }]);
+    // Standing ruling 5a, and the ENGINE publishes the vocabulary in the column type:
+    // `system.functions.origin` is `Enum8('System' = 0, 'SQLUserDefined' = 1,
+    // 'ExecutableUserDefined' = 2, 'WasmUserDefined' = 3)`. Writing the filter as "not
+    // System" admits all three user-defined origins AND a fourth one a later build
+    // adds; an inclusion list of the three would lose it silently, out of the count and
+    // out of the listing at once.
+    expect(sqlWith("objectKind = 'function'")).toContain("WHERE f.origin != 'System'");
+    expect(sqlWith("objectKind = 'function'")).not.toContain("SQLUserDefined");
+    await provider.disconnect();
+  });
+
+  test("a dictionary is counted once, not as a table as well", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const counts = await provider.countObjects([OBJECT_DATABASE]);
+
+    expect(counts).toEqual({
+      table: { count: 3 },
+      view: { count: 1 },
+      materialized_view: { count: 2 },
+      // Two: the DDL one and the config-file one.
+      dictionary: { count: 2 },
+      function: { count: 1 },
+    });
+    // A dictionary is a row of `system.tables` too (measured), so it has to be diverted
+    // off the `table` default or it is counted twice. The divert is MEMBERSHIP of
+    // `system.dictionaries`, not the engine name: measured on 26.7.1.1315,
+    // `CREATE TABLE d (id UInt64, name String) ENGINE = Dictionary(demo.dict_customers)`
+    // is accepted and produces a `system.tables` row with engine `Dictionary` and NO
+    // `system.dictionaries` row. That object is a table that reads a dictionary, and the
+    // engine name alone cannot tell the two apart. `table` stays the default arm because
+    // `system.tables.engine` is an OPEN set - 129 distinct values on a bare server - and
+    // an inclusion list would make every engine this code has never heard of invisible.
+    const counting = sqlWith("objectCount");
+    expect(counting).toContain("t.name IN ('dict_users')");
+    expect(counting).not.toContain("dict_regions_config");
+    expect(counting).not.toContain("t.engine = 'Dictionary'");
+    expect(counting).toContain("'table')");
+    await provider.disconnect();
+  });
+
+  test("a CONFIG-FILE dictionary is reached, because it has no system.tables row at all", async () => {
+    // Measured on 26.7.1.1315 against a server carrying both flavours. A dictionary
+    // declared in `/etc/clickhouse-server/*_dictionary.xml` appears in
+    // `system.dictionaries` with an EMPTY `database` and produces NO `system.tables` row
+    // and no `system.columns` row:
+    //
+    //   SELECT database, name FROM system.dictionaries
+    //     ->  ''    dict_regions_config     <- the config one
+    //         demo  dict_customers          <- the DDL one
+    //   SELECT count() FROM system.tables WHERE name = 'dict_regions_config'   ->  0
+    //
+    // Sourcing dictionaries from `system.tables` alone therefore lost it from the count
+    // AND the listing together, which is standing ruling 5a's exact absence: invisible in
+    // the tree while the badge keeps agreeing with the folder, so 5f holds and nothing
+    // detects it. Reading `system.dictionaries` separately reaches both flavours.
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const dictionaries = await provider.listObjects([OBJECT_DATABASE], "dictionary");
+
+    expect(dictionaries.map((object) => object.name)).toEqual(["dict_regions_config", "dict_users"]);
+    const listing = sqlWith("objectKind = 'dictionary'");
+    expect(listing).toContain("FROM system.dictionaries");
+    // The empty database IS the config-file dictionary's address: a database cannot be
+    // named the empty string, so this arm can never duplicate a DDL dictionary, which
+    // always carries its own database (measured). Like a function, it is server-global,
+    // so it is listed under every database and its path records the container it was
+    // reached through.
+    expect(listing).toContain("database = ''");
+    expect(dictionaries.map((object) => object.path)).toEqual([
+      [OBJECT_DATABASE, "dict_regions_config"],
+      [OBJECT_DATABASE, "dict_users"],
+    ]);
+    await provider.disconnect();
+  });
+
+  test("a declared kind the database holds none of badges 0 rather than vanishing", async () => {
+    // Seeded before the read. Building the record from the GROUP BY rows alone would
+    // leave the kind out, and an absent kind means something else and stronger: the
+    // engine has no such concept, so the tree draws no folder at all.
+    replyFor = (sql) => {
+      if (sql.includes("system.dictionaries")) return jsonReply([]);
+      if (sql.includes("objectCount")) return jsonReply([{ objectKind: "table", objectCount: "2" }]);
+      return objectReply(sql);
+    };
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const counts = await provider.countObjects([OBJECT_DATABASE]);
+
+    expect(counts.table).toEqual({ count: 2 });
+    expect(counts.dictionary).toEqual({ count: 0 });
+    expect(counts.function).toEqual({ count: 0 });
+    await provider.disconnect();
+  });
+
+  test("a refused count carries the server's own sentence, per kind, and is never 0", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    denyEverything();
+
+    const counts = await provider.countObjects([OBJECT_DATABASE]);
+
+    for (const kind of ["table", "view", "materialized_view", "dictionary", "function"]) {
+      expect(counts[kind]).toHaveProperty("unavailable");
+      // The server's words, not this product's prefix: a refused read is rendered to a
+      // person as the reason a folder has no number.
+      expect((counts[kind] as { unavailable: string }).unavailable).toContain("Not enough privileges");
+    }
+    await provider.disconnect();
+  });
+
+  test("a refused system.dictionaries read marks only dictionary as unavailable, leaving tables intact", async () => {
+    replyFor = (sql) => (sql.includes("system.dictionaries") ? DENIED() : objectReply(sql));
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    // countObjects survives:
+    const counts = await provider.countObjects([OBJECT_DATABASE]);
+    expect(counts.dictionary).toEqual({ unavailable: expect.stringMatching(/Not enough privileges/) });
+    // Without system.dictionaries, dict_users (which has a system.tables row) stays under table:
+    expect(counts.table).toEqual({ count: 4 });
+    expect(counts.view).toEqual({ count: 1 });
+    expect(counts.materialized_view).toEqual({ count: 2 });
+    expect(counts.function).toEqual({ count: 1 });
+
+    // listObjects("table") survives:
+    const tables = await provider.listObjects([OBJECT_DATABASE], "table");
+    expect(tables.map((t) => t.name)).toEqual([".inner_id.fake", "dict_users", "events", "mv_target"]);
+
+    // listObjects("dictionary") propagates the denial:
+    await expect(provider.listObjects([OBJECT_DATABASE], "dictionary")).rejects.toBeInstanceOf(AuthenticationError);
+
+    // describeObjects("table") survives:
+    const batch = await provider.describeObjects([OBJECT_DATABASE], "table");
+    expect(batch.details.length).toBeGreaterThan(0);
+
+    await provider.disconnect();
+  });
+
+  test("a table sharing a name with a config-file dictionary is not pulled out of the table folder", async () => {
+    // A config-file dictionary has database = '' in system.dictionaries and no row in system.tables.
+    // If a normal table in the browsed database happens to share its name, matching only the browsed
+    // database's rows (where database = {database}) prevents the table from being pulled out into
+    // the dictionary folder.
+    const COLLISION_NAME = "dict_regions_config";
+    replyFor = (sql) => {
+      if (sql.includes("FROM system.tables") && sql.includes("AS objectKind")) {
+        return jsonReply([
+          { objectName: COLLISION_NAME, objectKind: "table", objectRows: "10", objectBytes: "1024" },
+          { objectName: "events", objectKind: "table", objectRows: "3", objectBytes: "1024" },
+        ]);
+      }
+      if (sql.includes("FROM system.dictionaries") && !sql.includes("isKeyColumn")) {
+        const dictRows = [
+          {
+            objectDatabase: "",
+            objectName: COLLISION_NAME,
+            objectKind: "dictionary",
+            objectRows: null,
+            objectBytes: null,
+          },
+        ];
+        if (sql.includes(`WHERE database = '${OBJECT_DATABASE}'`) && !sql.includes("OR database = ''")) {
+          return jsonReply(dictRows.filter((row) => row.objectDatabase === OBJECT_DATABASE));
+        }
+        return jsonReply(dictRows);
+      }
+      return objectReply(sql);
+    };
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    // In the table listing, the table dict_regions_config is present:
+    const tables = await provider.listObjects([OBJECT_DATABASE], "table");
+    expect(tables.map((t) => t.name)).toContain(COLLISION_NAME);
+
+    // In the dictionary listing, the config-file dictionary is also present:
+    const dicts = await provider.listObjects([OBJECT_DATABASE], "dictionary");
+    expect(dicts.map((d) => d.name)).toContain(COLLISION_NAME);
+
+    await provider.disconnect();
+  });
+
+  test("a non-497 error on system.dictionaries rejects across counts, listObjects and describeObjects", async () => {
+    installObjectReplies();
+    replyFor = (sql) =>
+      sql.includes("FROM system.dictionaries")
+        ? exceptionReply(TIMEOUT_EXCEEDED, "TIMEOUT_EXCEEDED", "Timeout exceeded: elapsed 30 s", 500)
+        : objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await expect(provider.countObjects([OBJECT_DATABASE])).rejects.toThrow(/Timeout exceeded/);
+    await expect(provider.listObjects([OBJECT_DATABASE], "table")).rejects.toThrow(/Timeout exceeded/);
+    await expect(provider.describeObjects([OBJECT_DATABASE], "table")).rejects.toThrow(/Timeout exceeded/);
+    await provider.disconnect();
+  });
+
+  test("a count row whose kind names a prototype member draws no folder either", async () => {
+    // `Object.hasOwn` and not `in`, which is what makes the declared-kind guard
+    // ABSOLUTE rather than nearly so. `"toString" in counts` is true on any object
+    // literal, so the `in` spelling would write a folder for a kind the provider never
+    // declared, out of a catalog row nobody can see.
+    replyFor = (sql) =>
+      sql.includes("objectCount")
+        ? jsonReply([
+            { objectKind: "table", objectCount: "3" },
+            { objectKind: "toString", objectCount: "9" },
+            { objectKind: "constructor", objectCount: "9" },
+            { objectKind: "__proto__", objectCount: "9" },
+          ])
+        : objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const counts = await provider.countObjects([OBJECT_DATABASE]);
+
+    // The control, so this is not a test of an empty read: the declared kind DID take
+    // its count from the same rows.
+    expect(counts.table).toEqual({ count: 3 });
+    expect(Object.keys(counts).sort()).toEqual(["dictionary", "function", "materialized_view", "table", "view"]);
+    await provider.disconnect();
+  });
+
+  test("a count row with no kind or an unreadable number leaves the seeded zero alone", async () => {
+    replyFor = (sql) =>
+      sql.includes("objectCount")
+        ? jsonReply([
+            { objectKind: "", objectCount: "4" },
+            { objectKind: "view", objectCount: "not a number" },
+          ])
+        : objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const counts = await provider.countObjects([OBJECT_DATABASE]);
+
+    expect(counts.view).toEqual({ count: 0 });
+    expect(counts.table).toEqual({ count: 0 });
+    await provider.disconnect();
+  });
+
+  test("an unknown row count is ABSENT rather than zero, and a measured one is reported", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const views = await provider.listObjects([OBJECT_DATABASE], "materialized_view");
+
+    // `total_rows`/`total_bytes` are `Nullable(UInt64)` and really are null for a view
+    // and for a materialised view with a `TO` clause (measured). A view reported as 0
+    // rows and 0 bytes is a measurement nobody took.
+    expect(views).toEqual([
+      { path: [OBJECT_DATABASE, "mv_inner"], name: "mv_inner", kind: "materialized_view", rowCount: 2, sizeBytes: 512 },
+      { path: [OBJECT_DATABASE, "mv_to"], name: "mv_to", kind: "materialized_view" },
+    ]);
+    await provider.disconnect();
+  });
+
+  test("a listing row with no usable name is skipped rather than addressed as empty", async () => {
+    replyFor = (sql) =>
+      sql.includes("objectKind = 'view'")
+        ? jsonReply([{ objectName: "", objectKind: "view", objectRows: null, objectBytes: null }])
+        : objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    expect(await provider.listObjects([OBJECT_DATABASE], "view")).toEqual([]);
+    await provider.disconnect();
+  });
+
+  test("objects sort by PATH, segment by segment, not by a joined string", async () => {
+    // `JSON.stringify(path)` is the obvious spelling and it is wrong twice: at mixed
+    // depth the deeper path sorts first, because `,` (0x2C) is below `]` (0x5D), and
+    // JSON escapes, so a name holding a backslash or a quote sorts by its escape
+    // sequence. ClickHouse accepts all three in a backquoted identifier.
+    replyFor = (sql) =>
+      sql.includes("objectKind = 'table'")
+        ? jsonReply([
+            { objectName: "bZ", objectKind: "table", objectRows: null, objectBytes: null },
+            { objectName: 'b"q', objectKind: "table", objectRows: null, objectBytes: null },
+            { objectName: "a", objectKind: "table", objectRows: null, objectBytes: null },
+          ])
+        : objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const tables = await provider.listObjects([OBJECT_DATABASE], "table");
+
+    // Code points: `"` (0x22) below `Z` (0x5A). `JSON.stringify` escapes the quote to
+    // `\"`, so the comparison lands on `\` (0x5C) against `Z` and reverses the pair.
+    expect(tables.map((object) => object.name)).toEqual(["a", 'b"q', "bZ"]);
+    await provider.disconnect();
+  });
+
+  test("a kind the declaration does not carry is refused by name, in both methods", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await expect(provider.listObjects([OBJECT_DATABASE], "sequence")).rejects.toThrow(
+      /ClickHouse declares no object kind "sequence"/,
+    );
+    await expect(provider.describeObject([OBJECT_DATABASE, "x"], "sequence")).rejects.toThrow(
+      /ClickHouse declares no object kind "sequence"/,
+    );
+    await provider.disconnect();
+  });
+
+  test("a kind that is declared but has no listing statement says so, not that it is undeclared", async () => {
+    // Two questions, and only the declaration answers the first. Deciding "declared"
+    // from whether a statement exists would report "declares no object kind" about a
+    // kind `objectKinds` does declare.
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    const real = provider.getCapabilities();
+    spyOn(provider, "getCapabilities").mockReturnValue({
+      ...real,
+      objectKinds: [...(real.objectKinds ?? []), { id: "projection", role: "config", label: "P", labelPlural: "Ps" }],
+    });
+
+    await expect(provider.listObjects([OBJECT_DATABASE], "projection")).rejects.toThrow(
+      /declares the kind "projection" but has no statement that lists it/,
+    );
+    await provider.disconnect();
+  });
+
+  test("a table's detail is columns and skipping indexes, and never a foreign key", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const detail = await provider.describeObject([OBJECT_DATABASE, "events"], "table");
+
+    expect(detail.path).toEqual([OBJECT_DATABASE, "events"]);
+    expect(detail.columns).toEqual([
+      { name: "id", type: "UInt64", nullable: false, isPrimary: true, defaultValue: undefined },
+      { name: "day", type: "Date", nullable: false, isPrimary: false, defaultValue: undefined },
+      // `LowCardinality(Nullable(String))` is the one combination spelled with the
+      // nullable wrapper INSIDE, so a bare prefix test would call it not nullable.
+      {
+        name: "amount",
+        type: "LowCardinality(Nullable(String))",
+        nullable: true,
+        isPrimary: false,
+        defaultValue: "''",
+      },
+    ]);
+    // A data-skipping index prunes granules and enforces nothing, so no index
+    // ClickHouse reports is unique.
+    expect(detail.indexes).toEqual([{ name: "idx_amount", columns: ["amount"], unique: false }]);
+    // Always empty, and that is the engine: ClickHouse parses REFERENCES and enforces
+    // nothing by it, and `system.*` holds no constraint catalog to read one back from.
+    expect(detail.foreignKeys).toEqual([]);
+    // Neither bind is positional: the database is the segment the DECLARATION assigns
+    // to the `schema` level and the name is the LAST segment.
+    expect(sqlWith("columnName")).toContain(`WHERE c.database = '${OBJECT_DATABASE}' AND c.table = 'events'`);
+    await provider.disconnect();
+  });
+
+  test("a dictionary describes from system.dictionaries, which is the only catalog BOTH flavours are in", async () => {
+    // `system.columns` answers a DDL dictionary's columns (measured), and that was the
+    // first spelling. It cannot answer a CONFIG-FILE dictionary's, because that
+    // dictionary has no `system.tables` row and therefore no `system.columns` row either
+    // (measured: count 0). Describing every dictionary out of `system.dictionaries`
+    // instead is the one catalog both flavours are in, and it carries the key/attribute
+    // split, so a key column is reported `isPrimary` rather than guessed at.
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const detail = await provider.describeObject([OBJECT_DATABASE, "dict_regions_config"], "dictionary");
+
+    expect(detail.columns).toEqual([
+      { name: "id", type: "UInt64", nullable: false, isPrimary: true, defaultValue: undefined },
+      { name: "name", type: "Nullable(String)", nullable: true, isPrimary: false, defaultValue: undefined },
+    ]);
+    // No index and no foreign key: a dictionary's LAYOUT is not an index, and
+    // `system.data_skipping_indices` holds nothing for one.
+    expect(detail.indexes).toEqual([]);
+    expect(detail.foreignKeys).toEqual([]);
+    // The control: `system.columns` was never read for a dictionary.
+    expect(sentSql.filter((sql) => sql.includes("FROM system.columns"))).toEqual([]);
+    // A config dictionary is addressed under whatever database it was reached through,
+    // so the read has to accept the empty database as well as the container's own.
+    expect(sqlWith("isKeyColumn")).toContain(
+      `WHERE (database = '${OBJECT_DATABASE}' OR database = '') AND name = 'dict_regions_config'`,
+    );
+    await provider.disconnect();
+  });
+
+  test("a dictionary that is not there raises rather than describing itself as empty", async () => {
+    replyFor = (sql) => (sql.includes("isKeyColumn") ? jsonReply([]) : objectReply(sql));
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await expect(provider.describeObject([OBJECT_DATABASE, "ghost"], "dictionary")).rejects.toThrow(
+      /No ClickHouse dictionary named ghost in analytics/,
+    );
+    await provider.disconnect();
+  });
+
+  test("a declared kind with no catalog says so in BOTH methods, rather than describing as empty", async () => {
+    // The two methods have to agree about what an unmapped kind is. `listObjects` raised
+    // and `describeObject` returned three empty arrays, so a kind added to the
+    // declaration alone drew a real-looking empty detail panel instead of an error - and
+    // the `projection` test below it only exercised `listObjects`, so it pinned the
+    // wrong direction.
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    const real = provider.getCapabilities();
+    spyOn(provider, "getCapabilities").mockReturnValue({
+      ...real,
+      objectKinds: [...(real.objectKinds ?? []), { id: "projection", role: "config", label: "P", labelPlural: "Ps" }],
+    });
+
+    await expect(provider.describeObject([OBJECT_DATABASE, "p"], "projection")).rejects.toThrow(
+      /declares the kind "projection" but has no statement that describes it/,
+    );
+    await provider.disconnect();
+  });
+
+  test("a kind named after a prototype member inherits no catalog", async () => {
+    // The catalog map is a plain object, so `CATALOGS["toString"]` answers
+    // `Function.prototype.toString` rather than undefined. A declared kind of that name
+    // would then pass the "has a catalog" guard and reach a statement builder with a
+    // catalog that is a function. `Object.hasOwn` is the same guard `applyKindCounts`
+    // already uses for the counts.
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    const real = provider.getCapabilities();
+    spyOn(provider, "getCapabilities").mockReturnValue({
+      ...real,
+      objectKinds: [...(real.objectKinds ?? []), { id: "toString", role: "config", label: "T", labelPlural: "Ts" }],
+    });
+
+    await expect(provider.listObjects([OBJECT_DATABASE], "toString")).rejects.toThrow(
+      /declares the kind "toString" but has no statement that lists it/,
+    );
+    await expect(provider.describeObject([OBJECT_DATABASE, "x"], "toString")).rejects.toThrow(
+      /declares the kind "toString" but has no statement that describes it/,
+    );
+    await provider.disconnect();
+  });
+
+  test("the KIND is checked before the path, in both methods", async () => {
+    // Two guards, one order. `listObjects` checked the container first and
+    // `describeObject` the kind first, so one bad call reported the container and the
+    // other the kind. The kind is a question about the DECLARATION and is answered
+    // without looking at any data, so it goes first in both.
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await expect(provider.listObjects([OBJECT_DATABASE, "too", "long"], "sequence")).rejects.toThrow(
+      /declares no object kind "sequence"/,
+    );
+    await expect(provider.describeObject([OBJECT_DATABASE, "too", "long"], "sequence")).rejects.toThrow(
+      /declares no object kind "sequence"/,
+    );
+    await provider.disconnect();
+  });
+
+  test("a function answers three empty arrays with no round trip", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const detail = await provider.describeObject([OBJECT_DATABASE, "probe_double"], "function");
+
+    expect(detail).toEqual({ path: [OBJECT_DATABASE, "probe_double"], columns: [], indexes: [], foreignKeys: [] });
+    // The control: no catalog read was issued at all, so the empty arrays are a fact
+    // about the kind rather than a read that returned nothing.
+    expect(sentSql.filter((sql) => sql.includes("columnName"))).toEqual([]);
+    await provider.disconnect();
+  });
+
+  test("an object that is not there raises rather than describing itself as empty", async () => {
+    // `CREATE TABLE t ()` is a syntax error on this engine (measured, code 62), so
+    // every table-backed object has at least one column and an empty answer means the
+    // object is not there under that name in this database.
+    replyFor = (sql) => (sql.includes("columnName") ? jsonReply([]) : objectReply(sql));
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await expect(provider.describeObject([OBJECT_DATABASE, "ghost"], "table")).rejects.toThrow(
+      /No ClickHouse table named ghost in analytics/,
+    );
+    await provider.disconnect();
+  });
+
+  test("a refused index read reports columns with indexes unavailable instead of throwing", async () => {
+    // `system.data_skipping_indices` needs its own grant and answers code 497 without
+    // it. "This object has no skipping index" is a different fact from "you may not
+    // see its indexes", but throwing away the readable columns is wrong.
+    // The detail preserves columns and reports indexes as unavailable.
+    replyFor = (sql) => (sql.includes("indexName") ? DENIED() : objectReply(sql));
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const detail = await provider.describeObject([OBJECT_DATABASE, "events"], "table");
+    expect(detail.columns.length).toBeGreaterThan(0);
+    expect(detail.indexes).toEqual({ unavailable: expect.stringMatching(/Not enough privileges/) });
+    await provider.disconnect();
+  });
+
+  test("a non-497 error on single index read rejects rather than reporting unavailable", async () => {
+    installObjectReplies();
+    replyFor = (sql) =>
+      sql.includes("FROM system.data_skipping_indices")
+        ? exceptionReply(TIMEOUT_EXCEEDED, "TIMEOUT_EXCEEDED", "Timeout exceeded: elapsed 30 s", 500)
+        : objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await expect(provider.describeObject([OBJECT_DATABASE, "events"], "table")).rejects.toThrow(/Timeout exceeded/);
+    await provider.disconnect();
+  });
+
+  test("a column or index row with no usable name is skipped", async () => {
+    replyFor = (sql) => {
+      if (sql.includes("columnName")) {
+        return jsonReply([
+          { columnName: "", columnType: "UInt8", isPrimaryKey: 0, defaultKind: "", defaultExpression: "" },
+          { columnName: "kept", columnType: "UInt8", isPrimaryKey: 0, defaultKind: "", defaultExpression: "" },
+        ]);
+      }
+      if (sql.includes("indexName")) {
+        return jsonReply([
+          { indexName: "", indexExpression: "x" },
+          { indexName: "idx_kept", indexExpression: "(lower(b))" },
+        ]);
+      }
+      return objectReply(sql);
+    };
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const detail = await provider.describeObject([OBJECT_DATABASE, "events"], "table");
+
+    expect(detail.columns.map((column) => column.name)).toEqual(["kept"]);
+    expect(detail.indexes).toEqual([{ name: "idx_kept", columns: ["lower(b)"], unique: false }]);
+    await provider.disconnect();
+  });
+
+  test("a path of the wrong length is refused with the shape the DECLARATION describes", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await expect(provider.countObjects([])).rejects.toThrow(/container path is \[database\], received \[\]/);
+    await expect(provider.listObjects([OBJECT_DATABASE, "x"], "table")).rejects.toThrow(
+      /container path is \[database\], received \["analytics","x"\]/,
+    );
+    await expect(provider.describeObject([OBJECT_DATABASE], "table")).rejects.toThrow(
+      /"table" path is \[database, name\], received \["analytics"\]/,
+    );
+    await expect(provider.describeObject([OBJECT_DATABASE, "a", "b"], "table")).rejects.toThrow(
+      /"table" path is \[database, name\], received \["analytics","a","b"\]/,
+    );
+    await provider.disconnect();
+  });
+
+  test("the container depth and the name bind are DERIVED, which a two-level declaration shows", async () => {
+    // Standing ruling 5g. `container.length !== 1`, `path[0]` for the database and
+    // `path[1]` for the object name are all behaviour-identical to the derived forms on
+    // a one-level engine, which is exactly why three spellings of this defect shipped,
+    // each found one review later than the last. Rather than leave that to a two-level
+    // provider, this test hands THIS provider a two-level declaration and asks the same
+    // questions. The declaration is synthetic for ClickHouse; the derivation under test
+    // is the shared one every provider in #789 copies.
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    const real = provider.getCapabilities();
+    spyOn(provider, "getCapabilities").mockReturnValue({
+      ...real,
+      containerLevels: [
+        { id: "catalog", label: "Catalog", labelPlural: "Catalogs" },
+        { id: "schema", label: "Database", labelPlural: "Databases" },
+      ],
+    });
+
+    // The depth comes from `containerDepth()`, so a one-segment path is now WRONG and
+    // the message names both declared levels. A hardcoded `!== 1` would accept it.
+    await expect(provider.countObjects([OBJECT_DATABASE])).rejects.toThrow(
+      /container path is \[catalog, database\], received \["analytics"\]/,
+    );
+
+    // AND THE BINDS, which is the half a refusal-only test cannot see, and which is how
+    // the third spelling survived two providers and a review round. At this depth
+    // `path[0]` is the CATALOG and `path[1]` is the database, so binding `path[0]` as
+    // the database reads a database that does not exist, and binding `path[1]` as the
+    // name asks for an object called `analytics`.
+    const listed = await provider.listObjects(["warehouse", OBJECT_DATABASE], "table");
+    expect(sqlWith("objectKind = 'table'")).toContain(`WHERE t.database = '${OBJECT_DATABASE}'`);
+    expect(listed[0]?.path).toEqual(["warehouse", OBJECT_DATABASE, ".inner_id.fake"]);
+
+    const detail = await provider.describeObject(["warehouse", OBJECT_DATABASE, "events"], "table");
+    expect(detail.path).toEqual(["warehouse", OBJECT_DATABASE, "events"]);
+    expect(sqlWith("columnName")).toContain(`WHERE c.database = '${OBJECT_DATABASE}' AND c.table = 'events'`);
+    expect(sqlWith("indexName")).toContain(`WHERE i.database = '${OBJECT_DATABASE}' AND i.table = 'events'`);
+    await provider.disconnect();
+  });
+
+  test("a declaration with no database level is refused rather than bound to nothing", async () => {
+    // The other half of the segment guard. A path long enough for the declared depth
+    // still has no `schema` segment when the declaration carries no such level, and
+    // `undefined` must not reach the literal builder, which would quote the string
+    // "undefined" and read a database of that name.
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    const real = provider.getCapabilities();
+    spyOn(provider, "getCapabilities").mockReturnValue({
+      ...real,
+      containerLevels: [{ id: "catalog", label: "Catalog", labelPlural: "Catalogs" }],
+    });
+
+    await expect(provider.countObjects(["warehouse"])).rejects.toThrow(
+      /needs a "schema" container level and a segment for it; the declaration is \[catalog\]/,
+    );
+    await expect(provider.describeObject(["warehouse", "events"], "table")).rejects.toThrow(
+      /needs a "schema" container level and a segment for it/,
+    );
+    await provider.disconnect();
+  });
+
+  test("a name carrying a quote or a backslash is escaped into every statement", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await provider.describeObject([OBJECT_DATABASE, "o'brien\\x"], "table").catch(() => undefined);
+
+    // Both escapes are applied: ClickHouse honours the backslash inside a literal as
+    // well as the doubled quote, so escaping only the quote would leave `\'` as a way
+    // out of the string.
+    expect(sqlWith("columnName")).toContain("AND c.table = 'o''brien\\\\x'");
+    await provider.disconnect();
+  });
+
+  test("every object-surface method needs a connection", async () => {
+    const provider = new ClickHouseProvider(makeConnection({ database: OBJECT_DATABASE }));
+
+    await expect(provider.listContainers()).rejects.toBeInstanceOf(DatabaseConfigError);
+    await expect(provider.countObjects([OBJECT_DATABASE])).rejects.toBeInstanceOf(DatabaseConfigError);
+    await expect(provider.listObjects([OBJECT_DATABASE], "table")).rejects.toBeInstanceOf(DatabaseConfigError);
+    await expect(provider.describeObject([OBJECT_DATABASE, "events"], "table")).rejects.toBeInstanceOf(
+      DatabaseConfigError,
+    );
+  });
+});
+
+/**
+ * The bulk column read (#789).
+ *
+ * The fake replays the SAME `OBJECT_ROWS` fixture the single read replays, so every "the
+ * two readings agree" assertion compares two answers the provider produced. The whole
+ * method was also run against a live clickhouse-server 26.7.1.1315 holding
+ * `docker/clickhouse-init/01-object-fixture.sql`; what that run measured is in
+ * docs/providers/clickhouse.md.
+ */
+describe("ClickHouse bulk column read", () => {
+  test("describes every table in the folder, and each detail is what the single read answers", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const batch = await provider.describeObjects([OBJECT_DATABASE], "table");
+
+    expect(batch.truncated).toBeUndefined();
+    expect(batch.details.map((detail) => detail.path)).toEqual([
+      [OBJECT_DATABASE, ".inner_id.fake"],
+      [OBJECT_DATABASE, "events"],
+      [OBJECT_DATABASE, "mv_target"],
+    ]);
+    // One mapper serves both reads, so a divergence here is the bulk read spelling a column
+    // or an index differently from the single read of the same object.
+    for (const detail of batch.details) {
+      expect(detail).toEqual(await provider.describeObject(detail.path, "table"));
+    }
+    // The implicit inner table is in neither: the target is the same kind-tagged subquery
+    // the folder's listing filters, and it excludes an inner table structurally.
+    expect(batch.details.map((detail) => detail.path[1])).not.toContain(MV_INNER_TABLE);
+    await provider.disconnect();
+  });
+
+  test("every described path is one listObjects produced, for every relation kind", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    for (const kind of ["table", "view", "materialized_view"]) {
+      const listed = await provider.listObjects([OBJECT_DATABASE], kind);
+      const batch = await provider.describeObjects([OBJECT_DATABASE], kind);
+      expect(batch.details.map((detail) => detail.path)).toEqual(listed.map((object) => object.path));
+    }
+    await provider.disconnect();
+  });
+
+  test("a whole folder of tables costs four statements, and a folder of dictionaries two", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    sentSql.length = 0;
+
+    await provider.describeObjects([OBJECT_DATABASE], "table");
+    // Reading known dictionaries, the target read, the column read and the index read.
+    // The single read is two statements PER OBJECT, so the alternative for these three objects was six.
+    expect(sentSql).toHaveLength(4);
+
+    sentSql.length = 0;
+    await provider.describeObjects([OBJECT_DATABASE], "dictionary");
+    // A dictionary has no index at all - its LAYOUT is not one and
+    // `system.data_skipping_indices` holds nothing for it - so there is no third read.
+    expect(sentSql).toHaveLength(2);
+    await provider.disconnect();
+  });
+
+  test("both dictionary flavours describe, from the one catalog they are both in", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const batch = await provider.describeObjects([OBJECT_DATABASE], "dictionary");
+
+    // The DDL one and the CONFIG-FILE one, which has no `system.tables` row at all and
+    // therefore no `system.columns` row either. Each keeps its own columns.
+    expect(batch.details.map((detail) => detail.path)).toEqual([
+      [OBJECT_DATABASE, "dict_regions_config"],
+      [OBJECT_DATABASE, "dict_users"],
+    ]);
+    expect(batch.details[0]!.columns.map((column) => column.name)).toEqual(["id", "name"]);
+    expect(batch.details[1]!.columns.map((column) => column.name)).toEqual(["id", "label"]);
+    expect(batch.details.every((detail) => Array.isArray(detail.indexes) && detail.indexes.length === 0)).toBe(true);
+    // The control: `system.columns` was never read for a dictionary folder.
+    expect(sentSql.filter((sql) => sql.includes("FROM system.columns"))).toEqual([]);
+    await provider.disconnect();
+  });
+
+  test("the bulk dictionary read prefers the DDL flavour per name, which one LIMIT cannot do", async () => {
+    // `dictionaryColumnsSql()` picks the DDL dictionary over a config one of the same name
+    // with `ORDER BY database DESC LIMIT 1`, and that is a PER NAME choice, so the bulk form
+    // cannot use a `LIMIT` at all: it groups by name and takes each array with
+    // `argMax(..., database)`.
+    //
+    // MEASURED against clickhouse-server 26.7.1.1315, and the collision really is
+    // creatable: a `CREATE DICTIONARY demo.dict_regions_config` beside the config-file one
+    // gives `system.dictionaries` two rows for that name, and both readings then answer the
+    // DDL one's columns. Dropping `argMax` is not a wrong answer on this engine, it is a
+    // SERVER ERROR - code 215, "Column 'system.dictionaries.`key.names`' is not under
+    // aggregate function and not in GROUP BY keys" - which is why the clause is pinned by
+    // TEXT here rather than by a fixture that cannot produce it.
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await provider.describeObjects([OBJECT_DATABASE], "dictionary");
+
+    const sql = sqlWith("AS isKeyColumn");
+    expect(sql).toContain("argMax(`key.names`, database) AS keyNames");
+    expect(sql).toContain("argMax(`attribute.types`, database) AS attributeTypes");
+    expect(sql).toContain("GROUP BY name");
+    // And the config flavour's empty database is still accepted alongside the container's.
+    expect(sql).toContain(`WHERE (database = '${OBJECT_DATABASE}' OR database = '')`);
+    await provider.disconnect();
+  });
+
+  test("the engine cuts under its own order and the answer is sorted by path, and those are two different orders", async () => {
+    // The one probe that separates the two on this engine. MEASURED on
+    // clickhouse-server 26.7.1.1315: `ORDER BY name ASC` over a database holding `U+E000`
+    // and `U+1F600` answers `U+E000` first, because ClickHouse compares Strings as UTF-8
+    // BYTES; a JavaScript sort answers the reverse, because it compares UTF-16 code units
+    // and the surrogate `0xD83D` sorts below `0xE000`. The fake below is the engine's order,
+    // not a convenience.
+    const exotic = ["\uE000", "\u{1F600}"];
+    replyFor = (sql) =>
+      /^SELECT objectName FROM \(/.test(sql) && sql.includes("objectKind = 'table'")
+        ? jsonReply(exotic.map((objectName) => ({ objectName })))
+        : objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const batch = await provider.describeObjects([OBJECT_DATABASE], "table");
+
+    expect(batch.details.map((detail) => detail.path)).toEqual([
+      [OBJECT_DATABASE, "\u{1F600}"],
+      [OBJECT_DATABASE, "\uE000"],
+    ]);
+    await provider.disconnect();
+  });
+
+  test("a function answers an empty batch with no round trip at all", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    sentSql.length = 0;
+
+    await expect(provider.describeObjects([OBJECT_DATABASE], "function")).resolves.toEqual({ details: [] });
+
+    // Not "no rows came back": nothing was sent. A ClickHouse UDF resolves in no column
+    // catalog, which is a fact about the KIND and is answered from the declaration.
+    expect(sentSql).toEqual([]);
+    // The control: a kind that DOES have columns still reaches the server.
+    await provider.describeObjects([OBJECT_DATABASE], "view");
+    expect(sentSql.length).toBeGreaterThan(0);
+    await provider.disconnect();
+  });
+
+  test("an undeclared kind raises, and a declared kind with no catalog behind it raises differently", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await expect(provider.describeObjects([OBJECT_DATABASE], "sequence")).rejects.toThrow(
+      /ClickHouse declares no object kind "sequence"/,
+    );
+    // The same two questions the single read asks, in the same order: the DECLARATION
+    // decides whether the kind exists, then the catalog map decides whether anything can
+    // read it.
+    spyOn(provider, "getCapabilities").mockReturnValue({
+      ...provider.getCapabilities(),
+      objectKinds: [
+        ...(provider.getCapabilities().objectKinds ?? []),
+        { id: "projection", role: "config", label: "Projection", labelPlural: "Projections" },
+      ],
+    });
+    await expect(provider.describeObjects([OBJECT_DATABASE], "projection")).rejects.toThrow(
+      /declares the kind "projection" but has no statement that describes it/,
+    );
+    await provider.disconnect();
+  });
+
+  test("a container path of the wrong shape raises through the declaration, not a literal depth", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await expect(provider.describeObjects([], "table")).rejects.toThrow(/A ClickHouse container path is \[database\]/);
+    await expect(provider.describeObjects([OBJECT_DATABASE, "extra"], "table")).rejects.toThrow(
+      /A ClickHouse container path is \[database\]/,
+    );
+    await provider.disconnect();
+  });
+
+  test("the database is the segment the DECLARATION assigns, which a two-level declaration shows", async () => {
+    // Standing ruling 5g, driven to a BOUND VALUE and not to a refusal. With a catalog
+    // level in front, `container[0]` is the CATALOG and the database is `container[1]`:
+    // both are depth-identical at one level, so only this declaration tells them apart.
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    spyOn(provider, "getCapabilities").mockReturnValue({
+      ...provider.getCapabilities(),
+      containerLevels: [
+        { id: "catalog", label: "Catalog", labelPlural: "Catalogs" },
+        { id: "schema", label: "Database", labelPlural: "Databases" },
+      ],
+    });
+    sentSql.length = 0;
+
+    const batch = await provider.describeObjects(["warehouse", OBJECT_DATABASE], "table");
+
+    expect(batch.details.map((detail) => detail.path)).toEqual([
+      ["warehouse", OBJECT_DATABASE, ".inner_id.fake"],
+      ["warehouse", OBJECT_DATABASE, "events"],
+      ["warehouse", OBJECT_DATABASE, "mv_target"],
+    ]);
+    // The literal that reached the server is the DATABASE segment, never the catalog one.
+    expect(sqlWith("AS columnName")).toContain(`c.database = '${OBJECT_DATABASE}'`);
+    expect(sqlWith("AS columnName")).not.toContain("'warehouse'");
+    await provider.disconnect();
+  });
+
+  /**
+   * `truncated` is computed from the read, never from what survived the row filter (#789
+   * bulk-read review, Minor 8).
+   *
+   * The target read asks for `limit + 1` rows precisely so a saturated read is told from an
+   * exact one. Counting the FILTERED list instead means a name this provider could not read
+   * back both drops the object and suppresses the flag: the caller gets `limit` details and
+   * a claim of completeness while `limit + 1` objects exist, which is the absence ruling 5a
+   * calls the worst shape of defect in this epic.
+   *
+   * Unreachable on today's row shapes - `readIdentifier` rejects only a non-string or an
+   * empty string, neither of which ClickHouse can put in `system.tables.name` - so the fake
+   * server puts one there. Nine other providers already compute the flag from the unfiltered
+   * read, and this is the shape a twelfth implementer would copy.
+   */
+  test("a target row this provider cannot read still counts towards the truncation flag", async () => {
+    const reply = objectReply;
+    replyFor = (sql: string) => {
+      if (/^SELECT objectName FROM \(/.test(sql) && sql.includes("LIMIT 3")) {
+        return jsonReply([{ objectName: ".inner_id.fake" }, { objectName: "" }, { objectName: "events" }]);
+      }
+      return reply(sql);
+    };
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const batch = await provider.describeObjects([OBJECT_DATABASE], "table", 2);
+
+    // Two of the three rows were readable, so two objects are described - and the third row
+    // is why the answer is still marked short.
+    expect(batch.details.map((detail) => detail.path)).toEqual([
+      [OBJECT_DATABASE, ".inner_id.fake"],
+      [OBJECT_DATABASE, "events"],
+    ]);
+    expect(batch.truncated).toEqual({ limit: 2, reason: callerBoundTruncationReason(2) });
+    await provider.disconnect();
+  });
+
+  test("a limit that is not a positive whole number raises rather than clamping", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    sentSql.length = 0;
+
+    for (const limit of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await expect(provider.describeObjects([OBJECT_DATABASE], "table", limit)).rejects.toThrow(
+        /A ClickHouse bulk column read limit must be a positive whole number/,
+      );
+    }
+    // Nothing was sent for any of them: the guard is before the read, and a fractional
+    // limit interpolated into a `LIMIT` clause is a syntax error rather than a bound.
+    expect(sentSql).toEqual([]);
+    await provider.disconnect();
+  });
+
+  test("a bound that bites reports the caller's own limit, and one that does not never reports", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const bounded = await provider.describeObjects([OBJECT_DATABASE], "table", 2);
+    expect(bounded.details.map((detail) => detail.path)).toEqual([
+      [OBJECT_DATABASE, ".inner_id.fake"],
+      [OBJECT_DATABASE, "events"],
+    ]);
+    expect(bounded.truncated?.limit).toBe(2);
+    expect(bounded.truncated?.reason.length).toBeGreaterThan(0);
+    // The bound cuts OBJECTS and never columns: the detail it kept is complete.
+    expect(bounded.details[1]!.columns).toHaveLength(3);
+    // `limit + 1` is what the statement carries, so a saturated read is told from an exact
+    // one with no second count.
+    expect(sqlWith("LIMIT 3")).toContain("ORDER BY objectName ASC LIMIT 3");
+
+    const exact = await provider.describeObjects([OBJECT_DATABASE], "table", 3);
+    expect(exact.details).toHaveLength(3);
+    expect(exact.truncated).toBeUndefined();
+
+    const unbounded = await provider.describeObjects([OBJECT_DATABASE], "table");
+    expect(unbounded.details).toHaveLength(3);
+    expect(unbounded.truncated).toBeUndefined();
+    await provider.disconnect();
+  });
+
+  test("a refused index read reports columns with indexes unavailable instead of throwing on bulk", async () => {
+    // The same rule the single read carries: `system.data_skipping_indices` needs its own
+    // grant and answers code 497 without it. The bulk read preserves columns and reports
+    // indexes as unavailable.
+    replyFor = (sql) => (sql.includes("AS indexName") ? DENIED() : objectReply(sql));
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const batch = await provider.describeObjects([OBJECT_DATABASE], "table");
+    expect(batch.details.length).toBeGreaterThan(0);
+    for (const detail of batch.details) {
+      expect(detail.columns.length).toBeGreaterThan(0);
+      expect(detail.indexes).toEqual({ unavailable: expect.stringMatching(/Not enough privileges/) });
+    }
+    await provider.disconnect();
+  });
+
+  test("a non-497 error on bulk index read rejects rather than reporting unavailable", async () => {
+    installObjectReplies();
+    replyFor = (sql) =>
+      sql.includes("FROM system.data_skipping_indices")
+        ? exceptionReply(TIMEOUT_EXCEEDED, "TIMEOUT_EXCEEDED", "Timeout exceeded: elapsed 30 s", 500)
+        : objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await expect(provider.describeObjects([OBJECT_DATABASE], "table")).rejects.toThrow(/Timeout exceeded/);
+    await provider.disconnect();
+  });
+
+  test("describeObjects paths equal listObjects paths with full grants and when system.dictionaries is denied", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    // With full grants:
+    const fullBatch = await provider.describeObjects([OBJECT_DATABASE], "table");
+    const fullListed = await provider.listObjects([OBJECT_DATABASE], "table");
+    expect(fullBatch.details.map((d) => d.path)).toEqual(fullListed.map((o) => o.path));
+
+    // When system.dictionaries is denied: dict_users stays in the table folder for both
+    replyFor = (sql) => (sql.includes("FROM system.dictionaries") ? DENIED() : objectReply(sql));
+    const deniedBatch = await provider.describeObjects([OBJECT_DATABASE], "table");
+    const deniedListed = await provider.listObjects([OBJECT_DATABASE], "table");
+    expect(deniedBatch.details.map((d) => d.path)).toEqual(deniedListed.map((o) => o.path));
+    expect(deniedBatch.details.map((d) => d.path)).toContainEqual([OBJECT_DATABASE, "dict_users"]);
+
+    await provider.disconnect();
+  });
+
+  test("an empty folder answers an empty batch rather than raising", async () => {
+    replyFor = (sql) => (/^SELECT objectName FROM \(/.test(sql) ? jsonReply([]) : objectReply(sql));
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    // "This database holds none" is a true answer, unlike the single read's zero-column
+    // case, which means the object is not there under the name it was asked for.
+    await expect(provider.describeObjects([OBJECT_DATABASE], "table")).resolves.toEqual({ details: [] });
+    await provider.disconnect();
+  });
+
+  test("a column or index row with no usable name is skipped, as it is in the single read", async () => {
+    installObjectReplies();
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    replyFor = (sql) => {
+      if (sql.includes("AS columnName")) {
+        return jsonReply([
+          {
+            objectName: "events",
+            columnName: "",
+            columnType: "UInt8",
+            isPrimaryKey: 0,
+            defaultKind: "",
+            defaultExpression: "",
+          },
+          {
+            objectName: "events",
+            columnName: "kept",
+            columnType: "UInt8",
+            isPrimaryKey: 0,
+            defaultKind: "",
+            defaultExpression: "",
+          },
+        ]);
+      }
+      if (sql.includes("AS indexName")) {
+        return jsonReply([
+          { objectName: "events", indexName: "", indexExpression: "x" },
+          { objectName: "events", indexName: "idx_kept", indexExpression: "(lower(b))" },
+        ]);
+      }
+      return objectReply(sql);
+    };
+
+    const batch = await provider.describeObjects([OBJECT_DATABASE], "table");
+    const events = batch.details.find((detail) => detail.path[1] === "events")!;
+
+    expect(events.columns.map((column) => column.name)).toEqual(["kept"]);
+    expect(events.indexes).toEqual([{ name: "idx_kept", columns: ["lower(b)"], unique: false }]);
+    await provider.disconnect();
+  });
+});
+
+// ============================================================================
+// Object source reading (#789 Phase 2)
+// ----------------------------------------------------------------------------
+// Every text below has the SHAPE a live clickhouse-server 26.7.1.1315 answered for
+// `docker/clickhouse-init/01-object-fixture.sql`, renamed onto this block's fixture
+// database: the pretty multi-line spelling, the backquoted column names, the
+// `SETTINGS index_granularity = 8192` the server appends to a MergeTree table nobody
+// typed it on, and the `PASSWORD '[HIDDEN]'` it substitutes for a dictionary's
+// credential. What the live run measured is in docs/providers/clickhouse.md.
+// ============================================================================
+
+/**
+ * What `formatQuery(create_table_query)` answers per object, keyed by name.
+ *
+ * `dict_regions_config` is deliberately NOT here: the config-file dictionary has no
+ * `system.tables` row at all (measured), which is the refusal this engine's best
+ * three-absences case rests on.
+ */
+const OBJECT_SOURCE_BY_NAME: Readonly<Record<string, string>> = {
+  events:
+    "CREATE TABLE analytics.events\n(\n    `id` UInt64,\n    `day` Date,\n" +
+    "    `amount` LowCardinality(Nullable(String)) DEFAULT '',\n" +
+    "    INDEX idx_amount amount TYPE set(100) GRANULARITY 4\n)\nENGINE = MergeTree\n" +
+    "PRIMARY KEY id\nORDER BY id\nSETTINGS index_granularity = 8192",
+  events_view:
+    "CREATE VIEW analytics.events_view\n(\n    `customer` String\n)\nAS SELECT customer\nFROM analytics.events",
+  mv_inner:
+    "CREATE MATERIALIZED VIEW analytics.mv_inner\n(\n    `customer_id` UInt64\n)\n" +
+    "ENGINE = SummingMergeTree\nORDER BY customer_id\nSETTINGS index_granularity = 8192\n" +
+    "AS SELECT customer_id\nFROM analytics.events",
+  mv_to:
+    "CREATE MATERIALIZED VIEW analytics.mv_to TO analytics.mv_target\n(\n    `total` Decimal(12, 2)\n)\n" +
+    "AS SELECT total\nFROM analytics.events",
+  mv_target:
+    "CREATE TABLE analytics.mv_target\n(\n    `customer_id` UInt64,\n    `total` Decimal(12, 2)\n)\n" +
+    "ENGINE = MergeTree\nORDER BY customer_id\nSETTINGS index_granularity = 8192",
+  ".inner_id.fake":
+    "CREATE TABLE analytics.`.inner_id.fake`\n(\n    `x` UInt8\n)\nENGINE = MergeTree\nORDER BY x\n" +
+    "SETTINGS index_granularity = 8192",
+  dict_users:
+    "CREATE DICTIONARY analytics.dict_users\n(\n    `id` UInt64,\n    `label` String\n)\nPRIMARY KEY id\n" +
+    "SOURCE(CLICKHOUSE(TABLE 'users' DB 'analytics' USER 'libredb' PASSWORD '[HIDDEN]'))\n" +
+    "LIFETIME(MIN 0 MAX 0)\nLAYOUT(FLAT())",
+};
+
+/** `system.functions`, whose `create_query` is EMPTY for every non-SQL origin (measured). */
+const FUNCTION_SOURCE_ROWS: Readonly<Record<string, { objectOrigin: string; objectSource: string }>> = {
+  probe_double: { objectOrigin: "SQLUserDefined", objectSource: "CREATE FUNCTION probe_double AS x -> (x * 2)" },
+  probe_exec: { objectOrigin: "ExecutableUserDefined", objectSource: "" },
+  // Not a live shape either: `origin` is an Enum8 and always carries one of its four names.
+  // Same reason as the blank dictionary origin above, and the same measurement: replacing the
+  // provider's no-origin arm with a marker string left the suite at 201 pass 0 fail.
+  probe_blank_origin: { objectOrigin: "", objectSource: "" },
+};
+
+/**
+ * `system.dictionaries.origin` for a config-file dictionary: the file it is declared in.
+ *
+ * The SECOND row is not a live shape and says so: every config-file dictionary measured on
+ * 26.7.1.1315 reports the XML file it came from. It is here because the provider's refusal
+ * sentence has an arm for an origin the server does NOT report, and an arm no test drives is
+ * dead however many hits lcov attributes to its line (standing ruling 5b, #789). Measured
+ * before this row existed: replacing that arm with a marker string left the suite at
+ * 201 pass 0 fail.
+ */
+const CONFIG_DICTIONARY_ORIGINS: Readonly<Record<string, string>> = {
+  dict_regions_config: "/etc/clickhouse-server/regions_dictionary.xml",
+  dict_origin_blank: "",
+};
+
+/** The file the fixture's own config-file dictionary is declared in. */
+const CONFIG_DICTIONARY_ORIGIN = CONFIG_DICTIONARY_ORIGINS.dict_regions_config;
+
+/**
+ * The three source statements, answered off the fixtures above.
+ *
+ * Every arm tests the projection ALIAS as well as the catalog, and that is not belt and
+ * braces: the kind-tagged subquery the count and the listing share reads
+ * `FROM system.functions AS f` too, so an arm keyed on the catalog alone answered the COUNT
+ * with a function's source row and every count assertion in this file went to zero.
+ */
+function sourceReply(sql: string): Reply | null {
+  if (sql.includes("AS objectSource") && sql.includes("FROM system.tables AS t")) {
+    const text = OBJECT_SOURCE_BY_NAME[literalFor(sql, "t.name") ?? ""];
+    // The DATABASE filter is honoured rather than ignored, so a read that bound the wrong
+    // container segment answers nothing here instead of quietly matching on the name.
+    if (text === undefined || literalFor(sql, "t.database") !== OBJECT_DATABASE) return jsonReply([]);
+    return jsonReply([{ objectSource: text }]);
+  }
+  if (sql.includes("AS objectSource") && sql.includes("FROM system.functions AS f")) {
+    const row = FUNCTION_SOURCE_ROWS[literalFor(sql, "f.name") ?? ""];
+    return jsonReply(row === undefined ? [] : [row]);
+  }
+  if (sql.includes("AS objectOrigin") && sql.includes("FROM system.dictionaries AS d")) {
+    // Only the CONFIG-FILE flavour, which is what `d.database = ''` asks for.
+    const name = literalFor(sql, "d.name") ?? "";
+    if (!Object.hasOwn(CONFIG_DICTIONARY_ORIGINS, name)) return jsonReply([]);
+    return jsonReply([{ objectOrigin: CONFIG_DICTIONARY_ORIGINS[name] }]);
+  }
+  return null;
+}
+
+/**
+ * The object of each source-bearing kind this suite reads, and the WHOLE statement the
+ * provider must send for it.
+ *
+ * The population is taken from the DECLARATION in the test below and checked against these
+ * keys, never from a number typed here: a test that counts kinds cannot notice a kind that
+ * quietly became a refusal, which is the defect recipe rule 6 was written for.
+ */
+const SOURCE_READS: Readonly<Record<string, { path: readonly string[]; sql: string }>> = {
+  table: {
+    path: [OBJECT_DATABASE, "events"],
+    sql:
+      "SELECT formatQuery(t.create_table_query) AS objectSource FROM system.tables AS t " +
+      "WHERE t.database = 'analytics' AND t.name = 'events'",
+  },
+  view: {
+    path: [OBJECT_DATABASE, "events_view"],
+    sql:
+      "SELECT formatQuery(t.create_table_query) AS objectSource FROM system.tables AS t " +
+      "WHERE t.database = 'analytics' AND t.name = 'events_view'",
+  },
+  materialized_view: {
+    path: [OBJECT_DATABASE, "mv_to"],
+    sql:
+      "SELECT formatQuery(t.create_table_query) AS objectSource FROM system.tables AS t " +
+      "WHERE t.database = 'analytics' AND t.name = 'mv_to'",
+  },
+  dictionary: {
+    path: [OBJECT_DATABASE, "dict_users"],
+    sql:
+      "SELECT formatQuery(t.create_table_query) AS objectSource FROM system.tables AS t " +
+      "WHERE t.database = 'analytics' AND t.name = 'dict_users'",
+  },
+  function: {
+    path: [OBJECT_DATABASE, "probe_double"],
+    sql:
+      "SELECT f.origin AS objectOrigin, f.create_query AS objectSource FROM system.functions AS f " +
+      "WHERE f.name = 'probe_double'",
+  },
+};
+
+/** The one readable part of a document, refusing the hybrid shape before it narrows. */
+function readablePart(document: ObjectSourceDocument): {
+  readonly text: string;
+  readonly language: string;
+  readonly form: string;
+  readonly origin: string;
+  readonly truncated?: { readonly limit: number; readonly reason: string };
+} {
+  const [part] = document.parts;
+  if ("unavailable" in part && "text" in part) {
+    throw new Error("the part carries both a refusal and a text, which are different facts");
+  }
+  if (isSourcePartUnavailable(part)) throw new Error(`expected a text and got a refusal: ${part.unavailable}`);
+  return part;
+}
+
+/** The committed fixture, which is where the two adversarial objects below come from. */
+const CLICKHOUSE_FIXTURE_FILE = join(
+  import.meta.dir,
+  "..",
+  "..",
+  "..",
+  "docker",
+  "clickhouse-init",
+  "01-object-fixture.sql",
+);
+
+/**
+ * The names the escaping argument rests on, with the statement text each must produce.
+ *
+ * `fixtureLine` marks the two that the committed fixture CREATES, so the same name can be
+ * read back against a real server (standing ruling 5i). `bs_one\` is the one probe 11
+ * actually found: a TERMINAL backslash is the only shape that swallows the closing quote,
+ * and a name with a character after the backslash does not reproduce it.
+ *
+ * The other three need no fixture object, because the statement is the whole assertion: the
+ * read answers no row for them and raises, and what is being pinned is what went out.
+ */
+const ADVERSARIAL_NAMES: readonly {
+  readonly name: string;
+  readonly sent: string;
+  readonly fixtureLine?: string;
+}[] = [
+  { name: "bs_one\\", sent: "'bs_one\\\\'", fixtureLine: "CREATE TABLE demo.`bs_one\\\\`" },
+  { name: 'dq"two', sent: "'dq\"two'", fixtureLine: 'CREATE TABLE demo.`dq"two`' },
+  { name: "o'brien\\x", sent: "'o''brien\\\\x'" },
+  { name: "x\\' OR 1=1 --", sent: "'x\\\\'' OR 1=1 --'" },
+  { name: "a' UNION ALL SELECT 'pwn", sent: "'a'' UNION ALL SELECT ''pwn'" },
+];
+
+describe("object source", () => {
+  test("reads the definition of every source-bearing kind, pinning the statement AND the text", async () => {
+    replyFor = (sql) => sourceReply(sql) ?? objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    // The population comes from the DECLARATION. A list typed here would go on passing
+    // while a kind quietly stopped answering a text.
+    const kinds = (provider.getCapabilities().objectKinds ?? []).filter((kind) => kind.hasSource === true);
+    if (kinds.length === 0) throw new Error("no kind declares hasSource, so this loop certifies nothing");
+
+    const entered: string[] = [];
+    for (const kind of kinds) {
+      if (!Object.hasOwn(SOURCE_READS, kind.id)) {
+        throw new Error(`the kind "${kind.id}" declares source and this suite reads no object of it`);
+      }
+      const expectation = SOURCE_READS[kind.id];
+      sentSql.length = 0;
+
+      const document = await provider.readObjectSource(expectation.path, kind.id);
+
+      expect(document.path).toEqual([...expectation.path]);
+      expect(document.kind).toBe(kind.id);
+      expect(document.parts).toHaveLength(1);
+      const part = readablePart(document);
+      // THE TEXT, per kind. A wrong reply column reads as undefined, the provider correctly
+      // turns that into a refusal, and a refusal passes every count, length and
+      // whole-statement assertion (recipe rule 6, measured by Task 8).
+      const name = expectation.path[expectation.path.length - 1];
+      expect(part.text).toBe(
+        kind.id === "function" ? FUNCTION_SOURCE_ROWS[name].objectSource : OBJECT_SOURCE_BY_NAME[name],
+      );
+      expect(part.language).toBe("sql");
+      // The statement runs as given; the server rebuilt it from its own catalog rather than
+      // storing what the author typed.
+      expect(part.form).toBe("complete");
+      expect(part.origin).toBe("regenerated");
+      expect(part.truncated).toBeUndefined();
+      // THE WHOLE STATEMENT, so a rewritten SELECT expression or a dropped WHERE conjunct
+      // cannot survive behind a reply the fake routed on a substring.
+      expect(sentSql).toEqual([expectation.sql]);
+      expect(document.parts[0].id).toBe("definition");
+      expect(document.parts[0].label).toBe("Definition");
+      entered.push(kind.id);
+    }
+    // The loop's zero-iteration case is refused above; this is its did-not-skip case.
+    expect(entered).toEqual(kinds.map((kind) => kind.id));
+    await provider.disconnect();
+  });
+
+  test("a CONFIG-FILE dictionary answers a refusal naming the file it is declared in", async () => {
+    // The best three-absences case in the fleet, and it costs the fixture nothing: this
+    // dictionary sits beside a DDL dictionary of the SAME KIND, so the refusal is per
+    // OBJECT inside one declared kind. It has no `system.tables` row at all, so the read
+    // that answers for every other object of this kind answers no row for it.
+    replyFor = (sql) => sourceReply(sql) ?? objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    sentSql.length = 0;
+    const document = await provider.readObjectSource([OBJECT_DATABASE, "dict_regions_config"], "dictionary");
+
+    expect(document.parts).toHaveLength(1);
+    const [part] = document.parts;
+    // A hybrid carrying BOTH keys narrows to the refusal arm and passes every assertion
+    // below it, so the absence of `text` is asserted rather than assumed (recipe rule 8).
+    expect(Object.hasOwn(part, "text")).toBe(false);
+    if (!isSourcePartUnavailable(part)) throw new Error("narrowing");
+    expect(part.unavailable).toContain(CONFIG_DICTIONARY_ORIGIN);
+    expect(part.unavailable).toContain("configuration file");
+    // The second question is asked ONLY after the first answers nothing, and it asks for
+    // the config flavour alone: `d.database = ''` is a config-file dictionary's whole
+    // address, because a database cannot be named the empty string.
+    expect(sentSql).toEqual([
+      "SELECT formatQuery(t.create_table_query) AS objectSource FROM system.tables AS t " +
+        "WHERE t.database = 'analytics' AND t.name = 'dict_regions_config'",
+      "SELECT d.origin AS objectOrigin FROM system.dictionaries AS d " +
+        "WHERE d.name = 'dict_regions_config' AND d.database = ''",
+    ]);
+    await provider.disconnect();
+  });
+
+  test("a function with no SQL text answers a refusal carrying the origin the server reported", async () => {
+    replyFor = (sql) => sourceReply(sql) ?? objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const document = await provider.readObjectSource([OBJECT_DATABASE, "probe_exec"], "function");
+
+    const [part] = document.parts;
+    expect(Object.hasOwn(part, "text")).toBe(false);
+    if (!isSourcePartUnavailable(part)) throw new Error("narrowing");
+    // The ORIGIN is the engine's own column value and it is what says WHICH function this
+    // is: `ExecutableUserDefined` and `WasmUserDefined` have no SQL text at all, and the
+    // sentence would be a guess without it.
+    expect(part.unavailable).toContain("ExecutableUserDefined");
+    await provider.disconnect();
+  });
+
+  test("a dictionary whose origin the server does not report says THAT, not a sentence with a hole in it", async () => {
+    // The arm this drives was DEAD while raw lcov reported its line as hit: the fallback is
+    // on the same physical line as the truthy branch, so the `,0` record a zero-hit line
+    // would carry never appeared (standing ruling 5b, #789). Replacing the arm with a marker
+    // string left the suite at 201 pass 0 fail. It is user-visible prose rather than a
+    // formality: a reader is shown this sentence as the engine's own fact about the object.
+    replyFor = (sql) => sourceReply(sql) ?? objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const document = await provider.readObjectSource([OBJECT_DATABASE, "dict_origin_blank"], "dictionary");
+
+    const [part] = document.parts;
+    expect(Object.hasOwn(part, "text")).toBe(false);
+    if (!isSourcePartUnavailable(part)) throw new Error("narrowing");
+    // The WHOLE sentence, because what is wrong with a fallback nobody drove is the prose.
+    expect(part.unavailable).toBe(
+      "ClickHouse publishes no CREATE DICTIONARY statement for this dictionary: it is declared outside SQL " +
+        "and system.dictionaries reports no origin for it, so it has no system.tables row to read one from. " +
+        "SHOW CREATE DICTIONARY answers that the table does not exist for it, which is a false claim about a " +
+        "dictionary this server is serving.",
+    );
+    expect(part.unavailable).not.toContain("configuration file");
+    await provider.disconnect();
+  });
+
+  test("a function whose origin the server does not report says THAT rather than trailing off", async () => {
+    // The second half of the same dead-arm class: `origin === null` produced the EMPTY
+    // string, so the sentence simply lost the clause that says which absence it is, and no
+    // assertion could see the difference. Same measurement: a marker string in that arm left
+    // the suite at 201 pass 0 fail.
+    replyFor = (sql) => sourceReply(sql) ?? objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const document = await provider.readObjectSource([OBJECT_DATABASE, "probe_blank_origin"], "function");
+
+    const [part] = document.parts;
+    expect(Object.hasOwn(part, "text")).toBe(false);
+    if (!isSourcePartUnavailable(part)) throw new Error("narrowing");
+    expect(part.unavailable).toBe(
+      "ClickHouse publishes no SQL text for this function: system.functions.create_query is empty and " +
+        "system.functions reports no origin for it. A function whose body is an external program or a WASM " +
+        "module has no SQL definition to read.",
+    );
+    await provider.disconnect();
+  });
+
+  test("an empty definition is a refusal and never an empty editor", async () => {
+    // An empty text is not a definition. Unreachable through `system.tables` on a live
+    // server - `formatQuery('')` raises code 62 and 0 of 186 rows carry an empty
+    // `create_table_query` - and reachable through `system.functions`, which is the one
+    // catalog here that really does answer an empty string.
+    replyFor = (sql) =>
+      sql.includes("AS objectSource") && sql.includes("FROM system.tables AS t")
+        ? jsonReply([{ objectSource: "   \n  " }])
+        : (sourceReply(sql) ?? objectReply(sql));
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const document = await provider.readObjectSource([OBJECT_DATABASE, "events"], "table");
+
+    const [part] = document.parts;
+    expect(Object.hasOwn(part, "text")).toBe(false);
+    if (!isSourcePartUnavailable(part)) throw new Error("narrowing");
+    expect(part.unavailable).toContain("create_table_query");
+    await provider.disconnect();
+  });
+
+  test("a privilege denial is a refusal carrying the server's own sentence, unprefixed", async () => {
+    // Measured on 26.7.1.1315: a denial arrives as HTTP 500 with code 497, never 403, and
+    // `system.dictionaries` really does deny where `system.tables` silently FILTERS. The
+    // sentence is rendered to a person as the reason this object has no text, so it is the
+    // server's own words and never routed through the provider's error mapping.
+    replyFor = (sql) => (sql.includes("AS objectSource") ? DENIED() : objectReply(sql));
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const document = await provider.readObjectSource([OBJECT_DATABASE, "events"], "table");
+
+    const [part] = document.parts;
+    expect(Object.hasOwn(part, "text")).toBe(false);
+    if (!isSourcePartUnavailable(part)) throw new Error("narrowing");
+    expect(part.unavailable).toContain("Not enough privileges");
+    expect(part.unavailable).not.toContain("ClickHouse error");
+    await provider.disconnect();
+  });
+
+  test("a failure that is not a denial RAISES rather than becoming this object's refusal", async () => {
+    // A transport failure is nobody answering at all. Rendering it in the Source pane as
+    // the object's own refusal would present a symptom as a fact about the object.
+    replyFor = (sql) =>
+      sql.includes("AS objectSource")
+        ? exceptionReply(TIMEOUT_EXCEEDED, "TIMEOUT_EXCEEDED", "Timeout exceeded: elapsed 30 s", 500)
+        : objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await expect(provider.readObjectSource([OBJECT_DATABASE, "events"], "table")).rejects.toBeInstanceOf(TimeoutError);
+    await provider.disconnect();
+  });
+
+  test("an object that is not there RAISES and names it, for every catalog the read uses", async () => {
+    replyFor = (sql) => sourceReply(sql) ?? objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await expect(provider.readObjectSource([OBJECT_DATABASE, "no_such_table"], "table")).rejects.toThrow(
+      /No ClickHouse table named no_such_table in analytics/,
+    );
+    // A dictionary asks its second question first, and only then decides it is absent.
+    await expect(provider.readObjectSource([OBJECT_DATABASE, "no_such_dict"], "dictionary")).rejects.toThrow(
+      /No ClickHouse dictionary named no_such_dict in analytics/,
+    );
+    await expect(provider.readObjectSource([OBJECT_DATABASE, "no_such_fn"], "function")).rejects.toThrow(
+      /No ClickHouse function named no_such_fn/,
+    );
+    await provider.disconnect();
+  });
+
+  test("a caller's bound cuts the text and says so with the one sentence a bound is reported with", async () => {
+    replyFor = (sql) => sourceReply(sql) ?? objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    const whole = OBJECT_SOURCE_BY_NAME.events;
+    const document = await provider.readObjectSource([OBJECT_DATABASE, "events"], "table", 20);
+
+    const part = readablePart(document);
+    expect(part.text).toBe(whole.slice(0, 20));
+    expect(part.truncated).toEqual({ limit: 20, reason: sourceBoundTruncationReason(20) });
+    await provider.disconnect();
+  });
+
+  test("an undeclared kind, an unreadable kind and a missing language each raise differently", async () => {
+    replyFor = (sql) => sourceReply(sql) ?? objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    const real = provider.getCapabilities();
+
+    await expect(provider.readObjectSource([OBJECT_DATABASE, "x"], "sequence")).rejects.toThrow(
+      /ClickHouse declares no object kind "sequence"/,
+    );
+
+    // A kind that exists and publishes no definition text. ClickHouse has none today, so
+    // the declaration is swapped in: the guard is what keeps that true for a kind added
+    // later without a source read behind it.
+    spyOn(provider, "getCapabilities").mockReturnValue({
+      ...real,
+      objectKinds: [
+        ...(real.objectKinds ?? []),
+        { id: "projection", role: "config", label: "Projection", labelPlural: "Projections" },
+      ],
+    });
+    await expect(provider.readObjectSource([OBJECT_DATABASE, "p"], "projection")).rejects.toThrow(
+      /ClickHouse publishes no definition text for the kind "projection"/,
+    );
+
+    // Declared readable with no Monaco id to render it with. An unregistered or absent id
+    // degrades to plain text with no throw and nothing observable, so a kind that forgot
+    // its language would ship a Source tab that silently stopped highlighting.
+    spyOn(provider, "getCapabilities").mockReturnValue({
+      ...real,
+      objectKinds: [
+        ...(real.objectKinds ?? []),
+        { id: "projection", role: "config", label: "Projection", labelPlural: "Projections", hasSource: true },
+      ],
+    });
+    // The engine's name is part of the refusal and it now reaches the shared guard as an argument
+    // (#789), so a provider passing the wrong literal would attribute ClickHouse's refusal to
+    // another engine. Pin it here as well as on the two arms above.
+    await expect(provider.readObjectSource([OBJECT_DATABASE, "p"], "projection")).rejects.toThrow(
+      /ClickHouse declares readable source for the kind "projection" and no sourceLanguage to render it with/,
+    );
+
+    // Declared readable, with a language, and no catalog behind it.
+    spyOn(provider, "getCapabilities").mockReturnValue({
+      ...real,
+      objectKinds: [
+        ...(real.objectKinds ?? []),
+        {
+          id: "projection",
+          role: "config",
+          label: "Projection",
+          labelPlural: "Projections",
+          hasSource: true,
+          sourceLanguage: "sql",
+        },
+      ],
+    });
+    await expect(provider.readObjectSource([OBJECT_DATABASE, "p"], "projection")).rejects.toThrow(
+      /declares readable source for the kind "projection" but has no statement that reads it/,
+    );
+    await provider.disconnect();
+  });
+
+  test("a path of the wrong shape raises through the declaration, not a literal depth", async () => {
+    replyFor = (sql) => sourceReply(sql) ?? objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+
+    await expect(provider.readObjectSource([OBJECT_DATABASE], "table")).rejects.toThrow(
+      /A ClickHouse "table" path is \[database, name\], received \["analytics"\]/,
+    );
+    await provider.disconnect();
+  });
+
+  test("the object name and the container come from the DECLARATION, not from a position", async () => {
+    // Standing ruling 5g, driven all the way to the BOUND VALUES and never to a refusal.
+    // With a catalog level in front, `path[0]` is the CATALOG and the database is
+    // `path[1]`, and the object name is the LAST segment whatever the depth. Both spellings
+    // are depth-identical on this one-level engine, which is exactly why three of them
+    // shipped elsewhere in #789 before anyone caught one.
+    replyFor = (sql) => sourceReply(sql) ?? objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    const spy = spyOn(provider, "getCapabilities").mockReturnValue({
+      ...provider.getCapabilities(),
+      containerLevels: [
+        { id: "catalog", label: "Catalog", labelPlural: "Catalogs" },
+        { id: "schema", label: "Database", labelPlural: "Databases" },
+      ],
+    });
+    try {
+      sentSql.length = 0;
+      const document = await provider.readObjectSource(["warehouse", OBJECT_DATABASE, "events"], "table");
+
+      expect(document.path).toEqual(["warehouse", OBJECT_DATABASE, "events"]);
+      expect(readablePart(document).text).toBe(OBJECT_SOURCE_BY_NAME.events);
+      expect(sentSql).toEqual([
+        "SELECT formatQuery(t.create_table_query) AS objectSource FROM system.tables AS t " +
+          "WHERE t.database = 'analytics' AND t.name = 'events'",
+      ]);
+      expect(sentSql[0]).not.toContain("warehouse");
+    } finally {
+      spy.mockRestore();
+    }
+    await provider.disconnect();
+  });
+
+  test("the database segment is found by the level's ID, which a SWAPPED declaration shows", async () => {
+    // Recipe rule 9, from Task 9. A declaration that is already two-level makes the test
+    // above pass for an implementation hardcoding `catalog = path[0]` and
+    // `schema = path[1]`, because the swapped-in declaration matches the shape of the real
+    // one. Here the two levels are swapped over and the path is fed in the swapped order,
+    // and the SAME three values must still reach the server.
+    replyFor = (sql) => sourceReply(sql) ?? objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    const spy = spyOn(provider, "getCapabilities").mockReturnValue({
+      ...provider.getCapabilities(),
+      containerLevels: [
+        { id: "schema", label: "Database", labelPlural: "Databases" },
+        { id: "catalog", label: "Catalog", labelPlural: "Catalogs" },
+      ],
+    });
+    try {
+      sentSql.length = 0;
+      const document = await provider.readObjectSource([OBJECT_DATABASE, "warehouse", "events"], "table");
+
+      expect(readablePart(document).text).toBe(OBJECT_SOURCE_BY_NAME.events);
+      expect(sentSql).toEqual([
+        "SELECT formatQuery(t.create_table_query) AS objectSource FROM system.tables AS t " +
+          "WHERE t.database = 'analytics' AND t.name = 'events'",
+      ]);
+    } finally {
+      spy.mockRestore();
+    }
+    await provider.disconnect();
+  });
+
+  test("a name carrying a quote or a backslash reaches the statement escaped both ways", async () => {
+    // THE SECURITY-CRITICAL ONE, and the reason this read takes no identifier position at
+    // all. Probe 11 measured that a backslash inside a QUOTED IDENTIFIER is processed as an
+    // escape on this engine in both quoting forms, so it swallows the closing quote and the
+    // statement runs on into whatever follows; the shared `SQLBaseProvider.escapeIdentifier`
+    // doubles only the quote and is therefore unsafe here. Every caller-supplied name in
+    // this read reaches a statement through `literal()` instead, in a VALUE position, where
+    // the same hazard exists and both escapes answer it.
+    //
+    // THE TERMINAL BACKSLASH IS THE WHOLE POINT, and driving a name whose backslash has a
+    // character after it does not test it: measured on this suite, an escaper written as
+    // `value.replace(/\\(?=[\s\S])/g, "\\\\")`, which escapes a backslash only when
+    // something follows, read `bs_one\` back as `'bs_one\'`, swallowed the closing quote and
+    // still left the whole suite at 201 pass 0 fail, because no assertion drove a name that
+    // ENDED in one. That is why `demo.`bs_one\`` is in the committed fixture and why it is
+    // driven here.
+    replyFor = (sql) => sourceReply(sql) ?? objectReply(sql);
+    const provider = await connectProvider({ database: OBJECT_DATABASE });
+    const fixture = readFileSync(CLICKHOUSE_FIXTURE_FILE, "utf8");
+
+    // Non-vacuity first, in both directions: a loop over an empty table certifies nothing,
+    // and a table whose adversarial names are no longer in the fixture certifies a
+    // measurement nobody can re-run (standing ruling 5i).
+    if (ADVERSARIAL_NAMES.length === 0) {
+      throw new Error("no adversarial name is driven, so this escaping test certifies nothing");
+    }
+    const drove: string[] = [];
+    const checkedAgainstFixture: string[] = [];
+    for (const entry of ADVERSARIAL_NAMES) {
+      if (entry.fixtureLine !== undefined) {
+        if (!fixture.includes(entry.fixtureLine)) {
+          throw new Error(
+            `docker/clickhouse-init/01-object-fixture.sql no longer creates ${entry.name}, so the live half of this measurement cannot be re-run`,
+          );
+        }
+        checkedAgainstFixture.push(entry.name);
+      }
+      sentSql.length = 0;
+      await provider.readObjectSource([OBJECT_DATABASE, entry.name], "table").catch(() => undefined);
+
+      expect(sentSql).toEqual([
+        "SELECT formatQuery(t.create_table_query) AS objectSource FROM system.tables AS t " +
+          `WHERE t.database = 'analytics' AND t.name = ${entry.sent}`,
+      ]);
+      drove.push(entry.name);
+    }
+    // The loop's did-not-skip case, and the two facts a row could quietly lose: that a name
+    // ending in a backslash was driven at all, and that the fixture-backed ones were checked.
+    expect(drove).toEqual(ADVERSARIAL_NAMES.map((entry) => entry.name));
+    expect(drove.filter((name) => name.endsWith("\\"))).toEqual(["bs_one\\"]);
+    expect(checkedAgainstFixture).toEqual(["bs_one\\", 'dq"two']);
+    await provider.disconnect();
+  });
+
+  test("the source read needs a connection", async () => {
+    const provider = new ClickHouseProvider(makeConnection({ database: OBJECT_DATABASE }));
+
+    await expect(provider.readObjectSource([OBJECT_DATABASE, "events"], "table")).rejects.toBeInstanceOf(
+      DatabaseConfigError,
+    );
+  });
+});
+
+describe("comparePaths", () => {
+  // Driven directly, because no ClickHouse path is ever mixed-depth: the engine
+  // declares one container level and no kind declares `attachedTo`, so every path of
+  // every kind is two segments and a test driven through `listObjects` cannot tell the
+  // settled spelling from `JSON.stringify`. Standing ruling 5g names both differences
+  // this function exists for, and both are asserted here rather than left as a claim
+  // in a docblock. The shared rule is the same one every provider in #789 writes; Task
+  // 28 hoists the five copies into `src/lib/db/object-kinds.ts`.
+  test("a prefix sorts ABOVE the longer path it prefixes", () => {
+    expect(comparePaths(["app", "orders"], ["app", "orders", "stamp"])).toBeLessThan(0);
+    expect(comparePaths(["app", "orders", "stamp"], ["app", "orders"])).toBeGreaterThan(0);
+    // `JSON.stringify` reverses exactly this: the separator `,` (0x2C) is below the
+    // terminator `]` (0x5D), so the deeper path would sort first and a nested row would
+    // be drawn above the object it hangs off.
+    expect(JSON.stringify(["app", "orders", "stamp"]) < JSON.stringify(["app", "orders"])).toBe(true);
+  });
+
+  test("segments sort by their own code points, not by a JSON escape sequence", () => {
+    // `"` is 0x22 and `Z` is 0x5A, so the quote sorts first. `JSON.stringify` escapes
+    // the quote to `\"`, and the comparison then lands on `\` (0x5C) against `Z`
+    // (0x5A), which puts the two names the other way round.
+    expect(comparePaths(['b"q'], ["bZ"])).toBeLessThan(0);
+    expect(JSON.stringify(['b"q']) < JSON.stringify(["bZ"])).toBe(false);
+  });
+
+  test("two identical paths compare equal", () => {
+    expect(comparePaths(["app", "orders"], ["app", "orders"])).toBe(0);
+  });
+});
+
+// ============================================================================
+// endOpenQueryTransaction(): the absence is declared, not accidental (D75)
+// ============================================================================
+
+describe("endOpenQueryTransaction()", () => {
+  /** The only three answers D75 accepts from a provider that does not implement the surface. */
+  const ABSENCES = [
+    "the engine has no transaction to leave open",
+    "the driver cannot be asked",
+    "nobody has measured it yet",
+  ] as const;
+
+  test("is not implemented, and the doc names WHICH absence that is", () => {
+    const provider: DatabaseProvider = new ClickHouseProvider(makeConnection());
+
+    expect(provider.endOpenQueryTransaction).toBeUndefined();
+
+    // A boundary nobody wrote down becomes a fallback the next reader trusts, so the
+    // absence has to be readable in the doc as well as in the type. Exactly one of the
+    // three: "one of these two" is not an answer, and a doc that names none has not
+    // declared anything.
+    const doc = readFileSync(join(import.meta.dir, "../../../docs/providers/clickhouse.md"), "utf8");
+    expect(doc).toContain("endOpenQueryTransaction");
+
+    // The set that DOES implement the surface is read from the type, never enumerated
+    // here: a closed list repeated across the provider docs went stale the day a further
+    // provider implemented the surface, which is exactly what happened during D75.
+    expect(doc).not.toContain("`postgres`, `sqlite` and `duckdb`");
+    expect(ABSENCES.filter((absence) => doc.includes(absence))).toEqual([
+      "the engine has no transaction to leave open",
+    ]);
   });
 });

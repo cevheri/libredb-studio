@@ -5,6 +5,7 @@ import {
   FALLBACK_TABLE_NAME,
   resultExportFileName,
 } from "@/lib/export/result-export";
+import { UnwritableValue } from "@/lib/export/typed-literals";
 
 const source = (over: Partial<Parameters<typeof buildResultExport>[1]> = {}) => ({
   rows: [{ id: 1, name: "Ada" }],
@@ -44,6 +45,12 @@ describe("deriveTableName", () => {
 });
 
 describe("buildResultExport — csv", () => {
+  test.each([";", "\t"] as const)("passes the chosen CSV delimiter to the shared writer (%s)", (csvDelimiter) => {
+    const file = buildResultExport("csv", source({ csvDelimiter }));
+    expect(file.content).toBe(`id${csvDelimiter}name\n1${csvDelimiter}Ada`);
+    expect(file.extension).toBe("csv");
+    expect(file.mimeType).toBe("text/csv;charset=utf-8");
+  });
   test("writes an escaped CSV under the declared columns", () => {
     const file = buildResultExport("csv", source({ rows: [{ id: 1, name: 'A,"B"' }] }));
 
@@ -60,6 +67,35 @@ describe("buildResultExport — json", () => {
     expect(JSON.parse(file.content)).toEqual([{ id: 1, name: "Ada" }]);
     expect(file.mimeType).toBe("application/json");
     expect(file.extension).toBe("json");
+  });
+
+  // The CSV, the SQL forms and the grid all read a binary cell as `\x` hex; the JSON
+  // wrote `{"type":"Buffer","data":[...]}`, so one result exported three ways
+  // disagreed with itself (#1381). Measured 2026-10-03 on PostgreSQL 18.6 (`bytea`)
+  // and on SQL Server (`varbinary`), whose cells both reach the browser in that form.
+  test("writes a bytea or varbinary cell as the same text the CSV writes for it", () => {
+    for (const dialect of ["postgres", "mssql", "mysql", "sqlite", "oracle"] as const) {
+      const rows = [{ id: 1, payload: { type: "Buffer", data: [0xde, 0xad, 0xbe, 0xef, 0x00, 0xff] } }];
+      const json = buildResultExport("json", source({ rows, fields: ["id", "payload"], dialect }));
+      const csv = buildResultExport("csv", source({ rows, fields: ["id", "payload"], dialect }));
+
+      expect(JSON.parse(json.content)).toEqual([{ id: 1, payload: "\\xdeadbeef00ff" }]);
+      expect(csv.content).toBe("id,payload\n1,\\xdeadbeef00ff");
+    }
+  });
+
+  test("writes a live Uint8Array the same way", () => {
+    const rows = [{ payload: Uint8Array.from([0x00, 0xff]) }];
+
+    expect(JSON.parse(buildResultExport("json", source({ rows, fields: ["payload"] })).content)).toEqual([
+      { payload: "\\x00ff" },
+    ]);
+  });
+
+  test("leaves a document that merely looks Buffer-shaped as JSON", () => {
+    const rows = [{ doc: { type: "Buffer", data: [1, "two"] } }];
+
+    expect(JSON.parse(buildResultExport("json", source({ rows, fields: ["doc"] })).content)).toEqual(rows);
   });
 });
 
@@ -105,10 +141,123 @@ describe("buildResultExport — sql-insert", () => {
     expect(file.content).toContain("VALUES (1.5, 9007199254740993, true);");
   });
 
-  test("writes a non-finite number as NULL, because NaN is not a SQL number", () => {
-    const file = buildResultExport("sql-insert", source({ rows: [{ a: NaN, b: Infinity }], fields: ["a", "b"] }));
+  // NaN is not a SQL number literal, and NULL is a different value. The quoted word is
+  // what PostgreSQL reads back into a float column, and it is the same text the cell
+  // carries when it arrived over HTTP, where the server already wrote it as a word.
+  test("writes a non-finite number as its quoted word, not as NULL", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({ rows: [{ a: NaN, b: Infinity, c: -Infinity }], fields: ["a", "b", "c"] }),
+    );
 
-    expect(file.content).toContain("VALUES (NULL, NULL);");
+    expect(file.content).toContain("VALUES ('NaN', 'Infinity', '-Infinity');");
+  });
+
+  // Each spelling was replayed into its engine: SQLite stores a quoted 'Infinity' as
+  // TEXT and has no NaN, Oracle reads its own constants into BINARY_DOUBLE.
+  test.each([
+    ["sqlite", "VALUES (NULL, 9e999, -9e999);"],
+    ["oracle", "VALUES (BINARY_DOUBLE_NAN, BINARY_DOUBLE_INFINITY, -BINARY_DOUBLE_INFINITY);"],
+    ["duckdb", "VALUES ('NaN', 'Infinity', '-Infinity');"],
+    // Databend: the spellings M08b inserted on the pinned image, read back as NaN, inf and -inf.
+    ["databend", "VALUES ('NaN'::FLOAT, 'inf'::DOUBLE, '-inf'::FLOAT);"],
+    ["mysql", "VALUES (NULL, NULL, NULL);"],
+    ["mssql", "VALUES (NULL, NULL, NULL);"],
+    [undefined, "VALUES (NULL, NULL, NULL);"],
+  ] as const)("writes a non-finite number the way %s reads it back", (dialect, expected) => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({ rows: [{ a: NaN, b: Infinity, c: -Infinity }], fields: ["a", "b", "c"], dialect }),
+    );
+
+    expect(file.content).toContain(expected);
+  });
+
+  // Over HTTP the server sends the words as strings, which are floats only where the
+  // column was declared one; a text column may hold the word itself.
+  test("writes a non-finite word as a float only in a column declared as a float", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({
+        rows: [{ f: "Infinity", d: "-Infinity", r: "NaN", t: "Infinity" }],
+        fields: ["f", "d", "r", "t"],
+        dialect: "sqlite",
+        columnTypes: { f: "REAL", d: " double precision ", r: "FLOAT", t: "TEXT" },
+      }),
+    );
+
+    expect(file.content).toContain("VALUES (9e999, -9e999, NULL, 'Infinity');");
+  });
+
+  test("leaves a word in a column whose declared type is not a string as text", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({
+        rows: [{ f: "NaN" }],
+        fields: ["f"],
+        dialect: "sqlite",
+        columnTypes: { f: 7 } as unknown as Record<string, string>,
+      }),
+    );
+
+    expect(file.content).toContain("VALUES ('NaN');");
+  });
+
+  test("writes a non-finite number as JSON and CSV words too", () => {
+    const rows = [{ a: NaN, b: Infinity, c: -Infinity }];
+    const fields = ["a", "b", "c"];
+
+    expect(JSON.parse(buildResultExport("json", source({ rows, fields })).content)).toEqual([
+      { a: "NaN", b: "Infinity", c: "-Infinity" },
+    ]);
+    // A number is never text, so `-Infinity` passes the formula guard as the number it is.
+    expect(buildResultExport("csv", source({ rows, fields })).content).toBe("a,b,c\nNaN,Infinity,-Infinity");
+  });
+
+  test("writes a ClickHouse Float's NaN and infinities as its bare words, and plain in CSV (SF-045)", () => {
+    const rows = [
+      { id: 1, f: "Infinity", n: "-Infinity", g: "NaN" },
+      { id: 2, f: "-Infinity", n: null, g: 1.5 },
+    ];
+    const fields = ["id", "f", "n", "g"];
+    const columnTypes = { id: "Int32", f: "Float64", n: "Nullable(Float64)", g: "LowCardinality(Float32)" };
+    const insert = buildResultExport(
+      "sql-insert",
+      source({ rows, fields, columnTypes, dialect: "clickhouse", tabName: "t" }),
+    );
+    expect(insert.content).toBe(
+      [
+        `INSERT INTO t ("id", "f", "n", "g") VALUES (1, inf, -inf, nan);`,
+        `INSERT INTO t ("id", "f", "n", "g") VALUES (2, -inf, NULL, 1.5);`,
+      ].join("\n"),
+    );
+    // With no declared type, a number the host built itself still gets ClickHouse's spelling.
+    const undeclared = buildResultExport(
+      "sql-insert",
+      source({ rows: [{ f: Number.NEGATIVE_INFINITY }], fields: ["f"], dialect: "clickhouse", tabName: "t" }),
+    );
+    expect(undeclared.content).toBe(`INSERT INTO t ("f") VALUES (-inf);`);
+    const csv = buildResultExport("csv", source({ rows, fields, columnTypes, dialect: "clickhouse" }));
+    expect(csv.content).toBe("id,f,n,g\n1,Infinity,-Infinity,NaN\n2,-Infinity,,1.5");
+  });
+
+  test("writes a -Infinity that crossed JSON as text plain in a numeric column, guarded in a text one", () => {
+    const rows = [{ f: "-Infinity", n: "-Infinity", d: "-Infinity", t: "-Infinity", u: "-Infinity" }];
+    const fields = ["f", "n", "d", "t", "u"];
+    const columnTypes = { f: "FLOAT", n: "numeric", d: "NUMBER(38, 2)", t: "text" };
+
+    for (const csvDelimiter of [",", ";", "\t"] as const) {
+      const file = buildResultExport("csv", source({ rows, fields, columnTypes, csvDelimiter }));
+      expect(file.content.split("\n")[1]).toBe(
+        ["-Infinity", "-Infinity", "-Infinity", `"'-Infinity"`, `"'-Infinity"`].join(csvDelimiter),
+      );
+    }
+    // Only the word itself: a formula in a numeric column is still neutralised.
+    const formula = buildResultExport(
+      "csv",
+      source({ rows: [{ f: "-1+1" }], fields: ["f"], columnTypes: { f: "double precision" } }),
+    );
+    expect(formula.content).toBe(`f\n"'-1+1"`);
   });
 
   test("writes a date as an ISO literal rather than as a locale string", () => {
@@ -226,6 +375,19 @@ describe("buildResultExport — a DDL type the engine can actually parse", () =>
     expect(file.content).toContain('"at" TIMESTAMP');
   });
 
+  test("spells text the way Db2 takes it back, and keeps the standard spellings it accepts (#786)", () => {
+    // Measured on Db2 12.1.0.0: TEXT is SQL0204N "TEXT" is an undefined name, while BIGINT,
+    // DOUBLE PRECISION, BOOLEAN and TIMESTAMP are whole Db2 types.
+    const file = buildResultExport("sql-ddl", source({ rows: [row], fields, dialect: "db2" }));
+
+    expect(file.content).toContain('"t" CLOB');
+    expect(file.content).not.toContain("TEXT");
+    expect(file.content).toContain('"i" BIGINT');
+    expect(file.content).toContain('"n" DOUBLE PRECISION');
+    expect(file.content).toContain('"b" BOOLEAN');
+    expect(file.content).toContain('"at" TIMESTAMP');
+  });
+
   test("spells every inferred type the way SQL Server does", () => {
     const file = buildResultExport("sql-ddl", source({ rows: [row], fields, dialect: "mssql" }));
 
@@ -300,10 +462,10 @@ describe("buildResultExport — the type the engine itself declared", () => {
     expect(file.content).toBe('CREATE TABLE users (\n  "a" TEXT\n);');
   });
 
-  test("refuses a declared type holding a quote", () => {
+  test("refuses a declared type holding a quote it does not close", () => {
     const file = buildResultExport(
       "sql-ddl",
-      source({ rows: [{ a: 1 }], fields: ["a"], columnTypes: { a: 'ENUM("a")' } }),
+      source({ rows: [{ a: 1 }], fields: ["a"], columnTypes: { a: 'ENUM("a)' } }),
     );
 
     expect(file.content).toContain('"a" BIGINT');
@@ -313,6 +475,45 @@ describe("buildResultExport — the type the engine itself declared", () => {
     const file = buildResultExport("sql-ddl", source({ rows: [{ a: 1 }], fields: ["a"], columnTypes: { a: "" } }));
 
     expect(file.content).toContain('"a" BIGINT');
+  });
+
+  // #1386: these three were written as TEXT, which lost the type the INSERT beside them
+  // needs (an `integer[]` literal does not replay into TEXT as an array).
+  test("keeps an array type, a quoted type argument and a negative enum value", () => {
+    const ddl = (type: string) =>
+      buildResultExport("sql-ddl", source({ rows: [{ a: null }], fields: ["a"], columnTypes: { a: type } })).content;
+
+    expect(ddl("integer[]")).toContain('"a" integer[]');
+    expect(ddl("timestamp with time zone[]")).toContain('"a" timestamp with time zone[]');
+    expect(ddl("integer[][]")).toContain('"a" integer[][]');
+    expect(ddl("DateTime64(3, 'Europe/Istanbul')")).toContain(`"a" DateTime64(3, 'Europe/Istanbul')`);
+    expect(ddl("Enum8('a' = 1, 'b' = -2)")).toContain(`"a" Enum8('a' = 1, 'b' = -2)`);
+  });
+
+  test("still refuses a quoted argument that could close early or a comment", () => {
+    const ddl = (type: string) =>
+      buildResultExport("sql-ddl", source({ rows: [{ a: 1 }], fields: ["a"], columnTypes: { a: type } })).content;
+
+    for (const type of [
+      "Enum8('a\\', 1)",
+      "Enum8('a'' = 1)",
+      "DateTime64(3, 'UTC\n')",
+      "Int32 -- comment",
+      "Int32 - 1",
+      "integer[x]",
+      "integer]",
+      'STRUCT("a\\" INTEGER)',
+      'STRUCT("a) b" INTEGER',
+      "map<text, int>)",
+      "map<text, int",
+      "list>int<",
+      // Closes the column list and opens a new one: the character class alone admits it.
+      "int) SELECT load_file('/etc/passwd') AS b, (c int",
+      "Int32)",
+      "Nullable(Int32",
+    ]) {
+      expect(ddl(type)).toContain('"a" BIGINT');
+    }
   });
 });
 
@@ -389,7 +590,35 @@ describe("buildResultExport — a binary value in a statement", () => {
   });
 
   test("writes the standard X'…' form for the dialects whose engines take it", () => {
-    for (const dialect of ["mysql", "sqlite", "trino", "druid"] as const) {
+    // InfluxDB 3 measured on 3.12.0: `SELECT arrow_typeof(X'00ff')` answers `Binary`.
+    for (const dialect of ["mysql", "sqlite", "trino", "druid", "influxdb3"] as const) {
+      const file = buildResultExport("sql-insert", source({ ...binaryRow(wire), dialect }));
+
+      expect(file.content).toContain("VALUES (X'0102deadbeef');");
+    }
+  });
+
+  test("writes the standard X'...' form for the dialects that write no SQL of their own", () => {
+    // No statement is ever built for these to read: MongoDB, Redis, Kafka and the embedded store
+    // declare `queryLanguage: "json"` and Prometheus declares `"promql"` (#1085, #1088), so the
+    // export can claim only the portable form, as `values.ts` does for their literals. Neo4j writes
+    // Cypher, which has no INSERT and no byte literal, so the same holds for it, for Milvus and Qdrant, whose
+    // console requests are JSON, for InfluxQL, which has no INSERT and no byte literal either, and for Oxia, which
+    // has no statement language for a value, and for S3, whose console words name buckets and keys and never a value.
+    for (const dialect of [
+      "mongodb",
+      "redis",
+      "libredb",
+      "prometheus",
+      "kafka",
+      "etcd",
+      "neo4j",
+      "milvus",
+      "qdrant",
+      "influxdb",
+      "oxia",
+      "s3",
+    ] as const) {
       const file = buildResultExport("sql-insert", source({ ...binaryRow(wire), dialect }));
 
       expect(file.content).toContain("VALUES (X'0102deadbeef');");
@@ -420,6 +649,24 @@ describe("buildResultExport — a binary value in a statement", () => {
 
     expect(file.content).toContain("VALUES (unhex('0102deadbeef'));");
     expect(file.content).not.toContain("X'");
+  });
+
+  // Db2's `X'…'` is a CHARACTER string (FOR BIT DATA), not a binary one. Measured on Db2 LUW
+  // 12.1.0.0 (#786): `X'0102deadbeef'` into a `BLOB` or a `VARBINARY` column is SQL0408N, a value
+  // not compatible with the target, while `BX'0102deadbeef'` goes into `BLOB`, `VARBINARY` and
+  // `VARCHAR FOR BIT DATA` alike and reads back as `HEX(...)` = `0102DEADBEEF`.
+  test("writes Db2's BX'…', because its X'…' is a character string", () => {
+    const file = buildResultExport("sql-insert", source({ ...binaryRow(wire), dialect: "db2" }));
+
+    expect(file.content).toContain("VALUES (BX'0102deadbeef');");
+  });
+
+  // Databend reads a quoted string into BINARY through `binary_input_format`, utf-8 by default, so `X'…'` is not the
+  // spelling it was measured with: M08b inserted `unhex('00ff10')` and read back the three bytes.
+  test("writes Databend's unhex", () => {
+    const file = buildResultExport("sql-insert", source({ ...binaryRow(wire), dialect: "databend" }));
+
+    expect(file.content).toContain("VALUES (unhex('0102deadbeef'));");
   });
 
   test("writes ClickHouse's unhex", () => {
@@ -457,6 +704,10 @@ describe("buildResultExport — a binary value in a statement", () => {
     );
     expect(buildResultExport("sql-insert", source({ ...binaryRow(empty), dialect: "oracle" })).content).toContain(
       "VALUES (HEXTORAW(''));",
+    );
+    // `BX''` inserts a zero-length value into all three Db2 byte types, measured (#786).
+    expect(buildResultExport("sql-insert", source({ ...binaryRow(empty), dialect: "db2" })).content).toContain(
+      "VALUES (BX'');",
     );
     // `unhex('')` really inserts the zero-length blob on DuckDB: measured, the row
     // reads back with `octet_length(payload)` 0 rather than NULL.
@@ -551,9 +802,30 @@ describe("buildResultExport — a declared type that cannot stand alone", () => 
   });
 
   test("keeps the MySQL types that already stand for their whole family", () => {
-    for (const bare of ["text", "longtext", "blob", "tinyblob", "datetime", "timestamp", "year"]) {
-      expect(ddl({ c: bare }, "mysql")).toContain(`\`c\` ${bare}`);
+    for (const bare of ["text", "longtext", "blob", "tinyblob", "year"]) {
+      expect(ddl({ c: bare }, "mysql")).toBe(`CREATE TABLE users (\n  \`c\` ${bare}\n);`);
     }
+  });
+
+  // #1386: a bare `datetime`, `timestamp` and `time` are fractional precision 0 on MySQL,
+  // which rounds the `.999` the INSERT beside it carries up to the next second, and a bare
+  // `bit` is `bit(1)`, which refuses the wider value `mysql2` hands back as bytes.
+  test("widens the MySQL names whose bare form rounds or refuses the exported value", () => {
+    expect(ddl({ c: "datetime" }, "mysql")).toContain("`c` datetime(6)");
+    expect(ddl({ c: "timestamp" }, "mysql")).toContain("`c` timestamp(6)");
+    expect(ddl({ c: "time" }, "mysql")).toContain("`c` time(6)");
+    expect(ddl({ c: "bit" }, "mysql")).toContain("`c` bit(64)");
+  });
+
+  test("writes Postgres's bare bit as bit varying, which takes the bit string at its own length", () => {
+    expect(ddl({ c: "bit" }, "postgres")).toContain('"c" bit varying');
+    expect(ddl({ c: "bit[]" }, "postgres")).toContain('"c" bit varying[]');
+    expect(ddl({ c: "bit[][]" }, "postgres")).toContain('"c" bit varying[][]');
+  });
+
+  test("keeps a bare bit on the dialects with no measured re-spelling", () => {
+    expect(ddl({ c: "bit" }, "mssql")).toContain("[c] bit");
+    expect(ddl({ c: "datetime" }, undefined)).toContain('"c" TIMESTAMP');
   });
 
   test("spells Oracle's bare character and byte types as its unbounded ones", () => {
@@ -828,9 +1100,12 @@ describe("buildResultExport — the bare names the remaining reachable dialects 
     expect(ddl({ c: "year" }, undefined)).toContain('"c" BIGINT');
   });
 
-  // The seven dialects no row could be measured for: Druid takes no INSERT without the
-  // MSQ extension, the two search endpoints parse no CREATE TABLE, and the other four
-  // declare `queryLanguage: "json"` so no statement is ever built for them to read.
+  // The sixteen dialects no row could be measured for: Druid takes no INSERT without the
+  // MSQ extension, the two search endpoints and Couchbase parse no CREATE TABLE (a SQL++ collection
+  // takes no columns), InfluxDB 3 parses SQL but its 3.12 planner refuses DDL and DML, and MongoDB, Redis, Kafka,
+  // etcd and the embedded store declare `queryLanguage: "json"`, `prometheus` declares `"promql"`,
+  // `neo4j` declares `"cypher"`, `influxdb` declares `"influxql"`, and `milvus`, `qdrant` and `oxia` each
+  // declare `"json"` with a dialect of their own, so no SQL statement is ever built for those eleven to read.
   // A file for one of those is a file meant to run somewhere else, so it gets the same
   // portable spelling as no dialect at all rather than a guessed row.
   test("writes portable standard SQL for the dialects that parse no CREATE TABLE", () => {
@@ -844,6 +1119,16 @@ describe("buildResultExport — the bare names the remaining reachable dialects 
       "redis",
       "libredb",
       "couchbase",
+      "prometheus",
+      "kafka",
+      "etcd",
+      "neo4j",
+      "milvus",
+      "qdrant",
+      "influxdb",
+      "influxdb3",
+      "oxia",
+      "s3",
     ] as const) {
       expect(ddl({ c: "VARCHAR2" }, dialect)).toContain(" TEXT\n");
       expect(ddl({ c: "BINARY_DOUBLE" }, dialect)).toContain(" DOUBLE PRECISION\n");
@@ -986,6 +1271,616 @@ describe("buildResultExport - Oracle date and timestamp literals", () => {
     );
     expect(file.content).toContain(`VALUES ('2026-08-24T17:11:12.345Z');`);
   });
+
+  // The provider reads a DATE and a TIMESTAMP as the engine's wall clock (#1131), and that
+  // text is what reaches the export, over HTTP and in-process alike. Quoted as it is, it is
+  // read through the session's NLS_DATE_FORMAT (`DD-MON-RR` by default) and refused, so a
+  // column DECLARED one of the two gets the conversion function that parses that text.
+  // No getter is read on this path, which is why the +09:00 held above moves nothing.
+  describe("the provider's DATE and TIMESTAMP text (#1131)", () => {
+    test("writes a DATE's text as TO_DATE of that same text", () => {
+      expect(oracle({ at: "DATE" }, "2026-09-01 00:00:00")).toContain(
+        `VALUES (TO_DATE('2026-09-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS'));`,
+      );
+    });
+
+    test("writes a TIMESTAMP's text as TO_TIMESTAMP, with FF only when there is a fraction", () => {
+      expect(oracle({ at: "TIMESTAMP" }, "2026-09-01 10:30:00")).toContain(
+        `VALUES (TO_TIMESTAMP('2026-09-01 10:30:00', 'YYYY-MM-DD HH24:MI:SS'));`,
+      );
+      expect(oracle({ at: "TIMESTAMP" }, "2026-09-01 10:30:00.345")).toContain(
+        `VALUES (TO_TIMESTAMP('2026-09-01 10:30:00.345', 'YYYY-MM-DD HH24:MI:SS.FF'));`,
+      );
+    });
+
+    // `ALL_TAB_COLUMNS.DATA_TYPE` spells a timestamp column with its precision; a host
+    // declaring from the catalog would hand that spelling over.
+    test("still reads a TIMESTAMP declared with its precision as one", () => {
+      expect(oracle({ at: "timestamp(6)" }, "2026-09-01 10:30:00.5")).toContain(
+        `VALUES (TO_TIMESTAMP('2026-09-01 10:30:00.5', 'YYYY-MM-DD HH24:MI:SS.FF'));`,
+      );
+    });
+
+    test("writes a BC year through the signed year mask", () => {
+      expect(oracle({ at: "DATE" }, "-0044-03-15 00:00:00")).toContain(
+        `VALUES (TO_DATE('-0044-03-15 00:00:00', 'SYYYY-MM-DD HH24:MI:SS'));`,
+      );
+    });
+
+    // The declaration is what makes the text a date. A VARCHAR2 holding the same
+    // characters is text, and converting it would store the NLS rendering of a
+    // timestamp in its place; a zoned column never receives this text from the provider.
+    test("leaves the same text quoted in a column not declared DATE or TIMESTAMP", () => {
+      const text = "2026-09-01 10:30:00";
+      expect(oracle({ at: "VARCHAR2" }, text)).toContain(`VALUES ('2026-09-01 10:30:00');`);
+      expect(oracle({ at: "TIMESTAMP WITH TIME ZONE" }, text)).toContain(`VALUES ('2026-09-01 10:30:00');`);
+      expect(oracle(undefined, text)).toContain(`VALUES ('2026-09-01 10:30:00');`);
+    });
+
+    test("leaves text that is not the provider's form quoted", () => {
+      expect(oracle({ at: "DATE" }, "01-SEP-26")).toContain(`VALUES ('01-SEP-26');`);
+      // A DATE has no fraction, so a fraction is not a DATE's text.
+      expect(oracle({ at: "DATE" }, "2026-09-01 10:30:00.5")).toContain(`VALUES ('2026-09-01 10:30:00.5');`);
+    });
+
+    // The text goes into TO_DATE / TO_TIMESTAMP unquoted, so the match has to cover the
+    // whole cell: a valid wall clock with anything before or after it is ordinary text.
+    test("leaves a wall clock with text before or after it quoted and escaped", () => {
+      expect(oracle({ at: "DATE" }, "2026-09-01 10:30:00'); DROP TABLE x; --")).toContain(
+        `VALUES ('2026-09-01 10:30:00''); DROP TABLE x; --');`,
+      );
+      expect(oracle({ at: "TIMESTAMP" }, "x'); DROP TABLE x; -- 2026-09-01 10:30:00")).toContain(
+        `VALUES ('x''); DROP TABLE x; -- 2026-09-01 10:30:00');`,
+      );
+    });
+  });
+
+  // A zoned column still reaches the export as the driver's `Date` in-process, but over
+  // HTTP the row has been through JSON, so the same cell arrives as the text
+  // `Date#toISOString` wrote. Quoted, Oracle refuses it on replay with ORA-01843 (#1224).
+  describe("a BC year (#1498)", () => {
+    // The sign goes before the zeros and the mask takes it as SYYYY, as the provider's own text does.
+    const bcZoned = (iso: string) => new Date(iso);
+
+    test("writes a zoned BC instant with its sign and SYYYY", () => {
+      expect(oracle({ at: "TIMESTAMP WITH TIME ZONE" }, bcZoned("-000044-03-15T10:30:00.000Z"))).toContain(
+        `VALUES (FROM_TZ(TO_TIMESTAMP('-0044-03-15 10:30:00.000', 'SYYYY-MM-DD HH24:MI:SS.FF3'), 'UTC'));`,
+      );
+      expect(oracle({ at: "TIMESTAMP WITH LOCAL TIME ZONE" }, bcZoned("-000001-12-31T23:00:00.000Z"))).toContain(
+        `VALUES (FROM_TZ(TO_TIMESTAMP('-0001-12-31 23:00:00.000', 'SYYYY-MM-DD HH24:MI:SS.FF3'), 'UTC'));`,
+      );
+    });
+
+    test("writes a naive BC Date from its local fields, as TO_TIMESTAMP and as TO_DATE", () => {
+      const local = new Date(2026, 2, 15, 10, 30, 0, 5);
+      local.setFullYear(-44);
+      expect(oracle({ at: "TIMESTAMP" }, local)).toContain(
+        `VALUES (TO_TIMESTAMP('-0044-03-15 10:30:00.005', 'SYYYY-MM-DD HH24:MI:SS.FF3'));`,
+      );
+      expect(oracle({ at: "DATE" }, local)).toContain(
+        `VALUES (TO_DATE('-0044-03-15 10:30:00', 'SYYYY-MM-DD HH24:MI:SS'));`,
+      );
+      expect(oracle(undefined, local)).toContain(`'SYYYY-MM-DD HH24:MI:SS.FF3'`);
+    });
+
+    test("a four-digit year keeps YYYY and no sign, and a year before 1000 is only padded", () => {
+      expect(oracle({ at: "TIMESTAMP WITH TIME ZONE" }, bcZoned("0099-01-02T03:04:05.006Z"))).toContain(
+        `VALUES (FROM_TZ(TO_TIMESTAMP('0099-01-02 03:04:05.006', 'YYYY-MM-DD HH24:MI:SS.FF3'), 'UTC'));`,
+      );
+      expect(oracle({ at: "TIMESTAMP WITH TIME ZONE" }, bcZoned("9999-12-31T23:59:59.999Z"))).toContain(
+        `'9999-12-31 23:59:59.999', 'YYYY-MM-DD HH24:MI:SS.FF3'`,
+      );
+    });
+  });
+  describe("a zoned timestamp's ISO text, as it arrives over HTTP (#1224)", () => {
+    const fromTz = `VALUES (FROM_TZ(TO_TIMESTAMP('2026-08-24 17:11:12.345', 'YYYY-MM-DD HH24:MI:SS.FF3'), 'UTC'));`;
+
+    test("writes the text as the same FROM_TZ literal the Date of that instant gets", () => {
+      for (const declared of [
+        "TIMESTAMP WITH TIME ZONE",
+        "TIMESTAMP WITH LOCAL TIME ZONE",
+        "timestamp(6) with time zone",
+        "TIMESTAMP(9) WITH LOCAL TIME ZONE",
+      ]) {
+        const overHttp = oracle({ at: declared }, instant.toISOString());
+        expect(overHttp).toContain(fromTz);
+        expect(overHttp).toBe(oracle({ at: declared }, instant));
+      }
+    });
+
+    test("pads the fields of an early year the way the Date path does", () => {
+      expect(oracle({ at: "TIMESTAMP WITH TIME ZONE" }, "0099-01-02T03:04:05.006Z")).toContain(
+        `VALUES (FROM_TZ(TO_TIMESTAMP('0099-01-02 03:04:05.006', 'YYYY-MM-DD HH24:MI:SS.FF3'), 'UTC'));`,
+      );
+    });
+
+    // The declaration is what makes the text an instant, as it is for #1131's text.
+    test("leaves the same text quoted in a column not declared a zoned timestamp", () => {
+      const text = instant.toISOString();
+      for (const columnTypes of [{ at: "TIMESTAMP" }, { at: "TIMESTAMP(6)" }, { at: "DATE" }, { at: "VARCHAR2" }]) {
+        expect(oracle(columnTypes, text)).toContain(`VALUES ('2026-08-24T17:11:12.345Z');`);
+      }
+      expect(oracle(undefined, text)).toContain(`VALUES ('2026-08-24T17:11:12.345Z');`);
+      // Ending in `TIME ZONE`, or in the whole zoned name, is not being a zoned timestamp: the
+      // Date path's fallback reads both as zoned, but only the declared type takes this path.
+      expect(oracle({ at: "VARCHAR2 TIME ZONE" }, text)).toContain(`VALUES ('2026-08-24T17:11:12.345Z');`);
+      expect(oracle({ at: "VARCHAR2 TIMESTAMP WITH TIME ZONE" }, text)).toContain(
+        `VALUES ('2026-08-24T17:11:12.345Z');`,
+      );
+    });
+
+    // Only the exact form `Date#toISOString` writes is an instant the driver handed over.
+    test("leaves zoned text that is not exactly the ISO form quoted", () => {
+      for (const text of [
+        "2026-08-24T17:11:12.345+00:00",
+        "2026-08-24T17:11:12Z",
+        "2026-08-24T17:11:12.345678Z",
+        "2026-08-24 17:11:12.345Z",
+        "2026-08-24T17:11:12.345z",
+        "2026-08-24 10:11:12.345 -07:00",
+      ]) {
+        expect(oracle({ at: "TIMESTAMP WITH TIME ZONE" }, text)).toContain(`VALUES ('${text}');`);
+      }
+    });
+
+    // The form fits, but no `Date` writes it: there is no 30 February, and `24:00` is the
+    // next day's `00:00` to `toISOString`.
+    test("leaves text in the ISO form that is not a real instant quoted", () => {
+      for (const text of ["2026-02-30T00:00:00.000Z", "2026-09-01T24:00:00.000Z", "2026-13-01T00:00:00.000Z"]) {
+        expect(oracle({ at: "TIMESTAMP WITH TIME ZONE" }, text)).toContain(`VALUES ('${text}');`);
+      }
+    });
+
+    // `toISOString` writes a year outside 0000-9999 with a sign and six digits. Oracle has
+    // no year after 9999, and a BC instant does not replay through the Date path either,
+    // so both stay quoted rather than taking a literal the Date path does not write.
+    test("leaves a six-digit signed year quoted", () => {
+      for (const text of ["-000044-03-15T10:30:00.000Z", "+012026-09-01T07:30:00.000Z"]) {
+        expect(oracle({ at: "TIMESTAMP WITH TIME ZONE" }, text)).toContain(`VALUES ('${text}');`);
+      }
+    });
+
+    // The literal is built from the parsed instant, and the match has to cover the whole
+    // cell: a valid ISO instant with anything before or after it is ordinary text.
+    test("leaves an ISO instant with text before or after it quoted and escaped", () => {
+      expect(oracle({ at: "TIMESTAMP WITH TIME ZONE" }, "2026-08-24T17:11:12.345Z'); DROP TABLE x; --")).toContain(
+        `VALUES ('2026-08-24T17:11:12.345Z''); DROP TABLE x; --');`,
+      );
+      expect(oracle({ at: "TIMESTAMP WITH TIME ZONE" }, "x'); DROP TABLE x; -- 2026-08-24T17:11:12.345Z")).toContain(
+        `VALUES ('x''); DROP TABLE x; -- 2026-08-24T17:11:12.345Z');`,
+      );
+      expect(oracle({ at: "TIMESTAMP WITH TIME ZONE" }, "2026-08-24T17:11:12.345Z\n")).toContain(
+        `VALUES ('2026-08-24T17:11:12.345Z\n');`,
+      );
+    });
+  });
+});
+
+describe("buildResultExport: a cell whose literal depends on its declared type (#1386)", () => {
+  // Each row below is the shape the value has after the trip through JSON that every
+  // result takes to the browser, and the declared type is what the provider reports in
+  // `columnTypes`. The literal is the one replayed into the engine's own copy of the table
+  // on 2026-10-04.
+  const insert = (
+    dialect: Parameters<typeof buildResultExport>[1]["dialect"],
+    row: Record<string, unknown>,
+    columnTypes: Record<string, string>,
+  ) => buildResultExport("sql-insert", source({ rows: [row], fields: Object.keys(row), dialect, columnTypes })).content;
+
+  test("writes a Postgres array as an array literal, not as JSON", () => {
+    expect(insert("postgres", { a: [1, 2, 3] }, { a: "integer[]" })).toContain(`VALUES ('{"1","2","3"}');`);
+    expect(insert("postgres", { a: [] }, { a: "integer[]" })).toContain(`VALUES ('{}');`);
+    expect(
+      insert(
+        "postgres",
+        {
+          a: [
+            [1, 2],
+            [3, null],
+          ],
+        },
+        { a: "integer[]" },
+      ),
+    ).toContain(`VALUES ('{{"1","2"},{"3",NULL}}');`);
+  });
+
+  test("escapes a Postgres text element that holds a quote, a comma, a brace or the word NULL", () => {
+    const content = insert(
+      "postgres",
+      { a: ["q'x", "a,b", "{b}", "NULL", null, 'say "hi"', "back\\slash"] },
+      { a: "text[]" },
+    );
+
+    expect(content).toContain(`VALUES ('{"q''x","a,b","{b}","NULL",NULL,"say \\"hi\\"","back\\\\slash"}');`);
+  });
+
+  test("writes each element of a json or jsonb array as one document, arrays included", () => {
+    expect(insert("postgres", { a: [{ a: 1 }, [1, 2]] }, { a: "jsonb[]" })).toContain(
+      `VALUES ('{"{\\"a\\":1}","[1,2]"}');`,
+    );
+  });
+
+  test("leaves an array in a jsonb column as the JSON document it is", () => {
+    expect(insert("postgres", { a: [1, 2] }, { a: "jsonb" })).toContain(`VALUES ('[1,2]');`);
+    expect(insert("postgres", { a: [1, 2] }, {})).toContain(`VALUES ('[1,2]');`);
+  });
+
+  test("writes a Postgres interval as interval text", () => {
+    expect(insert("postgres", { a: { days: 1, hours: 2 } }, { a: "interval" })).toContain(`VALUES ('1 days 2 hours');`);
+    expect(
+      insert("postgres", { a: { years: -1, months: -2, days: 3, seconds: -1, milliseconds: -500 } }, { a: "interval" }),
+    ).toContain(`VALUES ('-1 years -2 months 3 days -1 seconds -500 milliseconds');`);
+    expect(insert("postgres", { a: {} }, { a: "interval" })).toContain(`VALUES ('0 seconds');`);
+  });
+
+  test("writes a Postgres point and circle in their input syntax", () => {
+    expect(insert("postgres", { a: { x: 1, y: 2 } }, { a: "point" })).toContain(`VALUES ('(1,2)');`);
+    expect(insert("postgres", { a: { x: 1, y: 2, radius: 3 } }, { a: "circle" })).toContain(`VALUES ('<(1,2),3>');`);
+  });
+
+  test("writes the elements of an interval, point or bytea array in their own text forms", () => {
+    expect(insert("postgres", { a: [{ days: 1 }, {}] }, { a: "interval[]" })).toContain(
+      `VALUES ('{"1 days","0 seconds"}');`,
+    );
+    expect(insert("postgres", { a: [{ x: 1, y: 2 }] }, { a: "point[]" })).toContain(`VALUES ('{"(1,2)"}');`);
+    expect(insert("postgres", { a: [{ type: "Buffer", data: [1, 255] }] }, { a: "bytea[]" })).toContain(
+      `VALUES ('{"\\\\x01ff"}');`,
+    );
+    expect(insert("postgres", { a: [true, false] }, { a: "boolean[]" })).toContain(`VALUES ('{"true","false"}');`);
+  });
+
+  // The MySQL date writer is left out until the provider reads the server's own date text
+  // (#1388), since it would have to guess the connection's timezone.
+  test("leaves a MySQL date to the generic writer", () => {
+    expect(insert("mysql", { a: "2024-12-31T23:59:59.999Z" }, { a: "datetime" })).toContain(
+      "VALUES ('2024-12-31T23:59:59.999Z');",
+    );
+  });
+
+  test("writes a SQL Server BIT as 1 and 0, since T-SQL has no true or false", () => {
+    expect(insert("mssql", { a: true, b: false }, { a: "bit", b: "bit" })).toContain("VALUES (1, 0);");
+  });
+
+  // Measured on SQL Server 2022 CU27: under a dmy language (british, Deutsch, Français)
+  // `'2026-10-04 12:34:56.123'` replays into a DATETIME as April 10th, and the `T` form as
+  // October 4th under every language (#1452). DATETIME2 reads either form the same.
+  test("writes a SQL Server DATETIME and SMALLDATETIME in the form every DATEFORMAT reads the same", () => {
+    expect(
+      insert(
+        "mssql",
+        { dt: "2026-10-04 12:34:56.123", sdt: "2026-10-04 12:35:00", dt2: "2026-10-04 12:34:56.123" },
+        { dt: "datetime", sdt: "smalldatetime", dt2: "datetime2" },
+      ),
+    ).toContain("VALUES (N'2026-10-04T12:34:56.123', N'2026-10-04T12:35:00', N'2026-10-04 12:34:56.123');");
+  });
+
+  test("still writes true and false where the dialect reads them", () => {
+    expect(insert("postgres", { a: true }, { a: "boolean" })).toContain("VALUES (true);");
+  });
+
+  test("writes a ClickHouse Array, Map and Tuple as ClickHouse literals", () => {
+    expect(insert("clickhouse", { a: [1, 2, 3] }, { a: "Array(Int32)" })).toContain("VALUES ([1, 2, 3]);");
+    expect(insert("clickhouse", { a: { k: 1, "it's": 2 } }, { a: "Map(String, Int32)" })).toContain(
+      "VALUES (map('k', 1, 'it''s', 2));",
+    );
+    expect(insert("clickhouse", { a: {} }, { a: "Map(String, Int32)" })).toContain("VALUES (map());");
+    expect(insert("clickhouse", { a: [1, "x"] }, { a: "Tuple(Int32, String)" })).toContain("VALUES (tuple(1, 'x'));");
+    expect(insert("clickhouse", { a: { b: ["p"], a: 7 } }, { a: "Tuple(a Int32, b Array(String))" })).toContain(
+      "VALUES (tuple(7, ['p']));",
+    );
+    expect(insert("clickhouse", { a: [[1, null], []] }, { a: "Array(Array(Nullable(Int32)))" })).toContain(
+      "VALUES ([[1, NULL], []]);",
+    );
+  });
+
+  test("writes a quoted 64-bit integer inside a ClickHouse container bare", () => {
+    expect(insert("clickhouse", { a: ["18446744073709551615"] }, { a: "Array(UInt64)" })).toContain(
+      "VALUES ([18446744073709551615]);",
+    );
+    expect(insert("clickhouse", { a: { "1": "2.5" } }, { a: "Map(UInt8, Decimal(9, 2))" })).toContain(
+      "VALUES (map(1, 2.5));",
+    );
+  });
+
+  test("leaves a dialect with no typed form, and a scalar ClickHouse column, to the generic writer", () => {
+    expect(insert("sqlite", { a: [1, 2] }, { a: "integer[]" })).toContain(`VALUES ('[1,2]');`);
+    expect(insert("clickhouse", { a: "18446744073709551615" }, { a: "UInt64" })).toContain(
+      "VALUES ('18446744073709551615');",
+    );
+  });
+});
+
+describe("buildResultExport: Trino, DuckDB and Cassandra literals (#1386)", () => {
+  // Each value is the shape the provider hands over after the trip through JSON, and each
+  // literal replayed into the engine's own copy of the table on 2026-10-04.
+  const insert = (
+    dialect: Parameters<typeof buildResultExport>[1]["dialect"],
+    row: Record<string, unknown>,
+    columnTypes: Record<string, string>,
+  ) => buildResultExport("sql-insert", source({ rows: [row], fields: Object.keys(row), dialect, columnTypes })).content;
+
+  test("writes each Trino type by its own literal, since INSERT coerces no varchar into it", () => {
+    const content = insert(
+      "trino",
+      {
+        b: "9007199254740993",
+        dec: "1.5",
+        r: 0.1,
+        d: "2024-02-29",
+        t: "13:14:15.123",
+        ts: "2024-12-31 23:59:59.999",
+        tz: "2024-12-31 23:59:59.999 Europe/Istanbul",
+        j: '{"s":"it\'s"}',
+        u: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+        ip: "10.0.0.1",
+        vb: "AQL/",
+        v: "x",
+      },
+      {
+        b: "bigint",
+        dec: "decimal(20, 4)",
+        r: "real",
+        d: "date",
+        t: "time",
+        ts: "timestamp(3)",
+        tz: "timestamp with time zone",
+        j: "json",
+        u: "uuid",
+        ip: "ipaddress",
+        vb: "varbinary",
+        v: "varchar",
+      },
+    );
+
+    expect(content).toContain(
+      "VALUES (9007199254740993, DECIMAL '1.5', REAL '0.1', DATE '2024-02-29', TIME '13:14:15.123', " +
+        "TIMESTAMP '2024-12-31 23:59:59.999', TIMESTAMP '2024-12-31 23:59:59.999 Europe/Istanbul', " +
+        `JSON '{"s":"it''s"}', UUID 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', IPADDRESS '10.0.0.1', X'0102ff', 'x');`,
+    );
+  });
+
+  test("writes a Trino array, map and row, nested and empty", () => {
+    expect(insert("trino", { a: [[1, null], []] }, { a: "array(array(integer))" })).toContain(
+      "VALUES (ARRAY[ARRAY[1, NULL], ARRAY[]]);",
+    );
+    expect(
+      insert("trino", { a: { p: [1.5, ["q"]] } }, { a: "map(varchar, row(x double, y array(varchar)))" }),
+    ).toContain("VALUES (MAP(ARRAY['p'], ARRAY[ROW(1.5, ARRAY['q'])]));");
+    expect(insert("trino", { a: {} }, { a: "map(varchar, integer)" })).toContain("VALUES (MAP());");
+    expect(insert("trino", { a: { k: { s: 1 } } }, { a: "map(varchar, json)" })).toContain(
+      `VALUES (MAP(ARRAY['k'], ARRAY[JSON '{"s":1}']));`,
+    );
+  });
+
+  test("writes a DuckDB INTERVAL, MAP, STRUCT and list as DuckDB literals", () => {
+    expect(insert("duckdb", { a: { months: 14, days: 3, micros: "14706000001" } }, { a: "INTERVAL" })).toContain(
+      "VALUES (INTERVAL '14 months 3 days 14706000001 microseconds');",
+    );
+    expect(
+      insert(
+        "duckdb",
+        {
+          a: [
+            { key: "k", value: 1 },
+            { key: "it's", value: 2 },
+          ],
+        },
+        { a: "MAP(VARCHAR, INTEGER)" },
+      ),
+    ).toContain("VALUES (MAP {'k': 1, 'it''s': 2});");
+    expect(insert("duckdb", { a: [] }, { a: "MAP(VARCHAR, INTEGER)" })).toContain("VALUES (MAP {});");
+    expect(insert("duckdb", { a: { b: ["p"], a: "7" } }, { a: 'STRUCT("a" BIGINT, "b" VARCHAR[])' })).toContain(
+      "VALUES ({'a': 7, 'b': ['p']});",
+    );
+    expect(insert("duckdb", { a: [[1, null], []] }, { a: "INTEGER[][]" })).toContain("VALUES ([[1, NULL], []]);");
+    expect(insert("duckdb", { a: [1, 2, 3] }, { a: "INTEGER[3]" })).toContain("VALUES ([1, 2, 3]);");
+  });
+
+  test("leaves a quoted DuckDB scalar, which DuckDB reads back, to the generic writer", () => {
+    expect(insert("duckdb", { a: "170141183460469231731687303715884105727" }, { a: "HUGEINT" })).toContain(
+      "VALUES ('170141183460469231731687303715884105727');",
+    );
+  });
+
+  test("writes CQL collections, tuples, UDTs, wide numbers, uuids and durations unquoted", () => {
+    const content = insert(
+      "cassandra",
+      {
+        li: [1, 2],
+        st: ["a", "it's"],
+        mp: { "1": ["x"] },
+        tup: [7, "x"],
+        addr: { street: "Main", zip: 1 },
+        b: "9007199254740993",
+        vi: "-1",
+        u: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+        du: "1mo2d3h",
+        nl: [[1], []],
+      },
+      {
+        li: "list<int>",
+        st: "set<varchar>",
+        mp: "map<int, frozen<set<varchar>>>",
+        tup: "tuple<int, varchar>",
+        addr: "address",
+        b: "bigint",
+        vi: "varint",
+        u: "uuid",
+        du: "duration",
+        nl: "list<list<int>>",
+      },
+    );
+
+    expect(content).toContain(
+      `VALUES ([1, 2], {'a', 'it''s'}, {1: {'x'}}, (7, 'x'), {"street": 'Main', "zip": 1}, 9007199254740993, -1, ` +
+        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11, 1mo2d3h, [[1], []]);",
+    );
+  });
+
+  test("freezes a collection nested in a CQL collection in the DDL", () => {
+    const ddl = buildResultExport(
+      "sql-ddl",
+      source({
+        rows: [{ a: null, b: null, c: null, d: null }],
+        fields: ["a", "b", "c", "d"],
+        dialect: "cassandra",
+        columnTypes: {
+          a: "list<list<int>>",
+          b: "map<int, set<varchar>>",
+          c: "list<address>",
+          d: "list<frozen<list<int>>>",
+        },
+      }),
+    ).content;
+
+    expect(ddl).toContain('"a" list<frozen<list<int>>>');
+    expect(ddl).toContain('"b" map<int, frozen<set<varchar>>>');
+    expect(ddl).toContain('"c" list<frozen<address>>');
+    expect(ddl).toContain('"d" list<frozen<list<int>>>');
+  });
+
+  test("still completes a bare CQL name the frozen rewrite leaves alone", () => {
+    const ddl = buildResultExport(
+      "sql-ddl",
+      source({ rows: [{ a: null }], fields: ["a"], dialect: "cassandra", columnTypes: { a: "character varying" } }),
+    ).content;
+
+    expect(ddl).toContain('"a" TEXT');
+  });
+
+  test("keeps a DuckDB STRUCT, fixed array and nested list type in the DDL", () => {
+    const ddl = buildResultExport(
+      "sql-ddl",
+      source({
+        rows: [{ a: null, b: null, c: null }],
+        fields: ["a", "b", "c"],
+        dialect: "duckdb",
+        columnTypes: { a: 'STRUCT("a" INTEGER, "b" VARCHAR[])', b: "INTEGER[3]", c: "MAP(INTEGER, VARCHAR[])" },
+      }),
+    ).content;
+
+    expect(ddl).toContain('"a" STRUCT("a" INTEGER, "b" VARCHAR[])');
+    expect(ddl).toContain('"b" INTEGER[3]');
+    expect(ddl).toContain('"c" MAP(INTEGER, VARCHAR[])');
+  });
+});
+
+describe("buildResultExport: a row with a cell the dialect has no literal for (#1386)", () => {
+  test("skips that row with a comment naming the column, and writes the others", () => {
+    const content = buildResultExport(
+      "sql-insert",
+      source({
+        rows: [{ t: [7, "x"] }, { t: [7] }, { t: [8, "y"] }],
+        fields: ["t"],
+        dialect: "cassandra",
+        columnTypes: { t: "tuple<int, varchar>" },
+      }),
+    ).content;
+
+    expect(content).toBe(
+      [
+        `INSERT INTO users ("t") VALUES ((7, 'x'));`,
+        `-- Row 2 skipped: column "t" holds a tuple that does not have its declared length, which cassandra has no literal for.`,
+        `INSERT INTO users ("t") VALUES ((8, 'y'));`,
+      ].join("\n"),
+    );
+  });
+
+  test("cannot let a column name end the comment", () => {
+    const content = buildResultExport(
+      "sql-insert",
+      source({
+        rows: [{ "a\nDROP TABLE x; --\u2028": "not a list" }],
+        fields: ["a\nDROP TABLE x; --\u2028"],
+        dialect: "trino",
+        columnTypes: { "a\nDROP TABLE x; --\u2028": "array(integer)" },
+      }),
+    ).content;
+
+    expect(content.split("\n")).toHaveLength(1);
+    expect(content).toBe(
+      '-- Row 1 skipped: column "a\\nDROP TABLE x; --?" holds an array that is not a list, which trino has no literal for.',
+    );
+  });
+
+  // The comment cleans what a refusal names on its own, whatever writer raised it. No writer but Databend's names
+  // engine text today, and that one cleans the type first, so a cell that raises the refusal itself, read here by the
+  // Trino writer, stands for the next writer that does.
+  test("cannot let what any writer's refusal names end the comment", () => {
+    const cell = [7];
+    Object.defineProperty(cell, 0, {
+      get() {
+        throw new UnwritableValue("an element\nSELECT 2 AS injected; -- ");
+      },
+    });
+    const content = buildResultExport(
+      "sql-insert",
+      source({ rows: [{ a: cell }], fields: ["a"], dialect: "trino", columnTypes: { a: "array(integer)" } }),
+    ).content;
+
+    expect(content.split("\n")).toHaveLength(1);
+    expect(content).toBe(
+      '-- Row 1 skipped: column "a" holds an element?SELECT 2 AS injected; --?, which trino has no literal for.',
+    );
+  });
+
+  // A Databend type is the server's own text, kept verbatim in `columnTypes`, so a hostile or impersonated endpoint
+  // chooses it, and the comment names a type that has no literal by that text.
+  const plantedType = (end: string) =>
+    buildResultExport(
+      "sql-insert",
+      source({
+        rows: [{ c: "x" }],
+        fields: ["c"],
+        dialect: "databend",
+        columnTypes: { c: `Mystery${end}SELECT 2 AS injected;${end}--` },
+      }),
+    ).content;
+
+  test("cannot let a declared type end the comment", () => {
+    const content = plantedType("\n");
+
+    expect(content.split("\n")).toHaveLength(1);
+    expect(content).toBe(
+      '-- Row 1 skipped: column "c" holds a value of type Mystery?SELECT 2 AS injected;?--, which databend has no literal for.',
+    );
+  });
+
+  // Databend's own lexer ends a `--` comment at a form feed too (`--[^\n\f]*`), and other replaying clients at the rest.
+  test.each<[string, string]>([
+    ["a carriage return", "\r"],
+    ["a carriage return and a line feed", "\r\n"],
+    ["a form feed", "\f"],
+    ["a vertical tab", "\v"],
+    ["a NUL", "\0"],
+    ["a next-line character", "\u0085"],
+    ["a line separator", "\u2028"],
+    ["a paragraph separator", "\u2029"],
+  ])("cannot let a declared type end the comment at %s", (_, end) => {
+    expect(plantedType(end)).toMatch(
+      /^-- Row 1 skipped: column "c" holds a value of type Mystery\?+SELECT [\x20-\x7e]*$/,
+    );
+  });
+});
+
+describe("buildResultExport: the table the producing query read (#1386)", () => {
+  test("names the one table a SELECT reads, ahead of the tab's title", () => {
+    const content = buildResultExport(
+      "sql-insert",
+      source({ tabName: "Query 1", query: "SELECT * FROM public.orders WHERE id > 1" }),
+    ).content;
+
+    expect(content).toContain("INSERT INTO public.orders (");
+  });
+
+  test("falls back to the tab's title for a join, a quoted name or no query", () => {
+    const name = (query: string | undefined) =>
+      buildResultExport("sql-insert", source({ tabName: "users", query })).content.split(" (")[0];
+
+    expect(name("SELECT * FROM a JOIN b ON a.id = b.id")).toBe("INSERT INTO users");
+    expect(name('SELECT * FROM "Order Items"')).toBe("INSERT INTO users");
+    expect(name(undefined)).toBe("INSERT INTO users");
+  });
 });
 
 describe("resultExportFileName", () => {
@@ -1013,5 +1908,336 @@ describe("resultExportFileName", () => {
   test("caps how much of a run id reaches the name", () => {
     const name = resultExportFileName("csv", "r".repeat(200));
     expect(name).toBe(`agent_run_${"r".repeat(64)}_export.csv`);
+  });
+});
+
+describe("buildResultExport — markdown and html", () => {
+  test("writes a Markdown table with the shared mime type and extension", () => {
+    const file = buildResultExport("markdown", source());
+    expect(file.content).toBe("| id | name |\n| --- | --- |\n| 1 | Ada |");
+    expect(file.mimeType).toBe("text/markdown;charset=utf-8");
+    expect(file.extension).toBe("md");
+  });
+
+  test("writes an HTML table with the shared mime type and extension", () => {
+    const file = buildResultExport("html", source());
+    expect(file.content).toContain("<tr><th>id</th><th>name</th></tr>");
+    expect(file.content).toContain("<tr><td>1</td><td>Ada</td></tr>");
+    expect(file.mimeType).toBe("text/html;charset=utf-8");
+    expect(file.extension).toBe("html");
+  });
+
+  test("ignores the dialect for the two text formats, which name no engine", () => {
+    const markdown = buildResultExport("markdown", source({ dialect: "oracle" }));
+    const html = buildResultExport("html", source({ dialect: "mssql" }));
+    expect(markdown.content).toBe("| id | name |\n| --- | --- |\n| 1 | Ada |");
+    expect(html.content).toContain("<tr><td>1</td><td>Ada</td></tr>");
+  });
+
+  test("returns text content, never a binary blob", () => {
+    expect(typeof buildResultExport("markdown", source()).content).toBe("string");
+    expect(typeof buildResultExport("html", source()).content).toBe("string");
+  });
+});
+
+// The four rulings design 7.2 asks of Databend (X01), each from the spellings M08a created and M08c read back on the
+// pinned image. The quote character is the identifier module's, so it is stripped before comparing.
+describe("buildResultExport: Databend's type rulings (X01)", () => {
+  const ddl = (columnTypes: Record<string, string> | undefined, rows: Record<string, unknown>[] = [{ c: null }]) =>
+    buildResultExport(
+      "sql-ddl",
+      source({ rows, fields: Object.keys(rows[0]), dialect: "databend", columnTypes }),
+    ).content.replace(/[`"]/g, "");
+
+  test("DIALECT_TYPES: an inferred column is spelled VARCHAR, DOUBLE and BINARY, the names M08a created", () => {
+    const content = ddl(undefined, [
+      { t: "x", n: 1.5, b: new Uint8Array([1]), i: 7, f: true, d: new Date("2026-10-07T00:00:00Z") },
+    ]);
+    expect(content).toContain("t VARCHAR");
+    expect(content).toContain("n DOUBLE,");
+    expect(content).toContain("b BINARY");
+    expect(content).toContain("i BIGINT");
+    expect(content).toContain("f BOOLEAN");
+    expect(content).toContain("d TIMESTAMP");
+  });
+
+  test("STANDS_ALONE: VARCHAR, TIMESTAMP and BINARY are kept, and a name Databend was not measured with is re-spelled", () => {
+    expect(ddl({ c: "varchar" })).toContain("c varchar");
+    expect(ddl({ c: "Timestamp" })).toContain("c Timestamp");
+    expect(ddl({ c: "Binary" })).toContain("c Binary");
+    expect(ddl({ c: "text" })).toContain("c VARCHAR");
+    expect(ddl({ c: "bytea" })).toContain("c BINARY");
+    expect(ddl({ c: "decimal" })).toContain("c DOUBLE");
+  });
+
+  test("DIALECT_BARE_SPELLING: no row, so a bare datetime is TIMESTAMP and never MySQL's datetime(6)", () => {
+    // Databend's Timestamp keeps microseconds without a precision, so no bare name it reports narrows the value.
+    expect(ddl({ c: "datetime" })).toContain("c TIMESTAMP");
+    expect(ddl({ c: "String" })).toContain("c String");
+  });
+
+  test("DECLARED_TYPE_REWRITE: no row, so a declared composite is written as Databend spelled it", () => {
+    expect(ddl({ c: "Nullable(Array(Int32 NULL))" })).toContain("c Nullable(Array(Int32 NULL))");
+    expect(ddl({ c: "Map(String, Int32)" })).toContain("c Map(String, Int32)");
+  });
+
+  test("a declared Binary cell replays as bytes, and a Binary cell that is not hex skips its row with the #1386 comment", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({
+        rows: [{ b: "616263" }, { b: "<bitmap binary>" }],
+        fields: ["b"],
+        dialect: "databend",
+        columnTypes: { b: "Nullable(Binary)" },
+      }),
+    );
+    expect(file.content).toContain("VALUES (unhex('616263'));");
+    expect(file.content).toContain('-- Row 2 skipped: column "b" holds a Binary that is not hex');
+  });
+
+  test("a declared Bitmap row is skipped with the #1386 comment", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({ rows: [{ b: "<bitmap binary>" }], fields: ["b"], dialect: "databend", columnTypes: { b: "Bitmap" } }),
+    );
+    expect(file.content).toContain('-- Row 1 skipped: column "b" holds a value of type Bitmap');
+  });
+});
+
+/**
+ * Snowflake's INSERT is `INSERT ... SELECT`, since `INSERT ... VALUES` refuses `PARSE_JSON`, and its temporal cells go
+ * through `TO_DATE`, `TO_TIME` and `TO_TIMESTAMP_*` with an explicit mask, so no account input format moves them.
+ * Every form here is provisional until a replay on an account confirms it.
+ */
+describe("buildResultExport: Snowflake's rows and types", () => {
+  const columnTypes = {
+    v: "VARIANT",
+    o: "OBJECT",
+    a: "ARRAY",
+    vec: "VECTOR(FLOAT, 2)",
+    d: "DATE",
+    tm: "TIME(9)",
+    ntz: "TIMESTAMP_NTZ(3)",
+    tz: "TIMESTAMP_TZ(9)",
+    b: "BINARY",
+    n: "NUMBER(10,2)",
+  };
+  const row = {
+    v: '{"a":1}',
+    o: '{"k":"v"}',
+    a: "[1,2]",
+    vec: "[1.5,2]",
+    d: "2026-10-12",
+    tm: "13:45:30.123456789",
+    ntz: "2026-10-12 13:45:30.123",
+    tz: "2026-10-12 13:45:30.123456789+01:00",
+    b: Buffer.from([0x01, 0xab]),
+    n: "12.50",
+  };
+
+  test("writes INSERT ... SELECT with PARSE_JSON, the VECTOR cast and masked temporal casts, byte for byte", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({ rows: [row], fields: Object.keys(row), tabName: "t", dialect: "snowflake", columnTypes }),
+    );
+    expect(file.content).toBe(
+      'INSERT INTO t ("v", "o", "a", "vec", "d", "tm", "ntz", "tz", "b", "n") SELECT ' +
+        "PARSE_JSON('{\"a\":1}'), PARSE_JSON('{\"k\":\"v\"}'), PARSE_JSON('[1,2]'), " +
+        "PARSE_JSON('[1.5,2]')::VECTOR(FLOAT, 2), TO_DATE('2026-10-12', 'YYYY-MM-DD'), " +
+        "TO_TIME('13:45:30.123456789', 'HH24:MI:SS.FF9'), " +
+        "TO_TIMESTAMP_NTZ('2026-10-12 13:45:30.123', 'YYYY-MM-DD HH24:MI:SS.FF3'), " +
+        "TO_TIMESTAMP_TZ('2026-10-12 13:45:30.123456789+01:00', 'YYYY-MM-DD HH24:MI:SS.FF9TZH:TZM'), " +
+        "X'01ab', 12.50;",
+    );
+  });
+
+  test("a year outside 1 to 9999 is written, never skipped (SF-008)", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({
+        rows: [{ d: "-0002-06-01" }, { d: "10000-01-01" }],
+        fields: ["d"],
+        tabName: "t",
+        dialect: "snowflake",
+        columnTypes: { d: "DATE" },
+      }),
+    );
+    expect(file.content).toBe(
+      `INSERT INTO t ("d") SELECT DATEADD(DAY, -146097, TO_DATE('0398-06-01', 'YYYY-MM-DD'));\n` +
+        `INSERT INTO t ("d") SELECT TO_DATE('10000-01-01', 'YYYY-MM-DD');`,
+    );
+  });
+
+  test("a VECTOR column, as the SQL API reports it, is cast to the dimension its value spells", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({
+        rows: [{ vec: "[1.500000,2.000000,-3.000000]" }],
+        fields: ["vec"],
+        tabName: "t",
+        dialect: "snowflake",
+        columnTypes: { vec: "VECTOR" },
+      }),
+    );
+    expect(file.content).toBe(
+      `INSERT INTO t ("vec") SELECT PARSE_JSON('[1.500000,2.000000,-3.000000]')::VECTOR(FLOAT, 3);`,
+    );
+  });
+
+  test("NaN and the infinities in a FLOAT column are Snowflake's own literals, never NULL", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({
+        rows: [{ f: "Infinity" }, { f: "-Infinity" }, { f: "NaN" }, { f: Number.NEGATIVE_INFINITY }],
+        fields: ["f"],
+        tabName: "t",
+        dialect: "snowflake",
+        columnTypes: { f: "FLOAT" },
+      }),
+    );
+    expect(file.content).toBe(
+      [
+        `INSERT INTO t ("f") SELECT 'inf'::FLOAT;`,
+        `INSERT INTO t ("f") SELECT '-inf'::FLOAT;`,
+        `INSERT INTO t ("f") SELECT 'NaN'::FLOAT;`,
+        `INSERT INTO t ("f") SELECT '-inf'::FLOAT;`,
+      ].join("\n"),
+    );
+  });
+
+  test("a row with no typed cell is still INSERT ... SELECT", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({ rows: [{ id: 1, name: "it's" }], fields: ["id", "name"], tabName: "t", dialect: "snowflake" }),
+    );
+    expect(file.content).toBe(`INSERT INTO t ("id", "name") SELECT 1, 'it''s';`);
+  });
+
+  test("a temporal cell not in the decoder's form skips its row with the #1386 comment", () => {
+    const file = buildResultExport(
+      "sql-insert",
+      source({ rows: [{ d: "12/10/2026" }], fields: ["d"], dialect: "snowflake", columnTypes: { d: "DATE" } }),
+    );
+    expect(file.content).toContain('-- Row 1 skipped: column "d" holds a DATE that is not in the form');
+  });
+
+  test("the DDL declares a VECTOR by its first value, and GEOGRAPHY, GEOMETRY and VARCHAR as reported (SF-033)", () => {
+    const ddl = buildResultExport(
+      "sql-ddl",
+      source({
+        rows: [
+          { vf: null, vi: "[1,2,3]", g: "POINT(1 2)", gm: "POINT(1 2)", c: "ab" },
+          { vf: "[1.5,2,3]", vi: "[4,5,6]", g: null, gm: null, c: null },
+        ],
+        fields: ["vf", "vi", "g", "gm", "c"],
+        tabName: "t",
+        dialect: "snowflake",
+        columnTypes: { vf: "VECTOR", vi: "vector", g: "GEOGRAPHY", gm: "GEOMETRY", c: "VARCHAR(5)" },
+      }),
+    ).content;
+    expect(ddl).toBe(
+      'CREATE TABLE t (\n  "vf" VECTOR(FLOAT, 3),\n  "vi" VECTOR(INT, 3),\n  "g" GEOGRAPHY,\n  "gm" GEOMETRY,\n  "c" VARCHAR(5)\n);',
+    );
+    const insert = buildResultExport(
+      "sql-insert",
+      source({
+        rows: [{ g: "POINT(1 2)" }],
+        fields: ["g"],
+        tabName: "t",
+        dialect: "snowflake",
+        columnTypes: { g: "GEOGRAPHY" },
+      }),
+    ).content;
+    // Snowflake casts the quoted text to GEOGRAPHY on insert (replayed 2026-10-14), so the cell stays text.
+    expect(insert).toBe(`INSERT INTO t ("g") SELECT 'POINT(1 2)';`);
+  });
+
+  test("a VECTOR column with no readable value is declared ARRAY, which holds its NULLs", () => {
+    const declare = (rows: Record<string, unknown>[]) =>
+      buildResultExport(
+        "sql-ddl",
+        source({ rows, fields: ["v"], tabName: "t", dialect: "snowflake", columnTypes: { v: "VECTOR" } }),
+      ).content;
+    expect(declare([{ v: null }])).toContain('"v" ARRAY');
+    expect(declare([{ v: "not a vector" }])).toContain('"v" ARRAY');
+    expect(declare([{ v: [1, 2.5] }])).toContain('"v" VECTOR(FLOAT, 2)');
+    // Only Snowflake reads its VECTOR this way; another dialect keeps the declared spelling.
+    expect(
+      buildResultExport(
+        "sql-ddl",
+        source({ rows: [{ v: null }], fields: ["v"], tabName: "t", dialect: "duckdb", columnTypes: { v: "VECTOR" } }),
+      ).content,
+    ).toContain('"v" VECTOR');
+  });
+
+  test("the DDL offers FLOAT for a float column and BINARY, never BLOB, for bytes", () => {
+    const ddl = buildResultExport(
+      "sql-ddl",
+      source({ rows: [{ f: 1.5, b: new Uint8Array([1]) }], fields: ["f", "b"], dialect: "snowflake" }),
+    ).content;
+    expect(ddl).toContain('"f" FLOAT');
+    expect(ddl).toContain('"b" BINARY');
+    expect(ddl).not.toContain("BLOB");
+    const declared = buildResultExport(
+      "sql-ddl",
+      source({ rows: [{ b: null }], fields: ["b"], dialect: "snowflake", columnTypes: { b: "BINARY" } }),
+    ).content;
+    expect(declared).toContain('"b" BINARY');
+  });
+});
+
+describe("buildResultExport: Apache Spark", () => {
+  test("DIALECT_TYPES: an inferred column is spelled STRING, DOUBLE and BINARY, which Spark has", () => {
+    const content = buildResultExport(
+      "sql-ddl",
+      source({ rows: [{ t: "x", n: 1.5, b: new Uint8Array([1]) }], fields: ["t", "n", "b"], dialect: "spark" }),
+    ).content;
+    expect(content).toContain("`t` STRING");
+    expect(content).toContain("`n` DOUBLE");
+    expect(content).toContain("`b` BINARY");
+    expect(content).not.toContain("TEXT");
+    expect(content).not.toContain("BLOB");
+    expect(content).not.toContain("DOUBLE PRECISION");
+  });
+
+  test("an INSERT writes Spark's typed literals, its escapes, X'..' bytes and the non-finite casts", () => {
+    const row = {
+      d: "2026-10-12",
+      s: "it's \\",
+      b: Buffer.from([0x01, 0xab]),
+      f: Number.NaN,
+      g: Number.POSITIVE_INFINITY,
+    };
+    const content = buildResultExport(
+      "sql-insert",
+      source({
+        rows: [row],
+        fields: Object.keys(row),
+        tabName: "t",
+        dialect: "spark",
+        columnTypes: { d: "date", s: "string", b: "binary", f: "double", g: "double" },
+      }),
+    ).content;
+    expect(content).toContain("DATE '2026-10-12'");
+    expect(content).toContain("'it\\'s \\\\'");
+    expect(content).toContain("X'01ab'");
+    expect(content).toContain("CAST('NaN' AS DOUBLE)");
+    expect(content).toContain("CAST('Infinity' AS DOUBLE)");
+  });
+
+  test("a geospatial cell is refused as unwritable, not written in a form Spark refuses", () => {
+    const row = { id: 1, g: "SRID=4326;POINT (1 2)" };
+    const content = buildResultExport(
+      "sql-insert",
+      source({
+        rows: [row],
+        fields: ["id", "g"],
+        tabName: "t",
+        dialect: "spark",
+        columnTypes: { id: "int", g: "geometry(4326)" },
+      }),
+    ).content;
+    expect(content).not.toContain("POINT (1 2)'");
+    expect(content).toContain('-- Row 1 skipped: column "g" holds a geometry(4326) value');
   });
 });

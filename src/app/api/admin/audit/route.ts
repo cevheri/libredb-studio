@@ -1,16 +1,18 @@
 import { getSession } from "@/lib/auth";
 import { NextResponse } from "next/server";
 import { getServerAuditBuffer, sanitizeAuditInput, type AuditEventType } from "@/lib/audit";
-import { auditRoleDenial } from "@/lib/api/require-session";
+import { auditRoleDenial, adminRequiredResponse } from "@/lib/api/require-session";
 import { createErrorResponse } from "@/lib/api/errors";
+import { sessionRequiredBody } from "@/lib/api/session-ended";
 import { logger } from "@/lib/logger";
 
 export async function GET(request: Request) {
   try {
     const session = await getSession();
-    if (!session || session.role !== "admin") {
-      if (session) auditRoleDenial({ route: "GET /api/admin/audit", user: session.username, request });
-      return NextResponse.json({ error: "Unauthorized. Admin access required." }, { status: 403 });
+    if (!session) return NextResponse.json(sessionRequiredBody("Authentication required"), { status: 401 });
+    if (session.role !== "admin") {
+      auditRoleDenial({ route: "GET /api/admin/audit", user: session.username, request });
+      return adminRequiredResponse();
     }
 
     const { searchParams } = new URL(request.url);
@@ -18,7 +20,7 @@ export async function GET(request: Request) {
     const limit = parseInt(searchParams.get("limit") || "100", 10);
 
     const buffer = getServerAuditBuffer();
-    const events = type ? buffer.filter({ type }) : buffer.getRecent(limit);
+    const events = type ? buffer.filter({ type, limit }) : buffer.getRecent(limit);
 
     return NextResponse.json({ events, total: buffer.size });
   } catch (error) {
@@ -28,9 +30,10 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   const session = await getSession();
-  if (!session || session.role !== "admin") {
-    if (session) auditRoleDenial({ route: "POST /api/admin/audit", user: session.username, request });
-    return NextResponse.json({ error: "Unauthorized. Admin access required." }, { status: 403 });
+  if (!session) return NextResponse.json(sessionRequiredBody("Authentication required"), { status: 401 });
+  if (session.role !== "admin") {
+    auditRoleDenial({ route: "POST /api/admin/audit", user: session.username, request });
+    return adminRequiredResponse();
   }
 
   try {

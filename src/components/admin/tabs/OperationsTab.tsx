@@ -18,6 +18,14 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { TypedConfirmDialog } from "@/components/typed-confirm";
+import {
+  MaintenanceEntityDialog,
+  READ_ONLY_MAINTENANCE,
+  closedEntityDialog,
+  entityRequest,
+  type EntityDialogOpening,
+} from "@/components/maintenance-entity-dialog";
 import {
   RefreshCw,
   Zap,
@@ -38,10 +46,26 @@ import {
 } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import { useMonitoringData } from "@/hooks/use-monitoring-data";
+import { useReturnFocus } from "@/hooks/use-return-focus";
 import { storage } from "@/lib/storage";
 import { useAllConnections } from "@/hooks/use-all-connections";
-import { maintenanceControl, type ActiveSessionDetails, type MaintenanceType } from "@/lib/db/types";
+import {
+  declaredEntityOperations,
+  maintenanceControl,
+  offersSessionTermination,
+  type ActiveSessionDetails,
+  type MaintenanceOperation,
+  type MaintenanceResult,
+  type MaintenanceType,
+  type ProviderCapabilities,
+  type TableStats,
+} from "@/lib/db/types";
+import { readObjectPathParam } from "@/lib/db/object-path";
+import { withConnectedMaintenance } from "@/lib/db/types";
 import { useProviderMetadata } from "@/hooks/use-provider-metadata";
+import { useCatalogs } from "@/hooks/use-catalogs";
+import { catalogOfPath, declaresCatalogSessions } from "@/lib/db/object-kinds";
+import { CatalogSelect } from "@/components/catalog-select";
 
 /**
  * The per-row maintenance controls this tab can render, in display order, with the
@@ -54,29 +78,92 @@ import { useProviderMetadata } from "@/hooks/use-provider-metadata";
  * `DBCC CHECKDB`, SQLite's `VACUUM`) - see `maintenanceControl` (#496).
  */
 const TABLE_ACTIONS: { type: MaintenanceType; label: string; Icon: LucideIcon; hover: string }[] = [
-  { type: "analyze", label: "Analyze", Icon: Search, hover: "hover:text-yellow-500" },
-  { type: "vacuum", label: "Vacuum", Icon: HardDrive, hover: "hover:text-blue-500" },
-  { type: "optimize", label: "Optimize", Icon: Wrench, hover: "hover:text-blue-500" },
-  { type: "reindex", label: "Reindex", Icon: RefreshCw, hover: "hover:text-purple-500" },
-  { type: "check", label: "Check", Icon: ShieldCheck, hover: "hover:text-green-500" },
+  { type: "analyze", label: "Analyze", Icon: Search, hover: "hover:text-hue-yellow" },
+  { type: "vacuum", label: "Vacuum", Icon: HardDrive, hover: "hover:text-hue-blue" },
+  { type: "optimize", label: "Optimize", Icon: Wrench, hover: "hover:text-hue-blue" },
+  { type: "reindex", label: "Reindex", Icon: RefreshCw, hover: "hover:text-hue-purple" },
+  { type: "check", label: "Check", Icon: ShieldCheck, hover: "hover:text-hue-green" },
 ];
+
+/** One per-row control: a `TABLE_ACTIONS` entry, or a declared operation outside `MaintenanceType` (spec 3.11). */
+interface TableAction {
+  type: MaintenanceOperation;
+  label: string;
+  Icon: LucideIcon;
+  hover: string;
+}
+
+/** A statistics row, or the deep-linked object this page offered because the list did not contain it. */
+type OperationsTableRow = TableStats & { addressed?: true };
+
+/**
+ * Whether any declared operation runs on one object.
+ *
+ * `perEntity` is the flag the tree menu asks (`maintenanceControl(..., "perEntity")` in
+ * `row-actions.ts`). A missing spec is not that declaration: `maintenanceControl` still
+ * offers the legacy per-row buttons, and those stay on measured rows only.
+ */
+function declaresPerObjectMaintenance(capabilities: ProviderCapabilities | undefined): boolean {
+  if (capabilities?.supportsMaintenance !== true) return false;
+  for (const type of capabilities.maintenanceOperations ?? []) {
+    if (capabilities.maintenanceOperationSpecs?.[type]?.perEntity === true) return true;
+  }
+  return false;
+}
+
+/**
+ * A row for the object a maintenance deep link named, when the statistics rows do not
+ * contain it and the provider declares the operation per object (#1412).
+ *
+ * Couchbase's `getTableStats()` returns one bucket row, so a collection path
+ * (`bucket`, `scope`, `collection`) never matches and the page used to refuse an
+ * action the tree had already offered. The path's last segment is the target a click
+ * sends and the segment above it is the container (`schemaName`), which is the pair
+ * `maintenanceKeyspace` already resolves. Nothing on the row is a measurement: item
+ * counts stay on the statistics rows.
+ *
+ * An empty statistics list is left alone. A failed read and a database that holds no
+ * tables both arrive as none, and a row here would hide that.
+ */
+function addressedMaintenanceRow(
+  capabilities: ProviderCapabilities | undefined,
+  path: readonly string[] | null,
+  tables: readonly TableStats[],
+  filter: string,
+): OperationsTableRow | null {
+  if (!declaresPerObjectMaintenance(capabilities) || path === null || path.length === 0) return null;
+  const tableName = path[path.length - 1] ?? "";
+  if (tableName === "" || filter !== tableName || tables.length === 0) return null;
+  const schemaName = path.length >= 2 ? (path[path.length - 2] ?? "") : "";
+  const contained = path.length >= 2;
+  const present = tables.some(
+    (table) => table.tableName === tableName && (!contained || table.schemaName === schemaName),
+  );
+  if (present) return null;
+  // No figure is a measurement: `rowCount` is omitted the same way #1540 omits an
+  // unpublished catalog estimate, and the row's copy says so rather than printing 0.
+  return {
+    schemaName,
+    tableName,
+    totalSize: "N/A",
+    totalSizeBytes: 0,
+    addressed: true,
+  };
+}
 
 /**
  * Why no per-table maintenance control is anywhere on this page.
  *
- * The schema explorer's two maintenance items are DEEP LINKS, and for an admin they
- * land HERE - `openMaintenance` in src/components/Studio.tsx pushes
- * /admin/operations?table=... - not on the monitoring Tables panel. They are gated on
- * what the OPERATION declares (`maintenanceControl(..., "perEntity")`), which is a
- * different question from whether this page has a ROW to hang the control on: the
- * controls render per row of `filteredTables` only, so every empty branch of the panel
- * below rendered nothing at all about the operation the operator arrived asking for
- * (U22).
+ * The schema explorer's maintenance items are deep links, and for an admin they land
+ * here (`openMaintenance` in src/components/Studio.tsx pushes `/admin/operations?path=...`).
+ * The controls render per row, so an empty list used to say nothing about the operation
+ * the operator arrived asking for (U22).
  *
- * Unlike the monitoring panel, this page HAS the requested table's name - the `?table=`
- * search param that seeded the filter - so naming it is a measurement rather than an
- * invention. It is named only while the filter still holds that param: once the operator
- * types something else, that table is no longer why the list is empty.
+ * A provider that declares the operation per object is offered a row for the address
+ * instead (`addressedMaintenanceRow`, #1412). This note is what remains where that
+ * declaration is absent, or where the statistics read itself failed. The table is
+ * named only while the filter still holds the deep link: once the operator types
+ * something else, that table is no longer why the list is empty.
  */
 function TableMaintenanceUnreachableNote({
   actions,
@@ -90,6 +177,16 @@ function TableMaintenanceUnreachableNote({
   );
 }
 
+/** The Global Operations heading, shared by the section's cards and by the line that replaces them. */
+function GlobalOperationsHeading() {
+  return (
+    <div className="flex items-center gap-2 mb-3">
+      <ShieldAlert className="h-4 w-4 text-brand" />
+      <h3 className="text-sm font-bold text-fg-secondary">Global Operations</h3>
+    </div>
+  );
+}
+
 interface OperationLogEntry {
   id: string;
   timestamp: Date;
@@ -98,6 +195,84 @@ interface OperationLogEntry {
   result: "success" | "failure";
   duration: number;
   error?: string;
+}
+
+/**
+ * A whole-database card the provider words itself (#1089, section 7.2): an operation `maintenanceControl` offers
+ * globally with a `title`, drawn with the spec's `label` on its button, the `title` as its heading and the
+ * `description` as its body.
+ */
+interface DeclaredCard {
+  type: MaintenanceOperation;
+  label?: string;
+  title: string;
+  description?: string;
+  /** The spec's `confirmation: "typed"`: the card asks for the connection's name before it sends anything. */
+  typed: boolean;
+}
+
+/** One opening of a declared card's typed dialog, keyed so that every opening mounts a fresh dialog. */
+interface TypedDialogOpening {
+  card: DeclaredCard;
+  /** False keeps the dialog in place while it animates out. */
+  open: boolean;
+  key: number;
+}
+
+/** The same opening, closed. */
+function closedDialog(current: TypedDialogOpening | null): TypedDialogOpening | null {
+  return current ? { ...current, open: false } : current;
+}
+
+/**
+ * Said in a declared card's typed dialog in place of the field, for a stored connection whose name is empty
+ * (#1089, section 3.4): the name is what the dialog asks for, and there is nothing to type.
+ */
+const UNNAMED_CONNECTION =
+  "This operation is confirmed by typing the connection's name, and this connection has none. Give it a name in its connection settings first.";
+
+/**
+ * The table a maintenance call handed back. Redis Run Info is the one that has rows:
+ * each `INFO` metric is one row, and the panel scrolls because a full reply is a
+ * couple of hundred of them (#1453).
+ */
+function MaintenanceResultTable({ report }: { report: Pick<MaintenanceResult, "rows" | "fields"> }) {
+  const rows = report.rows ?? [];
+  const fields = report.fields ?? [];
+  return (
+    <div className="rounded-xl border border-hairline bg-panel" data-testid="maintenance-result">
+      <div className="p-4 border-b border-hairline">
+        <span className="text-xs font-bold text-fg-secondary">Result ({rows.length})</span>
+      </div>
+      <div className="max-h-[360px] overflow-y-auto">
+        <Table>
+          <TableHeader>
+            <TableRow className="border-hairline hover:bg-transparent">
+              {fields.map((field) => (
+                <TableHead key={field} className="text-xs text-fg-muted font-bold uppercase">
+                  {field.charAt(0).toUpperCase() + field.slice(1)}
+                </TableHead>
+              ))}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map((row) => (
+              <TableRow
+                key={fields.map((field) => String(row[field] ?? "")).join("\u001f")}
+                className="border-hairline hover:bg-fill"
+              >
+                {fields.map((field) => (
+                  <TableCell key={field} className="font-mono text-xs text-fg-secondary py-2 align-top break-all">
+                    {String(row[field] ?? "")}
+                  </TableCell>
+                ))}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+    </div>
+  );
 }
 
 export function OperationsTab() {
@@ -115,13 +290,45 @@ export function OperationsTab() {
     connections.find((c) => c.id === selectedId) ?? (connections.length > 0 ? connections[0] : null);
   const [operationLog, setOperationLog] = useState<OperationLogEntry[]>([]);
   const [confirmKill, setConfirmKill] = useState<ActiveSessionDetails | null>(null);
+  const confirmKillReturnFocus = useReturnFocus();
   const [killingPid, setKillingPid] = useState<number | string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+  // A declared card's typed dialog, and the count that keys each opening: the dialog keeps its match and any refusal
+  // in its own state, so every opening mounts a fresh one, as the account dialogs do (#1089, section 7.2).
+  const [typedDialog, setTypedDialog] = useState<TypedDialogOpening | null>(null);
+  const [typedDialogOpenings, setTypedDialogOpenings] = useState(0);
+  // A whole-database run waiting for its confirmation (#1438), with the name its card gave it.
+  const [confirmGlobal, setConfirmGlobal] = useState<{ type: MaintenanceOperation; name: string } | null>(null);
+  const confirmGlobalReturnFocus = useReturnFocus();
+  // A per-row operation's dialog, keyed per opening the same way (spec 3.11).
+  const [entityDialog, setEntityDialog] = useState<EntityDialogOpening | null>(null);
+  const [entityDialogOpenings, setEntityDialogOpenings] = useState(0);
 
-  // The row an Explorer deep link named (`onOpenMaintenance("tables", name)` →
-  // /admin/operations?table=...). It seeds the filter and marks the row, so the
-  // named row is the one the operator lands on (#459).
-  const deepLinkedTable = useSearchParams().get("table");
+  /*
+    The object an Explorer deep link named (`onOpenMaintenance("tables", object.path)` →
+    /admin/operations?path=…&path=…). It seeds the filter and marks the row, so the named
+    row is the one the operator lands on (#459).
+
+    The link carries the ADDRESS, one parameter per segment, and it is read back with
+    `getAll` - the writer's inverse and nothing else, so no character inside a segment has to
+    be escaped by a rule the two could implement differently (#789, Task 35). It used to
+    carry `?table=<label>`, and a label is not unique: two containers holding one `customers`
+    marked both rows.
+
+    The list this page renders is per schema and per table, so the LAST segment is the row's
+    name and the one above it is the container the row declares as `schemaName` - the schema
+    on PostgreSQL, Oracle and SQL Server, the database on MySQL. A row is marked only when
+    both agree; an address whose container this engine spells differently marks nothing,
+    which is the honest answer where the alternative is marking a row the operator did not
+    ask for.
+  */
+  const deepLinkedPath = readObjectPathParam(useSearchParams());
+  const deepLinkedTable = deepLinkedPath === null ? null : (deepLinkedPath[deepLinkedPath.length - 1] ?? null);
+  const deepLinkedContainer = deepLinkedPath === null ? undefined : deepLinkedPath[deepLinkedPath.length - 2];
+  const isDeepLinkedRow = (table: TableStats): boolean =>
+    deepLinkedTable !== null &&
+    table.tableName === deepLinkedTable &&
+    (deepLinkedContainer === undefined || table.schemaName === deepLinkedContainer);
 
   // Offer only the maintenance the connected provider declares it can perform:
   // /api/db/maintenance rejects everything else with 400, so an ungated control can
@@ -129,7 +336,7 @@ export function OperationsTab() {
   // tab). Unknown capabilities hide the controls rather than showing them —
   // `metadata` is also null when /api/db/provider-meta fails, and failing open
   // would put the dead buttons back on exactly the connections this gate is for.
-  const { metadata } = useProviderMetadata(selectedConnection);
+  const { metadata, error: metadataError } = useProviderMetadata(selectedConnection);
 
   // Redis and the embedded engine declare `tablesAreDerivedGroupings`: their rows
   // are key-prefix/namespace groupings, not addressable tables, so a Tables panel
@@ -143,24 +350,60 @@ export function OperationsTab() {
   // `includeTables` is NOT gated on the flag above, and that is measured rather than an oversight.
   // useMonitoringData fetches once per CONNECTION (its effect depends on [connection, fetchData],
   // and fetchData reads its options through a ref), autoRefresh is off here, so the one request
-  // this tab makes is issued while `metadata` is still null and no later option change can reach
-  // it. Gating it would need either a shared-hook rewrite or making every engine's health and
-  // session panels wait on provider-meta first. The PANEL below is gated instead: that is where
+  // this tab makes is issued once and no later option change can reach it. That request now waits
+  // for `metadata` (#1530), so gating it has become possible, and is left to a change of its own.
+  // The PANEL below is gated instead: that is where
   // the empty "Tables (0)" a key-value provider used to render actually came from, and rendering
   // is reactive so it settles as soon as the capability arrives.
   const monitoringOptions = useMemo(() => ({ includeTables: true, includeIndexes: false, includeStorage: false }), []);
 
-  const { data, loading, error, refresh, killSession, runMaintenance } = useMonitoringData(
-    selectedConnection,
-    monitoringOptions,
-  );
+  // On a server-level connection this panel is one database's (#1530): the one a deep link's path
+  // names, until the operator picks another, else the one the studio chose last.
+  const {
+    catalogs,
+    catalog: storedCatalog,
+    setCatalog,
+    error: catalogsError,
+    retry: retryCatalogs,
+  } = useCatalogs(selectedConnection, metadata?.capabilities);
+  const [pickedCatalog, setPickedCatalog] = useState<string | null>(null);
+  const linkedCatalog =
+    metadata === null || deepLinkedPath === null ? undefined : catalogOfPath(metadata.capabilities, deepLinkedPath);
+  const catalog =
+    pickedCatalog ?? (linkedCatalog !== undefined && catalogs.includes(linkedCatalog) ? linkedCatalog : storedCatalog);
+  const chooseCatalog = (next: string) => {
+    setPickedCatalog(next);
+    setCatalog(next);
+  };
+  // Nothing is read before the database is known, nor while the declaration that says whether
+  // there is one is still being read; a failed declaration reads as before.
+  const waitingForCatalog =
+    selectedConnection !== null &&
+    (metadata === null
+      ? metadataError === null
+      : declaresCatalogSessions(metadata.capabilities) && catalog === undefined);
+
+  const { data, loading, error, refresh, killSession, runMaintenanceOutcome, maintenanceReport, previewMaintenance } =
+    useMonitoringData(waitingForCatalog ? null : selectedConnection, monitoringOptions, catalog);
   // Both maintenance surfaces ask ONE question - `maintenanceControl` in
   // src/lib/db/types.ts - so that neither can offer a control the other's engine
   // rejects. `capabilities` may be undefined here (provider-meta in flight, or its
   // request failed), which that helper reads as a denial.
-  const capabilities = metadata?.capabilities;
+  //
+  // The maintenance half comes from the monitoring payload when it carries one (#1387): that is
+  // read off the CONNECTED provider, which measured what this server accepts, where provider-meta
+  // answers the type id's declaration and so offered PostgreSQL's and MySQL's whole sets to
+  // CockroachDB, RisingWave, TiDB and the rest.
+  const declaredCapabilities = metadata?.capabilities;
+  const connectedMaintenance = data?.maintenance;
+  const capabilities = useMemo(
+    () => withConnectedMaintenance(declaredCapabilities, connectedMaintenance),
+    [declaredCapabilities, connectedMaintenance],
+  );
   const offers = (type: MaintenanceType, placement: "perEntity" | "global") =>
     maintenanceControl(capabilities, type, placement).offered;
+  // A session row's Terminate sends `kill`, which the route refuses wherever it is not declared (#1424).
+  const offersTerminate = offersSessionTermination(capabilities);
   // The six analyze/vacuum global ProviderLabels fields were declared, set by
   // seven providers, and read by no component, so every engine rendered
   // Postgres's query-planner copy (#427).
@@ -180,22 +423,68 @@ export function OperationsTab() {
   // Oracle's, MySQL's and ClickHouse's own words written and never shown, and sending
   // `vacuum` to any of those four is a 400 from /api/db/maintenance.
   const vacuumOperation = labels?.vacuumActionOperation ?? "vacuum";
-  const globalAnalyze = offers("analyze", "global");
-  const globalVacuum = offers(vacuumOperation, "global");
+  // One card per operation the gate offers globally with a `title`, in declaration order and in the provider's own
+  // words (#1089, section 7.2). Keyed on the title, not on "offered globally with no card of its own": that rule
+  // would give cards to DuckDB's optimize and to the global check of SQL Server, SQLite, libSQL and MySQL, and a
+  // kill card with no target to every engine on the base default, none of which asked for one.
+  const declaredCards = [...new Set(capabilities?.maintenanceOperations ?? [])].flatMap((type): DeclaredCard[] => {
+    const control = maintenanceControl(capabilities, type, "global");
+    if (!control.offered || control.title === undefined) return [];
+    return [
+      {
+        type,
+        label: control.label,
+        title: control.title,
+        description: control.description,
+        typed: control.confirmation === "typed",
+      },
+    ];
+  });
+  // A declared operation's card is its only one: the card worded from ProviderLabels that would send it is withheld.
+  const declared = new Set(declaredCards.map((card) => card.type));
+  const globalAnalyze = !declared.has("analyze") && offers("analyze", "global");
+  const globalVacuum = !declared.has(vacuumOperation) && offers(vacuumOperation, "global");
   // Never twice: where the vacuum slot already names `reindex`, this card would send
   // the same operation under a second set of words.
-  const globalReindex = vacuumOperation !== "reindex" && offers("reindex", "global");
-  const anyMaintenance = globalAnalyze || globalVacuum || globalReindex;
+  const globalReindex = vacuumOperation !== "reindex" && !declared.has("reindex") && offers("reindex", "global");
+  // What each whole-database card's button says, so the confirmation names the run the way the card did.
+  const globalNames: Partial<Record<MaintenanceOperation, string>> = {
+    analyze: labels?.analyzeGlobalLabel ?? "Run Analyze",
+    reindex: labels?.reindexGlobalLabel ?? "Run Reindex",
+    [vacuumOperation]: labels?.vacuumGlobalLabel ?? "Run Vacuum",
+    ...Object.fromEntries(declaredCards.map((card) => [card.type, card.label ?? card.title])),
+  };
+  // Declared cards count: an engine may offer none of the operations the three worded cards send.
+  const anyMaintenance = globalAnalyze || globalVacuum || globalReindex || declaredCards.length > 0;
 
-  // The per-row controls, in the provider's own words.
-  const tableActions = TABLE_ACTIONS.flatMap((action) => {
-    const control = maintenanceControl(capabilities, action.type, "perEntity");
-    return control.offered ? [{ ...action, label: control.label ?? action.label }] : [];
-  });
+  // The per-row controls, in the provider's own words: the tab's own candidates, then every declared operation outside
+  // `MaintenanceType` that runs on one row, in declaration order and under a generic icon (spec 3.11).
+  const declaredTableActions: TableAction[] = [
+    ...TABLE_ACTIONS.flatMap((action) => {
+      const control = maintenanceControl(capabilities, action.type, "perEntity");
+      return control.offered ? [{ ...action, label: control.label ?? action.label }] : [];
+    }),
+    ...declaredEntityOperations(capabilities).map((operation) => ({
+      type: operation.type,
+      label: operation.label,
+      Icon: Wrench,
+      hover: "hover:text-brand",
+    })),
+  ];
+  // A read-only connection's provider refuses these as it refuses the whole-database ones, so a row draws none of
+  // them: the same rule the Global Operations section follows, read from the same public field (#1418). Offered, each
+  // one led to a refusal the route had to make.
+  const readOnly = selectedConnection?.readOnly === true;
+  const tableActions = readOnly ? [] : declaredTableActions;
+  // The section's own line already explains the missing controls wherever it is drawn. An engine whose only
+  // operations run on one row (Milvus's Load and Release) draws no such section, so the rows say it themselves.
+  const rowsSayReadOnly = readOnly && !anyMaintenance && declaredTableActions.length > 0;
 
   const handleConnectionChange = (id: string) => {
     const conn = connections.find((c) => c.id === id);
     if (conn) setSelectedId(conn.id);
+    // A database picked for one connection is not a database of the next.
+    setPickedCatalog(null);
   };
 
   const addLogEntry = useCallback(
@@ -218,20 +507,73 @@ export function OperationsTab() {
     [],
   );
 
-  const handleRunMaintenance = async (type: string, target?: string) => {
+  // Same reason as TablesTab: `table.schemaName` is the namespace for every engine, and the
+  // row keys on it already. The log entry keeps naming the table alone, since that is what an
+  // operator reads back (#772).
+  //
+  // Answers the reason a run was refused for, or null once it was sent: the per-row dialog shows it in place of
+  // closing, and the log entry carries it, so a refusal is read where the operator is looking (#1418).
+  const runMaintenanceNow = async (
+    type: MaintenanceOperation,
+    target?: string,
+    container?: string,
+  ): Promise<string | null> => {
     const actionId = `${type}-${target || "global"}`;
     setActionLoading(actionId);
     const start = Date.now();
     try {
-      const success = await runMaintenance(type, target);
+      const outcome = await runMaintenanceOutcome(type, target, container);
       const duration = Date.now() - start;
-      addLogEntry(type.toUpperCase(), target || "all", success ? "success" : "failure", duration);
+      addLogEntry(
+        type.toUpperCase(),
+        target || "all",
+        outcome.success ? "success" : "failure",
+        duration,
+        outcome.error,
+      );
+      return outcome.success ? null : (outcome.error ?? `${type} failed`);
     } catch {
       const duration = Date.now() - start;
       addLogEntry(type.toUpperCase(), target || "all", "failure", duration);
+      return `${type} failed`;
     } finally {
       setActionLoading(null);
     }
+  };
+
+  // The handler every maintenance control on this tab calls (#1089, section 7.2). A declared card whose spec asks
+  // for a typed confirmation opens the typed dialog here instead, and the dialog sends the operation only once the
+  // connection's name matches. Every other whole-database call opens the plain confirmation (#1438). A per-row call
+  // whose spec asks for the row's own name or for a preview opens the per-row dialog instead (spec 3.11); every other
+  // per-row call sends with one click, as before.
+  const handleRunMaintenance = async (type: MaintenanceOperation, target?: string, container?: string) => {
+    const typedCard = target === undefined ? declaredCards.find((card) => card.type === type && card.typed) : undefined;
+    if (typedCard !== undefined) {
+      setTypedDialog({ card: typedCard, open: true, key: typedDialogOpenings });
+      setTypedDialogOpenings(typedDialogOpenings + 1);
+      return;
+    }
+    // A whole-database run asks first (#1438). The cards warn that these operations are
+    // resource-intensive, and on PostgreSQL "Run Reindex" is REINDEX DATABASE, which locks every
+    // table; terminating one session already asked, and these sent on the first click.
+    if (target === undefined) {
+      setConfirmGlobal({ type, name: globalNames[type] ?? type.toUpperCase() });
+      return;
+    }
+    const entity = entityRequest(capabilities, type, target, container);
+    if (entity !== null) {
+      setEntityDialog({ request: entity, open: true, key: entityDialogOpenings });
+      setEntityDialogOpenings(entityDialogOpenings + 1);
+      return;
+    }
+    await runMaintenanceNow(type, target, container);
+  };
+
+  // The whole-database confirmation's own button (#1438): the run it was opened for, once.
+  const handleConfirmGlobal = async () => {
+    if (!confirmGlobal) return;
+    setConfirmGlobal(null);
+    await runMaintenanceNow(confirmGlobal.type);
   };
 
   const handleKillClick = (session: ActiveSessionDetails) => {
@@ -261,6 +603,11 @@ export function OperationsTab() {
   const tablesUnavailable = data?.tables === undefined ? data?.errors?.tables : undefined;
   const [tableSearch, setTableSearch] = useState(deepLinkedTable ?? "");
   const filteredTables = tables.filter((t) => t.tableName.toLowerCase().includes(tableSearch.toLowerCase()));
+  // #1412. A deep link to an object the statistics rows do not contain, on a provider that
+  // declares the operation per object, is offered as its own row. The measured rows stay
+  // what the filter matched; the addressed row is not one of them.
+  const addressedRow = addressedMaintenanceRow(capabilities, deepLinkedPath, tables, tableSearch);
+  const visibleTables: OperationsTableRow[] = addressedRow ? [addressedRow, ...filteredTables] : filteredTables;
 
   // U22. Both halves have to be true for the dead end: the engine declares a control
   // that takes ONE table, and this page has no row to offer it on. Which absence it is
@@ -278,8 +625,16 @@ export function OperationsTab() {
     filteredTables.length === 0;
   const tableStatsAbsent =
     tablesUnavailable !== undefined || (tables.length === 0 && (data?.overview?.tableCount ?? 0) > 0);
+
+  // What the rows are, when the provider says they are only part of the database (#1085 6.2), read
+  // the way the monitoring `TablesTab` reads it. The Prometheus list is the metrics with the most head
+  // series, so "Tables (50)" read as the database's own count, and a filter for a metric outside the
+  // list said no table was found. Only over a list that is there: a refused read, or an empty list
+  // beside a counted overview, has nothing to scope and keeps the rendering below.
+  const listScope = tableStatsAbsent ? undefined : labels?.tableStatsCaption;
+  const listNoun = listScope === undefined ? "Tables" : "Listed";
   const maintenanceUnreachable =
-    tableActions.length > 0 && filteredTables.length === 0 && (deepLinkRowMissing || tableStatsAbsent);
+    tableActions.length > 0 && visibleTables.length === 0 && (deepLinkRowMissing || tableStatsAbsent);
 
   const activeCount = sessions.filter((s) => s.state === "active").length;
   const idleCount = sessions.filter((s) => s.state === "idle").length;
@@ -290,7 +645,9 @@ export function OperationsTab() {
     switch (state) {
       case "active":
         return (
-          <Badge className="bg-green-500/10 text-green-400 border border-green-500/20 text-[0.625rem]">Active</Badge>
+          <Badge className="bg-hue-green-tint/10 text-hue-green border border-hue-green-tint/20 text-[0.625rem]">
+            Active
+          </Badge>
         );
       case "idle":
         return (
@@ -300,12 +657,14 @@ export function OperationsTab() {
         );
       case "idle in transaction":
         return (
-          <Badge className="bg-yellow-500/10 text-yellow-400 border border-yellow-500/20 text-[0.625rem]">
+          <Badge className="bg-hue-yellow-tint/10 text-hue-yellow border border-hue-yellow-tint/20 text-[0.625rem]">
             Idle TX
           </Badge>
         );
       case "idle in transaction (aborted)":
-        return <Badge className="bg-red-500/10 text-red-400 border border-red-500/20 text-[0.625rem]">Abort</Badge>;
+        return (
+          <Badge className="bg-hue-red-tint/10 text-hue-red border border-hue-red-tint/20 text-[0.625rem]">Abort</Badge>
+        );
       default:
         return (
           <Badge variant="outline" className="text-[0.625rem]">
@@ -355,11 +714,18 @@ export function OperationsTab() {
             ))}
           </SelectContent>
         </Select>
+        <CatalogSelect
+          catalogs={catalogs}
+          value={catalog}
+          onChange={chooseCatalog}
+          className="h-9 w-full sm:w-[220px] ml-2 bg-panel border-hairline-strong text-fg-secondary"
+        />
         <Button
           variant="ghost"
           size="sm"
           className="h-8 text-fg-muted hover:text-fg-secondary"
-          onClick={refresh}
+          // A refused database list holds every read, so Refresh lists the databases again (#1530).
+          onClick={catalogsError === null ? refresh : retryCatalogs}
           disabled={loading}
         >
           <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${loading ? "animate-spin" : ""}`} />
@@ -367,37 +733,36 @@ export function OperationsTab() {
         </Button>
       </div>
 
-      {error && !data && (
-        <div className="rounded-xl border border-red-500/20 bg-red-500/5 p-4 text-red-400 text-sm">{error}</div>
+      {(catalogsError ?? error) && !data && (
+        <div className="rounded-xl border border-danger-tint/20 bg-danger-tint/5 p-4 text-danger text-sm">
+          {catalogsError ?? error}
+        </div>
       )}
 
       {/* Global Operations — hidden entirely where not one operation has a
           whole-database form. On Couchbase every operation needs a keyspace, so this
           section is absent rather than three cards that answer "requires a
           target" (#496). */}
-      {anyMaintenance && (
+      {anyMaintenance && selectedConnection?.readOnly !== true && (
         <div>
-          <div className="flex items-center gap-2 mb-3">
-            <ShieldAlert className="h-4 w-4 text-blue-400" />
-            <h3 className="text-sm font-bold text-fg-secondary">Global Operations</h3>
-          </div>
+          <GlobalOperationsHeading />
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
             {/* Analyze */}
             {globalAnalyze && (
               <div className="p-4 rounded-xl border border-hairline bg-fill-subtle hover:bg-fill transition-colors">
                 <div className="flex items-start justify-between mb-3">
-                  <div className="w-8 h-8 rounded-lg bg-yellow-500/10 border border-yellow-500/20 flex items-center justify-center">
-                    <Zap className="w-4 h-4 text-yellow-500" />
+                  <div className="w-8 h-8 rounded-lg bg-hue-yellow-tint/10 border border-hue-yellow-tint/20 flex items-center justify-center">
+                    <Zap className="w-4 h-4 text-hue-yellow" />
                   </div>
                   <Button
                     size="sm"
                     variant="outline"
-                    className="h-7 text-xs border-hairline-strong hover:bg-yellow-500/10 hover:text-yellow-500"
+                    className="h-7 text-xs border-hairline-strong hover:bg-hue-yellow-tint/10 hover:text-hue-yellow"
                     onClick={() => handleRunMaintenance("analyze")}
                     disabled={!!actionLoading || !selectedConnection}
                   >
                     {actionLoading === "analyze-global" ? <RefreshCw className="w-3 h-3 animate-spin mr-1" /> : null}
-                    {labels?.analyzeGlobalLabel ?? "Run Analyze"}
+                    {globalNames.analyze}
                   </Button>
                 </div>
                 <h4 className="text-sm font-bold text-fg mb-1">{labels?.analyzeGlobalTitle ?? "Update Statistics"}</h4>
@@ -411,20 +776,20 @@ export function OperationsTab() {
             {globalVacuum && (
               <div className="p-4 rounded-xl border border-hairline bg-fill-subtle hover:bg-fill transition-colors">
                 <div className="flex items-start justify-between mb-3">
-                  <div className="w-8 h-8 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center">
-                    <HardDrive className="w-4 h-4 text-blue-500" />
+                  <div className="w-8 h-8 rounded-lg bg-hue-blue-tint/10 border border-hue-blue-tint/20 flex items-center justify-center">
+                    <HardDrive className="w-4 h-4 text-hue-blue" />
                   </div>
                   <Button
                     size="sm"
                     variant="outline"
-                    className="h-7 text-xs border-hairline-strong hover:bg-blue-500/10 hover:text-blue-500"
+                    className="h-7 text-xs border-hairline-strong hover:bg-hue-blue-tint/10 hover:text-hue-blue"
                     onClick={() => handleRunMaintenance(vacuumOperation)}
                     disabled={!!actionLoading || !selectedConnection}
                   >
                     {actionLoading === `${vacuumOperation}-global` ? (
                       <RefreshCw className="w-3 h-3 animate-spin mr-1" />
                     ) : null}
-                    {labels?.vacuumGlobalLabel ?? "Run Vacuum"}
+                    {globalNames[vacuumOperation]}
                   </Button>
                 </div>
                 <h4 className="text-sm font-bold text-fg mb-1">{labels?.vacuumGlobalTitle ?? "Reclaim Space"}</h4>
@@ -442,18 +807,18 @@ export function OperationsTab() {
             {globalReindex && (
               <div className="p-4 rounded-xl border border-hairline bg-fill-subtle hover:bg-fill transition-colors">
                 <div className="flex items-start justify-between mb-3">
-                  <div className="w-8 h-8 rounded-lg bg-purple-500/10 border border-purple-500/20 flex items-center justify-center">
-                    <RefreshCw className="w-4 h-4 text-purple-500" />
+                  <div className="w-8 h-8 rounded-lg bg-hue-purple-tint/10 border border-hue-purple-tint/20 flex items-center justify-center">
+                    <RefreshCw className="w-4 h-4 text-hue-purple" />
                   </div>
                   <Button
                     size="sm"
                     variant="outline"
-                    className="h-7 text-xs border-hairline-strong hover:bg-purple-500/10 hover:text-purple-500"
+                    className="h-7 text-xs border-hairline-strong hover:bg-hue-purple-tint/10 hover:text-hue-purple"
                     onClick={() => handleRunMaintenance("reindex")}
                     disabled={!!actionLoading || !selectedConnection}
                   >
                     {actionLoading === "reindex-global" ? <RefreshCw className="w-3 h-3 animate-spin mr-1" /> : null}
-                    {labels?.reindexGlobalLabel ?? "Run Reindex"}
+                    {globalNames.reindex}
                   </Button>
                 </div>
                 <h4 className="text-sm font-bold text-fg mb-1">{labels?.reindexGlobalTitle ?? "Rebuild Indexes"}</h4>
@@ -463,19 +828,59 @@ export function OperationsTab() {
               </div>
             )}
 
+            {/* The provider's own cards (#1089, section 7.2), one per operation it declares a title for, in its order. */}
+            {declaredCards.map((card) => (
+              <div
+                key={card.type}
+                className="p-4 rounded-xl border border-hairline bg-fill-subtle hover:bg-fill transition-colors"
+              >
+                <div className="flex items-start justify-between mb-3">
+                  <div className="w-8 h-8 rounded-lg bg-brand-tint/10 border border-brand-tint/20 flex items-center justify-center">
+                    <Wrench className="w-4 h-4 text-brand" />
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-xs border-hairline-strong hover:bg-brand-tint/10 hover:text-brand"
+                    onClick={() => handleRunMaintenance(card.type)}
+                    disabled={!!actionLoading || !selectedConnection}
+                  >
+                    {actionLoading === `${card.type}-global` ? (
+                      <RefreshCw className="w-3 h-3 animate-spin mr-1" />
+                    ) : null}
+                    {card.label}
+                  </Button>
+                </div>
+                <h4 className="text-sm font-bold text-fg mb-1">{card.title}</h4>
+                <p className="text-xs text-fg-muted leading-relaxed">{card.description}</p>
+              </div>
+            ))}
+
             {/* Warning Card */}
-            <div className="p-4 rounded-xl border border-red-500/10 bg-red-500/5 flex flex-col justify-center">
-              <div className="flex items-center gap-2 text-red-400 mb-2">
+            <div className="p-4 rounded-xl border border-danger-tint/10 bg-danger-tint/5 flex flex-col justify-center">
+              <div className="flex items-center gap-2 text-danger mb-2">
                 <ShieldAlert className="w-4 h-4" />
                 <span className="text-xs font-bold uppercase tracking-wider">Warning</span>
               </div>
-              <p className="text-xs text-red-400/70 leading-relaxed italic">
+              <p className="text-xs text-danger/70 leading-relaxed italic">
                 These operations can be resource-intensive. Avoid running them during peak traffic hours.
               </p>
             </div>
           </div>
         </div>
       )}
+
+      {/* A read-only connection's provider refuses every maintenance operation (#1089), so the section
+          says so in one line in place of every card it would draw. Read from the public field, with no
+          type branch. */}
+      {anyMaintenance && selectedConnection?.readOnly === true && (
+        <div data-testid="operations-read-only">
+          <GlobalOperationsHeading />
+          <p className="text-xs text-fg-muted leading-relaxed">{READ_ONLY_MAINTENANCE}</p>
+        </div>
+      )}
+
+      {maintenanceReport && <MaintenanceResultTable report={maintenanceReport} />}
 
       {/* Tables + Sessions Split */}
       <div className="grid gap-6 md:grid-cols-2">
@@ -484,9 +889,9 @@ export function OperationsTab() {
           <div className="rounded-xl border border-hairline bg-panel">
             <div className="p-4 border-b border-hairline flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <Table2 className="w-4 h-4 text-blue-400" />
+                <Table2 className="w-4 h-4 text-brand" />
                 <span className="text-xs font-bold text-fg-secondary">
-                  {tablesUnavailable ? "Tables" : `Tables (${tables.length})`}
+                  {tablesUnavailable ? "Tables" : `${listNoun} (${tables.length})`}
                 </span>
               </div>
               <Input
@@ -496,6 +901,15 @@ export function OperationsTab() {
                 className="w-[140px] h-7 text-xs bg-raised border-hairline-strong"
               />
             </div>
+            {/* Outside the scrolling list, so it heads every row however far the list is scrolled. */}
+            {listScope !== undefined && (
+              <p
+                className="px-4 py-2 border-b border-hairline text-xs text-fg-muted"
+                data-testid="operations-tables-list-scope"
+              >
+                {listScope}
+              </p>
+            )}
             <div className="max-h-[350px] overflow-y-auto">
               {loading && tables.length === 0 ? (
                 <div className="p-4 space-y-2">
@@ -503,35 +917,59 @@ export function OperationsTab() {
                     <Skeleton key={i} className="h-10 w-full bg-overlay" />
                   ))}
                 </div>
-              ) : filteredTables.length === 0 ? (
+              ) : visibleTables.length === 0 ? (
                 <div className="p-8 text-center text-fg-subtle text-sm" data-testid="operations-tables-empty">
-                  {tablesUnavailable ?? "No tables found."}
+                  {/* A filter that matched none of a partial list saw only the listed rows, and a
+                      table outside them may match, so it must not say no table was found. */}
+                  {tablesUnavailable ??
+                    (listScope !== undefined && tables.length > 0
+                      ? "No listed table matches the filter."
+                      : "No tables found.")}
                 </div>
               ) : (
                 <div className="divide-y divide-hairline">
-                  {filteredTables.map((table) => (
+                  {visibleTables.map((table) => (
                     <div
                       key={`${table.schemaName}.${table.tableName}`}
-                      data-selected={table.tableName === deepLinkedTable ? "true" : undefined}
+                      data-selected={isDeepLinkedRow(table) ? "true" : undefined}
                       className={`group flex items-center justify-between px-4 py-2 hover:bg-fill transition-colors ${
-                        table.tableName === deepLinkedTable ? "bg-fill" : ""
+                        isDeepLinkedRow(table) ? "bg-fill" : ""
                       }`}
                     >
                       <div className="min-w-0">
-                        <div className="text-sm font-medium text-fg-secondary truncate max-w-[160px]">
-                          {table.tableName}
+                        <div className="flex items-baseline min-w-0 text-sm font-medium text-fg-secondary">
+                          {/* A row with no schema (a Prometheus metric, a search index) prints its bare name. */}
+                          {table.schemaName !== "" && (
+                            <>
+                              <span className="shrink-0 text-fg-muted">{table.schemaName}</span>
+                              <span className="shrink-0 text-fg-subtle">.</span>
+                            </>
+                          )}
+                          <span className="truncate max-w-[160px]">{table.tableName}</span>
                         </div>
                         <div className="flex items-center gap-2 text-xs text-fg-muted">
-                          <span className="font-mono">{table.rowCount.toLocaleString()} rows</span>
-                          <span>-</span>
-                          <span className="font-mono">{table.tableSize}</span>
-                          {(table.bloatRatio ?? 0) > 10 && (
-                            <Badge
-                              variant="outline"
-                              className="text-[0.625rem] text-yellow-400 border-yellow-500/20 h-4"
-                            >
-                              {(table.bloatRatio ?? 0).toFixed(0)}% bloat
-                            </Badge>
+                          {table.addressed ? (
+                            <span data-testid="operations-addressed-unmeasured">Not measured</span>
+                          ) : (
+                            <>
+                              {/* Dropped whole, separator included, where the catalog published no
+                                  estimate - CockroachDB's NULL `reltuples` (#1540). */}
+                              {table.rowCount !== undefined && (
+                                <>
+                                  <span className="font-mono">{table.rowCount.toLocaleString()} rows</span>
+                                  <span>-</span>
+                                </>
+                              )}
+                              <span className="font-mono">{table.tableSize}</span>
+                              {(table.bloatRatio ?? 0) > 10 && (
+                                <Badge
+                                  variant="outline"
+                                  className="text-[0.625rem] text-hue-yellow border-hue-yellow-tint/20 h-4"
+                                >
+                                  {(table.bloatRatio ?? 0).toFixed(0)}% bloat
+                                </Badge>
+                              )}
+                            </>
                           )}
                         </div>
                       </div>
@@ -543,7 +981,7 @@ export function OperationsTab() {
                             variant="ghost"
                             className={`w-7 h-7 text-fg-muted ${hover}`}
                             title={label}
-                            onClick={() => handleRunMaintenance(type, table.tableName)}
+                            onClick={() => handleRunMaintenance(type, table.tableName, table.schemaName)}
                             disabled={!!actionLoading}
                           >
                             {actionLoading === `${type}-${table.tableName}` ? (
@@ -559,6 +997,11 @@ export function OperationsTab() {
                 </div>
               )}
             </div>
+            {rowsSayReadOnly && (
+              <p className="px-4 pb-4 text-xs text-fg-muted leading-relaxed" data-testid="operations-rows-read-only">
+                {READ_ONLY_MAINTENANCE}
+              </p>
+            )}
             {maintenanceUnreachable && (
               <TableMaintenanceUnreachableNote
                 actions={tableActions.map((a) => a.label)}
@@ -572,7 +1015,7 @@ export function OperationsTab() {
         <div className="rounded-xl border border-hairline bg-panel">
           <div className="p-4 border-b border-hairline">
             <div className="flex items-center gap-2 mb-3">
-              <Users className="w-4 h-4 text-green-400" />
+              <Users className="w-4 h-4 text-hue-green" />
               <span className="text-xs font-bold text-fg-secondary">
                 {sessionsUnavailable ? "Sessions" : `Sessions (${sessions.length})`}
               </span>
@@ -587,13 +1030,13 @@ export function OperationsTab() {
                 <div className="text-[0.625rem] text-fg-muted uppercase font-bold">Idle</div>
               </div>
               <div className="rounded-lg bg-fill p-2 text-center">
-                <div className={`text-lg font-bold tabular-nums ${idleInTxCount > 0 ? "text-yellow-400" : "text-fg"}`}>
+                <div className={`text-lg font-bold tabular-nums ${idleInTxCount > 0 ? "text-hue-yellow" : "text-fg"}`}>
                   {idleInTxCount}
                 </div>
                 <div className="text-[0.625rem] text-fg-muted uppercase font-bold">In TX</div>
               </div>
               <div className="rounded-lg bg-fill p-2 text-center">
-                <div className={`text-lg font-bold tabular-nums ${waitingCount > 0 ? "text-orange-400" : "text-fg"}`}>
+                <div className={`text-lg font-bold tabular-nums ${waitingCount > 0 ? "text-hue-orange" : "text-fg"}`}>
                   {waitingCount}
                 </div>
                 <div className="text-[0.625rem] text-fg-muted uppercase font-bold">Wait</div>
@@ -663,19 +1106,22 @@ export function OperationsTab() {
                         </Badge>
                       </TableCell>
                       <TableCell className="text-right py-2">
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-6 w-6 text-fg-subtle hover:text-red-500 hover:bg-red-500/10 opacity-0 group-hover:opacity-100 transition-all"
-                          onClick={() => handleKillClick(session)}
-                          disabled={killingPid === session.pid}
-                        >
-                          {killingPid === session.pid ? (
-                            <LoaderCircle className="h-3 w-3 animate-spin" />
-                          ) : (
-                            <Skull className="h-3 w-3" />
-                          )}
-                        </Button>
+                        {offersTerminate && session.terminable !== false && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-6 w-6 text-fg-subtle hover:text-danger hover:bg-danger-tint/10 opacity-0 group-hover:opacity-100 transition-all"
+                            onClick={() => handleKillClick(session)}
+                            aria-label={`Terminate session ${session.pid}`}
+                            disabled={killingPid === session.pid}
+                          >
+                            {killingPid === session.pid ? (
+                              <LoaderCircle className="h-3 w-3 animate-spin" />
+                            ) : (
+                              <Skull className="h-3 w-3" />
+                            )}
+                          </Button>
+                        )}
                       </TableCell>
                     </TableRow>
                   ))}
@@ -709,11 +1155,16 @@ export function OperationsTab() {
                   {entry.type}
                 </Badge>
                 <span className="text-fg-tertiary font-mono truncate">{entry.target}</span>
+                {entry.error !== undefined && (
+                  <span className="text-danger truncate" title={entry.error} data-testid="operation-log-error">
+                    {entry.error}
+                  </span>
+                )}
                 <div className="ml-auto flex items-center gap-2 shrink-0">
                   {entry.result === "success" ? (
-                    <CircleCheck className="w-3 h-3 text-emerald-500" />
+                    <CircleCheck className="w-3 h-3 text-success" />
                   ) : (
-                    <CircleX className="w-3 h-3 text-red-500" />
+                    <CircleX className="w-3 h-3 text-danger" />
                   )}
                   <span className="text-fg-subtle font-mono text-xs">{entry.duration}ms</span>
                 </div>
@@ -725,7 +1176,7 @@ export function OperationsTab() {
 
       {/* Kill Session Confirmation Dialog */}
       <AlertDialog open={!!confirmKill} onOpenChange={() => setConfirmKill(null)}>
-        <AlertDialogContent className="bg-surface border-hairline-strong">
+        <AlertDialogContent className="bg-surface border-hairline-strong" {...confirmKillReturnFocus}>
           <AlertDialogHeader>
             <AlertDialogTitle className="text-fg">Terminate Session?</AlertDialogTitle>
             <AlertDialogDescription className="text-fg-tertiary">
@@ -745,12 +1196,85 @@ export function OperationsTab() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel className="border-hairline-strong text-fg-tertiary">Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handleConfirmKill} className="bg-red-600 text-white hover:bg-red-500">
+            <AlertDialogAction
+              onClick={handleConfirmKill}
+              className="bg-danger-solid text-white hover:bg-danger-solid-hover"
+            >
               Terminate
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* A whole-database run's confirmation (#1438): the operation, the connection and the database, as the
+          Terminate dialog above names the session it will end. */}
+      <AlertDialog open={!!confirmGlobal} onOpenChange={() => setConfirmGlobal(null)}>
+        <AlertDialogContent className="bg-surface border-hairline-strong" {...confirmGlobalReturnFocus}>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-fg">{confirmGlobal?.name}?</AlertDialogTitle>
+            <AlertDialogDescription className="text-fg-tertiary">
+              This runs <span className="font-mono font-bold text-fg">{confirmGlobal?.type.toUpperCase()}</span> over
+              the whole database.
+              <br />
+              <br />
+              Connection: <span className="font-medium text-fg-secondary">{selectedConnection?.name}</span>
+              {selectedConnection?.database ? (
+                <>
+                  <br />
+                  Database: <span className="font-medium text-fg-secondary">{selectedConnection.database}</span>
+                </>
+              ) : null}
+              <br />
+              <br />
+              These operations can be resource-intensive. Avoid running them during peak traffic hours.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="border-hairline-strong text-fg-tertiary">Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleConfirmGlobal}>{confirmGlobal?.name}</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* A declared card's typed confirmation (#1089, section 7.2): the connection's name, typed exactly. */}
+      {typedDialog && (
+        <TypedConfirmDialog
+          key={typedDialog.key}
+          open={typedDialog.open}
+          onOpenChange={(open) => !open && setTypedDialog(closedDialog)}
+          title={typedDialog.card.title}
+          description={typedDialog.card.description}
+          expected={selectedConnection?.name ?? ""}
+          match="exact"
+          unavailable={selectedConnection?.name ? undefined : UNNAMED_CONNECTION}
+          confirmLabel={typedDialog.card.title}
+          destructive
+          onConfirm={async () => {
+            // The outcome is the notification and the operation log, as for every other control on this tab, so
+            // the dialog closes once the request has answered, whatever it answered.
+            await runMaintenanceNow(typedDialog.card.type);
+            return null;
+          }}
+        />
+      )}
+
+      {/* A per-row operation's typed target or preview (spec 3.11): the row's own name, typed exactly, and the
+          provider's preview before the confirm button where the spec asks for one. */}
+      {entityDialog && (
+        <MaintenanceEntityDialog
+          key={entityDialog.key}
+          open={entityDialog.open}
+          onOpenChange={(open) => !open && setEntityDialog(closedEntityDialog)}
+          request={entityDialog.request}
+          loadPreview={previewMaintenance}
+          onConfirm={async () => {
+            // A run that was sent closes the dialog on the notification and the operation log, as every other control
+            // on this tab ends. A refused one keeps it open on the route's own sentence.
+            const { type, target, container } = entityDialog.request;
+            return runMaintenanceNow(type, target, container);
+          }}
+        />
+      )}
     </div>
   );
 }

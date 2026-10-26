@@ -1,17 +1,25 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { AGENT_THREAD_CONTEXT_MAX_CHARS } from "@/lib/agent/execution-policy";
+import { resetTuning } from "@/lib/agent/model-tuning";
 import {
-  modelProfiles,
+  answersUnreadStop,
   ceilingFor,
-  presentReminderLimitFor,
-  retriesEmptyTurn,
-  turnTimeoutMsFor,
+  compareHoldLimitFor,
+  modelProfiles,
   planStatementRetriesFor,
+  presentReminderLimitFor,
   reportReminderLimitFor,
+  retriesEmptyTurn,
+  retriesUnreadStop,
   samplingFor,
   threadContextMaxCharsFor,
+  turnTimeoutMsFor,
   verdictHoldLimitFor,
 } from "@/lib/agent/models";
-import { AGENT_THREAD_CONTEXT_MAX_CHARS } from "@/lib/agent/execution-policy";
+import { DEFAULT_SAMPLING } from "@/lib/agent/models/profile";
 import type { AgentRunWorkflowType } from "@/lib/agent/types";
 
 /**
@@ -41,6 +49,12 @@ const WORKFLOWS: readonly AgentRunWorkflowType[] = [
   "data-analysis",
 ];
 
+const writeDocument = (body: unknown): string => {
+  const path = join(mkdtempSync(join(tmpdir(), "libredb-tuning-")), "models.json");
+  writeFileSync(path, typeof body === "string" ? body : JSON.stringify(body));
+  return path;
+};
+
 describe("sampling is decided per model, defaulting to deterministic", () => {
   test("a model nobody has measured gets the default, on every workflow", () => {
     for (const workflow of WORKFLOWS) {
@@ -52,7 +66,9 @@ describe("sampling is decided per model, defaulting to deterministic", () => {
     // A cell locks only at 5/5, so the bar is a variance test as much as a capability one,
     // and choosing a tool is a structural task with nothing for a sample to explore. This is
     // the setting that won five cells.
+    expect(DEFAULT_SAMPLING).toEqual({ temperature: 0, topP: 1 });
     expect(samplingFor("gemma4:26b", "database-assessment")).toEqual({ temperature: 0, topP: 1 });
+    expect(samplingFor("qwen3:8b", "database-assessment")).toEqual({ temperature: 0, topP: 1 });
   });
 
   test("qwen3:8b is sampled on query-optimization, and nowhere else", async () => {
@@ -62,8 +78,39 @@ describe("sampling is decided per model, defaulting to deterministic", () => {
       the override is scoped to the one cell that needs it rather than to the model.
     */
     expect(samplingFor("qwen3:8b", "query-optimization").temperature).toBeGreaterThan(0);
-    expect(samplingFor("qwen3:8b", "database-assessment")).toEqual({ temperature: 0, topP: 1 });
     expect(samplingFor("qwen3:8b", "investigation")).toEqual({ temperature: 0, topP: 1 });
+  });
+
+  test("samplingFor over an operator-supplied temperature-only entry resolves without topP", () => {
+    // Verified against Anthropic/Claude endpoint compatibility: sending both temperature and topP
+    // causes Claude models to reject with 400.
+    const path = writeDocument({
+      schemaVersion: 1,
+      models: [
+        { id: "claude-haiku-4-5", measured: "temp only", settings: { sampling: { temperature: 0 } } },
+        {
+          id: "claude-custom-workflow",
+          measured: "workflow with entry sampling",
+          settings: { sampling: { temperature: 0 }, perWorkflow: { investigation: { temperature: 0.5 } } },
+        },
+        {
+          id: "claude-per-workflow-only",
+          measured: "workflow only inherits default topP",
+          settings: { perWorkflow: { investigation: { temperature: 0.5 } } },
+        },
+      ],
+    });
+    process.env.AGENT_MODEL_TUNING_PATH = path;
+    resetTuning();
+    try {
+      expect(samplingFor("claude-haiku-4-5", "investigation")).toEqual({ temperature: 0 });
+      expect(samplingFor("claude-haiku-4-5", undefined)).toEqual({ temperature: 0 });
+      expect(samplingFor("claude-custom-workflow", "investigation")).toEqual({ temperature: 0.5 });
+      expect(samplingFor("claude-per-workflow-only", "investigation")).toEqual({ temperature: 0.5, topP: 1 });
+    } finally {
+      delete process.env.AGENT_MODEL_TUNING_PATH;
+      resetTuning();
+    }
   });
 
   test("a model id is matched case-insensitively, and its TAG is not stripped", () => {
@@ -139,6 +186,23 @@ describe("sampling is decided per model, defaulting to deterministic", () => {
     expect(planStatementRetriesFor("qwen3:14b")).toBe(1);
     expect(planStatementRetriesFor("qwen3:8b")).toBe(0);
     expect(planStatementRetriesFor("some-model-released-tomorrow:70b")).toBe(0);
+  });
+
+  test("a stop that read nothing is answered for a model nobody has measured, and not against one who has", () => {
+    /*
+      The same distinction, on the other setting that carries it. `retriesUnreadStop` reads the
+      shipped document, where all thirty entries state the field and three — `nemotron3:33b`,
+      `qwen3.5:27b` and `qwen3.6:35b` — state `true`; `answersUnreadStop` is what the drive asks, and it separates a stated `false`
+      from no entry at all. The gate behind it fires only where the run called no tool, so it is
+      reachable only on a run that has already earned `no-report` and cannot cost a pass.
+    */
+    expect(retriesUnreadStop("nemotron3:33b")).toBe(true);
+    expect(retriesUnreadStop("qwen3:8b")).toBe(false);
+    expect(retriesUnreadStop("some-model-released-tomorrow:70b")).toBe(false);
+
+    expect(answersUnreadStop("nemotron3:33b")).toBe(true);
+    expect(answersUnreadStop("qwen3:8b")).toBe(false);
+    expect(answersUnreadStop("some-model-released-tomorrow:70b")).toBe(true);
   });
 
   test("a model whose turn does not fit the shipped limit is given its own", () => {
@@ -221,12 +285,47 @@ describe("sampling is decided per model, defaulting to deterministic", () => {
       That argument is about the DEFAULT. It says nothing about a model whose ledgers show the
       third ask landing, and until now there was no way to tell those two cases apart.
 
-      Every shipped model resolves to two, because none has been measured needing otherwise.
+      One model has now been measured needing otherwise. `laguna-xs-2.1:latest` optimize earns its
+      own verifier's rejection rather than arriving malformed, so the hold that tells a run why is
+      the one it can act on, and the cell closed at five. Every other shipped model still resolves
+      to two, and so does a model nobody has measured.
     */
-    for (const modelId of Object.keys(modelProfiles())) {
-      expect(verdictHoldLimitFor(modelId)).toBe(2);
+    for (const [modelId, profile] of Object.entries(modelProfiles())) {
+      expect(verdictHoldLimitFor(modelId)).toBe(profile.verdictHoldLimit ?? 2);
     }
+    expect(verdictHoldLimitFor("laguna-xs-2.1:latest")).toBe(5);
     expect(verdictHoldLimitFor("some-model-released-tomorrow:70b")).toBe(2);
+  });
+
+  test("how many times a report may be held to ask for the comparison it rests on", () => {
+    /*
+      THE FOURTH REMINDER BOUND, AND THE ONLY ONE THAT WAS A LITERAL.
+
+      `reportReminderLimit`, `presentReminderLimit` and `verdictHoldLimit` are all settings. The
+      compare-before-report hold was `compareReminders < 1` written into the loop, so the sentence
+      naming the two plan ids a run has already inspected was said exactly once, and a model that
+      reported anyway was never asked again.
+
+      Measured on `laguna-xs-2.1:latest` optimize, 2026-10-09: five rolls of its best document read
+      4/5, 4/5, 1/5, 4/5, 4/5, and the recurring loss was `report-composed` with
+      `no-plan-comparison` on a run that had inspected four plans. `plan-bar` was delivered in every
+      run of every roll. The run holds the plans, hears the sentence once, reports without comparing,
+      and the cell loses by one.
+
+      Safe the way `verdictHoldLimit` is safe, and for the same reason: the hold fires only where
+      `compose_report` is called by a run holding plans and no comparison, which is a run already
+      earning `no-plan-comparison`. A run about to pass never reaches it. What a raised limit costs
+      is turns on a run that has already lost.
+
+      One remains the default, so no model measured before this bound existed moves. The model that
+      asked for it carries five: at one its optimize cell held 4/5 across five rolls and the run it
+      lost was always the one that reported without comparing; at five it read 5/5.
+    */
+    for (const [modelId, profile] of Object.entries(modelProfiles())) {
+      expect(compareHoldLimitFor(modelId)).toBe(profile.compareHoldLimit ?? 1);
+    }
+    expect(compareHoldLimitFor("laguna-xs-2.1:latest")).toBe(5);
+    expect(compareHoldLimitFor("some-model-released-tomorrow:70b")).toBe(1);
   });
 
   test("every profile states what measured it", () => {

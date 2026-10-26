@@ -22,7 +22,12 @@
  *   a header, so an empty body is success rather than an error (spec 2.2).
  */
 
+import { endpointUrl, type HttpOrigin, httpOrigin, rejectRedirect } from "@/lib/db/http/endpoint";
+import { DatabaseConfigError } from "@/lib/db/errors";
+import { httpTransportFetch } from "@/lib/db/http/egress-policy";
+import { describeFetchFailure, networkFailureKind } from "@/lib/db/http/fetch-failure";
 import type { DatabaseConnection } from "@/lib/db/types";
+import { uniqueFieldNames } from "@/lib/db/utils/result-fields";
 import {
   type ClickHouseQueryOptions,
   type ClickHouseQueryResult,
@@ -42,8 +47,16 @@ const DEFAULT_TLS_PORT = 8443;
 /**
  * The envelope this file parses. Requested per statement instead of appended to
  * the user's SQL, so what the editor sends is what the server parses (spec 1.2).
+ *
+ * JSONCompact and not JSON, because only a positional row keeps every value.
+ * Measured on 26.7.1.1315: the engine qualifies a joined column itself (`b.x`), and
+ * that name can collide with a column already called `b.x`, so
+ * `SELECT a.x, b.x, 3 AS \`b.x\` FROM (SELECT 1 AS x) a, (SELECT 2 AS x) b` declares
+ * `b.x` twice. Under JSON the row is the object `{"x": 1,"b.x": 2,"b.x": 3}` and
+ * JSON.parse keeps only 3; under JSONCompact it is `[1, 2, 3]`, with the same `meta`
+ * and the same 64-bit and Decimal quoting.
  */
-const RESPONSE_FORMAT = "JSON";
+const RESPONSE_FORMAT = "JSONCompact";
 
 /** Header names are matched case-insensitively by `Headers.get`, hence lower case. */
 const SUMMARY_HEADER = "x-clickhouse-summary";
@@ -151,11 +164,6 @@ function parseJson(text: string): unknown {
   }
 }
 
-/** Bracket a bare IPv6 literal, which is otherwise not a legal URL authority. */
-function formatHost(host: string): string {
-  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-}
-
 /** A counter the server reports as a string, or 0 when it reported nothing usable. */
 function toCount(value: unknown): number {
   const count = Number(value);
@@ -196,20 +204,162 @@ function executionTimeMs(summary: ResponseSummary, envelope: ClickHouseJsonEnvel
  * Declared column order and types, or nulls when the envelope described neither.
  * Types are copied verbatim, wrappers included (spec 1.7): `Nullable(String)` is
  * what tells the user the column is nullable, and collapsing it would lose that.
+ *
+ * A name the server declares twice is numbered by the shared helper (`b.x`,
+ * `b.x (2)`), so every row and type is keyed by a name no other column has.
  */
 function describeColumns(envelope: ClickHouseJsonEnvelope): Pick<ClickHouseQueryResult, "fieldNames" | "columnTypes"> {
   if (!Array.isArray(envelope.meta)) return { fieldNames: null, columnTypes: null };
 
   const columns = envelope.meta as EnvelopeColumn[];
+  const fieldNames = uniqueFieldNames(columns.map((column) => column.name));
   return {
-    fieldNames: columns.map((column) => column.name),
-    columnTypes: Object.fromEntries(columns.map((column) => [column.name, column.type])),
+    fieldNames,
+    columnTypes: Object.fromEntries(columns.map((column, index) => [fieldNames[index], column.type])),
   };
+}
+
+/**
+ * ClickHouse's quoted spellings of a non-finite float under `output_format_json_quote_denormals`,
+ * and the words every other provider hands over for the same values (`src/lib/non-finite.ts`):
+ * the grid shows them, and the exports write them back as `inf`, `-inf` and `nan`.
+ */
+const NON_FINITE_FLOAT: Readonly<Record<string, string>> = { inf: "Infinity", "-inf": "-Infinity", nan: "NaN" };
+
+const FLOAT_TYPE = /^(Float(32|64)|BFloat16)$/;
+
+/**
+ * The top-level comma-separated arguments of a type's argument list, quotes and
+ * parentheses respected (`Tuple(a Enum8('x,y' = 1), b Float64)`).
+ */
+function typeArguments(text: string): string[] {
+  const args: string[] = [];
+  let depth = 0;
+  let quoted = false;
+  let start = 0;
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (char === "'") quoted = !quoted;
+    else if (quoted) continue;
+    else if (char === "(") depth++;
+    else if (char === ")") depth--;
+    else if (char === "," && depth === 0) {
+      args.push(text.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  args.push(text.slice(start).trim());
+  return args;
+}
+
+/** `Name(args)` as its name and top-level arguments; a type with no argument list has none. */
+function splitType(declared: string): { name: string; args: string[] } {
+  const text = declared.trim();
+  const open = text.indexOf("(");
+  if (open <= 0 || !text.endsWith(")")) return { name: text, args: [] };
+  return { name: text.slice(0, open).trim(), args: typeArguments(text.slice(open + 1, -1)) };
+}
+
+/**
+ * `value` with every quoted non-finite float replaced by its word, by the declared type:
+ * a scalar `Float32`, `Float64` or `BFloat16`, and the same inside `Nullable`,
+ * `LowCardinality`, `Array`, `Tuple` (an array, or an object when its elements are named)
+ * and a `Map`'s values. The type decides, never the text, so a `String` holding "inf" stays
+ * that string. `Variant`, `Dynamic` and `JSON` declare no element type to go by and are left
+ * as sent.
+ */
+function floatWords(value: unknown, declared: string): unknown {
+  if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+  const { name, args } = splitType(declared);
+  if ((name === "Nullable" || name === "LowCardinality") && args.length === 1) return floatWords(value, args[0]);
+  if (FLOAT_TYPE.test(name)) {
+    return typeof value === "string" && Object.hasOwn(NON_FINITE_FLOAT, value) ? NON_FINITE_FLOAT[value] : value;
+  }
+  if (name === "Array" && args.length === 1 && Array.isArray(value)) {
+    return value.map((element) => floatWords(element, args[0]));
+  }
+  if (name === "Map" && args.length === 2 && isPlainRecord(value)) {
+    return mapValues(value, () => args[1]);
+  }
+  if (name === "Tuple" && args.length > 0) {
+    // `a Float64` in a named tuple, `Float64` in an unnamed one.
+    const elements = args.map((arg) => /^([A-Za-z_][A-Za-z0-9_]*)\s+(\S.*)$/.exec(arg));
+    if (Array.isArray(value)) {
+      return value.map((element, index) =>
+        index < args.length ? floatWords(element, elements[index]?.[2] ?? args[index]) : element,
+      );
+    }
+    if (isPlainRecord(value)) {
+      const typeOf = new Map(elements.flatMap((match) => (match === null ? [] : [[match[1], match[2]] as const])));
+      return mapValues(value, (key) => typeOf.get(key));
+    }
+  }
+  return value;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** A copy of `record` with each value read by the type `typeOf` gives its key, or kept when it gives none. */
+function mapValues(
+  record: Record<string, unknown>,
+  typeOf: (key: string) => string | undefined,
+): Record<string, unknown> {
+  const copy: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(record)) {
+    const type = typeOf(key);
+    // Defined, not assigned: a key named `__proto__` would otherwise replace the prototype.
+    Object.defineProperty(copy, key, {
+      value: type === undefined ? entry : floatWords(entry, type),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return copy;
+}
+
+/**
+ * Each JSONCompact row, an array of values in `meta` order, as an object keyed by
+ * the field names. A row that is not an array, or whose value count differs from
+ * the declared columns, is refused: naming its values would be a guess. A
+ * non-finite float is handed over as its word (`floatWords`).
+ */
+function keyedRows(
+  data: unknown,
+  fieldNames: readonly string[] | null,
+  columnTypes: Record<string, string> | null,
+): ClickHouseRow[] {
+  if (!Array.isArray(data)) return [];
+
+  const names = fieldNames ?? [];
+  const types = names.map((name) => {
+    const type = columnTypes !== null && Object.hasOwn(columnTypes, name) ? columnTypes[name] : undefined;
+    return typeof type === "string" ? type : undefined;
+  });
+  return data.map((values: unknown) => {
+    if (!Array.isArray(values)) {
+      throw new ClickHouseTransportError("ClickHouse answered a row that is not an array of values", 0);
+    }
+    if (values.length !== names.length) {
+      throw new ClickHouseTransportError(
+        `ClickHouse answered a row of ${values.length} values for ${names.length} declared columns`,
+        0,
+      );
+    }
+    return Object.fromEntries(
+      names.map((name, index) => {
+        const type = types[index];
+        return [name, type === undefined ? values[index] : floatWords(values[index], type)];
+      }),
+    );
+  });
 }
 
 function parseEnvelope(text: string): ClickHouseJsonEnvelope {
   const envelope = asRecord(parseJson(text));
-  // The server announced JSON, so a body that is not a JSON object means
+  // The server announced JSONCompact, so a body that is not a JSON object means
   // something between here and it rewrote the response. Normalizing that keeps
   // the seam's promise that every throw is a ClickHouseTransportError - a raw
   // SyntaxError would slip past every `instanceof` branch in the provider.
@@ -254,9 +404,10 @@ function toQueryResult(outcome: HttpOutcome): ClickHouseQueryResult {
   if (outcome.headers.get(FORMAT_HEADER) !== RESPONSE_FORMAT) return untabulated(summary, outcome.text);
 
   const envelope = parseEnvelope(outcome.text);
+  const columns = describeColumns(envelope);
   return {
-    rows: Array.isArray(envelope.data) ? (envelope.data as ClickHouseRow[]) : [],
-    ...describeColumns(envelope),
+    rows: keyedRows(envelope.data, columns.fieldNames, columns.columnTypes),
+    ...columns,
     executionTimeMs: executionTimeMs(summary, envelope),
     mutationCount: summary.mutationCount,
     rawText: null,
@@ -341,9 +492,13 @@ function midstreamError(outcome: HttpOutcome): ClickHouseTransportError | null {
 }
 
 /** A failure that never reached the server, or never came back from it. */
-function transportError(cause: unknown): ClickHouseTransportError {
-  const reason = cause instanceof Error ? cause.message : String(cause);
-  return new ClickHouseTransportError(`ClickHouse request failed: ${reason}`, 0);
+function transportError(cause: unknown, url: string): ClickHouseTransportError {
+  return new ClickHouseTransportError(
+    `ClickHouse request failed: ${describeFetchFailure(cause, url)}`,
+    0,
+    undefined,
+    networkFailureKind(cause),
+  );
 }
 
 // ============================================================================
@@ -353,14 +508,14 @@ function transportError(cause: unknown): ClickHouseTransportError {
 export class ClickHouseHttpTransport implements ClickHouseTransport {
   public readonly kind = "http" as const;
 
-  private readonly origin: string;
+  private readonly origin: HttpOrigin;
   private readonly database: string | undefined;
   private readonly authorization: string | undefined;
 
   constructor(config: DatabaseConnection) {
     const secure = config.ssl !== undefined && config.ssl.mode !== "disable";
     const port = config.port ?? (secure ? DEFAULT_TLS_PORT : DEFAULT_PORT);
-    this.origin = `${secure ? "https" : "http"}://${formatHost(config.host ?? DEFAULT_HOST)}:${port}`;
+    this.origin = httpOrigin(secure ? "https" : "http", config.host ?? DEFAULT_HOST, port);
     this.database = config.database;
     // Live-verified: an EMPTY Basic username fails hard - "Got an empty user name
     // from Authorization HTTP header", code 516 - while sending no header at all
@@ -400,11 +555,24 @@ export class ClickHouseHttpTransport implements ClickHouseTransport {
     // JSON.parse silently rounds 18446744073709551615 to ...552000. Quoted, it
     // arrives as a string, which is what the `pg` driver already does for int8.
     params.set("output_format_json_quote_64bit_integers", "1");
+    // The same rounding for Decimal, which the setting above does not cover:
+    // measured on 26.9.9.28, a Decimal(38,10) holding
+    // 12345678901234567890.1234567891 arrived unquoted and was shown as
+    // 12345678901234567000. Every Decimal is then a string, small ones included,
+    // which is how the `pg` driver already hands over NUMERIC.
+    params.set("output_format_json_quote_decimals", "1");
+    // JSON has no number for inf, -inf or nan, and without this ClickHouse writes them
+    // as `null`: measured on 26.9.18.11, a non-Nullable Float64 holding inf was shown
+    // as NULL, exported as NULL and replayed as 0. Quoted, they arrive as the strings
+    // "inf", "-inf" and "nan", which `keyedRows` turns into the shared words by the
+    // column's declared type (`floatWords`).
+    params.set("output_format_json_quote_denormals", "1");
 
     const database = opts.database ?? this.database;
     if (database) params.set("database", database);
+    if (opts.queryId !== undefined) params.set("query_id", opts.queryId);
 
-    return `${this.origin}/?${params.toString()}`;
+    return endpointUrl(this.origin, "/", params);
   }
 
   private async send(url: string, sql: string, timeoutMs?: number): Promise<HttpOutcome> {
@@ -414,19 +582,26 @@ export class ClickHouseHttpTransport implements ClickHouseTransport {
     // timer around fetch alone would not.
     const signal = timeoutMs === undefined ? undefined : AbortSignal.timeout(timeoutMs);
 
+    let response: Response;
+    let text: string;
     try {
-      const response = await fetch(url, {
+      response = await httpTransportFetch(url, {
         method: "POST",
         headers: this.authorization ? { authorization: this.authorization } : {},
         body: sql,
+        // A followed redirect would carry the credential to wherever it points.
+        redirect: "manual",
         ...(signal ? { signal } : {}),
       });
-
-      return { ok: response.ok, status: response.status, headers: response.headers, text: await response.text() };
+      text = await response.text();
     } catch (error) {
+      if (error instanceof DatabaseConfigError) throw error;
       // A refused socket, an abort and a truncated body all arrive here, and all
       // have to leave as the seam's own error type.
-      throw transportError(error);
+      throw transportError(error, url);
     }
+
+    rejectRedirect(response, url);
+    return { ok: response.ok, status: response.status, headers: response.headers, text };
   }
 }

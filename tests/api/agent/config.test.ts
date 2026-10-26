@@ -41,7 +41,14 @@ const mockGetSession = mock(
 // Spread over the real module: a partial replacement stays installed process-wide
 // and breaks the next file that imports an export this one forgot (T9's lesson).
 function installMocks(): void {
-  mock.module("@/lib/auth", () => ({ ...realAuth, getSession: mockGetSession }));
+  mock.module("@/lib/auth", () => ({
+    ...realAuth,
+    getSession: mockGetSession,
+    readSession: mock(async () => {
+      const s = await mockGetSession();
+      return s ? { kind: "authenticated", session: s } : { kind: "anonymous" };
+    }),
+  }));
 }
 
 installMocks();
@@ -61,6 +68,7 @@ const ENV_KEYS = [
   "LLM_API_KEY",
   "LLM_MODEL",
   "LLM_API_URL",
+  "LLM_MODEL_EFFORT",
 ] as const;
 
 let originalEnv: Record<string, string | undefined>;
@@ -296,6 +304,7 @@ describe("GET /api/agent/config", () => {
     const body = await parseResponseJSON<Record<string, unknown>>(res);
 
     expect(res.status).toBe(401);
+    expect(body.code).toBe("AUTH_REQUIRED");
     expect(body).not.toHaveProperty("enabled");
     expect(body).not.toHaveProperty("reason");
   });

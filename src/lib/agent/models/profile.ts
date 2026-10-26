@@ -10,8 +10,8 @@ import type { AgentRunWorkflowType } from "../types";
 
 /** How a turn is sampled. Structural output, so the default explores nothing. */
 export interface AgentSampling {
-  readonly temperature: number;
-  readonly topP: number;
+  readonly temperature?: number;
+  readonly topP?: number;
 }
 
 export interface AgentModelProfile {
@@ -51,10 +51,14 @@ export interface AgentModelProfile {
   /**
    * How many extra turns a PLAN run gets when its prose named no statement and no refusal.
    *
-   * Zero by default, because a run that answered its objective is not obviously owed another
-   * turn, and 24 models clear this bar unaided. `qwen3:14b` is the measured case: its losing
-   * plan describes all eight tables and every relation and then stops without the fenced
-   * statement or the explicit refusal that plan mode scores.
+   * Stated by every measured profile, and the number a profile states is what that model gets:
+   * 0 where the model was watched declining the ask, 1 where the extra turn is what closed the
+   * cell. `qwen3:14b` is the measured case for 1 — its losing plan describes all eight tables and
+   * every relation and then stops without the fenced statement or the explicit refusal that plan
+   * mode scores.
+   *
+   * A model with no profile is a different question, and it is answered in `planStatementAsksFor`
+   * rather than here: absence is not a measurement, so an unmeasured model is asked once.
    */
   readonly planStatementRetries?: number;
 
@@ -95,8 +99,13 @@ export interface AgentModelProfile {
    * run that called nothing composed no report and has already earned `no-report`; the turn is
    * spent on a run that has lost. It cannot cost a pass, only recover a failure.
    *
-   * Off by default even so. The ten models locked at 300/300 were measured without it, and a
-   * drive-wide change is twice how this repository has handed back cells it had won.
+   * A stated `false` is obeyed even so. The ten models locked at 300/300 were measured without
+   * it, and overruling a measurement is twice how this repository has handed back cells it had
+   * won. What is NOT obeyed is an absent entry, which is not a measurement: the drive asks
+   * `answersUnreadStop`, not `retriesUnreadStop`, and that resolver offers the turn to a model
+   * nobody has measured. All twenty-eight shipped entries stated this field when the two were
+   * split, so no shipped model's turn count moved then; thirty state it now, three of them `true`
+   * — which is a record of what their runs were driven with, not a preference.
    *
    * It SUBSUMES `retryEmptyTurn`, and that is a property of the gate rather than of the name.
    * The condition is "called nothing", with no test on what was said, so an empty completion
@@ -108,6 +117,19 @@ export interface AgentModelProfile {
    * measured cell without re-measuring it. See `docs/BACKLOG.md`.
    */
   readonly retryUnreadStop?: boolean;
+  /**
+   * How many times a stop that read nothing is answered, where once is not enough.
+   *
+   * `retryUnreadStop` says WHETHER to answer; this says how often. The two are separate because a
+   * boolean can only ever give one ask, and the measurement says one is a bound rather than an
+   * answer: `devstral-small-2:24b` holds five of six surfaces at 5/5 and loses optimize on runs
+   * that call nothing - it says what it needs, is answered, says the same thing again, and the run
+   * ends. Three of five runs, `said=2` in each, fourteen to twenty seconds.
+   *
+   * A count for the reason `planStatementRetries` and `reportReminderLimit` are counts. Default
+   * one, so no measured model's turn count moves.
+   */
+  readonly unreadStopAsks?: number;
 
   /**
    * Whether this model's PLAN turn asks the endpoint for no reasoning at all.
@@ -125,9 +147,11 @@ export interface AgentModelProfile {
    * It reaches the OPENAI-COMPATIBLE adapter only. `providerOptions` is keyed `openai`, which
    * is right for the three kinds `provider-registry.ts` builds through `@ai-sdk/openai`
    * (`openai`, `ollama`, `custom`) and reaches nothing on `gemini`, which is `@ai-sdk/google`
-   * and reads its own key. So this is a no-op on the one hosted provider Studio ships an
-   * adapter for, silently — stated here because every model measured with it is local, and
-   * an operator who sets it on a Gemini model is owed the sentence rather than the silence.
+   * and reads its own key. So this is a no-op on Gemini, silently, and it is stated here
+   * because every model measured with it is local, and an operator who sets it on a Gemini
+   * model is owed the sentence rather than the silence. On the `openai` kind an operator's `LLM_MODEL_EFFORT`
+   * wins over it, and an effort the SDK will not send for the model is raised as an error
+   * rather than dropped (`agentProviderOptions` and `refusedEffortError` in `model-adapter.ts`).
    */
   readonly suppressPlanReasoning?: boolean;
   /**
@@ -145,8 +169,8 @@ export interface AgentModelProfile {
    * either answers at once or thinks until the wall — which is the shape this addresses and
    * `turnTimeoutMs` does not: a turn spent thinking finds the new wall too.
    *
-   * Reaches the OPENAI-COMPATIBLE adapter only, exactly as its sibling does, and is silently a
-   * no-op on `gemini`.
+   * Reaches the OPENAI-COMPATIBLE adapter only, exactly as its sibling does, is silently a
+   * no-op on `gemini`, and yields to `LLM_MODEL_EFFORT` on the `openai` kind.
    */
   readonly suppressAgentReasoning?: boolean;
   /**
@@ -172,6 +196,14 @@ export interface AgentModelProfile {
    * recorded, not because one has been.
    */
   readonly verdictHoldLimit?: number;
+
+  /**
+   * How many times this model's report may be held to ask for the comparison it rests on.
+   *
+   * Absent means one, which is the literal every entry written before this bound became per-model
+   * was measured under. See `DEFAULT_COMPARE_HOLD_LIMIT` for the measurement that asked for it.
+   */
+  readonly compareHoldLimit?: number;
 
   /**
    * How many times a report may be held to ask for the answer that belongs beside it.
@@ -235,10 +267,28 @@ export interface AgentNotices {
   readonly reportReminder: string;
   /** A PLAN run whose prose carried neither a runnable statement nor an explicit refusal. */
   readonly planStatement: string;
+  /**
+   * A turn the per-call ceiling cut off, on a run whose own deadline still has room.
+   *
+   * The one stop shape in the drive that had no recovery path. Measured on `qwen3.6:35b`: nine
+   * losses, every one cut at the ceiling with 333 to 353 seconds of a 450-second deadline and 34
+   * of 36 turns unspent, while the same cell's longest PASSING run took 183 seconds.
+   */
+  readonly turnCutOff: string;
   /** An answer-presenting run about to report a result it read but never presented. */
   readonly presentBeforeReport: string;
   /** A run that stopped without calling anything, having asked for what it could have read. */
   readonly unreadStop: string;
+  /**
+   * A tool call the ENDPOINT could not parse, handed back to the model that wrote it.
+   *
+   * The one failure here that is not the drive's judgement of a turn but the provider's: the
+   * arguments did not parse, so no call was made and no ledger entry exists. Re-sending the same
+   * request produces the same failure, which is why this is a sentence rather than a retry.
+   */
+  /** Said when a stopping turn wrote a tool CALL into the message text rather than calling. */
+  readonly toolCallAsText: string;
+  readonly unreadableToolCall: string;
 }
 
 /**
@@ -263,7 +313,12 @@ export const DEFAULT_REPORT_REMINDER_LIMIT = 1;
  * No extra turn, which is what every locked plan cell was measured against.
  *
  * A plan run that produced prose has answered or it has not, and the verifier reads that for
- * itself. Offering another turn to every model would change 24 models' runs to reach one.
+ * itself. This is the number a MEASURED profile falls back to when it states none, and every
+ * profile that ships states one, so in practice it changes no measured model's run.
+ *
+ * It is not what an unmeasured model gets. That is `planStatementAsksFor`, which answers 1: a
+ * model nobody has watched has not been watched declining the ask either, and refusing it a turn
+ * on the strength of a missing measurement is the server deciding by silence.
  */
 export const DEFAULT_PLAN_STATEMENT_RETRIES = 0;
 
@@ -282,10 +337,14 @@ export const DEFAULT_RETRY_EMPTY_TURN = false;
 /**
  * A run that stops having called nothing keeps its ending, unless a model's ledger asked.
  *
- * Off despite being free to grant — the turn is spent on a run whose verdict is already
- * `no-report` — because "free" is an argument about cost, not about wording. The sentence sent
- * is read by the model and acted on by it, so it is a measured value like every other, and it
- * belongs to the models measured with it rather than to all of them at once.
+ * Off, and it stays off for every model that states it: the sentence sent is read by the model
+ * and acted on by it, so it is a measured value like every other and belongs to the models
+ * measured with it rather than to all of them at once.
+ *
+ * This constant is what a STATED field falls back to, and every shipped entry states the field,
+ * so nothing resolves through it today. It is not what a model with no entry gets — that is
+ * `answersUnreadStop`, which offers the turn, because on a run already earning `no-report` a
+ * default cannot protect a passing run and so protects nothing.
  */
 export const DEFAULT_RETRY_UNREAD_STOP = false;
 
@@ -325,6 +384,26 @@ export const DEFAULT_PRESENT_REMINDER_LIMIT = 1;
  * third; the value it moved with is the value it had.
  */
 export const DEFAULT_VERDICT_HOLD_LIMIT = 2;
+
+/**
+ * How many times a report may be held to ask for the comparison it rests on.
+ *
+ * The fourth of the reminder bounds, and the last one that was a literal: the loop read
+ * `compareReminders < 1`, so the sentence naming the two plan ids a run has already inspected was
+ * said exactly once and a model that reported anyway was never asked again.
+ *
+ * One is what the literal was, so moving it into a default changes nothing for any shipped model.
+ * It exists because `laguna-xs-2.1:latest` optimize was measured against it on 2026-10-09: five
+ * rolls of its best document read 4/5, 4/5, 1/5, 4/5, 4/5, and the loss that recurred was
+ * `report-composed` with `no-plan-comparison` on runs holding four plans, with `plan-bar` delivered
+ * in every run. The cell loses by one, to a sentence it hears once.
+ *
+ * Safe in the way `DEFAULT_VERDICT_HOLD_LIMIT` is safe: the hold fires only where `compose_report`
+ * is called by a run holding plans and no comparison between them, which is a run already earning
+ * `no-plan-comparison`. A run about to pass cannot reach it, so a raised limit spends turns only on
+ * a run that has already lost.
+ */
+export const DEFAULT_COMPARE_HOLD_LIMIT = 1;
 
 /**
  * Deterministic, and the setting five locked cells were won on.

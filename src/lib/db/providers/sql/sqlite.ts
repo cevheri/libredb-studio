@@ -12,8 +12,15 @@
 
 import { SQLBaseProvider } from "./sql-base";
 import {
+  type Container,
+  type DatabaseObject,
   type DatabaseConnection,
-  type TableSchema,
+  type KindCount,
+  type ObjectDetail,
+  type ObjectDetailBatch,
+  type ObjectSourceDocument,
+  type ObjectKindSpec,
+  type OpenQueryTransactionOutcome,
   type QueryResult,
   type HealthInfo,
   type MaintenanceType,
@@ -40,38 +47,54 @@ import {
 } from "../../errors";
 import { assertReadOnlyBudget, measureResultBytes } from "./read-only-budget";
 import { formatBytes } from "../../utils/pool-manager";
-import { loadSQLiteDriver, type SQLiteDatabase } from "./sqlite-driver";
+import {
+  loadSQLiteDriver,
+  type SQLiteDatabase,
+  type SQLiteDeclaredColumn,
+  type SQLiteStatement,
+} from "./sqlite-driver";
+import { SQLiteWorkerClient, type SQLiteHandle, type SQLiteRawRead, type SQLiteWorkerOpen } from "./sqlite-worker";
+import { declaredColumnTypes } from "./column-types";
+import { SQLITE_CREATE_TABLE } from "./sqlite-create-table";
+import {
+  applySourceBound,
+  assertContainerPathShape,
+  assertObjectPathShape,
+  type ObjectPathShapeEngine,
+  callerBoundTruncationReason,
+  type ContainerPathShapeEngine,
+  declaredKinds,
+  findKind,
+  requireSourceKind,
+} from "../../object-kinds";
+import { comparePaths } from "../../object-path";
+import { unquoteLiteral } from "@/lib/sql/values";
 import { CACHE_HIT_RATIO_UNAVAILABLE } from "@/lib/monitoring-cache-ratio";
+import { logger } from "@/lib/logger";
 import * as fs from "fs";
 import * as path from "path";
+import { createMissingDirectories } from "@/lib/db/utils/create-directory";
+import { assertRegularFilesOrMissing, readRegularFileStart } from "@/lib/db/utils/regular-file";
+import { isUnwritableExistingFile } from "@/lib/db/utils/unwritable-file";
+import { uniqueFieldNames } from "@/lib/db/utils/result-fields";
+import { keyRowsByPosition } from "@/lib/db/utils/positional-rows";
+import { isReservedStoragePath } from "@/lib/data-dir";
+
+/**
+ * SQLite's identity for the shared container-path renderer.
+ *
+ * Which paths this engine accepts is not a field here: it is `containerPathShapes` in
+ * `getCapabilities()`, which the object routes read too (#1147).
+ */
+const SQLITE_CONTAINER_PATH_ENGINE: ContainerPathShapeEngine = {
+  code: "sqlite",
+  label: "A SQLite",
+  shapeNames: "label",
+};
 
 // ============================================================================
 // Type Definitions
 // ============================================================================
-
-// Row shapes returned by the PRAGMA introspection statements below.
-interface SQLiteColumnInfoRow {
-  cid: number;
-  name: string;
-  type: string;
-  notnull: number;
-  dflt_value: string | null;
-  pk: number;
-}
-
-interface SQLiteForeignKeyRow {
-  id: number;
-  seq: number;
-  table: string;
-  from: string;
-  to: string;
-}
-
-interface SQLiteIndexListRow {
-  seq: number;
-  name: string;
-  unique: number;
-}
 
 // ============================================================================
 // Introspection SQL
@@ -85,19 +108,8 @@ interface SQLiteIndexListRow {
 // stays accurate (same pattern as postgres.ts).
 // ============================================================================
 
-const SCHEMA_TABLES_SQL = `
-      SELECT name FROM sqlite_master
-      WHERE type = 'table'
-      AND name NOT LIKE 'sqlite_%'
-      ORDER BY name;
-    `;
-
-const DB_PAGE_SIZE_SQL = `
-          SELECT (SELECT page_count FROM pragma_page_count()) *
-                 (SELECT page_size FROM pragma_page_size()) as size
-        `;
-
-// Size of a :memory: database (no file to stat).
+// The database's size as SQLite counts it: its live pages, read through the WAL.
+// Used for file databases and :memory: alike (#1449).
 const MEMORY_DB_SIZE_SQL = `
           SELECT (page_count * page_size) as size
           FROM pragma_page_count(), pragma_page_size()
@@ -147,6 +159,761 @@ const STATS_INDEXES_SQL = `
       WHERE type = 'index' AND name NOT LIKE 'sqlite_%'
       ORDER BY tbl_name, name
     `;
+
+// ============================================================================
+// Object surface (#789)
+// ============================================================================
+
+/**
+ * The one schema this provider's object surface reads, and the reason it is a constant
+ * rather than a path segment.
+ *
+ * SQLite declares ZERO container levels, so no container path carries a schema and
+ * nothing here derives one. `main` is SQLite's own name for the database file the
+ * connection opened; `temp` and any `ATTACH`ed database are SESSION state on this handle,
+ * which a declaration read off an UNCONNECTED provider (`POST /api/db/provider-meta`,
+ * #457) cannot describe. Out of scope for Phase 1 and recorded as such in
+ * `docs/providers/sqlite.md`.
+ *
+ * It is not cosmetic, and it is not a filter that could be dropped. Measured on SQLite
+ * 3.53.2: with `CREATE TEMP TABLE main_only(ttt)` live, the one-argument
+ * `pragma_table_info('main_only')` answers the TEMP table's columns and the two-argument
+ * `pragma_table_info('main_only', 'main')` answers the file's. A read that leaves the
+ * schema out describes a different object under the same name. The same measurement on
+ * the listing side: `PRAGMA table_list` spans every attached schema AND `temp`, so
+ * without `t.schema = ?` a temp table shadowing a real one gives two objects ONE path,
+ * which is the uniqueness the tree addresses rows by.
+ */
+const MAIN_SCHEMA = "main";
+
+// ----------------------------------------------------------------------------
+// `name NOT LIKE 'sqlite\_%' ESCAPE '\'`, in all six statements below
+//
+// Names SQLite reserves for itself, excluded from every count and every listing. This
+// can never hide a user's object, and that is measured rather than assumed: the engine
+// refuses the name outright, `CREATE TABLE sqlite_foo` answering "object name reserved
+// for internal use: sqlite_foo". What it does remove is real and appears without being
+// asked for - `sqlite_schema` and `sqlite_temp_schema` are rows in `PRAGMA table_list`,
+// `sqlite_sequence` appears the moment a table declares AUTOINCREMENT, `sqlite_stat1`
+// the moment ANALYZE runs, and `sqlite_autoindex_<table>_<n>` the moment a column
+// declares UNIQUE or a PRIMARY KEY needs an index.
+//
+// `ESCAPE` is load-bearing: `_` is LIKE's single-character wildcard, so the unescaped
+// `'sqlite_%'` also matches `sqliteXanything`, which is a name a user CAN create.
+//
+// The same predicate is applied to all four populations, in the counts and in the
+// listings, so the badge and its folder can never disagree about what an object is
+// (standing ruling 5f).
+// ----------------------------------------------------------------------------
+
+/**
+ * How many objects of each kind the file holds, in one statement.
+ *
+ * Two arms because two catalogs answer: `PRAGMA table_list` separates a real table from
+ * the shadow tables an FTS5 or R-Tree module owns, and `sqlite_schema` is the only place
+ * an index or a trigger appears at all. The `CASE` maps the three relation-shaped
+ * `table_list` types onto the two declared kinds, and the `IN` list is the vocabulary:
+ * `PRAGMA table_list.type` is documented to carry exactly `table`, `view`, `shadow` and
+ * `virtual`, so the arm that is dropped is `shadow` and nothing else. That is SQLite's
+ * documentation rather than a `SELECT DISTINCT` over a fixture (standing ruling 5a), and
+ * the fixture in `tests/integration/db/sqlite-provider.test.ts` holds all four values so
+ * the claim is exercised rather than asserted.
+ */
+const COUNTS_SQL = `
+      SELECT kind, COUNT(*) AS n
+        FROM (
+               SELECT CASE t.type WHEN 'view' THEN 'view' ELSE 'table' END AS kind
+                 FROM pragma_table_list AS t
+                WHERE t.schema = ?
+                  AND t.type IN ('table', 'view', 'virtual')
+                  AND t.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+               UNION ALL
+               SELECT s.type AS kind
+                 FROM sqlite_schema AS s
+                WHERE s.type IN ('index', 'trigger')
+                  AND s.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+             )
+       GROUP BY kind
+    `;
+
+// `virtual` belongs with `table` and `shadow` does not, which is the whole reason
+// `PRAGMA table_list` is read here instead of `sqlite_schema`. An FTS5 table is one
+// `virtual` row plus five `shadow` rows and an R-Tree is one plus three, and
+// `sqlite_schema` types every one of them `table`: measured on the fixture in
+// `tests/integration/db/sqlite-provider.test.ts`, which holds six tables and one FTS5
+// table, a naive scan answers 12. A user SELECTs from the `virtual` row and never from a
+// `shadow` one, so the shadow tables are not objects this tree has any business drawing.
+const LIST_TABLES_SQL = `
+      SELECT t.name AS name
+        FROM pragma_table_list AS t
+       WHERE t.schema = ?
+         AND t.type IN ('table', 'virtual')
+         AND t.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+    `;
+
+const LIST_VIEWS_SQL = `
+      SELECT t.name AS name
+        FROM pragma_table_list AS t
+       WHERE t.schema = ?
+         AND t.type = 'view'
+         AND t.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+    `;
+
+// Indexes and triggers are not in `PRAGMA table_list` at all, so these two read
+// `sqlite_schema`, which needs no schema bind: measured with a database ATTACHed, the
+// unqualified name always resolves to `main.sqlite_schema`, and `temp` objects live in
+// the separate `sqlite_temp_schema`. So these two are already scoped to the same one
+// schema the two statements above bind.
+const LIST_INDEXES_SQL = `
+      SELECT s.name AS name
+        FROM sqlite_schema AS s
+       WHERE s.type = 'index'
+         AND s.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+    `;
+
+// `tbl_name` is the object the trigger fires on, which is the `attachedTo` nesting.
+const LIST_TRIGGERS_SQL = `
+      SELECT s.name AS name, s.tbl_name AS parent
+        FROM sqlite_schema AS s
+       WHERE s.type = 'trigger'
+         AND s.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+    `;
+
+// `table_xinfo` and not `table_info`, which is the same read minus the hidden column.
+// Measured: `table_info` DROPS a generated column in both spellings, VIRTUAL (hidden 2)
+// and STORED (hidden 3), so a table declaring one reports a column list the engine does
+// not have. `hidden = 1` is the other direction - a virtual table module's own interface
+// columns, its own name and `rank` on an FTS5 table - and those are not columns the table
+// declares, so only that value is excluded. `getSchema()` still reads `table_info` and
+// still loses generated columns; that is the flat surface's defect, recorded in
+// docs/BACKLOG.md.
+const OBJECT_COLUMNS_SQL = `
+      SELECT name, type, "notnull", dflt_value, pk
+        FROM pragma_table_xinfo(?, ?)
+       WHERE hidden <> 1
+       ORDER BY cid
+    `;
+
+// `ORDER BY name`, which `pragma_index_list` does NOT do on its own: measured, it answers
+// in reverse creation order, so `idx_orders_doubled` comes back before
+// `idx_orders_customer`. The bulk read has to order by the object to group its rows, and
+// an order that then differs from this one would make the two surfaces describe the same
+// table's indexes in two different sequences. Creation order is not a fact anybody reads,
+// so both are ordered by name.
+const OBJECT_INDEXES_SQL = `
+      SELECT name, "unique"
+        FROM pragma_index_list(?, ?)
+       WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+       ORDER BY name
+    `;
+
+const OBJECT_INDEX_COLUMNS_SQL = `
+      SELECT name
+        FROM pragma_index_info(?, ?)
+       ORDER BY seqno
+    `;
+
+// The parent's PRIMARY KEY column for a foreign key that names no column, resolved in
+// the same statement. Measured: `REFERENCES customers` (no column list) answers
+// `to = NULL`, which means the parent's primary key, and
+// `ForeignKeySchema.referencedColumn` is a string - so the alternative to resolving it is
+// putting a null in a typed string field.
+//
+// `pk` is a 1-BASED RANK over the parent's key columns and `seq` is the 0-based position
+// of this column inside the constraint, so `p.pk = f.seq + 1` is the parent key column
+// this one references. A correlated subquery rather than a second read per parent,
+// because the same shape then serves the bulk read, where the parents of a whole folder
+// would otherwise be a second N+1 inside the read that exists to remove one. A parent
+// that is not there at all answers NULL, which is the same absence the per-parent read
+// spelled as an out-of-range index (measured against `REFERENCES ghost`).
+//
+// The first placeholder is the SUBQUERY's schema, because SQLite numbers placeholders by
+// the order they APPEAR in the statement text and the select list is written before the
+// FROM clause.
+const OBJECT_FOREIGN_KEYS_SQL = `
+      SELECT f.id AS id, f.seq AS seq, f."table" AS "table", f."from" AS "from", f."to" AS "to",
+             (SELECT p.name FROM pragma_table_info(f."table", ?) AS p WHERE p.pk = f.seq + 1) AS parent_key
+        FROM pragma_foreign_key_list(?, ?) AS f
+       ORDER BY f.id, f.seq
+    `;
+
+/**
+ * Every object kind SQLite has, and nothing else.
+ *
+ * `sqlite_schema.type` carries exactly four values - `table`, `index`, `view` and
+ * `trigger` - and this is the whole inventory. There is no stored procedure and no stored
+ * function to declare: an application-defined SQLite function is registered against a
+ * connection by the HOST PROCESS through `sqlite3_create_function()` and is never written
+ * to the database file, so nothing survives the connection to be listed and a `routine`
+ * folder would be a claim about this product rather than about the file.
+ *
+ * `index` IS declared here, unlike on postgres, mysql, mssql and oracle. The test is
+ * whether the engine's own catalog models an index as a first-class named object at
+ * container level, and SQLite's does: an index is a row in `sqlite_schema` beside the
+ * tables, addressed by a bare name that shares one namespace with tables and views
+ * (measured: `CREATE INDEX t ON u(id)` against an existing table `t` answers
+ * "there is already a table named t").
+ *
+ * Module scope rather than a literal inside `getCapabilities()`, so the array is one
+ * object rather than a fresh one per call: `getCapabilities()` is called several times
+ * per request by the object routes and the tree.
+ */
+/**
+ * Every kind here publishes its own definition text (#789 Phase 2).
+ *
+ * One constant rather than four copies, because the fact is about the ENGINE and not about
+ * any one kind: `sqlite_schema` keeps a `sql` column on every row it has, so there is no kind
+ * on this engine that declares nothing. `sql` is a Monaco language id the installed bundle
+ * really registers, which `plsql`, `tsql` and `cql` are not.
+ *
+ * The layout of these entries is free: nothing reads them as text. The vocabulary is pinned to
+ * the agent side's `catalogCapture.kindWords` (`src/lib/agent/languages/sql/engines/sqlite.ts`) by `tests/unit/lib/agent/context-snapshot.test.ts`,
+ * which asks the constructed provider for `getCapabilities().objectKinds` rather than scraping
+ * this array (#981). An entry that wraps therefore cannot hide its kind from that guard, which
+ * is the hole the earlier `{ id: "..."` scrape left: a fifth kind written across two lines was
+ * missing from the guard's population AND from the agent side's map, so both sides shrank
+ * together and the guard passed over a kind nothing maps.
+ */
+const SOURCE_SQL: Pick<ObjectKindSpec, "hasSource" | "sourceLanguage"> = { hasSource: true, sourceLanguage: "sql" };
+
+const SQLITE_OBJECT_KINDS: readonly ObjectKindSpec[] = [
+  // `hasColumns` on the two relation kinds and on neither of the other two (#789). Written
+  // literally rather than derived from BULK_RELATION_TYPES, which holds the same two ids: that
+  // constant is declared after this array, so referencing it here would throw at module init.
+  // The literal is safe because invariant 8 in `tests/helpers/object-surface-conformance.ts`
+  // checks it against this provider's own `describeObject` in both directions, and the engine
+  // fact behind the two abstentions is measured: `pragma_table_xinfo` answers ZERO rows for an
+  // index name and for a trigger name, so an index and a trigger really have no column to draw.
+  {
+    id: "table",
+    role: "relation",
+    label: "Table",
+    labelPlural: "Tables",
+    acceptsRowWrites: true,
+    hasColumns: true,
+    ...SOURCE_SQL,
+  },
+  // No `acceptsRowWrites`. SQLite refuses a write to a view outright unless an INSTEAD OF
+  // trigger carries it, which is a per-OBJECT fact a per-kind declaration cannot state.
+  { id: "view", role: "relation", label: "View", labelPlural: "Views", hasColumns: true, ...SOURCE_SQL },
+  { id: "index", role: "config", label: "Index", labelPlural: "Indexes", ...SOURCE_SQL },
+  { id: "trigger", role: "attached", label: "Trigger", labelPlural: "Triggers", attachedTo: "table", ...SOURCE_SQL },
+];
+
+/** One row of `COUNTS_SQL`: a declared kind id and how many the file holds. */
+interface KindCountRow {
+  kind: string;
+  n: number;
+}
+
+/**
+ * One listed object, from whichever of the four listing statements answered.
+ *
+ * `parent` is selected by the trigger listing alone, which is what lets one mapper serve
+ * all four.
+ */
+interface ObjectRow {
+  name: string;
+  parent?: string | null;
+}
+
+/** One column of an object, as `pragma_table_xinfo` publishes it. */
+interface ObjectColumnRow {
+  name: string;
+  type: string | null;
+  notnull: number;
+  dflt_value: string | null;
+  pk: number;
+}
+
+/** One index on an object, as `pragma_index_list` publishes it. */
+interface ObjectIndexRow {
+  name: string;
+  unique: number;
+}
+
+/**
+ * One key column of one index, as `pragma_index_info` publishes it.
+ *
+ * `index_name` is carried on the row rather than held by the caller, so the single read
+ * and the bulk read hand the shared mapper the same shape: the single read reads one
+ * index at a time and tags each row, the bulk read selects the name in SQL.
+ */
+interface ObjectIndexColumnRow {
+  index_name: string;
+  name: string | null;
+}
+
+/**
+ * One foreign key constraint column, as `pragma_foreign_key_list` publishes it, plus the
+ * parent key column `OBJECT_FOREIGN_KEYS_SQL`'s correlated subquery resolved.
+ */
+interface ObjectForeignKeyRow {
+  id: number;
+  seq: number;
+  table: string;
+  from: string;
+  to: string | null;
+  parent_key: string | null;
+}
+
+/** One object's four row sets, whichever read produced them. */
+interface ObjectDetailRows {
+  readonly columns: readonly ObjectColumnRow[];
+  readonly indexes: readonly ObjectIndexRow[];
+  readonly indexColumns: readonly ObjectIndexColumnRow[];
+  readonly foreignKeys: readonly ObjectForeignKeyRow[];
+}
+
+/**
+ * Refuses a container path that is not the shape the DECLARATION describes.
+ *
+ * On SQLite the only valid container path is the empty one, and `container.length !== 0`
+ * is NOT how that is written. The depth comes from `containerDepth()` and the segment
+ * names from the declared level labels, so the check and its message are the same array:
+ * a provider copying this file onto a one- or two-level engine inherits a derivation
+ * rather than a literal that would refuse every valid path there (standing ruling 5g).
+ *
+ * This raises rather than answering an empty folder, because a path of another shape is a
+ * caller that built it from another engine's model, and an empty folder that looks exactly
+ * like a database holding nothing is the worst way to report that.
+ */
+function assertContainerPath(capabilities: ProviderCapabilities, container: readonly string[]): void {
+  assertContainerPathShape(capabilities, container, SQLITE_CONTAINER_PATH_ENGINE);
+}
+
+/**
+ * SQLite: an attached kind requires its parent segment, so the error names one shape.
+ */
+const PATH_SHAPE_ENGINE: ObjectPathShapeEngine = {
+  code: "sqlite",
+  label: "A SQLite",
+  attachedSegment: "required",
+};
+
+/**
+ * Every declared kind seeded at zero, before any row is read.
+ *
+ * Seeding is what makes "SQLite has this kind and this file holds none" render as a 0
+ * badge. Building the record from the GROUP BY rows alone would leave the kind out
+ * entirely, and an absent kind already means something else and stronger: the engine has
+ * no such concept, so the tree draws no folder at all.
+ */
+function seedZeroCounts(kinds: readonly ObjectKindSpec[]): Record<string, KindCount> {
+  return Object.fromEntries(kinds.map((kind) => [kind.id, { count: 0 } as KindCount]));
+}
+
+/**
+ * Overwrites the seeded zeros with what the GROUP BY actually answered.
+ *
+ * A kind that was never seeded is SKIPPED, so the DECLARATION decides which folders exist
+ * and a catalog row cannot add one - which is what keeps
+ * `tests/helpers/object-surface-conformance.ts`'s "never answers for an undeclared kind"
+ * true from this side.
+ *
+ * `Object.hasOwn` and not `in`, which is what makes that guarantee absolute rather than
+ * nearly so: `in` walks the prototype chain, so a row whose kind read `toString` or
+ * `constructor` would pass the test and write a folder the provider never declared.
+ */
+function applyKindCounts(counts: Record<string, KindCount>, rows: readonly KindCountRow[]): void {
+  for (const row of rows) {
+    if (Object.hasOwn(counts, row.kind)) counts[row.kind] = { count: Number(row.n) };
+  }
+}
+
+/**
+ * The engine's own sentence, verbatim, against every kind the failed read covered.
+ *
+ * Deliberately NOT through `mapDatabaseError`: that mapper gives a THROWN error a type and
+ * this product's prefix, and nothing here throws. The sentence is rendered to a person as
+ * the reason a folder has no number, so prefixing it would put our words in front of
+ * SQLite's. A refused read is never 0 - on a build older than 3.37 the sentence is
+ * "no such table: pragma_table_list", which is a different fact from "this file holds no
+ * tables", and `KindCount` is the type that keeps them apart.
+ */
+function unavailableCounts(ids: readonly string[], error: unknown): Record<string, KindCount> {
+  const reason = error instanceof Error ? error.message : String(error);
+  return Object.fromEntries(ids.map((id) => [id, { unavailable: reason } as KindCount]));
+}
+
+/**
+ * The `PRAGMA table_list` types one declared kind covers, and the whole set of kinds the
+ * bulk column read answers for (#789).
+ *
+ * The two `relation` kinds and nothing else. Measured: `pragma_table_xinfo` answers ZERO
+ * rows for an index name and for a trigger name, so those two kinds have no columns at
+ * all on this engine and `describeObjects` answers `{ details: [] }` for them without a
+ * round trip - the same fact `describeObject` answers as three empty arrays.
+ *
+ * The `IN` list is the same vocabulary `LIST_TABLES_SQL` and `LIST_VIEWS_SQL` carry, taken
+ * from SQLite's documentation of `PRAGMA table_list.type` rather than from a fixture
+ * (standing ruling 5a), so the bulk read's target can never be a different population from
+ * the folder's listing.
+ */
+const BULK_RELATION_TYPES: Readonly<Record<string, readonly string[]>> = {
+  table: ["table", "virtual"],
+  view: ["view"],
+};
+
+/**
+ * The target set of one bulk read: every object of one kind in `main`, in the engine's
+ * own order, optionally cut.
+ *
+ * `ORDER BY t.name` is not decoration. Measured: `pragma_table_list` answers in no useful
+ * order of its own, so without it a bounded read would keep an arbitrary subset and two
+ * calls could keep different ones. The sort runs under BINARY, which is the UTF-8 BYTE
+ * order, and that is NOT the same order `comparePaths` produces: measured, a database
+ * holding the two names U+E000 and U+1F600 comes back from SQLite in that order and from
+ * a JavaScript sort in the other, because JavaScript compares UTF-16 code units. So the
+ * MEMBERSHIP of a bounded cut is the engine's and the ORDER of the answer is ours, and the
+ * two are separated deliberately rather than assumed to agree.
+ *
+ * `LIMIT ?` carries `limit + 1`, so a saturated read is distinguishable from an exact one
+ * without a second count. The bound is bound rather than interpolated, measured accepted
+ * inside a CTE by both drivers.
+ */
+function describedCte(types: readonly string[], bounded: boolean): string {
+  return `WITH described AS (
+        SELECT t.name AS object_name
+          FROM pragma_table_list AS t
+         WHERE t.schema = ?
+           AND t.type IN (${types.map((type) => `'${type}'`).join(", ")})
+           AND t.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+         ORDER BY t.name${bounded ? "\n         LIMIT ?" : ""}
+      )`;
+}
+
+/**
+ * The five statements of one bulk read, which is FIVE round trips for a whole folder
+ * rather than one per object plus one per index.
+ *
+ * Every one of them joins a pragma table-valued function against the SAME `described`
+ * target, which is what makes the count constant: SQLite accepts a TVF argument that
+ * references a column of the row being joined, so `pragma_table_xinfo(d.object_name, ?)`
+ * runs once per target object inside one statement.
+ *
+ * The target read is separate and is what decides MEMBERSHIP. Taking it from the column
+ * read instead would drop an object whose every column is hidden, and the folder's listing
+ * would then name an object the batch does not carry.
+ */
+interface BulkDetailStatements {
+  readonly target: string;
+  readonly columns: string;
+  readonly indexes: string;
+  readonly indexColumns: string;
+  readonly foreignKeys: string;
+  /** How many trailing `MAIN_SCHEMA` binds each statement above takes, in that order. */
+  readonly schemaBinds: readonly [number, number, number, number, number];
+}
+
+function bulkDetailStatements(types: readonly string[], bounded: boolean): BulkDetailStatements {
+  const described = describedCte(types, bounded);
+  return {
+    target: `${described}
+      SELECT d.object_name AS object_name FROM described AS d`,
+    columns: `${described}
+      SELECT d.object_name AS object_name, x.name AS name, x.type AS type,
+             x."notnull" AS "notnull", x.dflt_value AS dflt_value, x.pk AS pk
+        FROM described AS d
+        JOIN pragma_table_xinfo(d.object_name, ?) AS x
+       WHERE x.hidden <> 1
+       ORDER BY d.object_name, x.cid`,
+    indexes: `${described}
+      SELECT d.object_name AS object_name, i.name AS name, i."unique" AS "unique"
+        FROM described AS d
+        JOIN pragma_index_list(d.object_name, ?) AS i
+       WHERE i.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+       ORDER BY d.object_name, i.name`,
+    indexColumns: `${described}, listed AS (
+        SELECT d.object_name AS object_name, i.name AS index_name
+          FROM described AS d
+          JOIN pragma_index_list(d.object_name, ?) AS i
+         WHERE i.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+      )
+      SELECT l.object_name AS object_name, l.index_name AS index_name, c.name AS name
+        FROM listed AS l
+        JOIN pragma_index_info(l.index_name, ?) AS c
+       ORDER BY l.object_name, l.index_name, c.seqno`,
+    foreignKeys: `${described}
+      SELECT d.object_name AS object_name, f.id AS id, f.seq AS seq, f."table" AS "table",
+             f."from" AS "from", f."to" AS "to",
+             (SELECT p.name FROM pragma_table_info(f."table", ?) AS p WHERE p.pk = f.seq + 1) AS parent_key
+        FROM described AS d
+        JOIN pragma_foreign_key_list(d.object_name, ?) AS f
+       ORDER BY d.object_name, f.id, f.seq`,
+    schemaBinds: [0, 1, 1, 2, 2],
+  };
+}
+
+/**
+ * Both forms of all five statements, per kind, built once at module load rather than per
+ * call: the object routes ask for a folder at a time and the text never varies.
+ */
+const BULK_DETAIL_SQL: Readonly<Record<string, BulkDetailStatements>> = Object.fromEntries(
+  Object.entries(BULK_RELATION_TYPES).map(([kind, types]) => [kind, bulkDetailStatements(types, false)]),
+);
+
+const BULK_DETAIL_SQL_BOUNDED: Readonly<Record<string, BulkDetailStatements>> = Object.fromEntries(
+  Object.entries(BULK_RELATION_TYPES).map(([kind, types]) => [kind, bulkDetailStatements(types, true)]),
+);
+
+/** One bulk row, tagged with the object it belongs to. */
+type OfObject<T> = T & { object_name: string };
+
+/** The rows of one bulk read, grouped by the object they describe. */
+function groupByObject<T extends { object_name: string }>(rows: readonly T[]): Map<string, T[]> {
+  const grouped = new Map<string, T[]>();
+  for (const row of rows) {
+    const existing = grouped.get(row.object_name);
+    if (existing === undefined) grouped.set(row.object_name, [row]);
+    else existing.push(row);
+  }
+  return grouped;
+}
+
+// ----------------------------------------------------------------------------
+// Object source reading (#789 Phase 2)
+// ----------------------------------------------------------------------------
+
+/**
+ * The one statement that answers every kind's definition, on the simplest source story in
+ * the fleet.
+ *
+ * `sqlite_schema` holds one row per object and `sql` is the text the AUTHOR submitted, so
+ * there is nothing to regenerate and nothing to assemble: one column, two binds, four kinds.
+ *
+ * BOTH BINDS ARE PARAMETERS and no identifier is ever interpolated, which is why this
+ * provider needs no escaper for the source read at all. `type` is taken from the KIND
+ * through `SOURCE_CATALOG_TYPES` and never from what the name happens to match, and that is
+ * a behavioural requirement rather than a stylistic one: a trigger may share a name with a
+ * table (measured on SQLite 3.53.2, where `CREATE INDEX` and `CREATE VIEW` under an existing
+ * table's name are both refused and `CREATE TRIGGER` is not), so `WHERE name = ?` alone
+ * answers TWO rows for `audit_log` with the table's first. The fixture holds exactly that
+ * object so the rule is exercised rather than asserted (standing ruling 5a).
+ *
+ * UNQUALIFIED `sqlite_schema` RESOLVES TO `main.sqlite_schema` even with a database
+ * ATTACHed, measured the same way the listing statements' comment records. This provider
+ * declares no container level, so `main` is the only database it addresses and there is no
+ * schema bind to add; the provider doc says so rather than leaving a reader to wonder what
+ * happens under `ATTACH`.
+ */
+const OBJECT_SOURCE_SQL = `
+      SELECT s.sql AS sql
+        FROM sqlite_schema AS s
+       WHERE s.type = ?
+         AND s.name = ?
+    `;
+
+/**
+ * Which `sqlite_schema.type` value belongs to which declared KIND.
+ *
+ * A map rather than the kind id used directly, even though the four spellings coincide
+ * today. The kind id is this provider's own declaration and the type value is the engine's
+ * catalog vocabulary; writing one where the other is meant is how a renamed kind would
+ * silently start reading the wrong rows. A VIRTUAL table is typed `table` here, which is why
+ * the `table` kind covers the FTS5 object the listing takes from `PRAGMA table_list`.
+ */
+const SOURCE_CATALOG_TYPES: Readonly<Record<string, string>> = {
+  table: "table",
+  view: "view",
+  index: "index",
+  trigger: "trigger",
+};
+
+/** One row of `OBJECT_SOURCE_SQL`: the stored text, or NULL. */
+interface ObjectSourceRow {
+  sql: string | null;
+}
+
+/**
+ * Which of the three ways a source row can carry no definition this row is.
+ *
+ * THEY ARE THREE DIFFERENT FACTS and one sentence cannot be true of all three, which is why
+ * the shape is decided here rather than folded into a single `=== null || .trim() === ""`
+ * test. `absent` is a row that does not carry the column this provider asked for, which is a
+ * defect in THIS READ; `null` is the engine's own stored NULL; `blank` is a column holding a
+ * text with nothing in it.
+ *
+ * `Object.hasOwn` and not `row.sql === undefined`, because the two are distinguishable and
+ * the distinction is the whole point: `bun:sqlite` builds a row object out of the columns the
+ * reply actually carried, so a statement whose alias was changed answers a row with no `sql`
+ * key at all.
+ */
+type BlankDefinitionShape = "absent" | "null" | "blank";
+
+function blankDefinitionShape(row: ObjectSourceRow): BlankDefinitionShape {
+  if (!Object.hasOwn(row, "sql")) return "absent";
+  return typeof row.sql === "string" ? "blank" : "null";
+}
+
+/**
+ * The sentence a row carrying no definition is refused with, ONE PER SHAPE.
+ *
+ * OURS rather than the engine's, and that is the exception `docs/providers/sqlite.md`
+ * records: SQLite supplies no sentence at all for any of these, it simply stores NULL. The
+ * MySQL provider writes its own sentence for the same reason and for the same shape, a row
+ * whose definition column is empty.
+ *
+ * THREE SENTENCES BECAUSE THERE ARE THREE CAUSES, and a refusal that states a cause which is
+ * false for the shape in front of it is worse than one that states none. "The engine stores
+ * NULL there only for an index it created for itself" is TRUE of a stored NULL and FALSE of
+ * the other two: the absent-column shape is this provider asking for a column the reply does
+ * not carry, and sending its reader to the listing filter would send them away from the
+ * statement that is actually wrong.
+ *
+ * NOTHING THE LISTINGS PRODUCE CAN REACH THE NULL SHAPE. `sql` is NULL for exactly one kind
+ * of object, an index SQLite created for itself (`sqlite_autoindex_<table>_<n>`), and every
+ * listing and every count here carries `name NOT LIKE 'sqlite\\_%' ESCAPE '\\'`, so no path
+ * the tree offers addresses such a row. The arm exists anyway, because an empty definition
+ * must never reach an editor as a definition: this is what the read would say if it ever
+ * started producing one.
+ */
+function blankDefinitionReason(shape: BlankDefinitionShape, kind: string, name: string): string {
+  const opening = `SQLite answered a row for the ${kind} "${name}"`;
+  if (shape === "absent") {
+    return (
+      `${opening} with no sqlite_schema.sql column at all. That is a fact about this read and ` +
+      "not about the object: the statement asks for one column and the reply does not carry it."
+    );
+  }
+  if (shape === "blank") {
+    return (
+      `${opening} whose sqlite_schema.sql holds no non-whitespace character. An empty ` +
+      "definition is not a definition, so it is refused rather than opened in an editor, and " +
+      "the engine supplies no sentence of its own for this."
+    );
+  }
+  return (
+    `${opening} whose sqlite_schema.sql is NULL. The engine stores NULL there only for an ` +
+    "index it created for itself, and it supplies no sentence of its own for this."
+  );
+}
+
+/** Which statement lists one kind, and what it binds. */
+const OBJECT_LISTINGS: Readonly<Record<string, { readonly sql: string; readonly params: readonly unknown[] }>> = {
+  table: { sql: LIST_TABLES_SQL, params: [MAIN_SCHEMA] },
+  view: { sql: LIST_VIEWS_SQL, params: [MAIN_SCHEMA] },
+  index: { sql: LIST_INDEXES_SQL, params: [] },
+  trigger: { sql: LIST_TRIGGERS_SQL, params: [] },
+};
+
+/**
+ * Where one listed object is addressed.
+ *
+ * Built from the CONTAINER and the ROW rather than from the kind id, so the four listing
+ * statements share one rule: a `parent` column adds a nesting segment and nothing else
+ * does, which is what the `attachedTo: "table"` declaration states. The container path is
+ * prefixed rather than assumed empty, so every path starts with its container even though
+ * SQLite's container path is always `[]` - the conformance helper asserts exactly that,
+ * and writing `[row.name]` here would be a second place that knows this engine's depth.
+ *
+ * A trigger's parent is `sqlite_schema.tbl_name`, which is never null for a trigger, so
+ * there is no parentless shape to collapse. It is not always a TABLE: SQLite allows an
+ * INSTEAD OF trigger on a VIEW and `tbl_name` then names the view. `attachedTo` names the
+ * kind a trigger usually hangs off, and the count and the listing both carry the view case
+ * rather than one of them dropping it (standing ruling 5f).
+ */
+function objectPath(container: readonly string[], row: ObjectRow): string[] {
+  const parent = row.parent;
+  if (parent === undefined || parent === null) return [...container, row.name];
+  return [...container, parent, row.name];
+}
+
+/**
+ * The VALUE a column defaults to, read out of the catalog text (#1029). SQLite reports a
+ * default as the expression AS WRITTEN, so a string default arrives as the quoted literal
+ * `'abc'`. `unquoteLiteral` decodes exactly one complete literal with this dialect's
+ * escaping and answers `undefined` for anything else, which is what lets a number such as
+ * `42` or an expression such as `CURRENT_TIMESTAMP` through unchanged. The text itself is
+ * kept alongside as `defaultExpression`, because once decoded this is no longer something
+ * that can be pasted after the word DEFAULT.
+ */
+function readCatalogDefault(raw: string | null | undefined): string | undefined {
+  return raw === null || raw === undefined ? undefined : (unquoteLiteral(raw, "sqlite") ?? raw);
+}
+
+/**
+ * ONE object's detail, from rows, for BOTH the single read and the bulk read (#789).
+ *
+ * One mapper and not two, because two are two chances for `describeObjects` to spell a
+ * column, an index or a foreign key differently from `describeObject` over the same
+ * table, and nothing downstream compares the two answers. Everything this function needs
+ * is on the rows, so the two callers differ only in which statement produced them: the
+ * single read binds one object name, the bulk read joins the same pragmas against a
+ * target set.
+ */
+function objectDetailFromRows(path: readonly string[], rows: ObjectDetailRows): ObjectDetail {
+  const keyColumns = new Map<string, string[]>();
+  for (const row of rows.indexColumns) {
+    // An index on an EXPRESSION publishes a null column name (`cid = -2`), and so does one
+    // that keys the rowid. Those are not columns of this object, so they are left out
+    // rather than rendered as a fabricated label; the index itself still appears, with an
+    // empty column list.
+    if (row.name === null) continue;
+    const existing = keyColumns.get(row.index_name);
+    if (existing === undefined) keyColumns.set(row.index_name, [row.name]);
+    else existing.push(row.name);
+  }
+
+  return {
+    path: [...path],
+    columns: rows.columns.map((row) => ({
+      name: row.name,
+      // `type` is the empty string on a virtual table's columns and on a column declared
+      // with no type at all, which SQLite allows. `getSchema()` spells that absence
+      // "TEXT", which is a guess about affinity; the empty string is what the engine said.
+      type: row.type ?? "",
+      nullable: row.notnull === 0,
+      // `pk` is a 1-BASED RANK and not a flag: a composite primary key answers 1 and 2,
+      // so `=== 1` reports the second key column as ordinary. Measured on
+      // `PRIMARY KEY (region, year)`.
+      isPrimary: row.pk > 0,
+      defaultValue: readCatalogDefault(row.dflt_value),
+      defaultExpression: row.dflt_value ?? undefined,
+    })),
+    indexes: rows.indexes.map((row) => ({
+      name: row.name,
+      columns: keyColumns.get(row.name) ?? [],
+      unique: row.unique === 1,
+    })),
+    foreignKeys: rows.foreignKeys.map((row) => ({
+      columnName: row.from,
+      // A bare name, never qualified: SQLite resolves a foreign key's parent inside the
+      // same database, so there is no cross-schema case to spell.
+      referencedTable: row.table,
+      referencedColumn: row.to ?? row.parent_key ?? "",
+    })),
+  };
+}
+
+// ============================================================================
+// A database file this process cannot write (the test itself, shared with DuckDB, is
+// `isUnwritableExistingFile` in db/utils/unwritable-file.ts)
+// ============================================================================
+
+/** SQLite's SQLITE_READONLY refusal, in the words both drivers raise it with. */
+/** The files SQLite keeps beside a database file: its rollback journal and its WAL pair. */
+const SQLITE_SIDECAR_SUFFIXES = ["-journal", "-wal", "-shm"] as const;
+
+function isReadOnlyWriteError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("attempt to write a readonly database");
+}
+
+/**
+ * True when the file's header says WAL journal mode: bytes 18 and 19, the file format
+ * write and read versions, are 2 in WAL mode and 1 under a rollback journal
+ * (https://www.sqlite.org/fileformat2.html#file_format_version_numbers). SQLite's own
+ * words for a refused WAL file differ by build (SQLITE_READONLY from the library bundled
+ * on Linux, SQLITE_CANTOPEN from Apple's, or with a `-wal` left and no `-shm`), so the
+ * header is what says the refusal is about WAL. It is read only to explain a refusal
+ * already raised: a file this process cannot read answers false, and that refusal keeps
+ * SQLite's words alone. The read never waits: a FIFO renamed onto the path since connect()
+ * checked it is refused rather than read on the server's own thread (`readRegularFileStart`).
+ */
+function isWalModeFile(dbPath: string): boolean {
+  const header = readRegularFileStart(dbPath, 20);
+  return header !== null && header.length === 20 && header[18] === 2 && header[19] === 2;
+}
 
 // ============================================================================
 // Agent read-only execution profile (#328)
@@ -211,15 +978,15 @@ export interface SQLiteTableSizeBytes {
  * right - but a test that reads the driver's name to predict which arm it is on is
  * reading the wrong thing.
  */
-export function readDbstatSizes(db: SQLiteDatabase): Map<string, SQLiteTableSizeBytes> | null {
-  let pages: { name: string; bytes: number }[];
-  try {
-    pages = db.prepare(DBSTAT_SIZES_SQL).all() as { name: string; bytes: number }[];
-  } catch {
-    return null;
-  }
-
-  const owners = db.prepare(DBSTAT_INDEX_OWNERS_SQL).all() as { name: string; tbl_name: string }[];
+/**
+ * Turn the two `dbstat` reads into per-table sizes. Shared by the in-process
+ * handle (`readDbstatSizes`) and the worker handle (`getTableStats`), so the two
+ * paths cannot disagree about how an index's pages are attributed.
+ */
+function buildDbstatSizes(
+  pages: readonly { name: string; bytes: number }[],
+  owners: readonly { name: string; tbl_name: string }[],
+): Map<string, SQLiteTableSizeBytes> {
   const bytesByObject = new Map(pages.map((page) => [page.name, Number(page.bytes) || 0]));
   const indexNames = new Set(owners.map((owner) => owner.name));
   const sizes = new Map<string, SQLiteTableSizeBytes>();
@@ -242,6 +1009,75 @@ export function readDbstatSizes(db: SQLiteDatabase): Map<string, SQLiteTableSize
   }
 
   return sizes;
+}
+
+export function readDbstatSizes(db: SQLiteDatabase): Map<string, SQLiteTableSizeBytes> | null {
+  let pages: { name: string; bytes: number }[];
+  try {
+    pages = db.prepare(DBSTAT_SIZES_SQL).all() as { name: string; bytes: number }[];
+  } catch {
+    return null;
+  }
+
+  const owners = db.prepare(DBSTAT_INDEX_OWNERS_SQL).all() as { name: string; tbl_name: string }[];
+  return buildDbstatSizes(pages, owners);
+}
+
+/**
+ * Read one row-returning statement's result: the rows keyed by column names that are
+ * non-empty and unique, and the declared types keyed by the same names.
+ *
+ * The rows are read as arrays (`values()`) and keyed by position, because a row read keyed
+ * by name keeps one value per name: `SELECT 1 AS a, 2 AS a` answered `{ a: 2 }` on both
+ * drivers, a join projecting `id` from two tables lost the first table's id, and
+ * `SELECT 1 AS ""` answered a column named "", which no grid column can take. The names are
+ * the declared column names through `uniqueFieldNames`, so those come back as `a` and
+ * `a (2)`, and as `(No column name)`. A column with no alias keeps the name SQLite gives it,
+ * its expression text (`4 + 5`), so SQLite itself never declares an empty name unasked.
+ *
+ * Declared types travel with the result (#273), and are read AFTER the rows because
+ * bun:sqlite refuses the question until the statement has run - see
+ * `SQLiteStatement.declaredColumns`, where both drivers were measured. Each type is paired
+ * with its column by position, so a repeated name keeps its own type too.
+ * `declaredColumnTypes` omits the key entirely when nothing was declared, which is the
+ * common case here rather than a failure: SQLite declares nothing for a computed column,
+ * a literal, an aggregate or any PRAGMA.
+ *
+ * An empty result still names its columns, because they come from the statement rather
+ * than from a first row.
+ */
+/**
+ * Read one row-returning statement's raw values and declared columns, before any
+ * result shaping. The values keep the driver's own conversion (64-bit integers as
+ * numbers when lossless and decimal strings otherwise, BLOBs as `Buffer`), because
+ * the shaping below must see exactly what the in-process driver hands out.
+ */
+function readStatementRows(
+  stmt: SQLiteStatement,
+  params: readonly unknown[],
+): { values: unknown[][]; columns: readonly SQLiteDeclaredColumn[] } {
+  const values = stmt.values(...params);
+  const columns = stmt.declaredColumns();
+  return { values, columns };
+}
+
+/**
+ * Turn raw values and declared columns into a shaped result: columns keyed by
+ * non-empty, unique names and the declared types paired with those names. Shared
+ * by the in-process path and the worker path, so one can never name a column
+ * differently from the other (see `readResultRows`'s former contract).
+ */
+function assembleResult(
+  values: readonly (readonly unknown[])[],
+  columns: readonly SQLiteDeclaredColumn[],
+  sql: string,
+): { rows: Record<string, unknown>[]; fields: string[]; declared: Pick<QueryResult, "columnTypes"> } {
+  const fields = uniqueFieldNames(columns.map(([name]) => name));
+  return {
+    rows: keyRowsByPosition(fields, values, "sqlite", sql),
+    fields,
+    declared: declaredColumnTypes(columns.map(([, type], index) => [fields[index], type] as const)),
+  };
 }
 
 /**
@@ -279,10 +1115,79 @@ export function buildTableStats(tableName: string, rowCount: number, size: SQLit
 // SQLite Provider
 // ============================================================================
 
+/**
+ * The in-process handle, used only for `:memory:` databases, which a child process
+ * cannot share. It wraps the existing `SQLiteDatabase` surface behind the same
+ * `SQLiteHandle` contract the worker implements, so the provider has one way to
+ * run a statement.
+ */
+class DirectSQLiteHandle implements SQLiteHandle {
+  constructor(private readonly db: SQLiteDatabase) {}
+
+  async exec(sql: string): Promise<void> {
+    this.db.exec(sql);
+  }
+
+  async all(sql: string, params?: readonly unknown[]): Promise<unknown[]> {
+    return this.db.prepare(sql).all(...(params ?? []));
+  }
+
+  async get(sql: string, params?: readonly unknown[]): Promise<unknown> {
+    return this.db.prepare(sql).get(...(params ?? [])) ?? null;
+  }
+
+  async queryRows(
+    sql: string,
+    params: readonly unknown[],
+    _timeoutMs?: number,
+    _queryId?: string,
+  ): Promise<SQLiteRawRead> {
+    const stmt = this.db.prepare(sql);
+    if (stmt.returnsRows()) {
+      const { values, columns } = readStatementRows(stmt, params);
+      return { values, columns, returnsRows: true, changes: 0 };
+    }
+    // `changes` is `sqlite3_changes()`, which a statement that changes no row leaves as the
+    // previous write set it, so node:sqlite handed a DDL statement that count. If
+    // `total_changes()` did not move, the statement changed no row. The worker's `query`
+    // does the same.
+    const before = this.totalChanges();
+    const info = params.length > 0 ? stmt.run(...params) : stmt.run();
+    const changes = this.totalChanges() === before ? 0 : info.changes;
+    return { values: [], columns: [], returnsRows: false, changes };
+  }
+
+  private totalChanges(): number {
+    const row = this.db.prepare("SELECT total_changes() AS n").get() as { n: number | bigint };
+    return Number(row.n);
+  }
+
+  async inTransaction(): Promise<boolean> {
+    return this.db.inTransaction;
+  }
+
+  async close(): Promise<void> {
+    this.db.close(true);
+  }
+}
+
 export class SQLiteProvider extends SQLBaseProvider {
   private db: SQLiteDatabase | null = null;
+  /** The worker-owned handle for on-disk databases; null for `:memory:`. */
+  private worker: SQLiteWorkerClient | null = null;
+  /** The one handle every statement runs through: in-process for `:memory:`, worker for files. */
+  private handle: SQLiteHandle | null = null;
+  /** The caller's own ids for statements in flight, so `cancelQuery` can tell "running" from "already done". */
+  private readonly runningQueryIds = new Set<string>();
+  /** The open-time facts, kept so a killed worker can be restarted with the same handle. */
+  private workerOpen: SQLiteWorkerOpen | null = null;
+  /** The one in-flight restart, so concurrent statements after a kill share one child. */
+  private startingWorker: Promise<SQLiteWorkerClient> | null = null;
   /** True when this instance was opened under the agent read-only profile. */
   private readonly readOnlyProfile: boolean;
+  private readonly denyExternalAccess: boolean;
+  /** The file's path when the editor opened it read-only because this process cannot write it; else null. */
+  private unwritableFilePath: string | null = null;
 
   constructor(config: DatabaseConnection, options: ProviderOptions = {}, execution: ProviderExecutionContext = {}) {
     super(config, options);
@@ -290,6 +1195,7 @@ export class SQLiteProvider extends SQLBaseProvider {
     // path builds providers from caller-supplied ProviderOptions, which has no
     // route to this flag in either direction.
     this.readOnlyProfile = execution.readOnly === true;
+    this.denyExternalAccess = execution.allowExternalFileAccess === false;
     this.validate();
   }
 
@@ -301,13 +1207,26 @@ export class SQLiteProvider extends SQLBaseProvider {
     return {
       ...super.getCapabilities(),
       defaultPort: null,
+      readsFileAccessPosture: true,
       supportsExplain: true,
       explainFormat: "sqlite-queryplan",
       supportsConnectionString: false,
       supportsInlineRowEdit: true,
+      // The Create Table form's grammar: `INTEGER PRIMARY KEY AUTOINCREMENT` and the five affinities (#1822).
+      createTable: SQLITE_CREATE_TABLE,
+      // The Generate Test Data dialog's multi-row `INSERT INTO ... VALUES` (#1468).
+      supportsTestDataGeneration: true,
+      // `LIMIT n OFFSET m`, applied by the shared limiter in `SQLBaseProvider.prepareQuery`.
+      supportsResultPagination: true,
       // SQLite HAS transactions; this provider holds no session for one, so
       // POST /api/db/transaction refuses the call and the controls stay hidden.
       supportsTransactions: false,
+      // On-disk statements run in a child process and can be cancelled; `:memory:` stays
+      // on the server thread because a child process cannot share it (#1364, #1623). With
+      // the worker turned off (`LIBREDB_SQLITE_WORKER=0`) on-disk statements fall back to
+      // the synchronous driver, so the server-blocking and cancel facts both flip back.
+      blocksServerWhileRunning: this.isMemoryDatabase() || !this.shouldUseWorker(),
+      supportsQueryCancel: !this.isMemoryDatabase() && this.shouldUseWorker(),
       maintenanceOperations: ["vacuum", "analyze", "reindex", "check"],
       // `VACUUM` rewrites the whole database file and takes no object at all, and
       // `PRAGMA integrity_check` reads the whole file the same way - `runMaintenance`
@@ -320,6 +1239,11 @@ export class SQLiteProvider extends SQLBaseProvider {
         reindex: { label: "Reindex Table", perEntity: true, global: true },
         check: { label: "Integrity Check", perEntity: false, global: true },
       },
+      containerLevels: [],
+      // `exact` over no level: the empty path is the only address, so any segment at all is a
+      // caller holding another engine's model. Read through `acceptedContainerShapes()` (#1147).
+      containerPathShapes: "exact",
+      objectKinds: SQLITE_OBJECT_KINDS,
     };
   }
 
@@ -361,40 +1285,87 @@ export class SQLiteProvider extends SQLBaseProvider {
   // ============================================================================
 
   public async connect(): Promise<void> {
-    if (this.db) {
+    if (this.db || this.worker) {
       return;
     }
 
-    try {
-      // Dynamically load the runtime-appropriate SQLite driver
-      const SQLiteDB = await loadSQLiteDriver();
+    if (this.denyExternalAccess) {
+      throw new DatabaseConfigError(
+        "SQLite connections require an administrator because this driver cannot confine statement-level file access",
+        "sqlite",
+      );
+    }
 
-      const dbPath = this.getDatabasePath();
+    try {
+      const dbPath = this.getDatabasePath(true);
+
+      // Before any of the three opens below: a read-only open of a FIFO waits for a writer that
+      // never comes, and SQLite reported a connection to a character device. Its sidecars too:
+      // SQLite opens a `-journal` beside the database read-only to see whether it is hot.
+      if (dbPath !== ":memory:") assertRegularFilesOrMissing(dbPath, SQLITE_SIDECAR_SUFFIXES);
 
       if (this.readOnlyProfile) {
-        this.connectReadOnly(SQLiteDB, dbPath);
+        await this.connectReadOnly(dbPath);
         return;
       }
 
-      if (dbPath !== ":memory:") {
-        const dir = path.dirname(dbPath);
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true });
-        }
+      if (dbPath === ":memory:") {
+        // A child process cannot share the in-memory database, so `:memory:` stays on
+        // this thread with the synchronous driver it always used (K3).
+        const SQLiteDB = await loadSQLiteDriver();
+        this.db = new SQLiteDB(dbPath, { create: true, readwrite: true });
+        this.db.exec("PRAGMA foreign_keys = ON");
+        this.db.exec("PRAGMA journal_mode = WAL");
+        this.db.exec("PRAGMA synchronous = NORMAL");
+        this.setConnected(true);
+        return;
       }
 
-      this.db = new SQLiteDB(dbPath, {
-        create: true,
-        readwrite: true,
-      });
+      if (isUnwritableExistingFile(dbPath)) {
+        await this.connectUnwritableFile(dbPath);
+        return;
+      }
 
-      // Enable WAL mode and foreign keys
-      this.db.exec("PRAGMA foreign_keys = ON");
-      this.db.exec("PRAGMA journal_mode = WAL");
-      this.db.exec("PRAGMA synchronous = NORMAL");
+      // One level at a time: Node's recursive mkdir never returns for a folder under /proc.
+      createMissingDirectories(path.dirname(dbPath));
 
+      if (this.shouldUseWorker()) {
+        this.workerOpen = { dbPath, readonly: false, queryOnly: false };
+        this.worker = await SQLiteWorkerClient.start(this.workerOpen);
+        this.handle = this.worker;
+      } else {
+        // The synchronous fallback: exactly the pre-worker open, so the test suite can
+        // exercise every on-disk behaviour without Bun's worker-process hang.
+        const SQLiteDB = await loadSQLiteDriver();
+        this.db = new SQLiteDB(dbPath, { create: true, readwrite: true });
+        this.db.exec("PRAGMA foreign_keys = ON");
+        this.db.exec("PRAGMA journal_mode = WAL");
+        this.db.exec("PRAGMA synchronous = NORMAL");
+      }
       this.setConnected(true);
     } catch (error) {
+      // The handle is opened before the pragmas run, so a failure past that line
+      // leaves this holding the user's file: the ordinary case is a connection that
+      // points at something which is not a SQLite database at all, where the open
+      // succeeds and `PRAGMA journal_mode` raises "file is not a database". Closing
+      // here for the reason disconnect() does: POSIX hides an unreleased handle,
+      // Windows does not, and a file the user picked by mistake would stay
+      // undeletable. Nulling it also keeps `connect()`'s own `if (this.db) return`
+      // from turning a retry into a silent no-op on a provider that is not connected.
+      //
+      // `finally`, because `close(true)` raises when SQLite cannot close, and a
+      // reference kept past that throw is exactly the silent no-op described above.
+      try {
+        // The worker's close kills the child after releasing the file; the in-process
+        // fallback's close(true) releases it immediately. Both may exist on a refused
+        // connect, so both are closed (file release, #1623).
+        await this.handle?.close();
+        this.db?.close(true);
+      } finally {
+        this.handle = null;
+        this.worker = null;
+        this.db = null;
+      }
       this.setError(error instanceof Error ? error : new Error(String(error)));
 
       // Typed refusals keep their own identity: wrapping them would strip the
@@ -403,11 +1374,51 @@ export class SQLiteProvider extends SQLBaseProvider {
         throw error;
       }
 
-      throw new ConnectionError(
-        `Failed to open SQLite database: ${error instanceof Error ? error.message : error}`,
-        "sqlite",
-      );
+      const reason = error instanceof Error ? error.message : String(error);
+      // The one read-only open SQLite refuses outright: see `connectUnwritableFile`.
+      const walHint =
+        this.unwritableFilePath !== null && isWalModeFile(this.unwritableFilePath)
+          ? `${this.unwritableFilePath} is open read-only because this process cannot write the file or its directory, and a file in WAL journal mode cannot be read without a -shm file beside it; switch it to a rollback journal (PRAGMA journal_mode = DELETE) where it is writable, or make its directory writable: `
+          : "";
+      throw new ConnectionError(`Failed to open SQLite database: ${walHint}${reason}`, "sqlite");
     }
+  }
+
+  /**
+   * Open, for the editor, an existing file this process cannot write: a read-only
+   * Docker mount, or a file owned by another user. The shared sequence above cannot
+   * open one at all, because `PRAGMA journal_mode = WAL` is a write (and WAL needs its
+   * `-wal` and `-shm` files beside the database), so every read used to fail with
+   * "attempt to write a readonly database".
+   *
+   * The handle is SQLite's own read-only open, without `create` and without the WAL
+   * pair, so reads work and a write is refused by the engine; `query()` names that
+   * refusal. `query_only` is NOT set: this is the editor, and the file's permissions
+   * are the boundary, not a profile.
+   *
+   * A file already in WAL journal mode, with no `-shm` file beside it, still cannot be
+   * opened when its directory is unwritable: SQLite reads one only with a `-shm` file
+   * beside it, and has nowhere to make one (measured on bun:sqlite and node:sqlite,
+   * 2026-09-26). `connect()` names that case, reading it from the file's header because
+   * SQLite words it differently by build (`isWalModeFile`).
+   */
+  private async connectUnwritableFile(dbPath: string): Promise<void> {
+    this.unwritableFilePath = dbPath;
+    logger.info(`[SQLite] Opening ${dbPath} read-only: this process cannot write the file or its directory`, {
+      provider: "sqlite",
+    });
+    if (this.shouldUseWorker()) {
+      this.workerOpen = { dbPath, readonly: true, queryOnly: false };
+      this.worker = await SQLiteWorkerClient.start(this.workerOpen);
+      this.handle = this.worker;
+    } else {
+      const SQLiteDB = await loadSQLiteDriver();
+      this.db = new SQLiteDB(dbPath, { readonly: true });
+      this.db.exec("PRAGMA foreign_keys = ON");
+      // A file in WAL mode fails here rather than at the open: SQLite opens its files lazily.
+      this.db.prepare("PRAGMA journal_mode").get();
+    }
+    this.setConnected(true);
   }
 
   /**
@@ -426,7 +1437,7 @@ export class SQLiteProvider extends SQLBaseProvider {
    * can only ever yield an empty one (node:sqlite) or fail (bun:sqlite), so
    * vending it would hand the agent a silently useless target.
    */
-  private connectReadOnly(SQLiteDB: Awaited<ReturnType<typeof loadSQLiteDriver>>, dbPath: string): void {
+  private async connectReadOnly(dbPath: string): Promise<void> {
     if (dbPath === ":memory:") {
       throw new ExecutionProfileError(
         "The agent read-only execution profile cannot target an in-memory SQLite database",
@@ -434,33 +1445,93 @@ export class SQLiteProvider extends SQLBaseProvider {
       );
     }
 
-    this.db = new SQLiteDB(dbPath, { readonly: true });
-    try {
-      this.enforceQueryOnly();
-    } catch (error) {
-      this.db.close();
-      this.db = null;
-      throw error;
+    if (this.shouldUseWorker()) {
+      this.workerOpen = { dbPath, readonly: true, queryOnly: true };
+      this.worker = await SQLiteWorkerClient.start(this.workerOpen);
+      this.handle = this.worker;
+      try {
+        await this.enforceQueryOnly();
+      } catch (error) {
+        // Released now, for the same reason disconnect() does it: a refused profile that
+        // left the file held open would be a lock on a database nobody is using.
+        try {
+          await this.handle.close();
+        } finally {
+          this.handle = null;
+          this.worker = null;
+        }
+        throw error;
+      }
+    } else {
+      const SQLiteDB = await loadSQLiteDriver();
+      this.db = new SQLiteDB(dbPath, { readonly: true });
+      try {
+        await this.enforceQueryOnly();
+      } catch (error) {
+        try {
+          this.db.close(true);
+        } finally {
+          this.db = null;
+        }
+        throw error;
+      }
     }
 
     this.setConnected(true);
   }
 
   /** Set `query_only` and refuse to continue unless it reads back enabled. */
-  private enforceQueryOnly(): void {
-    this.db!.exec(QUERY_ONLY_PRAGMA_SQL);
-    assertQueryOnlyEnabled(this.db!.prepare(QUERY_ONLY_READBACK_SQL).all());
+  private async enforceQueryOnly(): Promise<void> {
+    // Through `getHandle`, not `this.worker`: a deadline or a cancel kills the child,
+    // and the next statement must restart it before the PRAGMA runs (#1623).
+    const handle = await this.getHandle();
+    await handle.exec(QUERY_ONLY_PRAGMA_SQL);
+    assertQueryOnlyEnabled(await handle.all(QUERY_ONLY_READBACK_SQL));
   }
 
   public async disconnect(): Promise<void> {
-    if (this.db) {
-      this.db.close();
+    if (this.db || this.handle) {
+      // The worker's close kills the child after releasing the file, and the in-process
+      // close(true) releases the file immediately: either way a caller that has
+      // disconnected is entitled to delete, move or reopen the database.
+      if (this.db) await new DirectSQLiteHandle(this.db).close();
+      if (this.handle) {
+        // A running or queued statement is in flight: kill the child now instead of
+        // queueing a close behind it, so disconnect returns at once (#1623). An idle
+        // child still closes gracefully, which releases the file synchronously.
+        if (this.worker !== null && this.worker.hasWork()) this.worker.terminate();
+        else await this.handle.close();
+      }
+      this.handle = null;
       this.db = null;
+      this.worker = null;
       this.setConnected(false);
     }
   }
 
-  private getDatabasePath(): string {
+  /** Whether this connection targets an in-memory database, which a child process cannot share. */
+  private isMemoryDatabase(): boolean {
+    return this.getDatabasePath() === ":memory:";
+  }
+
+  /**
+   * Whether an on-disk connection runs in the child-process worker. The child is a
+   * `node` process, so it can only run `node:sqlite`: a forced `bun` driver
+   * (`LIBREDB_SQLITE_DRIVER=bun`, the test suite's way to exercise `bun:sqlite`)
+   * must stay in-process. `LIBREDB_SQLITE_WORKER=0` is the escape hatch for
+   * runtimes where the child cannot run at all.
+   */
+  private shouldUseWorker(): boolean {
+    if (this.isMemoryDatabase()) return false;
+    if (process.env.LIBREDB_SQLITE_DRIVER === "bun") return false;
+    const override = process.env.LIBREDB_SQLITE_WORKER;
+    if (override !== undefined) {
+      return !["0", "false", "no", "off"].includes(override.toLowerCase());
+    }
+    return true;
+  }
+
+  private getDatabasePath(checkReserved = false): string {
     let dbPath: string;
     if (this.config.connectionString) {
       dbPath = this.config.connectionString.startsWith("file:")
@@ -480,51 +1551,195 @@ export class SQLiteProvider extends SQLBaseProvider {
       throw new DatabaseConfigError("Invalid database path: NUL bytes are not allowed", "sqlite");
     }
 
-    return path.resolve(dbPath);
+    const resolved = path.resolve(dbPath);
+
+    // The server's own storage database is reserved: it is Studio's to manage, not a
+    // target a connection may open. A connection whose path resolves to it is refused
+    // here on connect, before any handle is opened. Metadata reads reuse the
+    // resolved path without repeating filesystem identity checks.
+    if (checkReserved && isReservedStoragePath(resolved)) {
+      throw new DatabaseConfigError(
+        "This path is reserved for the server's own storage and cannot be opened as a connection",
+        "sqlite",
+      );
+    }
+
+    return resolved;
   }
 
   // ============================================================================
   // Query Execution
   // ============================================================================
 
-  public async query(sql: string, params?: unknown[]): Promise<QueryResult> {
+  public async query(sql: string, params?: unknown[], queryId?: string): Promise<QueryResult> {
     this.ensureConnected();
 
     return this.trackQuery(async () => {
-      const { result, executionTime } = await this.measureExecution(async () => {
-        try {
-          const isSelect = this.isReadOnlyQuery(sql);
-
-          if (isSelect) {
-            const stmt = this.db!.prepare(sql);
-            const rows = params ? stmt.all(...params) : stmt.all();
-            const fields = rows.length > 0 ? Object.keys(rows[0] as object) : [];
-            return {
-              rows: (rows as unknown[]).map((row) => row as Record<string, unknown>) as Record<string, unknown>[],
-              fields,
-              changes: 0,
-            };
-          } else {
-            const stmt = this.db!.prepare(sql);
-            const info = params ? stmt.run(...params) : stmt.run();
+      if (queryId !== undefined) this.runningQueryIds.add(queryId);
+      try {
+        const { result, executionTime } = await this.measureExecution(async () => {
+          try {
+            const read = await (await this.getHandle()).queryRows(sql, params ?? [], this.queryTimeout, queryId);
+            // Routed on what SQLite compiled, not on the leading keyword: a statement with
+            // result columns is read for its rows, whatever it starts with. A keyword set
+            // missed WITH, VALUES and every `... RETURNING`, and `run()` dropped their rows.
+            if (read.returnsRows) {
+              return { ...assembleResult(read.values, read.columns, sql), changes: 0 };
+            }
             return {
               rows: [],
               fields: [],
-              changes: info.changes,
+              changes: read.changes,
+              // A write has no result columns at all - measured, both drivers answer an
+              // EMPTY column list after `run()` - so there is nothing to declare, and the
+              // key is left off exactly as `fields: []` leaves the names off.
+              declared: {},
             };
+          } catch (error) {
+            if (this.unwritableFilePath !== null && isReadOnlyWriteError(error)) {
+              throw new QueryError(
+                `SQLite database ${this.unwritableFilePath} is open read-only because this process cannot write the file or its directory: ${(error as Error).message}`,
+                "sqlite",
+                sql,
+              );
+            }
+            throw mapDatabaseError(error, "sqlite", sql);
           }
-        } catch (error) {
-          throw mapDatabaseError(error, "sqlite", sql);
-        }
-      });
+        });
 
-      return {
-        rows: result.rows,
-        fields: result.fields,
-        rowCount: result.rows.length || result.changes,
-        executionTime,
-      };
+        return {
+          rows: result.rows,
+          fields: result.fields,
+          rowCount: result.rows.length || result.changes,
+          executionTime,
+          ...result.declared,
+        };
+      } finally {
+        if (queryId !== undefined) this.runningQueryIds.delete(queryId);
+      }
     });
+  }
+
+  /**
+   * The handle to run statements on, restarting a killed worker if a cancel or a
+   * deadline ended it. `:memory:` returns the in-process handle.
+   */
+  private async getHandle(): Promise<SQLiteHandle> {
+    // `:memory:` derives its handle fresh from `this.db` on every call, so a test that
+    // swaps the in-process handle (see `interceptReads`) is seen by the next statement.
+    if (this.db) return new DirectSQLiteHandle(this.db);
+    if (this.handle === null) {
+      throw new DatabaseConfigError("Provider is not connected. Call connect() first.", "sqlite");
+    }
+    if (this.worker !== null && !this.worker.isAlive()) {
+      // The restarted worker opens the path again, and it may have been replaced since connect()
+      // checked it: a FIFO there held the read-only open, and this statement with it, for good.
+      try {
+        assertRegularFilesOrMissing(this.workerOpen!.dbPath, SQLITE_SIDECAR_SUFFIXES);
+      } catch (error) {
+        throw new ConnectionError(`Failed to open SQLite database: ${(error as Error).message}`, "sqlite");
+      }
+      // Single-flight: two statements racing to restart after a kill share one child,
+      // so a cancel followed by parallel queries leaves exactly one process (#1623).
+      this.startingWorker ??= SQLiteWorkerClient.start(this.workerOpen!);
+      try {
+        this.worker = await this.startingWorker;
+        this.handle = this.worker;
+      } finally {
+        this.startingWorker = null;
+      }
+    }
+    return this.handle;
+  }
+
+  /**
+   * Stop a running statement by killing the child that runs it (#1623). True only when
+   * a statement under that id was actually in flight; a finished or unknown id is false.
+   */
+  public async cancelQuery(queryId: string): Promise<boolean> {
+    if (!this.runningQueryIds.has(queryId)) return false;
+    this.runningQueryIds.delete(queryId);
+    const worker = this.worker;
+    if (worker !== null) {
+      if (worker.isRunning(queryId)) {
+        // The statement is the one the child executes now: preempt it by killing the child.
+        worker.terminate();
+      } else {
+        // Waiting behind another statement: drop it from the queue and leave the
+        // running statement alone (#1623).
+        worker.cancelQueued(queryId);
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Run one statement read with a PREEMPTIVE deadline. SQLite's drivers expose no
+   * interrupt, so the only way to stop an overrunning statement is to kill the child
+   * that runs it; the deadline here does that instead of waiting for the result (#1623).
+   */
+  private async runWithStatementTimeout<T>(fn: () => Promise<T>, timeoutMs: number, sql: string): Promise<T> {
+    return await new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.worker?.terminate();
+        reject(new QueryError(`Read-only execution exceeded the time budget: ${timeoutMs}ms allowed`, "sqlite", sql));
+      }, timeoutMs);
+      fn().then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  /**
+   * End a transaction a statement left open on this handle (D71).
+   *
+   * SQLite states it itself: `sqlite3_get_autocommit` is published by both drivers this
+   * provider runs on (bun:sqlite `inTransaction`, node:sqlite `isTransaction`, bridged in
+   * `sqlite-driver.ts`), so the question is answered without a round trip and without
+   * reading the statement text. Reading the text was never an option: the transaction can
+   * be opened by a `BEGIN` inside a form no splitter sees through, and the leak is the
+   * missing rollback, not the keyword.
+   *
+   * The ask is separate from the act here, unlike DuckDB, because SQLite answers it. It
+   * matters: measured on bun:sqlite 1.4.2, `ROLLBACK` with no transaction active throws
+   * "cannot rollback - no transaction is active", so a route that rolled back
+   * unconditionally would report an error on every script that ended cleanly.
+   *
+   * Discarding rather than committing is argued at `OpenQueryTransactionOutcome`. On this
+   * engine the cost of NOT doing it was measured on 2026-09-13: the provider holds ONE
+   * handle, so the next user's INSERT joined the abandoned transaction, answered HTTP 200
+   * and read its own row back, while `sqlite3` in another process saw nothing and a second
+   * writer was refused with "database is locked".
+   *
+   * THE `scope` PARAMETER IS DECLARED ON THE INTERFACE AND IGNORED HERE, deliberately (D87). It
+   * exists so a provider that borrows a DIFFERENT pooled client per call can name the one the
+   * caller's own statements ran on; this provider holds ONE handle for its whole life, so
+   * there is no other client to name. A signature that took it and did nothing with it would only
+   * suggest the question had been considered per call, which it has not.
+   *
+   * WHAT THAT DOES NOT MEAN: that the transaction ended here is the caller's own. One handle shared by every
+   * request on this stored connection is what makes another request's transaction REACHABLE, not
+   * what puts it out of reach: `getOrCreateProvider` caches this provider per `connection.id` for
+   * the whole process, which is the same sharing the paragraph above measured from the other side.
+   * `inTransaction` reports the handle's state, not who opened it, so a request whose own
+   * statements left nothing open still rolls back a concurrent request's `BEGIN`. That is the D87
+   * shape on a single connection and it is NOT closed: closing it needs the transaction owned by a
+   * scope rather than by a client, which is a design change and not a parameter.
+   */
+  public async endOpenQueryTransaction(): Promise<OpenQueryTransactionOutcome> {
+    this.ensureConnected();
+
+    if (!(await (await this.getHandle()).inTransaction())) return "none";
+
+    await (await this.getHandle()).exec("ROLLBACK");
+    return "rolled-back";
   }
 
   /**
@@ -557,25 +1772,42 @@ export class SQLiteProvider extends SQLBaseProvider {
     // Per statement, not just at open: the profiled provider is pooled and
     // reused, so a previous statement's `PRAGMA query_only = false` would
     // otherwise persist for every later call on this connection.
-    this.enforceQueryOnly();
+    await this.enforceQueryOnly();
 
     return this.trackQuery(async () => {
-      const { result, executionTime } = await this.measureExecution(async () => {
+      const {
+        result: { rows, fields, declared },
+        executionTime,
+      } = await this.measureExecution(async () => {
         try {
-          return this.db!.prepare(sql).all() as Record<string, unknown>[];
+          // The budgets below are checked on the rows either way, so a result refused for
+          // being too large carries its types no further than it carries its rows. The
+          // deadline is preemptive: an overrunning statement kills the child (#1623).
+          //
+          // The handle is captured BEFORE the deadline timer starts. If the timer fired
+          // first and `fn` resolved a fresh handle, it would restart the very statement
+          // the deadline just refused — that restart runs with no budget, and the next
+          // disconnect hangs waiting for a close it can never answer.
+          const handle = await this.getHandle();
+          const read = await this.runWithStatementTimeout(
+            () => handle.queryRows(sql, []),
+            budget.statementTimeoutMs,
+            sql,
+          );
+          return assembleResult(read.values, read.columns, sql);
         } catch (error) {
           throw mapDatabaseError(error, "sqlite", sql);
         }
       });
 
-      if (result.length > budget.maxResultRows) {
+      if (rows.length > budget.maxResultRows) {
         throw new QueryError(
-          `Read-only execution exceeded the row budget: ${result.length} rows > ${budget.maxResultRows} allowed`,
+          `Read-only execution exceeded the row budget: ${rows.length} rows > ${budget.maxResultRows} allowed`,
           "sqlite",
           sql,
         );
       }
-      const resultBytes = measureResultBytes(result);
+      const resultBytes = measureResultBytes(rows);
       if (resultBytes > budget.maxResultBytes) {
         throw new QueryError(
           `Read-only execution exceeded the byte budget: ${resultBytes} bytes > ${budget.maxResultBytes} allowed`,
@@ -583,11 +1815,12 @@ export class SQLiteProvider extends SQLBaseProvider {
           sql,
         );
       }
-      // SQLite has no transaction-local statement timeout, and neither adapter
-      // exposes sqlite3_interrupt or a progress handler, so the budget's
-      // timeout is a post-execution deadline: an overrunning statement is not
-      // preempted, but its result is refused rather than returned as if it had
-      // been within budget. Recorded as such in docs/providers/sqlite.md.
+      // With the child-process worker the deadline above is preemptive: an overrunning
+      // statement is killed and its promise rejects before this check. Under the
+      // synchronous fallback (`:memory:`, or `LIBREDB_SQLITE_WORKER=0`) there is no
+      // interrupt to call, so the timeout is a post-execution deadline there: the
+      // statement is not preempted, but its result is refused rather than returned as
+      // if it had been within budget.
       if (executionTime > budget.statementTimeoutMs) {
         throw new QueryError(
           `Read-only execution exceeded the time budget: ${executionTime}ms > ${budget.statementTimeoutMs}ms allowed`,
@@ -597,10 +1830,11 @@ export class SQLiteProvider extends SQLBaseProvider {
       }
 
       return {
-        rows: result,
-        fields: result.length > 0 ? Object.keys(result[0]) : [],
-        rowCount: result.length,
+        rows,
+        fields,
+        rowCount: rows.length,
         executionTime,
+        ...declared,
       };
     });
   }
@@ -609,105 +1843,461 @@ export class SQLiteProvider extends SQLBaseProvider {
   // Schema Operations
   // ============================================================================
 
-  public async getSchema(): Promise<TableSchema[]> {
+  // ============================================================================
+  // Object surface (#789)
+  // ============================================================================
+
+  /**
+   * No containers, because SQLite has no container level.
+   *
+   * `[]` is the ENGINE answering, not a refusal and not a gap: a SQLite connection opens
+   * one database file and every object in it is addressed by a bare name. The tree reads
+   * `containerDepth()` off the same declaration, sees 0, and draws the kind folders at the
+   * root under the empty container path; `enumerateContainers()` in
+   * `src/lib/api/object-route.ts` answers `[[]]` for the same engines. Inventing a
+   * synthetic `main` container to make the shape match the engines that do have a
+   * container level, such as PostgreSQL's schemas, would put a row in the tree that
+   * names nothing a user can act on.
+   *
+   * Takes no `parent`, which the optional interface parameter allows: there is no level
+   * for one to name, so accepting and ignoring it would be the same answer written twice.
+   */
+  public async listContainers(): Promise<Container[]> {
     this.ensureConnected();
+    return [];
+  }
 
-    const tablesStmt = this.db!.prepare(SCHEMA_TABLES_SQL);
-    const tables = tablesStmt.all() as { name: string }[];
+  /**
+   * How many objects of each declared kind the file holds, in one statement.
+   *
+   * Three outcomes, and the type keeps all three apart. A kind the GROUP BY answered for
+   * carries its count. A kind it did not carries `{ count: 0 }`, because it was seeded
+   * before the read. A kind whose read was refused carries SQLite's own sentence, so the
+   * object browser can say why a folder has no number instead of showing a zero nobody
+   * measured. The refusal is a real case rather than a defensive arm: `PRAGMA table_list`
+   * arrived in SQLite 3.37, and a build below it answers "no such table:
+   * pragma_table_list" for every kind at once, which is why one failure covers all four.
+   *
+   * The container path is checked BEFORE the read and raises, because a path of the wrong
+   * shape is a caller mistake and not something the engine refused.
+   */
+  public async countObjects(container: readonly string[]): Promise<Record<string, KindCount>> {
+    this.ensureConnected();
+    const capabilities = this.getCapabilities();
+    assertContainerPath(capabilities, container);
+    const declared = declaredKinds(capabilities);
+    const counts = seedZeroCounts(declared);
 
-    const schemas: TableSchema[] = [];
+    try {
+      applyKindCounts(counts, (await (await this.getHandle()).all(COUNTS_SQL, [MAIN_SCHEMA])) as KindCountRow[]);
+      return counts;
+    } catch (error) {
+      return unavailableCounts(
+        declared.map((kind) => kind.id),
+        error,
+      );
+    }
+  }
 
-    for (const { name: tableName } of tables) {
-      const countStmt = this.db!.prepare(`SELECT COUNT(*) as count FROM "${tableName}"`);
-      const countResult = countStmt.get() as { count: number };
-      const rowCount = countResult?.count || 0;
+  /** One object-surface read, mapped against THE STATEMENT SQLITE RECEIVED. */
+  private async runObjectQuery<T>(sql: string, params: readonly unknown[]): Promise<T[]> {
+    try {
+      return (await (await this.getHandle()).all(sql, params)) as T[];
+    } catch (error) {
+      throw mapDatabaseError(error, "sqlite", sql);
+    }
+  }
 
-      const columnsStmt = this.db!.prepare(`PRAGMA table_info("${tableName}")`);
-      const columns = columnsStmt.all() as SQLiteColumnInfoRow[];
-
-      const fkStmt = this.db!.prepare(`PRAGMA foreign_key_list("${tableName}")`);
-      const foreignKeys = fkStmt.all() as SQLiteForeignKeyRow[];
-
-      const indexStmt = this.db!.prepare(`PRAGMA index_list("${tableName}")`);
-      const indexList = indexStmt.all() as SQLiteIndexListRow[];
-
-      const indexes = [];
-      for (const idx of indexList) {
-        if (idx.name.startsWith("sqlite_")) continue;
-
-        const indexInfoStmt = this.db!.prepare(`PRAGMA index_info("${idx.name}")`);
-        const indexCols = indexInfoStmt.all() as Array<{ seqno: number; cid: number; name: string }>;
-
-        indexes.push({
-          name: idx.name,
-          columns: indexCols.map((c) => c.name),
-          unique: idx.unique === 1,
-        });
-      }
-
-      let sizeBytes = 0;
-      try {
-        const pageCountStmt = this.db!.prepare(DB_PAGE_SIZE_SQL);
-        const sizeResult = pageCountStmt.get() as { size: number };
-        sizeBytes = sizeResult?.size || 0;
-      } catch {
-        // Ignore size calculation errors
-      }
-
-      schemas.push({
-        name: tableName,
-        rowCount,
-        size: formatBytes(sizeBytes),
-        columns: columns.map((col) => ({
-          name: col.name,
-          type: col.type || "TEXT",
-          nullable: col.notnull === 0,
-          isPrimary: col.pk === 1,
-          defaultValue: col.dflt_value ?? undefined,
-        })),
-        indexes,
-        foreignKeys: foreignKeys.map((fk) => ({
-          columnName: fk.from,
-          referencedTable: fk.table,
-          referencedColumn: fk.to,
-        })),
-      });
+  /**
+   * The objects of one kind, names only.
+   *
+   * Ordering is done here rather than with an `ORDER BY`, and that is deliberate. Four
+   * statements answer these listings, so four `ORDER BY` clauses would be four chances to
+   * disagree; and a SQL sort runs under the column's own collation, which is `BINARY` on
+   * `sqlite_schema.name` but is whatever a `COLLATE` clause said on a user's own catalog
+   * view. A code-point sort here is one rule and the same rule everywhere.
+   *
+   * By PATH and not by name, because it is the address that has to be stable: sorting by
+   * the address groups an object's triggers under it.
+   */
+  public async listObjects(container: readonly string[], kind: string): Promise<DatabaseObject[]> {
+    this.ensureConnected();
+    const capabilities = this.getCapabilities();
+    assertContainerPath(capabilities, container);
+    // Two questions, asked in order, and only the DECLARATION answers the first. Deciding
+    // "is this kind declared" from whether a listing statement exists would make the two
+    // methods disagree, and would report "declares no object kind" about a kind
+    // `objectKinds` does declare but nothing here can list.
+    if (findKind(capabilities, kind) === undefined) {
+      throw new QueryError(`SQLite declares no object kind "${kind}"`, "sqlite");
+    }
+    const statement = OBJECT_LISTINGS[kind];
+    if (statement === undefined) {
+      throw new QueryError(`SQLite declares the kind "${kind}" but has no statement that lists it`, "sqlite");
     }
 
-    return schemas;
+    return (await this.runObjectQuery<ObjectRow>(statement.sql, statement.params))
+      .map((row) => ({ path: objectPath(container, row), name: row.name, kind }))
+      .sort((left, right) => comparePaths(left.path, right.path));
+    // No `rowCount` and no `sizeBytes`, and both absences are facts about SQLite rather
+    // than unfinished work. There is no catalog row estimate at all here: `sqlite_stat1`
+    // exists only after someone ran ANALYZE, so a `COUNT(*)` per object would be a full
+    // table scan per row of this listing. Per-object bytes come only from `dbstat`, which
+    // scans the whole database file (see DBSTAT_SIZES_SQL) and is not on a build without
+    // SQLITE_ENABLE_DBSTAT_VTAB. A fabricated 0 in either field would read as an empty
+    // object, which is the estimate #469 removed from the Storage tab.
+  }
+
+  /**
+   * Columns, indexes and foreign keys for one object of one KIND.
+   *
+   * The kind decides everything and nothing here reads the name to work out what it is
+   * holding. Only the two `relation` kinds have any of the three: measured,
+   * `pragma_table_xinfo` answers zero rows for an index name and for a trigger name, so an
+   * index and a trigger answer three empty arrays without a round trip. That is a true
+   * fact about those kinds rather than a failed read, and
+   * `tests/helpers/object-surface-conformance.ts` states the same rule from the caller's
+   * side. An index's own key list is NOT published here and that is deliberate:
+   * `IndexSchema.columns` is a list of column names and an index on an expression has
+   * none, measured as `index_info.name = NULL, cid = -2`, so half the indexes on an engine
+   * would describe themselves and the other half would silently describe themselves
+   * wrongly. A trigger's body is source text, which is Phase 2's Source tab.
+   *
+   * Keying on `role === "relation"` is safe HERE and is not the general rule: MySQL keys
+   * the same decision on the catalog, because a MariaDB sequence is declared `config` and
+   * still has real columns. On SQLite the two coincide exactly.
+   *
+   * Path depth is derived from the declaration: one segment per declared container level,
+   * plus the attached parent where the kind declares one, plus the name. Every SQLite
+   * trigger has a parent - `sqlite_schema.tbl_name` is never null for one - so there is a
+   * single shape rather than the two MySQL accepts.
+   *
+   * Zero columns IS a failed read and raises: SQLite refuses `CREATE TABLE t()`, so every
+   * table and every view has at least one column, and an empty answer means the object is
+   * not there under that name in `main`.
+   */
+  public async describeObject(path: readonly string[], kind: string): Promise<ObjectDetail> {
+    this.ensureConnected();
+    const capabilities = this.getCapabilities();
+    const spec = findKind(capabilities, kind);
+    if (spec === undefined) {
+      throw new QueryError(`SQLite declares no object kind "${kind}"`, "sqlite");
+    }
+
+    assertObjectPathShape(capabilities, spec, kind, path, PATH_SHAPE_ENGINE);
+
+    if (spec.role !== "relation") {
+      return { path: [...path], columns: [], indexes: [], foreignKeys: [] };
+    }
+
+    // Neither bind is positional. The object's own name is the LAST segment, which is
+    // right at every depth, where `path[0]` is right only at depth 1 and would name a
+    // container segment on the five two-level engines that copy this shape. The schema is
+    // the constant `main` rather than a segment, because this engine declares no container
+    // level to take one from - see MAIN_SCHEMA for what leaving it out actually does.
+    const binds = [path[path.length - 1], MAIN_SCHEMA];
+
+    const columnRows = await this.runObjectQuery<ObjectColumnRow>(OBJECT_COLUMNS_SQL, binds);
+    if (columnRows.length === 0) {
+      throw new QueryError(`No SQLite ${kind} named ${binds[0]} in ${MAIN_SCHEMA}`, "sqlite", OBJECT_COLUMNS_SQL);
+    }
+
+    return objectDetailFromRows(path, {
+      columns: columnRows,
+      indexes: await this.readObjectIndexes(binds),
+      indexColumns: await this.readObjectIndexColumns(binds),
+      foreignKeys: await this.readObjectForeignKeys(binds),
+    });
+  }
+
+  /**
+   * One entry per index on this object, its columns in `seqno` order.
+   *
+   * The `sqlite_` exclusion is the same predicate the Indexes folder lists by, so the two
+   * surfaces cannot disagree about what an index is: an implicit `sqlite_autoindex_*`
+   * serves a UNIQUE or PRIMARY KEY constraint, cannot be dropped, and is not an object a
+   * user declared.
+   */
+  private async readObjectIndexes(binds: readonly unknown[]): Promise<ObjectIndexRow[]> {
+    return await this.runObjectQuery<ObjectIndexRow>(OBJECT_INDEXES_SQL, binds);
+  }
+
+  /**
+   * The key columns of every index on this object, tagged with the index they belong to.
+   *
+   * One read per index, which is what `pragma_index_info` takes; the tag is added here so
+   * the rows reach `objectDetailFromRows` in the same shape the bulk read's single
+   * statement produces. Null names are kept rather than filtered, because the MAPPER is
+   * the one place that decides what an expression key means.
+   */
+  private async readObjectIndexColumns(binds: readonly unknown[]): Promise<ObjectIndexColumnRow[]> {
+    const [, schema] = binds;
+    const indexes = await this.readObjectIndexes(binds);
+    const rows: ObjectIndexColumnRow[] = [];
+    for (const index of indexes) {
+      const columns = await this.runObjectQuery<{ name: string | null }>(OBJECT_INDEX_COLUMNS_SQL, [
+        index.name,
+        schema,
+      ]);
+      for (const column of columns) rows.push({ index_name: index.name, name: column.name });
+    }
+    return rows;
+  }
+
+  /**
+   * This object's foreign keys, one entry per constrained column.
+   *
+   * `to` is NULL when the reference names no column - `REFERENCES customers` rather than
+   * `REFERENCES customers(id)` - and SQLite reads that as the parent's PRIMARY KEY.
+   * `ForeignKeySchema.referencedColumn` is a string, so the choice is to resolve it or to
+   * put a null in a typed string field. The parent's key columns are read at most once per
+   * parent and only when some constraint needs them.
+   */
+  private async readObjectForeignKeys(binds: readonly unknown[]): Promise<ObjectForeignKeyRow[]> {
+    const [name, schema] = binds;
+    // The schema first, because it is the SUBQUERY's placeholder and SQLite numbers
+    // placeholders by where they appear in the statement text.
+    return await this.runObjectQuery<ObjectForeignKeyRow>(OBJECT_FOREIGN_KEYS_SQL, [schema, name, schema]);
+  }
+
+  /**
+   * Columns, indexes and foreign keys for EVERY object of one kind in the file (#789).
+   *
+   * FIVE round trips for a whole folder, constant in the number of objects, which is the
+   * entire reason this method exists: the caller's alternative was one `describeObject`
+   * per object, and each of those is itself a column read, an index list, one read per
+   * index and a foreign key list. The five are the target read plus the four detail reads,
+   * each joining a pragma table-valued function against the same target set.
+   *
+   * The four guards are asked in the same order PostgreSQL asks them, and each one is a
+   * different fact:
+   *   1. a kind this engine does not declare RAISES, naming the engine and the kind. An
+   *      empty batch would be a claim about the file; an undeclared kind is a fact about
+   *      SQLite.
+   *   2. the container path is checked through `assertContainerPath`, the same reader
+   *      `listObjects` uses, so the depth comes from the declaration and never from a
+   *      literal (standing ruling 5g).
+   *   3. a `limit` that is not a positive whole number raises rather than clamping: a 0
+   *      would answer nothing while reporting a truncation nobody asked for, and a
+   *      fraction reaches the driver as a bind it cannot use.
+   *   4. a kind with no columns answers `{ details: [] }` with NO round trip. On SQLite
+   *      that is `index` and `trigger`, measured: `pragma_table_xinfo` answers zero rows
+   *      for either name.
+   *
+   * The bound is the CALLER's and is never invented here. `limit + 1` reaches the target's
+   * `LIMIT`, the extra object is dropped, and `truncated` carries the caller's own limit;
+   * an unbounded call can never report truncation. `getSchema()`'s column list is capped
+   * nowhere in this file and nothing here adds a cap of its own.
+   *
+   * Paths are built by `objectPath`, the rule `listObjects` builds its paths with, and
+   * sorted by `comparePaths`, so the two answers join on path. Membership comes from the
+   * TARGET read and not from the column read: an object whose every column is hidden would
+   * otherwise be listed by the folder and missing from the batch. That is also why this
+   * method does not repeat `describeObject`'s zero-column throw - there the empty answer
+   * means the object is not there under that name, here the catalog has just said it is.
+   */
+  public async describeObjects(container: readonly string[], kind: string, limit?: number): Promise<ObjectDetailBatch> {
+    this.ensureConnected();
+    const capabilities = this.getCapabilities();
+    if (findKind(capabilities, kind) === undefined) {
+      throw new QueryError(`SQLite declares no object kind "${kind}"`, "sqlite");
+    }
+    assertContainerPath(capabilities, container);
+    if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+      throw new QueryError(
+        `A SQLite bulk column read limit must be a positive whole number, received ${limit}`,
+        "sqlite",
+      );
+    }
+    if (BULK_RELATION_TYPES[kind] === undefined) return { details: [] };
+
+    const bounded = limit !== undefined;
+    const statements = bounded ? BULK_DETAIL_SQL_BOUNDED[kind]! : BULK_DETAIL_SQL[kind]!;
+    const head = [MAIN_SCHEMA, ...(bounded ? [limit + 1] : [])];
+    const params = (schemaBinds: number): unknown[] => [...head, ...Array<string>(schemaBinds).fill(MAIN_SCHEMA)];
+
+    const targets = await this.runObjectQuery<{ object_name: string }>(
+      statements.target,
+      params(statements.schemaBinds[0]),
+    );
+    const truncated = bounded && targets.length > limit;
+    // The extra object the `limit + 1` bound brought back is dropped here, so its rows in
+    // the four maps below are simply never read.
+    const names = (truncated ? targets.slice(0, limit) : targets).map((row) => row.object_name);
+
+    const columns = groupByObject(
+      await this.runObjectQuery<OfObject<ObjectColumnRow>>(statements.columns, params(statements.schemaBinds[1])),
+    );
+    const indexes = groupByObject(
+      await this.runObjectQuery<OfObject<ObjectIndexRow>>(statements.indexes, params(statements.schemaBinds[2])),
+    );
+    const indexColumns = groupByObject(
+      await this.runObjectQuery<OfObject<ObjectIndexColumnRow>>(
+        statements.indexColumns,
+        params(statements.schemaBinds[3]),
+      ),
+    );
+    const foreignKeys = groupByObject(
+      await this.runObjectQuery<OfObject<ObjectForeignKeyRow>>(
+        statements.foreignKeys,
+        params(statements.schemaBinds[4]),
+      ),
+    );
+
+    const details = names
+      .map((name) =>
+        objectDetailFromRows(objectPath(container, { name }), {
+          columns: columns.get(name) ?? [],
+          indexes: indexes.get(name) ?? [],
+          indexColumns: indexColumns.get(name) ?? [],
+          foreignKeys: foreignKeys.get(name) ?? [],
+        }),
+      )
+      .sort((left, right) => comparePaths(left.path, right.path));
+
+    return truncated ? { details, truncated: { limit, reason: callerBoundTruncationReason(limit) } } : { details };
+  }
+
+  /**
+   * One object's definition text, exactly as its author submitted it (#789 Phase 2).
+   *
+   * EVERY DECLARED KIND CAN ANSWER, and this is the simplest source story in the fleet:
+   * `sqlite_schema` keeps one row per object and `sql` on that row is the text somebody
+   * typed. So `form` is `complete` - every one of them runs as given - and `origin` is
+   * `stored`, which on this engine is a real distinction rather than a formality.
+   * Several other SQL providers rebuild their text from a catalog instead,
+   * and the caption's whole job is to stop a REGENERATION reading as the user's own text: if
+   * every engine said `regenerated` the distinction would be decoration.
+   *
+   * `stored` CARRIES ONE CAVEAT, measured on SQLite 3.53.2 and recorded in
+   * docs/providers/sqlite.md: the engine REWRITES the stored text on `ALTER TABLE`. A rename
+   * rewrites the name and quotes it, and an added column is appended to the text. So the
+   * bytes are the author's own bytes up to the last schema change, which is still a different
+   * fact from a statement rebuilt out of a catalog, and a reader is told which one they have.
+   *
+   * NO REFUSAL IS REACHABLE HERE, and that is a measured CANNOT rather than an omission.
+   * `sqlite_schema.sql` is NULL for exactly one shape, an index SQLite created for itself,
+   * and every listing this provider answers excludes the `sqlite_` prefix, so no path the
+   * tree offers addresses such a row. The blank arm below exists anyway, because an empty
+   * definition must never reach an editor as a definition.
+   *
+   * The document is ONE part, so `parts` is an array literal of one. There is nothing to
+   * assemble: unlike an Oracle or a MariaDB package, a SQLite object has exactly one text.
+   *
+   * Absence RAISES rather than answering a refusal part, and the two are different facts: a
+   * refusal says the definition cannot be read, and no rows says nothing of that name is
+   * there under that kind. The message names the last segment because that is the only thing
+   * a caller can act on.
+   *
+   * Neither bind is positional (standing ruling 5g). The object's own name is
+   * `path[path.length - 1]`, which is right at every depth, and the path SHAPE comes from
+   * `assertObjectPathShape`, the same reader `describeObject` uses, so the Source tab and the
+   * detail pane cannot disagree about what a trigger's address is. A two-level declaration
+   * driven all the way to the binds pins both in this provider's suite, because a zero-level
+   * engine's own fixture cannot tell a derivation from a literal.
+   */
+  public async readObjectSource(path: readonly string[], kind: string, limit?: number): Promise<ObjectSourceDocument> {
+    this.ensureConnected();
+    const capabilities = this.getCapabilities();
+    const spec = requireSourceKind(capabilities, kind, { displayName: "SQLite", type: "sqlite" });
+    assertObjectPathShape(capabilities, spec, kind, path, PATH_SHAPE_ENGINE);
+    if (!Object.hasOwn(SOURCE_CATALOG_TYPES, kind)) {
+      throw new QueryError(
+        `SQLite declares readable source for the kind "${kind}" but has no catalog type that reads it`,
+        "sqlite",
+      );
+    }
+
+    const name = path[path.length - 1];
+    const rows = await this.runObjectQuery<ObjectSourceRow>(OBJECT_SOURCE_SQL, [SOURCE_CATALOG_TYPES[kind], name]);
+    const row = rows[0];
+    if (row === undefined) {
+      throw new QueryError(`No SQLite ${kind} named ${name} in ${MAIN_SCHEMA}`, "sqlite", OBJECT_SOURCE_SQL);
+    }
+
+    const definition = row.sql;
+    if (definition === null || definition === undefined || definition.trim() === "") {
+      const reason = blankDefinitionReason(blankDefinitionShape(row), kind, name);
+      return {
+        path: [...path],
+        kind,
+        parts: [{ id: "definition", label: "Definition", unavailable: reason }],
+      };
+    }
+
+    const bounded = applySourceBound(definition, limit);
+    return {
+      path: [...path],
+      kind,
+      parts: [
+        {
+          id: "definition",
+          label: "Definition",
+          text: bounded.text,
+          language: spec.sourceLanguage,
+          form: "complete",
+          origin: "stored",
+          ...(bounded.truncated === undefined ? {} : { truncated: bounded.truncated }),
+        },
+      ],
+    };
   }
 
   // ============================================================================
   // Health & Monitoring
   // ============================================================================
 
+  /**
+   * The database's size in bytes, or absent when it genuinely cannot be read (#546).
+   *
+   * `getHealth()` and `getOverview()` both used to read this size themselves, and
+   * drifted: `getHealth()` caught a failed file stat to `"Unknown"` and a failed
+   * `:memory:` read to `"N/A"`, `getOverview()` initialized to `0` and left it
+   * there through an empty catch either way, and neither result was a measurement
+   * - a read that never answered is not the same fact as a database that is
+   * genuinely empty. One reader now decides both, so the two panels cannot
+   * disagree about the same database again, and the review that caught the
+   * :memory: half of this - `result?.size || 0` cannot tell a measured zero from
+   * `sizeStmt.get()` returning no row, or a row whose `size` is `undefined` - is
+   * fixed once here rather than twice.
+   *
+   * A file database is sized the same way as `:memory:`, by `page_count * page_size`,
+   * not by its file on disk (#1449). In WAL journal mode a write lands in the `-wal` and
+   * reaches the main file only at a checkpoint, so the main file alone undercounts:
+   * measured on SQLite 3.53.0 with 1,000 rows, a 4 KB main file beside a 104 KB `-wal`,
+   * and the Storage tab drew tables and indexes at 1000% and 900% of the database. The
+   * main file plus the `-wal` overcounts instead: the `-wal` is not truncated by a
+   * checkpoint, and before one it can hold several copies of the same page (measured in
+   * review: 36,864 + 45,352 bytes after `PRAGMA wal_checkpoint(PASSIVE)` against 36,864
+   * live). `page_count` reads through the WAL and counts each live page once, which is
+   * also what `dbstat` measures tables and indexes against. The `-wal` keeps its own row
+   * in `getStorageStats()`.
+   */
+  private async readDatabaseSizeBytes(): Promise<number | undefined> {
+    try {
+      const result = (await (await this.getHandle()).get(MEMORY_DB_SIZE_SQL)) as { size?: number } | null;
+      // A type check, not `|| 0`: page_count * page_size answering a real zero is
+      // a measured reading, kept - but `|| 0` cannot tell that apart from
+      // `get()` returning no row, or a row whose `size` came back `undefined`,
+      // both of which `as { size: number }` casts past rather than rules out.
+      return typeof result?.size === "number" ? result.size : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   public async getHealth(): Promise<HealthInfo> {
     this.ensureConnected();
 
     const dbPath = this.getDatabasePath();
-
-    let databaseSize = "N/A";
-    if (dbPath !== ":memory:") {
-      try {
-        const stats = fs.statSync(dbPath);
-        databaseSize = formatBytes(stats.size);
-      } catch {
-        databaseSize = "Unknown";
-      }
-    } else {
-      try {
-        const sizeStmt = this.db!.prepare(MEMORY_DB_SIZE_SQL);
-        const result = sizeStmt.get() as { size: number };
-        databaseSize = formatBytes(result?.size || 0);
-      } catch {
-        databaseSize = "N/A";
-      }
-    }
+    const sizeBytes = await this.readDatabaseSizeBytes();
+    const databaseSize = sizeBytes === undefined ? "N/A" : formatBytes(sizeBytes);
 
     let isHealthy = true;
     try {
-      const integrityStmt = this.db!.prepare("PRAGMA integrity_check");
-      const integrityResult = integrityStmt.get() as { integrity_check: string };
+      const integrityResult = (await (await this.getHandle()).get("PRAGMA integrity_check")) as {
+        integrity_check: string;
+      } | null;
       isHealthy = integrityResult?.integrity_check === "ok";
     } catch {
       isHealthy = false;
@@ -715,8 +2305,9 @@ export class SQLiteProvider extends SQLBaseProvider {
 
     let journalMode = "unknown";
     try {
-      const journalStmt = this.db!.prepare("PRAGMA journal_mode");
-      const journalResult = journalStmt.get() as { journal_mode: string };
+      const journalResult = (await (await this.getHandle()).get("PRAGMA journal_mode")) as {
+        journal_mode: string;
+      } | null;
       journalMode = journalResult?.journal_mode || "unknown";
     } catch {
       // Ignore
@@ -757,7 +2348,12 @@ export class SQLiteProvider extends SQLBaseProvider {
   // Maintenance Operations
   // ============================================================================
 
-  public async runMaintenance(type: MaintenanceType, target?: string): Promise<MaintenanceResult> {
+  /**
+   * `container` is deliberately ignored: SQLite resolves a bare name against the attached
+   * database it was opened on, always `main` for this provider, and the file has no second
+   * namespace to name (#772). The parameter is accepted so the shared contract holds.
+   */
+  public async runMaintenance(type: MaintenanceType, target?: string, _container?: string): Promise<MaintenanceResult> {
     this.ensureConnected();
 
     const { result, executionTime } = await this.measureExecution(async () => {
@@ -773,13 +2369,15 @@ export class SQLiteProvider extends SQLBaseProvider {
         case "reindex":
           sql = target ? `REINDEX ${this.escapeIdentifier(target)}` : "REINDEX";
           break;
-        case "check":
-          const checkStmt = this.db!.prepare("PRAGMA integrity_check");
-          const checkResult = checkStmt.get() as { integrity_check: string };
+        case "check": {
+          const checkResult = (await (await this.getHandle()).get("PRAGMA integrity_check")) as {
+            integrity_check: string;
+          } | null;
           return {
             success: checkResult?.integrity_check === "ok",
             message: checkResult?.integrity_check || "Unknown",
           };
+        }
       }
 
       // Unsupported types fall through the switch with sql left empty. A
@@ -790,7 +2388,7 @@ export class SQLiteProvider extends SQLBaseProvider {
         throw new QueryError(`Unsupported maintenance type for SQLite: ${type}`, "sqlite");
       }
 
-      this.db!.exec(sql);
+      await (await this.getHandle()).exec(sql);
       return { success: true, message: `${type.toUpperCase()} completed successfully` };
     });
 
@@ -809,39 +2407,21 @@ export class SQLiteProvider extends SQLBaseProvider {
     this.ensureConnected();
 
     // Get SQLite version
-    const versionStmt = this.db!.prepare("SELECT sqlite_version() as version");
-    const versionResult = versionStmt.get() as { version: string };
+    const versionResult = (await (await this.getHandle()).get("SELECT sqlite_version() as version")) as {
+      version: string;
+    } | null;
     const version = `SQLite ${versionResult?.version || "Unknown"}`;
 
-    // Get database size
-    const dbPath = this.getDatabasePath();
-    let databaseSizeBytes = 0;
-
-    if (dbPath !== ":memory:") {
-      try {
-        const stats = fs.statSync(dbPath);
-        databaseSizeBytes = stats.size;
-      } catch {
-        // File might not exist yet
-      }
-    } else {
-      try {
-        const sizeStmt = this.db!.prepare(MEMORY_DB_SIZE_SQL);
-        const result = sizeStmt.get() as { size: number };
-        databaseSizeBytes = result?.size || 0;
-      } catch {
-        // Ignore
-      }
-    }
+    // Get database size, absent rather than 0 when it cannot be read (#546) - see
+    // `readDatabaseSizeBytes()` above, shared with `getHealth()`.
+    const sizeBytes = await this.readDatabaseSizeBytes();
 
     // Get table count
-    const tableCountStmt = this.db!.prepare(TABLE_COUNT_SQL);
-    const tableCountResult = tableCountStmt.get() as { count: number };
+    const tableCountResult = (await (await this.getHandle()).get(TABLE_COUNT_SQL)) as { count: number } | null;
     const tableCount = tableCountResult?.count || 0;
 
     // Get index count
-    const indexCountStmt = this.db!.prepare(INDEX_COUNT_SQL);
-    const indexCountResult = indexCountStmt.get() as { count: number };
+    const indexCountResult = (await (await this.getHandle()).get(INDEX_COUNT_SQL)) as { count: number } | null;
     const indexCount = indexCountResult?.count || 0;
 
     return {
@@ -849,8 +2429,11 @@ export class SQLiteProvider extends SQLBaseProvider {
       uptime: "N/A",
       activeConnections: 1,
       maxConnections: 1,
-      databaseSize: formatBytes(databaseSizeBytes),
-      databaseSizeBytes,
+      // "N/A", not formatBytes(0): moves with the figure, so an unanswered read
+      // does not print a confident "0 Bytes" beside the Storage tab's own absence
+      // message.
+      databaseSize: sizeBytes === undefined ? "N/A" : formatBytes(sizeBytes),
+      ...(sizeBytes === undefined ? {} : { databaseSizeBytes: sizeBytes }),
       tableCount,
       indexCount,
     };
@@ -922,20 +2505,38 @@ export class SQLiteProvider extends SQLBaseProvider {
     ];
   }
 
+  /**
+   * The same two `dbstat` reads the in-process handle makes, through whatever handle
+   * this provider runs on. The shared attribution lives in `buildDbstatSizes`.
+   */
+  private async readDbstatSizesViaHandle(): Promise<Map<string, SQLiteTableSizeBytes> | null> {
+    let pages: { name: string; bytes: number }[];
+    try {
+      pages = (await (await this.getHandle()).all(DBSTAT_SIZES_SQL)) as { name: string; bytes: number }[];
+    } catch {
+      return null;
+    }
+    const owners = (await (await this.getHandle()).all(DBSTAT_INDEX_OWNERS_SQL)) as {
+      name: string;
+      tbl_name: string;
+    }[];
+    return buildDbstatSizes(pages, owners);
+  }
+
   public async getTableStats(): Promise<TableStats[]> {
     this.ensureConnected();
 
-    const tablesStmt = this.db!.prepare(STATS_TABLES_SQL);
-    const tables = tablesStmt.all() as { name: string }[];
+    const tables = (await (await this.getHandle()).all(STATS_TABLES_SQL)) as { name: string }[];
 
     // One dbstat scan per call, not per table: it reads the whole database file.
-    const sizes = readDbstatSizes(this.db!);
+    const sizes = await this.readDbstatSizesViaHandle();
     const stats: TableStats[] = [];
 
     for (const { name: tableName } of tables) {
       // Get row count
-      const countStmt = this.db!.prepare(`SELECT COUNT(*) as count FROM "${tableName}"`);
-      const countResult = countStmt.get() as { count: number };
+      const countResult = (await (await this.getHandle()).get(`SELECT COUNT(*) as count FROM "${tableName}"`)) as {
+        count: number;
+      } | null;
       const rowCount = countResult?.count || 0;
 
       stats.push(buildTableStats(tableName, rowCount, sizes?.get(tableName) ?? null));
@@ -947,19 +2548,23 @@ export class SQLiteProvider extends SQLBaseProvider {
   public async getIndexStats(): Promise<IndexStats[]> {
     this.ensureConnected();
 
-    const indexesStmt = this.db!.prepare(STATS_INDEXES_SQL);
-    const indexes = indexesStmt.all() as { name: string; tbl_name: string }[];
+    const indexes = (await (await this.getHandle()).all(STATS_INDEXES_SQL)) as { name: string; tbl_name: string }[];
 
     const stats: IndexStats[] = [];
 
     for (const { name: indexName, tbl_name: tableName } of indexes) {
       // Get index info
-      const indexInfoStmt = this.db!.prepare(`PRAGMA index_info("${indexName}")`);
-      const indexCols = indexInfoStmt.all() as { seqno: number; cid: number; name: string }[];
+      const indexCols = (await (await this.getHandle()).all(`PRAGMA index_info("${indexName}")`)) as {
+        seqno: number;
+        cid: number;
+        name: string;
+      }[];
 
       // Get index uniqueness
-      const indexListStmt = this.db!.prepare(`PRAGMA index_list("${tableName}")`);
-      const indexList = indexListStmt.all() as { name: string; unique: number }[];
+      const indexList = (await (await this.getHandle()).all(`PRAGMA index_list("${tableName}")`)) as {
+        name: string;
+        unique: number;
+      }[];
       const indexMeta = indexList.find((i) => i.name === indexName);
 
       stats.push({
@@ -1001,8 +2606,7 @@ export class SQLiteProvider extends SQLBaseProvider {
       }
     } else {
       try {
-        const sizeStmt = this.db!.prepare(MEMORY_DB_SIZE_SQL);
-        const result = sizeStmt.get() as { size: number };
+        const result = (await (await this.getHandle()).get(MEMORY_DB_SIZE_SQL)) as { size: number } | null;
         mainSizeBytes = result?.size || 0;
       } catch {
         // Ignore

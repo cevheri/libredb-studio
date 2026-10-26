@@ -1,4 +1,41 @@
+import type { TypedConfirmationAsk } from "@/lib/db/types";
 import type { DatabaseType } from "@/lib/types";
+import {
+  ETCD_DESTRUCTIVE_OPERATIONS,
+  etcdTypedConfirmation,
+  readEtcdOperations,
+} from "@/lib/db/providers/keyvalue/etcd/guard";
+import { LIMITS as FIRESTORE_LIMITS } from "@/lib/db/providers/document/firestore/constants";
+import { firestoreRefusal } from "@/lib/db/providers/document/firestore/console/guard";
+import { OXIA_MAX_TEXT_BYTES } from "@/lib/db/providers/keyvalue/oxia/constants";
+import { OXIA_DESTRUCTIVE_OPERATIONS, oxiaRefusal, readOxiaOperations } from "@/lib/db/providers/keyvalue/oxia/guard";
+import { readRedisCommandText, redisRefusal } from "@/lib/db/providers/keyvalue/redis-command-text";
+import { KUBECTL_MAX_TEXT_BYTES } from "@/lib/db/providers/platform/kubernetes/console/commands";
+import { kubectlRefusal } from "@/lib/db/providers/platform/kubernetes/console/guard";
+import { S3_MAX_TEXT_BYTES } from "@/lib/db/providers/objectstore/s3/console/constants";
+import {
+  readS3Operations,
+  S3_DESTRUCTIVE_OPERATIONS,
+  s3Refusal,
+} from "@/lib/db/providers/objectstore/s3/console/guard";
+import {
+  INFLUXQL_DESTRUCTIVE_OPERATIONS,
+  INFLUXQL_MAX_TEXT_BYTES,
+  influxqlRefusal,
+  readInfluxqlOperations,
+} from "@/lib/db/providers/timeseries/influxdb/influxql-policy";
+import {
+  MILVUS_DESTRUCTIVE_OPERATIONS,
+  milvusRefusal,
+  readMilvusOperations,
+} from "@/lib/db/providers/vector/milvus/guard";
+import { MILVUS_CONSOLE } from "@/lib/db/providers/vector/milvus/routes";
+import {
+  QDRANT_DESTRUCTIVE_OPERATIONS,
+  qdrantRefusal,
+  readQdrantOperations,
+} from "@/lib/db/providers/vector/qdrant/guard";
+import { QDRANT_CONSOLE } from "@/lib/db/providers/vector/qdrant/routes";
 
 /**
  * The confirmation gate's vocabulary for the engines whose query text is NOT SQL.
@@ -10,13 +47,15 @@ import type { DatabaseType } from "@/lib/types";
  * reason every other by-database difference in this repo does: one type-to-facts
  * table, read by one function, so the gate carries no type test of its own.
  *
- * Scope rule, and the reason this file is short: it names ONLY what these two
- * providers can really run. Both were read before the tables below were written -
- * `src/lib/db/providers/keyvalue/redis.ts` and
- * `src/lib/db/providers/document/mongodb.ts` - and neither was probed against a live
- * server in this change, so nothing here is claimed as measured behaviour. What each
- * command or operation DOES is taken from the engines' own command references; what
- * can REACH the engine is taken from the provider code.
+ * Scope rule, and the reason this file is short: it names ONLY what each provider
+ * can really run. Each was read before its table below was written -
+ * `src/lib/db/providers/keyvalue/redis.ts`,
+ * `src/lib/db/providers/document/mongodb/index.ts`,
+ * `src/lib/db/providers/timeseries/prometheus/` and
+ * `src/lib/db/providers/stream/kafka/` - and none was probed against a live
+ * server for the rows here, so nothing here is claimed as measured behaviour. What
+ * each command or operation DOES is taken from the engines' own command references;
+ * what can REACH the engine is taken from the provider code.
  */
 
 /** Whether `value` is a JSON object - not an array, not null. */
@@ -70,7 +109,14 @@ const MONGODB_DESTRUCTIVE_OPERATIONS: ReadonlySet<string> = new Set([
  * `CLUSTER SHARDS` are the reads); every form of it reassigns a slot, which is what
  * puts it beside `CLUSTER RESET` and `CLUSTER FORGET`.
  *
- * Every name here can reach the server: `runCommand` calls
+ * Every name here is a command the provider runs: `query()` refuses some commands
+ * before they reach the server (`sharedConnectionRefusal` in
+ * `src/lib/db/providers/keyvalue/redis.ts`, documented in section 5.2b of
+ * `docs/providers/redis.md`), and a confirmation followed by that refusal would be
+ * the double take this gate exists to avoid. The blocking list and sorted-set pops
+ * (`BLPOP`, `BZPOPMIN` and the rest of the `B` forms) are refused that way, so only their
+ * non-blocking forms (`LPOP`, `RPOP`, `LMPOP`, `LMOVE`, `RPOPLPUSH`, `ZPOPMIN`,
+ * `ZPOPMAX`, `ZMPOP`) are here. `runCommand` itself calls
  * `client.call(command, ...args)` with no allow-list of any kind, so the vocabulary
  * is bounded by what Redis accepts rather than by what this provider implements.
  * Container commands are spelled with their subcommand (`CONFIG SET`), which the
@@ -131,16 +177,11 @@ const REDIS_DESTRUCTIVE_COMMANDS: ReadonlySet<string> = new Set([
   "LPOP",
   "RPOP",
   "LMPOP",
-  "BLPOP",
-  "BRPOP",
-  "BLMPOP",
   "LSET",
   "LREM",
   "LTRIM",
   "LMOVE",
-  "BLMOVE",
   "RPOPLPUSH",
-  "BRPOPLPUSH",
   // Sets
   "SPOP",
   "SREM",
@@ -155,10 +196,7 @@ const REDIS_DESTRUCTIVE_COMMANDS: ReadonlySet<string> = new Set([
   "ZREMRANGEBYLEX",
   "ZPOPMIN",
   "ZPOPMAX",
-  "BZPOPMIN",
-  "BZPOPMAX",
   "ZMPOP",
-  "BZMPOP",
   "ZUNIONSTORE",
   "ZINTERSTORE",
   "ZDIFFSTORE",
@@ -192,6 +230,48 @@ const REDIS_DESTRUCTIVE_COMMANDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * PromQL operations that destroy or change anything: none, so the set is empty.
+ *
+ * Not an omission. The language has no statement that writes, and the provider sends
+ * editor text to one place, `POST /api/v1/query`, which evaluates an expression and
+ * does nothing else. Every path the provider can call is a read, and all of them are
+ * listed in `PATHS` in `src/lib/db/providers/timeseries/prometheus/http-transport.ts`
+ * (#1085 S9). Series deletion and snapshots, which are the admin API, and the
+ * lifecycle endpoints are calls this product never makes (#1085, section 2).
+ */
+const PROMETHEUS_DESTRUCTIVE_OPERATIONS: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Kafka read-request operations that destroy or change anything: none, so the set is empty.
+ *
+ * Not an omission. The editor text is one JSON read request (#1088, section 5.1): a topic, a
+ * partition, where to start and how many messages, and the provider refuses any other key. It
+ * names no operation at all, and the provider sends nothing that writes: it never produces,
+ * commits an offset, joins a group or creates a topic, and `tests/unit/db/kafka/seam-guard.test.ts`
+ * holds the one file that calls its client library to an allowlist of reads (#1088, section 2).
+ */
+const KAFKA_DESTRUCTIVE_OPERATIONS: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Cypher operations that destroy or change anything and reach the server: none, so the set is empty.
+ *
+ * Not an omission. Cypher text can write (`CREATE`, `MERGE`, `SET`, `DELETE`, `DROP`), but the provider
+ * refuses every write before sending it (Neo4j spec 5.5): the read policy in
+ * `src/lib/db/graph/cypher/read-policy.ts` refuses a write word, the server's own EXPLAIN classification
+ * refuses what the words miss, and the statement runs in a READ session besides. A confirmation would ask
+ * about a statement that cannot run.
+ */
+const NEO4J_DESTRUCTIVE_OPERATIONS: ReadonlySet<string> = new Set<string>();
+
+/**
+ * kubectl operations that destroy or change anything and reach the server: none, so the set is empty.
+ *
+ * Not an omission. A mutating kubectl command is refused before any request, and the Kubernetes provider's request
+ * policy admits GET and the three self reviews only, so a confirmation would ask about a statement that cannot run.
+ */
+const KUBERNETES_DESTRUCTIVE_OPERATIONS: ReadonlySet<string> = new Set<string>();
+
+/**
  * The names a query would run, or `undefined` when the text cannot be read as one.
  *
  * `undefined` is not "nothing to run": it means the reader could not tell WHAT would
@@ -204,6 +284,58 @@ interface DestructiveVocabulary {
   readonly operations: ReadonlySet<string>;
   /** How this engine's query text names the operations it would run. */
   readonly read: OperationReader;
+  /**
+   * Whether this row is the gate's whole answer, so the gate's SQL keyword test never
+   * reads the text.
+   *
+   * False keeps that test in front of the row as a backstop: a SQL write keyword in a
+   * MongoDB or Redis buffer asks, although the provider would refuse the text. The
+   * backstop is not free on Redis, where a read whose arguments are `update` and then
+   * `set` (`MGET update set`) meets its `UPDATE ... SET` probe and asks.
+   *
+   * True where reading the text as SQL is wrong rather than cautious. A PromQL
+   * expression can start with a metric name the server's data chooses, `update`,
+   * `delete` and `drop` are legal names, and read as SQL the tree's own selector for
+   * such a metric is a write. A Kafka read request names its topic, which can carry
+   * any of those names too, in text that can only ever read that topic. An etcd command
+   * names its keys, which can be spelled like any SQL keyword, and `guard.ts` reads it with
+   * the parser the provider runs, so what asks and what runs are one parse (#1089).
+   */
+  readonly decidesAlone: boolean;
+  /**
+   * What a statement this row asks about makes the person type before it runs, or undefined where the one-click
+   * dialog is the whole confirmation (#1089, section 5.5).
+   *
+   * Absent means one click for every statement the row asks about. `QuerySafetyDialog` reads it through
+   * `vocabularyTypedConfirmation`, for a statement the gate already stopped, and draws the shared typed field for
+   * the answer: the text itself, or the connection's name with every target listed.
+   */
+  readonly typedConfirmation?: (text: string) => TypedConfirmationAsk | undefined;
+  /**
+   * False keeps this row's statements from the AI safety analysis: the confirmation gate then posts nothing to
+   * `/api/ai/query-safety` and calls no adapter in its place (#1089, E10).
+   *
+   * Absent means the gate sends the statement, as it does for every engine today. A row declares `false` where the
+   * text carries what a write stores, as an etcd `put` carries its value, which must not leave the deployment
+   * through the gate.
+   */
+  readonly safetyAnalysis?: false;
+  /**
+   * The sentence this connection type's editor refuses a statement with, or undefined to send it.
+   *
+   * Absent means the editor sends every statement, as it does for every engine today. A row declares it where the
+   * dialect has a browser-safe verdict of its own, and a statement it refuses is never sent to any route or host
+   * callback and never written to query history, on every path either shell can take (`statementRefusal`).
+   */
+  readonly refuse?: (text: string) => string | undefined;
+  /**
+   * The bound on a statement's text in UTF-8 bytes, the same constant the provider's own dialect declares.
+   *
+   * Absent means no bound of this kind. A row that declares it is refused past it in the browser, answered 413 by
+   * `POST /api/db/query`, and refused by `POST /api/db/multi-query` outright, whose SQL splitter would turn one
+   * console text into several requests.
+   */
+  readonly maxTextBytes?: number;
 }
 
 /**
@@ -255,33 +387,6 @@ const readMongodbOperations: OperationReader = (query) => {
 };
 
 /**
- * The ONE command a Redis buffer would run, reduced the way `commandBody` reduces it:
- * `#` comment lines dropped, then the first blank-line-delimited block. The
- * schema explorer's "Generate Command" output is a list of alternatives separated by
- * blank lines and only its first block runs, so reading the whole buffer would prompt
- * about commands nobody asked for.
- *
- * The provider also tracks open quotes across lines, so that a line-leading `#`
- * inside a quoted argument stays data. That is deliberately not modelled here,
- * because it cannot change the answer: a quote can only be opened on an earlier line,
- * and the command NAME is on the block's first line, which no quote precedes.
- */
-function redisCommandBody(query: string): string {
-  const block: string[] = [];
-  for (const raw of query.split("\n")) {
-    const line = raw.trim();
-    if (line.startsWith("#")) continue;
-    if (line === "") {
-      // A blank line ends the first block; blank lines before it are padding.
-      if (block.length > 0) break;
-      continue;
-    }
-    block.push(raw);
-  }
-  return block.join("\n").trim();
-}
-
-/**
  * One token as the plain tokenizer would produce it: quote characters are structure
  * to that parser, not part of the argument, and both parsers uppercase the command
  * before calling it - so `del`, `DEL` and `"DEL"` are the same command.
@@ -304,15 +409,24 @@ function redisNames(command: string, next: string | undefined): string[] {
  * MongoDB-shaped generator emits - and the plain form `DEL k`. A body that starts
  * with `{` takes the JSON path in the provider too, so a broken JSON body never
  * falls back to the plain reading; it is unreadable, and unreadable asks.
+ *
+ * The text is read by the provider's own `readRedisCommandText()`, so the command
+ * this names is the one that runs: each line is a command, `#` lines are dropped,
+ * and the first blank line ends the read, which keeps the schema explorer's
+ * cheatsheet of blank-line-separated alternatives from prompting about commands
+ * nobody asked for. A text holding a second command names nothing, the way etcd's
+ * refused text does: the row's `refuse` stops it in the editor before anything is
+ * sent, and the provider refuses it too, so a prompt would ask about a command that
+ * cannot run.
  */
 const readRedisOperations: OperationReader = (query) => {
-  const body = redisCommandBody(query);
-  if (body === "") return [];
+  const read = readRedisCommandText(query);
+  if (read.kind === "empty" || read.kind === "refused") return [];
 
-  if (body.startsWith("{")) {
+  if (read.kind === "json") {
     let parsed: unknown;
     try {
-      parsed = JSON.parse(body);
+      parsed = JSON.parse(read.body);
     } catch {
       return undefined;
     }
@@ -324,19 +438,210 @@ const readRedisOperations: OperationReader = (query) => {
     return redisNames(command, typeof first === "string" ? first : undefined);
   }
 
-  const tokens = body.split(/\s+/);
-  return redisNames(tokens[0], tokens[1]);
+  return redisNames(read.words[0], read.words[1]);
 };
 
 /**
- * The single type-to-facts table. A type with no row here is one whose statements the
- * SQL half of the gate reads; a row would be a second, weaker opinion about the same
- * text.
+ * What a PromQL buffer would run: never an operation this gate asks about.
+ *
+ * The MongoDB and Redis readers turn text they cannot resolve into a prompt. This one
+ * has nothing to resolve: whatever the text says, the one request it becomes is an
+ * evaluation, and text the server cannot parse is refused there with nothing changed.
+ */
+const readPrometheusOperations: OperationReader = () => [];
+
+/**
+ * What a Kafka buffer would run: never an operation this gate asks about.
+ *
+ * Nothing to resolve here either: whatever the text says, the provider either parses it as one
+ * read of one topic's messages or refuses it before anything is sent, so text it cannot parse
+ * changes nothing and asks nothing.
+ */
+const readKafkaOperations: OperationReader = () => [];
+
+/**
+ * What a Cypher buffer would run: never an operation this gate asks about.
+ *
+ * Nothing to resolve: the provider either runs the text as one read or refuses it before anything is sent,
+ * so a write, and text it cannot lex, changes nothing and asks nothing.
+ */
+const readNeo4jOperations: OperationReader = () => [];
+
+/**
+ * What a kubectl statement would run: never an operation this gate asks about.
+ *
+ * The provider either runs the statement as reads or refuses it before anything is sent, so a mutating command, and
+ * text it cannot lex, changes nothing and asks nothing.
+ */
+const readKubernetesOperations: OperationReader = () => [];
+
+/**
+ * The single type-to-facts table. It has a row for exactly the types that
+ * `readsSqlText` in `@/lib/sql/grammar` reports as not SQL, and a test holds the two
+ * tables to that. A type with no row here is one whose statements the SQL half of the
+ * gate reads; a row would be a second, weaker opinion about the same text.
  */
 export const NON_SQL_DESTRUCTIVE_VOCABULARY: Readonly<Partial<Record<DatabaseType, DestructiveVocabulary>>> = {
-  mongodb: { operations: MONGODB_DESTRUCTIVE_OPERATIONS, read: readMongodbOperations },
-  redis: { operations: REDIS_DESTRUCTIVE_COMMANDS, read: readRedisOperations },
+  etcd: {
+    operations: ETCD_DESTRUCTIVE_OPERATIONS,
+    // The provider's own parser, read by guard.ts, so what asks and what runs are one parse (#1089 5.5). Text
+    // it refuses names nothing, where every other reader answers "could not tell": the provider refuses that
+    // text before any request, so a prompt would ask about a command that cannot run.
+    read: readEtcdOperations,
+    decidesAlone: true,
+    // A range delete and a lease revoke are typed; everything else that asks takes one click (#1089 5.5).
+    typedConfirmation: etcdTypedConfirmation,
+    // A put's value is part of the statement, so no etcd statement is posted for an AI analysis (#1089 E10).
+    safetyAnalysis: false,
+  },
+  // InfluxDB (InfluxDB spec 5.7): the browser-safe InfluxQL policy the provider runs reads the text, so what asks and
+  // what runs are one reading. An allowed statement only reads, so nothing asks; what the policy refuses (a write,
+  // `INTO`, a second statement, a lexical fault) the editor refuses before anything is sent, and on 1.x and 2.x that
+  // policy is the only boundary before `DROP DATABASE`.
+  influxdb: {
+    operations: INFLUXQL_DESTRUCTIVE_OPERATIONS,
+    read: readInfluxqlOperations,
+    decidesAlone: true,
+    // A statement carries tag values and filters, so no InfluxQL statement is posted for an AI analysis (R21).
+    safetyAnalysis: false,
+    refuse: influxqlRefusal,
+    maxTextBytes: INFLUXQL_MAX_TEXT_BYTES,
+  },
+  kafka: { operations: KAFKA_DESTRUCTIVE_OPERATIONS, read: readKafkaOperations, decidesAlone: true },
+  // Kubernetes: the provider refuses every mutating command before any request, so nothing asks. A statement names
+  // namespaces and objects, so none is posted for an AI analysis. What the console's parser refuses (a write, exec or
+  // a tunnel, a connection flag, a flag outside v1) the editor refuses before anything is sent, past the dialect's
+  // own byte bound.
+
+  // MQTT (#1635): there is no console and no statement, so nothing is ever read for a destructive verb. The row
+  // exists because the record is exhaustive over every engine whose text is not SQL, and its operations list is
+  // empty by construction: this provider has no code that can write to a broker.
+  mqtt: { operations: new Set<string>(), read: () => [], decidesAlone: true, safetyAnalysis: false },
+  // Firestore (spec 3.2): the S3 and Kubernetes model. The console's own guard reads the text with the parser the
+  // provider runs, so what is refused and what runs are one parse. A statement only reads, so nothing asks; what the
+  // guard refuses (a write method, a second statement, the modular API, a `${` in a template string) the editor refuses
+  // before anything is sent, past the console's 64 KiB bound. A statement names collections, ids and values, so none is
+  // posted for an AI analysis.
+  firestore: {
+    operations: new Set<string>(),
+    read: () => [],
+    decidesAlone: true,
+    safetyAnalysis: false,
+    refuse: (text) => firestoreRefusal(text) ?? undefined,
+    maxTextBytes: FIRESTORE_LIMITS.maxConsoleBytes,
+  },
+  // RabbitMQ (#1656): a read request reads a stream's messages and nothing else, so no destructive verb exists to read
+  // and nothing is posted for an AI analysis.
+  rabbitmq: { operations: new Set<string>(), read: () => [], decidesAlone: true, safetyAnalysis: false },
+
+  // OPC UA (#1677): the console reads one JSON read request, so there is no destructive verb to find. The row
+  // exists because the record is exhaustive over every engine whose text is not SQL, and its operations list is
+  // empty by construction: the client seam names eight read services and none of them writes.
+  opcua: { operations: new Set<string>(), read: () => [], decidesAlone: true, safetyAnalysis: false },
+
+  // MTConnect (#1722): the console reads one request line from a closed table of nine routes, every one a GET, so
+  // there is no destructive verb to find. The row names no operation ON PURPOSE, in the shape Prometheus and Kafka
+  // use: naming one would claim this provider can send it.
+  mtconnect: { operations: new Set<string>(), read: () => [], decidesAlone: true, safetyAnalysis: false },
+  // Modbus (#1723): the row exists because `readsSqlText` says this engine's text is not SQL, and
+  // it names NO operation on purpose, in the shape MTConnect and Prometheus use. The encoder builds
+  // four read function codes and the identification request and nothing else, so there is no
+  // destructive verb to find; naming one would claim this provider can send it.
+  modbus: { operations: new Set<string>(), read: () => [], decidesAlone: true, safetyAnalysis: false },
+
+  // NETCONF (#1724): the console reads one JSON read request naming a datastore, a path and a bound, so there is no
+  // destructive verb to find. The operations list is empty BY CONSTRUCTION rather than by this version's scope:
+  // `requests.ts` builds four read operations and a close, and no function in the provider can build an
+  // `<edit-config>`, a `<commit>` or a `<lock>`. Naming an operation here would claim this provider can send one.
+  netconf: { operations: new Set<string>(), read: () => [], decidesAlone: true, safetyAnalysis: false },
+  snmp: { operations: new Set<string>(), read: () => [], decidesAlone: true, safetyAnalysis: false },
+  // Sparkplug B (#1720): a read request names a group, an edge node and a window, so there is no destructive verb
+  // to read, and nothing is posted for an AI analysis. The absence is structural: the encoder has no function that
+  // writes a PUBLISH, so no console text could change a plant even if one named a verb.
+  sparkplug: { operations: new Set<string>(), read: () => [], decidesAlone: true, safetyAnalysis: false },
+  kubernetes: {
+    operations: KUBERNETES_DESTRUCTIVE_OPERATIONS,
+    read: readKubernetesOperations,
+    decidesAlone: true,
+    safetyAnalysis: false,
+    refuse: kubectlRefusal,
+    maxTextBytes: KUBECTL_MAX_TEXT_BYTES,
+  },
+  // Milvus (vector-family spec 5.7, E10): the provider's own guard.ts reads the text with the parser the provider
+  // runs, so what asks and what runs are one parse. A v1 request only reads, so nothing asks; what guard.ts refuses
+  // (a write route, a server-side function, an endpoint-bearing key) the editor refuses before anything is sent.
+  milvus: {
+    operations: MILVUS_DESTRUCTIVE_OPERATIONS,
+    read: readMilvusOperations,
+    decidesAlone: true,
+    // A request carries vectors, filters and values, so no Milvus statement is posted for an AI analysis.
+    safetyAnalysis: false,
+    refuse: milvusRefusal,
+    maxTextBytes: MILVUS_CONSOLE.maxTextBytes,
+  },
+  mongodb: { operations: MONGODB_DESTRUCTIVE_OPERATIONS, read: readMongodbOperations, decidesAlone: false },
+  // The provider refuses every write before sending it, so a confirmation would ask about a statement that
+  // cannot run (Neo4j spec 5.5).
+  neo4j: { operations: NEO4J_DESTRUCTIVE_OPERATIONS, read: readNeo4jOperations, decidesAlone: true },
+  // Oxia (O10, C17): the provider's own guard.ts reads the text with the parser the provider runs, so what asks
+  // and what runs are one parse. v1 only reads, so nothing asks; what guard.ts refuses (a write or stream verb,
+  // a key under __oxia/, a refused flag) the editor refuses before anything is sent.
+  oxia: {
+    operations: OXIA_DESTRUCTIVE_OPERATIONS,
+    read: readOxiaOperations,
+    decidesAlone: true,
+    // A command names keys, and an Oxia key path names Pulsar tenants, namespaces and topics (SEC-05), so no
+    // Oxia statement is posted for an AI analysis.
+    safetyAnalysis: false,
+    refuse: oxiaRefusal,
+    maxTextBytes: OXIA_MAX_TEXT_BYTES,
+  },
+  prometheus: { operations: PROMETHEUS_DESTRUCTIVE_OPERATIONS, read: readPrometheusOperations, decidesAlone: true },
+  // Qdrant (vector-family spec 6.7): the provider's own guard.ts reads the text with the parser the provider
+  // runs, so what asks and what runs are one parse. A v1 request only reads, so nothing asks; what guard.ts refuses
+  // (a write route, an inference input other than local BM25, an unknown key) the editor refuses before anything is
+  // sent.
+  qdrant: {
+    operations: QDRANT_DESTRUCTIVE_OPERATIONS,
+    read: readQdrantOperations,
+    decidesAlone: true,
+    // A request carries vectors, filters and payload values, so no Qdrant statement is posted for an AI analysis.
+    safetyAnalysis: false,
+    refuse: qdrantRefusal,
+    maxTextBytes: QDRANT_CONSOLE.maxTextBytes,
+  },
+  // Redis: each line of the text is one command (docs/providers/redis.md 3.4a), and a second command is refused in
+  // the editor with the provider's own reading, before anything is sent, rather than run as one merged command.
+  redis: {
+    operations: REDIS_DESTRUCTIVE_COMMANDS,
+    read: readRedisOperations,
+    decidesAlone: false,
+    refuse: redisRefusal,
+  },
+  // S3-compatible object storage: the provider's own guard reads the text with the parser the provider runs, so
+  // what asks and what runs are one parse. v1 only reads, so nothing asks; what the guard refuses (a write command, an
+  // unknown flag, a bucket or key the console cannot address) the editor refuses before anything is sent.
+  s3: {
+    operations: S3_DESTRUCTIVE_OPERATIONS,
+    read: readS3Operations,
+    decidesAlone: true,
+    // A command names buckets and keys, so no S3 statement is posted for an AI analysis.
+    safetyAnalysis: false,
+    refuse: s3Refusal,
+    maxTextBytes: S3_MAX_TEXT_BYTES,
+  },
 };
+
+/**
+ * Whether this type's row is the gate's whole answer, which `isDangerousQuery` asks
+ * before it reads the text as SQL at all.
+ *
+ * False for every type with no row, and for no type at all: the SQL half reads those.
+ */
+export function vocabularyDecidesAlone(databaseType?: DatabaseType): boolean {
+  const facts = databaseType === undefined ? undefined : NON_SQL_DESTRUCTIVE_VOCABULARY[databaseType];
+  return facts?.decidesAlone === true;
+}
 
 /**
  * Whether this query, on a type whose text is not SQL, asks for a confirmation.
@@ -351,4 +656,85 @@ export function isDestructiveNonSqlQuery(query: string, databaseType?: DatabaseT
   const named = facts.read(query);
   if (named === undefined) return true;
   return named.some((name) => facts.operations.has(name));
+}
+
+/**
+ * What this statement asks the person to type before it runs, or undefined where the gate's one click is the whole
+ * confirmation (#1089, section 5.5).
+ *
+ * Undefined for every type with no row, including no type at all, and for every row that declares no
+ * `typedConfirmation`. The text reaches the row as it was written.
+ */
+export function vocabularyTypedConfirmation(
+  databaseType: DatabaseType | undefined,
+  text: string,
+): TypedConfirmationAsk | undefined {
+  const facts = databaseType === undefined ? undefined : NON_SQL_DESTRUCTIVE_VOCABULARY[databaseType];
+  return facts?.typedConfirmation?.(text);
+}
+
+/**
+ * Whether the confirmation gate may post this type's statements to the AI safety analysis (#1089, E10).
+ *
+ * True for every type with no row, including no type at all, and for every row that does not declare
+ * `safetyAnalysis: false`, which is what the gate did for every engine before the field existed.
+ */
+export function vocabularySendsToModel(databaseType?: DatabaseType): boolean {
+  const facts = databaseType === undefined ? undefined : NON_SQL_DESTRUCTIVE_VOCABULARY[databaseType];
+  return facts?.safetyAnalysis !== false;
+}
+
+/**
+ * The UTF-8 length of a text, counted without encoding it: a surrogate pair is one code point of four bytes, and a
+ * lone surrogate counts three, as `TextEncoder` and `Buffer.byteLength` write it as U+FFFD.
+ */
+function utf8Bytes(text: string): number {
+  let bytes = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const unit = text.charCodeAt(index);
+    if (unit < 0x80) {
+      bytes += 1;
+    } else if (unit < 0x800) {
+      bytes += 2;
+    } else if (unit >= 0xd800 && unit <= 0xdbff && (text.charCodeAt(index + 1) & 0xfc00) === 0xdc00) {
+      bytes += 4;
+      index += 1;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+/**
+ * The console text bound this connection type declares, in UTF-8 bytes, or undefined where it declares none.
+ *
+ * Undefined for every type with no row, including no type at all, and for every row that declares no bound.
+ */
+export function consoleTextByteLimit(databaseType?: DatabaseType): number | undefined {
+  const facts = databaseType === undefined ? undefined : NON_SQL_DESTRUCTIVE_VOCABULARY[databaseType];
+  return facts?.maxTextBytes;
+}
+
+/** The sentence a text over `limit` bytes is refused with, naming its size and the bound and never quoting it. */
+export function consoleTextOverLimit(text: string, limit: number): string | undefined {
+  const bytes = utf8Bytes(text);
+  if (bytes <= limit) return undefined;
+  return `The statement is ${bytes} bytes in UTF-8, over the ${limit}-byte limit for this connection type. Shorten it to run it.`;
+}
+
+/**
+ * Why this connection type's editor refuses this statement, or undefined to send it.
+ *
+ * The bound first, so a row's own verdict never reads an oversize text; then the row's `refuse`. Undefined for
+ * every type with no row, including no type at all, and for every row that declares neither field.
+ */
+export function statementRefusal(query: string, databaseType?: DatabaseType): string | undefined {
+  const facts = databaseType === undefined ? undefined : NON_SQL_DESTRUCTIVE_VOCABULARY[databaseType];
+  if (facts === undefined) return undefined;
+  if (facts.maxTextBytes !== undefined) {
+    const over = consoleTextOverLimit(query, facts.maxTextBytes);
+    if (over !== undefined) return over;
+  }
+  return facts.refuse?.(query);
 }

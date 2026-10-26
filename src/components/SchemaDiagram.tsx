@@ -17,7 +17,9 @@ import {
   type NodeTypes,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { TableSchema } from "@/lib/types";
+import { relationCountLabel, relationObjects, type DetailedObject } from "@/lib/db/detailed-object";
+import { objectPathLabel } from "@/lib/db/object-path";
+import type { ProviderCapabilities } from "@/lib/db/types";
 import { Download, Info, LoaderCircle, Search, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { motion } from "framer-motion";
@@ -55,8 +57,19 @@ function yieldToPaint(): Promise<void> {
 }
 
 interface SchemaDiagramProps {
-  schema: TableSchema[];
+  schema: readonly DetailedObject[];
   onClose: () => void;
+  /**
+   * The provider's own declaration. WHICH kinds this diagram draws is a filter over the
+   * kinds the engine declared with `role: "relation"`, not a constant in this file: a
+   * diagram is columns and foreign keys, which is what a relation has and a routine, a
+   * trigger and a ClickHouse dictionary do not. A new engine's relation kind is therefore
+   * drawn with no change here (#789).
+   *
+   * Optional because the metadata read is asynchronous, and an empty canvas while it is in
+   * flight would read as a database with no tables.
+   */
+  capabilities?: ProviderCapabilities;
 }
 
 /**
@@ -84,7 +97,7 @@ const DIAGRAM_THEME = {
   },
 } as const;
 
-function SchemaDiagramInner({ schema, onClose }: SchemaDiagramProps) {
+function SchemaDiagramInner({ schema, onClose, capabilities }: SchemaDiagramProps) {
   const mode = useEffectiveTheme();
   const diagram = DIAGRAM_THEME[mode];
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
@@ -106,16 +119,19 @@ function SchemaDiagramInner({ schema, onClose }: SchemaDiagramProps) {
   const [highlightStore] = useState(createHighlightStore);
   const { toast } = useToast();
 
+  // What this canvas may draw at all: the engine's declared relation kinds.
+  const relations = useMemo(() => relationObjects(schema, capabilities), [schema, capabilities]);
+
   // Filter tables by search (deferred so typing stays responsive on large schemas)
   const filteredSchema = useMemo(() => {
-    if (!deferredQuery.trim()) return schema;
+    if (!deferredQuery.trim()) return relations;
     const q = deferredQuery.toLowerCase();
-    return schema.filter((t) => t.name.toLowerCase().includes(q));
-  }, [schema, deferredQuery]);
+    return relations.filter((t) => t.name.toLowerCase().includes(q));
+  }, [relations, deferredQuery]);
 
   const graph = useMemo(
-    () => buildGraph(filteredSchema, { compact: compactMode, expandedTables: new Set(expandedTables) }),
-    [filteredSchema, compactMode, expandedTables],
+    () => buildGraph(filteredSchema, { compact: compactMode, expandedTables: new Set(expandedTables), capabilities }),
+    [filteredSchema, compactMode, expandedTables, capabilities],
   );
 
   // The STRUCTURE of the graph (tables, relationships, compact mode). Both the
@@ -172,10 +188,11 @@ function SchemaDiagramInner({ schema, onClose }: SchemaDiagramProps) {
   // async second-phase schema) is invalid the moment the graph rebuilds. The
   // memo matters: onNodesChange re-renders on every drag frame, and this scan
   // is O(nodes).
-  const selectionInGraph = useMemo(
-    () => (selectedNode ? graph.nodes.some((n) => n.id === selectedNode) : true),
+  const selectedTable = useMemo(
+    () => graph.nodes.find((n) => n.id === selectedNode)?.data.table ?? null,
     [graph, selectedNode],
   );
+  const selectionInGraph = selectedNode === null || selectedTable !== null;
   if (!selectionInGraph) {
     setSelectedNode(null);
   }
@@ -285,13 +302,15 @@ function SchemaDiagramInner({ schema, onClose }: SchemaDiagramProps) {
 
   const diagramActions = useMemo<DiagramActions>(
     () => ({
-      toggleExpand: (table: string) => {
+      // The NODE ID, which `buildGraph` writes as the object's `diagramNodeId`: a label is shared
+      // by two objects in two containers and expanded whichever the set answered for (#789).
+      toggleExpand: (nodeId: string) => {
         setExpandedTables((current) => {
           const next = new Set(current);
-          if (next.has(table)) {
-            next.delete(table);
+          if (next.has(nodeId)) {
+            next.delete(nodeId);
           } else {
-            next.add(table);
+            next.add(nodeId);
           }
           return next;
         });
@@ -344,16 +363,16 @@ function SchemaDiagramInner({ schema, onClose }: SchemaDiagramProps) {
   // Warn when the DISPLAYED graph runs on guesses: either the schema carries
   // no FK data at all, or the current (possibly filtered) view fell back to
   // dashed heuristic edges because no FK is usable within it.
-  const schemaHasFkData = schema.some((t) => (t.foreignKeys || []).length > 0);
+  const schemaHasFkData = relations.some((t) => (t.foreignKeys || []).length > 0);
   const showHeuristicWarning = graph.usedHeuristic || !schemaHasFkData;
   const heuristicWarningText = graph.usedHeuristic
     ? `${schemaHasFkData ? "No usable FK relationships in this view." : "No FK data available."} Showing heuristic relationships (dashed).`
     : "No FK data available.";
 
-  if (schema.length === 0) {
+  if (relations.length === 0) {
     return (
       <div className="absolute inset-0 z-50 bg-canvas flex flex-col items-center justify-center">
-        <LoaderCircle strokeWidth={1.5} className="w-8 h-8 text-blue-500 animate-spin mb-4" />
+        <LoaderCircle strokeWidth={1.5} className="w-8 h-8 text-brand animate-spin mb-4" />
         <p className="text-fg-muted text-xs">Generating ERD Diagram...</p>
       </div>
     );
@@ -435,7 +454,7 @@ function SchemaDiagramInner({ schema, onClose }: SchemaDiagramProps) {
                 <Button
                   variant="outline"
                   size="sm"
-                  className={`bg-raised border-hairline-strong hover:bg-fill text-xs ${compactMode ? "text-blue-400" : ""}`}
+                  className={`bg-raised border-hairline-strong hover:bg-fill text-xs ${compactMode ? "text-brand" : ""}`}
                   onClick={() => setCompactMode(!compactMode)}
                 >
                   {compactMode ? "Detail" : "Compact"}
@@ -445,6 +464,7 @@ function SchemaDiagramInner({ schema, onClose }: SchemaDiagramProps) {
                   size="icon"
                   className="rounded-full bg-raised border-hairline-strong hover:bg-fill"
                   onClick={onClose}
+                  aria-label="Close schema diagram"
                 >
                   <X strokeWidth={1.5} className="w-3.5 h-3.5" />
                 </Button>
@@ -455,11 +475,11 @@ function SchemaDiagramInner({ schema, onClose }: SchemaDiagramProps) {
             <Panel position="top-left" className="p-4">
               <div className="bg-raised/80 backdrop-blur-md border border-hairline-strong p-3 rounded-xl shadow-2xl space-y-2">
                 <h3 className="text-xs font-medium text-fg mb-1 flex items-center gap-2">
-                  <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+                  <div className="w-2 h-2 rounded-full bg-brand-tint animate-pulse" />
                   ERD Visualizer
                 </h3>
                 <div className="flex items-center gap-3 text-xs text-fg-muted">
-                  <span>{filteredSchema.length} tables</span>
+                  <span>{relationCountLabel(filteredSchema, capabilities)}</span>
                   <span>{graph.edgeCount} relationships</span>
                   {isLayouting && (
                     <span className="flex items-center gap-1 text-fg-subtle">
@@ -480,22 +500,25 @@ function SchemaDiagramInner({ schema, onClose }: SchemaDiagramProps) {
                     placeholder="Filter tables..."
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
-                    className="w-full pl-7 pr-2 py-1.5 bg-fill border border-hairline-strong rounded text-xs text-fg-secondary placeholder:text-fg-subtle focus:outline-none focus:border-blue-500/50"
+                    className="w-full pl-7 pr-2 py-1.5 bg-fill border border-hairline-strong rounded text-xs text-fg-secondary placeholder:text-fg-subtle focus:outline-none focus:border-brand-tint/50"
                   />
                 </div>
 
                 {/* No FK warning */}
                 {showHeuristicWarning && (
-                  <div className="flex items-start gap-1.5 text-[0.625rem] text-amber-500/80">
+                  <div className="flex items-start gap-1.5 text-[0.625rem] text-warning/80">
                     <Info strokeWidth={1.5} className="w-3 h-3 mt-0.5 shrink-0" />
                     <span>{heuristicWarningText}</span>
                   </div>
                 )}
 
                 {/* Selected node info */}
-                {selectedNode && (
-                  <div className="text-xs text-blue-400 border-t border-hairline pt-2">
-                    Selected: <span className="font-mono font-medium">{selectedNode}</span>
+                {selectedTable && (
+                  <div className="text-xs text-brand border-t border-hairline pt-2">
+                    {/* The dotted ADDRESS and never the node id: the id is `diagramNodeId`, an
+                        escaped address nobody reads, and never the bare label, which two
+                        objects in two containers share (#789). */}
+                    Selected: <span className="font-mono font-medium">{objectPathLabel(selectedTable.path)}</span>
                     <button onClick={() => selectTable(null)} className="ml-2 text-fg-subtle hover:text-fg-tertiary">
                       clear
                     </button>
@@ -509,7 +532,7 @@ function SchemaDiagramInner({ schema, onClose }: SchemaDiagramProps) {
               transform is temporarily swapped for the fit-all capture. */}
           {exporting && (
             <div className="absolute inset-0 z-50 bg-canvas/85 flex flex-col items-center justify-center gap-2">
-              <LoaderCircle strokeWidth={1.5} className="w-6 h-6 text-blue-500 animate-spin" />
+              <LoaderCircle strokeWidth={1.5} className="w-6 h-6 text-brand animate-spin" />
               <p className="text-fg-muted text-xs">Exporting {exporting.toUpperCase()}...</p>
             </div>
           )}
@@ -519,10 +542,10 @@ function SchemaDiagramInner({ schema, onClose }: SchemaDiagramProps) {
   );
 }
 
-export function SchemaDiagram({ schema, onClose }: SchemaDiagramProps) {
+export function SchemaDiagram({ schema, onClose, capabilities }: SchemaDiagramProps) {
   return (
     <ReactFlowProvider>
-      <SchemaDiagramInner schema={schema} onClose={onClose} />
+      <SchemaDiagramInner schema={schema} onClose={onClose} capabilities={capabilities} />
     </ReactFlowProvider>
   );
 }

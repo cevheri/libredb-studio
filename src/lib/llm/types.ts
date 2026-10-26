@@ -9,6 +9,21 @@
 
 export type LLMProviderType = "gemini" | "openai" | "ollama" | "custom";
 
+/**
+ * The reasoning efforts `LLM_MODEL_EFFORT` may name: exactly the values the installed
+ * `@ai-sdk/openai` declares for `reasoningEffort` on its chat options, which
+ * `tests/unit/llm/config.test.ts` pins at compile time so an SDK upgrade cannot widen or narrow
+ * the set behind this list's back. The SDK's Responses options take any string, so the chat enum
+ * is the stricter of its two declarations and the one an operator's typo is caught against.
+ *
+ * Which of these a given model accepts is the model's fact, not this list's: GPT-6.1 Sol, for
+ * one, has no `none`. Studio keeps no model table for that; the SDK's own refusal is raised as an
+ * error where the agent reads it (`src/lib/agent/model-adapter.ts`).
+ */
+export const LLM_MODEL_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+export type LLMModelEffort = (typeof LLM_MODEL_EFFORTS)[number];
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -18,6 +33,19 @@ export interface LLMConfig {
   apiKey?: string;
   model: string;
   apiUrl?: string;
+  /**
+   * True when the provider was named rather than defaulted. Naming one is a statement of intent to
+   * use AI, so missing credentials are then an unfinished setup to report, not an absence to pass
+   * over. Absent means implicit, which keeps a hand-built config on the quiet path.
+   */
+  providerExplicit?: boolean;
+  /**
+   * The reasoning effort `LLM_MODEL_EFFORT` names, trimmed and lower-cased, or absent for the
+   * provider's own default. Held as configured rather than as an `LLMModelEffort`, because a
+   * typo has to survive resolution to be refused by `validateConfig`; read it through
+   * `validModelEffort`, which narrows it.
+   */
+  modelEffort?: string;
 }
 
 // ============================================================================
@@ -40,6 +68,12 @@ export interface LLMStreamOptions {
   model?: string;
   temperature?: number;
   maxTokens?: number;
+  /**
+   * Ends the request when it aborts: the wait for the first byte, the stream after it, and any retry
+   * not yet sent. A caller that bounds how long it waits for a model passes one, because a request
+   * the caller has stopped waiting for would otherwise keep running against the endpoint.
+   */
+  signal?: AbortSignal;
 }
 
 // ============================================================================
@@ -87,10 +121,18 @@ export class LLMError extends Error {
 }
 
 /**
- * Configuration error - missing or invalid config
+ * Configuration error - missing or invalid config.
+ *
+ * `reason` marks the two cases a caller treats apart: `missing_credentials`, an AI setup that may be
+ * absent on purpose, and `effort_refused`, an `LLM_MODEL_EFFORT` the configured model does not take,
+ * which the agent's start path refuses in every mode rather than letting a run reach it.
  */
 export class LLMConfigError extends LLMError {
-  constructor(message: string, provider?: LLMProviderType) {
+  constructor(
+    message: string,
+    provider?: LLMProviderType,
+    public readonly reason?: "missing_credentials" | "effort_refused",
+  ) {
     super(message, provider);
     this.name = "LLMConfigError";
     Object.setPrototypeOf(this, LLMConfigError.prototype);
@@ -168,6 +210,43 @@ export function isRetryableError(error: unknown): boolean {
     return false;
   }
 
+  // Context length exceeded errors are not retryable
+  if (isContextLengthError(error)) {
+    return false;
+  }
+
   // Rate limit and stream errors may be retryable
   return true;
+}
+
+/** Maximum character budget for schema context in AI documentation */
+export const MAX_SCHEMA_CONTEXT_CHARS = 30_000;
+
+/** Whether an error indicates the prompt exceeded the model's available context window */
+export function isContextLengthError(error: unknown): boolean {
+  if (!error) return false;
+  const msg = error instanceof Error ? error.message : String(error);
+  return msg.includes("exceeds the available context size");
+}
+
+/**
+ * Whether the endpoint refused the model's TOOL CALL because it could not parse it.
+ *
+ * A distinction `isRetryableError` cannot draw and must not: both arrive as `LLMStreamError`, and
+ * a broken frame genuinely is worth sending the same bytes again. This one is not. The endpoint
+ * read the model's arguments, failed on them, and hands the raw text back — so re-sending the
+ * identical request asks the model to make the identical mistake, which is what it does.
+ *
+ * Measured on `gpt-oss:20b`, database-assessment: three runs, each re-asked the full two allowed
+ * times, six attempts, six identical failures, the run ending seventeen seconds into a
+ * 630-second budget with four tools already called. The endpoint's own message is
+ * `error parsing tool call: raw='<the model's text>', err=<why>` — a reasoning model writing its
+ * thinking into the argument field with valid JSON after it.
+ *
+ * Matched on the endpoint's wording, which is narrow on purpose. The alternative — treating every
+ * stream error as a model fault — would stop re-asking the broken frames that the re-ask above
+ * was measured to rescue.
+ */
+export function isToolCallParseError(error: unknown): boolean {
+  return error instanceof LLMStreamError && /parsing tool call/i.test(error.message);
 }

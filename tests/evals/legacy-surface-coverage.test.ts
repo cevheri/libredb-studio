@@ -182,16 +182,20 @@ const ASSESSMENT = "Tell me what is wrong with this database.";
 
 /** One under-populated, unindexed foreign key — the shape Autopilot's index section was for. */
 const PG_COLUMNS = [
-  { table_schema: "public", table_name: "employees", column_name: "emp_no", data_type: "integer", is_nullable: "NO" },
   {
     table_schema: "public",
     table_name: "employees",
-    column_name: "department_id",
-    data_type: "integer",
-    is_nullable: "YES",
+    columns: [
+      { name: "emp_no", type: "integer", nullable: "NO" },
+      { name: "department_id", type: "integer", nullable: "YES" },
+      { name: "hired_on", type: "date", nullable: "YES" },
+    ],
   },
-  { table_schema: "public", table_name: "employees", column_name: "hired_on", data_type: "date", is_nullable: "YES" },
-  { table_schema: "public", table_name: "departments", column_name: "id", data_type: "integer", is_nullable: "NO" },
+  {
+    table_schema: "public",
+    table_name: "departments",
+    columns: [{ name: "id", type: "integer", nullable: "NO" }],
+  },
 ];
 
 const PG_RELATIONS = [
@@ -237,7 +241,7 @@ const SQLITE_OBJECTS = [
 const INVENTORY: Readonly<Record<"postgres" | "sqlite", (sql: string) => ReturnType<typeof rows> | null>> = {
   postgres: (sql) => {
     if (sql.includes("information_schema.columns")) {
-      return rows(PG_COLUMNS, ["table_schema", "table_name", "column_name", "data_type", "is_nullable"]);
+      return rows(PG_COLUMNS, ["table_schema", "table_name", "columns"]);
     }
     if (sql.includes("pg_constraint")) {
       return rows(PG_RELATIONS, [
@@ -389,16 +393,23 @@ describe("what the removed panels did that these runs do not", () => {
       "inspect_operations",
       "inspect_plan",
       "inspect_schema",
+      // The cluster usage reading, offered by no SQL workflow: it reaches a cluster, not a monitoring panel.
+      "inspect_usage",
       // Registered, and offered by no workflow yet — asserted over every workflow
       // type in `tests/unit/lib/agent/tools.test.ts`.
       "present_answer",
       "profile_table",
+      // The cluster workload profile, offered by no SQL workflow either: it reads a namespace's workloads.
+      "profile_workloads",
       "recommend_change",
       "run_read_query",
     ]);
-    // Four canonical operations: three composed SQL, and the curated read that names
-    // no statement at all. That fourth id is the thing B27 said did not exist.
+    // Four canonical SQL-side operations: three composed SQL, and the curated read that names
+    // no statement at all. That fourth id is the thing B27 said did not exist. The fifth and sixth
+    // are the cluster usage reading and the workload profile, which name no statement either.
     expect([...new Set(Object.values(AGENT_TOOL_DEFINITIONS).map((tool) => tool.operationId))].sort()).toEqual([
+      "cluster.usage.read",
+      "cluster.workloads.read",
       "db.operations.read",
       "sql.explain.estimate",
       "sql.query.read",
@@ -434,6 +445,8 @@ describe("what the removed panels did that these runs do not", () => {
         void turn;
         return chatToolCallStream("read_monitoring", JSON.stringify({ slowQueryLimit: 20 }), "call_monitor");
       },
+      answersProse("I cannot read live monitoring from here."),
+      // A refused call read nothing, so the drive names the instruments once more.
       answersProse("I cannot read live monitoring from here."),
     ]);
 
@@ -516,6 +529,8 @@ describe("what the removed panels did that these runs do not", () => {
         );
       },
       answersProse("I can only report what I read."),
+      // A refused call read nothing, so the drive names the instruments once more.
+      answersProse("I can only report what I read."),
     ]);
 
     expect(drive.transcripts[1] ?? "").toContain(String.raw`There is no tool called \"recommend_change\"`);
@@ -536,7 +551,10 @@ describe("what the removed panels did that these runs do not", () => {
       answer: async () => rows(HEADCOUNTS, ["department", "headcount"]),
     });
     runs.push(followUp);
-    const second = await followUp.drive([answersProse("I would count the sales table.")]);
+    const second = await followUp.drive([
+      answersProse("I would count the sales table."),
+      answersProse("I would count the sales table."),
+    ]);
 
     expect(followUp.runId).not.toBe(first.runId);
     const prompt = second.transcripts[0] ?? "";

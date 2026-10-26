@@ -3,8 +3,11 @@ import { AGENT_HANDOVER_BUDGET, AGENT_HANDOVER_PROFILE } from "@/lib/agent/execu
 import type { AgentRunEvent } from "@/lib/agent/types";
 import { accessAgentRun } from "@/lib/api/agent-run-access";
 import { createErrorResponse } from "@/lib/api/errors";
+import { editorExecutionContext } from "@/lib/api/execution-context";
+import { catalogSessionConnection } from "@/lib/db/catalog-scope";
 import { acquireExecutionProfileProvider } from "@/lib/db/factory";
 import { logger } from "@/lib/logger";
+import { rowsWithNonFiniteWords } from "@/lib/non-finite";
 import { resolveConnection } from "@/lib/seed/resolve-connection";
 
 /**
@@ -86,14 +89,24 @@ export async function POST(req: Request, context?: HandoverParams) {
   }
 
   try {
-    const connection = await resolveConnection(
+    const resolved = await resolveConnection(
       { connectionId: record.connectionId },
       { role: record.actor.role, username: record.actor.sessionId },
     );
-    const provider = await acquireExecutionProfileProvider(connection, AGENT_HANDOVER_PROFILE);
+    // In the database the run read, on a server-level connection (#1530): the run drafted the
+    // statement against that database's objects, so it runs there and nowhere else.
+    const connection = record.catalog === undefined ? resolved : catalogSessionConnection(resolved, record.catalog);
+    // The run's own actor decides the file-access posture, as it decided the connection above: SQLite
+    // opens only for a trusted requester, on this profile as in the editor.
+    const provider = await acquireExecutionProfileProvider(
+      connection,
+      AGENT_HANDOVER_PROFILE,
+      {},
+      editorExecutionContext({ role: record.actor.role }, connection),
+    );
     if (typeof provider.queryReadOnly !== "function") {
       // Never a fallback to `query()`. `acquireExecutionProfileProvider` already
-      // refuses a provider without the database-native path under this profile, so
+      // refuses a provider without a read-only statement path under this profile, so
       // reaching here is a server fault — and the one thing it must not do is put the
       // statement on the writable path this route exists to leave.
       throw new Error("agent hand-over: the acquired provider exposes no read-only execution path");
@@ -111,7 +124,13 @@ export async function POST(req: Request, context?: HandoverParams) {
     // actually ran rather than its own copy of it. No `pagination`: there is no offset
     // to page with here — the row bound refuses rather than truncates, exactly as the
     // agent's own path does (§2.5), so a result that arrived is a whole result.
-    return NextResponse.json({ runId, sql: answer.sql, result });
+    // NaN and the infinities as words, as on `/api/db/query` (`src/lib/non-finite.ts`).
+    return NextResponse.json({
+      runId,
+      ...(record.catalog === undefined ? {} : { catalog: record.catalog }),
+      sql: answer.sql,
+      result: { ...result, rows: rowsWithNonFiniteWords(result.rows) },
+    });
   } catch (error) {
     return createErrorResponse(error, { route: ROUTE });
   }

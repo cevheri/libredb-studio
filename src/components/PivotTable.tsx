@@ -1,17 +1,34 @@
 "use client";
 
 import React, { useState, useMemo, useCallback, useEffect } from "react";
-import { Columns3, GripVertical, ArrowRight } from "lucide-react";
+import { Columns3, GripVertical, ArrowRight, Download } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { DatabaseType, QueryResult } from "@/lib/types";
 import { quoteLiteral } from "@/lib/sql/values";
 import { quoteIdentifier } from "@/lib/sql/identifier";
+import { downloadText } from "@/lib/export/download";
+import { pivotTableText } from "@/lib/export/pivot-table";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 interface PivotTableProps {
-  result: QueryResult | null;
-  onLoadQuery?: (query: string) => void;
+  readonly result: QueryResult | null;
+  readonly onLoadQuery?: (query: string) => void;
   /** The connected engine, so a generated literal is quoted the way it reads it. */
-  databaseType?: string;
+  readonly databaseType?: string;
+  /**
+   * Whether this connection can RUN the SQL this panel generates, or undefined while nobody knows.
+   *
+   * A browser pass on OPC UA pressed Generate SQL and watched it replace the reader's JSON read
+   * request with a SELECT the engine cannot parse - the editor's contents gone, and the only way
+   * back the undo stack. The engine's declared `queryLanguage` is the fact, so the control is drawn
+   * where the answer is yes or not yet known and withheld where it is no.
+   */
+  readonly offersGeneratedSql?: boolean;
 }
 
 type AggFunction = "count" | "sum" | "avg" | "min" | "max";
@@ -41,7 +58,7 @@ export function aggregate(values: unknown[], fn: AggFunction): string {
   }
 }
 
-export function PivotTable({ result, onLoadQuery, databaseType }: PivotTableProps) {
+export function PivotTable({ result, onLoadQuery, databaseType, offersGeneratedSql }: PivotTableProps) {
   const [rowField, setRowField] = useState<string | null>(null);
   const [colField, setColField] = useState<string | null>(null);
   const [valueField, setValueField] = useState<string | null>(null);
@@ -106,6 +123,29 @@ export function PivotTable({ result, onLoadQuery, databaseType }: PivotTableProp
 
     return { colKeys, pivotRows };
   }, [rows, rowField, colField, valueField, aggFunction]);
+
+  const exportPivot = useCallback(
+    (format: "csv" | "json") => {
+      if (!pivotData || !rowField) return;
+
+      const headers = [
+        rowField,
+        ...pivotData.colKeys.map((ck) => (ck === "__all__" ? `${AGG_LABELS[aggFunction]}(${valueField || "*"})` : ck)),
+      ];
+
+      const rows = pivotData.pivotRows.map((row) => [
+        row.rowKey,
+        ...pivotData.colKeys.map((ck) => row.values.get(ck) || "0"),
+      ]);
+
+      downloadText(
+        pivotTableText(headers, rows, format),
+        format === "csv" ? "text/csv" : "application/json",
+        `pivot_table_${Date.now()}.${format}`,
+      );
+    },
+    [pivotData, rowField, valueField, aggFunction],
+  );
 
   // Generate SQL
   const generateSQL = useCallback(() => {
@@ -214,7 +254,7 @@ export function PivotTable({ result, onLoadQuery, databaseType }: PivotTableProp
               className={cn(
                 "px-1.5 py-0.5 rounded text-xs font-medium transition-colors",
                 aggFunction === fn
-                  ? "bg-blue-500/20 text-blue-400 border border-blue-500/20"
+                  ? "bg-brand-tint/20 text-brand border border-brand-tint/20"
                   : "text-fg-subtle hover:text-fg-tertiary",
               )}
             >
@@ -223,16 +263,34 @@ export function PivotTable({ result, onLoadQuery, databaseType }: PivotTableProp
           ))}
         </div>
 
-        {onLoadQuery && rowField && (
+        {onLoadQuery && rowField && offersGeneratedSql !== false && (
           <button
             onClick={() => {
               const sql = generateSQL();
               if (sql) onLoadQuery(sql);
             }}
-            className="ml-auto flex items-center gap-1 px-2 py-1 rounded text-xs font-medium text-fg-muted hover:text-blue-400 hover:bg-blue-500/10 transition-colors"
+            className="ml-auto flex items-center gap-1 px-2 py-1 rounded text-xs font-medium text-fg-muted hover:text-brand hover:bg-brand-tint/10 transition-colors"
           >
             <ArrowRight strokeWidth={1.5} className="w-3 h-3" /> Generate SQL
           </button>
+        )}
+        {pivotData && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                className="inline-flex items-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded-md hover:bg-surface-hover"
+              >
+                <Download className="w-3.5 h-3.5" />
+                Export
+              </button>
+            </DropdownMenuTrigger>
+
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onClick={() => exportPivot("csv")}>Export as CSV</DropdownMenuItem>
+              <DropdownMenuItem onClick={() => exportPivot("json")}>Export as JSON</DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         )}
       </div>
 
@@ -241,7 +299,7 @@ export function PivotTable({ result, onLoadQuery, databaseType }: PivotTableProp
           <table className="w-full text-xs font-mono">
             <thead className="sticky top-0 z-10 bg-raised">
               <tr>
-                <th className="text-left px-3 py-2 text-fg-muted border-b border-r border-hairline font-mediumr">
+                <th className="text-left px-3 py-2 text-fg-muted border-b border-r border-hairline font-medium">
                   {rowField}
                 </th>
                 {pivotData.colKeys.map((ck) => (
@@ -256,10 +314,10 @@ export function PivotTable({ result, onLoadQuery, databaseType }: PivotTableProp
             </thead>
             <tbody>
               {pivotData.pivotRows.map((row, i) => (
-                <tr key={i} className="hover:bg-blue-500/[0.03] border-b border-hairline">
+                <tr key={i} className="hover:bg-brand-tint/[0.03] border-b border-hairline">
                   <td className="px-3 py-1.5 text-fg-secondary border-r border-hairline font-medium">{row.rowKey}</td>
                   {pivotData.colKeys.map((ck) => (
-                    <td key={ck} className="px-3 py-1.5 text-right text-amber-500/90 border-r border-hairline">
+                    <td key={ck} className="px-3 py-1.5 text-right text-hue-amber/90 border-r border-hairline">
                       {row.values.get(ck) || "0"}
                     </td>
                   ))}

@@ -17,7 +17,7 @@
 | **Default port** | `1521` |
 | **Connection pooling** | Yes — `oracledb` pool (`poolMin`/`poolMax`/`poolTimeout`) |
 | **Connection string** | Supported — EZConnect `host:port/service` or a TNS string (passed straight to the driver's `connectString`) |
-| **Transactions** | Yes — explicit begin/commit/rollback (**no** auto-rollback timeout) |
+| **Transactions** | Yes: explicit begin/commit/rollback (5-minute auto-rollback on an owned provider only, see §3.4) |
 | **Query cancellation** | Yes — tracked connection + `connection.break()` |
 | **SSL** | Yes — `connection.ssl` selects TCPS, the DN match and the wallet ([§4.3](#43-ssl--tls)) |
 | **Source** | [`src/lib/db/providers/sql/oracle.ts`](../../src/lib/db/providers/sql/oracle.ts) |
@@ -36,10 +36,10 @@ providers, with several Oracle-isms that are worth knowing before reading the co
 |--------|------------|--------|
 | Driver mode | `pg` | `oracledb` **Thin** by default (Thick opt-in via `ORACLE_CLIENT_LIB_DIR`) |
 | Pagination | `LIMIT … OFFSET` | `FETCH FIRST n ROWS ONLY` / `OFFSET m ROWS FETCH NEXT n` |
-| Schema scope | all non-system schemas | the connecting **user's** schema (`OWNER = USER`) |
+| Schema scope | all non-system schemas | every owner in `ALL_USERS` ([§7](#the-object-surface-789-and-the-confinement-it-lifts-765)); the deleted flat reading saw only the connecting user's |
 | Schema queries | 1 `MATERIALIZED`-CTE round-trip | **5 bulk** `ALL_*` queries grouped in memory |
 | Maintenance | vacuum / analyze / reindex / kill | `analyze` (DBMS_STATS) / `optimize` (rebuild one table's indexes, or the schema's) / `kill` |
-| Transaction timeout | 5-minute auto-rollback | **none** |
+| Transaction timeout | 5-minute auto-rollback | 5-minute auto-rollback on an **owned** provider (governance), **none** otherwise |
 | Cancellation | `pg_cancel_backend(pid)` | `connection.break()` (tracked connection) |
 | SSL | `buildSSLConfig()` + cloud auto-detect | `tcps://` + `sslServerDNMatch` + `walletContent` (no cloud auto-detect) |
 | Monitoring source | `pg_stat_*` | `V$` views (privilege-gated, each guarded) |
@@ -47,7 +47,7 @@ providers, with several Oracle-isms that are worth knowing before reading the co
 
 ### Thin mode
 
-The constructor ([oracle.ts:186](../../src/lib/db/providers/sql/oracle.ts)) uses pure-JS Thin mode by
+The constructor ([`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts)) uses pure-JS Thin mode by
 default, sets `outFormat = OUT_FORMAT_OBJECT` (rows as objects), and `autoCommit = true` globally.
 Thin mode means **no native Oracle client** has to be installed in the container — a real deployment
 win.
@@ -75,7 +75,7 @@ them: `getCapabilities()`, `getLabels()`, and `prepareQuery()` (Oracle paginatio
 
 ### Registration
 
-Loaded on demand by the factory ([`factory.ts:77`](../../src/lib/db/factory.ts)):
+Loaded on demand by the factory ([`factory.ts`](../../src/lib/db/factory.ts)):
 
 ```ts
 case 'oracle': {
@@ -91,17 +91,19 @@ case 'oracle': {
 ### 3.1 EZConnect connect string (service name, not database)
 
 Oracle connects to a **service**, not a database name. `getConnectString()`
-([oracle.ts:103](../../src/lib/db/providers/sql/oracle.ts)) returns the raw `connectionString` if
+([`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts)) returns the raw `connectionString` if
 given, otherwise builds `host:port/serviceName` where `serviceName = config.serviceName ??
 config.database ?? 'ORCL'`. Accordingly, `validate()` requires only `host` (not `database`) when no
 connection string is present.
 
 ### 3.2 `FETCH FIRST` instead of `LIMIT`
 
-Oracle has no `LIMIT`, so `prepareQuery()` ([oracle.ts:225](../../src/lib/db/providers/sql/oracle.ts))
+Oracle has no `LIMIT`, so `prepareQuery()` ([`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts))
 overrides the base and appends `FETCH FIRST n ROWS ONLY` (or `OFFSET m ROWS FETCH NEXT n ROWS ONLY`
 when an offset is set) to bare `SELECT`s that don't already have a limit. Default page size
 `DEFAULT_QUERY_LIMIT = 500`; unlimited caps at `MAX_UNLIMITED_ROWS = 100000`.
+
+A `limit` or an `offset` that is not a non-negative safe integer is refused with a `QueryError` before either branch runs, by the check the shared limiter runs first (`assertRowBounds` in [`query-limiter.ts`](../../src/lib/db/utils/query-limiter.ts)).
 
 Both branches append at the **end of the statement**, which `src/lib/sql/statement-end.ts` delimits —
 before any trailing comment and before the terminating `;`, both of which are then re-attached
@@ -154,23 +156,58 @@ deliberately stricter than node-oracledb's tokenizer, which opens a q-string at 
 `q`/`Q` whatever comes before it; the strict side is the one whose mistake costs a bound — and, since
 #297, a confirmation prompt on that statement — rather than a misplaced clause.
 
-### 3.3 Owner-scoped, five-query schema introspection
+### 3.2a A generated statement carries no terminator
 
-`getSchema()` ([oracle.ts:323](../../src/lib/db/providers/sql/oracle.ts)) runs **five bulk queries**
-over the `ALL_*` data-dictionary views — tables, columns, primary keys, foreign keys, indexes —
-all filtered by `OWNER = :1` (the connecting user, upper-cased) and then **grouped in memory** by
-table. This is neither the Postgres single-CTE approach nor MySQL's per-table N+1: it is a fixed
-5 round-trips regardless of table count. There is no `getSchemaList()`/`getSchemaRelations()`
-(no two-phase split), and the returned `TableSchema` has **no `size` field** (only `rowCount` from
-`NUM_ROWS`, an optimizer estimate that can be stale/`NULL`).
+`getCapabilities()` declares `statementTerminator: 'none'`, so the two statements
+`src/lib/query-generators.ts` writes on the user's behalf - "Select Top 50" and
+"Generate Query" - end without a `;`.
 
-### 3.4 No transaction auto-rollback timeout
+`;` is a SQL*Plus convention rather than Oracle SQL. node-oracledb sends ONE statement and the
+terminator is not part of it, so the generated form was rejected outright.
 
-Unlike the Postgres and MySQL providers (which arm a 5-minute auto-rollback timer),
-`beginTransaction()` ([oracle.ts:258](../../src/lib/db/providers/sql/oracle.ts)) simply checks out a
-connection and marks the transaction active — **there is no timeout**. An abandoned transaction
-holds its connection (and locks) until explicitly committed/rolled back or the connection is
-reclaimed by the pool.
+Measured through this provider on Oracle AI Database 26ai Free on 2026-09-12, by clicking a table
+in the object browser:
+
+```
+SELECT * FROM APP.APP_CUSTOMERS FETCH FIRST 50 ROWS ONLY;   -> ORA-00933: SQL command not properly ended
+SELECT * FROM APP.APP_CUSTOMERS FETCH FIRST 50 ROWS ONLY    -> rows
+```
+
+The generator carried that `;` from the day its Oracle branch was written, so clicking a table on
+Oracle had never once worked. This is a declaration rather than a branch in the generator: nothing
+in `src/lib/query-generators.ts` needs to know which engine it is writing for (#789).
+
+The row bound in the statement above has since gone: #816 moved the preview cap into the `limit`
+execution option, so what the generator writes today is `SELECT * FROM APP.APP_CUSTOMERS` — still
+with no `;`, which is the half of that measurement the engine cares about. The Oracle branch itself
+was removed with the bound, because once there is no `FETCH FIRST` to spell it did nothing the
+shared return does not already do.
+
+It bounds the generators, and it also tells the editor to read a one-statement selection through
+the statement reader (#1414). A `;` a user types after a plain statement is stripped by that reader
+before the statement is sent: with the caret in the statement on every engine, and, because of this
+declaration, also when the statement is selected; a multi-statement selection is still sent as
+selected. The raw API passes text through untouched. The one `;` the reader keeps is the one after a
+PL/SQL unit's `END`, which is part of the unit ([§5.1](#51-execution)).
+
+### 3.3 Schema introspection reads the `ALL_*` views, and is not owner-scoped
+
+Every reading of this engine's objects goes through the object surface
+([§7](#the-object-surface-789-and-the-confinement-it-lifts-765)). The flat reading that came before it
+ran five bulk queries over the `ALL_*` data-dictionary views, all filtered by
+`OWNER = :1` (the connecting user, upper-cased) and grouped in memory by table, so the app showed
+exactly one schema on Oracle with no way to reach another. It is deleted (#765). Row counts still come
+from `NUM_ROWS`, an optimizer estimate that can be stale or `NULL`.
+
+### 3.4 Transaction auto-rollback timeout on an owned provider only
+
+`beginTransaction()` ([`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts)) checks out a connection and marks the transaction active.
+A provider created with an `owner` in its execution context, which only governance does (`ProviderExecutionContext.owner`, see [Per-user providers](../GOVERNANCE.md#per-user-providers)), also arms the 5-minute auto-rollback timer of the Postgres and MySQL providers there.
+`createDatabaseProvider` hands the execution context to `OracleProvider` for this.
+When the timer fires, `expireTransaction()` rolls the transaction back and closes the held connection, which releases it to the pool; a rollback or a close that fails is logged, and the transaction is released all the same.
+`commitTransaction()`, `rollbackTransaction()` and `disconnect()` clear the timer.
+A provider without an owner, which is every install without governance, arms **no** timer: an abandoned transaction holds its connection (and locks) until explicitly committed or rolled back, or the connection is reclaimed by the pool.
+Arming the timer in every mode would change the transaction lifetime of every install without governance, so it waits for a product decision ([GOV3](../BACKLOG.md#gov3-arming-the-mssql-and-oracle-transaction-timeout-in-every-mode-needs-a-design-decision-first)).
 
 ### 3.5 SSL through the connect string, not a `buildSSLConfig()`
 
@@ -182,15 +219,38 @@ mapping, and for the two Oracle-specific consequences: the chain is **always** v
 `rejectUnauthorized` to turn off), and the CA and client certificates travel as one `walletContent`
 PEM rather than three options.
 
-### 3.6 Privilege-resilient monitoring
+### 3.6 A failed connect closes the pool it created
+
+`createPool()` resolves before anything is dialled in Thin mode, so a connect that fails on its test
+borrow already holds a live pool. `factory.getOrCreateProvider()` never caches a provider whose
+`connect()` threw, which means nothing can call `disconnect()` on it afterwards, and node-oracledb's
+background creator keeps reaching for `poolMin` connections with **no delay between attempts**. One
+failed connect to an unreachable host therefore pins a CPU core and floods that host until the
+process exits — measured at roughly 14,000 TCP connect attempts and one full core per second.
+
+The `catch` in `connect()` closes that pool with `close(0)` (force close, the oracledb equivalent of
+`end()`) and clears `this.pool` before rethrowing, so a retried `connect()` creates a fresh pool
+instead of returning silently through the `if (this.pool)` guard while connected to nothing. A
+`close()` that itself rejects is swallowed rather than replacing the connect error. This is the same
+contract PostgreSQL and SQL Server already follow ([#1102](https://github.com/libredb/libredb-studio/issues/1102)).
+
+### 3.7 Privilege-resilient monitoring
 
 Oracle monitoring reads `V$` dynamic-performance views, which require privileges a typical app user
-may lack. Every monitoring sub-query is wrapped in its own try/catch and degrades rather than failing
+may lack. Every `V$` sub-query is wrapped in its own try/catch and degrades rather than failing
 the whole call — so the dashboard still renders for a low-privilege user, just with gaps. The default
 it degrades to is `N/A` or `[]` where the shape has a place to say "not measured", and — in the
 health and overview readings, where a number would otherwise be invented — **nothing at all**:
 `getHealth().activeConnections` and `getOverview().activeConnections` are both omitted rather than
 reported as `0` ([§7.2](#72-when-the-connection-count-is-not-measurable)).
+
+The guard covers the `V$` reads, the ones a privilege decides. `getTableStats()` and
+`getIndexStats()` read only the `USER_*` / `ALL_*` dictionary views, which every user can read, so
+they are **not** guarded: a failure there is a defect or a dead connection, never a missing grant,
+and it rejects with the engine's sentence. The inherited `getMonitoringData()` records it under
+`errors.tables` / `errors.indexes`, and the Tables, Storage and admin Operations tabs show that
+refusal instead of "No table statistics available". An empty `catch` used to turn exactly such a
+failure into an empty list ([§7.4](#74-what-a-tables-size-counts)).
 
 ---
 
@@ -213,12 +273,12 @@ const b = { id: 'or-1', name: 'XE', type: 'oracle',
   user: 'app', password: 'secret', createdAt: new Date() };
 ```
 
-`validate()` ([oracle.ts:89](../../src/lib/db/providers/sql/oracle.ts)) requires `host` only when no
+`validate()` ([`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts)) requires `host` only when no
 `connectionString` is given; `database` is **not** required (Oracle uses the service name).
 
 ### 4.2 Connection pooling
 
-`connect()` builds an `oracledb` pool ([oracle.ts:121](../../src/lib/db/providers/sql/oracle.ts)):
+`connect()` builds an `oracledb` pool ([`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts)):
 
 | `oracledb` pool option | Value | Source |
 |------------------------|-------|--------|
@@ -230,13 +290,13 @@ const b = { id: 'or-1', name: 'XE', type: 'oracle',
 > `ProviderOptions` option, defaulting to `DEFAULT_QUERY_TIMEOUT`) are **not** mapped — there is no
 > provider-driven server-side query timeout (cancellation is explicit, [§5.2](#52-query-cancellation)).
 
-`connect()` is idempotent; `getPoolStats()` ([oracle.ts:651](../../src/lib/db/providers/sql/oracle.ts))
+`connect()` is idempotent; `getPoolStats()` ([`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts))
 exposes `{ total: connectionsOpen, idle, active: connectionsInUse, waiting: 0 }`.
 
 ### 4.3 SSL / TLS
 
 `getConnectString()` and `buildTLSAttributes()`
-([oracle.ts:271](../../src/lib/db/providers/sql/oracle.ts)) map `connection.ssl` onto the three
+([`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts)) map `connection.ssl` onto the three
 things the driver understands:
 
 | `ssl.mode` | Connect string | `sslServerDNMatch` | Chain verified |
@@ -274,7 +334,7 @@ the same string to `tls.createSecureContext()` as `cert`, `key` **and** `ca`.
 
 | Env var | Required | Effect |
 |---------|----------|--------|
-| `ORACLE_CLIENT_LIB_DIR` | No (default: unset, Thin mode) | Absolute path to an installed Oracle Instant Client `lib` directory. When set, the constructor calls `oracledb.initOracleClient({ libDir })` and the driver runs in Thick mode instead of Thin. |
+| `ORACLE_CLIENT_LIB_DIR` | No (default: unset, Thin mode) | Absolute path to an installed Oracle Instant Client directory. When set, the constructor calls `oracledb.initOracleClient({ libDir })` and the driver runs in Thick mode instead of Thin. **On Linux this variable alone is not enough** — see [below](#on-linux-the-variable-alone-is-not-enough). |
 
 ```bash
 # Only needed against a pre-12.1 Oracle server (see the Thin-mode caveat above).
@@ -282,14 +342,68 @@ the same string to `tls.createSecureContext()` as `cert`, `key` **and** `ca`.
 ORACLE_CLIENT_LIB_DIR=/opt/oracle/instantclient_19_28
 ```
 
+**Thick mode is reachable on the default image only.** Oracle publishes no musl build of Instant
+Client, so the `-alpine` and `-alpine-slim` tags (issue #840, [DISTRIBUTION.md](../DISTRIBUTION.md))
+can never load it whatever an operator layers on top — `Dockerfile.alpine` therefore does not ship
+node-oracledb's native addons at all, since nothing in those images could load them. Thin mode is
+unaffected and measured working on both: the driver is pure JavaScript there, Next's output file
+tracing carries it into the standalone payload, and `oracledb.thin === true` inside the running
+container. An attempted `initOracleClient()` fails with the driver's own NJS-045, whose text already
+tells the operator to use Thin mode. So an Oracle 12.1+ server works on every tag; an 11.2 server
+needs the default one.
+
 node-oracledb's Thin/Thick choice is a **process-wide singleton** — `initOracleClient()` throws if
 called more than once, or after any connection/pool already exists. This is why the setting is a
 process-level env var rather than a per-connection config field: every `OracleProvider` in the
 process shares one driver mode. The constructor guards the call with a module-level flag so it runs
 at most once regardless of how many `OracleProvider` instances (i.e. connections) are created. The
 Oracle Instant Client itself must already be installed at the given path — this provider does not
-download or bundle it. If the path is wrong (no client library there), the constructor fails fast
-with a `DatabaseConfigError` naming `ORACLE_CLIENT_LIB_DIR`, not a cryptic driver error.
+download or bundle it. If the client cannot be loaded, the constructor fails fast with a
+`DatabaseConfigError` that names `ORACLE_CLIENT_LIB_DIR` and says which of the three failures it is
+(`describeOracleClientLoadFailure()` in [errors.ts](../../src/lib/db/errors.ts) decides the wording;
+[§11](#11-error-handling) lists the codes).
+
+#### On Linux the variable alone is not enough
+
+Setting `ORACLE_CLIENT_LIB_DIR` makes the driver call `initOracleClient({ libDir })`, and on Linux
+that call **cannot** load Instant Client on its own. `libclntsh.so.19.1` is built with no RUNPATH, so
+the dynamic loader has no way to find the libraries it depends on (`libnnz19.so`,
+`libclntshcore.so.19.1`) even though they sit right next to it. The call fails with:
+
+```
+DPI-1047: Cannot locate a 64-bit Oracle Client library: "libnnz19.so: cannot open shared object file"
+```
+
+node-oracledb's own documentation is explicit about this: *"Never set libDir on Linux and related
+platforms. Instead you must configure the system library search path to include the directory before
+starting Node.js."* This provider still passes `libDir` on every platform (it is the documented
+mechanism on Windows and macOS, and it is harmless on Linux once the directory is on the loader
+path), so on Linux you need **both**:
+
+1. `ORACLE_CLIENT_LIB_DIR=<dir>`, and
+2. `<dir>` on the system library search path — either a file under `/etc/ld.so.conf.d/` followed by
+   `ldconfig`, or `LD_LIBRARY_PATH=<dir>` exported **before** Node starts (the loader reads it at
+   process start; setting it from inside the app is too late).
+
+Measured with Instant Client 19.28 against Oracle Free 23ai: with either of those two in place,
+`initOracleClient({ libDir })` succeeds (`oracledb.thin === false`, client 19.28.0.0.0) and
+`v$session_connect_info.client_driver` reports `node-oracledb : 6.10.0 thk`. Without them, only
+`DPI-1047`.
+
+There is a second Linux prerequisite on Debian 13 (the runtime base): the client links against
+`libaio.so.1`, but trixie's `libaio1t64` package installs only `libaio.so.1t64`, so
+`ldd libclntsh.so.19.1` reports `libaio.so.1 => not found`. A symlink fixes it, and the recipe below
+creates one.
+
+> **Before this fix, Thick mode could not be entered at all in a real build.** Measured on the
+> published images 0.13.4 and 0.13.7: with `ORACLE_CLIENT_LIB_DIR` set, `POST /api/db/test-connection`
+> returned HTTP 400 `CONFIG_ERROR` quoting `NJS-045` and paths under `/ROOT/node_modules/oracledb`.
+> The driver was bundled into the server chunk, which rewrote its `__dirname`, so it looked for its
+> own native addon at a path that does not exist and never got as far as reading the Instant Client.
+> The recipes in this section could not have worked on those images. `oracledb` is now in
+> `serverExternalPackages` ([next.config.ts](../../next.config.ts)) and the package is copied
+> explicitly by the Dockerfile runner stage and `scripts/build-standalone-payload.sh`, the same way
+> the other native drivers are.
 
 #### Pick the right Instant Client version
 
@@ -302,13 +416,51 @@ by [Oracle client/server interoperability](https://docs.oracle.com/en/database/o
 | **Oracle 11.2** (11g) | **19c** — the newest client that still reaches 11.2 (11.2.0.3 / 11.2.0.4). **21c and 23ai cannot connect to 11.2.** |
 | Oracle 12.1+ | Any current Instant Client (19c / 21c / 23ai). Thin mode already covers these, so Thick is rarely needed. |
 
-#### Connecting to a pre-12.1 server (build your own image)
+#### A 12.1+ server can still force Thick mode
+
+The server version is not the only reason to leave Thin mode, and "my DBA says I need Thick mode on
+12.2" is a real and common case (#538). Thin mode covers 12.1 and later *as a version*, but it
+refuses a connection when the server demands something it does not implement:
+
+The codes below are read out of node-oracledb 6.10.0's own source (`lib/thin/`, `lib/errors.js`),
+not inferred from the symptom, because the driver does **not** report every one of these as a Thin
+mode refusal and some are not the driver's error at all:
+
+| What the server or connection requires | What you actually see |
+|----------------------------------------|-----------------------|
+| Oracle Native Network Encryption or data integrity checksumming | `NJS-533` |
+| An account whose only password verifier is the 10G one | `NJS-116` |
+| A wallet available only as `cwallet.sso` | `NJS-529` — *Invalid wallet content format. Supported format is PEM* |
+| Kerberos, RADIUS, operating-system or other external authentication | **No single driver code.** Thin mode implements `externalAuth` for token-based authentication (`lib/thin/protocol/messages/auth.js`) but has no Kerberos, RADIUS or OS-auth implementation, and raises nothing of its own for them — the *server* refuses the logon, so what arrives is an `ORA-` logon error. Thick mode only. |
+| LDAP (directory) naming for the connect identifier | **Not a Thin-mode refusal.** There is no LDAP code anywhere under `lib/thin`, so an `ldap://` identifier fails during connect-string resolution instead, typically `NJS-516` (*no configuration directory set or available to search for tnsnames.ora*) or a connect-string parse error. Thick mode only. |
+
+The three rows that *are* driver codes map to a non-retryable `DatabaseConfigError` naming
+`ORACLE_CLIENT_LIB_DIR` ([§11](#11-error-handling)) rather than to a retryable connection failure.
+The last two rows do not, and cannot: nothing in their text identifies the cause.
+
+Two of them have a way out that needs no Instant Client, and the provider's error message says so in
+both cases:
+
+- **`NJS-116`** — the account simply has no 12C verifier. A DBA resetting its password writes one
+  (given a server `SQLNET.ALLOWED_LOGON_VERSION_SERVER` that permits it).
+- **`NJS-529`** — Thin mode reads only PEM. Converting the wallet to `ewallet.pem`
+  (`orapki wallet pkcs12_to_pem`, or openssl against the PKCS#12) is enough; Thick mode reads the
+  `cwallet.sso` as it stands.
+
+`NJS-089` is **not** in the table on purpose. In Thin mode the driver raises it for client-side
+features it has not implemented — heterogeneous pooling (`lib/thin/pool.js`), some database object
+types (`lib/thin/dbObject.js`), Advanced Queuing (`lib/thin/protocol/messages/aqArray.js`,
+`aqBase.js`) and a few protocol features — none of which is something a server can demand at
+connect time. It is still mapped ([§11](#11-error-handling)), because the remedy is the same.
+
+#### Building an image with Instant Client (works for both cases above)
 
 The published image (`ghcr.io/libredb/libredb-studio`) ships **Thin only** — it does not bundle the
 Oracle Instant Client, because the native client is ~100 MB and only a minority of deployments need
-it. To reach an 11g server, build a derived image that layers Instant Client 19c on top and sets the
-env var. The runtime base is Debian 13 (`node:*-trixie-slim`), so install `libaio1t64` (trixie's
-renamed `libaio1`) and unpack the Basic package:
+it. What the image does carry (since #538) is the driver's own Thick-mode addon, so layering a client
+on top is all that is left to do. The runtime base is Debian 13 (`node:*-trixie-slim`), so the recipe
+installs `libaio1t64` (trixie's renamed `libaio1`), symlinks the SONAME the client actually asks for,
+unpacks the Basic package, and puts the directory on the loader path:
 
 ```dockerfile
 FROM ghcr.io/libredb/libredb-studio:latest
@@ -317,20 +469,44 @@ USER root
 # Instant Client 19c — reaches Oracle 11.2; 21c/23ai do not. Pin to a specific
 # 19.x build; check https://www.oracle.com/database/technologies/instant-client/linux-x86-64-downloads.html
 # for the current file name and update the version folder in ORACLE_CLIENT_LIB_DIR to match.
-RUN apt-get update && apt-get install -y --no-install-recommends libaio1t64 unzip curl \
+# ca-certificates is not optional: the base image does not have it (and has no
+# curl either), and --no-install-recommends will not pull it in, so without it
+# the download below fails with curl (77) setting the certificate file.
+RUN apt-get update && apt-get install -y --no-install-recommends libaio1t64 unzip curl ca-certificates \
     && mkdir -p /opt/oracle && cd /opt/oracle \
     && curl -fsSLO https://download.oracle.com/otn_software/linux/instantclient/1928000/instantclient-basic-linux.x64-19.28.0.0.0dbru.zip \
     && unzip -q instantclient-basic-linux.x64-*.zip \
     && rm instantclient-basic-linux.x64-*.zip \
+    # Debian 13 ships libaio.so.1t64; the client links against libaio.so.1.
+    && ln -sf libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1 \
+    # Required, not optional: libclntsh has no RUNPATH, so without this the
+    # driver fails with DPI-1047 no matter what ORACLE_CLIENT_LIB_DIR says.
+    && echo /opt/oracle/instantclient_19_28 > /etc/ld.so.conf.d/oracle-instantclient.conf \
+    && ldconfig \
     && rm -rf /var/lib/apt/lists/*
 ENV ORACLE_CLIENT_LIB_DIR=/opt/oracle/instantclient_19_28
 USER nextjs
 ```
 
-Instead of rebuilding, you can also mount an Instant Client directory from the host into the stock
-image and point `ORACLE_CLIENT_LIB_DIR` at the mount — whichever your deployment prefers. A
-first-class, separately-published Thick-mode image variant is a possible future addition; until then
-the derived image above is the supported path.
+Instead of rebuilding, you can mount an Instant Client directory from the host into the stock image
+and point `ORACLE_CLIENT_LIB_DIR` at the mount — but then the loader-path step has to be done on the
+container too, and `ldconfig` is not available to you at that point, so set `LD_LIBRARY_PATH` to the
+same directory in the container's environment (`docker run -e`, or `env:` in the pod spec). The
+`libaio.so.1` symlink is needed either way; on the stock image that means the mount has to supply it
+or the container has to run as root long enough to create it, which is why the derived image above is
+the supported path. A first-class, separately-published Thick-mode image variant is a possible future
+addition.
+
+### Connection string
+
+The scheme shown for Oracle is `oracle://`.
+Its row in `CONNECTION_STRING` is declared in [`oracle-connection-string.ts`](../../src/lib/db/providers/sql/oracle-connection-string.ts).
+It has no `readTls`, so a pasted `oracle://` URL carries no SSL mode into the form, and it runs no seed load check.
+
+### Execution UI
+
+The rolled-back notice names `COMMIT` as the keyword that keeps an open transaction, and `oracle` has no consent deadline, so the agent's consent card shows no deadline chip or sentence for it.
+Its row in `EXECUTION_UI` is declared in [`oracle-execution-ui.ts`](../../src/lib/db/providers/sql/oracle-execution-ui.ts).
 
 ---
 
@@ -338,7 +514,7 @@ the derived image above is the supported path.
 
 ### 5.1 Execution
 
-`query(sql, params?, queryId?)` ([oracle.ts:162](../../src/lib/db/providers/sql/oracle.ts)) checks
+`query(sql, params?, queryId?)` ([`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts)) checks
 out a pooled connection, optionally stores the **connection object** under `queryId` for
 cancellation, runs `conn.execute(sql, binds, { outFormat: OUT_FORMAT_OBJECT, autoCommit: true, fetchTypeHandler })`
 ([§5.3](#53-what-each-oracle-type-arrives-as) says what the handler is for),
@@ -347,6 +523,23 @@ and returns:
 ```ts
 { rows, fields: metaData.map(m => m.name), rowCount: rows.length, executionTime, columnTypes? }
 ```
+
+**Column names.** Every column reaches the grid named, and under a name no other column of the result has, by the driver's own doing.
+An unaliased expression is named by its text (`SELECT 1+1 FROM dual` answers `1+1`), and an empty alias is refused by the server (`SELECT 1 AS "" FROM dual` fails with `ORA-01741: illegal zero-length identifier`).
+A repeated name is numbered by node-oracledb itself, in `metaData` and before any row is keyed (`_setup` in `oracledb/lib/impl/resultset.js`, 6.10.0): the first column keeps the name, a repeat takes `NAME_1`, `NAME_2`, and a number skips a name the statement declares.
+Measured on 2026-10-07 against Oracle XE with that driver, the same in `OUT_FORMAT_OBJECT` and `OUT_FORMAT_ARRAY`:
+
+| statement | names | row |
+|---|---|---|
+| `SELECT 1 AS a, 2 AS a FROM dual` | `A`, `A_1` | `{ A: 1, A_1: 2 }` |
+| `SELECT 1 AS a, 2 AS a, 3 AS a_1 FROM dual` | `A`, `A_2`, `A_1` | `{ A: 1, A_2: 2, A_1: 3 }` |
+| a join projecting `user_id` from both sides of `all_users` | `USER_ID`, `USER_ID_1` | both values |
+| `SELECT 1+1, 1+1 FROM dual` | `1+1`, `1+1_1` | both values |
+
+So no value is lost, and the provider keys rows by the names the driver gives rather than through `uniqueFieldNames`.
+The declared names are not gone: the driver hands each column to the call's `fetchTypeHandler` under its declared name before it renames it, though only for a statement it does not serve from its statement cache.
+Rebuilding the shared `name (2)` form from them was tried and left out: it would take a statement-cache miss on every editor statement, and a `CURSOR(...)` column read as arrays loses the names of its nested columns.
+So a repeat reads `NAME_1`, which data masking and the inline-edit refusal do not read as a repeat of `NAME`.
 
 A `SELECT` answers with a `rows` array and `rowCount` is `rows.length`. A non-`SELECT`
 (INSERT/UPDATE/DELETE/DDL/PL/SQL) carries **no `rows` array at all**, and that absence is what
@@ -374,13 +567,37 @@ proving each statement had landed:
 `autoCommit: true` on the call is load-bearing, not decoration: `oracledb.autoCommit` defaults to
 `false`, and measured without it the `INSERT` still reported `rowsAffected: 1` while a second
 session saw `COUNT(*) = 0`, and the row was gone for good once the writing connection went back to
-the pool. Bind parameters use Oracle's `:1`-style placeholders (`getPlaceholder()` from the base).
+the pool. Bind parameters use Oracle's `:1`-style placeholders.
 Native errors are normalised through `mapDatabaseError()` (see [§11](#11-error-handling)).
+
+**PL/SQL from the editor (#1312).** The grammar's `script` fact for this dialect
+(`src/lib/db/providers/sql/oracle-sql-grammar.ts`) makes the editor's statement reader treat a PL/SQL unit as ONE statement:
+an anonymous block that starts with `DECLARE` or `BEGIN`, and `CREATE [OR REPLACE]
+[EDITIONABLE | NONEDITIONABLE] PROCEDURE | FUNCTION | PACKAGE [BODY] | TRIGGER | TYPE BODY`. The unit
+is read to the `END` that closes its outermost block, and the `;` after that `END` is kept, because
+Oracle refuses the unit without it (`PLS-00103`, "Encountered the symbol end-of-file"). A line holding
+only `/` ends the statement in progress and is never sent, as in SQL*Plus, so a script written for
+SQL*Plus or SQL Developer runs unchanged. A compound trigger is read to its last `END` with each timing
+point a block of its own, a `<<label>>` before a block is read past, and a call spec (`AS LANGUAGE
+JAVA …`, `AS LANGUAGE C …`, `AS EXTERNAL …`, `AS MLE MODULE …`) has no body, so the `;` after it ends
+it. A unit the reader still cannot close on its own needs that `/`, as it does there. A `WITH FUNCTION`
+read is not a unit and is still cut at its inner `;`.
+
+A write inside a block still asks for confirmation: the gate reads into a statement led by `BEGIN`,
+`DECLARE`, `IF`, `THEN` and the other control-flow words, so `BEGIN DELETE FROM emp; END;` asks, and so
+does a block that runs dynamic SQL (`EXECUTE IMMEDIATE`, `DBMS_SQL`), whose text the gate cannot read
+(`docs/editor/query-optimization.md`, multi-statement runs).
+
+Measured before this on 26ai Free 23.26.3: the editor cut `CREATE OR REPLACE PROCEDURE raise_sal(p_pct IN
+NUMBER) AS BEGIN UPDATE emp SET salary = salary * (1 + p_pct/100); END;` at its inner `;`, the first
+fragment answered `success` while `user_objects` showed the procedure INVALID, the second was
+`ORA-00900`, and a trigger cut the same way stayed INVALID on its table so that every later INSERT
+failed with `ORA-04098`.
 
 ### 5.2 Query cancellation
 
 A query issued with a `queryId` stores its connection in a `Map`. `cancelQuery(queryId)`
-([oracle.ts:208](../../src/lib/db/providers/sql/oracle.ts)) calls `connection.break()` on it —
+([`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts)) calls `connection.break()` on it —
 interrupting the in-flight OCI call — and returns `true` on success (it does not verify a query was
 actually running). Exposed via `POST /api/db/cancel`.
 
@@ -399,7 +616,8 @@ summary all read.
 | `RAW` | `Buffer` | `{"type":"Buffer","data":[10,11,12]}` | `\x0a0b0c` |
 | `NUMBER` | `number` | `1.2345678901234568e+37` — **digits lost** | the double, see below |
 | `BINARY_DOUBLE` | `number` | `3.5` | the number |
-| `TIMESTAMP` / `DATE` | `Date` | `"2026-08-23T17:46:46.422Z"` | the formatted date |
+| `DATE` | `string`, the stored wall clock (see below) | `"2026-09-01 10:11:12"` | the text |
+| `TIMESTAMP` | `string`, the stored wall clock (see below) | `"2026-09-01 10:30:00.345"`, sub-ms dropped | the text |
 | `TIMESTAMP WITH TIME ZONE` | `Date` | `"2026-08-24T07:11:12.345Z"` — offset folded to UTC, sub-ms dropped | the formatted date — [§5.5](#55-an-interval-is-normalized-to-its-oracle-literal-a-time-zone-cannot-be) |
 | `TIMESTAMP WITH LOCAL TIME ZONE` | `Date` | `"2026-08-24T07:11:12.345Z"` — same, normalized to the session time zone first | the formatted date — [§5.5](#55-an-interval-is-normalized-to-its-oracle-literal-a-time-zone-cannot-be) |
 | `INTERVAL YEAR TO MONTH` | `IntervalYM` | `"+03-07"` | its Oracle literal — [§5.5](#55-an-interval-is-normalized-to-its-oracle-literal-a-time-zone-cannot-be) |
@@ -412,7 +630,9 @@ summary all read.
 
 `query()` and `queryInTransaction()` pass a per-call **`fetchTypeHandler`**
 ([oracle.ts](../../src/lib/db/providers/sql/oracle.ts)) that maps `CLOB` and `NCLOB` to
-`oracledb.STRING` and `BLOB` to `oracledb.BUFFER`. Every other column keeps the driver's own default:
+`oracledb.STRING` and `BLOB` to `oracledb.BUFFER`. Apart from `DATE` and `TIMESTAMP`, which it gives a
+converter ([below](#a-date-and-a-timestamp-read-as-the-stored-wall-clock-in-every-server-time-zone-1131)),
+every other column keeps the driver's own default:
 `RAW` is already a `Buffer` and `VARCHAR2` already a string, and restating them would put this
 provider in charge of types it has no reason to touch.
 
@@ -441,8 +661,8 @@ INSERT INTO r6_lob ("ID", "C", "B") VALUES (1, '{"_events":{"finish":[null]},"_r
 A `BLOB` as a `Buffer` needs nothing further: `asBytes` in
 [`src/lib/export/binary.ts`](../../src/lib/export/binary.ts) accepts both a live `Uint8Array` and the
 `{"type":"Buffer","data":[…]}` JSON it serializes to, which is the same contract a Postgres `bytea`
-and a MySQL `BLOB` already reach the binary cell renderer, the row detail sheet, the CSV and the SQL
-export's binary literal through. Verified by exporting a row and replaying it into Oracle itself:
+and a MySQL `BLOB` already reach the binary cell renderer, the row detail sheet, the CSV, the JSON
+export's `\x…` string (#1381) and the SQL export's binary literal through. Verified by exporting a row and replaying it into Oracle itself:
 
 ```
 SOURCE   {"ID":1,"C":"the quick brown fox","NC":"ncl-value-unicode-café","B":{"type":"Buffer","data":[222,173,190,239,1,2]}}
@@ -461,9 +681,73 @@ in **18 ms** — and the ceiling is the runtime's own and fails loudly: a string
 failed query rather than as a value that has quietly lost its tail.
 
 The handler is deliberately **per-call**, not the process-wide `oracledb.fetchAsString` /
-`fetchAsBuffer` globals: those would also change every schema and monitoring read (`getSchema` reads
+`fetchAsBuffer` globals: those would also change every schema and monitoring read (the catalog reads read
 `ALL_TAB_COLUMNS.DATA_DEFAULT`, a `LONG`), and they outlive the provider — the embeddable library
 surface runs inside a host application that may have its own oracledb consumers.
+
+#### A DATE and a TIMESTAMP read as the stored wall clock, in every server time zone (#1131)
+
+Neither type holds a zone. oracledb, in Thin and Thick mode alike, builds the `Date` for both by
+reading the stored fields as **local time of the Node process** (`makeDate(useLocal)` in
+`oracledb/lib/util.js`), and every row path then serialized that `Date` as ISO UTC, so the value moved
+with the server's `TZ`. The published image runs in UTC, which hid it; `npx @libredb/studio` on a
+machine east or west of UTC did not. Measured on 2026-10-02 with
+[`tests/live/oracle-zoneless-values.ts`](../../tests/live/oracle-zoneless-values.ts) against
+`gvenzl/oracle-free:slim` (`Oracle AI Database 26ai Free Release 23.26.3.0.0`, oracledb 6.10.0, Bun
+1.4.2), through this provider, for `DATE '2026-09-01'` and `TIMESTAMP '2026-09-01 10:30:00'`, before
+and after this change:
+
+| process `TZ` | `DATE` before | `TIMESTAMP` before | `DATE` now | `TIMESTAMP` now |
+|---|---|---|---|---|
+| `UTC` | `2026-09-01T00:00:00.000Z` | `2026-09-01T10:30:00.000Z` | `2026-09-01 00:00:00` | `2026-09-01 10:30:00` |
+| `Europe/Istanbul` | `2026-08-31T21:00:00.000Z` (the previous day) | `2026-09-01T07:30:00.000Z` (3 hours early) | `2026-09-01 00:00:00` | `2026-09-01 10:30:00` |
+| `America/Los_Angeles` | `2026-09-01T07:00:00.000Z` | `2026-09-01T17:30:00.000Z` (7 hours late) | `2026-09-01 00:00:00` | `2026-09-01 10:30:00` |
+
+The server's own `TO_CHAR` printed the "now" column in every zone, and the same held for the other
+rows of the run: `TO_DATE('2026-08-24 10:11:12')`, `TIMESTAMP '2026-09-01 10:30:00.345'` and `.5`,
+`NULL`, and the BC date `-0044-03-15 00:00:00`, which before read as `-000044-03-15T00:00:00.000Z`
+under `UTC` and as `-000044-03-14T22:04:08.000Z` under Istanbul, the zone's local mean time for that
+year. `TIMESTAMP '2026-09-01 10:30:00 +03:00'` WITH TIME ZONE read as `2026-09-01T07:30:00.000Z`
+throughout, before and after.
+
+The shifted text reached the grid, copy, CSV, JSON, the SQL INSERT export and the MCP and agent reads.
+Over HTTP, where the export receives the row as JSON, the old SQL INSERT export quoted that ISO text
+(`VALUES (1, '2026-08-31T21:00:00.000Z', '2026-09-01T07:30:00.000Z')`) and Oracle refused it on
+replay with `ORA-01861: literal does not match format string`. The in-process export still had the
+driver's `Date` and wrote its local fields, which replayed to the right values. The export of the
+provider's text now replays to values the server calls equal, for all four rows, under Istanbul.
+
+The provider tests pin the reading for all three zones over the `Date` the driver builds, and the live
+script ([§12.4](#124-optional-verifying-against-a-live-oracle)) holds it against the server.
+
+- **The spelling.** A `DATE` is `YYYY-MM-DD HH24:MI:SS`, always with its time, because an Oracle `DATE`
+  always holds one. A `TIMESTAMP` adds the fraction the `Date` kept, with trailing zeros trimmed, and a
+  whole second carries none: `'2026-09-01 10:30:00.345'`, `'2026-09-01 10:30:00.5'`,
+  `'2026-09-01 10:30:00'`. A BC year keeps one leading sign, `'-0044-03-15 00:00:00'`, as
+  `TO_CHAR(d, 'SYYYY-MM-DD HH24:MI:SS')` prints it.
+- **How.** The handler gives both types a **converter** that reads the `Date` back through its *local*
+  getters, the inverse of what the driver did, so the stored fields come back in every zone.
+  `TIMESTAMP WITH TIME ZONE` and `WITH LOCAL TIME ZONE` are left alone: each names an instant, the
+  driver hands over that instant, and its ISO form is the same in every zone.
+- **Why not the NLS formats.** Setting the session's `NLS_DATE_FORMAT` / `NLS_TIMESTAMP_FORMAT` and
+  fetching as a string does nothing in Thin mode, the default, which never asks the server for text for
+  these types: a fetch type of `oracledb.STRING` is the same `Date` put through `toString()`
+  (`oracledb/lib/impl/resultset.js`), in the Node process's zone and without milliseconds, the finding
+  [§5.5](#the-time-zones-and-why-the-offset-is-not-recoverable) records for the zoned type. Moving the
+  session `TIME_ZONE` to UTC was not taken either: Thin sets it at connect to the process's offset, and
+  `CURRENT_DATE` and `LOCALTIMESTAMP` read it, so changing it would change what a user's own query
+  answers.
+- **What the `Date` lost stays lost**, because it is gone before the converter runs:
+  - Digits past the millisecond: `.345678` still reads `.345`.
+  - A wall clock inside the Node zone's spring-forward gap. It exists in the table but not in that
+    zone, so the driver's `Date` is an hour later: `new Date(2026, 2, 8, 2, 30)` reads back as 03:30
+    under `America/Los_Angeles`. UTC has no gap, so the published image is exact.
+  - A year below 100, which the `Date` constructor reads as 19xx.
+
+  `TO_CHAR` in the query is exact for all three.
+- **Library surface:** an in-process consumer now receives strings, not `Date` objects, for these two
+  types. The SQL export reads the text back into an Oracle literal, and inline row editing binds `:n`
+  through the same conversion functions ([§5.5](#the-sql-export-writes-an-oracle-date-literal-not-an-iso-string)).
 
 #### `NUMBER` still loses digits, and that is a separate defect
 
@@ -482,8 +766,10 @@ already a string. The two `INTERVAL` types were left alone by that change too an
 Oracle is the one engine of the four whose driver hands over a NAME rather than a wire code:
 `result.metaData[].dbTypeName`. It is passed through into `QueryResult.columnTypes` verbatim
 ([column-types.ts](../../src/lib/db/providers/sql/column-types.ts)), keyed by the column name in
-`fields`, by both `query()` and `queryInTransaction()`, and it is uppercase - the same spelling
-`ALL_TAB_COLUMNS.DATA_TYPE` uses, so a declared type reads like the schema tree's entry.
+`fields`, by both `query()` and `queryInTransaction()`, and it is uppercase.
+It is not the schema tree's `type`, which is a column's full declaration, such as `VARCHAR2(20 BYTE)` ([§7](#a-columns-type-is-its-declaration-built-from-the-dictionary-1139)).
+For most types it is the `ALL_TAB_COLUMNS.DATA_TYPE` spelling, which the tree reports as `baseType ?? type`.
+The exceptions, measured on 21c XE, are `FLOAT`, which reads `NUMBER` here, and the `TIMESTAMP` and `INTERVAL` types, which lose the precision `DATA_TYPE` carries: a `TIMESTAMP(3)` column reads `TIMESTAMP` here and `TIMESTAMP(3)` in the tree.
 
 Measured on Oracle AI Database 26ai Free over the probe table, verbatim from `oracledb`:
 
@@ -650,7 +936,7 @@ TLTZ  REFUSED  ORA-01843: An invalid month was specified.
 ```
 
 So a DDL+INSERT export of any ordinary Oracle table with a date column was unreplayable. The fix is
-in the shared export (`src/lib/export/result-export.ts`), not in this provider, and the conversion
+in this engine's SQL writing module ([`oracle-sql-writing.ts`](../../src/lib/db/providers/sql/oracle-sql-writing.ts), `export.columnWriters`), not in this provider, and the conversion
 function IS the literal — the way `HEXTORAW` already is for a `RAW`. Which function comes from the
 **declared** type (`columnTypes`, [§5.4](#54-declared-column-types)), because the two shapes disagree
 about which fields of the `Date` are the value:
@@ -660,7 +946,49 @@ about which fields of the `Date` are the value:
 | `DATE` | `TO_DATE('2026-08-24 10:11:12', 'YYYY-MM-DD HH24:MI:SS')` — the **local** fields |
 | `TIMESTAMP` (and anything else, and no declared type) | `TO_TIMESTAMP('2026-08-24 10:11:12.345', 'YYYY-MM-DD HH24:MI:SS.FF3')` — the **local** fields |
 | `TIMESTAMP WITH TIME ZONE`, `TIMESTAMP WITH LOCAL TIME ZONE` | `FROM_TZ(TO_TIMESTAMP('2026-08-24 17:11:12.345', 'YYYY-MM-DD HH24:MI:SS.FF3'), 'UTC')` — the **UTC** instant |
+| `DATE`, holding the provider's text (#1131) | `TO_DATE('2026-09-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')`, the **text** itself |
+| `TIMESTAMP` or `TIMESTAMP(n)`, holding the provider's text (#1131) | `TO_TIMESTAMP('2026-09-01 10:30:00.345', 'YYYY-MM-DD HH24:MI:SS.FF')`, the **text** itself, `.FF` only when it has a fraction |
+| `TIMESTAMP[(n)] WITH [LOCAL] TIME ZONE`, holding a `Date`'s ISO text, as over HTTP (#1224) | `FROM_TZ(TO_TIMESTAMP('2026-08-24 17:11:12.345', 'YYYY-MM-DD HH24:MI:SS.FF3'), 'UTC')`, the **same literal** the `Date` of that instant gets |
 
+- **The provider's own text for a naive column (#1131).** The provider reads a `DATE` and a `TIMESTAMP`
+  as their wall clock ([§5.3](#a-date-and-a-timestamp-read-as-the-stored-wall-clock-in-every-server-time-zone-1131)),
+  and that text is what reaches the export, over HTTP and in-process alike. Quoted as it is, it would
+  be read through the session's `NLS_DATE_FORMAT` (`DD-MON-RR` by default) and refused, so the export
+  writes it through the function of the declared type, with a mask that spells the text's own form:
+  `SYYYY` only for a BC year, and `FF`, which takes one to nine digits, only when there is a fraction.
+  No getter is read, so the zone the export runs in moves nothing. Two things stay quoted as text:
+  - A cell in a column not declared `DATE` or `TIMESTAMP`: a `VARCHAR2` holding the same characters is
+    text, and converting it would store the NLS rendering of a timestamp in its place.
+  - A value not in that form, a `DATE` text with a fraction included.
+
+  So the naive `Date` rows above now apply only to a host that builds its rows itself.
+- **A BC year (#1498).** A `Date` whose year is negative, such as a zoned `Date` the driver reads for
+  `-0044-03-15 10:30:00 +00:00` or a naive one a host built, is written with the sign in front of the
+  zeros and the signed mask: `FROM_TZ(TO_TIMESTAMP('-0044-03-15 10:30:00.000', 'SYYYY-MM-DD HH24:MI:SS.FF3'), 'UTC')`,
+  and `TO_DATE('-0044-03-15 10:30:00', 'SYYYY-MM-DD HH24:MI:SS')` for a `DATE`. Before, the year was
+  padded as `0-44`, which Oracle refused (`ORA-01843`, `ORA-01850`). A year of 0 to 9999 keeps `YYYY` and
+  no sign. #1498 measured the signed literals on Oracle AI Database 26ai Free 23.26.3: replayed into a
+  copy of the source table, the server compares the rows equal.
+- **A zoned column's ISO text, over HTTP (#1224).** The provider leaves `TIMESTAMP WITH TIME ZONE` and
+  `WITH LOCAL TIME ZONE` as the driver's `Date`, so in-process the export gets the zoned `Date` row
+  above. Over HTTP the row has been through JSON (`POST /api/db/query`), and the cell is that `Date`'s
+  `toISOString` text, `2026-09-01T07:30:00.000Z`. Quoted, Oracle reads it through the session's
+  `NLS_TIMESTAMP_TZ_FORMAT` and refuses it: `ORA-01843: An invalid month was specified`. So for a
+  column declared `TIMESTAMP[(n)] WITH [LOCAL] TIME ZONE`, text in exactly that form
+  (`YYYY-MM-DDTHH:MM:SS.sssZ`) is parsed back to its `Date` and written by the same code as the `Date`,
+  but only when that `Date` writes the same text back. The literal is built from the parsed fields,
+  never from the text. The live script ([§12.4](#124-optional-verifying-against-a-live-oracle)) replays
+  both zoned types this way under `Europe/Istanbul`, and the server calls every row equal. Three things
+  stay quoted as text:
+  - The same text in a column not declared a zoned timestamp: `TIMESTAMP`, `DATE`, `VARCHAR2`, or no
+    declared type.
+  - Other text in a zoned column: `+00:00` in place of `Z`, no fraction or more than three digits of
+    one, a space in place of `T`, and text that has the form but is not what `toISOString` writes for
+    any instant, such as `2026-02-30T00:00:00.000Z` or `T24:00:00.000Z`.
+  - A year outside 0000–9999, which `toISOString` writes with a sign and six digits
+    (`-000044-03-15T10:30:00.000Z`, `+012026-…`). Oracle has no year after 9999, and the BC text is left
+    for a separate change, so it stays quoted and Oracle still refuses it (`ORA-01847`). The `Date` of a BC
+    instant is written with its sign (above), so only this text form is affected.
 - **Local fields for a naive column**, because that is the inverse of what the driver did: it built
   the `Date` by reading the stored wall clock in the *Node process's* zone. Measured above, a `DATE`
   holding `2026-08-24 10:11:12` arrives as `2026-08-24T07:11:12.000Z` from a process at `+03:00`, so
@@ -688,9 +1016,25 @@ about which fields of the `Date` are the value:
   fractional second at all. Both were measured: a `TO_TIMESTAMP` literal inserted into a `DATE`
   column is accepted and silently truncated to the whole second, so the explicit function only says
   what the column already is.
+- **Inline grid editing** ([`use-inline-editing.ts`](../../src/hooks/use-inline-editing.ts), #1807)
+  opens its editor on those same three text forms: the wall-clock text of a `DATE` or `TIMESTAMP`
+  (#1131) and the ISO instant text of a `TIMESTAMP WITH [LOCAL] TIME ZONE` over HTTP (#1224). And
+  `oracledb` binds a string parameter as `DB_TYPE_VARCHAR`, which Oracle reads into a date or
+  timestamp column through the session's `NLS_DATE_FORMAT` (`DD-MON-RR`), `NLS_TIMESTAMP_FORMAT`
+  (`DD-MON-RR HH.MI.SSXFF AM`), or `NLS_TIMESTAMP_TZ_FORMAT` (`DD-MON-RR HH.MI.SSXFF AM TZR`).
+  Measured on 26ai Free 23.26.3.0.0 (`oracledb` 26.0.0, `TZ=Europe/Istanbul`): a bare `SET "COL" = :1`
+  is refused with `ORA-01861: literal does not match format string` on `DATE` and `ORA-01843: An
+  invalid month was specified.` on `TIMESTAMP` and both zoned timestamp types. So an edit still in the
+  column's form (`inlineEdit.boundEdit` in
+  [`oracle-sql-writing.ts`](../../src/lib/db/providers/sql/oracle-sql-writing.ts), sharing the
+  masks and regexes the SQL INSERT export reads there) binds `:n` inside `TO_DATE(:n,
+  '[S]YYYY-MM-DD HH24:MI:SS')`, `TO_TIMESTAMP(:n, '[S]YYYY-MM-DD HH24:MI:SS[.FF]')`, or
+  `FROM_TZ(TO_TIMESTAMP(:n, 'YYYY-MM-DD HH24:MI:SS.FF3'), 'UTC')` (binding `YYYY-MM-DD HH:MM:SS.sss`).
+  Text in any other shape, or in a column declared as another type, is bound as `:n` untouched.
 
 Verified end to end — read through the provider, exported, replayed into a fresh table, compared **by
-the server**:
+the server**. This run predates #1131, so `D` and `TS` are still the driver's `Date` in it, read by a
+process at `+03:00`:
 
 ```
 PROVIDER ROWS  [{"K":1,"D":"2026-08-24T07:11:12.000Z","TS":"2026-08-24T07:11:12.345Z","TTZ":"2026-08-24T17:11:12.345Z","TLTZ":"2026-08-24T17:11:12.345Z"},
@@ -718,11 +1062,26 @@ survive an export, because it did not survive the driver.**
 
 ---
 
+### 5.6 SQL grammar
+
+How this engine's statement text is read is declared once, in [`src/lib/db/providers/sql/oracle-sql-grammar.ts`](../../src/lib/db/providers/sql/oracle-sql-grammar.ts), the `oracle` row of the SQL grammar registry in `src/lib/db/sql-grammar/`.
+Its grammar is `ORACLE_GRAMMAR`, the one reading the statement splitter, the row limiter, the confirmation gate and query-event redaction share, so they cannot disagree about where a literal or a comment ends.
+`#` is an identifier character and comments open on `--` and `/*` only, from node-oracledb's own SQL tokenizer (`lib/thin/statement.js`).
+Alternate quoting is on, and Oracle is the only row with it: the same tokenizer's `_parseQstring` opens a q-string at a `'` after `q` or `Q`, `nq'...'` included, with `[ ] { } ( ) < >` as paired delimiters, as Oracle's SQL Language Reference (checked 2026-08-05) gives it.
+Block comments are flat: the tokenizer stops at the first `*/`, and the PL/SQL Language Reference says one multiline comment cannot contain another.
+`//` is code, probed 2026-08-25 on Oracle Free through sqlplus: `SELECT 1 AS a // note FROM dual` is ORA-00923.
+A PL/SQL unit is one statement, ended by SQL*Plus's `/` line: measured on 26ai Free 23.26.3, a procedure cut at its inner `;` was stored INVALID with PLS-00103, and the unit is refused without the `;` after its `END`, so the splitter keeps that one.
+`[...]` is not established and stays at the fail-safe default.
+The update-target reader takes `MINUS` as a set operator here alone, since it is an ordinary column name on every other engine.
+`readsSqlText` is `true`: the editor text is SQL, and the provider extends `SQLBaseProvider`.
+Redaction is `sql` with `"` as its name quote: a redacted statement keeps its words and every name in that quote, and every literal becomes `?`.
+
 ## 6. Transactions
 
-Explicit lifecycle on a dedicated connection checked out from the pool ([oracle.ts:258](../../src/lib/db/providers/sql/oracle.ts)).
-Oracle starts a transaction implicitly on the first DML, so `beginTransaction()` just holds the
-connection. **No auto-rollback timeout** (see [§3.4](#34-no-transaction-auto-rollback-timeout)).
+Explicit lifecycle on a dedicated connection checked out from the pool (`beginTransaction()`,
+[`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts)). Oracle starts a transaction implicitly on
+the first DML, so `beginTransaction()` just holds the connection. A 5-minute auto-rollback on an owned provider only (see
+[§3.4](#34-transaction-auto-rollback-timeout-on-an-owned-provider-only)).
 Surfaced via `POST /api/db/transaction`.
 
 | Method | Behaviour |
@@ -732,39 +1091,887 @@ Surfaced via `POST /api/db/transaction`.
 | `commitTransaction()` / `rollbackTransaction()` | `commit()`/`rollback()`, then closes the connection. Throws if none active. |
 | `isInTransaction()` | Current state. |
 
+### 6.1 `endOpenQueryTransaction()` is NOT implemented here, because the engine has no transaction to leave open
+
+The providers that implement `endOpenQueryTransaction()` ([`types.ts`](../../src/lib/db/types.ts)) end a transaction a statement run through `query()` left behind on the session the next request borrows; the set is read from the type rather than listed here, because a list repeated across provider docs goes stale the moment it grows.
+This provider does not, and the reason is that on this path **the engine has no transaction to leave open**.
+
+Two independent facts in `query()` ([`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts)) make that true, and neither is an inference about the engine's name:
+
+- Every statement executes with `autoCommit: true`, so Oracle ends the transaction that statement implicitly started, at that statement. A statement that FAILS ends it too: Oracle rolls a failed statement back to its own implicit savepoint, and the statement before it was already committed. `BEGIN` does not change this — in Oracle it opens a PL/SQL block, not a transaction.
+- The pooled connection is closed in the `finally` of every call, so nothing survives the statement for a later caller to inherit. `oracledb` 6.10.0 in Thin mode also rolls back inside that close: `ThinConnectionImpl.close()` issues a rollback when `_protocol.txnInProgress` is set, before the session goes back to the pool.
+
+The ask exists on this driver, unlike `mysql` and `mssql`: `oracledb` publishes `connection.transactionInProgress`, read from the server's own end-of-call `TXN_IN_PROGRESS` status flag.
+It is not usable here, because by the time a caller could ask, the connection the statement ran on has been closed.
+That is also why implementing the surface to answer `"none"` would be wrong rather than harmless: it would certify an absence on a session that no longer exists.
+
+The interactive lifecycle above is the only transaction this provider holds open, and it is not what the surface names: it runs on a connection of its own with `autoCommit: false`, which `query()` never borrows.
+
 ---
 
 ## 7. Schema introspection
 
-`getSchema()` returns one `TableSchema` per table owned by the connecting user. Five `ALL_*` queries
-(`OWNER = :user`), grouped client-side:
+The dictionary views every object read draws on:
 
 | Data | Source view(s) |
 |------|----------------|
 | Tables + row estimate | `ALL_TABLES` (`NUM_ROWS`) |
-| Columns | `ALL_TAB_COLUMNS` (`isPrimary` derived from PK set; `nullable` = `NULLABLE = 'Y'`) |
+| Columns | `ALL_TAB_COLUMNS` (`type` built from `DATA_TYPE` and its length, precision and scale columns, #1139, and from `VECTOR_INFO` where the server has it, #1209; `isPrimary` derived from PK set; `nullable` = `NULLABLE = 'Y'`) |
 | Primary keys | `ALL_CONSTRAINTS` + `ALL_CONS_COLUMNS` (`CONSTRAINT_TYPE = 'P'`) |
 | Foreign keys | `ALL_CONSTRAINTS` (type `'R'`) joined to the referenced constraint's columns |
 | Indexes | `ALL_INDEXES` + `ALL_IND_COLUMNS` (`unique` = `UNIQUENESS = 'UNIQUE'`) |
 
-No `getSchemaList()`/`getSchemaRelations()`; no `size` on the returned tables (see [§3.3](#33-owner-scoped-five-query-schema-introspection)).
+### The object surface (#789), and the confinement it lifts (#765)
+
+The flat reading this replaced was bound to `OWNER = <connecting user>` on every one of its five
+reads, so the app showed exactly one schema on Oracle with no way to reach another. The object
+surface is five container-aware methods
+(`listContainers`, `countObjects`, `listObjects`, `describeObject`, `describeObjects`) declared in
+[`types.ts`](../../src/lib/db/types.ts) and implemented in
+[`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts). Both surfaces are live through Phase 1;
+the flat reading it replaced is deleted.
+
+#### Nine kinds, and the dictionary that answers for each
+
+| Kind | `role` | `ALL_OBJECTS.OBJECT_TYPE` | Listing read | Note |
+|---|---|---|---|---|
+| `table` | `relation` | `TABLE` | `ALL_OBJECTS`, minus materialized-view containers | `acceptsRowWrites: true` |
+| `view` | `relation` | `VIEW` | `ALL_OBJECTS` | not a row-write target |
+| `materialized_view` | `relation` | `MATERIALIZED VIEW` | `ALL_OBJECTS` | not a row-write target |
+| `synonym` | `config` | `SYNONYM` | `ALL_OBJECTS` | |
+| `sequence` | `config` | `SEQUENCE` | `ALL_OBJECTS` | |
+| `package` | `group` | `PACKAGE` (+ `PACKAGE BODY`) | `ALL_OBJECTS`, two rows collapsed | `childKinds: ['procedure', 'function']` |
+| `procedure` | `routine` | `PROCEDURE` | `ALL_OBJECTS` | |
+| `function` | `routine` | `FUNCTION` | `ALL_OBJECTS` | |
+| `trigger` | `attached` | `TRIGGER` | `ALL_OBJECTS`, with `ALL_TRIGGERS` OUTER joined for the parent | `attachedTo: 'table'` |
+
+`containerLevels` is one level, `schema`, and on Oracle that level IS a user: a schema is not a
+thing created beside a user, it is what a user owns. No `catalog` level is declared, because a pool
+is opened against one service and nothing in the product can switch the pluggable database on a
+live connection.
+
+**No `index` kind**, on the same line PostgreSQL is read against. Oracle's own dictionary models an
+index as an attribute of the table it is on: `ALL_INDEXES` is keyed by `TABLE_OWNER` and
+`TABLE_NAME`, and an index cannot exist apart from them. So an index stays in `describeObject()`'s
+output beside that object's columns rather than becoming a container-level folder.
+
+**A package's members are declared but not browsable yet.** `childKinds` is a true statement about
+the engine and Phase 2 renders it, but Phase 1's provider surface is container-scoped end to end:
+`countObjects(container)` and `listObjects(container, kind)` both take a container, and nothing
+lists an object's children. A Procedures folder under a package would therefore render, never
+badge, and expand to nothing. `listObjects(container, 'package')` returns the packages themselves.
+
+#### Two dictionary vocabularies for the same nine kinds
+
+`ALL_OBJECTS.OBJECT_TYPE` writes the type names with spaces; the `object_type` argument
+`DBMS_METADATA.GET_DDL` takes writes them with underscores. They are not interchangeable, and Phase
+2 (the Source tab) reads the second column, so both are written once in `ORACLE_OBJECT_TYPES` in
+[`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts) rather than typed out twice:
+
+| Kind | `ALL_OBJECTS.OBJECT_TYPE` | `DBMS_METADATA.GET_DDL` |
+|---|---|---|
+| `table` | `TABLE` | `TABLE` |
+| `view` | `VIEW` | `VIEW` |
+| `materialized_view` | `MATERIALIZED VIEW` | `MATERIALIZED_VIEW` |
+| `synonym` | `SYNONYM` | `SYNONYM` |
+| `sequence` | `SEQUENCE` | `SEQUENCE` |
+| `package` | `PACKAGE` | `PACKAGE` |
+| (a package body) | `PACKAGE BODY` | `PACKAGE_BODY` |
+| `procedure` | `PROCEDURE` | `PROCEDURE` |
+| `function` | `FUNCTION` | `FUNCTION` |
+| `trigger` | `TRIGGER` | `TRIGGER` |
+
+The package body is deliberately outside the kind table and kept beside it: it is not a kind, it is
+the second dictionary row of the one `package` node, and putting it in the table would add it to
+the counting statement and report every package twice.
+
+#### `listContainers()` reads `ALL_USERS`, and that is what ends the single-schema confinement
+
+One statement, bound to nothing. `ORACLE_MAINTAINED = 'N'` is the dictionary's own answer to "is
+this schema Oracle's", so no hand-written name denylist exists here and none should be added:
+measured on Oracle Database 21c XE, **29 of the 33 rows in `ALL_USERS` are Oracle's own**, and a
+list written by hand would be wrong on the next release. `ALL_USERS` itself is not privilege
+filtered, so every user sees every owner.
+
+**The cost of that filter is a known limitation, and `SYSTEM` is the name to know.** An
+Oracle-maintained owner other than the session user is not in the container list at all, so it
+cannot be browsed, and `SYSTEM` is one of them while genuinely holding user-visible objects:
+measured, the fixture's `APP` user counts 4 tables and 1 view in `SYSTEM`. `MDSYS` and `XDB` are in
+the same position. This is the same trade PostgreSQL's system-schema exclusion makes, for the same
+reason, and it is why the session's own owner is exempted: connecting as `SYSTEM` still browses
+`SYSTEM`.
+
+The session's own owner is kept whatever `ORACLE_MAINTAINED` says
+(`OR USERNAME = SYS_CONTEXT('USERENV','SESSION_USER')`), because connecting as `SYSTEM` must not
+hide `SYSTEM`. That same `SYS_CONTEXT` call, not `connection.user`, is what marks
+`Container.isSessionDefault`: it is Oracle's own answer for who is connected, so it is right under
+external authentication and right for an owner created with a quoted lower-case name.
+
+**`ORACLE_MAINTAINED` costs the filter, never the list.** The column arrived in Oracle Database
+12.1. Thin mode refuses anything older with `NJS-138`, but Thick mode is an explicit opt-in for
+exactly those servers ([§4.4](#44-thick-mode-opt-in-oracle_client_lib_dir)), so an 11.2 instance
+answering `ORA-00904` here is a supported configuration; `listContainers()` re-runs the statement
+without the filter. The retry is keyed on the COLUMN NAME as well as on `ORA-00904`, because 00904
+is "invalid identifier" generally and re-running without the filter repairs nothing when the
+missing column was `USERNAME`. Both halves of that key survive a non-English `NLS_LANGUAGE`:
+Oracle translates the sentence, never the `ORA-` prefix and never the quoted identifier.
+
+A container path is passed to the other three methods verbatim and is never upper-cased.
+The deleted flat reading upper-cased `connection.user` because it was reading what a person typed
+into a form; a container segment came out of `ALL_USERS`, so it is already the dictionary's own
+spelling, and
+`CREATE USER "app"` is legal.
+
+#### `countObjects()` is one statement that reads no column of any table
+
+This is what #765 is. Measured on 21c XE against the `SYS` owner (1,672 tables, 113,264 columns),
+which is the nearest thing on a laptop to the reporter's PeopleSoft instance:
+
+| | statements | rows materialised | wall clock |
+|---|---|---|---|
+| the deleted flat reading, on connect | 5 | 121,462 | 1,490 ms |
+| `listContainers()` + `countObjects()` | 2 | 12 | 72 ms |
+
+Verified from the server side rather than from the client: after a flushed shared pool, a connect
+plus first paint leaves exactly three statements in `V$SQL` for the app user (the container read,
+the counting read, and node-oracledb's own `BEGIN NULL; END;` connection test) and **zero**
+touching `ALL_TAB_COLUMNS` or `ALL_IND_COLUMNS`. One `describeObject()` call then puts two of them
+there, which is the control that makes the zero a measurement rather than an empty log.
+
+Two exclusions inside that one statement, and both turn a badge into a lie if they are missed.
+
+**`PACKAGE BODY` is not counted.** A body is not a separate tree node, so counting it would double
+the Packages badge.
+
+**A materialized view's container table is not counted as a table.** Measured:
+`CREATE MATERIALIZED VIEW app_revenue_mv` writes TWO rows into `ALL_OBJECTS`, the materialized view
+and a `TABLE` of the same name for its container, with `GENERATED = 'N'` on both, so nothing about
+the table row says it is not a table somebody created. Left in, an owner with 100 materialized
+views reports 100 tables nobody wrote, and each one opens onto the materialized view's own columns.
+The deleted flat reading had that defect, and it was visible on the fixture: it returned three
+tables for an owner holding two.
+
+The rule needs no second dictionary view, and that is measured rather than assumed. A table and a
+materialized view cannot share a name in one owner, because they share Oracle's schema-object
+namespace: `CREATE TABLE app.app_revenue_mv` against the fixture's materialized view answered
+`ORA-00955`. So a same-named `TABLE`/`MATERIALIZED VIEW` pair is always the container, and one
+analytic window over the rows already being read finds it. Reading `ALL_MVIEWS` instead answers the
+same and costs more: against the 15,636-object `SYS` owner, the window form takes **10,385
+consistent gets** and a correlated `NOT EXISTS` over `ALL_OBJECTS` takes **18,285**.
+
+**A refused read is `{ unavailable }`, never 0**, carrying Oracle's own sentence unmapped, and every
+declared kind is seeded at `{ count: 0 }` before the read so a folder the owner holds none of
+renders a zero rather than disappearing. There is no partial outcome to report here and no retry
+that could produce one: `ALL_OBJECTS` is the single source for all nine kinds, so Oracle refuses it
+whole or not at all. Worth knowing when reading a small number: `ALL_*` views FILTER by privilege
+rather than refusing, so an owner you can see only part of answers a real count of the part you can
+see, not a refusal. Measured: `APP` counting `SYSTEM` gets 4 tables and 1 view.
+
+#### A package's specification and body are one object carrying both statuses
+
+Oracle stores them as two dictionary rows with two statuses, and a user wrote one package.
+`listObjects(container, 'package')` reads both and collapses them by name; the collapsed object's
+`status` is `INVALID` when EITHER half is, because "the package works" is false if either half does
+not compile. Neither row is privileged: a body can outlive its specification, and a specification
+usually exists with no body while it is being written. All four combinations are real, and the
+fixture ships the second one because it is the state Oracle is in most often:
+
+| Specification | Body | Rendered |
+|---|---|---|
+| `VALID` | `VALID` | nothing |
+| `VALID` | `INVALID` | `INVALID` |
+| `INVALID` | `VALID` | `INVALID` |
+| `VALID` | absent | nothing |
+
+A successful `CREATE OR REPLACE PACKAGE BODY` can leave an `INVALID` body behind rather than
+failing, which is why `docker/oracle-init/01-object-fixture.sql` contains a package whose body
+deliberately does not compile. Do not "fix" it.
+
+**`status` is set only where `ALL_OBJECTS` says `INVALID`, for every kind.** Until #789 this
+provider published `STATUS` on every object, which put a `VALID` badge beside every table in the
+tree: `VALID` is what nearly every row in a real schema says, so the badge carried no information
+and taught a reader to skip the field. The field's contract is now that its PRESENCE is the signal
+and Oracle's own word is the content, and absence means ordinary rather than unknown. The decision
+stays in this provider because only it knows which of Oracle's words is the ordinary one; a
+renderer that knew the string `VALID` would be a branch on the engine moved up a layer.
+
+`STATUS` is `ALL_OBJECTS`'s `VALID`/`INVALID` for every kind, triggers included. `ALL_TRIGGERS` has
+a `STATUS` column of its own that says `ENABLED`/`DISABLED`, which is a different fact about a
+different thing, so the trigger listing joins back to `ALL_OBJECTS` rather than putting two
+vocabularies in one field. A trigger's enabled state is a Phase 2 detail-tab fact.
+
+#### Object identity: Oracle needs no disambiguator on the last path segment
+
+`DatabaseObject.path`'s last segment must be unique within its parent, and on PostgreSQL that
+forces a routine's segment to carry its argument types. Oracle does not, and this was measured
+rather than reasoned:
+
+- `CREATE OR REPLACE FUNCTION app.app_order_total(p_a NUMBER, p_b NUMBER)` against the fixture's
+  existing single-argument `APP_ORDER_TOTAL` **replaced** it. `ALL_OBJECTS` still held one row.
+  Oracle has no routine overloading at schema level.
+- A function cannot even share a name with a table: `CREATE OR REPLACE FUNCTION app.app_orders`
+  answered `ORA-00955`. Tables, views, materialized views, sequences, private synonyms, packages,
+  standalone procedures and functions all share ONE namespace per owner, so Oracle paths happen to
+  be unique across those kinds as well as within each of them. The shared conformance helper only
+  requires the second, and nothing here should be tightened to depend on the first.
+
+`ALL_ARGUMENTS` does carry an `OVERLOAD` column, and it is the right column: a PACKAGE can hold
+overloaded members. Phase 1 lists packages and not their members, so nothing needs it yet, and
+`OVERLOAD` is what Phase 2 should reach for rather than a format invented here.
+
+Triggers are the one kind in a different namespace, and that is measured too:
+`CREATE TRIGGER app.app_orders ... ON app.app_orders` succeeds beside the table of that name. It
+costs nothing, because a trigger's path has three segments where a table's has two.
+
+#### Where a trigger hangs, including the cases that are not a table
+
+`attachedTo: 'table'`, so a trigger is `[owner, table, trigger]` and not `[owner, trigger]`. Oracle
+would in fact allow the shorter form, since a trigger name is unique within its owner rather than
+within its table, but the nesting is what the tree renders and it is the same rule every engine in
+#789 follows. Four cases, all measured:
+
+- **Base table in another owner.** `ALL_TRIGGERS` separates `OWNER` from `TABLE_OWNER`, and a
+  trigger `APP` owns on `REPORTING`'s table is real. It is listed in **APP's** container, because
+  `APP` is what owns it, and its path is `['APP', 'REPORT_DAILY', 'REPORT_DAILY_TRG']`. The middle
+  segment then names a table that APP's own Tables folder does not list. That is the honest answer
+  of the three available: putting it in `REPORTING`'s container would list an object that owner does
+  not own, and joining the owner into the segment (`REPORTING.REPORT_DAILY`) would put a qualified
+  name back into a path, which is the exact defect `DatabaseObject.path` exists to prevent.
+- **Base object is a view.** An `INSTEAD OF` trigger gives `BASE_OBJECT_TYPE = 'VIEW'` with the view
+  in `TABLE_NAME`, so it nests under the view. The `attachedTo` declaration names one kind and the
+  path names the object, which is what addresses it.
+- **The base table is invisible to this user.** `ALL_TRIGGERS` is outer joined, so there is no row
+  to read a parent from and the trigger lists at two segments, exactly like the case below. The two
+  are deliberately indistinguishable: what the tree needs is an address, and the object is counted
+  either way.
+- **No base object at all.** A `SCHEMA` or `DATABASE` trigger (`AFTER LOGON ON SCHEMA`) leaves
+  `TABLE_NAME` NULL. It hangs off the container itself, so its path is two segments,
+  `['APP', 'APP_LOGON_TRG']`. Filtering it out of the listing instead would have made the folder
+  disagree with the badge, since the count comes from `ALL_OBJECTS`, which counts every trigger.
+  `describeObject()` accepts both depths for an attached kind for the same reason.
+
+**The count and the listing read ONE catalog, and for triggers that took fixing.** Standing ruling
+5f requires the listing to contain exactly what the count counted, and the count reads
+`ALL_OBJECTS`. The two dictionary views do not expose the same population, which is measured rather
+than argued: a user holding nothing but `CREATE SESSION` and one `SELECT` grant sees **83 rows in
+`ALL_TRIGGERS` and 0 in `ALL_OBJECTS`**, because `ALL_OBJECTS` answers by privilege on the object
+while `ALL_TRIGGERS` also answers by accessibility of the BASE TABLE. Driving the listing from
+`ALL_TRIGGERS` with an inner join therefore computes an INTERSECTION, which can only ever be a
+SUBSET of what the badge counted: the badge can outrun the folder, never the reverse. On 21c XE no
+reader could be constructed where that subset was strictly smaller, so the divergence is structural
+rather than exhibited, and the outer join removes the question at no cost. Verified live on the
+fixture: 4 counted, 4 listed.
+
+The shared conformance helper still does not assert `list.length === count`, because a count and a
+listing remain two reads at two instants against a live engine.
+
+#### `describeObject()` reads four statements, each bound to one owner and one object
+
+Columns from `ALL_TAB_COLUMNS`, the primary key and the foreign keys from
+`ALL_CONSTRAINTS` + `ALL_CONS_COLUMNS`, indexes from `ALL_INDEXES` + `ALL_IND_COLUMNS`. They run in
+sequence on one pooled connection, because a single `oracledb` connection serialises its statements
+anyway. `ALL_TAB_COLUMNS` answers for a view and for a materialized view's container table as well
+as for a table, so none of the three relation kinds needs a dictionary of its own.
+
+All four bind `[path[0], path[path.length - 1]]`. The object's own name is the LAST segment and
+never `path[1]`: the two are the same string on a one-level engine like this one and different on
+the five two-level engines that copy this file, where `path[1]` is a container segment and the read
+would narrow to nothing.
+
+The KIND decides whether they run at all: only the three kinds whose `role` is `relation` have
+columns, so a package, a routine, a synonym, a sequence and a trigger answer three empty arrays
+without a round trip. That is a true fact about those kinds rather than a failed read. Deciding it
+from the NAME instead would be correct only by coincidence, and Oracle is where the coincidence
+breaks: these statements key the last path segment against `TABLE_NAME`, and a trigger named
+`APP_ORDERS` on table `APP_CUSTOMERS` is legal, so it would have been handed `APP_ORDERS`'s columns
+as if they were its own.
+
+Those same three kinds, `table`, `view` and `materialized_view`, are the ones that declare
+`hasColumns`, which is what gives an object row a twisty in the object tree; a synonym, a sequence, a
+package, a procedure, a function and a trigger declare nothing and are leaves, because
+`describeObject()` answers them three empty arrays.
+`sequence` is why the declaration is per provider rather than derived from the role or the kind id:
+this provider gates on the role, so an Oracle sequence has no columns at all, while PostgreSQL's
+`sequence` answers `last_value`, `log_cnt` and `is_called` under the same kind id.
+An object dropped between the listing and the expand is not an error here: the four reads answer no
+row and `describeObject()` returns three empty arrays, which the tree reports on the open row as
+`No columns reported` rather than as a refusal.
+
+Two of the four statements differ from the deleted flat reading's counterparts on purpose:
+
+- The foreign-key read pairs columns with `rcc.POSITION = acc.POSITION`. Without it a two-column
+  foreign key joins every referencing column to every referenced one and reports four pairs for two.
+  The flat foreign-key statement had that defect and is gone with it.
+- The index read is keyed by `ai.TABLE_OWNER`, not `ai.OWNER`. An index one user owns on another
+  user's table belongs to the table when a person is looking at the table, and an index this owner
+  holds on somebody else's table does not.
+
+`ForeignKeySchema.referencedTable` is one string, so it is spelled bare within the same owner and
+`OWNER.TABLE` outside it. Qualifying the cross-owner case is not cosmetic, since a bare name there
+addresses a table in the wrong schema. Turning that string into a path is Phase 2's.
+
+#### `describeObjects()` describes a whole folder in five statements (#789)
+
+`describeObjects(container, kind, limit?)` answers columns, indexes and foreign keys for EVERY object
+of one kind in one owner, in FIVE round trips whatever the folder holds, against four per object for
+the single read.
+On this engine that is also the other half of #765: the same four dictionary views scoped to an owner
+alone answered 910,000 column rows on the reporter's instance.
+
+**The timing is the one in this family that does not simply favour the bulk read, and it is measured
+rather than assumed.**
+On Oracle Database 21c XE against a 202-table owner, three consecutive runs in one connection:
+
+| Run | `describeObjects()` | 202 × `describeObject()` |
+|---|---|---|
+| first | 1025 ms | 447 ms |
+| second | 53 ms | 206 ms |
+| third | 50 ms | 220 ms |
+
+The first call pays a hard parse of five large statements the shared pool has never seen; every call
+after it is about four times faster than the N+1.
+That is why all five carry BINDS rather than interpolated values: a statement whose text changes per
+owner would hard-parse every time and never reach the second row of that table.
+
+The five decisions this engine had to make for itself, each measured rather than reasoned:
+
+**Which catalog.**
+The same four `ALL_*` dictionary views `describeObject()` reads, and not `USER_*`, which answers only
+for the connecting user and is what #765 was about.
+The five statements share one `described` CTE and the four detail reads join it by NAME, which is the
+only key these views carry: none of `ALL_TAB_COLUMNS`, `ALL_CONSTRAINTS`, `ALL_CONS_COLUMNS` or
+`ALL_INDEXES` publishes an `OBJECT_ID`.
+Joining on a name is safe here for a measured reason: tables, views, materialized views, synonyms,
+sequences, packages, procedures and functions share ONE namespace inside an owner, and a second
+`CREATE` of any of them answers ORA-00955.
+
+**Which kinds have no columns.**
+Everything but `table`, `view` and `materialized_view`: a package, a procedure, a function, a synonym,
+a sequence and a trigger answer `{ details: [] }` with no round trip.
+A MATERIALIZED VIEW is NOT one of them, measured on 21c XE: `ALL_TAB_COLUMNS` answers for one, because
+it has a container table underneath, and that container is also why the `table` target has to drop it.
+
+**What bounds the read on the wire.**
+`ORDER BY o.OBJECT_NAME FETCH FIRST :3 ROWS ONLY`, bound at `limit + 1`, and **not `ROWNUM`**: ROWNUM
+is assigned BEFORE the sort, so `WHERE ROWNUM <= n ORDER BY OBJECT_NAME` keeps an arbitrary set and
+then orders it, while `FETCH FIRST` cuts the ordered set.
+The extra object is dropped and `truncated` carries the CALLER's limit; an unbounded call runs a
+statement with no row bound and can never report truncation.
+Nothing here caps a column list.
+
+**What orders the cut, and under whose collation.**
+The target's `ORDER BY OBJECT_NAME`, which runs under the database's own `NLS_SORT` and is therefore
+the SERVER's order rather than ours.
+It decides WHICH objects a bound keeps and nothing else: the answer is re-sorted by path in code, one
+rule everywhere, because callers join the two readings on path rather than on position.
+
+**Mixed path depth (ruling 5f).**
+Not in this engine's relation set.
+`table`, `view` and `materialized_view` are all addressed `[owner, name]`; `trigger` is the kind that
+sits at two depths here - a SCHEMA or DATABASE trigger has no base object - and it has no columns.
+
+**A bind trap worth carrying forward.**
+Each detail statement names the owner a SECOND time, for its own join, and that reference takes the
+next free placeholder (`:3` unbounded, `:4` bounded) with the owner repeated in the bind array.
+A repeated `:1` looks right and is not: measured against a live 21c XE, oracledb maps a bind ARRAY by
+the order the placeholders APPEAR rather than by the number they carry, so a statement naming `:1`
+twice answers `NJS-098: 3 bind placeholders were used in the SQL statement but 2 bind values were
+provided`.
+The unit suite could not see that, because its fake dispatches on statement text and never counted the
+binds, so the arity is asserted from the arguments now.
+
+An empty owner costs ONE round trip rather than five.
+
+Rebuilding the 202-table owner the timings above were measured on, as APP on XEPDB1, so the numbers
+are re-runnable rather than asserted:
+
+```sql
+BEGIN
+  FOR i IN 0 .. 199 LOOP
+    EXECUTE IMMEDIATE 'CREATE TABLE bulk_t' || LPAD(i,3,'0') || ' (id NUMBER PRIMARY KEY, a VARCHAR2(20), b NUMBER)';
+    EXECUTE IMMEDIATE 'CREATE INDEX bulk_ix' || LPAD(i,3,'0') || ' ON bulk_t' || LPAD(i,3,'0') || ' (a)';
+  END LOOP;
+END;
+/
+```
+
+#### A column's type is its declaration, built from the dictionary (#1139)
+
+`ALL_TAB_COLUMNS.DATA_TYPE` has no length, precision or scale: a `VARCHAR2(20)` reads `VARCHAR2` and
+a `NUMBER(12,2)` reads `NUMBER`.
+The schema-diff migration generator writes `ColumnSchema.type` into `CREATE TABLE` and
+`ALTER TABLE ... ADD (...)` as it is, so a type read from `DATA_TYPE` alone breaks the migration.
+A bare `VARCHAR2`, `NVARCHAR2` or `RAW` is refused with ORA-00906.
+A bare `CHAR` or `NUMBER` is worse, because Oracle accepts it and creates a different column:
+`CHAR(1)`, or a `NUMBER` with no precision or scale.
+
+Both column reads therefore also select `DATA_LENGTH`, `DATA_PRECISION`, `DATA_SCALE`, `CHAR_LENGTH`
+and `CHAR_USED`, and `declaredType()` in `oracle.ts` builds the declaration with this rule:
+
+| `DATA_TYPE` | Declaration |
+| --- | --- |
+| `VARCHAR2`, `CHAR` | `<DATA_TYPE>(<CHAR_LENGTH> BYTE)` when `CHAR_USED` is `B`, `<DATA_TYPE>(<CHAR_LENGTH> CHAR)` when it is `C` |
+| `NVARCHAR2`, `NCHAR` | `<DATA_TYPE>(<CHAR_LENGTH>)` |
+| `RAW` | `RAW(<DATA_LENGTH>)` |
+| `NUMBER` | `NUMBER` when precision and scale are both null, `NUMBER(*,<s>)` when only precision is null, `NUMBER(<p>)` when scale is 0, otherwise `NUMBER(<p>,<s>)` |
+| `FLOAT` | `FLOAT(<DATA_PRECISION>)` |
+| `UROWID` | `UROWID(<DATA_LENGTH>)` (#1209) |
+| `VECTOR` | `VECTOR_INFO` as it is, where the server has that column (#1209) |
+| anything else | `DATA_TYPE` as it is |
+
+`ColumnSchema.type` is that declaration, and `ColumnSchema.baseType` is `DATA_TYPE`.
+`baseType` is OMITTED where the two are equal, which is the rule the MySQL and SQL Server providers
+follow too.
+`type` is what a reader sees and what DDL writes.
+`baseType` is what a reader that decides on a type family matches against, and the code generator
+and the test data generator already read `baseType ?? type`.
+
+Measured on Oracle Database 21c Express Edition over `APP.COLUMN_TYPES`, which the fixture creates:
+
+| Declared | `DATA_TYPE` | `type` | `baseType` |
+| --- | --- | --- | --- |
+| `VARCHAR2(20)`, `VARCHAR2(20 BYTE)` | `VARCHAR2` | `VARCHAR2(20 BYTE)` | `VARCHAR2` |
+| `VARCHAR2(20 CHAR)` | `VARCHAR2` | `VARCHAR2(20 CHAR)` | `VARCHAR2` |
+| `NVARCHAR2(10)` | `NVARCHAR2` | `NVARCHAR2(10)` | `NVARCHAR2` |
+| `CHAR(2)` | `CHAR` | `CHAR(2 BYTE)` | `CHAR` |
+| `CHAR(3 CHAR)` | `CHAR` | `CHAR(3 CHAR)` | `CHAR` |
+| `NCHAR(3)` | `NCHAR` | `NCHAR(3)` | `NCHAR` |
+| `RAW(16)` | `RAW` | `RAW(16)` | `RAW` |
+| `NUMBER` | `NUMBER` | `NUMBER` | absent |
+| `NUMBER(10)` | `NUMBER` | `NUMBER(10)` | `NUMBER` |
+| `NUMBER(12,2)` | `NUMBER` | `NUMBER(12,2)` | `NUMBER` |
+| `NUMBER(*,2)` | `NUMBER` | `NUMBER(*,2)` | `NUMBER` |
+| `NUMBER(5,-2)` | `NUMBER` | `NUMBER(5,-2)` | `NUMBER` |
+| `INTEGER` | `NUMBER` | `NUMBER(*,0)` | `NUMBER` |
+| `FLOAT(10)` | `FLOAT` | `FLOAT(10)` | `FLOAT` |
+| `FLOAT` | `FLOAT` | `FLOAT(126)` | `FLOAT` |
+| `TIMESTAMP(3)` | `TIMESTAMP(3)` | `TIMESTAMP(3)` | absent |
+| `TIMESTAMP(6) WITH TIME ZONE` | the same | the same | absent |
+| `INTERVAL DAY(3) TO SECOND(2)` | the same | the same | absent |
+| `DATE`, `CLOB`, `BLOB`, `BINARY_DOUBLE` | the same | the same | absent |
+| `UROWID(100)` | `UROWID` | `UROWID(100)` | `UROWID` |
+| `UROWID` | `UROWID` | `UROWID(4000)` | `UROWID` |
+
+A table created from the built declarations has `ALL_TAB_COLUMNS` rows identical to the fixture's,
+25 of 25, on 21c XE and on Oracle AI Database 26ai Free 23.26.3.
+The `TIMESTAMP` and `INTERVAL` types need no rule, because `DATA_TYPE` already carries their
+precision.
+
+##### `UROWID` and `VECTOR` (#1209)
+
+Both types carry a size that `DATA_TYPE` leaves out, and a bare `DATA_TYPE` is accepted for both.
+So before #1209 a migration created a different column without an error, the same class of defect
+as a `CHAR(2)` read back as `CHAR`.
+A bare `UROWID` is created with `DATA_LENGTH` 4000, so `UROWID(100)` needs its `DATA_LENGTH`.
+A bare `UROWID` reads as `UROWID(4000)`, and that declaration creates the same column.
+
+A vector's dimension count and format are in no length, precision or scale column.
+`CHAR_LENGTH` holds the dimension count, and nothing but `VECTOR_INFO` holds the format.
+So the declaration of a vector column is `VECTOR_INFO` as it is.
+Measured on Oracle AI Database 26ai Free 23.26.3.
+The fixture cannot hold these columns because the compose image is 21c, so the live guard creates
+them:
+
+| Declared | `CHAR_LENGTH` | `VECTOR_INFO`, which is `type` | Bare `VECTOR` creates |
+| --- | --- | --- | --- |
+| `VECTOR` | 0 | `VECTOR(*,*,DENSE)` | the same |
+| `VECTOR(3, FLOAT32)` | 3 | `VECTOR(3,FLOAT32,DENSE)` | `VECTOR(*,*,DENSE)` |
+| `VECTOR(*, FLOAT64)` | 0 | `VECTOR(*,FLOAT64,DENSE)` | `VECTOR(*,*,DENSE)` |
+| `VECTOR(16, BINARY)` | 16 | `VECTOR(16,BINARY,DENSE)` | `VECTOR(*,*,DENSE)` |
+| `VECTOR(100, FLOAT32, SPARSE)` | 100 | `VECTOR(100,FLOAT32,SPARSE)` | `VECTOR(*,*,DENSE)` |
+
+`baseType` is `VECTOR` for each of them.
+Each `VECTOR_INFO` spelling, replayed on the same server, creates a column with the same
+`VECTOR_INFO`, `CHAR_LENGTH` and `DATA_LENGTH`.
+`VECTOR(5, INT8)` and `VECTOR(3)` read as `VECTOR(5,INT8,DENSE)` and `VECTOR(3,*,DENSE)`, and they
+replay the same too.
+
+`VECTOR_INFO` is a `VARCHAR2` column on 26ai, and it does not exist on 21c XE: a read that names it
+is `ORA-00904: "VECTOR_INFO": invalid identifier`, or `"C"."VECTOR_INFO"` in the bulk read.
+Both column reads therefore name it only where the server has it.
+`readColumns()` asks for it first, and on an ORA-00904 that names `VECTOR_INFO` it reads the columns
+again without it.
+This is the repair `listContainers()` makes for `ALL_USERS.ORACLE_MAINTAINED`.
+The provider instance also remembers the refusal, so a server without the column pays for one
+refused read for each provider instance, not one for each describe.
+Nothing resets that memory, a reconnect of the same instance included.
+So a server upgraded to 23ai under an open provider instance keeps the read without `VECTOR_INFO`,
+and its `VECTOR` columns read as `DATA_TYPE` until the instance is recreated.
+An ORA-00904 that names another column is raised, because reading without `VECTOR_INFO` repairs
+nothing there.
+A `VECTOR` row without `VECTOR_INFO` keeps `DATA_TYPE`, which is what the provider reported before
+#1209.
+
+`BYTE` is written even though `DBMS_METADATA.GET_DDL` leaves it out.
+Under `NLS_LENGTH_SEMANTICS = CHAR`, a bare `VARCHAR2(20)` is created with `CHAR_USED = C`, measured,
+so a migration without `BYTE` would change the column on such a target.
+A computed view column is safe with this rule: `COUNT(*)`, `1/3` and `N * 2` report a null precision
+and scale and read as `NUMBER`, and `SUBSTR(A, 1, 3)` reads as `VARCHAR2(12 BYTE)`.
+
+`QueryResult.columnTypes` does NOT change.
+It comes from the driver ([§5.4](#54-declared-column-types)), and there a computed result column
+reports precision 0 or scale -127, so it stays `DATA_TYPE`'s spelling on purpose.
+
+`tests/live/oracle-column-type.ts` ([§12.4](#124-optional-verifying-against-a-live-oracle)) holds
+this against a real server.
+It replays the generated `CREATE TABLE` under `NLS_LENGTH_SEMANTICS = CHAR`, requires an accept,
+and compares the new table's `ALL_TAB_COLUMNS` rows with the fixture's.
+It then replays the `DATA_TYPE`-only definition that this replaces and requires ORA-00906.
+
+##### What the server does with a `MODIFY` (#1240)
+
+The migration generator writes a modified column as one
+`ALTER TABLE <t> MODIFY (<col> <type><default><nullability>)`.
+It writes the nullability clause, ` NULL` or ` NOT NULL`, only when the nullability changes.
+Oracle refuses a nullability the column already has, measured on 21c XE and 26ai Free 23.26.3:
+
+| Statement | Result |
+| --- | --- |
+| `MODIFY ("S" VARCHAR2(50 BYTE) NULL)`, `S` nullable | `ORA-01451: column to be modified to NULL cannot be modified to NULL`, and `S` keeps its type |
+| `MODIFY ("N" VARCHAR2(50 BYTE) NOT NULL)`, `N` NOT NULL | `ORA-01442: column to be modified to NOT NULL is already NOT NULL`, and `N` keeps its type |
+| `MODIFY ("S" VARCHAR2(50 BYTE))`, `S` nullable | accepted: `VARCHAR2(50 BYTE)`, nullable |
+| `MODIFY ("U" UROWID(4000))`, `U` a nullable `UROWID(100)` | accepted: `DATA_LENGTH` 4000 |
+
+Before #1240 the clause was always there, so a type or default change on a column whose
+nullability did not change was refused, and the migration changed nothing.
+The live guard ([§12.4](#124-optional-verifying-against-a-live-oracle)) replays a type change on a
+nullable and on a NOT NULL column, and a nullability change in each direction, and requires the
+target's `ALL_TAB_COLUMNS` rows, `NULLABLE` included.
+
+One consequence for the schema diff, measured and accepted rather than repaired.
+`diffColumns()` compares `type`, and a snapshot saved before #1139 stored `DATA_TYPE`.
+So every column whose declaration now differs from `DATA_TYPE` reports one false
+`Type changed: VARCHAR2 → VARCHAR2(20 BYTE)` and one `MODIFY`.
+Its nullability did not change, so the `MODIFY` has no nullability clause.
+What the server does with it depends on the side of the diff the old snapshot is on.
+Measured on an empty table on 21c XE and 26ai Free 23.26.3:
+
+- **The old snapshot is the source.** The `MODIFY` writes the current declaration, for example
+  `MODIFY ("V" VARCHAR2(20 BYTE))`.
+  The server accepts it and the column does not change.
+  This holds for `VARCHAR2`, `CHAR`, `NUMBER`, `FLOAT`, `RAW` and `UROWID`.
+- **The old snapshot is the target.** The `MODIFY` writes the bare `DATA_TYPE`.
+  A bare `VARCHAR2` or `RAW` is refused with ORA-00906.
+  A bare `CHAR`, `NUMBER`, `FLOAT` or `UROWID` is accepted and changes the column: `CHAR(2)` becomes
+  `CHAR(1)`, `NUMBER(12,2)` loses its precision and scale, `FLOAT(10)` becomes `FLOAT(126)`, and
+  `UROWID(100)` becomes `UROWID(4000)`.
+
+A column whose declaration is `DATA_TYPE`, such as `DATE`, `CLOB` or a bare `NUMBER`, compares equal
+and reports nothing, and a new snapshot clears the rest.
+Comparing `baseType` instead would also hide a real `VARCHAR2(20)` → `VARCHAR2(40)`, which is the
+change this section exists to carry.
+
+### Object source (#789)
+
+`readObjectSource(path, kind, limit?)` answers ONE object's definition text as a document of named
+parts, each part either readable text or Oracle's own reason there is none.
+All NINE declared kinds have one, so this provider has no "declares nothing" list.
+
+| Kind | Statement | What the text IS | Parts |
+|---|---|---|---|
+| `table` | `DBMS_METADATA.GET_DDL('TABLE', :name, :owner)` | complete, regenerated | 1, `definition` |
+| `view` | `GET_DDL('VIEW', ...)` | complete, regenerated | 1, `definition` |
+| `materialized_view` | `GET_DDL('MATERIALIZED_VIEW', ...)` | complete, regenerated | 1, `definition` |
+| `synonym` | `GET_DDL('SYNONYM', ...)` | complete, regenerated | 1, `definition` |
+| `sequence` | `GET_DDL('SEQUENCE', ...)` | complete, regenerated | 1, `definition` |
+| `package` | `GET_DDL('PACKAGE_SPEC', ...)` then `GET_DDL('PACKAGE_BODY', ...)` | complete, regenerated | 1 or 2, `spec` then `body` |
+| `procedure` | `GET_DDL('PROCEDURE', ...)` | complete, regenerated | 1, `definition` |
+| `function` | `GET_DDL('FUNCTION', ...)` | complete, regenerated | 1, `definition` |
+| `trigger` | `GET_DDL('TRIGGER', ...)` | complete, regenerated | 1, `definition` |
+
+The metadata type comes from the translation table the provider already ships for the count and the
+listings, so the two vocabularies cannot drift: `ALL_OBJECTS.OBJECT_TYPE` writes them with spaces
+(`MATERIALIZED VIEW`, `PACKAGE BODY`) and `GET_DDL` takes them with underscores
+(`MATERIALIZED_VIEW`, `PACKAGE_BODY`).
+
+That shared table is what makes the two vocabularies drift-proof, and it is also what makes ONE
+edit able to break nine reads at once, so the nine spellings above are pinned in
+`tests/integration/db/oracle-provider.test.ts` as a LITERAL list captured from the live server
+rather than read back out of the provider's own table.
+A wrong spelling is not a soft failure: `GET_DDL` answers an unknown `object_type` with
+`ORA-31600: invalid input value BOGUS_TYPE for parameter OBJECT_TYPE in function GET_DDL`, so the
+Source tab for every object of that kind fails.
+
+**`form` is `complete` and `origin` is `regenerated`, on every kind, and both are measurements.**
+`GET_DDL` answers a statement that runs as given, never a body or a bare SELECT.
+It is not the author's bytes either: the fixture's
+`CREATE OR REPLACE FUNCTION app.app_order_total(p_id NUMBER)` comes back as
+`CREATE OR REPLACE EDITIONABLE FUNCTION "APP"."APP_ORDER_TOTAL" (p_id NUMBER)`, with a keyword the
+author never typed and a qualification the author never wrote, so a reader is never shown a
+reconstruction as an original.
+
+**Nothing is interpolated and no identifier escaper is involved.**
+The metadata type, the object name and the owner are all three BINDS (`:1`, `:2`, `:3`), so a
+caller-supplied name never reaches statement text on this path.
+The owner is the segment the DECLARATION assigns to the `schema` container level and the object name
+is the LAST path segment; neither is read by a literal index.
+
+**The Monaco language id is `sql`, and that is a compromise this provider states rather than hides.**
+MEASURED on the installed monaco-editor 0.57.0: `plsql` is not among the 89 language ids the bundle
+registers, and an unregistered id degrades to plain text SILENTLY, with no throw and nothing
+observable. A PL/SQL body therefore renders under the SQL grammar, which highlights the DML and
+misses `IS`, `BEGIN`, `EXCEPTION` and the block structure.
+
+#### A package is TWO parts, and a package with no body is ONE
+
+`GET_DDL('PACKAGE', ...)` retrieves the specification AND the body together in one CLOB, and this
+provider deliberately does not use it. Two round trips are paid instead, for three reasons that one
+concatenated CLOB cannot express:
+
+- a body may be ABSENT, and a concatenation cannot say so. `APP_SPEC_ONLY_PKG` in the fixture is that
+  state, and it emits ONE part. The missing body is neither a refusal nor an error: nobody ever wrote
+  it, so there is nothing to refuse.
+- a body may be WRAPPED while the specification is not, and one CLOB gives the reader neither
+  honestly. `APP_WRAPPED_PKG` in the fixture is that state: a readable `spec` part beside a refused
+  `body` part.
+- the two halves carry independent `STATUS` values, which `APP_BROKEN_PKG` exhibits.
+
+#### A kind declaring source and no `sourceLanguage` RAISES
+
+`readObjectSource` refuses with
+`Oracle declares readable source for the kind "<kind>" and no sourceLanguage to render it with`, before
+a connection is taken from the pool. There is no fallback to a literal `sql`: an unregistered or absent
+Monaco id degrades to plain text with no throw and nothing observable, so a fallback would hide a
+deleted declaration behind a Source tab that had quietly stopped highlighting. All nine declared
+languages are pinned by the isolated census
+(`tests/isolated/object-source-declarations.test.ts`), so the only way to reach this arm is a
+declaration somebody removed.
+
+#### ORA-31603 says "not found in schema" for an object you merely cannot read
+
+This is the single most important thing to know about this surface, because since #765 the tree lists
+EVERY owner, so opening another schema's object is the ordinary path rather than an edge case.
+
+MEASURED on Oracle XE 21.3.0.0.0 as `APP`, which holds `SELECT` on `REPORTING.REPORT_DAILY` and no
+catalog role:
+
+```
+SQL> SELECT DBMS_METADATA.GET_DDL('TABLE','REPORT_DAILY','REPORTING') FROM DUAL;
+ORA-31603: object "REPORT_DAILY" of type TABLE not found in schema "REPORTING"
+```
+
+The identical error, word for word, comes back for `REPORTING.NO_SUCH_TABLE`, which really does not
+exist. Oracle's own message cannot tell the two apart, and shipping it unqualified tells a user their
+objects are gone.
+
+**The code is read off `errorNum`, not off the message.** node-oracledb carries the Oracle error
+number as a numeric `errorNum` on the error it rejects with, in both modes: thin assigns it in
+`lib/thin/protocol/protocol.js` (`err.errorNum = message.errorInfo.num`) and every prebuilt thick addon
+under `build/Release` exports the same property name
+(`strings oracledb-6.10.0-linux-x64.node | grep -x errorNum`), both checked against oracledb 6.10.0.
+Scanning the MESSAGE for `ORA-31603` would make a failure that merely quotes that text, a wrapped
+error or a logged one, look like a missing object, and the second question would then be asked about
+the wrong fact. An error carrying a different `errorNum` raises even when its text quotes this code.
+An error carrying no numeric `errorNum` at all, which is what a rejection composed outside the driver
+looks like, still falls to the text scan, and that arm is asked second.
+
+So on ORA-31603 the provider asks a SECOND question:
+
+```sql
+SELECT 1 FROM ALL_OBJECTS WHERE OWNER = :1 AND OBJECT_NAME = :2 AND OBJECT_TYPE = :3
+```
+
+- a row EXISTS: the object is there and the READ was refused. The part carries an `unavailable`
+  holding Oracle's own ORA-31603 sentence whole and first, then the fact that settles which of the
+  two it is.
+- no row: the object is genuinely absent to this session, and the read RAISES a `QueryError` naming
+  the object. It never answers a document and never answers a refusal.
+
+**`ALL_OBJECTS` by name, and never `DBA_OBJECTS`.** `ALL_OBJECTS` is privilege-filtered, so it answers
+"can THIS caller see it", which is the question being asked. `DBA_OBJECTS` would answer "does it exist
+anywhere", turning the disambiguation into a cross-schema existence oracle over objects the caller has
+no grant on at all, and it needs a catalog role most callers do not hold, so it would also fail for the
+very sessions this path exists to serve.
+
+The type is bound in the DICTIONARY spelling, which is the column `ALL_OBJECTS` publishes. Binding the
+metadata spelling would answer NO ROW for every object of the three kinds whose two spellings differ,
+turning every privilege refusal on a materialized view or a package body into a false claim of absence.
+
+**What the refusal drops, and why that is a selection rather than a rewrite.** node-oracledb composes
+that error as ten lines: the `ORA-31603` line, then nine `ORA-06512: at "SYS.DBMS_METADATA", line 6781`
+frames, then a `Help:` link. The frames are a PL/SQL backtrace of line numbers inside Oracle's own
+package and say nothing about the object, and the refusal pane renders the engine's sentence in full,
+so leaving them in would bury the disambiguation under nine lines of `SYS` internals. Not one word of
+Oracle's is changed, reordered or paraphrased; the `ORA-06512` frames are dropped and everything else,
+the help link included, is kept. Only the ORA-31603 path is filtered: every other failure raises
+through `mapDatabaseError` with its message untouched.
+
+#### Wrapped PL/SQL: the detection rule, and why it is a POSITION
+
+A unit created through `DBMS_DDL.CREATE_WRAPPED` is stored as the encoder's output, and `GET_DDL`
+hands that output over with no error at all. A provider that passed it to an editor would show
+something that is not a definition and could not say so.
+
+**THE RULE**, established by probe 7 on Oracle XE 21.3.0.0.0 and documented nowhere Oracle publishes:
+a unit's definition text is WRAPPED if and only if the token immediately following the CLOSING DOUBLE
+QUOTE of its quoted name in the `DBMS_METADATA` header is the bare keyword `wrapped`,
+case-insensitive, AND the next physical line is the wrap format marker, matching `^[a-z][0-9]{6}$`
+(`a000000` on 21.3.0.0.0). The pattern is wider than the one literal on purpose: the marker names the
+encoder's format version, and pinning `a000000` would report a later Oracle's wrapped unit as plain
+text.
+
+```
+  CREATE OR REPLACE EDITIONABLE FUNCTION "APP"."APP_WRAPPED_MULTI" wrapped
+a000000
+369
+...
+```
+
+**The rule was mutation-tested rather than asserted.** The fixture commits four plain, VALID,
+COMPILING functions, three of them built to defeat the naive TEXTUAL rule and the fourth the control
+for the header position itself, and none of the four may be tidied away:
+
+| Fixture unit | Built to defeat | First source line |
+|---|---|---|
+| `APP_FIRST_LINE_WRAPPED` | "the line ends with `wrapped`" | `... RETURN NUMBER IS -- wrapped` |
+| `APP_SECOND_LINE_MARKER` | "line 2 is the format marker" | `... RETURN NUMBER IS /*`, then `a000000` |
+| `APP_CONJ_DEFEATER` | both halves at once | `... RETURN NUMBER IS /* wrapped`, then `a000000` |
+| `APP_ZERO_ARG` | the control: the closest PLAIN shape to a wrapped header | `... "APP_ZERO_ARG" RETURN NUMBER IS` |
+
+All four fail the predicate, because `GET_DDL` writes the object name inside double quotes and what
+follows it is decided by the PARSER: a plain unit admits only `(`, a RETURN clause, `IS` or `AS` in
+that position. If a future Oracle ever admits `wrapped` there for a plain unit, the assertion over
+these units fails by name.
+
+**The fifth unit attacks the OTHER conjunct, and it is the one that does not compile.**
+All four above defeat the keyword half of the rule; until `APP_MARKERLESS_HEADER` was added, the
+MARKER half was asserted by nothing at all, because a real wrapped unit always carries its marker.
+MEASURED on Oracle XE 21.3.0.0.0, and it is not what the parser rule above would lead you to expect:
+`wrapped` after a function name is ACCEPTED, because it is the wrap keyword.
+
+```sql
+CREATE OR REPLACE FUNCTION app.app_markerless_header wrapped
+BEGIN
+  RETURN 1;
+END;
+```
+
+That leaves one row in `USER_ERRORS`, `PLS-00753: malformed or corrupted wrapped unit`, the object is
+created `FUNCTION` / `INVALID`, and `DBMS_METADATA.GET_DDL` answers its source verbatim anyway: the
+header carries the keyword and the next line is `BEGIN`.
+So the predicate must answer NOT WRAPPED for it, and a reader gets a readable text rather than a
+manufactured refusal.
+Deleting the marker conjunct from the rule fails exactly the test over this unit.
+
+**A second, independent signal exists and is deliberately not used.** `ALL_SOURCE` holds a whole
+wrapped unit in ONE row with embedded newlines, where a plain unit is one row per line, and that shape
+is not forgeable from source text at all. It is not used because it costs a second round trip on every
+PL/SQL read and answers nothing for the five kinds that are not PL/SQL. It is written down here so a
+future defect in the header predicate has a measured alternative rather than a research problem.
+
+`EXECUTE ON DBMS_DDL` is already granted to `PUBLIC` on `gvenzl/oracle-xe`, so the fixture needs no
+grant to create a wrapped unit.
+
+#### Other refusals, and what raises instead
+
+- an EMPTY or whitespace-only definition is a REFUSAL carrying that fact, never a readable part. An
+  empty definition is not a definition, and an empty editor over one is the hazard this whole surface
+  exists to remove.
+- a CLOB that arrives as something other than a string RAISES. `GET_DDL` answers a CLOB, oracledb
+  answers a CLOB with a `Lob` stream by default, and serialising one throws
+  `TypeError: Converting circular structure to JSON`. The fix, `lobFetchTypeHandler`, is a PER-CALL
+  option and the object surface's ordinary reader passes none, so this read has its own `execute`; a
+  value that still comes back as a stream is a defect of ours and is reported as one rather than
+  coerced into an editor.
+- a path whose shape this kind cannot take is refused by the same rule `describeObject` uses, which
+  the two methods share so they cannot come to disagree about one engine.
+- a kind the provider declares no source for is refused by name.
+
+#### Reproducing every one of these
+
+The whole fixture is applied by the mount, so no command below creates anything:
+
+The container name and the host port below are a PRIVATE pair, not the defaults, and that is
+deliberate: a machine already running an Oracle on 1521, or a container already called `oracle`, is
+the ordinary case rather than the exception, and the recipe must not collide with one.
+Every measurement in this section was taken on exactly this pair.
+Remove only what you created.
+
+```bash
+docker run -d --name src-task07-oracle -e ORACLE_PASSWORD='Password123!' -p 15217:1521 \
+  -v "$PWD/docker/oracle-init:/container-entrypoint-initdb.d:ro" gvenzl/oracle-xe
+# wait for "DATABASE IS READY TO USE!" in `docker logs src-task07-oracle`, about four minutes
+docker exec -i src-task07-oracle sqlplus -s app/'Password123!'@localhost:1521/XEPDB1
+# 15217 is the HOST port, for a connection from the Studio UI; the exec above is already
+# inside the container, where the listener is on 1521.
+docker rm -f src-task07-oracle   # when you are done, and nothing else
+```
+
+```sql
+SET LONG 200000 PAGESIZE 0 LINESIZE 32767 LONGCHUNKSIZE 200000
+SELECT DBMS_METADATA.GET_DDL('FUNCTION','APP_WRAPPED_MULTI','APP') FROM DUAL;   -- wrapped
+SELECT DBMS_METADATA.GET_DDL('FUNCTION','APP_CONJ_DEFEATER','APP') FROM DUAL;   -- plain, and imitates it
+SELECT DBMS_METADATA.GET_DDL('FUNCTION','APP_MARKERLESS_HEADER','APP') FROM DUAL; -- keyword, no marker
+SELECT LINE, POSITION, TEXT FROM ALL_ERRORS WHERE NAME = 'APP_MARKERLESS_HEADER'; -- PLS-00753
+SELECT DBMS_METADATA.GET_DDL('BOGUS_TYPE','APP_ORDERS','APP') FROM DUAL;        -- ORA-31600
+SELECT DBMS_METADATA.GET_DDL('MATERIALIZED VIEW','APP_REVENUE_MV','APP') FROM DUAL; -- ORA-31600 again
+SELECT DBMS_METADATA.GET_DDL('PACKAGE_BODY','APP_WRAPPED_PKG','APP') FROM DUAL; -- wrapped body
+SELECT DBMS_METADATA.GET_DDL('PACKAGE_BODY','APP_SPEC_ONLY_PKG','APP') FROM DUAL; -- ORA-31603, absent
+SELECT DBMS_METADATA.GET_DDL('TABLE','REPORT_DAILY','REPORTING') FROM DUAL;     -- ORA-31603, refused
+SELECT DBMS_METADATA.GET_DDL('TABLE','NO_SUCH_TABLE','REPORTING') FROM DUAL;    -- ORA-31603, absent
+SELECT OWNER, OBJECT_NAME, OBJECT_TYPE FROM ALL_OBJECTS WHERE OWNER = 'REPORTING';
+```
+
+The last statement is the second question by hand: it answers a row for `REPORT_DAILY` and none for
+`NO_SUCH_TABLE`, which is the entire difference between a refusal and a raise.
+The two ORA-31600 lines are the other vocabulary's failure mode: the dictionary spelling
+`MATERIALIZED VIEW` is as invalid an `object_type` as `BOGUS_TYPE` is, which is why the nine metadata
+spellings are pinned in the suite rather than left to a table two consumers read differently.
+
+#### The fixture
+
+[`docker/oracle-init/01-object-fixture.sql`](../../docker/oracle-init/01-object-fixture.sql),
+mounted at `/container-entrypoint-initdb.d` by the `oracle` service in `database-compose.yml`. It
+creates two owners so the lifted confinement is observable, one object of every declared kind, the
+three trigger cases above, the package whose body does not compile, and the wrapped-PL/SQL block with
+the four plain units that imitate it and the fifth, INVALID one that carries the keyword without the
+marker ([Object source](#object-source-789)). `APP.COLUMN_TYPES` has one column per row of the
+column type rule ([§7](#a-columns-type-is-its-declaration-built-from-the-dictionary-1139)). Connect as `APP` /
+`Password123!` on service `XEPDB1`.
+
+It also seeds ROWS, two in `APP.APP_CUSTOMERS` and two in `REPORTING.REPORT_DAILY`, and those are
+part of the fixture rather than decoration: the terminator measurement in
+[§3.2a](#32a-a-generated-statement-carries-no-terminator) reads `-> rows`, and a table with none
+answers the accepted statement and the rejected one alike. One is inside the connecting user's own
+schema and one is outside it, which is the pair the generated statement's qualification needs.
+
+Three things about it are load-bearing:
+
+- The `/` statement terminators are a SQL*Plus convention and are correct in a mounted init script,
+  which SQL*Plus runs. They must **never** be sent through `node-oracledb`, which takes one
+  statement per `execute()` and answers `ORA-00911` for a trailing terminator.
+- `GRANT CREATE TABLE TO app` looks redundant beside `RESOURCE`, and is not: creating a materialized
+  view in another user's schema checks that the owner holds `CREATE TABLE` **directly**, and a
+  privilege held through a role does not satisfy that check. Without the line,
+  `CREATE MATERIALIZED VIEW` answered `ORA-01031` while `SYS` held `CREATE ANY MATERIALIZED VIEW`.
+- The scripts run once and only on a fresh data directory, so an existing container has to be
+  recreated before an edit takes effect.
 
 ---
+
+### Object edit (#789)
+
+This engine is a REFUSAL of the strongest class in the fleet: the FAILURE destroys the object.
+A `CREATE OR REPLACE` that fails to COMPILE overwrites the stored source with the broken text, marks the object `INVALID`, and THE DRIVER DOES NOT THROW, measured on FUNCTION, PROCEDURE, PACKAGE BODY, PACKAGE SPEC, TRIGGER and a `FORCE` VIEW.
+For a TRIGGER that is a table outage rather than one broken object: every INSERT then answers `ORA-04098` while `USER_TRIGGERS.STATUS` still reads `ENABLED`.
+Detecting that success-that-is-not-a-success means reading the driver's warning, and it is unwritable here until an ambient declaration grows: [`db-drivers.d.ts`](../../src/types/db-drivers.d.ts) declares oracledb's `Result` with no `warning` member at all.
+No kind here declares `acceptsSourceEdits`, and `tests/isolated/object-edit-declarations.test.ts` is what holds that absence and this section together.
 
 ## 8. Monitoring & health
 
 All from `V$`/`USER_*` views; `getMonitoringData()` (inherited) fans them out in parallel. Each
-sub-query is independently privilege-guarded ([§3.6](#36-privilege-resilient-monitoring)).
+`V$` sub-query is independently privilege-guarded; the dictionary-only table and index statistics
+are not ([§3.7](#37-privilege-resilient-monitoring)).
 
 | Method | Primary source | Notes / degradation |
 |--------|----------------|---------------------|
 | `getHealth()` | `V$SESSION`, `USER_SEGMENTS`, `V$SYSSTAT`, `V$SQL` | each block guarded → absent/`N/A`/`[]` if no privilege; `activeConnections` is **omitted**, never `0` ([§7.2](#72-when-the-connection-count-is-not-measurable)); `cacheHitRatio` is `N/A`, never `0%` ([§7.1](#71-when-the-cache-hit-ratio-is-not-measurable)) |
-| `getOverview()` | `V$VERSION`, `V$INSTANCE`, `V$SESSION`, `V$PARAMETER`, `USER_SEGMENTS`, `USER_TABLES`/`USER_INDEXES` | each guarded; `activeConnections` is **omitted**, never `0` ([§7.2](#72-when-the-connection-count-is-not-measurable)), while `maxConnections` stays `0` because `0` there means "no limit published" |
+| `getOverview()` | `V$VERSION`, `V$INSTANCE`, `V$SESSION`, `V$PARAMETER`, `USER_SEGMENTS`, `USER_TABLES`/`USER_INDEXES` | each guarded; `activeConnections` is **omitted**, never `0` ([§7.2](#72-when-the-connection-count-is-not-measurable)), while `maxConnections` stays `0` because `0` there means "no limit published"; `databaseSizeBytes` is **omitted** and `databaseSize` stays `N/A`, never a `0`, when `USER_SEGMENTS` does not answer ([§7.3](#73-when-the-database-size-is-not-measurable)) |
 | `getPerformanceMetrics()` | `V$SYSSTAT` | **only** `cacheHitRatio`, and it is **omitted** when `V$SYSSTAT` cannot be read (no QPS/deadlocks/buffer-pool) — [§7.1](#71-when-the-cache-hit-ratio-is-not-measurable) |
 | `getSlowQueries()` | `V$SQL` (top-N by `ELAPSED_TIME`) | `sharedBlksHit`=`BUFFER_GETS`, `sharedBlksRead`=`DISK_READS`; `[]` on failure |
 | `getActiveSessions()` | `V$SESSION` ⋈ `V$SQL` | `pid` = `"SID,SERIAL#"`; wait class/event; `[]` on failure |
-| `getTableStats()` | `ALL_TABLES` + `USER_SEGMENTS` | sizes + `lastAnalyze`; no live/dead tuples, no bloat; `[]` on failure |
-| `getIndexStats()` | `ALL_INDEXES` + `USER_SEGMENTS` + `ALL_IND_COLUMNS` | **`scans` always `0`** (no usage counter exposed); `isPrimary` always `false`; `[]` on failure |
+| `getTableStats()` | `USER_TABLES` + `USER_LOBS` + `USER_INDEXES` + `USER_SEGMENTS` | one row per table the connected user owns; sizes + `lastAnalyze` ([§7.4](#74-what-a-tables-size-counts)); no live/dead tuples, no bloat; **rejects** with the engine's sentence on failure ([§3.7](#37-privilege-resilient-monitoring)) |
+| `getIndexStats()` | `ALL_INDEXES` + `USER_SEGMENTS` + `ALL_IND_COLUMNS` | size summed over every segment of the index, partitions included; **`scans` always `0`** (no usage counter exposed); `isPrimary` always `false`; **rejects** on failure |
 | `getStorageStats()` | `DBA_DATA_FILES` → fallback `USER_SEGMENTS` | per-tablespace size; DBA view falls back to user segments without privilege |
 
 ### 7.1 When the cache hit ratio is not measurable
@@ -857,16 +2064,113 @@ reported as `0`. The absence is spelled `measuredNumber(...)` plus a conditional
 a refused `V$PARAMETER` leaves `0` and the card says "no limit published". The count is read first in
 that shared block precisely so a refused ceiling cannot carry a measured count away with it.
 
+### 7.3 When the database size is not measurable
+
+`getOverview()` sizes the schema with one statement over a **data dictionary view of the connected
+user's own segments**:
+
+```sql
+SELECT SUM(BYTES) AS TOTAL FROM USER_SEGMENTS
+```
+
+That is a different story from [§7.1](#71-when-the-cache-hit-ratio-is-not-measurable) and
+[§7.2](#72-when-the-connection-count-is-not-measurable), and the difference is the point. `USER_*`
+views describe objects the current user owns, so this statement needs none of the `V_$` access those
+sections turn on - the `ORA-00942` measured there against a `CREATE SESSION`-only user is **not**
+what fails here, and **no failure of this statement has been measured on a live instance at all**.
+That is precisely why the guard names no cause: a dictionary the DBA has locked down, a connection
+lost between this statement and the one before it, and an overrunning query that nothing here cuts
+short - this provider wires no server-side query timeout at all
+([§4.2](#42-connection-pooling)) - all arrive at the same `catch` in the same shape. A `catch` cannot
+tell them apart. It knows only that no figure arrived.
+
+So the figure is **omitted**, not zeroed. `DatabaseOverview.databaseSizeBytes` is optional exactly so
+this can be said - *"absence and zero are different facts"*, its docblock in
+[`src/lib/db/types.ts`](../../src/lib/db/types.ts) - and until #565 this method could not say it: the
+local was initialised to `0` and the `catch` was empty, so a statement that never answered published
+a measured-looking zero, indistinguishable from a schema that owns nothing.
+
+The monitoring **Storage** tab
+([`src/components/monitoring/tabs/StorageTab.tsx`](../../src/components/monitoring/tabs/StorageTab.tsx))
+is what the difference buys: it keys its entire breakdown off `databaseSizeBytes !== undefined`, so
+on the absence it renders *"No storage size information available."* On the fabricated `0` it drew
+the breakdown instead - and drew it against a total that contradicted its own rows. The Tables and
+Indexes figures come from `getTableStats()`, a **separate** read that does not share the size
+statement's failure, so real per-table bytes sat under a schema reported as `0 B`: every share is
+gated on `totalSize > 0`, so all three bars stayed empty, and `0 - tables - indexes` went negative,
+which the remainder row refuses as `N/A`. What the tab presented as a measurement was therefore a
+breakdown whose every element either disagreed with the total or declined to answer.
+
+**`databaseSize`, the formatted string, moves with the figure.** It is initialised to `"N/A"` and
+only `formatBytes()` replaces it, so an unanswered statement now leaves `"N/A"` where it used to
+leave `"0 bytes"`. That is not cosmetic: both the monitoring Overview card and the Storage tab's own
+header render this string as the headline size (`overview?.databaseSize || "N/A"`), so the old
+initialiser printed a confident `0 bytes` directly above *"No storage size information available."*
+`getHealth()` in this same file initialises its own `databaseSize` to `"N/A"`, so `getOverview()`
+was the odd one out; #569 (libSQL) and #517 (the search provider) merged the same
+pairing.
+
+A schema that really measures `0` is a **reading** and is kept, and here that case is ordinary rather
+than hypothetical: a freshly created user owns no segment, so `SUM(BYTES)` answers one row of `NULL`,
+which the provider maps to `0`; the tab then formats the `0 B` it was given. If the driver returns no
+row, no expected column, or a non-finite value, the measurement is absent and the string stays `N/A`.
+The shared `measuredNullableAggregate()` ([`measured-aggregate.ts`](../../src/lib/db/utils/measured-aggregate.ts))
+boundary preserves those states without a falsy test that would erase a genuine zero.
+
+### 7.4 What a table's size counts
+
+`USER_SEGMENTS` names each segment for its own object (`SEGMENT_NAME`, with `SEGMENT_TYPE` saying
+what kind) and has **no `TABLE_NAME` column**. From the provider's first version through 0.17.0 the
+table-stats statement selected one from it anyway, so on every Oracle connection the read answered
+`ORA-00904: "TABLE_NAME": invalid identifier`, the empty `catch` returned `[]`, and Monitoring >
+Tables, the Storage tab's table figures and the admin per-table maintenance list all read "no tables"
+(measured on Oracle AI Database 26ai Free 23.26.3.0.0, 2026-10-04). Which table owns an index or a
+LOB is a fact of `USER_INDEXES` and `USER_LOBS`, so the statement now lists every segment a table
+owns through those two and joins `USER_SEGMENTS` by name and kind:
+
+| Counted toward | Segments |
+|----------------|----------|
+| `tableSize` | the table's own (`TABLE`, `TABLE PARTITION`, `TABLE SUBPARTITION`); its LOB segments (`LOBSEGMENT`, `LOB PARTITION`, ...); its LOB indexes (`LOBINDEX`); an index-organized table's top index, where that table's rows live |
+| `indexSize` | every other index on the table, one segment per partition summed |
+
+Everything that stores the rows is the table, the way PostgreSQL's table size includes TOAST. The
+join matches a segment's kind as well as its name because indexes have their own namespace and may
+share a table's name. Measured on the same server with a seeded schema:
+
+| Table | Shape | `tableSize` | `indexSize` |
+|-------|-------|-------------|-------------|
+| `PART_T` | two range partitions, one LOCAL index | 16 MB (2 x 8 MB partitions) | 128 KB (2 x 64 KB) |
+| `DOCS` | CLOB + BLOB, primary key | 7.69 MB (64 KB table + 7.25 MB and 256 KB LOB segments + 2 x 64 KB LOB indexes) | 64 KB |
+| `EMP` | heap, primary key + one index, analyzed | 64 KB, 2000 rows, `lastAnalyze` set | 256 KB |
+| `IOT_T` | index-organized | 64 KB (the top index) | 0 B |
+| `HEAPY` | no row ever inserted (deferred segment creation) | 0 B | 0 B |
+
+A table never analyzed reads `rowCount` 0 and no `lastAnalyze`: both are the optimizer statistics,
+filled by Gather Statistics. `DROPPED = 'NO'` keeps a recycle-bin `BIN$` table out of the list
+wherever the dictionary shows one. An index the user owns on another schema's table is listed in
+`USER_INDEXES` under that table's bare name, so `TABLE_OWNER = USER` keeps it off a same-named table
+here. `schemaName` is the statement's own `USER`, the account the views answer for, which is the owner
+the per-row Gather Statistics and Rebuild Indexes then act on ([§9](#9-maintenance)). It is not the
+configured login name: a proxy login (`app[report]`) or a quoted lower-case user differ from it.
+
+A table stored in a `CLUSTER` has no segment of its own (the cluster holds it), so it reads 0 B.
+
 ---
 
 ## 9. Maintenance
 
-`runMaintenance(type, target?)` ([oracle.ts:586](../../src/lib/db/providers/sql/oracle.ts)):
+`runMaintenance(type, target?, container?)` ([`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts)):
+
+A `container` is the OWNER the row carries as `schemaName` (#772). It moves every read off the
+`USER_*` catalogs and onto their `ALL_*` twins with the owner bound, passes that owner as the
+first `GATHER_TABLE_STATS` / `GATHER_SCHEMA_STATS` argument in place of `USER`, and qualifies
+each `ALTER INDEX "<owner>"."<index>" REBUILD`. Without one the connected user is the owner,
+which is the reading every column below used before the parameter existed.
 
 | Type | With target | Without target |
 |------|-------------|----------------|
-| `analyze` | `DBMS_STATS.GATHER_TABLE_STATS(USER, '<t>')` | `DBMS_STATS.GATHER_SCHEMA_STATS(USER)` |
-| `optimize` | rebuild the indexes THAT TABLE owns: `SELECT INDEX_NAME FROM USER_INDEXES WHERE TABLE_NAME = :t AND INDEX_TYPE = 'NORMAL'`, then `ALTER INDEX "<i>" REBUILD` for each (own try/catch) | rebuild **every** normal user index (`USER_INDEXES`, each in its own try/catch) |
+| `analyze` | `DBMS_STATS.GATHER_TABLE_STATS(<owner>, '<t>')` | `DBMS_STATS.GATHER_SCHEMA_STATS(<owner>)` |
+| `optimize` | rebuild the indexes THAT TABLE owns: `SELECT INDEX_NAME FROM USER_INDEXES WHERE TABLE_NAME = :t AND INDEX_TYPE = 'NORMAL'` (or `ALL_INDEXES` with `OWNER = :owner`), then `ALTER INDEX "<i>" REBUILD` for each (own try/catch) | rebuild **every** normal user index (`USER_INDEXES` / `ALL_INDEXES`, each in its own try/catch) |
 | `kill` | `ALTER SYSTEM KILL SESSION '<SID,SERIAL#>'` | throws (`SID,SERIAL#` required) |
 
 `getCapabilities().maintenanceOperations = ['analyze', 'optimize', 'kill']`. Targets are
@@ -951,24 +2255,51 @@ is what lets the Operations tab render those words and send an operation Oracle 
 
 ## 10. Capabilities & labels
 
-### `getCapabilities()` ([oracle.ts:61](../../src/lib/db/providers/sql/oracle.ts))
+### `getCapabilities()` ([`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts))
 
 | Capability | Value |
 |------------|-------|
 | `queryLanguage` | `sql` |
 | `supportsExplain` | **`false`** (intentionally disabled — see [Known limitations](#14-known-limitations--future-work)) |
 | `supportsExternalQueryLimiting` | `true` (from base) |
-| `supportsCreateTable` | `true` (from base) |
-| `supportsInlineRowEdit` | `true` — `UPDATE t SET c = v WHERE pk = v` is core Oracle DML |
+| `createTable` | declared, see [Create Table form](#create-table-form) |
+| `supportsInlineRowEdit` | `true` — `UPDATE t SET c = v WHERE pk = v` is core Oracle DML; an edit of a `DATE`, `TIMESTAMP`, or `TIMESTAMP WITH [LOCAL] TIME ZONE` cell still in the provider's text form binds `:n` through `TO_DATE`, `TO_TIMESTAMP`, or `FROM_TZ(TO_TIMESTAMP(:n, …), 'UTC')` ([§5.5](#the-sql-export-writes-an-oracle-date-literal-not-an-iso-string)) |
+| `supportsTestDataGeneration` | `true` - the row menus offer Generate Test Data on tables, which writes one multi-row `INSERT INTO ... VALUES`. A `DATE` value is written as `TO_DATE('2026-01-27', 'YYYY-MM-DD')` and a `TIMESTAMP` value as `TO_TIMESTAMP('2026-01-27 14:30:00', 'YYYY-MM-DD HH24:MI:SS')`, the form the SQL export writes, because the quoted ISO text is read through `NLS_DATE_FORMAT` and refused with `ORA-01861`; a `NUMBER` column is generated as an integer and written unquoted (#1400) |
+| `supportsResultPagination` | `true` — `OFFSET m ROWS FETCH NEXT n ROWS ONLY` from this provider's own `prepareQuery` override; page one is `FETCH FIRST n ROWS ONLY` (#816) |
 | `supportsTransactions` | `true` — Oracle is always in a transaction and the held connection commits or rolls back, so the trio and the SANDBOX toggle are offered (#464) |
+| `implicitCommitStatements` | `ALTER`, `ANALYZE`, `ASSOCIATE`, `AUDIT`, `COMMENT`, `CREATE`, `DISASSOCIATE`, `DROP`, `FLASHBACK`, `GRANT`, `NOAUDIT`, `PURGE`, `RENAME`, `REVOKE`, `TRUNCATE`: Oracle's DDL, which "implicitly commits the current transaction before and after every DDL statement" (SQL Language Reference, "Types of SQL Statements"). Plus `BEGIN`, `DECLARE` and `CALL`: a PL/SQL block or a procedure can commit through `EXECUTE IMMEDIATE` or its own `COMMIT`. SANDBOX refuses all of these before sending, because a `ROLLBACK` after one answers success and can undo nothing, and this provider reads no transaction state back from the server to notice afterwards, so the declaration is the only guard here. `COMMIT`, `ROLLBACK` and `ABORT` are refused on every engine |
+| `implicitCommitExceptions` | `ALTER SESSION`, `ALTER SYSTEM`: session and system control, not DDL, so SANDBOX lets them through |
 | `declaresForeignKeys` | `true` — inherited from the base capabilities; read from `ALL_CONSTRAINTS`, so an empty list is about the schema or the owner, not the engine |
 | `supportsMaintenance` | `true` |
 | `maintenanceOperations` | `['analyze', 'optimize', 'kill']` |
 | `supportsConnectionString` | `true` |
 | `defaultPort` | `1521` |
+| `statementTerminator` | `'none'` - node-oracledb sends one statement and `;` is not part of it (see [§3.2a](#32a-a-generated-statement-carries-no-terminator)) |
 | `schemaRefreshPattern` | `(CREATE\|DROP\|ALTER\|TRUNCATE)\b` (from base) |
+| `containerLevels` | one level, `schema` - and on Oracle that level is a USER ([§7](#the-object-surface-789-and-the-confinement-it-lifts-765)) |
+| `containerPathShapes` | `exact`: only `[schema]` addresses a container, so a shorter or a longer path is refused, by the object routes over HTTP and by this provider for a caller that reaches it directly (#1147) |
+| `objectKinds` | nine: table, view, materialized view, synonym, sequence, package, procedure, function, trigger. No `index` kind ([§7](#the-object-surface-789-and-the-confinement-it-lifts-765)) |
 
-### Labels — overridden ([oracle.ts:71](../../src/lib/db/providers/sql/oracle.ts))
+### Create Table form
+
+`createTable` is `ORACLE_CREATE_TABLE` in [`oracle-create-table.ts`](../../src/lib/db/providers/sql/oracle-create-table.ts), a module that loads no driver, so the Create Table form and its tests read the real declaration (#1822).
+It is the grammar the form writes; the form itself knows no engine.
+
+| Field | Value |
+|-------|-------|
+| Auto-increment clause | `NUMBER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY`, not sequence-backed |
+| Column constraints (`PRIMARY KEY`, `UNIQUE`) | Yes |
+| Key type | `INTEGER` |
+| Types, in dropdown order | `VARCHAR2(255)`, `CLOB`, `INTEGER`, `NUMBER(19)`, `NUMBER(1)`, `TIMESTAMP`, `DATE`, `RAW(16)`, `NUMBER(10,2)` |
+
+The auto-increment clause is the identity column, the spelling Oracle documents as the current one.
+`VARCHAR2` is the string type Oracle documents; `VARCHAR` is reserved for a future meaning.
+There is no `TEXT`, `BIGINT` or `UUID` type, so long text is `CLOB`, a 64-bit integer is `NUMBER(19)` and a GUID is `RAW(16)`.
+A `BOOLEAN` table column is 23ai and later, so a true/false column is `NUMBER(1)`, the spelling that works on the versions before it.
+JSON is `CLOB` for the same reason: the native `JSON` type is 21c and later.
+A row that reads like the old shared list is Oracle agreeing with it, not a row nobody looked at.
+
+### Labels — overridden (`getLabels()`, [`oracle.ts`](../../src/lib/db/providers/sql/oracle.ts))
 
 Oracle **overrides** the default SQL labels so the UI uses Oracle vocabulary:
 `analyzeAction` → *"Gather Statistics"*, `vacuumAction` → *"Rebuild Indexes"*, and the matching
@@ -979,6 +2310,35 @@ The monitoring Queries panel's empty state was hardcoded to PostgreSQL's `pg_sta
 on every engine (#463); `getSlowQueries()` here reads `V$SQL`
 ([§8](#8-monitoring--health)) and returns `[]` when that read is refused, so the grant is the thing a
 DBA can act on.
+
+### SQL writing
+
+[`sql/oracle-sql-writing.ts`](../../src/lib/db/providers/sql/oracle-sql-writing.ts) declares how a generated statement spells a literal, a name and a bind for this engine, and it is this engine's row of `SQL_WRITING` ([`src/lib/db/sql-writing/index.ts`](../../src/lib/db/sql-writing/index.ts)), which the readers in [`src/lib/sql/values.ts`](../../src/lib/sql/values.ts) and [`src/lib/sql/identifier.ts`](../../src/lib/sql/identifier.ts) look up.
+A literal is written by `literalStandard` and read back by `unquoteStandard`: the quote is doubled and a backslash is data.
+A name is quoted by `identifierDoubleQuoted`, the SQL standard form: a double-quoted name with an inner double quote doubled.
+A bind is spelled by `placeholderColon`, as `:1`, `:2`.
+`oracledb` binds an array to `:n`.
+The module also declares a `temporalLiteral` form.
+Oracle reads a quoted string in a date position through the session's `NLS_DATE_FORMAT`, `DD-MON-RR` by default, and refuses the ISO text with `ORA-01861: literal does not match format string` (#1400, on Oracle 23.26.3.0.0; the SQL export measured the same refusal for all four date types).
+So a `YYYY-MM-DD` date goes through `TO_DATE` and a `YYYY-MM-DD HH24:MI:SS` timestamp through `TO_TIMESTAMP`, with a mask that spells the text's own form, as the export writes the same types, and the session's format moves nothing.
+Text that is not in that form is quoted as it is: the mask would refuse it, and a plain literal says what the caller had.
+Inline row editing reads a key column's kind through the shared `INSTANT_TYPE_NAMES`, `FLOAT64_TYPE_NAMES` and `EXACT_DECIMAL_TYPE_NAMES` of the module's `inlineEdit`.
+Its `boundEdit` wraps the `:n` bind of a `DATE`, `TIMESTAMP` or `TIMESTAMP WITH [LOCAL] TIME ZONE` edit still in the provider's text in `TO_DATE`, `TO_TIMESTAMP` or `FROM_TZ(TO_TIMESTAMP(…), 'UTC')`, with the masks the SQL INSERT export uses (#1818).
+`oracledb` binds a string as `DB_TYPE_VARCHAR`, which Oracle reads into those columns through the session's `NLS_DATE_FORMAT`, `NLS_TIMESTAMP_FORMAT` or `NLS_TIMESTAMP_TZ_FORMAT`.
+Measured 2026-10-18 on Oracle AI Database 26ai Free 23.26.3.0.0 (`oracledb` 26.0.0, `TZ=Europe/Istanbul`): a bare `:1` was refused with `ORA-01861: literal does not match format string` on `DATE` and `ORA-01843: An invalid month was specified.` on the three timestamp types, while the wrapped bind stored each value equal on the server, BC dates included.
+Every other edit is bound as `:n` untouched.
+
+The module's `export` field spells a result export's column types through `ddlTypes`: `VARCHAR2(4000)`, `NUMBER(19)`, `BINARY_DOUBLE`, `NUMBER(1)`, `TIMESTAMP` and `BLOB`, since Oracle has no `TEXT` and no `BOOLEAN` before 23c.
+Each name in `standsAlone` was measured, one `CREATE TABLE probe (c <name>)` per name on Oracle Free 23ai, read back out of `USER_TAB_COLUMNS`, and is listed only because Oracle both accepted it and stored it unnarrowed.
+`NUMBER` there is the full 38 digits.
+A binary cell is written by `binaryHexToRaw`, because Oracle parses neither `X'…'` nor `0x…` as a binary literal (`SELECT rawtohex(x'0102') FROM dual` is `ORA-00907`), so the conversion function is the literal.
+`HEXTORAW('')` is NULL, which is also what Oracle stores for a zero-length RAW, so the empty case needs no special spelling.
+`nonFinite` writes `BINARY_DOUBLE_NAN`, `BINARY_DOUBLE_INFINITY` and `-BINARY_DOUBLE_INFINITY`: replayed into Oracle AI Database 23.26.3 (2026-10-04), its own constants read back into `BINARY_DOUBLE` and `BINARY_FLOAT`.
+`columnWriters` writes a date or timestamp cell through a conversion function chosen by the column's declared type, because Oracle parses none of the literal forms a `Date` stringifies to.
+Measured through the real export path on Oracle AI Database 26ai Free 23.26.2.0.0, an exported `'2026-08-24T07:11:12.345Z'` is `ORA-01843: An invalid month was specified` for all three timestamp types and `ORA-01861: literal does not match format string` for a `DATE`.
+A naive `DATE` or `TIMESTAMP` is written from the local fields of the `Date`: a `DATE` holding `2026-08-24 10:11:12` arrived as `2026-08-24T07:11:12.000Z` from a process at `+03:00`, so writing the ISO text would move every such value by the exporter's own offset.
+A zoned column is written through `FROM_TZ(..., 'UTC')`, which keeps the instant whatever zone the replaying session runs in, and a declared `DATE` through `TO_DATE`, since a `TO_TIMESTAMP` literal inserted into a `DATE` is accepted and silently truncated to the whole second.
+`NO_BARE_SPELLING` completes it.
 
 ---
 
@@ -991,10 +2351,18 @@ DBA can act on.
 | Missing `host` (no connection string) | `DatabaseConfigError` |
 | Operation before `connect()` | `DatabaseConfigError` (via `ensureConnected()`) |
 | `connect()` fails | `ConnectionError` (carries host/port) |
-| `ORA-01017` / *invalid username/password* | `AuthenticationError` |
+| A privilege the user lacks, by `errorNum`: `ORA-01031` insufficient privileges, `ORA-01045` no `CREATE SESSION` | `PermissionDeniedError`, answered `403 PERMISSION_DENIED` with `Permission denied: ` before the server's sentence |
+| A refused credential, by `errorNum`: `ORA-01017` an invalid credential, `ORA-01005` a null password, `ORA-28000` a locked account, `ORA-28001` an expired one | `AuthenticationError`, answered `401 AUTH_ERROR`; a message with no `errorNum` is still read by its words (*ORA-01017*, *password*) |
 | `ORA-12541` / `ORA-12154` / `TNS:` | `ConnectionError` |
 | `ORA-00942` (table or view does not exist) | `QueryError` |
 | `NJS-138` (server predates Oracle 12.1, Thin-mode incompatible) | `DatabaseConfigError`, **not retryable** — see [§4.4](#44-thick-mode-opt-in-oracle_client_lib_dir) |
+| `NJS-116` (account has only a 10G password verifier) | `DatabaseConfigError`, **not retryable**. Checked *before* the generic *password* branch, which would otherwise report it as an authentication failure. The message also names the DBA-side fix (a password reset writes a 12C verifier) |
+| `NJS-533` (server requires Native Network Encryption or checksumming) | `DatabaseConfigError`, **not retryable** |
+| `NJS-529` (wallet is not PEM, typically an sso-only `cwallet.sso`) | `DatabaseConfigError`, **not retryable**. Caught by code, not by substring: the driver's text says nothing about Thin mode. The message names both ways out — convert the wallet to `ewallet.pem`, or use Thick mode |
+| `NJS-089` (a **client-side** feature Thin mode does not implement: heterogeneous pooling, some database object types, Advanced Queuing) | `DatabaseConfigError`, **not retryable** |
+| Any other message containing *not supported by node-oracledb in Thin mode* | `DatabaseConfigError`, **not retryable** |
+| `NJS-045` from `initOracleClient()` (no Thick-mode addon in this build) | `DatabaseConfigError` from the constructor, worded as a **packaging defect** naming the platform and arch, not as a bad path |
+| `DPI-1047` from `initOracleClient()` (client libraries not loadable) | `DatabaseConfigError` from the constructor, pointing at the loader path (`/etc/ld.so.conf.d/` + `ldconfig`, or `LD_LIBRARY_PATH`) and `libaio.so.1` |
 | Driver message contains *timeout* / *timed out* | `TimeoutError` |
 | `connection.break()`-interrupted query | maps via the generic path (the driver's `ORA-01013` / "user requested cancel"); other `ORA-*` codes fall through to `QueryError`/`DatabaseError` with the original message |
 
@@ -1028,33 +2396,49 @@ the mock and the provider reading the same declaration. That declaration is hand
 package, and no `@types/oracledb` dependency here), so a driver upgrade that changes a shape is
 caught by a live probe, not by `tsc`.
 
+**The mock refuses a `USER_SEGMENTS` column the view does not have.** It answered every statement
+it was sent, so `SELECT TABLE_NAME ... FROM USER_SEGMENTS` passed the suite for as long as it shipped
+while the engine refused it with ORA-00904 ([§7.4](#74-what-a-tables-size-counts)). Worse, the
+table-stats statement fell through to the mock's database-size answer, and the old test asserted only
+the field types of that wrong row. The default handler now answers ORA-00904 for any column outside
+the 27 the view has on 23.26.3.0.0, a test pins that the guard refuses the 0.17.0 statement, and the
+table and index statistics are matched before the `USER_SEGMENTS` answers and asserted value by value.
+
 > ⚠️ **Mock isolation:** `bun`'s `mock.module()` is process-wide; files mocking different drivers
-> cross-contaminate in a shared process. A **single file** is safe (one file = one process). The
-> full `bun run test` script runs the core group in **one** process and is load-order flaky, so
-> **CI does not use it** — the deterministic runner is **`bun run test:ci`** (per-file isolation via
-> `tests/run-core.sh`); the coverage workflow uses `bun run test:coverage`. See [`CLAUDE.md`](../../CLAUDE.md).
+> would cross-contaminate if they shared one. They never do: `bun run test` gives every test file its
+> own bun process, so a single file is safe and so is the whole suite, which is the same command CI
+> runs. `bun run test:coverage` is that runner with coverage on. See [`CLAUDE.md`](../../CLAUDE.md).
 
 ### 12.2 Coverage
 
 The suite covers: validation, connect/disconnect, query, capabilities, **labels override**,
-**`prepareQuery` FETCH FIRST / OFFSET-FETCH**, `getSchema` (columns/PKs/FKs/indexes grouping),
+**`prepareQuery` FETCH FIRST / OFFSET-FETCH**, the object surface (columns/PKs/FKs/indexes),
 health, maintenance (analyze/optimize/kill), pool stats, the transaction lifecycle, query
 cancellation (`break()`), overview, performance metrics, slow queries, active sessions,
-table/index/storage stats, **the LOB fetch type handler** (per type, plus that `getSchema` is left
-alone and that a `BLOB` reaches `asBytes` in both its live and its serialized shape), **the
+table/index/storage stats, **the LOB fetch type handler** (per type, plus that the catalog reads are
+left alone and that a `BLOB` reaches `asBytes` in both its live and its serialized shape), **the
 `INTERVAL` literals** (both types, positive/negative/zero, a nine-digit year count, nanosecond
 precision, `NULL`, both query paths, and that a result with no interval column keeps the driver's own
-rows array), error mapping,
+rows array), **the `DATE`/`TIMESTAMP` wall clock** (#1131: the same row read under `UTC`,
+`Europe/Istanbul` and `America/Los_Angeles`, the fraction, padding and a BC year, `NULL`, both query
+paths, the two zoned types as untouched controls, and the SQL INSERT export of the read), error mapping,
 and **every `ssl.mode` branch** (the TCPS switch, the
 DN-match flag, the concatenated `walletContent`, and a pasted connect string keeping its own
 protocol) asserted against the attributes `createPool` received.
+
+It also covers **the object surface** (#789): the nine declared kinds and their roles, the shared
+`assertObjectSurface` contract, the container list and its `ORACLE_MAINTAINED` fallback, the
+one-statement count and its two exclusions, the package spec-and-body collapse across all three
+row orderings, the three trigger shapes, the four narrow detail reads, and every refusal. Each of
+those invariants was mutation-checked: the logic behind it was deleted and the suite confirmed to
+go red, which caught two assertions that were passing vacuously.
 
 ### 12.3 Run it
 
 ```bash
 bun test tests/integration/db/oracle-provider.test.ts   # just this file (single process — safe)
-bun run test:ci                                          # CI publish gate — per-file isolation (tests/run-core.sh)
-bun run test:coverage                                    # CI coverage workflow — per-file core + components
+bun run test                                             # the whole suite, one process per file, what CI runs
+bun run test:coverage                                    # CI coverage workflow: the same runner, with coverage
 ```
 
 ### 12.4 Optional: verifying against a live Oracle
@@ -1063,6 +2447,59 @@ bun run test:coverage                                    # CI coverage workflow 
 docker run --rm -e ORACLE_PASSWORD=secret -p 1521:1521 gvenzl/oracle-free:slim
 # then connect to localhost:1521 / FREEPDB1 (user system, password secret) in the Studio UI
 ```
+
+`tests/live/oracle-zoneless-values.ts` (#1131,
+[§5.3](#a-date-and-a-timestamp-read-as-the-stored-wall-clock-in-every-server-time-zone-1131)) holds
+the `DATE`/`TIMESTAMP` reading against the server itself. It reads a throwaway table through the
+provider under `UTC`, `Europe/Istanbul` and `America/Los_Angeles` AND as the server's own `TO_CHAR`,
+and requires the two to agree. It also checks that `TIMESTAMP WITH TIME ZONE` stays an instant, that
+the raw driver value is still the shifted `Date` the conversion compensates for, and that the SQL
+INSERT export of the read, put through JSON as over HTTP, replays to values the server calls equal,
+`TIMESTAMP WITH TIME ZONE` and `WITH LOCAL TIME ZONE` included (#1224). Supply the password configured on
+the container:
+
+```bash
+ORACLE_TEST_PORT=1521 ORACLE_TEST_PASSWORD="$PROBE_PASSWORD" bun tests/live/oracle-zoneless-values.ts
+```
+
+For the object surface, use the compose service instead, which mounts the fixture
+([§7](#the-object-surface-789-and-the-confinement-it-lifts-765)). Connecting as `SYSTEM` is a
+weaker test than connecting as `APP`: `SYSTEM` reads every owner, so a read that was still
+owner-scoped would look correct.
+
+```bash
+docker compose -f database-compose.yml up -d oracle
+# then connect to localhost:1521 / XEPDB1 as APP / Password123!
+```
+
+The live guard for the column type rule
+([§7](#a-columns-type-is-its-declaration-built-from-the-dictionary-1139)) reads the same fixture.
+Its subject is what the ENGINE creates from a declaration, which a mock cannot settle. It CREATES
+and DROPS throwaway tables in the connecting user's schema, so point it at a disposable server:
+
+```bash
+LIBREDB_LIVE_ORACLE_URL='oracle://app:Password123!@127.0.0.1:1521/XEPDB1' \
+  bun tests/live/oracle-column-type.ts
+```
+
+On 21c the guard prints that it skipped the `VECTOR` case (#1209). To run that case, use 26ai Free.
+The fixture names the 21c service `XEPDB1`, and 26ai Free names it `FREEPDB1`.
+So mount a copy of the fixture with the service name replaced, measured on 26ai Free 23.26.3.
+The init scripts run only on a fresh container, so wait for `DATABASE IS READY TO USE!` before you
+connect:
+
+```bash
+mkdir -p /tmp/oracle-init-free
+sed 's/XEPDB1/FREEPDB1/g' docker/oracle-init/01-object-fixture.sql > /tmp/oracle-init-free/01-object-fixture.sql
+docker run -d --name libredb-oracle-free -e ORACLE_PASSWORD='Password123!' -p 1522:1521 \
+  -v /tmp/oracle-init-free:/container-entrypoint-initdb.d:ro gvenzl/oracle-free:slim
+until docker logs libredb-oracle-free 2>&1 | grep -q 'DATABASE IS READY TO USE!'; do sleep 10; done
+LIBREDB_LIVE_ORACLE_URL='oracle://app:Password123!@127.0.0.1:1522/FREEPDB1' \
+  bun tests/live/oracle-column-type.ts
+```
+
+The guard also holds the `MODIFY` rule (#1240,
+[§7](#what-the-server-does-with-a-modify-1240)) on both servers.
 
 ---
 
@@ -1079,12 +2516,15 @@ const provider = await createDatabaseProvider({
 
 await provider.connect();
 const res = await provider.query('SELECT id, email FROM users WHERE active = :1', [1]);
-const schema = await provider.getSchema();   // 5 ALL_* queries, grouped in memory
+const tables = await provider.listObjects(['APP'], 'table');
+const { details } = await provider.describeObjects(['APP'], 'table');
 await provider.disconnect();
 ```
 
 Over the API: `POST /api/db/query`, `POST /api/db/transaction`, `POST /api/db/cancel`,
-`POST /api/db/maintenance` (admin), `POST /api/db/schema/list` (falls back to `getSchema()`).
+`POST /api/db/maintenance` (admin), `POST /api/db/objects/inventory`, and
+the object tree's own routes under `POST /api/db/objects/*`
+([§7](#the-object-surface-789-and-the-confinement-it-lifts-765)).
 
 ---
 
@@ -1114,16 +2554,34 @@ Over the API: `POST /api/db/query`, `POST /api/db/transaction`, `POST /api/db/ca
   `10:11:12.345 -07:00` comes back rendered `17:11:12.345 UTC`, and the sub-millisecond digits a
   `Date` cannot hold are not in the file either. Both are the driver's truncation, above, not the
   export's.
+- **A `DATE` or `TIMESTAMP` is only as exact as the driver's `Date`.** The provider reads both as their
+  wall clock in every zone (#1131), but the driver has already built the `Date` in the Node process's
+  zone, so three values arrive wrong:
+  - A wall clock inside that zone's spring-forward gap, an hour late.
+  - A year below 100, read as 19xx.
+  - Any digit past the millisecond.
+
+  UTC has no gap, so the published image is exact for the first; `TO_CHAR` in the query is exact for
+  all three ([§5.3](#a-date-and-a-timestamp-read-as-the-stored-wall-clock-in-every-server-time-zone-1131)).
 - **`oracledb` ships no TypeScript declarations, so the driver surface is hand-declared.** Verified
   on 6.10.0: no `types`/`typings` field in its `package.json` and no `.d.ts` anywhere in the package,
   and there is no `@types/oracledb` in this project's dependencies. `src/types/db-drivers.d.ts`
   declares the members this provider actually uses instead of the blanket `any` it used to; that
   declaration is checked against the driver only by the live probes and the integration mock, so a
   driver upgrade that changes a shape will not be caught by `tsc` alone.
-- **`NJS-138` (pre-12.1 server) is a non-retryable configuration error, not a transient one.**
-  `mapDatabaseError()` maps it to `DatabaseConfigError` instead of the generic retryable
-  `ConnectionError` every other `connect()` failure produces — see [§4.4](#44-thick-mode-opt-in-oracle_client_lib_dir)
-  and [§11](#11-error-handling). The error message points the operator at `ORACLE_CLIENT_LIB_DIR`.
+- **Every Thin-mode refusal is a non-retryable configuration error, not a transient one.**
+  `mapDatabaseError()` maps `NJS-138`, `NJS-116`, `NJS-533`, `NJS-529` and `NJS-089` (plus any message saying
+  *not supported by node-oracledb in Thin mode*) to `DatabaseConfigError` instead of the generic
+  retryable `ConnectionError` every other `connect()` failure produces — see
+  [§4.4](#44-thick-mode-opt-in-oracle_client_lib_dir) and [§11](#11-error-handling). Each message
+  points the operator at `ORACLE_CLIENT_LIB_DIR`. Only `NJS-138` was recognised before #538; the
+  others reached the user as "try again later" for a condition that never clears.
+- **Thick mode needs the operator to configure the loader, and the stock image ships no client.**
+  On Linux `ORACLE_CLIENT_LIB_DIR` alone produces `DPI-1047`: the directory must also be on the
+  system library search path, and `libaio.so.1` must resolve on Debian 13. That is a documented
+  two-step recipe ([§4.4](#44-thick-mode-opt-in-oracle_client_lib_dir)), not something the provider
+  can do for the operator — the loader reads `LD_LIBRARY_PATH` before Node starts, and `ldconfig`
+  needs root. *Future:* a separately-published image variant with Instant Client already layered in.
 - **`EXPLAIN` is intentionally disabled for Oracle until a dialect wrapper exists.**
   `getCapabilities().supportsExplain` is `false`, so the UI hides the *Explain* action. The UI's
   EXPLAIN builder only handles Postgres/MySQL; before the flag was flipped, the *Explain* action
@@ -1146,10 +2604,8 @@ Over the API: `POST /api/db/query`, `POST /api/db/transaction`, `POST /api/db/ca
   ([§4.3](#43-ssl--tls)). A `connectionString` is passed through verbatim, so the protocol it names
   is the one used. *Future:* surface the mismatch in the dialog rather than leaving the connect
   string to decide silently.
-- **No transaction auto-rollback timeout** (unlike Postgres/MySQL) — an abandoned transaction holds
-  its connection/locks until committed, rolled back, or pool-reclaimed.
-- **Schema is owner-scoped** to the connecting user (`OWNER = USER`); objects in other schemas the
-  user can see are not listed, and tables carry no size field.
+- **No transaction auto-rollback timeout without an owner** (unlike Postgres/MySQL): outside governance an abandoned transaction holds
+  its connection/locks until committed, rolled back, or pool-reclaimed ([§3.4](#34-transaction-auto-rollback-timeout-on-an-owned-provider-only)).
 - **`getIndexStats().scans` is always `0`** and `isPrimary` always `false` — Oracle index usage
   counters aren't read here.
 - **Row counts (`NUM_ROWS`) are optimizer estimates** populated by `DBMS_STATS`; they can be stale
@@ -1159,7 +2615,29 @@ Over the API: `POST /api/db/query`, `POST /api/db/transaction`, `POST /api/db/ca
   ([§7.2](#72-when-the-connection-count-is-not-measurable)). `getPerformanceMetrics()` reports only the cache-hit ratio (no QPS,
   deadlocks, or buffer-pool usage), and **omits even that** when `V$SYSSTAT` is unreadable rather
   than substituting a figure — [§7.1](#71-when-the-cache-hit-ratio-is-not-measurable).
-- **No two-phase schema loading** — `/api/db/schema/list` falls back to the full `getSchema()`.
+- **An Oracle-maintained owner other than the session user is not browsable**, `SYSTEM`, `MDSYS`
+  and `XDB` included, because `listContainers()` filters on `ALL_USERS.ORACLE_MAINTAINED`. Measured:
+  the fixture's `APP` user can see 4 tables and 1 view in `SYSTEM`, and none of them is reachable in
+  the tree. Same trade as PostgreSQL's system-schema exclusion, and the session's own owner is
+  exempted so connecting as `SYSTEM` still browses `SYSTEM`
+  ([§7](#the-object-surface-789-and-the-confinement-it-lifts-765)).
+- **A package's members are not browsable.** The `package` kind declares
+  `childKinds: ['procedure', 'function']`, which is true of the engine, but Phase 1's provider
+  surface is container-scoped end to end and nothing lists an object's children. Phase 2 owns it.
+
+---
+
+## Migration DDL
+
+[`ORACLE_MIGRATION_DDL`](../../src/lib/db/providers/sql/oracle-migration-ddl.ts) is what the schema-diff migration generator writes for `oracle`, read through `migrationDdlFor` in `src/lib/db/migration-ddl/`.
+Oracle DDL commits implicitly and `BEGIN` opens a PL/SQL block, not a transaction, so `transactionWrapper` is `null`.
+Oracle has no `IF EXISTS` on `DROP CONSTRAINT` or `DROP INDEX`, so a dropped foreign key, index or table is written bare.
+A column definition puts `DEFAULT` before `NOT NULL`, falls back to `VARCHAR2(255)`, and is added with `ADD (...)`.
+A modified column writes its nullability only when it changes, because restating ` NULL` on a nullable column is ORA-01451 and the column keeps its old type (#1240).
+The live regression probe is `tests/live/schema-diff-dialects.ts`.
+The fields it takes unchanged from `src/lib/db/migration-ddl/shared.ts` are `standardAddForeignKey`, `standardCreateIndex`, `standardCreateTableForeignKey`, `standardDropColumn` and `standardPrimaryKey`.
+
+It prints no refusal reason.
 
 ---
 
@@ -1173,4 +2651,4 @@ Over the API: `POST /api/db/query`, `POST /api/db/transaction`, `POST /api/db/ca
 - Errors (incl. `ORA-*` mapping): [`src/lib/db/errors.ts`](../../src/lib/db/errors.ts)
 - Tests: [`tests/integration/db/oracle-provider.test.ts`](../../tests/integration/db/oracle-provider.test.ts)
 - API contract: [`docs/API_DOCS.md`](../API_DOCS.md)
-- Sibling provider docs: [PostgreSQL](./postgres.md) · [MySQL](./mysql.md) · [Apache Trino](./trino.md) · [Redis](./redis.md)
+- Sibling provider docs: [PostgreSQL](./postgres.md) · [MySQL](./mysql.md) · [Trino](./trino.md) · [Redis](./redis.md)

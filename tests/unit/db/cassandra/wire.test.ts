@@ -54,6 +54,22 @@ function makeConnection(overrides: Partial<DatabaseConnection> = {}): DatabaseCo
 }
 
 describe("normalizeCassandraValue", () => {
+  // #1386: the driver's own `toString()` divides months into years with `toFixed(0)`, so
+  // 18 months printed `2y6mo` (30 months), and the SQL export writes the duration bare.
+  test("a duration is spelled from its three fields, with whole years", () => {
+    const spell = (months: number, days: number, nanoseconds: string) =>
+      normalizeCassandraValue(new types.Duration(months, days, types.Long.fromString(nanoseconds)));
+
+    expect(String(new types.Duration(18, 0, types.Long.ZERO))).toBe("2y6mo");
+    expect(spell(18, 0, "0")).toBe("1y6mo");
+    expect(spell(24, 0, "0")).toBe("2y");
+    expect(spell(1, 2, "10984005006007")).toBe("1mo2d3h3m4s5ms6us7ns");
+    expect(spell(0, -1, "0")).toBe("-1d");
+    expect(spell(0, 0, "-1500")).toBe("-1us500ns");
+    // The driver prints a zero duration as the empty string, which is no CQL literal.
+    expect(spell(0, 0, "0")).toBe("0s");
+  });
+
   test("a blob is handed on AS BYTES, for the one module that reads them", () => {
     // The exact bytes of `probe.type_matrix.c_blob`, whose JSON.stringify was
     // captured as {"type":"Buffer","data":[76,105,98,114,101,68,66,0,195,191,…]}.
@@ -231,6 +247,39 @@ describe("toCassandraResult", () => {
     expect(result.fieldNames).toEqual(["id", "amount"]);
     expect(result.columnTypes).toEqual({ id: "int", amount: "decimal" });
     expect(result.pageState).toBeNull();
+  });
+
+  test("a column declared with an empty name is named, so the grid can key it", () => {
+    const result = toCassandraResult({
+      columns: [
+        { name: "", type: { code: 9, info: null } },
+        { name: "id", type: { code: 9, info: null } },
+      ],
+      rows: [{ "": 7, id: 1 }],
+      pageState: null,
+    });
+
+    expect(result.fieldNames).toEqual(["(No column name)", "id"]);
+    expect(result.rows).toEqual([{ "(No column name)": 7, id: 1 }]);
+    expect(result.columnTypes).toEqual({ "(No column name)": "int", id: "int" });
+  });
+
+  test("two columns of one name are refused, because the driver kept only the last value", () => {
+    // cassandra-driver 4.10.0 builds each row as `row[column.name] = value`
+    // (lib/streams.js parseRows), so `SELECT a AS x, b AS x` reaches this seam as one key
+    // holding b. Showing both headers would show b twice; the first value is gone.
+    const read = () =>
+      toCassandraResult({
+        columns: [
+          { name: "x", type: { code: 9, info: null } },
+          { name: "x", type: { code: 13, info: null } },
+        ],
+        rows: [{ x: "b" }],
+        pageState: null,
+      });
+
+    expect(read).toThrow(CassandraTransportError);
+    expect(read).toThrow('The result has two columns named "x"');
   });
 
   test("a void result declares no columns at all", () => {

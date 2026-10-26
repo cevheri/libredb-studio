@@ -1,11 +1,19 @@
 "use client";
 
+import { appFetch } from "@/lib/config/base-path";
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { DatabaseConnection } from "@/lib/types";
-import { buildConnectionPayload } from "./use-connection-payload";
-import type { MonitoringData, MonitoringOptions } from "@/lib/db/types";
+import { buildConnectionPayload, catalogField } from "./use-connection-payload";
+import type { MaintenancePreview, MaintenanceResult, MonitoringData, MonitoringOptions } from "@/lib/db/types";
 import { toast } from "sonner";
 import { TimeSeriesBuffer, type TimeSeriesPoint } from "@/lib/time-series-buffer";
+
+/** What one maintenance run came to: whether it happened, and the refusal's own sentence when it did not. */
+export interface MaintenanceOutcome {
+  readonly success: boolean;
+  /** The route's sentence for a refused request, or the engine's own for a run it reported failed. */
+  readonly error?: string;
+}
 
 interface UseMonitoringDataReturn {
   data: MonitoringData | null;
@@ -19,14 +27,41 @@ interface UseMonitoringDataReturn {
   setRefreshInterval: (ms: number) => void;
   refresh: () => Promise<void>;
   killSession: (pid: number | string) => Promise<boolean>;
-  runMaintenance: (type: string, target?: string) => Promise<boolean>;
+  runMaintenance: (type: string, target?: string, container?: string) => Promise<boolean>;
+  /** `runMaintenance` with its reason: for a caller that records or shows why a run was refused. */
+  runMaintenanceOutcome: (type: string, target?: string, container?: string) => Promise<MaintenanceOutcome>;
+  /** Rows from the last maintenance call on this selection, or null when that call had none. */
+  maintenanceReport: Pick<MaintenanceResult, "rows" | "fields"> | null;
+  previewMaintenance: (type: string, target: string, container?: string) => Promise<MaintenancePreview>;
 }
 
 const DEFAULT_REFRESH_INTERVAL = 30000; // 30 seconds
 
+/**
+ * The table a maintenance response carried, or null when it carried only a sentence.
+ *
+ * Rows without columns, and columns without rows, are not a table: the Operations tab
+ * would render an empty header or a row with nothing to label it.
+ */
+function maintenanceReportFrom(
+  result: Pick<MaintenanceResult, "rows" | "fields">,
+): Pick<MaintenanceResult, "rows" | "fields"> | null {
+  if (
+    !Array.isArray(result.rows) ||
+    result.rows.length === 0 ||
+    !Array.isArray(result.fields) ||
+    result.fields.length === 0
+  ) {
+    return null;
+  }
+  return { rows: result.rows, fields: result.fields };
+}
+
 export function useMonitoringData(
   connection: DatabaseConnection | null,
   options?: MonitoringOptions,
+  /** The database to monitor on a server-level connection (#1530); its panels are that database's. */
+  catalog?: string,
 ): UseMonitoringDataReturn {
   const [dataState, setData] = useState<MonitoringData | null>(null);
   const [loading, setLoading] = useState(false);
@@ -40,7 +75,9 @@ export function useMonitoringData(
   // rather than in an effect (react.dev, "You Might Not Need an Effect" -
   // adjusting some state when a prop changes) so that the very render which
   // switches connections already reports an empty history.
-  const connectionId = connection?.id ?? null;
+  // A selection is a connection AND, on a server-level one, a database (#1530): another database is
+  // another chart, exactly as another connection is.
+  const connectionId = connection === null ? null : JSON.stringify([connection.id, catalog ?? null]);
   const [selection, setSelection] = useState({ id: connectionId, seq: 0 });
   if (selection.id !== connectionId) {
     setSelection({ id: connectionId, seq: selection.seq + 1 });
@@ -53,6 +90,14 @@ export function useMonitoringData(
     points: TimeSeriesPoint<MonitoringData>[];
   } | null>(null);
 
+  // The table from the last maintenance call, tagged with the selection that asked
+  // for it. A switch reads as no table, the same way history does, so one connection
+  // never keeps showing another's INFO.
+  const [reportState, setReportState] = useState<{
+    selection: number;
+    report: Pick<MaintenanceResult, "rows" | "fields"> | null;
+  } | null>(null);
+
   // Time series buffer for historical data
   const historyRef = useRef(new TimeSeriesBuffer<MonitoringData>(120));
   // Which selection the buffer above currently holds points for.
@@ -60,6 +105,7 @@ export function useMonitoringData(
 
   // Use refs to store latest values without causing re-renders
   const connectionRef = useRef(connection);
+  const catalogRef = useRef(catalog);
   const optionsRef = useRef(options);
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -113,11 +159,12 @@ export function useMonitoringData(
     setError(null);
 
     try {
-      const res = await fetch("/api/db/monitoring", {
+      const res = await appFetch("/api/db/monitoring", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...buildConnectionPayload(currentConnection),
+          ...catalogField(catalogRef.current),
           options: optionsRef.current,
         }),
         signal: abortControllerRef.current.signal,
@@ -177,6 +224,9 @@ export function useMonitoringData(
     // that changed it.
     if (!connection) return;
 
+    // The database rides on a ref `fetchData` reads, set here so a switch refetches with it (#1530).
+    catalogRef.current = catalog;
+
     // Initial fetch
     fetchData();
 
@@ -186,7 +236,7 @@ export function useMonitoringData(
         abortControllerRef.current.abort();
       }
     };
-  }, [connection, fetchData]); // Only re-run when connection ID changes
+  }, [connection, catalog, fetchData]); // Only re-run when the connection or its database changes
 
   // Auto-refresh setup (separate effect)
   useEffect(() => {
@@ -217,13 +267,14 @@ export function useMonitoringData(
       if (!currentConnection) return false;
 
       try {
-        const res = await fetch("/api/db/maintenance", {
+        const res = await appFetch("/api/db/maintenance", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             type: "kill",
             target: String(pid),
             ...buildConnectionPayload(currentConnection),
+            ...catalogField(catalogRef.current),
           }),
         });
 
@@ -248,19 +299,27 @@ export function useMonitoringData(
     [fetchData],
   );
 
-  const runMaintenance = useCallback(
-    async (type: string, target?: string): Promise<boolean> => {
+  // The run and why it did not happen. `runMaintenance` below is this, read as a boolean: a caller that writes the
+  // reason somewhere the toast is not (the Operations tab's log, the dialog that asked) needs the sentence too (#1418).
+  const runMaintenanceOutcome = useCallback(
+    async (type: string, target?: string, container?: string): Promise<MaintenanceOutcome> => {
       const currentConnection = connectionRef.current;
-      if (!currentConnection) return false;
+      if (!currentConnection) return { success: false };
+
+      // Read before the await: the table belongs to the selection that asked for
+      // it, not to whichever one is on screen when the reply arrives.
+      const selectionSeq = selectionRef.current;
 
       try {
-        const res = await fetch("/api/db/maintenance", {
+        const res = await appFetch("/api/db/maintenance", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             type,
             target,
+            container,
             ...buildConnectionPayload(currentConnection),
+            ...catalogField(catalogRef.current),
           }),
         });
 
@@ -279,27 +338,62 @@ export function useMonitoringData(
         // whole surface recorded a completed operation. A provider that reports no verdict
         // keeps the old reading: only an explicit `false` is a refusal.
         if (result.success === false) {
-          toast.error(result.message || `${type} failed`);
+          const refusal: string = result.message || `${type} failed`;
+          toast.error(refusal);
+          setReportState({ selection: selectionSeq, report: null });
           // Refreshed anyway: a refused operation can still have moved part of the state
           // it was asked about (Oracle rebuilds index by index), so the panels must not
           // keep showing what was true before the attempt.
           await fetchData();
-          return false;
+          return { success: false, error: refusal };
         }
 
         toast.success(result.message || `${type} completed successfully`);
+        setReportState({ selection: selectionSeq, report: maintenanceReportFrom(result) });
 
         // Refresh data after maintenance
         await fetchData();
 
-        return true;
+        return { success: true };
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : `Failed to run ${type}`;
         toast.error(errorMessage);
-        return false;
+        setReportState({ selection: selectionSeq, report: null });
+        return { success: false, error: errorMessage };
       }
     },
     [fetchData],
+  );
+
+  const runMaintenance = useCallback(
+    async (type: string, target?: string, container?: string): Promise<boolean> =>
+      (await runMaintenanceOutcome(type, target, container)).success,
+    [runMaintenanceOutcome],
+  );
+
+  // What one per-row operation will do (spec 3.11). Raised rather than toasted: the dialog that asked shows the
+  // route's own sentence in place of the preview, and offers no confirm button.
+  const previewMaintenance = useCallback(
+    async (type: string, target: string, container?: string): Promise<MaintenancePreview> => {
+      const currentConnection = connectionRef.current;
+      if (!currentConnection) throw new Error("No connection is selected");
+
+      const res = await appFetch("/api/db/maintenance/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type,
+          target,
+          container,
+          ...buildConnectionPayload(currentConnection),
+          ...catalogField(catalogRef.current),
+        }),
+      });
+      const result = await res.json();
+      if (!res.ok) throw new Error(result.error || `Failed to preview ${type}`);
+      return result.preview as MaintenancePreview;
+    },
+    [],
   );
 
   // Derived rather than reset in the connection effect: with no connection
@@ -317,5 +411,8 @@ export function useMonitoringData(
     refresh,
     killSession,
     runMaintenance,
+    runMaintenanceOutcome,
+    maintenanceReport: connection !== null && reportState?.selection === selection.seq ? reportState.report : null,
+    previewMaintenance,
   };
 }

@@ -1,9 +1,9 @@
 apiVersion: v2
 name: libredb-studio
-description: Web-based SQL IDE for cloud-native teams supporting sixteen engines - PostgreSQL, MySQL, SQLite, DuckDB, Oracle, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra and libSQL
+description: Web-based SQL IDE for cloud-native teams supporting forty-one engines - PostgreSQL, MySQL, SQLite, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Redis, Couchbase, Firestore, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, BigQuery, Snowflake, Apache Spark, Apache Cassandra, libSQL, Prometheus, Apache Kafka, MQTT, RabbitMQ, etcd, Neo4j, Milvus, Qdrant, InfluxDB, InfluxDB 3, Oxia, Databend, S3-compatible object storage, Kubernetes, OPC UA, MTConnect, Modbus, NETCONF, SNMP and Sparkplug B
 type: application
-version: 0.1.58
-appVersion: "0.13.7"
+version: 0.1.103
+appVersion: "1.1.0"
 kubeVersion: ">=1.26.0-0"
 home: https://github.com/libredb/libredb-studio
 icon: https://raw.githubusercontent.com/libredb/libredb-studio/main/public/logo.svg
@@ -38,6 +38,93 @@ keywords:
   # One keyword only, unlike the pair above: DuckDB is registered as `duckdb` and that
   # is also the product name an evaluator types, so there is no second spelling to catch.
   - duckdb
+  # Two keywords, like the libsql pair above: `prometheus` is the type-id and the product,
+  # and `promql` is what an evaluator looking for a PromQL client types.
+  - prometheus
+  - promql
+  # One keyword only, like duckdb above: `kafka` is the type-id and also the word an evaluator
+  # looking for a Kafka client types, so there is no second spelling to catch.
+  - kafka
+  # One keyword only, like kafka above: `etcd` is the type-id and the word an evaluator looking
+  # for an etcd client types, so there is no second spelling to catch.
+  - etcd
+  # Two keywords, like the libsql pair above: `db2` is the type-id, and `ibm-db2` is what an
+  # evaluator who searches by vendor types, since the product is IBM Db2.
+  - db2
+  - ibm-db2
+  # Two keywords, like the prometheus pair above: `neo4j` is the type-id and the product, and
+  # `cypher` is what an evaluator looking for a Cypher client types.
+  - neo4j
+  - cypher
+  # A relative, not a provider: VictoriaMetrics answers the Prometheus HTTP API and connects as
+  # `prometheus` at the tier its gate-4 probe measured (docs/providers/README.md). The first
+  # wire-compatible relative given a keyword, because an evaluator looking for a VictoriaMetrics
+  # client types that name and not the driver's.
+  - victoriametrics
+  # A relative of `kafka`, as VictoriaMetrics is of `prometheus`: Redpanda answers the Kafka
+  # protocol and connects as `kafka` at the tier its live read-only check measured
+  # (docs/providers/README.md), and an evaluator looking for a Redpanda client types that name.
+  - redpanda
+  # One keyword each, like kafka above: `milvus` and `qdrant` are the type-ids and the words an
+  # evaluator looking for a Milvus or Qdrant client types, so there is no second spelling to catch.
+  - milvus
+  - qdrant
+  # Three keywords, like the prometheus pair above with one more: `influxdb` and `influxdb3` are
+  # the two type-ids and the products, and `influxql` is what an evaluator looking for an
+  # InfluxQL client types.
+  - influxdb
+  - influxql
+  - influxdb3
+  # One keyword, like kafka above: `oxia` is the type-id and the word an evaluator looking for an
+  # Oxia client types, so there is no second spelling to catch.
+  - oxia
+  # One keyword, like oxia above: `databend` is the type-id and the word an evaluator looking for
+  # a Databend client types, so there is no second spelling to catch.
+  - databend
+  # Three keywords: `s3` is the type-id and the protocol an evaluator types, `object-storage` the
+  # category, and `minio` the server most self-hosted S3-compatible stores still run; the provider is
+  # verified on MinIO, Silo, Garage and RustFS (docs/providers/s3.md).
+  - s3
+  - object-storage
+  - minio
+  # One keyword, like databend above: `kubernetes` is the type-id and the word an evaluator looking
+  # for a cluster browser types.
+  - kubernetes
+  # One keyword, like databend above: `bigquery` is the type-id and the word an evaluator looking for a
+  # BigQuery client types.
+  - bigquery
+  # One keyword, like bigquery above: `snowflake` is the type-id and the word an evaluator looking for a
+  # Snowflake client types.
+  - snowflake
+  # One keyword, like snowflake above: `spark` is the type-id and the word an evaluator looking for an
+  # Apache Spark client types.
+  - spark
+  # One keyword, like kubernetes above: `mqtt` is the type-id and the protocol an evaluator looking
+  # for a broker browser types; no product name to catch, because every broker speaks the same standard.
+  - mqtt
+  # One keyword, like mqtt above: `firestore` is the type-id and the word an evaluator looking for a Firestore client types.
+  - firestore
+  # Two keywords, like the prometheus pair above: `rabbitmq` is the type-id and the product, and
+  # `amqp` the protocol an evaluator looking for a broker browser types.
+  - rabbitmq
+  - amqp
+  # One keyword, like mqtt above: `opcua` is the type-id and the protocol an evaluator looking for a
+  # plant browser types; no product name to catch, because every server speaks the same standard.
+  - opcua
+  # One keyword, like opcua above: `mtconnect` is the type-id and the protocol an evaluator
+  # searches for, and the agent itself is not a product name anyone would search.
+  - mtconnect
+  # One keyword, like mtconnect above: `modbus` is the type-id and the protocol an evaluator
+  # looking for a device reader searches for.
+  - modbus
+  - netconf
+  # One keyword, like mtconnect above: `snmp` is the type-id and the three letters an evaluator
+  # looking for device monitoring would type; the protocol has no product name to catch.
+  - snmp
+  # One keyword, like mtconnect above: `sparkplug` is the type-id and the specification an
+  # evaluator searches for. Its transport is MQTT, whose keyword is already above, so a search
+  # for the transport finds Studio either way; this is the keyword that finds the payload.
+  - sparkplug
   - web-ide
 maintainers:
   - name: cevheri
@@ -46,6 +133,12 @@ annotations:
   artifacthub.io/category: database
   artifacthub.io/license: MIT
   artifacthub.io/prerelease: "false"
+  # False: 0.1.60 tracks app release 0.14.1, which repairs how the light theme is
+  # painted and how two wire families are asked for a query plan. Accent colours were
+  # picked for a dark ground and reused on the light one, so warning, success and danger
+  # text sat as low as 1.46:1 against the surface behind it; and both EXPLAIN grammars
+  # are now measured when the connection opens rather than assumed from the type id. No
+  # template, value or default moves, and the image is where every one of them lands.
   # False: 0.1.58 tracks app release 0.13.7, which adds one metadata field to
   # package.json and nothing else. The npm artifact declared no licence, so
   # @libredb/studio showed as unlicensed on the registry while the repository shipped
@@ -92,10 +185,130 @@ annotations:
   # operator looking for them will find them. The app-level security fixes of earlier
   # releases remain recorded on 0.1.37, the chart version that first shipped them; the
   # adm-zip pin note belongs to 0.1.44, unchanged.
-  artifacthub.io/containsSecurityUpdates: "false"
+  # True: 0.1.64 tracks app release 0.16.0, which carries two security-relevant changes in the
+  # image. A transaction belonged to the cached provider rather than to the session, so any
+  # account reaching a shared connection id could roll back another account's uncommitted work,
+  # measured through the product's own route on PostgreSQL 18.4; and the local auth provider
+  # gains an optional TOTP second factor, asserted as control 1.6 in docs/SECURITY.md. The first
+  # is a cross-account authorization defect an operator running a shared connection needs to know
+  # about, which is what this flag exists to tell them.
+  # False: 0.1.66 tracks app release 0.16.1, which fixes correctness and startup
+  # behaviour rather than a weakness. The one an operator should still read before
+  # upgrading is the boot refusal: with AUTH_BOOTSTRAP off and no JWT secret the
+  # container used to start, report itself healthy and answer every login with a 503,
+  # and it now prints what is missing and exits. A chart install that set
+  # secrets.jwtSecret (or secrets.existingSecret) is unaffected, because the chart has
+  # always required it; an install that reached that state some other way now stops at
+  # boot instead of serving a login nobody can pass.
+  # True: 0.1.67 tracks app release 0.16.2, whose headline change is an authorization fix in
+  # the image. The database provider cache was keyed on the connection id the caller sent, so
+  # any signed-in account that named another session's connection id was handed that session's
+  # already-open provider, with its credentials, and could also disconnect it. It was reported
+  # privately as GHSA-3wh2-8x78-jfw4 and scored 8.8. An operator running shared or seeded
+  # connections should read it before deciding whether to upgrade; no chart template or value
+  # moves, so the upgrade is the image.
+  # True: 0.1.71 tracks app release 0.17.0, which carries two security fixes in the image. The
+  # managed seed route removed only password and connectionString, so the Elasticsearch API key
+  # pair and ssl.clientKey of a managed seed reached every signed-in user its roles admitted; and
+  # the HTTP transports built their URLs from unvalidated host and port values and followed
+  # redirects, while Trino followed any nextUri a coordinator sent with the connection's
+  # credential attached. An operator running managed seeds or HTTP-family engines should read
+  # both; no chart template or value moves for either, so the upgrade is the image.
+  # False: 0.1.72 adds one value, config.passkeyOrigin, and changes no behaviour on its
+  # own - unset (the default) writes no PASSKEY_ORIGIN, so every existing install renders
+  # exactly as before. Set, it is written to PASSKEY_ORIGIN, the public origin passkey
+  # sign-in (#785) is bound to. That needs an application image that includes passkey
+  # sign-in, and appVersion 0.17.0 does not read the variable, so the value acts only once
+  # an application release moves appVersion. Unlike the 0.1.52 precedent, which exposed a
+  # setting the image already read, this one exposes a setting ahead of the image.
+  # False: 0.1.73 changes chart metadata only, naming etcd in the description, the keywords and
+  # the README; no template, value or default moves.
+  # False: 0.1.74 changes chart metadata only, naming Neo4j in the description, the keywords and
+  # the README; no template, value or default moves.
+  # False: 0.1.75 changes chart metadata only, naming Db2 LUW in the description, the keywords and
+  # the README; no template, value or default moves.
+  # False: 0.1.76 changes chart metadata only, naming Milvus, Qdrant and InfluxDB in the
+  # description, the keywords and the README; no template, value or default moves.
+  # False: 0.1.77 changes chart metadata only, naming Oxia in the description, the keywords and
+  # the README; no template, value or default moves.
+  # True: 0.1.78 tracks app release 0.18.0, which carries three security fixes in the image. On a
+  # deployment with the OIDC_* variables set, whatever its auth provider, the oidc-state cookie that
+  # GET /api/auth/oidc/login hands any visitor was also accepted as the session cookie, so an
+  # unauthenticated visitor passed the session check outside /admin, from 0.7.0 through 0.17.0
+  # (GHSA-8gc9-2gm6-5c7f); a non-admin user's DuckDB connection could read, and in some cases write,
+  # any file the Studio process can reach; and SQLite, DuckDB and LibreDB connections now refuse
+  # Studio's own storage and credential files as their database path for every role, with SQLite
+  # opening only for an admin. An operator with the OIDC_* variables set, or offering DuckDB or
+  # SQLite to non-admin users, should read all three; no chart template or value moves for any of
+  # them, so the upgrade is the image. The chart's own edit is its description, which calls Trino by
+  # its own name (#1158).
+  # True: 0.1.79 tracks app release 0.18.1, which carries one security fix in the image. With
+  # server storage (config.storageProvider sqlite or postgres), an account that signed in on a
+  # browser profile another account had signed out of received that account's browser copy of
+  # the workspace: the connections it had added, with their saved credentials, and its query
+  # history, from 0.8.0 through 0.18.0 (GHSA-jwvh-6phv-j9jh). An operator running server storage where
+  # people share a browser profile should read it; no chart template or value moves, so the
+  # upgrade is the image. The chart's own edit names Databend in the description, the keywords
+  # and the README.
+  # False: 0.1.80 adds three values, extraVolumes, extraVolumeMounts and extraObjects (#1526),
+  # all empty by default, so every existing install renders exactly as before. They mount
+  # extra volumes into the app container and ship extra manifests with the release.
+  # False: 0.1.81 tracks app release 0.18.2, which carries no security fix: Databend's official
+  # icon, new connections that start unlabelled, Generate Test Data and Source tab fixes, and
+  # provider fixes. No template, value or default moves, so the upgrade is the image.
+  # False: 0.1.82 changes chart metadata only, naming S3-compatible object storage in the
+  # description, the keywords and the README; no template, value or default moves.
+  # True: 0.1.83 sets automountServiceAccountToken on the pod spec from
+  # serviceAccount.automountServiceAccountToken. The value used to reach only the
+  # ServiceAccount the chart renders, so an install with serviceAccount.create=false ran as
+  # the namespace's default account and mounted its API token into the pod, where anything
+  # able to read a file in the container could take it. Studio reads that token only for
+  # Vault Kubernetes auth (VAULT_ROLE), so the token now stays out unless the value is set
+  # to true. An install with create=false that logs in to Vault through the pod's account
+  # sets the value to true, or projects a token through extraVolumes and extraVolumeMounts
+  # and points VAULT_K8S_TOKEN_PATH at it.
+  # False: 0.1.84 changes chart metadata only, naming Kubernetes in the description, the
+  # keywords and the README; no template, value or default moves.
+  # False: 0.1.85 tracks app release 0.18.3, which carries no security fix: the read-only
+  # Kubernetes and S3-compatible object storage providers, a click on a pod that shows its last
+  # 50 log lines, and provider fixes. Query history keeps no value of a kubectl credential flag,
+  # and the text transport now refuses a method other than GET or POST, which no released
+  # caller sent. No template, value or default moves, so the upgrade is the image.
+  # False: 0.1.87 changes chart metadata only, naming BigQuery in the description, the keywords and the
+  # README; no template, value or default moves.
+  # False: 0.1.88 changes chart metadata only, naming Firestore in the description, the keywords and the
+  # README; no template, value or default moves.
+  # False: 0.1.89 changes chart metadata only, naming RabbitMQ in the description, the keywords and the
+  # README; no template, value or default moves.
+  # False: 0.1.90 changes chart metadata only, naming Snowflake in the description, the keywords and the
+  # README; no template, value or default moves.
+  # False: 0.1.91 changes chart metadata only, naming OPC UA in the description, the keywords and the
+  # README; no template, value or default moves.
+  # False: 0.1.92 changes chart metadata only, naming Apache Spark in the description, the keywords and the
+  # README; no template, value or default moves.
+  # False: 0.1.99 adds the governance values (governance.*, the Secret keys governance-postgres-url and
+  # governance-private-keys, stickySessions.enabled) and typed values for OIDC_USER_ROLES, OIDC_PROMPT,
+  # OIDC_AUTO_REDIRECT, OIDC_LOGOUT_HINT, AUTH_SESSION_TTL_SECONDS and STORAGE_POSTGRES_SCHEMA. Every one
+  # is off or empty by default, so an install that sets none of them renders exactly as before.
+  # True: 0.1.100 tracks app release 1.0.0, which scopes POST /api/db/disconnect to the caller's
+  # own providers: in every earlier release any signed-in user could close the providers and SSH
+  # tunnels other users had open on a connection by naming its id. 1.0.0 is also the first app
+  # release that reads the governance values 0.1.99 added; under 0.1.99's default image, 0.18.3,
+  # governance.enabled points readiness at /api/ready, which that image does not serve. No
+  # template, value or default moves, so the upgrade is the image.
+  # False: 0.1.101 adds config.llmModelEffort, written as LLM_MODEL_EFFORT, the reasoning effort for
+  # the openai provider. It is empty by default, so an install that does not set it renders exactly
+  # as before; the default image, 1.0.0, does not read it.
+  # True: 0.1.103 tracks app release 1.1.0, which hardens how the app checks what it is sent. The
+  # multi-query route validates its paging options as the query route does, a file database path
+  # can no longer stall the server, and the confirmation gate now asks before a write it used to
+  # miss: a data-modifying WITH list, EXPLAIN ANALYZE of a write, and a statement after a bare
+  # carriage return in a line comment. No template, value or default moves, so the upgrade is the
+  # image.
+  artifacthub.io/containsSecurityUpdates: "true"
   artifacthub.io/images: |
     - name: libredb-studio
-      image: ghcr.io/libredb/libredb-studio:0.13.7
+      image: ghcr.io/libredb/libredb-studio:1.1.0
       platforms:
         - linux/amd64
         - linux/arm64
@@ -107,8 +320,13 @@ annotations:
     - name: Source
       url: https://github.com/libredb/libredb-studio
   artifacthub.io/changes: |
-    - "The published npm package now declares its licence. package.json carried no license field, so @libredb/studio rendered on npm as unlicensed even though the project has been MIT since its first release and the LICENSE file was always inside the tarball - npm includes it regardless of the files list. The declaration is what package managers, mirrors and licence scanners read, and only a new release can carry it. No chart template, value or image behaviour moves"
-    - "Track app release 0.13.7 (appVersion bump; default image tag follows)"
+    - "Accept an identity provider access token on the API for native clients, opt in through OIDC_BEARER_AUDIENCE and OIDC_BEARER_CLIENT_IDS"
+    - "Map OIDC roles from a namespaced claim name such as Auth0's and from an object claim such as Zitadel's"
+    - "Validate the multi-query route's paging options as the query route does"
+    - "Keep a SQLite or DuckDB file path from stalling the server"
+    - "Ask before a data-modifying WITH list, EXPLAIN ANALYZE of a write, and a statement after a bare carriage return in a line comment"
+    - "Read PostgreSQL primary and foreign keys from pg_catalog, so a SELECT-only role sees them"
+    - "Track app release 1.1.0 (appVersion bump; default image tag follows)"
 dependencies:
   - name: postgresql
     version: "16.x.x"

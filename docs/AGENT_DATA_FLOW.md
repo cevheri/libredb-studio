@@ -23,19 +23,30 @@ if it only lists the good news.
 
 ## Contents
 
-- [The short version](#the-short-version)
-- [Where a request goes](#where-a-request-goes)
-- [When nothing leaves at all](#when-nothing-leaves-at-all)
-- [The classification, before any run](#the-classification-before-any-run)
-- [One agent run, message by message](#one-agent-run-message-by-message)
-- [What comes back, and what is done with it](#what-comes-back-and-what-is-done-with-it)
-- [What #352 added to the boundary](#what-352-added-to-the-boundary)
-- [The fence, and what it does not do](#the-fence-and-what-it-does-not-do)
-- [B29: the open unfenced path](#b29-the-open-unfenced-path)
-- [How much can leave](#how-much-can-leave)
-- [What never leaves](#what-never-leaves)
-- [The other AI surfaces](#the-other-ai-surfaces)
-- [Where prompts do not go](#where-prompts-do-not-go)
+- [What leaves the machine](#what-leaves-the-machine)
+  - [Contents](#contents)
+  - [The short version](#the-short-version)
+  - [Where a request goes](#where-a-request-goes)
+  - [When nothing leaves at all](#when-nothing-leaves-at-all)
+  - [The classification, before any run](#the-classification-before-any-run)
+  - [One agent run, message by message](#one-agent-run-message-by-message)
+    - [1. The system instructions — server text only](#1-the-system-instructions--server-text-only)
+    - [2. Your objective, verbatim](#2-your-objective-verbatim)
+    - [2a. The conversation, when a run continues one — fenced](#2a-the-conversation-when-a-run-continues-one--fenced)
+    - [3. The schema inventory — identifiers and types, fenced](#3-the-schema-inventory--identifiers-and-types-fenced)
+    - [4. The relations block — identifiers only, quoted and escaped](#4-the-relations-block--identifiers-only-quoted-and-escaped)
+    - [5. Each tool result](#5-each-tool-result)
+    - [5a. The operations workflow: what a curated reading sends](#5a-the-operations-workflow-what-a-curated-reading-sends)
+    - [6. On a resumed run, what the ledger already holds](#6-on-a-resumed-run-what-the-ledger-already-holds)
+  - [What comes back, and what is done with it](#what-comes-back-and-what-is-done-with-it)
+  - [What #352 added to the boundary](#what-352-added-to-the-boundary)
+  - [The fence, and what it does not do](#the-fence-and-what-it-does-not-do)
+  - [B29: the closed path, assistant messages are defanged on the way into the transcript](#b29-the-closed-path-assistant-messages-are-defanged-on-the-way-into-the-transcript)
+  - [How much can leave](#how-much-can-leave)
+  - [What never leaves](#what-never-leaves)
+  - [Where prompts do not go](#where-prompts-do-not-go)
+  - [The other AI surfaces](#the-other-ai-surfaces)
+  - [Verifying this page yourself](#verifying-this-page-yourself)
 
 ---
 
@@ -44,13 +55,13 @@ if it only lists the good news.
 | Surface | What it sends | Fenced? |
 | --- | --- | --- |
 | `POST /api/agent/classify`, **before any run exists** | Your objective, and nothing else. One short completion that asks the model to name one of the five workflows. It fires when you press **Start** with the workflow left on **Automatic**, which is the default; naming a workflow yourself under **Advanced** skips it entirely. See [the classification, before any run](#the-classification-before-any-run) | No — it carries no database content to fence. Your objective is sent as the user message, and the server's instructions tell the model to treat that text as data to classify and never as instructions to it |
-| Any **run**, in either mode, on **any** engine | Your objective, and a schema inventory (table, column, index identifiers and column types) with its relations graph (identifiers only). **Since #414 that inventory leaves on every engine**, where before it left on PostgreSQL and SQLite alone: those two are read with catalog statements the server composes, and the other fifteen by asking the connection's own provider to describe its schema. On **MongoDB and Couchbase** the provider works out a collection's fields from a **sample of your own documents** — no value from them is in the message, but the **existence** of a field there is derived from your data rather than read from a catalog, which is a weaker claim than a catalog reading's and is why that reading has its own operation id (`db.schema.read`) an operator can deny alone. When the reading cannot be taken — a refusal, a provider that cannot describe its own schema, a description that overran the time the run granted it — nothing of the schema leaves and a server sentence saying which of those happened goes in its place. See [the schema inventory](#3-the-schema-inventory--identifiers-and-types-fenced) | Everything derived from the database is wrapped in an untrusted-content fence before it reaches a prompt |
+| Any **run**, in either mode, on **any** engine | Your objective, and a schema inventory (table, column, index identifiers and column types) with its relations graph (identifiers only). **Since #414 that inventory leaves on every engine**, where before it left on PostgreSQL and SQLite alone: those two are read with catalog statements the server composes, and the other forty by asking the connection's own provider to describe its schema. On **MongoDB and Couchbase** the provider works out a collection's fields from a **sample of your own documents**: no value from them is in the message, but the **existence** of a field there is derived from your data rather than read from a catalog, which is a weaker claim than a catalog reading's and is why that reading has its own operation id (`db.schema.read`) an operator can deny alone. When the reading cannot be taken (a refusal, a provider that cannot describe its own schema, a description that overran the time the run granted it), nothing of the schema leaves and a server sentence saying which of those happened goes in its place. See [the schema inventory](#3-the-schema-inventory--identifiers-and-types-fenced) | Everything derived from the database is wrapped in an untrusted-content fence before it reaches a prompt |
 | An **agent run** | The above, plus the rows of each read the model performed, up to 200 per read; engine error text; server-written refusals; server-minted ids | Same fence |
 | Any **run that continues a conversation**, in either mode, on any engine | **In addition to everything above**: the earlier steps' objectives — *your own earlier questions*, capped at 200 characters each — and the most recent step's report, which is a model's claims about your data. No row of any result, and no earlier step's report but the newest. Sent only when the rail attaches a previous run's id, which it does for a follow-up on the same connection; a run that starts its own conversation sends no such message. Bounded to 4000 characters by default and switchable off with `LIBREDB_AGENT_THREAD_CONTEXT=false`. See [the conversation](#2a-the-conversation-when-a-run-continues-one--fenced) | Same fence, identified as `operation agent/thread`: it is prose a user and a model wrote, and none of it is the server's voice |
 | An **agent run opened as Operate** | Your objective; a **schema inventory reduced to its own names and index names** (no column names, no column types, no relations graph), read whichever of the two ways that engine is read and named with whichever noun that engine's provider declares — tables, collections, datasources, key patterns; in Plan mode the engine's **row-count estimates** for those same tables where the engine holds any — PostgreSQL and SQLite — and nothing per column; and the rows of each curated reading — which, for the `sessions` and `slow-queries` kinds, include **other database users' in-flight statement text and their database usernames**. See [the operations workflow](#5a-the-operations-workflow-what-a-curated-reading-sends) | Same fence: the inventory and every reading's rows are database content and are fenced |
 | `POST /api/ai/explain` | Your statement, the EXPLAIN plan, the schema context the browser holds, the engine type | No |
-| `POST /api/ai/query-safety` | Your statement, a filtered schema context, the engine type | No |
-| `POST /api/ai/describe-schema` | A schema context. From the **Data Profiler** that context includes a per-column `min=` and `max=`, which are **real column values** | No |
+| `POST /api/ai/query-safety` | Your statement, a filtered schema context, the engine type. Never an etcd, Milvus, Qdrant, InfluxDB (InfluxQL), Oxia, S3-compatible object storage or Kubernetes statement: the dialog posts nothing for an engine whose destructive vocabulary declares `safetyAnalysis: false`, which those seven do, because an etcd `put` carries its value in the statement (#1089), a Milvus or Qdrant request carries vectors, filters and values, an InfluxQL statement carries tag values and filters, an Oxia command names keys whose paths name Pulsar tenants and namespaces, an S3 command names buckets and object keys, and a kubectl statement names namespaces and objects | No |
+| `POST /api/ai/describe-schema` | A schema context. From the **Data Profiler** that context includes a per-column `min=` and `max=`, which are **real column values**, except on a column the data masking configuration masks for you, which is sent masked | No |
 | Everything else in the **running server** | Every outbound connection goes to a host **you** configured — your databases, your OIDC issuer when `NEXT_PUBLIC_AUTH_PROVIDER=oidc` (`src/lib/oidc.ts`), and the model provider above. The one host `src/` names itself is OpenAI's default base URL, reached only if you set `LLM_PROVIDER=openai` (`src/lib/llm/utils/config.ts:23`) | — |
 | The **`npx` launcher**, before the server exists | The release tarball and `SHA256SUMS` from a hard-coded `github.com` URL (`bin/lib/launcher-utils.mjs:87`, from `bin/studio.js:218-219`). Once per version, cached in `~/.libredb-studio/`; no other install path uses it | — |
 
@@ -59,14 +70,15 @@ if it only lists the good news.
 ## Where a request goes
 
 Exactly one place: the model provider **you** configured through `LLM_PROVIDER`, `LLM_MODEL`,
-`LLM_API_KEY` and `LLM_API_URL`. The agent resolves that configuration through `src/lib/llm`'s own
+`LLM_API_KEY`, `LLM_API_URL` and, for `openai` only, `LLM_MODEL_EFFORT`. The agent resolves that configuration through `src/lib/llm`'s own
 resolution — the same one the remaining AI features use — so there is one answer rather than two
 that can disagree (`src/lib/agent/model-adapter.ts`).
 
 | Kind | Endpoint | Call site |
 | --- | --- | --- |
-| `gemini` | `{LLM_API_URL}` when you set one, Google's own Generative AI endpoint otherwise. The variable is read on both Gemini surfaces, so a proxy configured for the chat surface is also where a run goes — nothing routes to a host you did not name, and nothing silently keeps talking to Google either | `src/lib/agent/provider-registry.ts:136-150`, `src/lib/llm/utils/gemini-endpoint.ts` |
-| `openai`, `ollama`, `custom` | `{LLM_API_URL}/chat/completions` — whatever host you named | `src/lib/agent/provider-registry.ts:123-134` |
+| `gemini` | `{LLM_API_URL}` when you set one, Google's own Generative AI endpoint otherwise. The variable is read on both Gemini surfaces, so a proxy configured for the chat surface is also where a run goes: nothing routes to a host you did not name, and nothing silently keeps talking to Google either | `src/lib/agent/provider-registry.ts:147-161`, `src/lib/llm/utils/gemini-endpoint.ts` |
+| `openai` | `{LLM_API_URL}/responses`, the Responses API, at `https://api.openai.com/v1` unless you set another base URL. Every call is sent `store: false` | `src/lib/agent/provider-registry.ts:131-145`, `agentProviderOptions` in `src/lib/agent/model-adapter.ts` |
+| `ollama`, `custom` | `{LLM_API_URL}/chat/completions`, whatever host you named | `src/lib/agent/provider-registry.ts:131-145` |
 
 Two properties of that seam are enforced rather than assumed:
 
@@ -74,11 +86,15 @@ Two properties of that seam are enforced rather than assumed:
   `OPENAI_BASE_URL` when they are undefined, and `@ai-sdk/google` reads
   `GOOGLE_GENERATIVE_AI_API_KEY`. Every setting is therefore passed explicitly, so none of those
   reads can happen — a keyless Ollama gets a placeholder token and a keyless custom endpoint gets no
-  `Authorization` header at all (`provider-registry.ts:83-113`, asserted on the wire in
+  `Authorization` header at all (`provider-registry.ts:91-121`, asserted on the wire in
   `tests/isolated/agent-model-adapter.test.ts`).
 - **The SDK's hosted gateway is unreachable by construction.** The AI SDK also accepts a bare model
   id, which it resolves through its own gateway — a third party nothing in this repository
-  configures. The type excludes that arm (`AgentLanguageModel`, `provider-registry.ts:55-63`).
+  configures. The type excludes that arm (`AgentLanguageModel`, `provider-registry.ts:63-71`).
+- **OpenAI keeps nothing a run sends.**
+  Every call of the `openai` kind, the run's turns, the capability probe and the workflow classification alike, is a Responses API request with `store: false`, so OpenAI does not store the response or the schemas and rows the request carried.
+  Stateless mode is also why each turn's reasoning comes back as an encrypted item that the next turn sends back unread; Studio cannot read it and holds it only in the drive's in-memory transcript.
+  `LLM_MODEL_EFFORT`, when set, is sent as `reasoning.effort`, and a value the SDK will not send for the configured model is raised as a configuration error when the model is built, before any request leaves, rather than sent at another effort (`agentProviderOptions`, `refusedEffortError` and `createAgentModel` in `src/lib/agent/model-adapter.ts`, asserted on the wire in `tests/isolated/agent-model-adapter.test.ts`).
 
 `LLM_API_URL` reaches the `gemini` kind on the agent path exactly as on the chat surface, so a Gemini
 deployment behind an egress proxy or on a regional endpoint is configurable from the one variable. The
@@ -95,7 +111,7 @@ spellings in `src/lib/llm/utils/gemini-endpoint.ts`. Give the versioned URL; a b
   not render, and every run-reaching agent route answers `404` (`src/lib/agent/config.ts`,
   `docs/AGENT.md`, "Turning it on"). **The test is a configuration that validates, not a key.**
   `validateConfig` demands `LLM_API_KEY` for the `gemini` and `openai` kinds only
-  (`src/lib/llm/utils/config.ts:127-134`): `LLM_PROVIDER=ollama` validates with no key at all, and so
+  (`src/lib/llm/utils/config.ts:184-191`): `LLM_PROVIDER=ollama` validates with no key at all, and so
   does `custom` with an `LLM_API_URL`, and on either of those the agent is available and everything
   on this page is sent to that endpoint. What has no AI is a deployment carrying **no `LLM_*`
   configuration at all** — the provider then defaults to `gemini` (`config.ts:12`), which is refused
@@ -116,8 +132,9 @@ spellings in `src/lib/llm/utils/gemini-endpoint.ts`. Give the versioned URL; a b
   uses (`establishContext` in `src/lib/agent/investigation.ts`): the alternative was a mode that knew
   your database only when an agent run had already read it in the same process. What that reads is a
   schema inventory — names, types, keys and relations — plus what the engine already RECORDS about
-  its own tables (`pg_class.reltuples` and `pg_stats` on PostgreSQL, `sqlite_stat1` on SQLite). On
-  those two engines the catalog is read with statements the server composes; since #414 **every other
+  its own tables (`pg_class.reltuples` and `pg_stats` on PostgreSQL, `sqlite_stat1` on SQLite,
+  `sys.partitions.rows` on SQL Server). On PostgreSQL and SQLite
+  the catalog is read with statements the server composes; since #414 **every other
   engine is read a second way** — the server asks the connection's own provider to describe its
   schema, which is the same inspection this product performs when it lists your tables in the sidebar,
   and it composes no statement at all. Nothing about your DATA is in the composed reading: no table is
@@ -135,7 +152,7 @@ carries nothing of yours:
 
 - the **capability probe**, one round trip asking the model to call a trivial tool. Its prompt is a
   fixed server-written string and carries nothing of yours (`PROBE_PROMPT`,
-  `src/lib/agent/capability-probe.ts:134`). A positive verdict is cached for the life of the
+  `src/lib/agent/capability-probe.ts:135`). A positive verdict is cached for the life of the
   process, so it is paid once (`src/lib/agent/capability-gate.ts`);
 - the **classification**, which sends your objective. It is the section below.
 
@@ -166,6 +183,7 @@ Four bounds, all of them properties of the code rather than of intent:
 - **One call, no tools, no streaming, no retries.** `generateText` with `maxRetries: 0`.
 - **At most 16 output tokens** (`CLASSIFY_MAX_OUTPUT_TOKENS`), because the answer is one
   identifier.
+  The `openai` kind gets 1024 (`CLASSIFY_MAX_OUTPUT_TOKENS_RESPONSES`), because the Responses API counts a reasoning model's thinking against that cap: at 16, `gpt-6-luna` spent all of it reasoning and every run opened unclassified.
 - **Eight seconds** (`AGENT_WORKFLOW_CLASSIFY_TIMEOUT_MS`), after which the run opens unclassified;
   the browser holds a longer ceiling of its own so it never preempts the server's.
 - **It is skipped entirely when you name the workflow yourself** under **Advanced**. That is not an
@@ -185,7 +203,7 @@ routes for that reason.
 
 ## One agent run, message by message
 
-The transcript is assembled in `runInvestigation` (`src/lib/agent/investigation.ts:662-825`) and is
+The transcript is assembled in `runInvestigation` (`src/lib/agent/investigation.ts:2537`) and is
 sent by `takeTurn` through `streamText` (`investigation.ts:575-592`). Nothing else in the runtime
 sends anything.
 
@@ -201,14 +219,14 @@ One field of your connection record *is*: its **engine type**, the canonical typ
 spends it on the fence tag the deliverable must carry, and since the Operate-engine fix a prose plan
 spends it twice: on the rule that binds the readings it may name to the engine it is planning
 against, and on the fence tag for a reading that engine happens to express as a statement. It is
-a server-side enum with seventeen members, so what it discloses is which of seventeen engines this
+a server-side enum with forty-two members, so what it discloses is which of forty-two engines this
 connection is — never its host, its database name or its credentials, none of which reach a prompt at
 all (see [What never leaves](#what-never-leaves)).
 
 ### 2. Your objective, verbatim
 
 The first user message is the text you typed, unmodified apart from the trim the rail applies
-(`investigation.ts:698`). Bounded to 4000 characters by the route and by the rail
+(`investigation.ts:2654`). Bounded to 4000 characters by the route and by the rail
 (`AGENT_MAX_OBJECTIVE_LENGTH`).
 
 ### 2a. The conversation, when a run continues one — fenced
@@ -216,7 +234,7 @@ The first user message is the text you typed, unmodified apart from the trim the
 **This is the one message whose content came from an EARLIER question of yours.** It is sent only
 when a run continues a conversation: a follow-up asked on the same connection, where the rail
 attaches the previous run's id and the route derives the block server-side from those runs' own
-ledgers (`thread-context.ts`, `investigation.ts:1923`). A run that starts a conversation of its own
+ledgers (`thread-context.ts`, `investigation.ts:2660-2661`). A run that starts a conversation of its own
 sends nothing here, and there is no such message at all.
 
 What is in it, and where each half came from:
@@ -259,7 +277,7 @@ capture is shared between runs through the process hold, so a workflow-shaped pa
 later be handed to an investigation run as if it were complete — and what differs is how much of it
 is packed into a message. Concretely, what leaves the process on an Operate run is **the inventory's
 own names and its index names only** — table names on a SQL engine, collection names on MongoDB, and
-on Redis and LibreDB the key prefixes described two paragraphs below (`packOperationsInventory`, `context-snapshot.ts`): no column names, no column
+on Redis, LibreDB and etcd the key prefixes described two paragraphs below (`packOperationsInventory`, `context-snapshot.ts`): no column names, no column
 types, no foreign keys, and section 4's relations block is not sent at all. Under the same 6000-character
 bound and the same fence, with every identifier quoted inside it. A **Plan**-mode Operate run also gets
 section 6's estimated statistics, and there too the reduction holds: row estimates only, with no
@@ -271,17 +289,18 @@ a refusal — nothing of the schema leaves and a server-written note says so in 
 
 **Two readings produce it, and which one runs is the dialect's decision** (#414). On PostgreSQL and
 SQLite the server composes a catalog statement per kind and executes it read-only. On the other
-fifteen it invokes `db.schema.read`, which calls the connection's own `provider.getSchema()` — the
-inspection the sidebar performs when it lists your tables — and composes no statement at all.
-**Fifteen counts type-ids the factory can build, not engines a user would name**: `SHIPPED` holds
-seventeen, `CATALOG_PLANS` serves two of them, and the remainder is what this second reading covers.
+forty it invokes `db.schema.read`, which walks the connection's own OBJECT SURFACE, the same
+`listContainers`, `countObjects`, `listObjects` and `describeObjects` the sidebar walks when it lists
+your objects, and composes no statement at all.
+**Forty counts type-ids the factory can build, not engines a user would name**: `SHIPPED` holds
+forty-two, two of them supply a `catalogCapture`, and the remainder is what this second reading covers.
 Every other count said about grounding in these docs counts the same thing. libSQL is one of the
-fifteen and not one of the two: it speaks SQLite's dialect, but the read-only catalog path
-`CATALOG_PLANS` serves needs a database-native read-only profile, and `PRAGMA query_only` is refused
+forty and not one of the two: it speaks SQLite's dialect, but the read-only catalog path
+a `catalogCapture` takes needs a database-native read-only profile, and `PRAGMA query_only` is refused
 by a libSQL server (see [`providers/libsql.md`](./providers/libsql.md)). Two things it does
 NOT count. The wire-compatible engines of
 [`docs/providers/README.md`](./providers/README.md) are not extra members — TiDB is grounded because it
-arrives as `mysql`, and it is that type-id that is counted. And two of the fifteen, the embedded
+arrives as `mysql`, and it is that type-id that is counted. And two of the forty, the embedded
 `libredb` and `duckdb`, reach this path through a handle they do not open: the file takes an exclusive
 lock, so the grounding acquisition borrows the connection's own open provider rather than opening a
 second one that the lock would refuse (`findOpenSingleWriterProvider`, `src/lib/db/factory.ts`; see
@@ -302,7 +321,7 @@ two properties differ and are stated here rather than left to be discovered:
   rather than read from a catalog, and that is a different claim from every other line in this
   document — worth its own sentence for exactly that reason, and the reason `db.schema.read` is an
   operation id of its own rather than a detail of the capture.
-- **On Redis and LibreDB the names are not names anything holds.** `getSchema()` scans a bounded
+- **On Redis, LibreDB and etcd the names are not names anything holds.** The object walk scans a bounded
   slice of the keyspace and groups the real key names it found under their common prefix, so what
   leaves the process is one row per prefix — `user:*`, `order:*` — and each is a summary this server
   computed from your key names rather than an object the engine declares. The names it summarises are
@@ -310,6 +329,9 @@ two properties differ and are stated here rather than left to be discovered:
   (`ProviderCapabilities.tablesAreDerivedGroupings`), and where it is true a plan run is told so in
   one sentence, because a run that reads `user:*` as an addressable key drafts a command against
   something that does not exist (measured live, #414).
+- On Oxia the grounding carries the shard rows only, never a key, a value or a leader address (`key` is listed by the Keys panel, not by the object walk).
+- On S3-compatible object storage the grounding carries bucket names only, never an object key, a prefix, a size or any object content (objects are listed by the Keys panel, not by the object walk).
+- On Kubernetes the grounding carries the Default namespace and `Cluster` only, with their kinds, counts and object names, and says how many other namespaces it did not read; never a value, a label, an annotation, an environment value, a ConfigMap or Secret key, or a Secret's name (the Secrets kind arrives with its count alone).
 
 **What the block CALLS these rows is the provider's own word** (#414). The prompt's header, its
 omission notice and the relations block take their noun from `ProviderLabels.entityName` — "table" on
@@ -321,18 +343,19 @@ that was hard-coded before.
 So on an Operate run this section is narrower than what follows and section 4 does not happen. On
 every other workflow, the inventory is captured once per run by whichever of the two readings that
 dialect gets, then packed for the task
-(`packContextForTask`, `src/lib/agent/context-snapshot.ts:466-505`). Per table it renders
-(`renderTable`, `context-snapshot.ts:428-441`):
+(`packContextForTask` in `src/lib/agent/context-snapshot.ts`). Per table it renders
+(`renderTable` in `context-snapshot.ts`):
 
 - the table name;
 - up to 12 columns, each as `name type`, plus ` NOT NULL`, ` PK` and ` -> referencedTable.column`
-  where they apply;
+  where they apply; on an engine whose fields are inferred from sampled documents (MongoDB), no
+  ` NOT NULL`, with one line saying the fields were sampled (`sampledFields`);
 - up to 4 index names with their column lists;
 - a count of what was left out, named as left out rather than silently dropped.
 
 Tables are ordered by relevance to the words in your objective, and lines are added only while the
-**fenced whole** still fits 6000 characters (`AGENT_CONTEXT_PACK_MAX_CHARS`,
-`context-snapshot.ts:348`). Table and column names are database content — anyone who can write to
+**fenced whole** still fits 6000 characters (`AGENT_CONTEXT_PACK_MAX_CHARS` in
+`context-snapshot.ts`). Table and column names are database content: anyone who can write to
 the database writes them — so the block goes through `fenceUntrustedContent` before it is a message.
 
 **No row value is in this block.** On the two engines whose fields are sampled, that sentence is
@@ -342,12 +365,11 @@ name is what the block carries.
 ### 4. The relations block — identifiers only, quoted and escaped
 
 The inventory's foreign keys, rendered as a relation list and fenced beside the inventory
-(`packRelations`, `investigation.ts:288-294`; rendering in `src/lib/agent/er-diagram.ts:228-269`).
+(`packRelations`, `investigation.ts:1806`; rendering in `src/lib/agent/er-diagram.ts:228-269`).
 It carries table names, column names, and at the deepest detail level a table's primary-key and
 leading-index column names (`keyColumns`, `er-diagram.ts:145-157`). **Never a row value.**
 
-On the six engines that declare no foreign keys at all — MongoDB, Redis, LibreDB, Druid, ClickHouse,
-Couchbase — this block carries no relations and says why: the engine has no such constraint to
+On the thirty-four engines that declare no foreign keys at all (MongoDB, Redis, LibreDB, Druid, ClickHouse, Couchbase, Firestore, Trino, Snowflake, Apache Spark, Cassandra, Elasticsearch, OpenSearch, Prometheus, InfluxDB (InfluxQL), InfluxDB 3 (SQL), BigQuery, Apache Kafka, MQTT, RabbitMQ, OPC UA, MTConnect, Modbus, NETCONF, etcd, Neo4j, Milvus, Qdrant, Oxia, Databend, S3-compatible object storage, Kubernetes, SNMP and Sparkplug B) this block carries no relations and says why: the engine has no such constraint to
 declare, so there is nothing here a reading could have missed (#414, driven from
 `ProviderCapabilities.declaresForeignKeys` rather than from the connection's type). It is one server
 sentence and no database content, which makes it the one form of this block that discloses nothing.
@@ -362,14 +384,14 @@ rendered characters — a bound in characters, because a count of edges is not a
 
 | Outcome | What is sent back to the model | Call site |
 | --- | --- | --- |
-| A completed read | A server sentence naming the artifact id, then the **rows**: one `JSON.stringify` per row, newline separated, inside a fence labelled `<what it was>, N row(s)` | `tools.ts:918-932`, rendering at `tools.ts:620-624` |
-| A statement that failed at the database | The **engine's own message**, fenced, referenced by the statement's fingerprint | `tools.ts:872-882` |
-| A policy denial | Server text only: the deny code, the policy version, and advice that a boundary decided this. There is no engine text because a denial produced none | `denialText`, `tools.ts:568-574` |
-| An approval requirement | Server text naming the operation id | `approvalText`, `tools.ts:576-581` |
-| A table profile (Assess) | Counts, the number of findings, the covered column range — plus the **table name** and the **finding lines** (each `column: code — detail`), both fenced. No value from any column | `tools.ts:1325-1345`, `describeFindings` at `tools.ts:1143-1150` |
+| A completed read | A server sentence naming the artifact id, then the **rows**: one `JSON.stringify` per row, newline separated, inside a fence labelled `<what it was>, N row(s)` | `runAuditedAgentCall` (`tools.ts`), rendering by `renderRows` (`tools.ts`) |
+| A statement that failed at the database | The **engine's own message**, fenced, referenced by the statement's fingerprint | `runAuditedAgentCall` (`tools.ts`) |
+| A policy denial | Server text only: the deny code, the policy version, and advice that a boundary decided this. There is no engine text because a denial produced none | `denialText` (`tools.ts`) |
+| An approval requirement | Server text naming the operation id | `approvalText` (`tools.ts`) |
+| A table profile (Assess) | Counts, the number of findings, the covered column range, plus the **table name** and the **finding lines** (each the column name, the finding code and its detail, as `describeFindings` writes them), both fenced. No value from any column | `profileTableTool` (`tools.ts`) and, on MongoDB, `runMongoProfile` (`languages/mongo/tools.ts`); `describeFindings` (`tool-contracts.ts`) |
 | A curated operational reading (Operate) | A server sentence naming the artifact id, then the **projected rows**, fenced like any other result. What those rows contain is the point: for `sessions` and `slow-queries` they carry **statement text other users are running or have run**, and for `sessions` the **database username, client address and application name of each connected session**. See below | `tools.ts`, `CURATED_READINGS` |
-| A plan comparison (Optimize) | The two statements the run drafted and the server's structural reading of each plan (`full-scan` / `index` / `mixed` / `unknown`, plus whatever estimates the engine reported) | `plan-summary.ts`, restated at `investigation.ts:367-369` |
-| A catalog read that could not be performed | Fixed server advice, and one of two things before it. When the rows the read produced are already gone, when the connection's provider cannot describe its own schema, or when that description overran the time the run granted it, it is a **server sentence** that may name the connection's **engine type** ("a mongodb connection") or the catalog kind (`context-snapshot.ts:301-305,315-318`). When the catalog read was itself refused, the sentence forwarded is `inspectSchemaTool`'s **own `modelText`** (`context-snapshot.ts:312`) — which for a policy denial is server text, and for a **database-error refusal is the engine's own message, fenced** (`tools.ts:872-882`). Either way it is wrapped by `unavailable` (`context-snapshot.ts:243-245`) and pushed as a user message. **Except on an Operate run**, where the diagnosis is forwarded (`capture.detail`) and only the fixed ADVICE is replaced, because that advice sends a model to `inspect_schema` — a tool the workflow does not hold. So the same text reaches the prompt on an Operate run, including a fenced engine message, minus the sentence naming a tool that is not there |
+| A plan comparison (Optimize) | Server text only: how each of the two plans reaches its rows, by the server's structural reading (`full-scan` / `index` / `mixed` / `unknown`), and that both are estimates. The plans themselves are not echoed, because they carry table and index names. A resumed run is also told the two statements the run drafted, beside those readings | `comparePlansTool` (`tools.ts`), reading by `summarisePlan` (`plan-summary.ts`); restated by `describePriorProgress` (`investigation.ts`) |
+| A catalog read that could not be performed | Fixed server advice, and one of two things before it. When the rows the read produced are already gone, when the connection's provider cannot describe its own schema, or when that description overran the time the run granted it, it is a **server sentence** that may name the connection's **engine type** ("a mongodb connection") or the catalog kind (`readInventory` and `captureFromProvider` in `context-snapshot.ts`). When the catalog read was itself refused, the sentence forwarded is the read's **own `modelText`** (`readCatalogForGrounding` in `tools.ts`, the core `inspectSchemaTool` reads through too), which for a policy denial is server text, and for a **database-error refusal is the engine's own message, fenced** (`runAuditedAgentCall` in `tools.ts`). Either way it is wrapped by `unavailable` in `context-snapshot.ts` and pushed as a user message. **Except on an Operate run**, where the diagnosis is forwarded (`capture.detail`) and only the fixed ADVICE is replaced, because that advice sends a model to `inspect_schema`, a tool the workflow does not hold. So the same text reaches the prompt on an Operate run, including a fenced engine message, minus the sentence naming a tool that is not there |
 
 ### 5a. The operations workflow: what a curated reading sends
 
@@ -418,7 +440,7 @@ own assistant messages (`investigation.ts:625-631`).
 
 | What the model returns | What is done to it first | Where it is displayed |
 | --- | --- | --- |
-| **Its assistant messages** — its prose and the tool calls it made, together | **Nothing.** They are appended to the transcript verbatim (`investigation.ts:792`), because rewriting an assistant turn would desynchronise `tool_call_id`, so they are **not fenced** and are resent on every later turn. This is the mechanism of B29 below | Not displayed as such. Only the parts below reach the rail |
+| **Its assistant messages** — its prose and the tool calls it made, together | `neutraliseAssistantMessages` rewrites a copy on the way into the transcript: string content, text parts and tool-call inputs are defanged, `toolCallId` and `toolName` stay byte-identical, and reasoning parts pass through because signed thinking blocks cannot be rewritten | Not displayed as such. Only the parts below reach the rail |
 | **A tool call's arguments** | Parsed against that tool's own schema first (`parseToolInput`, `tools.ts:987`). A shape the schema rejects is answered with server text and reaches no database | — |
 | **The SQL of a read** (`run_read_query`) | After the schema, it goes to the database through the agent's own audited pipeline, under the read-only execution profile (`runReadQueryTool`, `tools.ts:1051-1058` → `executeAgentOperation`, `tools.ts:809`). It is recorded verbatim as a `statement-drafted` entry with the model's `rationale` (`investigation.ts:859`) | The rail: the SQL as a quoted block, the rationale as the entry's detail (`timeline.ts:378-385`, rendered at `AgentRail.tsx:693,699-703`). **Apply to editor** puts the text in your editor and runs nothing (`AgentRail.tsx:176-186`) |
 | **A recommended statement and rationale** (`recommend_change`) | The statement is checked against the change it claims to be, and every citation against this run's own ledger; either failing refuses it (`tools.ts:1402-1407`). **Nothing executes it** — the tool reaches no database | The rail: statement quoted, rationale as detail, with the application's own *"Not applied: nothing here runs this statement."* appended to it (`timeline.ts:421-430`) |
@@ -463,7 +485,7 @@ worth naming because it is instructions and identifiers rather than data:
   treat as data and never as instruction, so an instruction inside one is an instruction the model
   is right to ignore. That is why `packContextForTask` takes a `preface` parameter instead of the
   caller concatenating one — anything prepended outside the function would overrun its character
-  bound by exactly its own length (`context-snapshot.ts:453-470`).
+  bound by exactly its own length (`packContextForTask` in `context-snapshot.ts`).
 - **The same contract reaches two refusals**: a wrong-shaped tool input and a citation that resolves
   to nothing (`tools.ts:479,609`).
 
@@ -481,7 +503,7 @@ statement rather than as an opaque token.
 ## The fence, and what it does not do
 
 Everything derived from the database is wrapped by `fenceUntrustedContent`
-(`src/lib/agent/untrusted-content.ts:71-76`): a header naming what the block is, which operation
+(`src/lib/agent/untrusted-content.ts:119`): a header naming what the block is, which operation
 produced it and which id it joins to; a fixed instruction that the lines are data and must never be
 followed as instructions; and a pair of markers bounding the region.
 
@@ -508,32 +530,32 @@ Two limits stated as plainly as the property:
 
 ---
 
-## B29: the open unfenced path
+## B29: the closed path, assistant messages are defanged on the way into the transcript
 
-**An identifier the model quotes back into its own tool arguments reaches the transcript unfenced.**
-This is open, not closed, and it is not a bounded residual.
+**An identifier the model quotes back into its own tool arguments no longer reaches the transcript
+unfenced.** `neutraliseAssistantMessages` in `src/lib/agent/investigation.ts` defangs every marker in
+an assistant message's text and tool-call arguments before the message is pushed to the transcript,
+while leaving `tool_call_id` and `toolName` byte-identical.
 
-The mechanism: after each turn the loop appends the SDK's own assistant messages verbatim
-(`investigation.ts:625-631`) — the model's words, including the arguments of the tool calls it made.
-Those arguments are not passed through the fence, because an assistant message is the model's turn
-rather than the server's, and rewriting it would desynchronise `tool_call_id`. An attacker who can
-name a table controls the whole identifier, so they control the marker *and* arbitrary text after
-it; the surrounding JSON does not make that suffix safe.
+The mechanism that used to be open: after each turn the loop appended the SDK's own assistant
+messages verbatim — the model's words, including the arguments of the tool calls it made. An
+attacker who can name a table controls the whole identifier, so they controlled the marker *and*
+arbitrary text after it; the surrounding JSON did not make that suffix safe.
 
-What **is** true, and is a different claim: **the server never hands the model the raw marker.**
-Every server-authored path neutralises it first, so a model reading a hostile inventory sees the
-defanged spelling and has nothing to copy — to get the raw marker into an assistant message the
-model has to reconstruct it. Both halves are asserted in `tests/evals/injection.test.ts`: that the
-fenced inventory carries no raw marker, and that the transport does not prevent one if the model
-produces it anyway.
+Two halves are still asserted separately, as they always were. **The server never hands the model
+the raw marker**: every server-authored path neutralises it first, so a model reading a hostile
+inventory sees the defanged spelling and has nothing to copy. And now the transport half holds too:
+even a model that reconstructs the marker is defanged when its assistant message enters the
+transcript — asserted in `tests/evals/injection.test.ts` with a scripted model that supplies the raw
+identifier directly, which is stronger than what the fenced paths give a real one.
 
-The other half of the boundary is what stops that mattering more than it does: obeying injected text
-changes nothing about what the run may **do**. A write is refused by the statement guard before the
-database, a tool the run was never offered does not exist for it, and a claim citing something the
-run never read cannot be composed — each asserted against the deciding function in
+The other half of the boundary is unchanged: obeying injected text changes nothing about what the
+run may **do**. A write is refused by the statement guard before the database, a tool the run was
+never offered does not exist for it, and a claim citing something the run never read cannot be
+composed — each asserted against the deciding function in
 `tests/unit/agent-policy-gates.test.ts`.
 
-Full entry: `docs/BACKLOG.md` B29.
+The entry was deleted from `docs/BACKLOG.md` when the fix landed.
 
 ---
 
@@ -545,7 +567,7 @@ The frozen execution policies are the ceiling on one run's egress, one row per w
 | Bound | Value | What it caps |
 | --- | --- | --- |
 | `maxResultRows` / `maxResultBytes` | 200 rows / 256 KiB | The most one read can return — and therefore the most one tool result can send |
-| `maxStatementsPerRun` | 18-45, by workflow | Reads per drive, grounding reads and repairs included — the composed catalog reads and, since #414, the one `db.schema.read` call that replaces them on the other fifteen. The figures did not move for it: that path is the cheapest of the three, so nothing had to be bought (`docs/AGENT.md`, the budget arithmetic) |
+| `maxStatementsPerRun` | 18-45, by workflow | Reads per run, folded across its drives (#999), grounding reads and repairs included: the composed catalog reads and, since #414, the one `db.schema.read` call that replaces them on the other forty. The figures did not move for it: that path is the cheapest of the three, so nothing had to be bought (`docs/AGENT.md`, the budget arithmetic) |
 | `AGENT_CONTEXT_PACK_MAX_CHARS` | 6000 | The fenced schema inventory |
 | `MAX_ER_CHARS` | 2000 | The fenced relations block |
 | `AGENT_MAX_OBJECTIVE_LENGTH` | 4000 | Your objective |
@@ -555,8 +577,12 @@ An oversized read is **refused, not truncated**, so a result that reached the mo
 one. Note the honest edge: the comparison happens after the driver has materialised the rows, so an
 oversized read is refused but still paid for at the database.
 
-Every one of these is **per drive**. A run resumed after a restart starts each of them again
-(`docs/BACKLOG.md` B6).
+**Some of these bound the run and some bound one drive.** `maxStatementsPerRun` and the
+database-time figure bound the run: since #999 a drive is seeded with what the run's ledger says
+earlier drives spent. `runDeadlineMs` bounds the run on the wall clock, measured from the moment
+the run opened, so time it spends paused or between drives is spent against it. `maxModelTurns` and
+the repair ledger are still per drive: a resumed run counts its own turns and its repair attempts
+start again (`docs/BACKLOG.md` B6).
 
 **The classification is outside all of it**, by construction: it happens before a run exists, so
 there is no budget to charge it to. Its own bounds are its 8-second ceiling and its 16-token
@@ -576,11 +602,11 @@ output cap, and what it sends is one objective — see
   **One credential does leave, necessarily: your `LLM_API_KEY`.** It is not in a prompt — it is in
   the request's authentication metadata, because that is how the provider authenticates you. The
   OpenAI-compatible kinds send it as the `Authorization` header
-  (`src/lib/agent/provider-registry.ts:108,125-128`) and Gemini passes it to the Google provider
-  (`:143`). Two consequences worth stating: a keyless Ollama gets a placeholder token and a keyless
-  custom endpoint gets no `Authorization` header at all (`:109,112`), so neither invents a
+  (`src/lib/agent/provider-registry.ts:116,133-136`) and Gemini passes it to the Google provider
+  (`:154`). Two consequences worth stating: a keyless Ollama gets a placeholder token and a keyless
+  custom endpoint gets no `Authorization` header at all (`:117,120`), so neither invents a
   credential; and Gemini's `baseURL` comes from `LLM_API_URL` — the host you configured for the chat
-  surface and no other (`:136-150`). "No credentials leave" would be the wrong claim
+  surface and no other (`:147-161`). "No credentials leave" would be the wrong claim
   here — the accurate one is that **no database credential** reaches the model, while the model
   provider's own key reaches the model provider and nothing else.
 - **Cell values from a table's own columns.** No agent path reads a row out of a user table and
@@ -595,6 +621,12 @@ output cap, and what it sends is one objective — see
   assume is the claim one line up in section 3, where a field name in the inventory is derived from
   your data rather than read from a catalog. Stated in both places on purpose: "no value leaves" and
   "nothing was read" are different promises, and only the first one is made here.
+- **A column an engine only inferred from sampled data.**
+  A provider marks such a column `provenance: "sampled"`, because its name was read out of stored rows rather than out of a declaration.
+  `machineColumns` (`src/lib/db/detailed-object.ts`) removes it before the agent's inventory is built, before `inspect_schema` caps or counts columns, and from the `schemaContext` string the four AI surfaces below send, so it reaches no model and no MCP client.
+  The Data Profiler's table still profiles it, and the column profiles it sends for an AI summary leave it out.
+  The object tree and the documentation table still show it, and the tree marks it "(sampled)".
+  Qdrant sets it on every payload key it samples; MongoDB and Couchbase sample documents and do not, as the boundary above states.
 - **Cell values from a profile.** The Assess workflow's profile is aggregates only: counts of rows,
   present values, distinct values, and shape matches computed with `count(CASE WHEN … LIKE …)`
   *inside* the database. There is deliberately no `min`/`max`, because on a text column those return
@@ -612,7 +644,7 @@ output cap, and what it sends is one objective — see
 - **Not into the server log.** `streamText`'s default `onError` writes the raw provider error to the
   console, and an `APICallError` carries `requestBodyValues` — the entire prompt. It is silenced
   deliberately in both places that call the SDK, and the error is read off the stream instead
-  (`investigation.ts:588-591`, `capability-probe.ts:36-40,257-259`).
+  (`investigation.ts:588-591`, `capability-probe.ts:37-41,266-268`).
 - **Not into the audit trail.** Agent audit events carry the operation id, an `agent:<role>` actor,
   the outcome, a reason code, elapsed time and a correlation id — never the statement, the session
   identifier or the driver's message (`docs/SECURITY.md`, control 3.5).
@@ -631,16 +663,22 @@ fences what it sends:
 | Feature | Route | What the browser sends | Call site |
 | --- | --- | --- | --- |
 | Visual EXPLAIN's AI explanation | `POST /api/ai/explain` | `query`, `explainPlan`, `schemaContext`, `databaseType` | `src/components/VisualExplain.tsx:486-497` |
-| Query safety dialog | `POST /api/ai/query-safety` | `query`, a filtered `schemaContext`, `databaseType` | `src/components/QuerySafetyDialog.tsx:167-171` |
+| Query safety dialog | `POST /api/ai/query-safety` | `query`, a filtered `schemaContext`, `databaseType`; nothing at all for an etcd, Milvus, Qdrant, InfluxDB (InfluxQL), Oxia, S3-compatible object storage or Kubernetes statement (`vocabularySendsToModel`, `src/lib/db/destructive-commands.ts`) | `src/components/QuerySafetyDialog.tsx:221-231` |
 | Database documentation | `POST /api/ai/describe-schema` | A schema string built from table names, row counts and column definitions | `src/components/DatabaseDocs.tsx:61-68` |
-| Data Profiler's AI summary | `POST /api/ai/describe-schema` | Per column: null percent, distinct count, **`min=` and `max=`** | `src/components/DataProfiler.tsx:148-173` |
+| Data Profiler's AI summary | `POST /api/ai/describe-schema` | Per column: null percent, distinct count, **`min=` and `max=`**, masked where the grid would mask the column | `src/components/DataProfiler.tsx:141-176` |
 
-**That last row is the one to read carefully.** `/api/db/profile` computes `MIN(col::text)` and
-`MAX(col::text)` per column (`src/app/api/db/profile/route.ts:96-97`), and the Data Profiler puts
-both into the context it sends for an AI summary. Those are **real values out of your columns** —
-the lexicographic first and last of each profiled column. It is the sharpest difference between the
+**That last row is the one to read carefully.** `/api/db/profile` computes `MIN(col)` and
+`MAX(col)` per column (`src/app/api/db/profile/route.ts:66`), and the Data Profiler puts
+both into the context it sends for an AI summary. Those are **real values out of your columns**:
+the smallest and largest of each profiled column, in the column's own type. It is the sharpest difference between the
 two profiling surfaces in this product: the agent's `profile_table` was built so that no value can
-leave, and the legacy profiler's AI summary sends two per column.
+leave, and the legacy profiler's AI summary sends two per column. The one exception is a column the
+data masking configuration masks: in the standalone app the profiler decides that exactly as the
+results grid does, for the same role and switch, and sends that column's two values masked (#1421);
+the embedded workspace's profiler masks the built-in patterns (email, password, card, token and the
+rest), in the summary it hands a host's `onDescribeSchema` too. Masking is applied in the
+browser, so it narrows what a model is shown; it is not a server-side control over what the profile
+route returns.
 
 None of the four surfaces fires on its own: each is behind a control the user presses.
 

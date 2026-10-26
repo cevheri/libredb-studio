@@ -5,12 +5,17 @@
 
 import {
   type DatabaseProvider,
+  type Container,
+  type DatabaseObject,
+  type KindCount,
+  type ObjectDetail,
+  type DescribeObjectsOptions,
+  type ObjectDetailBatch,
   type DatabaseType,
   type DatabaseConnection,
-  type TableSchema,
   type QueryResult,
   type HealthInfo,
-  type MaintenanceType,
+  type MaintenanceOperation,
   type MaintenanceResult,
   type ProviderOptions,
   type PoolConfig,
@@ -159,9 +164,30 @@ export abstract class BaseDatabaseProvider implements DatabaseProvider {
   public abstract connect(): Promise<void>;
   public abstract disconnect(): Promise<void>;
   public abstract query(sql: string, params?: unknown[]): Promise<QueryResult>;
-  public abstract getSchema(): Promise<TableSchema[]>;
+
+  /*
+    The object surface (#789). Abstract here rather than defaulted, because there is no
+    honest default: what a container is, what kinds an engine has and how an object is
+    addressed are facts only the provider holds. They replaced `getSchema`,
+    `getSchemaList` and `getSchemaRelations`, which this class also declared abstract.
+  */
+  public abstract listContainers(parent?: readonly string[]): Promise<Container[]>;
+  public abstract countObjects(container: readonly string[]): Promise<Record<string, KindCount>>;
+  public abstract listObjects(container: readonly string[], kind: string): Promise<DatabaseObject[]>;
+  public abstract describeObject(path: readonly string[], kind: string): Promise<ObjectDetail>;
+  public abstract describeObjects(
+    container: readonly string[],
+    kind: string,
+    limit?: number,
+    options?: DescribeObjectsOptions,
+  ): Promise<ObjectDetailBatch>;
+
   public abstract getHealth(): Promise<HealthInfo>;
-  public abstract runMaintenance(type: MaintenanceType, target?: string): Promise<MaintenanceResult>;
+  public abstract runMaintenance(
+    type: MaintenanceOperation,
+    target?: string,
+    container?: string,
+  ): Promise<MaintenanceResult>;
 
   // Monitoring methods (must be implemented by subclasses)
   public abstract getOverview(): Promise<DatabaseOverview>;
@@ -178,11 +204,6 @@ export abstract class BaseDatabaseProvider implements DatabaseProvider {
 
   public isConnected(): boolean {
     return this.state.connected;
-  }
-
-  public async getTables(): Promise<string[]> {
-    const schema = await this.getSchema();
-    return schema.map((table) => table.name);
   }
 
   /**
@@ -308,13 +329,23 @@ export abstract class BaseDatabaseProvider implements DatabaseProvider {
       queryLanguage: "sql",
       supportsExplain: true,
       supportsExternalQueryLimiting: true,
-      supportsCreateTable: true,
+      // No `createTable`: a subclass offers the Create Table form only once it declares the
+      // grammar the form writes, never one inherited in another engine's dialect (#648, #1822).
       supportsInlineRowEdit: true,
+      // False, and NOT the permissive default the flag above takes: the `prepareQuery`
+      // below returns the statement untouched and never applies an offset, so a subclass
+      // that does not override BOTH would offer a page-two control its own query path
+      // answers with page one (#816).
+      supportsResultPagination: false,
       // False, unlike supportsInlineRowEdit above: this class implements no
       // transaction methods, so a subclass that does not add them has none, and
       // POST /api/db/transaction refuses the call. The four that hold a session for
       // one (postgres, mysql, oracle, mssql) override this.
       supportsTransactions: false,
+      // False for the same reason: a subclass that inherits this default has not said its
+      // engine takes the generator's rows, so the row menus do not offer it (#1468). The
+      // engines that do override this.
+      supportsTestDataGeneration: false,
       // The default is the SQL default: a relational engine has foreign keys whether
       // or not a given schema uses them. The engines that have none override this
       // (#414), which is the direction that carries the strong claim.

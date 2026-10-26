@@ -1,5 +1,6 @@
 "use client";
 
+import { appFetch } from "@/lib/config/base-path";
 import React, { useMemo, useState, useCallback, useEffect, useRef } from "react";
 import {
   Zap,
@@ -24,6 +25,7 @@ import {
   ListTree,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { explainRequestEngine } from "@/lib/db/execution-ui/explain-request";
 import type { ExplainPlanNode, ExplainPlanResult, ExplainPlanInput, ExplainTreeNode } from "@/lib/explain/types";
 
 export type { ExplainPlanResult } from "@/lib/explain/types";
@@ -56,7 +58,27 @@ function formatTime(ms: number): string {
 // Analysis Functions
 // ============================================================================
 
+/**
+ * Whether this plan node reports what really happened (`EXPLAIN (ANALYZE ...)`) or
+ * only what the planner expects (`EXPLAIN (FORMAT JSON)`). An estimate carries no
+ * `Actual *` field at all, and reading it as a run would show every node as zero rows
+ * in zero time. The background plan beside every run is an estimate since #1311,
+ * because the ANALYZE form executed the user's statement a second time.
+ */
+function wasExecuted(node: ExplainPlanNode): boolean {
+  return node["Actual Rows"] !== undefined;
+}
+
+/** What the plan bars are drawn against: time when the plan ran, cost when it was only planned. */
+function planScale(analysis: PlanAnalysis): number {
+  return (analysis.executed ? analysis.executionTime : analysis.totalCost) || 1;
+}
+
 interface PlanAnalysis {
+  /** False for an estimated plan: the figures below are the planner's, nothing ran. */
+  executed: boolean;
+  /** The planner's row estimate for the statement's result (the root node's). */
+  plannedRows: number;
   totalTime: number;
   planningTime: number;
   executionTime: number;
@@ -94,9 +116,10 @@ function analyzePlan(plan: ExplainPlanResult[]): PlanAnalysis {
   const executionTime = plan?.[0]?.["Execution Time"] || rootPlan?.["Actual Total Time"] || 0;
   const planningTime = plan?.[0]?.["Planning Time"] || 0;
   const totalCost = rootPlan?.["Total Cost"] || 0;
+  const executed = rootPlan !== undefined && wasExecuted(rootPlan);
 
   // Recursive node analysis
-  function analyzeNode(node: ExplainPlanNode, depth: number = 0) {
+  function analyzeNode(node: ExplainPlanNode, depth: number = 0, stoppedByLimit: boolean = false) {
     if (!node) return;
     nodeCount++;
 
@@ -109,12 +132,14 @@ function analyzePlan(plan: ExplainPlanResult[]): PlanAnalysis {
     bufferHits += node["Shared Hit Blocks"] || 0;
     bufferReads += node["Shared Read Blocks"] || 0;
 
-    // Check for Sequential Scan on large tables
-    if (nodeType.includes("Seq Scan") && actualRows > 10000) {
+    // Check for Sequential Scan on large tables. An estimated plan has no actual rows,
+    // so the planner's count stands in: a scan it expects to be large is the finding.
+    const scannedRows = executed ? actualRows : planRows;
+    if (nodeType.includes("Seq Scan") && scannedRows > 10000) {
       warnings.push({
         type: "warning",
         title: "Sequential Scan",
-        description: `Full table scan on "${node["Relation Name"] || "table"}" (${formatNumber(actualRows)} rows). Consider adding an index.`,
+        description: `Full table scan on "${node["Relation Name"] || "table"}" (${formatNumber(scannedRows)} rows). Consider adding an index.`,
         node: nodeType,
       });
     }
@@ -122,7 +147,7 @@ function analyzePlan(plan: ExplainPlanResult[]): PlanAnalysis {
     // Check for row estimate mismatch
     if (planRows > 0 && actualRows > 0) {
       const ratio = actualRows / planRows;
-      if (ratio > 10 || ratio < 0.1) {
+      if (ratio > 10 || (ratio < 0.1 && !stoppedByLimit)) {
         warnings.push({
           type: "info",
           title: "Estimate Mismatch",
@@ -153,8 +178,16 @@ function analyzePlan(plan: ExplainPlanResult[]): PlanAnalysis {
       });
     }
 
-    // Recurse into children
-    (node["Plans"] || []).forEach((child) => analyzeNode(child, depth + 1));
+    // A Limit can stop streaming descendants early. Blocking nodes still consume
+    // their whole input, even when the Limit stops reading their output. A Hashed
+    // SetOp (EXCEPT, INTERSECT) builds its table from every input row first.
+    const blocksInput =
+      nodeType === "Sort" ||
+      nodeType === "Hash" ||
+      (nodeType === "Aggregate" && (node.Strategy === "Plain" || node.Strategy === "Hashed")) ||
+      (nodeType === "SetOp" && node.Strategy === "Hashed");
+    const childrenStoppedByLimit = nodeType === "Limit" || (stoppedByLimit && !blocksInput);
+    (node["Plans"] || []).forEach((child) => analyzeNode(child, depth + 1, childrenStoppedByLimit));
   }
 
   if (rootPlan) {
@@ -176,11 +209,13 @@ function analyzePlan(plan: ExplainPlanResult[]): PlanAnalysis {
 
   insights.push({
     label: "Execution",
-    value: formatTime(executionTime),
+    value: executed ? formatTime(executionTime) : "Not executed",
     status: executionTime > 1000 ? "critical" : executionTime > 100 ? "warning" : "good",
   });
 
   return {
+    executed,
+    plannedRows: rootPlan?.["Plan Rows"] || 0,
     totalTime: executionTime + planningTime,
     planningTime,
     executionTime,
@@ -199,16 +234,16 @@ function analyzePlan(plan: ExplainPlanResult[]): PlanAnalysis {
 // ============================================================================
 
 const NodeIcon = ({ type }: { type: string }) => {
-  if (type.includes("Seq Scan")) return <Search strokeWidth={1.5} className="w-3.5 h-3.5 text-amber-400" />;
+  if (type.includes("Seq Scan")) return <Search strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-amber" />;
   if (type.includes("Index Scan") || type.includes("Index Only"))
-    return <Target strokeWidth={1.5} className="w-3.5 h-3.5 text-emerald-400" />;
-  if (type.includes("Scan")) return <Search strokeWidth={1.5} className="w-3.5 h-3.5 text-blue-400" />;
-  if (type.includes("Join")) return <Layers strokeWidth={1.5} className="w-3.5 h-3.5 text-purple-400" />;
-  if (type.includes("Sort")) return <ArrowDown strokeWidth={1.5} className="w-3.5 h-3.5 text-amber-400" />;
+    return <Target strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-emerald" />;
+  if (type.includes("Scan")) return <Search strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-blue" />;
+  if (type.includes("Join")) return <Layers strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-purple" />;
+  if (type.includes("Sort")) return <ArrowDown strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-amber" />;
   if (type.includes("Limit")) return <LayoutGrid strokeWidth={1.5} className="w-3.5 h-3.5 text-fg-tertiary" />;
   if (type.includes("Aggregate") || type.includes("Group"))
-    return <Zap strokeWidth={1.5} className="w-3.5 h-3.5 text-pink-400" />;
-  if (type.includes("Hash")) return <HardDrive strokeWidth={1.5} className="w-3.5 h-3.5 text-cyan-400" />;
+    return <Zap strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-pink" />;
+  if (type.includes("Hash")) return <HardDrive strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-cyan" />;
   return <Database strokeWidth={1.5} className="w-3.5 h-3.5 text-fg-muted" />;
 };
 
@@ -217,23 +252,25 @@ const StatusBadge = ({ status }: { status: "good" | "warning" | "critical" }) =>
     <div
       className={cn(
         "w-2 h-2 rounded-full",
-        status === "good" ? "bg-emerald-500" : status === "warning" ? "bg-amber-500" : "bg-red-500",
+        status === "good" ? "bg-success-tint" : status === "warning" ? "bg-warning-tint" : "bg-danger-tint",
       )}
     />
   );
 };
 
 // Compact Plan Node
-const PlanNode = ({ node, depth = 0, maxTime }: { node: ExplainPlanNode; depth?: number; maxTime: number }) => {
+// `scale` is the root's measure the bar is drawn against: its execution time for an
+// executed plan, its total cost for an estimate (see `wasExecuted`).
+const PlanNode = ({ node, depth = 0, scale }: { node: ExplainPlanNode; depth?: number; scale: number }) => {
   const [expanded, setExpanded] = useState(depth < 2);
   const nodeType = node["Node Type"] || "Unknown";
-  const actualTime = node["Actual Total Time"] || 0;
-  const actualRows = node["Actual Rows"] || 0;
+  const executed = wasExecuted(node);
+  const measure = executed ? node["Actual Total Time"] || 0 : node["Total Cost"] || 0;
   const children = node["Plans"] || [];
   const isIndexScan = nodeType.includes("Index");
   const isSeqScan = nodeType.includes("Seq Scan");
 
-  const timePercent = maxTime > 0 ? (actualTime / maxTime) * 100 : 0;
+  const timePercent = scale > 0 ? (measure / scale) * 100 : 0;
 
   return (
     <div className="relative">
@@ -259,7 +296,10 @@ const PlanNode = ({ node, depth = 0, maxTime }: { node: ExplainPlanNode; depth?:
 
         {/* Icon */}
         <div
-          className={cn("p-1 rounded", isSeqScan ? "bg-amber-500/10" : isIndexScan ? "bg-emerald-500/10" : "bg-fill")}
+          className={cn(
+            "p-1 rounded",
+            isSeqScan ? "bg-hue-amber-tint/10" : isIndexScan ? "bg-hue-emerald-tint/10" : "bg-fill",
+          )}
         >
           <NodeIcon type={nodeType} />
         </div>
@@ -276,21 +316,23 @@ const PlanNode = ({ node, depth = 0, maxTime }: { node: ExplainPlanNode; depth?:
 
         {/* Stats */}
         <div className="flex items-center gap-4 text-xs font-mono">
-          <span className="text-fg-muted w-16 text-right">{formatNumber(actualRows)} rows</span>
+          <span className="text-fg-muted w-16 text-right">
+            {executed ? formatNumber(node["Actual Rows"] || 0) : `~${formatNumber(node["Plan Rows"] || 0)}`} rows
+          </span>
           <span
             className={cn(
               "w-16 text-right",
-              timePercent > 50 ? "text-red-400" : timePercent > 20 ? "text-amber-400" : "text-fg-tertiary",
+              timePercent > 50 ? "text-danger" : timePercent > 20 ? "text-warning" : "text-fg-tertiary",
             )}
           >
-            {formatTime(actualTime)}
+            {executed ? formatTime(measure) : `cost ${formatNumber(measure)}`}
           </span>
           {/* Time bar */}
           <div className="w-20 h-1.5 bg-fill rounded-full overflow-hidden">
             <div
               className={cn(
                 "h-full rounded-full transition-all",
-                timePercent > 50 ? "bg-red-500" : timePercent > 20 ? "bg-amber-500" : "bg-blue-500",
+                timePercent > 50 ? "bg-danger-tint" : timePercent > 20 ? "bg-warning-tint" : "bg-brand-tint",
               )}
               style={{ width: `${Math.min(timePercent, 100)}%` }}
             />
@@ -304,15 +346,15 @@ const PlanNode = ({ node, depth = 0, maxTime }: { node: ExplainPlanNode; depth?:
           {/* Filter info */}
           {node["Filter"] && (
             <div className="flex items-start gap-2 py-1 text-xs">
-              <span className="text-amber-500/70 font-medium shrink-0">Filter:</span>
+              <span className="text-hue-amber/70 font-medium shrink-0">Filter:</span>
               <span className="text-fg-muted font-mono break-all">{node["Filter"]}</span>
             </div>
           )}
           {/* Index info */}
           {node["Index Name"] && (
             <div className="flex items-center gap-2 py-1 text-xs">
-              <span className="text-emerald-500/70 font-medium">Index:</span>
-              <span className="text-emerald-400 font-mono">{node["Index Name"]}</span>
+              <span className="text-hue-emerald/70 font-medium">Index:</span>
+              <span className="text-hue-emerald font-mono">{node["Index Name"]}</span>
             </div>
           )}
           {/* Buffer stats */}
@@ -325,7 +367,7 @@ const PlanNode = ({ node, depth = 0, maxTime }: { node: ExplainPlanNode; depth?:
 
           {/* Children */}
           {children.map((child, idx) => (
-            <PlanNode key={idx} node={child} depth={depth + 1} maxTime={maxTime} />
+            <PlanNode key={idx} node={child} depth={depth + 1} scale={scale} />
           ))}
         </div>
       )}
@@ -369,9 +411,17 @@ const TreeNodeView = ({ node, depth = 0 }: { node: ExplainTreeNode; depth?: numb
         <ListTree strokeWidth={1.5} className="w-3 h-3 text-fg-tertiary" />
       </div>
 
-      {/* Label */}
+      {/* Label, and under it whatever the engine printed ABOUT this node */}
       <div className="flex-1 min-w-0">
         <span className="text-xs font-medium text-fg truncate">{node.label}</span>
+        {/* A text plan's attributes: CockroachDB prints `table: orders@orders_pkey` and
+            `spans: FULL SCAN` under the operator they describe, TiDB carries the same
+            kind of thing in extra EXPLAIN columns, and `detail` is where both land.
+            Without this the tree would show operator names and nothing else — most of
+            what those plans say would be readable only in the raw tab (#597). */}
+        {node.detail !== undefined && (
+          <span className="block text-[11px] font-mono text-fg-muted truncate">{node.detail}</span>
+        )}
       </div>
 
       {/* Metric badges — only when the node actually carries metrics */}
@@ -478,14 +528,14 @@ function AIExplainTab({
     abortControllerRef.current = abortController;
 
     try {
-      const response = await fetch("/api/ai/explain", {
+      const response = await appFetch("/api/ai/explain", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query: query || "Unknown query",
           explainPlan: plan,
           schemaContext: schemaContext || "",
-          databaseType: databaseType || "postgres",
+          databaseType: explainRequestEngine(databaseType),
         }),
         signal: abortController.signal,
       });
@@ -537,7 +587,7 @@ function AIExplainTab({
                 className={cn(
                   "text-xs font-mono p-3 rounded-lg overflow-x-auto border",
                   isSql
-                    ? "bg-blue-500/5 border-blue-500/10 text-blue-300"
+                    ? "bg-brand-tint/5 border-brand-tint/10 text-brand-bright"
                     : "bg-fill-subtle border-hairline text-fg-tertiary",
                 )}
               >
@@ -546,7 +596,7 @@ function AIExplainTab({
               {isSql && onLoadQuery && (
                 <button
                   onClick={() => onLoadQuery(content)}
-                  className="absolute top-2 right-2 opacity-0 group-hover/code:opacity-100 transition-opacity px-2 py-1 rounded bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium flex items-center gap-1"
+                  className="absolute top-2 right-2 opacity-0 group-hover/code:opacity-100 transition-opacity px-2 py-1 rounded bg-brand-solid hover:bg-brand-solid-hover text-white text-xs font-medium flex items-center gap-1"
                 >
                   <Play strokeWidth={1.5} className="w-3 h-3" /> Try This
                 </button>
@@ -593,7 +643,7 @@ function AIExplainTab({
         const num = line.match(/^(\d+)\./)?.[1];
         elements.push(
           <div key={idx} className="flex items-start gap-2 text-xs text-fg-tertiary leading-relaxed ml-2 my-0.5">
-            <span className="text-blue-400 font-medium mt-0 shrink-0 w-4">{num}.</span>
+            <span className="text-brand font-medium mt-0 shrink-0 w-4">{num}.</span>
             <span>{renderInlineFormatting(line.replace(/^\d+\.\s*/, ""))}</span>
           </div>,
         );
@@ -624,7 +674,7 @@ function AIExplainTab({
       }
       if (part.startsWith("`") && part.endsWith("`")) {
         return (
-          <code key={i} className="text-blue-400 bg-blue-500/10 px-1 rounded text-xs font-mono">
+          <code key={i} className="text-brand bg-brand-tint/10 px-1 rounded text-xs font-mono">
             {part.slice(1, -1)}
           </code>
         );
@@ -638,7 +688,7 @@ function AIExplainTab({
     return (
       <div className="h-full flex flex-col items-center justify-center p-8 text-center">
         <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-purple-500/20 to-blue-500/10 flex items-center justify-center mb-4">
-          <Sparkles strokeWidth={1.5} className="w-7 h-7 text-purple-400" />
+          <Sparkles strokeWidth={1.5} className="w-7 h-7 text-hue-purple" />
         </div>
         <h3 className="text-xs font-medium text-fg mb-1">AI Query Analysis</h3>
         <p className="text-xs text-fg-muted max-w-[280px] leading-relaxed mb-4">
@@ -650,7 +700,7 @@ function AIExplainTab({
           className={cn(
             "flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-medium transition-all",
             query
-              ? "bg-purple-600 hover:bg-purple-500 text-white shadow-lg shadow-purple-900/20"
+              ? "bg-hue-purple-solid hover:bg-hue-purple-solid-hover text-white shadow-lg shadow-purple-900/20"
               : "bg-fill text-fg-subtle cursor-not-allowed",
           )}
         >
@@ -667,8 +717,8 @@ function AIExplainTab({
       {/* Re-analyze button */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-hairline bg-surface">
         <div className="flex items-center gap-2">
-          <Sparkles strokeWidth={1.5} className="w-3 h-3 text-purple-400" />
-          <span className="text-xs font-medium text-purple-400">AI Analysis</span>
+          <Sparkles strokeWidth={1.5} className="w-3 h-3 text-hue-purple" />
+          <span className="text-xs font-medium text-hue-purple">AI Analysis</span>
         </div>
         <button
           onClick={analyzeWithAI}
@@ -687,7 +737,7 @@ function AIExplainTab({
       {/* Content */}
       <div className="flex-1 overflow-auto p-4">
         {error && (
-          <div className="flex items-center gap-2 p-3 rounded-lg bg-red-500/5 border border-red-500/10 text-red-400 text-xs mb-4">
+          <div className="flex items-center gap-2 p-3 rounded-lg bg-danger-tint/5 border border-danger-tint/10 text-danger text-xs mb-4">
             <TriangleAlert strokeWidth={1.5} className="w-3.5 h-3.5 shrink-0" />
             {error}
           </div>
@@ -697,7 +747,7 @@ function AIExplainTab({
 
         {isLoading && !aiResponse && (
           <div className="flex items-center gap-3 text-fg-muted text-xs">
-            <LoaderCircle strokeWidth={1.5} className="w-3.5 h-3.5 animate-spin text-purple-400" />
+            <LoaderCircle strokeWidth={1.5} className="w-3.5 h-3.5 animate-spin text-hue-purple" />
             <span>Analyzing execution plan...</span>
           </div>
         )}
@@ -718,6 +768,18 @@ function AIExplainTab({
 // ============================================================================
 
 type ExplainTab = "insights" | "tree" | "raw" | "ai";
+
+/**
+ * The raw tab shows what the engine sent. That is JSON for every format but one:
+ * `mysql-text` stores the plan as PLAIN TEXT, because the MySQL-wire relatives that
+ * refuse `EXPLAIN FORMAT=JSON` print a text or tabular plan instead (measured
+ * 2026-09-06: StarRocks 3.3.22 `EXPLAIN SELECT 1` answers 13 rows of one text column,
+ * Apache Doris 4.1.3 answers 17). Stringifying that would show one quoted line with
+ * escaped newlines instead of the plan.
+ */
+function formatRawPlan(raw: unknown): string {
+  return typeof raw === "string" ? raw : JSON.stringify(raw, null, 2);
+}
 
 // First entry is the kind's default tab. No "insights" for tree plans —
 // analyzePlan's heuristics key off postgres-only fields (Actual Rows, Total
@@ -813,16 +875,37 @@ export function VisualExplain({ plan, query, schemaContext, databaseType, onLoad
             </div>
           ) : (
             <div className="flex items-center gap-6">
-              <div className="flex items-center gap-2">
-                <Clock strokeWidth={1.5} className="w-3 h-3 text-blue-400" />
-                <span className="text-xs font-medium text-fg">{formatTime(analysis?.executionTime || 0)}</span>
-                <span className="text-xs text-fg-subtle">execution</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <TrendingUp className="w-3 h-3 text-fg-muted" />
-                <span className="text-xs font-medium text-fg-tertiary">{formatNumber(analysis?.totalRows || 0)}</span>
-                <span className="text-xs text-fg-subtle">rows</span>
-              </div>
+              {analysis?.executed === false ? (
+                // An estimate: nothing ran, so there is no time to show and the rows
+                // are the planner's expectation for the result.
+                <>
+                  <div className="flex items-center gap-2">
+                    <Clock strokeWidth={1.5} className="w-3 h-3 text-brand" />
+                    <span className="text-xs font-medium text-fg">Estimated plan</span>
+                    <span className="text-xs text-fg-subtle">not executed</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <TrendingUp className="w-3 h-3 text-fg-muted" />
+                    <span className="text-xs font-medium text-fg-tertiary">~{formatNumber(analysis.plannedRows)}</span>
+                    <span className="text-xs text-fg-subtle">rows</span>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="flex items-center gap-2">
+                    <Clock strokeWidth={1.5} className="w-3 h-3 text-brand" />
+                    <span className="text-xs font-medium text-fg">{formatTime(analysis?.executionTime || 0)}</span>
+                    <span className="text-xs text-fg-subtle">execution</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <TrendingUp className="w-3 h-3 text-fg-muted" />
+                    <span className="text-xs font-medium text-fg-tertiary">
+                      {formatNumber(analysis?.totalRows || 0)}
+                    </span>
+                    <span className="text-xs text-fg-subtle">rows</span>
+                  </div>
+                </>
+              )}
               <div className="flex items-center gap-2">
                 <HardDrive strokeWidth={1.5} className="w-3 h-3 text-fg-muted" />
                 <span className="text-xs font-medium text-fg-tertiary">{formatNumber(analysis?.totalCost || 0)}</span>
@@ -841,7 +924,7 @@ export function VisualExplain({ plan, query, schemaContext, databaseType, onLoad
                   "px-3 py-1 text-xs font-medium rounded-md transition-all",
                   activeTab === tab
                     ? tab === "ai"
-                      ? "bg-purple-500/20 text-purple-300"
+                      ? "bg-hue-purple-tint/20 text-hue-purple-alt"
                       : "bg-fill-strong text-fg"
                     : "text-fg-muted hover:text-fg-secondary",
                 )}
@@ -882,28 +965,28 @@ export function VisualExplain({ plan, query, schemaContext, databaseType, onLoad
                     className={cn(
                       "flex items-start gap-3 p-3 rounded-lg border",
                       warning.type === "critical"
-                        ? "bg-red-500/5 border-red-500/10"
+                        ? "bg-danger-tint/5 border-danger-tint/10"
                         : warning.type === "warning"
-                          ? "bg-amber-500/5 border-amber-500/10"
-                          : "bg-blue-500/5 border-blue-500/10",
+                          ? "bg-warning-tint/5 border-warning-tint/10"
+                          : "bg-brand-tint/5 border-brand-tint/10",
                     )}
                   >
                     <div
                       className={cn(
                         "p-1 rounded",
                         warning.type === "critical"
-                          ? "bg-red-500/10"
+                          ? "bg-danger-tint/10"
                           : warning.type === "warning"
-                            ? "bg-amber-500/10"
-                            : "bg-blue-500/10",
+                            ? "bg-warning-tint/10"
+                            : "bg-brand-tint/10",
                       )}
                     >
                       {warning.type === "critical" ? (
-                        <TriangleAlert strokeWidth={1.5} className="w-3 h-3 text-red-400" />
+                        <TriangleAlert strokeWidth={1.5} className="w-3 h-3 text-danger" />
                       ) : warning.type === "warning" ? (
-                        <TriangleAlert strokeWidth={1.5} className="w-3 h-3 text-amber-400" />
+                        <TriangleAlert strokeWidth={1.5} className="w-3 h-3 text-warning" />
                       ) : (
-                        <Info strokeWidth={1.5} className="w-3 h-3 text-blue-400" />
+                        <Info strokeWidth={1.5} className="w-3 h-3 text-brand" />
                       )}
                     </div>
                     <div className="flex-1 min-w-0">
@@ -911,10 +994,10 @@ export function VisualExplain({ plan, query, schemaContext, databaseType, onLoad
                         className={cn(
                           "text-xs font-medium",
                           warning.type === "critical"
-                            ? "text-red-300"
+                            ? "text-danger-bright"
                             : warning.type === "warning"
-                              ? "text-amber-300"
-                              : "text-blue-300",
+                              ? "text-warning-bright"
+                              : "text-brand-bright",
                         )}
                       >
                         {warning.title}
@@ -926,14 +1009,28 @@ export function VisualExplain({ plan, query, schemaContext, databaseType, onLoad
               </div>
             )}
 
-            {/* No warnings */}
-            {analysis && analysis.warnings.length === 0 && (
-              <div className="flex items-center gap-3 p-3 rounded-lg bg-emerald-500/5 border border-emerald-500/10">
-                <div className="p-1 rounded bg-emerald-500/10">
-                  <CircleCheck strokeWidth={1.5} className="w-3 h-3 text-emerald-400" />
+            {/* Nothing read is nothing judged (#1389): a plan with no node this view knows used
+                to reach the success card below, which reads as a verdict about the query. */}
+            {analysis && analysis.nodeCount === 0 && (
+              <div className="flex items-center gap-3 p-3 rounded-lg bg-fill-subtle border border-hairline">
+                <div className="p-1 rounded bg-fill">
+                  <Info strokeWidth={1.5} className="w-3 h-3 text-fg-muted" />
                 </div>
                 <div>
-                  <h4 className="text-xs font-medium text-emerald-300">Query looks good</h4>
+                  <h4 className="text-xs font-medium text-fg-secondary">Plan could not be read</h4>
+                  <p className="text-xs text-fg-muted">The raw tab shows the plan as the server sent it.</p>
+                </div>
+              </div>
+            )}
+
+            {/* No warnings */}
+            {analysis && analysis.nodeCount > 0 && analysis.warnings.length === 0 && (
+              <div className="flex items-center gap-3 p-3 rounded-lg bg-success-tint/5 border border-success-tint/10">
+                <div className="p-1 rounded bg-success-tint/10">
+                  <CircleCheck strokeWidth={1.5} className="w-3 h-3 text-success" />
+                </div>
+                <div>
+                  <h4 className="text-xs font-medium text-success-bright">Query looks good</h4>
                   <p className="text-xs text-fg-muted">No obvious performance issues detected.</p>
                 </div>
               </div>
@@ -956,7 +1053,7 @@ export function VisualExplain({ plan, query, schemaContext, databaseType, onLoad
             <div>
               <h3 className="text-xs font-medium text-fg-muted mb-2">Execution Plan</h3>
               <div className="rounded-lg border border-hairline bg-fill-subtle p-2">
-                {rootPlan && analysis && <PlanNode node={rootPlan} maxTime={analysis.executionTime || 1} />}
+                {rootPlan && analysis && <PlanNode node={rootPlan} scale={planScale(analysis)} />}
               </div>
             </div>
           </div>
@@ -967,7 +1064,7 @@ export function VisualExplain({ plan, query, schemaContext, databaseType, onLoad
             <div className="rounded-lg border border-hairline bg-fill-subtle p-2">
               {input.kind === "tree" && <TreeNodeView node={input.root} />}
               {input.kind !== "tree" && rootPlan && analysis && (
-                <PlanNode node={rootPlan} maxTime={analysis.executionTime || 1} />
+                <PlanNode node={rootPlan} scale={planScale(analysis)} />
               )}
             </div>
           </div>
@@ -976,7 +1073,7 @@ export function VisualExplain({ plan, query, schemaContext, databaseType, onLoad
         {activeTab === "raw" && (
           <div className="p-4">
             <pre className="text-xs font-mono text-fg-tertiary bg-fill-subtle rounded-lg p-4 overflow-auto border border-hairline">
-              {JSON.stringify(input.kind === "tree" ? input.raw : postgresPlan, null, 2)}
+              {formatRawPlan(input.kind === "tree" ? input.raw : postgresPlan)}
             </pre>
           </div>
         )}

@@ -42,12 +42,17 @@ import {
 } from "@/lib/db/errors";
 import {
   type ActiveSessionDetails,
+  type Container,
   type DatabaseConnection,
+  type DatabaseObject,
   type DatabaseOverview,
   type HealthInfo,
   type IndexStats,
+  type KindCount,
   type MaintenanceResult,
   type MaintenanceType,
+  type ObjectDetail,
+  type ObjectDetailBatch,
   type PerformanceMetrics,
   type PreparedQuery,
   type ProviderCapabilities,
@@ -58,7 +63,6 @@ import {
   type QueryWarning,
   type SlowQueryStats,
   type StorageStats,
-  type TableSchema,
   type TableStats,
 } from "@/lib/db/types";
 import { analyzeQuery } from "@/lib/db/utils/query-limiter";
@@ -69,11 +73,19 @@ import {
   getIndexStats as readIndexStats,
   getOverview as readOverview,
   getPerformanceMetrics as readPerformanceMetrics,
-  getSchema as readSchema,
   getSlowQueries as readSlowQueries,
   getStorageStats as readStorageStats,
   getTableStats as readTableStats,
 } from "./introspect";
+import {
+  countObjects,
+  describeObject,
+  describeObjects,
+  DRUID_CONTAINER_LEVELS,
+  DRUID_OBJECT_KINDS,
+  listContainers,
+  listObjects,
+} from "./objects";
 import {
   DRUID_CLIENT_DEADLINE_GRACE_MS,
   DRUID_TRANSPORT_FAILURE,
@@ -204,12 +216,15 @@ export class DruidProvider extends SQLBaseProvider {
       // Live-verified, `CREATE TABLE t (id BIGINT)` answers 400 "Incorrect syntax
       // near the keyword 'CREATE' at line 1, column 1" and the parser lists the
       // statements it expected, with no form of CREATE among them. A datasource
-      // comes into existence by being ingested into.
-      supportsCreateTable: false,
+      // comes into existence by being ingested into. So this provider declares no
+      // `createTable`.
       // Same class of answer as CREATE, for the same reason: `UPDATE t SET ...` is
       // rejected with `Unsupported SQL statement [UPDATE]`. Druid SQL has no
       // row-level DML at all - a datasource changes through ingestion.
       supportsInlineRowEdit: false,
+      supportsTestDataGeneration: false,
+      // `LIMIT n OFFSET m` from the shared limiter; Druid SQL accepts both clauses.
+      supportsResultPagination: true,
       // Druid SQL has no DML at all, so nothing to wrap.
       supportsTransactions: false,
       // Druid SQL has no constraints — no primary key either, which is why
@@ -235,6 +250,16 @@ export class DruidProvider extends SQLBaseProvider {
       // rejects both, so in practice a query never refreshes the schema - which is
       // correct: a Druid schema changes through ingestion, not through the editor.
       schemaRefreshPattern: "\\b(INSERT|REPLACE)\\b",
+      // The object model (#789). One schema level and three kinds, declared in
+      // `objects.ts` beside the statements that read them. Five kinds are ABSENT
+      // rather than declared empty - view, materialized view, function, procedure,
+      // trigger - because `CREATE` is not in Druid's grammar in any form, so the tree
+      // draws no folder for any of them.
+      containerLevels: DRUID_CONTAINER_LEVELS,
+      // Only the declared depth is an address: a partial path would leave a level unbound and
+      // answer an empty folder. Read through `acceptedContainerShapes()` (#1147).
+      containerPathShapes: "exact",
+      objectKinds: DRUID_OBJECT_KINDS,
     };
   }
 
@@ -337,7 +362,7 @@ export class DruidProvider extends SQLBaseProvider {
     const mapped = this.mapDruidError(error);
     // A rejected credential is not a connectivity problem, and saying so would
     // send the user to check their host.
-    if (mapped instanceof AuthenticationError) return mapped;
+    if (mapped instanceof AuthenticationError || mapped instanceof DatabaseConfigError) return mapped;
 
     return new ConnectionError(
       `Failed to connect to Druid: ${mapped.message}`,
@@ -419,6 +444,12 @@ export class DruidProvider extends SQLBaseProvider {
    * server named no exception code.
    */
   private mapDruidError(error: unknown, sql?: string): Error {
+    // A connection that never opened is a connection problem. Its message says
+    // "timed out", which the shared message-based mapping would read as a slow
+    // query and answer with query advice, so the transport's kind decides first.
+    if (error instanceof DruidTransportError && error.failure === "timed-out") {
+      return new ConnectionError(error.message, this.type, this.config.host, this.config.port);
+    }
     if (!(error instanceof DruidTransportError) || error.category === DRUID_TRANSPORT_FAILURE) {
       return this.mapError(error, sql);
     }
@@ -451,21 +482,6 @@ export class DruidProvider extends SQLBaseProvider {
   // ==========================================================================
   // Schema
   // ==========================================================================
-
-  /**
-   * The datasources and their columns, from `INFORMATION_SCHEMA` alone.
-   *
-   * `getSchemaList` and `getSchemaRelations` are deliberately NOT implemented.
-   * Both are optional and the client falls back to this method, and the split
-   * exists to keep a slow relationship read from blocking the table list - which
-   * Druid has neither half of: there are no user-defined indexes and no foreign
-   * keys, so a list would be byte-identical to this and a relations read would
-   * spend a round trip to answer two empty arrays per datasource.
-   */
-  public async getSchema(): Promise<TableSchema[]> {
-    const transport = this.requireTransport();
-    return this.guarded(() => readSchema(transport));
-  }
 
   // ==========================================================================
   // Monitoring
@@ -516,6 +532,43 @@ export class DruidProvider extends SQLBaseProvider {
   public async getHealth(): Promise<HealthInfo> {
     const transport = this.requireTransport();
     return this.guarded(() => readHealth(transport));
+  }
+
+  // ==========================================================================
+  // The object surface (#789)
+  // --------------------------------------------------------------------------
+  // Four delegations and nothing else: the declaration, the statements and every
+  // measurement behind them live in `objects.ts`, next to each other.
+  //
+  // Three of the four are `guarded`, so a refusal reaches the caller as this repo's
+  // own error type. `countObjects` is deliberately NOT: it never throws for a read
+  // failure, it answers `{ unavailable: <the server's own sentence> }` per kind, and
+  // guarding it would replace Druid's words with ours in the one place a person is
+  // shown them.
+  // ==========================================================================
+
+  public async listContainers(parent?: readonly string[]): Promise<Container[]> {
+    const transport = this.requireTransport();
+    return this.guarded(() => listContainers(transport, parent));
+  }
+
+  public async countObjects(container: readonly string[]): Promise<Record<string, KindCount>> {
+    return countObjects(this.requireTransport(), this.getCapabilities(), container);
+  }
+
+  public async listObjects(container: readonly string[], kind: string): Promise<DatabaseObject[]> {
+    const transport = this.requireTransport();
+    return this.guarded(() => listObjects(transport, this.getCapabilities(), container, kind));
+  }
+
+  public async describeObject(path: readonly string[], kind: string): Promise<ObjectDetail> {
+    const transport = this.requireTransport();
+    return this.guarded(() => describeObject(transport, this.getCapabilities(), path, kind));
+  }
+
+  public async describeObjects(container: readonly string[], kind: string, limit?: number): Promise<ObjectDetailBatch> {
+    const transport = this.requireTransport();
+    return this.guarded(() => describeObjects(transport, this.getCapabilities(), container, kind, limit));
   }
 
   // ==========================================================================

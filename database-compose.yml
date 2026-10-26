@@ -9,7 +9,7 @@ x-druid-env: &druid-env
   # druid-multi-stage-query is included on purpose: it is what makes `INSERT INTO ... SELECT`
   # (MSQ) available on /druid/v2/sql/task. The provider does not use that endpoint - the point
   # is that the live pass can prove the *synchronous* endpoint rejects INSERT even when the
-  # engine is fully capable of it, which is the honest reason supportsCreateTable is false.
+  # engine is fully capable of it, which is the honest reason it declares no createTable.
   druid_extensions_loadList: '["druid-histogram", "druid-datasketches", "druid-lookups-cached-global", "postgresql-metadata-storage", "druid-multi-stage-query"]'
   druid_zk_service_host: druid-zookeeper
   druid_metadata_storage_host: ""
@@ -44,9 +44,22 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
     ports:
-      - "5432:5432"
+      # Loopback only: postgres/postgres is committed in this file, so keep this
+      # database off the host's LAN address.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # The seed this file's postgres is for. Without it the service came up with an
+      # empty `postgres` database and no `libredb_dev` at all, so the object-tree
+      # fixture in 02-sample-data.sql (#710, #789) was never applied and an acceptance
+      # run measured an absence we had created. The scripts run in alphabetical order
+      # and ONLY on a fresh data directory, so an existing container has to be
+      # recreated before they take effect.
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
   mongodb:
-    image: mongo:latest
+    # Pinned by digest: the agent read-only profile's privilege allowlist, plan shapes and memory figures are measured
+    # on this build (docs/providers/mongodb.md), and tests/live/mongodb-agent-profile.ts and its CI step run the same
+    # reference; tests/unit/db/mongodb/live-environment.test.ts holds the three equal.
+    image: mongo:9.0.4@sha256:f90507905ce6e52e4a63d0ff8964fc254fa4d37ccbe56c56f4bc0186eb02edea
     container_name: libredb-mongodb
     restart: unless-stopped
     environment:
@@ -54,6 +67,13 @@ services:
       MONGO_INITDB_ROOT_PASSWORD: admin
     ports:
       - "27017:27017"
+    volumes:
+      # The object-browser fixture (#789). The image runs every .js in this directory
+      # through mongosh once, on a FRESH data directory only, so an already-initialized
+      # container has to be recreated before an edit to that file takes effect. Connect
+      # against the `app` database it creates; `configstore` is there so the reserved
+      # database names stay excluded by exact name rather than by prefix.
+      - ./docker/mongodb-init:/docker-entrypoint-initdb.d:ro
   mysql:
     image: mysql:latest
     container_name: libredb-mysql
@@ -63,12 +83,21 @@ services:
       MYSQL_DATABASE: mysql
     ports:
       - "3306:3306"
+    volumes:
+      # The object-browser fixture (#789). The image runs it once, on a FRESH data
+      # directory only, so an already-initialized container has to be recreated before an
+      # edit to that file takes effect. Connect against the `app` database it creates.
+      - ./docker/mysql-init:/docker-entrypoint-initdb.d:ro
   mssql:
     # Use 2022-latest to avoid SQL Server 2025 NUMA/processor topology assert in containers.
     # Limit CPUs to avoid: ASSERT (result * DrtlGetProcessorCoreCount() == DrtlGetProcessorCount())
     image: mcr.microsoft.com/mssql/server:2022-latest
     container_name: libredb-mssql
     restart: unless-stopped
+    # No init-script mount, and that is the image rather than an omission: this one has no
+    # init-script directory at all. `docker/mssql-init/` holds two scripts to apply by hand,
+    # each carrying its own `docker cp` + `sqlcmd` line - the object-browser fixture, and the
+    # least-privilege principal the agent read-only execution profile requires.
     environment:
       ACCEPT_EULA: "Y"
       MSSQL_SA_PASSWORD: Password123!
@@ -85,10 +114,58 @@ services:
     container_name: libredb-oracle
     restart: unless-stopped
     environment:
+      # Inert against this image and left alone rather than removed, because it records
+      # what somebody expected. ORACLE_PDB is the Oracle-published image's variable;
+      # gvenzl/oracle-xe reads ORACLE_DATABASE, and setting that one creates a SECOND
+      # pluggable database and adds minutes to the first start. Measured: the service name
+      # to connect to is XEPDB1.
       ORACLE_PDB: ORCLPDB1
       ORACLE_PASSWORD: Password123!
     ports:
       - "1521:1521"
+    volumes:
+      # The object-browser fixture (#789, #765): two owners, one object of every declared
+      # kind, and a package whose body deliberately does not compile. SQL*Plus runs these
+      # once and ONLY on a fresh data directory, so an existing container has to be
+      # recreated before an edit takes effect. Connect as APP / Password123! on XEPDB1.
+      - ./docker/oracle-init:/container-entrypoint-initdb.d:ro
+  db2:
+    # IBM Db2 Community Edition, the engine the Db2 provider (#786) was measured on.
+    image: icr.io/db2_community/db2:12.1.0.0
+    container_name: libredb-db2
+    restart: unless-stopped
+    # Unprivileged: IBM's run instructions pass --privileged, but the instance only needs
+    # these two capabilities for its shared memory. Measured on a container started this
+    # way: Privileged=false, CapAdd=[CAP_IPC_LOCK CAP_IPC_OWNER], and the database starts.
+    cap_add:
+      - IPC_LOCK
+      - IPC_OWNER
+    environment:
+      LICENSE: accept
+      DB2INSTANCE: db2inst1
+      DB2INST1_PASSWORD: Password123
+      DBNAME: testdb
+      ARCHIVE_LOGS: "false"
+      AUTOCONFIG: "false"
+      SAMPLEDB: "false"
+    ports:
+      - "50000:50000"
+    volumes:
+      # The object-browser fixture: schemas APP and REPORTING, one object of every kind the
+      # provider lists, and the tables the maintenance and value tests use. The image
+      # executes EVERY file in /var/custom on every start, so only the script goes there and
+      # the .sql it feeds to the CLP is mounted elsewhere. The script loads the fixture once
+      # and skips it when APP.ORDERS exists, so an edit takes effect on a fresh volume only.
+      # Connect as db2inst1 / Password123 to TESTDB.
+      - ./docker/db2-init/01-object-fixture.sh:/var/custom/01-object-fixture.sh:ro
+      - ./docker/db2-init/01-object-fixture.sql:/var/custom-fixture/01-object-fixture.sql:ro
+    healthcheck:
+      # The first start creates the instance and the database, which takes minutes.
+      test: ["CMD-SHELL", "su - db2inst1 -c 'db2gcf -s' | grep -q Available"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
   couchbase:
     # The image ships an uninitialized node: the cluster, the credentials below,
     # the bucket and its primary index are all applied by the couchbase-init
@@ -135,6 +212,13 @@ services:
       COUCHBASE_USER: Administrator
       COUCHBASE_PASSWORD: password123
       COUCHBASE_BUCKET: travel
+    volumes:
+      # The object-browser fixture (#789). Couchbase has no
+      # /docker-entrypoint-initdb.d, so the sidecar sources it after the cluster,
+      # the bucket and the bucket-level primary index exist. The script is
+      # re-runnable, so `docker compose up couchbase-init` re-applies an edit
+      # without recreating the data node.
+      - ./docker/couchbase-init:/fixture:ro
     entrypoint: ["/bin/bash", "-c"]
     command:
       # $$ escapes compose interpolation: these expand in the container's shell.
@@ -159,7 +243,11 @@ services:
             "http://$$COUCHBASE_HOST:8093/query/service" \
             --data-urlencode "statement=CREATE PRIMARY INDEX IF NOT EXISTS ON \`$$COUCHBASE_BUCKET\`"; then
             echo "couchbase ready: bucket $$COUCHBASE_BUCKET has a primary index"
-            exit 0
+            # The object-browser fixture (#789): the scope, the collections, the
+            # two same-named indexes, the two same-named scope functions, the
+            # global function and the legacy map-reduce view. Every claim the
+            # provider doc makes about this engine is re-measurable against it.
+            exec bash /fixture/01-object-fixture.sh
           fi
           sleep 2
         done
@@ -183,6 +271,19 @@ services:
       # 8123 is HTTP, the only protocol the provider speaks. 9000 (native TCP) is deliberately
       # NOT exposed: there is no native-protocol transport in this codebase to connect with it.
       - "8123:8123"
+    volumes:
+      # The object-browser fixture (#789). The image feeds these to clickhouse-client once,
+      # on a FRESH data directory only, so an already-initialized container has to be
+      # recreated before an edit to that file takes effect. Connect against the `demo`
+      # database CLICKHOUSE_DB creates.
+      - ./docker/clickhouse-init:/docker-entrypoint-initdb.d:ro
+      # A CONFIG-FILE dictionary, which SQL cannot create. Measured: such a dictionary has
+      # no system.tables row at all and lives only in system.dictionaries with an empty
+      # database, so it is the only object that exercises the provider's dictionary union.
+      # The default config's <dictionaries_config>*_dictionary.*ml</dictionaries_config> glob
+      # is what picks this file up, so the `_dictionary.xml` suffix and this exact directory
+      # are both load-bearing.
+      - ./docker/clickhouse-config/regions_dictionary.xml:/etc/clickhouse-server/regions_dictionary.xml:ro
     ulimits:
       # ClickHouse warns at every start below this and degrades under load, same class of
       # issue as the couchbase nofile setting above.
@@ -196,9 +297,9 @@ services:
       interval: 5s
       timeout: 5s
       retries: 40
-    # No seed sidecar: CLICKHOUSE_DB above creates `demo` on first boot, and unlike Couchbase
-    # there is no index prerequisite - a SELECT against a freshly created table works
-    # immediately. Do not add one.
+    # No seed sidecar: CLICKHOUSE_DB above creates `demo` on first boot, the init mount seeds
+    # it, and unlike Couchbase there is no index prerequisite - a SELECT against a freshly
+    # created table works immediately. Do not add one.
 
   # ---------------------------------------------------------------------------------------
   # Apache Druid. Unlike every other service here, Druid is a distributed system and has no
@@ -342,6 +443,15 @@ services:
     environment: *druid-env
     volumes:
       - druid_router_var:/opt/druid/var
+      # The object-surface fixture (#789). Druid's image has no init-script directory
+      # and Druid has no CREATE statement at all, so the fixture is a lookup map plus
+      # three ingestion task specs and a script that applies them:
+      #
+      #   docker exec libredb-druid-router bash /opt/druid-init/apply.sh
+      #
+      # Mounted on the Router because the Router fronts the SQL endpoint AND, through
+      # the management proxy, the Coordinator and Overlord APIs the fixture needs.
+      - ./docker/druid-init:/opt/druid-init:ro
     ports:
       - "8888:8888"
     depends_on:
@@ -364,6 +474,12 @@ services:
     restart: unless-stopped
     ports:
       - "6379:6379"
+    # The object-browser fixture (#789) is NOT mounted here on purpose: this image has no
+    # init-script directory and no entrypoint hook of any kind, so there is nowhere to mount
+    # it that would run it. Apply it by hand, in one command, once the service is up:
+    #   docker exec -i libredb-redis redis-cli --no-raw < docker/redis-init/01-object-fixture.redis
+    # redis-cli reading stdin uses ONE connection for the whole file, which is what makes the
+    # `SELECT 3` in the middle of it land in database 3. See docs/providers/redis.md 11.5.
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -403,6 +519,13 @@ services:
       xpack.security.enabled: "false"
       # Sized for a laptop. The image otherwise claims a heap from the host's total memory.
       ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      # The object-surface fixture (#789). Neither image has an init-script directory
+      # and neither product has DDL - an index, an alias, an ingest pipeline, an index
+      # template and a data stream are all created over REST - so the fixture is a
+      # script, mounted read-only and run by hand or by `docker exec`. The exact
+      # commands are in docs/providers/elasticsearch.md.
+      - ./docker/search-init:/opt/search-init:ro
     ports:
       # 9200 is the HTTP API, the only protocol this provider speaks. 9300 (transport) is
       # deliberately not published: there is no transport-protocol client in this codebase.
@@ -431,6 +554,10 @@ services:
       # the node serves HTTPS with a self-signed certificate and a default admin password.
       DISABLE_SECURITY_PLUGIN: "true"
       OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      # The same fixture script, unchanged: every endpoint it calls answered identically
+      # on both products (#789). See docs/providers/opensearch.md for the commands.
+      - ./docker/search-init:/opt/search-init:ro
     ports:
       # 9201 on the host because both products ship on 9200 in the container and the
       # elasticsearch service above already publishes it. The provider's default port stays
@@ -513,7 +640,125 @@ services:
   # ---------------------------------------------------------------------------------------
 
   # ---------------------------------------------------------------------------------------
-  # Apache Trino (issue #424, Phase 2). One container is the whole cluster: the coordinator
+  # Snowflake has no service here: it is managed-only, and no emulator speaks the SQL API v2
+  # with real authentication. Its tests replay documented answers through an injected
+  # transport; docs/providers/snowflake.md says how a capture on a live account replaces them.
+  # ---------------------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------------------
+  # Apache Spark (issue #1736): Spark Connect, the gRPC server of sbin/start-connect-server.sh;
+  # docs/providers/spark.md says what each service is for. The catalog is in memory, so
+  # `bun tests/live/spark-evidence.ts --setup <service>` creates the sample namespace after each
+  # start. `spark` carries no token and exercises the tokenless path; `spark-auth` takes its
+  # token from SPARK_CONNECT_TOKEN and refuses to start without one; `spark-tls` is an HTTP/2
+  # TLS proxy in front of it, with certificates from SPARK_TLS_DIR, which
+  # docker/spark/make-certs.sh writes outside the repository. No `${VAR:?}` form is used: one
+  # anywhere in this file makes every compose command fail without that variable.
+  # Start on request only:
+  #   docker compose -f database-compose.yml up -d spark
+  #   docker compose -f database-compose.yml --profile spark-4-1 up -d spark-4-1
+  #   docker compose -f database-compose.yml --profile spark-auth up -d spark-auth spark-tls
+  # ---------------------------------------------------------------------------------------
+  spark:
+    image: apache/spark:4.2.0@sha256:fc64959c04bd87b0ac686be9aaa9008b69cdb1afc695400528279c8b01f43d89
+    container_name: libredb-spark
+    # With bash as PID 1, docker stop waits 10 s and kills; with an init process the server stops at once.
+    init: true
+    # --wait keeps the server in the foreground and local[4] bounds the driver's task threads. studio_unloaded is a
+    # configured catalog nothing loads, so the tree's third catalog source is exercised: the server starts, Config
+    # get_all returns the key, SHOW CATALOGS never lists it, and loading it fails with Spark's text.
+    command: >-
+      /opt/spark/sbin/start-connect-server.sh --wait --master local[4] --driver-memory 2g
+      --conf spark.sql.catalog.studio_unloaded=org.apache.spark.sql.execution.datasources.v2.jdbc.JDBCTableCatalog
+    ports:
+      - "127.0.0.1:15002:15002"
+      # The driver UI, which the live check reads job states from.
+      - "127.0.0.1:4040:4040"
+    # A 2g driver heap streams a 449 MB result inside 4g; 449m was the smallest heap that started.
+    mem_limit: 4g
+    healthcheck:
+      # A TCP connection to the Spark Connect port, opened with bash, which the image carries; the server starts in
+      # about 3 s.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/15002"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  spark-4-1:
+    image: apache/spark:4.1.3@sha256:bf9d035a7c32a8ca46aa58d6348182ffd7d2dff6409206ecfbb3915ff1fef211
+    container_name: libredb-spark-4-1
+    # The version floor of the provider (Spark 4.1).
+    profiles: ["spark-4-1"]
+    init: true
+    command: >-
+      /opt/spark/sbin/start-connect-server.sh --wait --master local[4] --driver-memory 2g
+      --conf spark.sql.catalog.studio_unloaded=org.apache.spark.sql.execution.datasources.v2.jdbc.JDBCTableCatalog
+    ports:
+      - "127.0.0.1:15003:15002"
+      - "127.0.0.1:4041:4040"
+    mem_limit: 4g
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/15002"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  spark-auth:
+    image: apache/spark:4.2.0@sha256:fc64959c04bd87b0ac686be9aaa9008b69cdb1afc695400528279c8b01f43d89
+    container_name: libredb-spark-auth
+    profiles: ["spark-auth"]
+    init: true
+    environment:
+      # Spark reads this variable as it reads spark.connect.authenticate.token. Empty, the command below refuses to
+      # start, so this service never runs without a token.
+      SPARK_CONNECT_AUTHENTICATE_TOKEN: ${SPARK_CONNECT_TOKEN:-}
+    # spark.driver.maxResultSize=4m and spark.connect.grpc.arrow.maxBatchSize=1m here only, so their two failures are
+    # captured without bounding the default server: with the batch size at 1m a command answer above about 0.7 MiB
+    # fails with Spark's one-batch assertion (the provider's command-batch-bound refusal), which a default server
+    # reaches only past the 16 MiB receive cap.
+    command:
+      - bash
+      - -c
+      - >-
+        test -n "$$SPARK_CONNECT_AUTHENTICATE_TOKEN" || { echo "spark-auth: set SPARK_CONNECT_TOKEN" >&2; exit 2; };
+        exec /opt/spark/sbin/start-connect-server.sh --wait --master local[4] --driver-memory 2g
+        --conf spark.sql.catalog.studio_unloaded=org.apache.spark.sql.execution.datasources.v2.jdbc.JDBCTableCatalog
+        --conf spark.driver.maxResultSize=4m
+        --conf spark.connect.grpc.arrow.maxBatchSize=1m
+    ports:
+      - "127.0.0.1:15004:15002"
+    mem_limit: 4g
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/15002"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  spark-tls:
+    image: public.ecr.aws/docker/library/nginx:stable-alpine@sha256:0985e772fb9f729e6fa0980da05fca5d9c468e870eed43071545afa9d2e27d94
+    container_name: libredb-spark-tls
+    profiles: ["spark-auth"]
+    depends_on:
+      spark-auth:
+        condition: service_healthy
+    volumes:
+      - ./docker/spark/nginx.conf:/etc/nginx/nginx.conf:ro
+      # Without SPARK_TLS_DIR the source does not exist and this service alone refuses to start.
+      - type: bind
+        source: ${SPARK_TLS_DIR:-/nonexistent/set-SPARK_TLS_DIR}
+        target: /etc/nginx/certs
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:15005:15005"
+    mem_limit: 256m
+
+  # ---------------------------------------------------------------------------------------
+  # Trino (issue #424, Phase 2). One container is the whole cluster: the coordinator
   # runs the worker in-process by default, which is enough to answer every statement the
   # provider sends. Nothing else is needed to exercise it.
   # ---------------------------------------------------------------------------------------
@@ -526,6 +771,21 @@ services:
     image: trinodb/trino:476
     container_name: libredb-trino
     restart: unless-stopped
+    volumes:
+      # The object-surface fixture (#789). Mounted at /fixtures and NOT at the
+      # /docker-entrypoint-initdb.d most services here use, because that name is a promise
+      # this image does not keep: the Trino image has no init-script directory and runs no
+      # seed script of its own. The `trino-init` sidecar below is what applies the file, and
+      # mounting it on the coordinator too is what makes the re-apply after a restart a
+      # one-liner with no bind flags:
+      #
+      #   docker exec libredb-trino trino --server localhost:8080 \
+      #     --file /fixtures/01-object-fixture.sql
+      #
+      # That re-apply is not optional housekeeping. The `memory` connector holds its schemas,
+      # tables, views and functions in the COORDINATOR'S HEAP, so a restart loses all of them
+      # and the sidecar, being a one-shot, does not run again by itself.
+      - ./docker/trino-init:/fixtures:ro
     ports:
       # 8080 is the client protocol AND the web UI - one port, two surfaces, which is why
       # the provider's default port is a generic number and the dialect is declared rather
@@ -544,11 +804,55 @@ services:
       interval: 5s
       timeout: 5s
       retries: 40
-    # No seed sidecar, and no `depends_on`: the image ships the `tpch` catalog configured, so
-    # `tpch.tiny.nation` (25 rows) and `tpch.tiny.lineitem` (60175 rows) are queryable the
-    # moment the healthcheck passes - generated on read, never stored. `tpcds`, `memory`,
-    # `system` and `jmx` are configured too. Point a connection's Database field at `tpch`;
-    # `jmx` is what makes the overview's uptime readable, so leave that catalog in place.
+    # No `depends_on`: the image ships the `tpch` catalog configured, so `tpch.tiny.nation`
+    # (25 rows) and `tpch.tiny.lineitem` (60175 rows) are queryable the moment the
+    # healthcheck passes - generated on read, never stored. `tpcds`, `memory`, `system` and
+    # `jmx` are configured too. Point a connection's Database field at `tpch`; `jmx` is what
+    # makes the overview's uptime readable, so leave that catalog in place.
+    #
+    # THERE IS NO ICEBERG CATALOG HERE, and that is a deliberate limit rather than an
+    # oversight. A materialized view is the one object kind Trino cannot create without one,
+    # and on 476 only a HIVE-METASTORE-backed Iceberg catalog will create one at all.
+    #
+    # THE CHEAP ROUTE WAS PROBED FOR #789 AND REFUSED, so the next person does not have to
+    # spend the same afternoon finding out. The hope was that Trino's Iceberg connector would
+    # take `iceberg.catalog.type=jdbc` against the `postgres` service above, giving a
+    # materialized-view fixture for the price of one properties file and a warehouse volume
+    # with NO new image in this file. Measured on 2026-09-13, the JDBC catalog was brought
+    # all the way up and WORKS - `CREATE SCHEMA`, `CREATE TABLE` and a two-row `INSERT` all
+    # succeeded - and `CREATE MATERIALIZED VIEW` still answered
+    # `createMaterializedView is not supported for Iceberg JDBC catalogs`. Two traps found on
+    # the way, both recorded in docs/providers/trino.md: Trino 476 never creates the JDBC
+    # catalog's own `iceberg_tables` table, and a `file://` warehouse needs
+    # `fs.hadoop.enabled=true` rather than the native local filesystem.
+    #
+    # So an Iceberg catalog here would mean a metastore service, a warehouse volume and a
+    # second image in this file for one object kind. The object surface therefore answers
+    # `materialized_view: 0` everywhere on this cluster, which is the TRUE answer for it, and
+    # docs/providers/trino.md carries the catalog properties and the exact statements that
+    # reproduce the materialized-view measurements on a cluster that does have one.
+
+  trino-init:
+    # One-shot sidecar, the same shape as couchbase-init above. The Trino image has no
+    # init-script convention of its own, so the seeding is a CLI run rather
+    # than a mount the server reads: the CLI ships in this image at /usr/bin/trino, which is
+    # why the sidecar reuses the coordinator's image instead of adding a second one.
+    image: trinodb/trino:476
+    container_name: libredb-trino-init
+    restart: "no"
+    depends_on:
+      trino:
+        condition: service_healthy
+    volumes:
+      - ./docker/trino-init:/fixtures:ro
+    # `--server trino:8080`, the compose service name, not localhost: this is a separate
+    # container. The image's own entrypoint launches a coordinator, so it is replaced here.
+    entrypoint: ["/usr/bin/trino"]
+    command:
+      - "--server"
+      - "trino:8080"
+      - "--file"
+      - "/fixtures/01-object-fixture.sql"
 
   cassandra:
     # Pinned to the exact build the provider was live-verified against, the same rule
@@ -559,6 +863,24 @@ services:
     image: cassandra:5.0.9
     container_name: libredb-cassandra
     restart: unless-stopped
+    # TWO SETTINGS THAT SHIP DISABLED, rewritten into cassandra.yaml before the node
+    # starts. Without them this service measures a CONFIGURATION rather than an engine
+    # (issue #789): `CREATE MATERIALIZED VIEW` answers "Materialized views are disabled.
+    # Enable in cassandra.yaml to use." and `CREATE FUNCTION` answers "User-defined
+    # functions are disabled in cassandra.yaml - set user_defined_functions_enabled=true
+    # to enable", so the object fixture would build neither and the tree would show two
+    # empty folders that look like facts about Cassandra.
+    #
+    # A sed rather than a mounted cassandra.yaml: the file is ~2000 lines and version
+    # specific, so a copy pinned here would silently strip whatever 5.0.10 adds. The
+    # image's own entrypoint is still what starts the node. Cassandra 5.0 logs an
+    # experimental warning beside the first setting, which is the engine's own wording
+    # and not a problem with this service.
+    command: >
+      bash -c "sed -i
+      -e 's/^materialized_views_enabled:.*/materialized_views_enabled: true/'
+      -e 's/^user_defined_functions_enabled:.*/user_defined_functions_enabled: true/'
+      /etc/cassandra/cassandra.yaml && exec docker-entrypoint.sh cassandra -f"
     environment:
       CASSANDRA_CLUSTER_NAME: libredb-probe
       # 2G of a 4G limit. The image otherwise sizes the heap from the HOST's memory,
@@ -585,9 +907,2256 @@ services:
       timeout: 10s
       retries: 30
       start_period: 60s
-    # No seed sidecar: the provider's live pass creates its own keyspace. The gate-4
-    # probe used `probe` with customers (500 rows), orders (2000), events (10
-    # partitions x 50 clustering rows), a secondary index and a 28-column type matrix.
+    volumes:
+      # THE IMAGE HAS NO INIT-SCRIPT DIRECTORY. Its entrypoint runs `cassandra -f` and
+      # never scans a mounted folder, and the node is not accepting CQL at the moment
+      # the entrypoint starts anyway. The mount puts the fixture INSIDE the container so
+      # it can be applied by hand once `nodetool status` reports UN:
+      #
+      #   docker exec libredb-cassandra cqlsh -f \
+      #     /fixtures/01-object-fixture.cql
+      #
+      # The target is /fixtures and NOT the /docker-entrypoint-initdb.d every other
+      # service here uses, because that name is a promise this image does not keep: it
+      # would tell a reader the file runs itself at start, and nothing runs it.
+      #
+      # The full recipe, including the optional trigger step, is in
+      # docs/providers/cassandra.md.
+      - ./docker/cassandra-init:/fixtures:ro
+    # No seed sidecar, because there is nothing for one to hook into: see the volume
+    # above. The object fixture (issue #789) builds keyspace `probe` with three tables, a
+    # materialized view, three indexes of two different catalog kinds, a user-defined
+    # type, four functions including an overloaded pair, an aggregate and - after the
+    # documented trigger step - one trigger. It also creates a keyspace called
+    # `system_reports`, which exists to keep the "a system keyspace is excluded by exact
+    # name, never by a `system%` prefix" measurement refutable.
+
+  # ---------------------------------------------------------------------------------------
+  # Prometheus (issue #1085, #424 Phase 6). One container is the whole server: it scrapes
+  # itself, evaluates the rule files beside its configuration and answers the HTTP API the
+  # provider reads, so nothing else is needed to exercise it. `prometheus-auth` below is the
+  # same image behind basic auth, for the answers only a credential-checking server gives.
+  # ---------------------------------------------------------------------------------------
+  prometheus:
+    # Pinned to the exact build the provider was live-verified against, the same rule the
+    # clickhouse and trino services follow: the envelope, the truncation warning, the lexer's
+    # reserved words and the 401 answer recorded in tests/fixtures/prometheus/README.md are
+    # claims about 3.13.3, the 3.13 LTS line, not about Prometheus in general.
+    image: prom/prometheus:v3.13.3
+    container_name: libredb-prometheus
+    restart: unless-stopped
+    # No `command`: the image's own reads /etc/prometheus/prometheus.yml and stores under
+    # /prometheus, and it passes neither --web.enable-lifecycle nor --web.enable-admin-api, so
+    # this server offers exactly the read API the provider may call (#1085 S9) and nothing
+    # that deletes a series or stops the process.
+    volumes:
+      # The whole configuration, tracked: the scrape jobs and the rule files, each commented
+      # with the edge of the provider's object model it exists for. Prometheus reads it at
+      # start, so restart the service after an edit; for a change that must reach the
+      # fixtures, recreate it with --force-recreate --renew-anon-volumes and capture again.
+      - ./docker/prometheus:/etc/prometheus:ro
+    ports:
+      - "9090:9090"
+    healthcheck:
+      # /-/ready answers 503 until the storage is open and the configuration is loaded, and 200
+      # after, which is the condition that matters; /-/healthy is 200 from the first second.
+      # The image is busybox-based and ships wget, not curl (checked with `command -v`
+      # before writing this, as the libsql service's comment asks).
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  prometheus-auth:
+    # The same image and configuration behind the exporter-toolkit web config, which is how
+    # Prometheus itself does basic auth. It exists for the answers a stock server cannot give:
+    # the 401 status, body and header for a missing, wrong or Bearer credential (#1085 M5).
+    # Its own scrape jobs read /metrics without a credential, so its self-scrape targets are
+    # `down` with a 401; that is expected, and the data lives on 9090. Start it deliberately:
+    #
+    #   docker compose -f database-compose.yml --profile prometheus-auth up -d prometheus-auth
+    image: prom/prometheus:v3.13.3
+    container_name: libredb-prometheus-auth
+    profiles: ["prometheus-auth"]
+    restart: unless-stopped
+    # `command` replaces the image's CMD, so its two defaults are restated before the web
+    # config, and there is still no lifecycle or admin flag.
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.config.file=/etc/prometheus/web-auth.yml"
+    volumes:
+      - ./docker/prometheus:/etc/prometheus:ro
+    ports:
+      # 9091 on the host because the service above owns 9090. The provider's default port
+      # stays 9090: this is a collision on THIS machine, not a fact about the product.
+      - "9091:9090"
+    healthcheck:
+      # The web config guards every path, /-/ready included, so the check sends the documented
+      # test credential from web-auth.yml (user `studio`, password `studio-probe`). A hash that
+      # does not match that password therefore shows as a service that never turns healthy,
+      # not as a puzzling 401 in the first probe.
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - --header
+        - "Authorization: Basic c3R1ZGlvOnN0dWRpby1wcm9iZQ=="
+        - http://localhost:9090/-/ready
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ---------------------------------------------------------------------------------------
+  # Apache Kafka (issue #1088). A single combined KRaft node is the default fixture, seeded
+  # by a one-shot sidecar and by docker/kafka/seed-binary.ts from the host. Two more
+  # fixtures sit behind profiles: `kafka-cluster`, three nodes for replication, and
+  # `kafka-auth`, TLS plus SCRAM plus an authorizer, for the answers only such a broker gives.
+  # ---------------------------------------------------------------------------------------
+  kafka:
+    # Pinned to the exact build the provider was live-verified against (docs/providers/kafka.md):
+    # the error names, the config sources and the group states captured under
+    # tests/fixtures/kafka are claims about 4.3.1, not about Kafka in general.
+    # A single combined KRaft node; the listener names follow apache/kafka's own
+    # docker/examples single-node plaintext compose.
+    image: apache/kafka:4.3.1
+    container_name: libredb-kafka
+    restart: unless-stopped
+    ports:
+      # Loopback only, as the postgres service's. No [::1] binding: Docker refuses to start a
+      # container whose IPv6 binding it cannot assign, which would break a plain `up`.
+      - "127.0.0.1:9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "CONTROLLER://:29093,PLAINTEXT_HOST://:9092,PLAINTEXT://:19092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT_HOST://localhost:9092,PLAINTEXT://kafka:19092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:29093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # 512m in place of the image's default 1G, so the heap and the container limit below
+      # cannot drift apart. Measured on the seeded fixtures: 150 to 176 MiB live after a GC.
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+    healthcheck:
+      # A socket to the in-container listener through bash's /dev/tcp (the libsql service's
+      # form), not kafka-topics.sh: that CLI is a fresh JVM, 1.55 CPU-seconds per probe, which
+      # kept each idle broker at ~0.3 of a core; this probe takes 0.02. Enough, because the
+      # broker opens its listeners only once started: measured from cold, the socket accepted
+      # and ApiVersions answered within 4 ms of each other, and an RF 3 topic created at once.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/19092"]
+      # Probed every second while starting, so `up --wait` and depends_on see healthy within
+      # a second of the broker (from cold: ready in 3 to 4 s); once healthy, once a minute.
+      # The start period is three times the ~60 s the start plus seed took on a loaded host,
+      # failures inside it do not count, and a connect answers in milliseconds.
+      start_period: 180s
+      start_interval: 1s
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    # Bounded at the maintainer's request: unbounded, the Kafka fixtures loaded the host until
+    # it locked up. 1G holds the 512m heap plus the ~140 MiB the JVM keeps outside it plus the
+    # ~127 MiB of a CLI JVM run inside it (measured peak 543 MiB with the seed); no swap past
+    # it. 1.5 CPUs: the broker plus one CLI JVM, which takes a core while it runs.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+    memswap_limit: 1G
+
+  kafka-init:
+    # One-shot seed, reusing the broker image for its CLI tools (the trino-init precedent).
+    # The records the console producer cannot write come from the host afterwards:
+    #   bun docker/kafka/seed-binary.ts localhost:9092
+    # No data volume: removing the two containers resets the fixture, and the seed appends,
+    # so run it once per fresh broker.
+    image: apache/kafka:4.3.1
+    container_name: libredb-kafka-init
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./docker/kafka/seed.sh:/seed.sh:ro
+    entrypoint: ["bash", "/seed.sh", "kafka:19092"]
+    # The seed runs one CLI JVM at a time: measured peak 121 MiB and one core.
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 384M
+    memswap_limit: 384M
+
+  # -- Kafka, three-node cluster ----------------------------------------------
+
+  kafka-cluster-1:
+    # Three combined KRaft nodes (broker and controller each), one per host port, so the
+    # client can reach every advertised broker from the host. The only fixture where a
+    # partition has more than one replica, so it is where under-replication and a leader
+    # failover are seen live. Profile-gated: start it with
+    #   docker compose -f database-compose.yml --profile kafka-cluster up -d
+    image: apache/kafka:4.3.1
+    container_name: libredb-kafka-cluster-1
+    profiles: ["kafka-cluster"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9192:9192"
+    environment: &kafka-cluster-env
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "CONTROLLER://:29093,PLAINTEXT_HOST://:9192,PLAINTEXT://:19092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT_HOST://localhost:9192,PLAINTEXT://kafka-cluster-1:19092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-cluster-1:29093,2@kafka-cluster-2:29093,3@kafka-cluster-3:29093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 2
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # 512m in place of the image's default 1G, so the heap and the container limit below
+      # cannot drift apart. Measured on the seeded fixtures: 150 to 176 MiB live after a GC.
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+    # The kafka service's probe and its reasons, shared by the three nodes through this anchor.
+    healthcheck: &kafka-cluster-health
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/19092"]
+      start_period: 180s
+      start_interval: 1s
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    # The kafka service's bound and its reasons, per node and shared by all three through
+    # this anchor; measured peak 541 to 650 MiB per node with the replicated seed.
+    <<: &kafka-cluster-limits
+      deploy:
+        resources:
+          limits:
+            cpus: "1.5"
+            memory: 1G
+      memswap_limit: 1G
+
+  kafka-cluster-2:
+    image: apache/kafka:4.3.1
+    container_name: libredb-kafka-cluster-2
+    profiles: ["kafka-cluster"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9193:9193"
+    environment:
+      <<: *kafka-cluster-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: "CONTROLLER://:29093,PLAINTEXT_HOST://:9193,PLAINTEXT://:19092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT_HOST://localhost:9193,PLAINTEXT://kafka-cluster-2:19092"
+    healthcheck: *kafka-cluster-health
+    <<: *kafka-cluster-limits
+
+  kafka-cluster-3:
+    image: apache/kafka:4.3.1
+    container_name: libredb-kafka-cluster-3
+    profiles: ["kafka-cluster"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9194:9194"
+    environment:
+      <<: *kafka-cluster-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: "CONTROLLER://:29093,PLAINTEXT_HOST://:9194,PLAINTEXT://:19092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT_HOST://localhost:9194,PLAINTEXT://kafka-cluster-3:19092"
+    healthcheck: *kafka-cluster-health
+    <<: *kafka-cluster-limits
+
+  kafka-cluster-init:
+    # The same seed as kafka-init, with every topic at replication factor 3; then, from the
+    # host, `bun docker/kafka/seed-binary.ts localhost:9192`.
+    image: apache/kafka:4.3.1
+    container_name: libredb-kafka-cluster-init
+    profiles: ["kafka-cluster"]
+    restart: "no"
+    depends_on:
+      kafka-cluster-1:
+        condition: service_healthy
+      kafka-cluster-2:
+        condition: service_healthy
+      kafka-cluster-3:
+        condition: service_healthy
+    volumes:
+      - ./docker/kafka/seed.sh:/seed.sh:ro
+    entrypoint: ["bash", "/seed.sh", "kafka-cluster-1:19092", "all", "3"]
+    # The seed runs one CLI JVM at a time: measured peak 123 MiB and one core.
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 384M
+    memswap_limit: 384M
+
+  # -- Kafka, TLS and SCRAM with an authorizer --------------------------------
+
+  kafka-auth-certs:
+    # Generates a throwaway CA and a localhost broker certificate into a named volume at
+    # first start, so no private key is ever committed (the Secret Scan's default rule).
+    image: apache/kafka:4.3.1
+    container_name: libredb-kafka-auth-certs
+    profiles: ["kafka-auth"]
+    restart: "no"
+    user: "0"
+    volumes:
+      - kafka-auth-certs:/certs
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -e
+        cd /certs
+        [ -f broker.pem ] && exit 0
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem -days 3650 -subj "/CN=libredb-kafka-auth-ca"
+        openssl req -newkey rsa:2048 -nodes -keyout broker.key -out broker.csr -subj "/CN=localhost"
+        printf "subjectAltName=DNS:localhost,IP:127.0.0.1\n" > san.ext
+        openssl x509 -req -in broker.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out broker.crt -days 3650 -extfile san.ext
+        openssl pkcs8 -topk8 -nocrypt -in broker.key -out broker.pk8
+        cat broker.pk8 broker.crt > broker.pem
+        chmod 644 ca.pem broker.pem
+    # Two RSA keys by openssl: the whole generation was measured to finish inside 32M.
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 64M
+    memswap_limit: 64M
+
+  kafka-auth:
+    # TLS plus SCRAM-SHA-512 on the published port, and StandardAuthorizer, so a principal
+    # with no ACL sees what such a principal sees. Two traps this configuration avoids:
+    # the image's /etc/kafka/docker/configure switches into a JKS-only mode whenever an
+    # advertised listener's text contains `SSL://`, so the TLS listener is named EXTERNAL and
+    # mapped to SASL_SSL; and inter-broker and admin traffic use a PLAINTEXT INTERNAL listener
+    # inside the container only, whose ANONYMOUS principal is a super user, so the SCRAM user
+    # is created after start, with no ACL granted to it:
+    #
+    #   docker exec libredb-kafka-auth /opt/kafka/bin/kafka-configs.sh \
+    #     --bootstrap-server localhost:19092 --alter --entity-type users --entity-name reader \
+    #     --add-config 'SCRAM-SHA-512=[iterations=8192,password=<a password of your choice>]'
+    #   docker cp libredb-kafka-auth:/certs/ca.pem ./kafka-auth-ca.pem
+    #
+    # No JAAS file and no properties file: the SCRAM login module is set inline below, and
+    # nothing would read one.
+    image: apache/kafka:4.3.1
+    container_name: libredb-kafka-auth
+    profiles: ["kafka-auth"]
+    restart: unless-stopped
+    depends_on:
+      kafka-auth-certs:
+        condition: service_completed_successfully
+    ports:
+      # 19094 on the host: the INTERNAL listener's advertised localhost:19092 is the
+      # container's own loopback, reached only by `docker exec`.
+      - "127.0.0.1:19094:9093"
+    volumes:
+      - kafka-auth-certs:/certs:ro
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "CONTROLLER://:29093,INTERNAL://:19092,EXTERNAL://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://localhost:19092,EXTERNAL://localhost:19094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:SASL_SSL"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:29093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      CLUSTER_ID: "7L6g3nShT-eMCtK--X86sw"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_SASL_ENABLED_MECHANISMS: "SCRAM-SHA-512"
+      KAFKA_LISTENER_NAME_EXTERNAL_SCRAM___SHA___512_SASL_JAAS_CONFIG: "org.apache.kafka.common.security.scram.ScramLoginModule required;"
+      KAFKA_SSL_KEYSTORE_TYPE: "PEM"
+      KAFKA_SSL_KEYSTORE_LOCATION: "/certs/broker.pem"
+      KAFKA_AUTHORIZER_CLASS_NAME: "org.apache.kafka.metadata.authorizer.StandardAuthorizer"
+      KAFKA_SUPER_USERS: "User:ANONYMOUS;User:admin"
+      # 512m in place of the image's default 1G, so the heap and the container limit below
+      # cannot drift apart. Measured on the seeded fixtures: 150 to 176 MiB live after a GC.
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+    # The kafka service's probe and its reasons; the INTERNAL listener is the one the
+    # kafka-configs.sh that creates the SCRAM user talks to.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/19092"]
+      start_period: 180s
+      start_interval: 1s
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    # The kafka service's bound and its reasons; measured peak 547 MiB with the reader and topic.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+    memswap_limit: 1G
+
+  # ---------------------------------------------------------------------------------------
+  # RabbitMQ (issue #1656). One 4.3.6 node is the default fixture, seeded by a one-shot that
+  # runs tests/live/rabbitmq-seed.ts. Three more sit behind profiles: `rabbitmq-42`, a 4.2.9
+  # node, the permanent home of the broker's 541 conversion close; `rabbitmq-cluster`, three
+  # 4.3.6 nodes, for the stream read with no running replica; and `rabbitmq-tls`, a node whose
+  # AMQP and management listeners take TLS from certificates generated at start. The image
+  # reference below is the one the CI step runs; tests/unit/db/rabbitmq/live-environment.test.ts
+  # holds every rule of this block. docker/rabbitmq/README.md lists the files.
+  # ---------------------------------------------------------------------------------------
+  rabbitmq:
+    # Pinned by digest: the expected outcomes of the live check and the captures under
+    # tests/fixtures/rabbitmq are keyed by this digest, never by a version the broker reports.
+    image: &rabbitmq-436 rabbitmq:4.3.6-management@sha256:8dd6e3570ddaa2ef82a6c3a8950e79c1f73893adfbdddbc374fc1f1ac8a0f5dd
+    container_name: libredb-rabbitmq
+    hostname: libredb-rabbitmq
+    restart: unless-stopped
+    environment: &rabbitmq-admin
+      # The fixture's administrator; the seed creates the four Studio users. No password is
+      # written here: both come from the shell, with no default, and
+      #   eval "$(bun tests/live/rabbitmq-seed.ts --env)"
+      # exports the ones the seed builds. RabbitMQ would take an empty one as unset and fall back
+      # to its default password, so each broker's entrypoint refuses to start without one.
+      RABBITMQ_DEFAULT_USER: libredb-admin
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_LIVE_ADMIN_PASSWORD}
+    entrypoint: &rabbitmq-entry
+      - /bin/sh
+      - -c
+      - test -n "$$RABBITMQ_DEFAULT_PASS" || { echo "RABBITMQ_LIVE_ADMIN_PASSWORD is not set, see docker/rabbitmq/README.md" >&2; exit 1; }; exec docker-entrypoint.sh rabbitmq-server
+    volumes:
+      # The image enables rabbitmq_management and rabbitmq_prometheus only; the Test Connection
+      # queue check needs rabbitmq_stream_management, so the plugin list is mounted.
+      - ./docker/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    ports:
+      # Loopback only. 15692 is the Prometheus endpoint the read-only check's oracle scrapes.
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+      - "127.0.0.1:15692:15692"
+    # Each stream holds file descriptors for its segment and index; at the image's 1,024 a broker
+    # with about 500 streams fails to open one and its metadata store stops, so every login is
+    # then refused. The listing captures declare more than 500 streams.
+    ulimits: &rabbitmq-nofile
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck: &rabbitmq-health
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      start_period: 60s
+      start_interval: 1s
+      interval: 60s
+      timeout: 15s
+      retries: 3
+    deploy: &rabbitmq-limits
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+    memswap_limit: 1G
+
+  rabbitmq-init:
+    # One-shot seed on the repository's own Bun, with the repository mounted read-only. The seed
+    # talks to the broker over the network only, and refuses a broker that is already seeded:
+    # a stream publish appends, so removing the two containers resets the fixture.
+    image: &rabbitmq-seed oven/bun:1.4.2@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895
+    container_name: libredb-rabbitmq-init
+    restart: "no"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes: &rabbitmq-seed-mounts ["./tests:/repo/tests:ro", "./tsconfig.json:/repo/tsconfig.json:ro"]
+    working_dir: /repo
+    environment:
+      RABBITMQ_LIVE_HOST: rabbitmq
+      RABBITMQ_LIVE_DIGEST: sha256:8dd6e3570ddaa2ef82a6c3a8950e79c1f73893adfbdddbc374fc1f1ac8a0f5dd
+      RABBITMQ_LIVE_ADMIN_USER: libredb-admin
+      RABBITMQ_LIVE_ADMIN_PASSWORD: ${RABBITMQ_LIVE_ADMIN_PASSWORD}
+      RABBITMQ_LIVE_FIXTURE_PASSWORD: ${RABBITMQ_LIVE_FIXTURE_PASSWORD}
+    entrypoint: ["bun", "tests/live/rabbitmq-seed.ts"]
+    deploy: &rabbitmq-seed-limits
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+    memswap_limit: 512M
+
+  rabbitmq-42:
+    # 4.2 receives no further community release, so the 541 close of a message the broker cannot
+    # convert to AMQP 0-9-1 stays reproducible here. Start it with
+    #   docker compose -f database-compose.yml --profile rabbitmq-42 up -d rabbitmq-42 rabbitmq-42-init
+    image: rabbitmq:4.2.9-management@sha256:9e9fd21d60f060acc9ecbd847cd1dcb87e6550bdb0297c27e79a40bfe1766ce4
+    container_name: libredb-rabbitmq-42
+    hostname: libredb-rabbitmq-42
+    profiles: ["rabbitmq-42"]
+    restart: unless-stopped
+    environment: *rabbitmq-admin
+    entrypoint: *rabbitmq-entry
+    volumes:
+      - ./docker/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    ports:
+      - "127.0.0.1:5682:5672"
+      - "127.0.0.1:15682:15672"
+      - "127.0.0.1:15702:15692"
+    ulimits: *rabbitmq-nofile
+    healthcheck: *rabbitmq-health
+    deploy: *rabbitmq-limits
+    memswap_limit: 1G
+
+  rabbitmq-42-init:
+    image: *rabbitmq-seed
+    container_name: libredb-rabbitmq-42-init
+    profiles: ["rabbitmq-42"]
+    restart: "no"
+    depends_on:
+      rabbitmq-42:
+        condition: service_healthy
+    volumes: *rabbitmq-seed-mounts
+    working_dir: /repo
+    environment:
+      RABBITMQ_LIVE_HOST: rabbitmq-42
+      RABBITMQ_LIVE_DIGEST: sha256:9e9fd21d60f060acc9ecbd847cd1dcb87e6550bdb0297c27e79a40bfe1766ce4
+      RABBITMQ_LIVE_ADMIN_USER: libredb-admin
+      RABBITMQ_LIVE_ADMIN_PASSWORD: ${RABBITMQ_LIVE_ADMIN_PASSWORD}
+      RABBITMQ_LIVE_FIXTURE_PASSWORD: ${RABBITMQ_LIVE_FIXTURE_PASSWORD}
+    entrypoint: ["bun", "tests/live/rabbitmq-seed.ts"]
+    deploy: *rabbitmq-seed-limits
+    memswap_limit: 512M
+
+  # -- RabbitMQ, three-node cluster -------------------------------------------------------
+
+  rabbitmq-cluster-1:
+    # Three 4.3.6 nodes formed by classic peer discovery, one host port each, for the stream
+    # read whose replicas are all down. The Erlang cookie is a fixture value written at start.
+    # Name the services: with a profile and no names, compose starts every default service too.
+    #   docker compose -f database-compose.yml --profile rabbitmq-cluster up -d --wait \
+    #     rabbitmq-cluster-1 rabbitmq-cluster-2 rabbitmq-cluster-3
+    image: *rabbitmq-436
+    container_name: libredb-rabbitmq-cluster-1
+    hostname: libredb-rabbitmq-cluster-1
+    profiles: ["rabbitmq-cluster"]
+    restart: unless-stopped
+    environment: &rabbitmq-cluster-env
+      RABBITMQ_DEFAULT_USER: libredb-admin
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_LIVE_ADMIN_PASSWORD}
+      RABBITMQ_FIXTURE_COOKIE: libredb-rabbitmq-cluster-fixture
+    entrypoint: &rabbitmq-cluster-entry
+      - /bin/sh
+      - -c
+      - test -n "$$RABBITMQ_DEFAULT_PASS" || { echo "RABBITMQ_LIVE_ADMIN_PASSWORD is not set, see docker/rabbitmq/README.md" >&2; exit 1; }; printf '%s' "$$RABBITMQ_FIXTURE_COOKIE" > /var/lib/rabbitmq/.erlang.cookie && chown rabbitmq:rabbitmq /var/lib/rabbitmq/.erlang.cookie && chmod 400 /var/lib/rabbitmq/.erlang.cookie && exec docker-entrypoint.sh rabbitmq-server
+    volumes: &rabbitmq-cluster-mounts
+      - ./docker/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+      - ./docker/rabbitmq/cluster.conf:/etc/rabbitmq/conf.d/20-cluster.conf:ro
+    ports:
+      - "127.0.0.1:5695:5672"
+      - "127.0.0.1:15695:15672"
+    ulimits: *rabbitmq-nofile
+    healthcheck: *rabbitmq-health
+    deploy: *rabbitmq-limits
+    memswap_limit: 1G
+
+  rabbitmq-cluster-2:
+    image: *rabbitmq-436
+    container_name: libredb-rabbitmq-cluster-2
+    hostname: libredb-rabbitmq-cluster-2
+    profiles: ["rabbitmq-cluster"]
+    restart: unless-stopped
+    environment: *rabbitmq-cluster-env
+    entrypoint: *rabbitmq-cluster-entry
+    volumes: *rabbitmq-cluster-mounts
+    ports:
+      - "127.0.0.1:5696:5672"
+      - "127.0.0.1:15696:15672"
+    ulimits: *rabbitmq-nofile
+    healthcheck: *rabbitmq-health
+    deploy: *rabbitmq-limits
+    memswap_limit: 1G
+
+  rabbitmq-cluster-3:
+    image: *rabbitmq-436
+    container_name: libredb-rabbitmq-cluster-3
+    hostname: libredb-rabbitmq-cluster-3
+    profiles: ["rabbitmq-cluster"]
+    restart: unless-stopped
+    environment: *rabbitmq-cluster-env
+    entrypoint: *rabbitmq-cluster-entry
+    volumes: *rabbitmq-cluster-mounts
+    ports:
+      - "127.0.0.1:5697:5672"
+      - "127.0.0.1:15697:15672"
+    ulimits: *rabbitmq-nofile
+    healthcheck: *rabbitmq-health
+    deploy: *rabbitmq-limits
+    memswap_limit: 1G
+
+  # -- RabbitMQ, TLS on both listeners ----------------------------------------------------
+
+  rabbitmq-tls-certs:
+    # One-shot: a CA and a server certificate for localhost and 127.0.0.1, generated into
+    # rabbitmq-tls-certs when missing, so no key is ever committed. Start both by name, then copy
+    # the CA out:
+    #   docker compose -f database-compose.yml --profile rabbitmq-tls up -d --wait rabbitmq-tls-certs rabbitmq-tls
+    #   docker compose -f database-compose.yml cp rabbitmq-tls:/etc/rabbitmq/certs/ca.pem .
+    image: alpine/openssl:3.5.8@sha256:3f25da71f70eba788067daac3f3df03bd1de7a7c52ed89fa93b94ad2c92d986b
+    container_name: libredb-rabbitmq-tls-certs
+    profiles: ["rabbitmq-tls"]
+    restart: "no"
+    volumes: ["./docker/rabbitmq:/rabbitmq:ro", "rabbitmq-tls-certs:/certs"]
+    entrypoint: ["sh", "/rabbitmq/certs.sh", "/certs"]
+    deploy: *rabbitmq-seed-limits
+    memswap_limit: 512M
+
+  rabbitmq-tls:
+    image: *rabbitmq-436
+    container_name: libredb-rabbitmq-tls
+    hostname: libredb-rabbitmq-tls
+    profiles: ["rabbitmq-tls"]
+    restart: unless-stopped
+    depends_on: { rabbitmq-tls-certs: { condition: service_completed_successfully } }
+    environment: *rabbitmq-admin
+    entrypoint: *rabbitmq-entry
+    volumes:
+      - ./docker/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+      - ./docker/rabbitmq/tls.conf:/etc/rabbitmq/conf.d/20-tls.conf:ro
+      - rabbitmq-tls-certs:/etc/rabbitmq/certs:ro
+    ports:
+      - "127.0.0.1:5671:5671"
+      - "127.0.0.1:15671:15671"
+    ulimits: *rabbitmq-nofile
+    healthcheck: *rabbitmq-health
+    deploy: *rabbitmq-limits
+    memswap_limit: 1G
+
+  # ---------------------------------------------------------------------------------------
+  # etcd (the etcd provider). One member is the default fixture, seeded by a one-shot sidecar
+  # through etcd's own gRPC gateway. Two more fixtures sit behind profiles: `etcd-cluster`,
+  # three members for member list, a leader change, one member's defragmentation, a stopped
+  # member and a lost quorum; and `etcd-auth`, two TLS servers with RBAC on, one reading client
+  # certificates and one taking passwords only. The scripts, the seeded keys, the users and the
+  # certificates are described in docker/etcd/README.md.
+  # ---------------------------------------------------------------------------------------
+  etcd:
+    # Pinned to the exact build the provider is verified against, by tag and by digest: the
+    # error texts, the gateway's answers and the captures under tests/fixtures/etcd are claims
+    # about 3.7.2, not about etcd in general. The image is distroless: etcd, etcdctl and
+    # etcdutl, and no shell, so every command below is an exec form.
+    image: gcr.io/etcd-development/etcd:v3.7.2@sha256:7c6c239825d00e3f6328a69caafd54be92063acf0c2ce78b8394699f52b75dc3
+    container_name: libredb-etcd
+    restart: unless-stopped
+    # Its own member name and cluster token, as every etcd fixture here: two single-member
+    # servers started with the defaults answer with the same cluster and member ids, and a
+    # capture must say which server answered it. The advertised client URL is the host's, the
+    # address `member list` shows. No data volume: removing the container resets the fixture.
+    command:
+      - /usr/local/bin/etcd
+      - --name=libredb-etcd
+      - --initial-cluster-token=libredb-etcd
+      - --initial-cluster=libredb-etcd=http://etcd:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.1:2379
+      - --data-dir=/var/lib/etcd/data
+    ports:
+      # Loopback only, as the postgres service's.
+      - "127.0.0.1:2379:2379"
+    environment:
+      # The Go runtime collects before it reaches the container's bound below, rather than being
+      # killed there.
+      GOMEMLIMIT: 900MiB
+    healthcheck: &etcd-health
+      # etcdctl's own check: a linearizable read, so it passes only once the member has a leader
+      # and commits. A Go binary, not a JVM: a probe costs milliseconds.
+      test: ["CMD", "etcdctl", "endpoint", "health", "--command-timeout=3s"]
+      start_period: 60s
+      start_interval: 1s
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    # Bounded at the maintainer's request, as the Kafka fixtures are; no swap past it. Measured
+    # 12 to 15 MiB with the seed. 1G rather than the other servers' 512M, because this is the
+    # server the key-prefix walk and the read bounds are measured on, over a far larger fixture
+    # of the measurement's own, and etcd builds a whole Range answer in memory.
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+    memswap_limit: 1G
+
+  etcd-seed:
+    # One-shot seed through the gateway (docker/etcd/seed.sh), which carries a key or a value
+    # as base64 of its exact bytes. Idempotent, so it may run again on a seeded server.
+    image: alpine/curl:8.21.0@sha256:a1c44bab54d88e18ea9a6a4ecefab7f2d230b968567b78960fcaff8d51b7f067
+    container_name: libredb-etcd-seed
+    restart: "no"
+    depends_on:
+      etcd:
+        condition: service_healthy
+    volumes:
+      - ./docker/etcd:/etcd:ro
+    entrypoint: ["sh", "/etcd/seed.sh", "http://etcd:2379"]
+    <<: &etcd-one-shot-limits
+      deploy:
+        resources:
+          limits:
+            cpus: "0.5"
+            memory: 64M
+      memswap_limit: 64M
+
+  # -- etcd, three-member cluster ---------------------------------------------
+
+  etcd-cluster-1:
+    # Three members of one cluster, published on one port at three loopback addresses, so a
+    # hosts entry naming all three reaches every member by one name (failover by name); inside
+    # the compose network the three share the alias etcd-cluster for the same purpose, where the
+    # host cannot bind the addresses. Profile-gated: start it, then seed it, with
+    #   docker compose -f database-compose.yml --profile etcd-cluster up -d --wait \
+    #     etcd-cluster-1 etcd-cluster-2 etcd-cluster-3
+    #   docker compose -f database-compose.yml --profile etcd-cluster up -d etcd-cluster-seed
+    image: gcr.io/etcd-development/etcd:v3.7.2@sha256:7c6c239825d00e3f6328a69caafd54be92063acf0c2ce78b8394699f52b75dc3
+    container_name: libredb-etcd-cluster-1
+    profiles: ["etcd-cluster"]
+    restart: unless-stopped
+    command:
+      - /usr/local/bin/etcd
+      - --name=libredb-etcd-cluster-1
+      - --initial-cluster-token=libredb-etcd-cluster
+      - --initial-cluster=libredb-etcd-cluster-1=http://etcd-cluster-1:2380,libredb-etcd-cluster-2=http://etcd-cluster-2:2380,libredb-etcd-cluster-3=http://etcd-cluster-3:2380
+      - --initial-advertise-peer-urls=http://etcd-cluster-1:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.2:2379
+      - --data-dir=/var/lib/etcd/data
+    ports:
+      - "127.0.0.2:2379:2379"
+    networks: &etcd-cluster-alias
+      default:
+        aliases: ["etcd-cluster"]
+    environment: &etcd-member-env
+      GOMEMLIMIT: 450MiB
+    # The etcd service's probe: a member without a leader turns unhealthy, which is the state a
+    # lost quorum is meant to show.
+    healthcheck: *etcd-health
+    # Measured 15 to 17 MiB per member with the replicated seed; one core each.
+    <<: &etcd-member-limits
+      deploy:
+        resources:
+          limits:
+            cpus: "1"
+            memory: 512M
+      memswap_limit: 512M
+
+  etcd-cluster-2:
+    image: gcr.io/etcd-development/etcd:v3.7.2@sha256:7c6c239825d00e3f6328a69caafd54be92063acf0c2ce78b8394699f52b75dc3
+    container_name: libredb-etcd-cluster-2
+    profiles: ["etcd-cluster"]
+    restart: unless-stopped
+    command:
+      - /usr/local/bin/etcd
+      - --name=libredb-etcd-cluster-2
+      - --initial-cluster-token=libredb-etcd-cluster
+      - --initial-cluster=libredb-etcd-cluster-1=http://etcd-cluster-1:2380,libredb-etcd-cluster-2=http://etcd-cluster-2:2380,libredb-etcd-cluster-3=http://etcd-cluster-3:2380
+      - --initial-advertise-peer-urls=http://etcd-cluster-2:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.3:2379
+      - --data-dir=/var/lib/etcd/data
+    ports:
+      - "127.0.0.3:2379:2379"
+    networks: *etcd-cluster-alias
+    environment: *etcd-member-env
+    healthcheck: *etcd-health
+    <<: *etcd-member-limits
+
+  etcd-cluster-3:
+    image: gcr.io/etcd-development/etcd:v3.7.2@sha256:7c6c239825d00e3f6328a69caafd54be92063acf0c2ce78b8394699f52b75dc3
+    container_name: libredb-etcd-cluster-3
+    profiles: ["etcd-cluster"]
+    restart: unless-stopped
+    command:
+      - /usr/local/bin/etcd
+      - --name=libredb-etcd-cluster-3
+      - --initial-cluster-token=libredb-etcd-cluster
+      - --initial-cluster=libredb-etcd-cluster-1=http://etcd-cluster-1:2380,libredb-etcd-cluster-2=http://etcd-cluster-2:2380,libredb-etcd-cluster-3=http://etcd-cluster-3:2380
+      - --initial-advertise-peer-urls=http://etcd-cluster-3:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.4:2379
+      - --data-dir=/var/lib/etcd/data
+    ports:
+      - "127.0.0.4:2379:2379"
+    networks: *etcd-cluster-alias
+    environment: *etcd-member-env
+    healthcheck: *etcd-health
+    <<: *etcd-member-limits
+
+  etcd-cluster-seed:
+    # The same seed as etcd-seed, written once through the first member; raft replicates it.
+    image: alpine/curl:8.21.0@sha256:a1c44bab54d88e18ea9a6a4ecefab7f2d230b968567b78960fcaff8d51b7f067
+    container_name: libredb-etcd-cluster-seed
+    profiles: ["etcd-cluster"]
+    restart: "no"
+    depends_on:
+      etcd-cluster-1:
+        condition: service_healthy
+      etcd-cluster-2:
+        condition: service_healthy
+      etcd-cluster-3:
+        condition: service_healthy
+    volumes:
+      - ./docker/etcd:/etcd:ro
+    entrypoint: ["sh", "/etcd/seed.sh", "http://etcd-cluster-1:2379"]
+    <<: *etcd-one-shot-limits
+
+  # -- etcd, TLS with RBAC on --------------------------------------------------
+
+  etcd-auth-certs:
+    # Generates a throwaway CA, the servers' certificate, the users' client certificates and
+    # the users' passwords into a named volume at first start (docker/etcd/certs.sh), so no
+    # private key and no password is ever committed.
+    image: alpine/openssl:3.5.8@sha256:3f25da71f70eba788067daac3f3df03bd1de7a7c52ed89fa93b94ad2c92d986b
+    container_name: libredb-etcd-auth-certs
+    profiles: ["etcd-auth"]
+    restart: "no"
+    volumes:
+      - etcd-auth-certs:/certs
+      - ./docker/etcd:/etcd:ro
+    entrypoint: ["sh", "/etcd/certs.sh", "/certs"]
+    <<: *etcd-one-shot-limits
+
+  etcd-auth:
+    # TLS with --client-cert-auth: every client presents a certificate from the fixture's CA,
+    # and with RBAC on its Common Name is the etcd user when no token is sent. The token TTL is
+    # 10 seconds of disuse, so an expired token is met live. RBAC is turned on after start by
+    # etcd-auth-init. Profile-gated, with etcd-auth-password: start both, then seed them, with
+    #   docker compose -f database-compose.yml --profile etcd-auth up -d --wait \
+    #     etcd-auth etcd-auth-password
+    #   docker compose -f database-compose.yml --profile etcd-auth up -d \
+    #     etcd-auth-init etcd-auth-password-init
+    image: gcr.io/etcd-development/etcd:v3.7.2@sha256:7c6c239825d00e3f6328a69caafd54be92063acf0c2ce78b8394699f52b75dc3
+    container_name: libredb-etcd-auth
+    profiles: ["etcd-auth"]
+    restart: unless-stopped
+    depends_on:
+      etcd-auth-certs:
+        condition: service_completed_successfully
+    command:
+      - /usr/local/bin/etcd
+      - --name=libredb-etcd-auth
+      - --initial-cluster-token=libredb-etcd-auth
+      - --initial-cluster=libredb-etcd-auth=http://etcd-auth:2380
+      - --initial-advertise-peer-urls=http://etcd-auth:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --listen-client-urls=https://0.0.0.0:2379
+      - --advertise-client-urls=https://localhost:12379
+      - --cert-file=/certs/server.crt
+      - --key-file=/certs/server.key
+      - --trusted-ca-file=/certs/ca.pem
+      - --client-cert-auth
+      - --auth-token=simple
+      - --auth-token-ttl=10
+      - --data-dir=/var/lib/etcd/data
+    ports:
+      # 12379 on the host, so the three fixtures can run at once; the provider's default port
+      # stays 2379.
+      - "127.0.0.1:12379:2379"
+    volumes:
+      - etcd-auth-certs:/certs:ro
+    environment: *etcd-member-env
+    healthcheck:
+      # `auth status` answers with RBAC on or off and needs no credential, and it is a raft
+      # request, so it passes only once the member has a leader; `endpoint health` fails
+      # as soon as RBAC is on (etcdserver: user name is empty). The certificate is
+      # unknown-user's, whose Common Name is no etcd user.
+      test:
+        - CMD
+        - etcdctl
+        - --endpoints=https://127.0.0.1:2379
+        - --cacert=/certs/ca.pem
+        - --cert=/certs/unknown-user.crt
+        - --key=/certs/unknown-user.key
+        - --command-timeout=3s
+        - auth
+        - status
+      start_period: 60s
+      start_interval: 1s
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    # The cluster members' bound; measured 18 to 19 MiB with the seed and RBAC.
+    <<: *etcd-member-limits
+
+  etcd-auth-init:
+    # The seed, then RBAC (docker/etcd/rbac.sh), over TLS with the one certificate that has
+    # no Common Name, which etcd's gateway still accepts once RBAC is on (docker/etcd/certs.sh).
+    # Idempotent: a second run signs in with root's password first.
+    image: alpine/curl:8.21.0@sha256:a1c44bab54d88e18ea9a6a4ecefab7f2d230b968567b78960fcaff8d51b7f067
+    container_name: libredb-etcd-auth-init
+    profiles: ["etcd-auth"]
+    restart: "no"
+    depends_on:
+      etcd-auth:
+        condition: service_healthy
+    volumes:
+      - etcd-auth-certs:/certs:ro
+      - ./docker/etcd:/etcd:ro
+    environment:
+      ETCD_TLS: "--cacert /certs/ca.pem --cert /certs/gateway-client.crt --key /certs/gateway-client.key"
+      ETCD_PASSWORD_DIR: /certs
+    entrypoint: ["sh", "-c", "sh /etcd/seed.sh https://etcd-auth:2379 && sh /etcd/rbac.sh https://etcd-auth:2379"]
+    <<: *etcd-one-shot-limits
+
+  etcd-auth-password:
+    # The same server without --client-cert-auth: TLS that the client verifies and a password,
+    # the most common production shape, which --client-cert-auth would rule out, because it
+    # applies to every client listener. The same users, roles and token TTL.
+    image: gcr.io/etcd-development/etcd:v3.7.2@sha256:7c6c239825d00e3f6328a69caafd54be92063acf0c2ce78b8394699f52b75dc3
+    container_name: libredb-etcd-auth-password
+    profiles: ["etcd-auth"]
+    restart: unless-stopped
+    depends_on:
+      etcd-auth-certs:
+        condition: service_completed_successfully
+    command:
+      - /usr/local/bin/etcd
+      - --name=libredb-etcd-auth-password
+      - --initial-cluster-token=libredb-etcd-auth-password
+      - --initial-cluster=libredb-etcd-auth-password=http://etcd-auth-password:2380
+      - --initial-advertise-peer-urls=http://etcd-auth-password:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --listen-client-urls=https://0.0.0.0:2379
+      - --advertise-client-urls=https://localhost:12479
+      - --cert-file=/certs/server.crt
+      - --key-file=/certs/server.key
+      - --auth-token=simple
+      - --auth-token-ttl=10
+      - --data-dir=/var/lib/etcd/data
+    ports:
+      - "127.0.0.1:12479:2379"
+    volumes:
+      - etcd-auth-certs:/certs:ro
+    environment: *etcd-member-env
+    # The etcd-auth service's probe, with no client certificate, which this server never asks for.
+    healthcheck:
+      test:
+        - CMD
+        - etcdctl
+        - --endpoints=https://127.0.0.1:2379
+        - --cacert=/certs/ca.pem
+        - --command-timeout=3s
+        - auth
+        - status
+      start_period: 60s
+      start_interval: 1s
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    # The cluster members' bound; measured 18 to 19 MiB with the seed and RBAC.
+    <<: *etcd-member-limits
+
+  etcd-auth-password-init:
+    # etcd-auth-init for the password server: the CA only, since this server asks for no
+    # client certificate.
+    image: alpine/curl:8.21.0@sha256:a1c44bab54d88e18ea9a6a4ecefab7f2d230b968567b78960fcaff8d51b7f067
+    container_name: libredb-etcd-auth-password-init
+    profiles: ["etcd-auth"]
+    restart: "no"
+    depends_on:
+      etcd-auth-password:
+        condition: service_healthy
+    volumes:
+      - etcd-auth-certs:/certs:ro
+      - ./docker/etcd:/etcd:ro
+    environment:
+      ETCD_TLS: "--cacert /certs/ca.pem"
+      ETCD_PASSWORD_DIR: /certs
+    entrypoint: ["sh", "-c", "sh /etcd/seed.sh https://etcd-auth-password:2379 && sh /etcd/rbac.sh https://etcd-auth-password:2379"]
+    <<: *etcd-one-shot-limits
+
+  # ---------------------------------------------------------------------------------------
+  # Oxia (the Oxia provider). One standalone server is the default fixture, three shards, seeded
+  # by a one-shot that runs the Oxia CLI inside the Oxia image. Four more fixtures sit behind
+  # profiles: `oxia-natural` (two standalone servers that sort keys naturally), `oxia-017` (the
+  # same seed on the 0.17 line), `oxia-auth` (TLS and an OIDC token) and `oxia-cluster` (a
+  # coordinator and three data servers, for the dial policy). Keys the CLI cannot write are
+  # added by hand with tests/live/oxia-seed-raw.ts. The scripts, the seeded keys and the
+  # certificates are described in docker/oxia/README.md.
+  # ---------------------------------------------------------------------------------------
+  oxia:
+    # Pinned to the exact build the provider is verified against, by tag and by digest: the
+    # captures under tests/fixtures/oxia and the provider's error texts are claims about
+    # 0.16.10, not about Oxia in general. The 0.17 line has its own fixture, oxia-017.
+    image: oxia/oxia:0.16.10@sha256:da5133e862715b2ea03aada42593d0cb16b7b079bbba2035f82b870a3ccfb322
+    container_name: libredb-oxia
+    restart: unless-stopped
+    # A standalone server advertises the address it listens on, so the container port is the
+    # published one. No data volume: removing the container resets the fixture.
+    command:
+      - oxia
+      - standalone
+      - --shards
+      - "3"
+      - --public-addr
+      - 0.0.0.0:6648
+      - --metrics-addr
+      - 0.0.0.0:8080
+      - --data-dir
+      - /data/db
+      - --wal-dir
+      - /data/wal
+    ports:
+      # Loopback only, as the postgres service's.
+      - "127.0.0.1:6648:6648"
+    environment:
+      # The Go runtime collects before it reaches the container's bound below, rather than being
+      # killed there.
+      GOMEMLIMIT: 900MiB
+    healthcheck: &oxia-standalone-health
+      # A list through the public listener, which exits 0 only once the shard map is served, so
+      # it also catches a server whose assignments never arrive. A standalone server has no
+      # internal listener for `oxia health` (measured on 0.16.10: connection refused on 6649).
+      # The authority is localhost:6648, a plain host:port, which every server accepts.
+      test: ["CMD", "oxia", "client", "-a", "localhost:6648", "--request-timeout", "3s", "list", "-s", "/", "-e", "/0"]
+      start_period: 60s
+      start_interval: 1s
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    # Bounded at the maintainer's request, as the Kafka fixtures are; no swap past it. A seeded
+    # 0.17.1 server measured 217 MiB and a seeded 0.16.10 server 101 MiB, so 1G leaves room for
+    # the 17 MiB value's WAL and the 20,000 bulk keys of tests/live/oxia-seed-raw.ts.
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+    memswap_limit: 1G
+
+  oxia-seed:
+    # One-shot seed through the Oxia CLI of the server's own image (docker/oxia/seed.sh). It
+    # wipes the namespace first, so it may run again on a seeded server.
+    image: oxia/oxia:0.16.10@sha256:da5133e862715b2ea03aada42593d0cb16b7b079bbba2035f82b870a3ccfb322
+    container_name: libredb-oxia-seed
+    restart: "no"
+    depends_on:
+      oxia:
+        condition: service_healthy
+    volumes:
+      - ./docker/oxia:/seed:ro
+    entrypoint: ["sh", "/seed/seed.sh", "oxia:6648", "full"]
+    <<: &oxia-one-shot-limits
+      deploy:
+        resources:
+          limits:
+            cpus: "0.5"
+            memory: 256M
+      memswap_limit: 256M
+
+  # -- Oxia, natural key order -------------------------------------------------
+
+  oxia-natural:
+    # The natural key order, which a namespace fixes at creation, on two shards: the small key
+    # set, with keys whose first byte sorts below /. Profile-gated with oxia-natural-blind:
+    #   docker compose -f database-compose.yml --profile oxia-natural up -d --wait \
+    #     oxia-natural oxia-natural-blind
+    #   docker compose -f database-compose.yml --profile oxia-natural up oxia-natural-seed
+    image: oxia/oxia:0.16.10@sha256:da5133e862715b2ea03aada42593d0cb16b7b079bbba2035f82b870a3ccfb322
+    container_name: libredb-oxia-natural
+    profiles: ["oxia-natural"]
+    restart: unless-stopped
+    command: &oxia-natural-command
+      - oxia
+      - standalone
+      - --shards
+      - "2"
+      - --public-addr
+      - 0.0.0.0:6648
+      - --metrics-addr
+      - 0.0.0.0:8080
+      - --data-dir
+      - /data/db
+      - --wal-dir
+      - /data/wal
+      - --key-sorting
+      - natural
+    ports:
+      - "127.0.0.1:6658:6648"
+    environment:
+      GOMEMLIMIT: 450MiB
+    healthcheck: *oxia-standalone-health
+    # A small key set: 512M, half the default server's bound.
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+    memswap_limit: 512M
+
+  oxia-natural-blind:
+    # The blind spot of the order probe: a natural namespace whose listed keys each begin with
+    # a byte below /. 605 short keys: 256M.
+    image: oxia/oxia:0.16.10@sha256:da5133e862715b2ea03aada42593d0cb16b7b079bbba2035f82b870a3ccfb322
+    container_name: libredb-oxia-natural-blind
+    profiles: ["oxia-natural"]
+    restart: unless-stopped
+    command: *oxia-natural-command
+    ports:
+      - "127.0.0.1:6659:6648"
+    environment:
+      GOMEMLIMIT: 200MiB
+    healthcheck: *oxia-standalone-health
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256M
+    memswap_limit: 256M
+
+  oxia-natural-seed:
+    # Both natural servers, one after the other, from inside the oxia-natural profile, so a
+    # plain up never starts a profiled server.
+    image: oxia/oxia:0.16.10@sha256:da5133e862715b2ea03aada42593d0cb16b7b079bbba2035f82b870a3ccfb322
+    container_name: libredb-oxia-natural-seed
+    profiles: ["oxia-natural"]
+    restart: "no"
+    depends_on:
+      oxia-natural:
+        condition: service_healthy
+      oxia-natural-blind:
+        condition: service_healthy
+    volumes:
+      - ./docker/oxia:/seed:ro
+    entrypoint: ["sh", "-c", "sh /seed/seed.sh oxia-natural:6648 small && sh /seed/seed.sh oxia-natural-blind:6648 blind"]
+    <<: *oxia-one-shot-limits
+
+  # -- Oxia, the 0.17 line -----------------------------------------------------
+
+  oxia-017:
+    # The same server and seed on 0.17.1, pinned by digest: the line the provider doc
+    # recommends, and the captures under tests/fixtures/oxia/0.17.1 are claims about it.
+    # Profile-gated:
+    #   docker compose -f database-compose.yml --profile oxia-017 up -d --wait oxia-017
+    #   docker compose -f database-compose.yml --profile oxia-017 up oxia-017-seed
+    image: oxia/oxia:0.17.1@sha256:165bf4f3803153f23be3ba699f6430ab1463cdeaa46e341ff32c3eaed0d1b7d6
+    container_name: libredb-oxia-017
+    profiles: ["oxia-017"]
+    restart: unless-stopped
+    command:
+      - oxia
+      - standalone
+      - --shards
+      - "3"
+      - --public-addr
+      - 0.0.0.0:6648
+      - --metrics-addr
+      - 0.0.0.0:8080
+      - --data-dir
+      - /data/db
+      - --wal-dir
+      - /data/wal
+    ports:
+      - "127.0.0.1:6668:6648"
+    environment:
+      GOMEMLIMIT: 900MiB
+    healthcheck: *oxia-standalone-health
+    # A seeded 0.17.1 server measured 217 MiB.
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+    memswap_limit: 1G
+
+  oxia-017-seed:
+    # The full seed with the 0.17.1 CLI.
+    image: oxia/oxia:0.17.1@sha256:165bf4f3803153f23be3ba699f6430ab1463cdeaa46e341ff32c3eaed0d1b7d6
+    container_name: libredb-oxia-017-seed
+    profiles: ["oxia-017"]
+    restart: "no"
+    depends_on:
+      oxia-017:
+        condition: service_healthy
+    volumes:
+      - ./docker/oxia:/seed:ro
+    entrypoint: ["sh", "/seed/seed.sh", "oxia-017:6648", "full"]
+    <<: *oxia-one-shot-limits
+
+  # -- Oxia, TLS with an OIDC token --------------------------------------------
+
+  oxia-auth-certs:
+    # Generates a throwaway CA, the server certificate, a client pair, the JWT key pair and the
+    # tokens into a named volume at first start (docker/oxia/certs.sh), so no certificate, key
+    # or token is ever committed.
+    image: alpine/openssl:3.5.8@sha256:3f25da71f70eba788067daac3f3df03bd1de7a7c52ed89fa93b94ad2c92d986b
+    container_name: libredb-oxia-auth-certs
+    profiles: ["oxia-auth"]
+    restart: "no"
+    volumes:
+      - oxia-auth-material:/certs
+      - ./docker/oxia:/seed:ro
+    entrypoint: ["sh", "/seed/certs.sh", "/certs"]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 64M
+    memswap_limit: 64M
+
+  oxia-auth:
+    # A coordinator and a data server in one container: TLS on the public listener and the OIDC
+    # provider with a static key, so a token is checked without an issuer endpoint. The
+    # coordinator's memory metadata is rebuilt on a restart, and the server keeps its shards.
+    # Not seeded: the 0.16.10 CLI has no TLS or token flag. Profile-gated:
+    #   docker compose -f database-compose.yml --profile oxia-auth up -d --wait oxia-auth
+    image: oxia/oxia:0.16.10@sha256:da5133e862715b2ea03aada42593d0cb16b7b079bbba2035f82b870a3ccfb322
+    container_name: libredb-oxia-auth
+    profiles: ["oxia-auth"]
+    restart: unless-stopped
+    depends_on:
+      oxia-auth-certs:
+        condition: service_completed_successfully
+    command:
+      - sh
+      - -c
+      - |
+        oxia coordinator --cconfig /seed/cluster-auth.yaml --metadata memory -i 0.0.0.0:6652 -a 0.0.0.0:6651 -m 0.0.0.0:6653 &
+        exec oxia server -p 0.0.0.0:6678 -i 0.0.0.0:6649 -m 0.0.0.0:8080 --data-dir /data/db --wal-dir /data/wal \
+          --tls-cert-file /certs/server.crt --tls-key-file /certs/server.key \
+          --auth-provider-name oidc \
+          --auth-provider-params '{"issuers":{"https://issuer.libredb-fixture.invalid":{"allowedAudiences":"oxia","userNameClaim":"sub","staticKeyFile":"/certs/jwt.pub"}}}'
+    ports:
+      # The port cluster-auth.yaml advertises, the same on the host and in the container.
+      - "127.0.0.1:6678:6678"
+    volumes:
+      - oxia-auth-material:/certs:ro
+      - ./docker/oxia:/seed:ro
+    environment:
+      GOMEMLIMIT: 900MiB
+    healthcheck: &oxia-internal-health
+      # `oxia health` on the internal listener, which answers SERVING without TLS or a token;
+      # the 0.16.10 CLI has no TLS or token flag for the public one (measured on the shared
+      # TLS and OIDC probes).
+      test: ["CMD", "oxia", "health", "--host", "localhost", "--port", "6649", "--timeout", "3s"]
+      start_period: 60s
+      start_interval: 1s
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+    memswap_limit: 1G
+
+  # -- Oxia, a coordinator and three data servers ------------------------------
+
+  oxia-cluster-coordinator:
+    # The cluster of docker/oxia/cluster.yaml, for the dial policy: each shard leader is
+    # advertised at its own loopback port. Profile-gated:
+    #   docker compose -f database-compose.yml --profile oxia-cluster up -d --wait \
+    #     oxia-cluster-coordinator oxia-cluster-1 oxia-cluster-2 oxia-cluster-3
+    # An empty cluster-mode server measured 24 MiB.
+    image: oxia/oxia:0.16.10@sha256:da5133e862715b2ea03aada42593d0cb16b7b079bbba2035f82b870a3ccfb322
+    container_name: libredb-oxia-cluster-coordinator
+    profiles: ["oxia-cluster"]
+    restart: unless-stopped
+    command:
+      - oxia
+      - coordinator
+      - --cconfig
+      - /seed/cluster.yaml
+      - --metadata
+      - memory
+      - -i
+      - 0.0.0.0:6652
+      - -a
+      - 0.0.0.0:6651
+      - -m
+      - 0.0.0.0:6653
+    volumes:
+      - ./docker/oxia:/seed:ro
+    environment:
+      GOMEMLIMIT: 200MiB
+    healthcheck:
+      # The coordinator's internal listener answers `oxia health` (measured on 0.16.10).
+      test: ["CMD", "oxia", "health", "--host", "localhost", "--port", "6652", "--timeout", "3s"]
+      start_period: 60s
+      start_interval: 1s
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256M
+    memswap_limit: 256M
+
+  oxia-cluster-1:
+    # A cluster advertises the public address of cluster.yaml, so the container listens on the
+    # published port. The check is on the internal listener: a list from inside one container is
+    # sent to leaders on the other servers, whose advertised ports are the host's.
+    image: oxia/oxia:0.16.10@sha256:da5133e862715b2ea03aada42593d0cb16b7b079bbba2035f82b870a3ccfb322
+    container_name: libredb-oxia-cluster-1
+    profiles: ["oxia-cluster"]
+    restart: unless-stopped
+    command: ["oxia", "server", "-p", "0.0.0.0:6671", "-i", "0.0.0.0:6649", "-m", "0.0.0.0:8080", "--data-dir", "/data/db", "--wal-dir", "/data/wal"]
+    ports:
+      - "127.0.0.1:6671:6671"
+    environment: &oxia-cluster-env
+      GOMEMLIMIT: 450MiB
+    healthcheck: *oxia-internal-health
+    <<: &oxia-cluster-server-limits
+      deploy:
+        resources:
+          limits:
+            cpus: "1"
+            memory: 512M
+      memswap_limit: 512M
+
+  oxia-cluster-2:
+    image: oxia/oxia:0.16.10@sha256:da5133e862715b2ea03aada42593d0cb16b7b079bbba2035f82b870a3ccfb322
+    container_name: libredb-oxia-cluster-2
+    profiles: ["oxia-cluster"]
+    restart: unless-stopped
+    command: ["oxia", "server", "-p", "0.0.0.0:6672", "-i", "0.0.0.0:6649", "-m", "0.0.0.0:8080", "--data-dir", "/data/db", "--wal-dir", "/data/wal"]
+    ports:
+      - "127.0.0.1:6672:6672"
+    environment: *oxia-cluster-env
+    healthcheck: *oxia-internal-health
+    <<: *oxia-cluster-server-limits
+
+  oxia-cluster-3:
+    image: oxia/oxia:0.16.10@sha256:da5133e862715b2ea03aada42593d0cb16b7b079bbba2035f82b870a3ccfb322
+    container_name: libredb-oxia-cluster-3
+    profiles: ["oxia-cluster"]
+    restart: unless-stopped
+    command: ["oxia", "server", "-p", "0.0.0.0:6673", "-i", "0.0.0.0:6649", "-m", "0.0.0.0:8080", "--data-dir", "/data/db", "--wal-dir", "/data/wal"]
+    ports:
+      - "127.0.0.1:6673:6673"
+    environment: *oxia-cluster-env
+    healthcheck: *oxia-internal-health
+    <<: *oxia-cluster-server-limits
+
+  # ---------------------------------------------------------------------------------------
+  # Milvus (the milvus provider). One standalone server with authorization on is the default
+  # fixture, seeded by a one-shot Python sidecar; two TLS servers sit behind the `milvus-tls`
+  # profile, one-way TLS and mutual TLS. Every server follows Milvus's standalone_embed.sh at
+  # tag v3.0.2 with three measured changes: a named volume per server, because the image runs
+  # as uid 999 and the script's bind mount crashed it with exit code 134; image v3.0.2, where
+  # the script at that tag pins v3.0.1; and, for TLS, REST on a listener of its own, because
+  # TLS forces separate ports. docker/milvus/README.md describes the servers, the seeded
+  # objects, the users and the certificates.
+  # ---------------------------------------------------------------------------------------
+  milvus:
+    # Pinned to the exact build the vector fixtures were captured from, by tag and by digest:
+    # the captures under tests/fixtures/vector are claims about 3.0.2.
+    image: milvusdb/milvus:v3.0.2@sha256:5f13bf88e110a517911c3e6dd8172454e90042c21e606a868084615a4302c8a0
+    container_name: libredb-milvus
+    # During the research the embedded etcd of one server stalled on fdatasync for 7.8 s, lost
+    # its lease and exited with code 80, so the server restarts; a harness checks every
+    # service's health first and fails loudly on an exited or unhealthy one, with no retry.
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    security_opt: ["seccomp:unconfined"]
+    # Authorization is on. root keeps Milvus's documented default password, which nothing here
+    # sets: it is the server's built-in default.
+    environment: &milvus-env
+      ETCD_USE_EMBED: "true"
+      ETCD_DATA_DIR: /var/lib/milvus/etcd
+      ETCD_CONFIG_PATH: /milvus/configs/embedEtcd.yaml
+      COMMON_STORAGETYPE: local
+      DEPLOY_MODE: STANDALONE
+      COMMON_SECURITY_AUTHORIZATIONENABLED: "true"
+    volumes:
+      - milvus-data:/var/lib/milvus
+      - ./docker/milvus/embedEtcd.yaml:/milvus/configs/embedEtcd.yaml
+      - ./docker/milvus/user.yaml:/milvus/configs/user.yaml
+    ports:
+      # gRPC and REST share 19530. The management port 9091 answers without authentication on
+      # 3.0.2, so it is published on loopback alone, as 19091, for the live check's telemetry
+      # read; 9091 on the host is prometheus-auth's. The embedded etcd's 2379 is not published.
+      - "127.0.0.1:19530:19530"
+      - "127.0.0.1:19091:9091"
+    healthcheck: &milvus-health
+      # The management port's own probe, plain HTTP inside the container on every server.
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      start_period: 90s
+      start_interval: 2s
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    # Bounded at the maintainer's request; no swap past it. Measured 156 to 292 MiB after
+    # seeding during the research.
+    <<: &milvus-limits
+      deploy:
+        resources:
+          limits:
+            cpus: "2"
+            memory: 4G
+      memswap_limit: 4G
+
+  milvus-seed:
+    # One-shot seed (docker/milvus/seed.py) in a pinned Python image, which installs pymilvus
+    # and its dependencies from docker/milvus/requirements.txt, pinned with hashes. It creates
+    # what is missing and leaves what exists, so it may run again on a seeded server, and it
+    # generates the passwords of the users reader and nobody into the milvus-credentials volume.
+    # pip writes to stderr, so `run ... milvus-seed ... --manifest` prints the manifest alone.
+    # requirements.txt hashes the linux/amd64 wheels, so the seed runs as linux/amd64 everywhere.
+    image: python:3.12-slim@sha256:dddfd7e07f9d15aeeca61529320492139d21cac7f0070c00609243e51e4e0016
+    platform: linux/amd64
+    container_name: libredb-milvus-seed
+    restart: "no"
+    depends_on:
+      milvus:
+        condition: service_healthy
+    volumes:
+      - ./docker/milvus:/seed:ro
+      - milvus-credentials:/credentials
+    environment: &seed-env
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_ROOT_USER_ACTION: ignore
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint:
+      - sh
+      - -c
+      - pip install --quiet --no-cache-dir --require-hashes -r /seed/requirements.txt 1>&2 && exec python /seed/seed.py "$$@"
+      - milvus-seed
+    command: ["--uri", "http://milvus:19530", "--credentials", "/credentials"]
+    <<: &vector-seed-limits
+      deploy:
+        resources:
+          limits:
+            cpus: "1"
+            memory: 1G
+      memswap_limit: 1G
+
+  # -- Milvus, one-way and mutual TLS -------------------------------------------
+
+  milvus-certs:
+    # Generates a throwaway CA, the servers' certificate and the client certificates into a
+    # named volume at first start (docker/milvus/certs.sh), so no private key is ever committed.
+    image: alpine/openssl:3.5.8@sha256:3f25da71f70eba788067daac3f3df03bd1de7a7c52ed89fa93b94ad2c92d986b
+    container_name: libredb-milvus-certs
+    profiles: ["milvus-tls"]
+    restart: "no"
+    volumes:
+      - milvus-certs:/certs
+      - ./docker/milvus:/milvus:ro
+    entrypoint: ["sh", "/milvus/certs.sh", "/certs"]
+    <<: &vector-one-shot-limits
+      deploy:
+        resources:
+          limits:
+            cpus: "0.5"
+            memory: 64M
+      memswap_limit: 64M
+
+  milvus-tls:
+    # tlsMode 1: the server presents its certificate and asks for none. REST moves to its own
+    # listener, 8080, published as 19541. Profile-gated, with milvus-mtls.
+    image: milvusdb/milvus:v3.0.2@sha256:5f13bf88e110a517911c3e6dd8172454e90042c21e606a868084615a4302c8a0
+    container_name: libredb-milvus-tls
+    profiles: ["milvus-tls"]
+    restart: unless-stopped
+    depends_on:
+      milvus-certs:
+        condition: service_completed_successfully
+    command: ["milvus", "run", "standalone"]
+    security_opt: ["seccomp:unconfined"]
+    environment:
+      <<: *milvus-env
+      COMMON_SECURITY_TLSMODE: "1"
+      PROXY_HTTP_PORT: "8080"
+      TLS_SERVERPEMPATH: /milvus/tls/server.pem
+      TLS_SERVERKEYPATH: /milvus/tls/server.key
+      TLS_CAPEMPATH: /milvus/tls/ca.pem
+    volumes:
+      - milvus-tls-data:/var/lib/milvus
+      - milvus-certs:/milvus/tls:ro
+      - ./docker/milvus/embedEtcd.yaml:/milvus/configs/embedEtcd.yaml
+      - ./docker/milvus/user.yaml:/milvus/configs/user.yaml
+    ports:
+      - "127.0.0.1:19531:19530"
+      - "127.0.0.1:19541:8080"
+    healthcheck: *milvus-health
+    <<: *milvus-limits
+
+  milvus-mtls:
+    # tlsMode 2: the server also asks for a client certificate issued by the fixture's CA. Only
+    # gRPC is published; REST keeps its own listener inside the container.
+    image: milvusdb/milvus:v3.0.2@sha256:5f13bf88e110a517911c3e6dd8172454e90042c21e606a868084615a4302c8a0
+    container_name: libredb-milvus-mtls
+    profiles: ["milvus-tls"]
+    restart: unless-stopped
+    depends_on:
+      milvus-certs:
+        condition: service_completed_successfully
+    command: ["milvus", "run", "standalone"]
+    security_opt: ["seccomp:unconfined"]
+    environment:
+      <<: *milvus-env
+      COMMON_SECURITY_TLSMODE: "2"
+      PROXY_HTTP_PORT: "8080"
+      TLS_SERVERPEMPATH: /milvus/tls/server.pem
+      TLS_SERVERKEYPATH: /milvus/tls/server.key
+      TLS_CAPEMPATH: /milvus/tls/ca.pem
+    volumes:
+      - milvus-mtls-data:/var/lib/milvus
+      - milvus-certs:/milvus/tls:ro
+      - ./docker/milvus/embedEtcd.yaml:/milvus/configs/embedEtcd.yaml
+      - ./docker/milvus/user.yaml:/milvus/configs/user.yaml
+    ports:
+      - "127.0.0.1:19532:19530"
+    healthcheck: *milvus-health
+    <<: *milvus-limits
+
+  # ---------------------------------------------------------------------------------------
+  # Qdrant (the qdrant provider). One server with no key is the default fixture, seeded by a
+  # one-shot Python sidecar; three keyed servers sit behind profiles: `qdrant-auth`, with an
+  # admin key, a read-only key and JWT RBAC, and `qdrant-tls`, with one-way TLS and with TLS
+  # that verifies the client's certificate. The keys and the TLS settings reach each keyed
+  # server as the local.yaml qdrant-keys generates into a volume, never as an environment
+  # variable here. No server publishes gRPC 6334 or the internal port 6335, which the provider
+  # never dials, and no server has a data volume: removing its container resets it.
+  # docker/qdrant/README.md describes the servers, the seeded collections and the keys.
+  # ---------------------------------------------------------------------------------------
+  qdrant:
+    # The GHCR mirror of the build the vector fixtures were captured from, by tag and by
+    # digest; it reports commit 6ab21cac.
+    image: ghcr.io/qdrant/qdrant/qdrant:v1.19.1@sha256:808d42530f48a2b88abe960165ffe81e9ec71f505d72e6404145444e0e085822
+    container_name: libredb-qdrant
+    restart: unless-stopped
+    environment: &qdrant-env
+      # A server otherwise reports to telemetry.qdrant.io every hour.
+      QDRANT__TELEMETRY_DISABLED: "true"
+    ports:
+      - "127.0.0.1:6333:6333"
+    healthcheck: &qdrant-http-health
+      # /readyz needs no key. The image has bash and no curl, so the probe speaks HTTP itself.
+      test:
+        - CMD
+        - bash
+        - -c
+        - exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /readyz HTTP/1.0\r\n\r\n' >&3 && head -n 1 <&3 | grep -q ' 200 '
+      start_period: 30s
+      start_interval: 1s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # Bounded at the maintainer's request; no swap past it. Measured 44 to 80 MiB after seeding
+    # during the research.
+    <<: &qdrant-limits
+      deploy:
+        resources:
+          limits:
+            cpus: "2"
+            memory: 2G
+      memswap_limit: 2G
+
+  qdrant-seed:
+    # One-shot seed (docker/qdrant/seed.py) in a pinned Python image, which installs
+    # qdrant-client and its dependencies from docker/qdrant/requirements.txt, pinned with
+    # hashes. It creates what is missing and leaves what exists. It mounts the keys read-only,
+    # so the same one-shot seeds qdrant-auth with --api-key-file (docker/qdrant/README.md).
+    # requirements.txt hashes the linux/amd64 wheels, so the seed runs as linux/amd64 everywhere.
+    image: python:3.14-slim@sha256:0741d101873c12ab927e6f8653feb8862b9bd58771177acb1b885b95141f91b4
+    platform: linux/amd64
+    container_name: libredb-qdrant-seed
+    restart: "no"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    volumes:
+      - ./docker/qdrant:/seed:ro
+      - qdrant-keys:/keys:ro
+    environment: *seed-env
+    entrypoint:
+      - sh
+      - -c
+      - pip install --quiet --no-cache-dir --require-hashes -r /seed/requirements.txt 1>&2 && exec python /seed/seed.py "$$@"
+      - qdrant-seed
+    command: ["--url", "http://qdrant:6333"]
+    <<: *vector-seed-limits
+
+  # -- Qdrant, keys, JWT and TLS -------------------------------------------------
+
+  qdrant-keys:
+    # Generates each keyed server's admin and read-only keys, its local.yaml and the TLS
+    # material into a named volume at first start (docker/qdrant/keys.sh), so no key and no
+    # private key is ever committed.
+    image: alpine/openssl:3.5.8@sha256:3f25da71f70eba788067daac3f3df03bd1de7a7c52ed89fa93b94ad2c92d986b
+    container_name: libredb-qdrant-keys
+    profiles: ["qdrant-auth", "qdrant-tls"]
+    restart: "no"
+    volumes:
+      - qdrant-keys:/keys
+      - ./docker/qdrant:/qdrant-scripts:ro
+    entrypoint: ["sh", "/qdrant-scripts/keys.sh", "/keys"]
+    <<: *vector-one-shot-limits
+
+  qdrant-auth:
+    image: ghcr.io/qdrant/qdrant/qdrant:v1.19.1@sha256:808d42530f48a2b88abe960165ffe81e9ec71f505d72e6404145444e0e085822
+    container_name: libredb-qdrant-auth
+    profiles: ["qdrant-auth"]
+    restart: unless-stopped
+    depends_on:
+      qdrant-keys:
+        condition: service_completed_successfully
+    entrypoint: ["bash", "-c", "cp /keys/auth/local.yaml /qdrant/config/local.yaml && exec ./entrypoint.sh"]
+    environment:
+      <<: *qdrant-env
+      # inference listener must receive nothing
+      QDRANT__INFERENCE__ADDRESS: http://host.docker.internal:18904/infer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - qdrant-keys:/keys:ro
+    ports:
+      - "127.0.0.1:6343:6333"
+    healthcheck: *qdrant-http-health
+    <<: *qdrant-limits
+
+  qdrant-tls:
+    # TLS on REST: the server presents its certificate and asks for none.
+    image: ghcr.io/qdrant/qdrant/qdrant:v1.19.1@sha256:808d42530f48a2b88abe960165ffe81e9ec71f505d72e6404145444e0e085822
+    container_name: libredb-qdrant-tls
+    profiles: ["qdrant-tls"]
+    restart: unless-stopped
+    depends_on:
+      qdrant-keys:
+        condition: service_completed_successfully
+    entrypoint: ["bash", "-c", "cp /keys/tls/local.yaml /qdrant/config/local.yaml && exec ./entrypoint.sh"]
+    environment: *qdrant-env
+    volumes:
+      - qdrant-keys:/keys:ro
+    ports:
+      - "127.0.0.1:6353:6333"
+    healthcheck: &qdrant-tcp-health
+      # The listener speaks TLS, which bash cannot, so the probe only opens the socket.
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/6333"]
+      start_period: 30s
+      start_interval: 1s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    <<: *qdrant-limits
+
+  qdrant-mtls:
+    # TLS with verify_https_client_certificate: the server also asks for a client certificate
+    # issued by the fixture's CA.
+    image: ghcr.io/qdrant/qdrant/qdrant:v1.19.1@sha256:808d42530f48a2b88abe960165ffe81e9ec71f505d72e6404145444e0e085822
+    container_name: libredb-qdrant-mtls
+    profiles: ["qdrant-tls"]
+    restart: unless-stopped
+    depends_on:
+      qdrant-keys:
+        condition: service_completed_successfully
+    entrypoint: ["bash", "-c", "cp /keys/mtls/local.yaml /qdrant/config/local.yaml && exec ./entrypoint.sh"]
+    environment: *qdrant-env
+    volumes:
+      - qdrant-keys:/keys:ro
+    ports:
+      - "127.0.0.1:6363:6333"
+    healthcheck: *qdrant-tcp-health
+    <<: *qdrant-limits
+
+  # ---------------------------------------------------------------------------------------
+  # InfluxDB (the influxdb and influxdb3 providers). Three servers, one per line the providers
+  # are verified against: 1.13.1 and 2.9.1, which the influxdb type reads over the v1 /query
+  # API, and 3.12.0 Core, which both types read. Each is pinned by tag and by digest, and each
+  # has authentication on with the fixed test credentials below, as the clickhouse and neo4j
+  # services spell theirs; the read principals are added by the seed. influxdb-seed is a
+  # one-shot that runs docker/influxdb/seed.sh, the only writer of these fixtures: it creates
+  # the 1.x reader (READ on home), the 2.x read-only token for bucket home, which it keeps in
+  # the influxdb2-read-token volume, and the home and edge data on each server.
+  # influxdb3-filelimit, behind its profile, is the file-limit fixture (--query-file-limit 1),
+  # seeded by hand. No server has a named data volume; the 1.x and 2.x images declare anonymous
+  # ones, which survive --force-recreate, so a reset removes them with the container
+  # (`rm -s -f -v`), and the seed writes the server again with fresh timestamps.
+  # docker/influxdb/README.md describes the servers, the principals and the seed data.
+  # ---------------------------------------------------------------------------------------
+  influxdb1:
+    image: influxdb:1.13.1@sha256:3e3913d3b7512d1749922c8183bbf2a76973dd9f98e1a1e3249c652ec1576fc0
+    container_name: libredb-influxdb1
+    restart: unless-stopped
+    environment:
+      # The image's entrypoint creates the admin user and database home at first start.
+      INFLUXDB_HTTP_AUTH_ENABLED: "true"
+      INFLUXDB_ADMIN_USER: admin
+      INFLUXDB_ADMIN_PASSWORD: password123
+      INFLUXDB_DB: home
+      # A server otherwise reports to usage.influxdata.com every 24 hours.
+      INFLUXDB_REPORTING_DISABLED: "true"
+    ports:
+      - "127.0.0.1:8087:8086"
+    healthcheck: &influxdb-ping-health
+      # /ping needs no credential on 1.x and 2.x and answers 204; the image carries curl.
+      test: ["CMD", "curl", "-sf", "-o", "/dev/null", "http://127.0.0.1:8086/ping"]
+      start_period: 30s
+      start_interval: 1s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # Bounded as the Qdrant fixtures are; no swap past it. 2 GiB leaves room for the hand-run
+    # bench database (docker/influxdb/README.md).
+    <<: &influxdb-limits
+      deploy:
+        resources:
+          limits:
+            cpus: "2"
+            memory: 2G
+      memswap_limit: 2G
+
+  influxdb2:
+    image: influxdb:2.9.1@sha256:db0bdab1e5ad5ee899c127b8c13d9c986a3ced78cd9200dd80a1064bf1533b6e
+    container_name: libredb-influxdb2
+    restart: unless-stopped
+    environment:
+      # The image's entrypoint runs the initial setup at first start: user admin, org libredb,
+      # bucket home and this all-access operator token.
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: password123
+      DOCKER_INFLUXDB_INIT_ORG: libredb
+      DOCKER_INFLUXDB_INIT_BUCKET: home
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: libredb-influxdb2-operator-token
+      # A server otherwise reports to telemetry.influxdata.com every 8 hours.
+      INFLUXD_REPORTING_DISABLED: "true"
+    ports:
+      - "127.0.0.1:8086:8086"
+    healthcheck: *influxdb-ping-health
+    <<: *influxdb-limits
+
+  influxdb3:
+    image: influxdb:3.12.0-core@sha256:624d69bca6bf6fb174aca5a974e1d96e5c5486994e6ae35bc9b4fe02b9520076
+    container_name: libredb-influxdb3
+    restart: unless-stopped
+    environment: &influxdb3-env
+      # The admin token, in the file shape `influxdb3 create token --admin --offline` writes,
+      # read by `serve --admin-token-file`. That command mints a random token; this one is the
+      # fixed test token, so the seed and the evidence harness read it from this file.
+      LIBREDB_INFLUXDB3_TOKEN: apiv3_libredb-influxdb3-admin-token
+    entrypoint: &influxdb3-entrypoint
+      - bash
+      - -c
+      - >-
+        umask 077 &&
+        printf '{"token": "%s", "name": "_admin"}\n' "$$LIBREDB_INFLUXDB3_TOKEN" > /tmp/admin-token.json &&
+        exec influxdb3 serve --node-id libredb --object-store file
+        --data-dir /home/influxdb3/.influxdb3 --admin-token-file /tmp/admin-token.json
+        --disable-telemetry-upload "$$@"
+      - influxdb3
+    ports:
+      - "127.0.0.1:8181:8181"
+    healthcheck: &influxdb3-ping-health
+      # /ping needs a token on 3.x; the image carries curl.
+      test:
+        - CMD-SHELL
+        - 'curl -sf -o /dev/null -H "Authorization: Bearer $$LIBREDB_INFLUXDB3_TOKEN" http://127.0.0.1:8181/ping'
+      start_period: 30s
+      start_interval: 1s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    <<: *influxdb-limits
+
+  influxdb3-filelimit:
+    # The same server with --query-file-limit 1, so a query over more than one of the Parquet
+    # files `seed.sh filelimit` persists meets the file-limit error: 21 timestamps 4 hours
+    # apart, each in its own 10-minute gen1 window, persist 21 files (measured 2026-10-04).
+    # A snapshot after every WAL file, and after 10 seconds at most, persists the seed within
+    # seconds of the write. Profile-gated: only the evidence harness and the preview-window
+    # measurement read it.
+    image: influxdb:3.12.0-core@sha256:624d69bca6bf6fb174aca5a974e1d96e5c5486994e6ae35bc9b4fe02b9520076
+    container_name: libredb-influxdb3-filelimit
+    profiles: ["influxdb-filelimit"]
+    restart: unless-stopped
+    environment: *influxdb3-env
+    entrypoint: *influxdb3-entrypoint
+    command: ["--query-file-limit", "1", "--wal-files-per-snapshot", "1", "--force-snapshot-max-age", "10s"]
+    ports:
+      - "127.0.0.1:8182:8181"
+    healthcheck: *influxdb3-ping-health
+    <<: *influxdb-limits
+
+  influxdb-seed:
+    # One-shot seed (docker/influxdb/seed.sh) in the 2.9.1 image, which carries bash, curl and
+    # GNU date, so the seed pulls no image of its own. It creates what is missing and leaves
+    # what exists: a second run on a seeded server writes nothing.
+    image: influxdb:2.9.1@sha256:db0bdab1e5ad5ee899c127b8c13d9c986a3ced78cd9200dd80a1064bf1533b6e
+    container_name: libredb-influxdb-seed
+    restart: "no"
+    depends_on:
+      influxdb1:
+        condition: service_healthy
+      influxdb2:
+        condition: service_healthy
+      influxdb3:
+        condition: service_healthy
+    volumes:
+      - ./docker/influxdb:/seed:ro
+      - influxdb2-read-token:/tokens
+    environment:
+      INFLUXDB1_URL: http://influxdb1:8086
+      INFLUXDB2_URL: http://influxdb2:8086
+      INFLUXDB3_URL: http://influxdb3:8181
+      # 2.9.1 shows a token's value only when it creates it, so the seed keeps the read-only
+      # token here; read it with `docker cp libredb-influxdb-seed:/tokens/influxdb2-read-token -`.
+      INFLUXDB2_READ_TOKEN_FILE: /tokens/influxdb2-read-token
+    entrypoint: ["bash", "/seed/seed.sh"]
+    # The one-shot bound of the Milvus certificate and Qdrant key jobs, shared here: the anchor
+    # is named after the vector fixtures that declared it.
+    <<: *vector-one-shot-limits
+
+  # ---------------------------------------------------------------------------------------
+  # Neo4j (the neo4j provider). One Community server, Bolt for the provider and HTTP for the
+  # health probe only. The seed is a graph written for this repository, loaded by hand once the
+  # service is healthy; the official Movies graph carries no licence and is not vendored. The
+  # graph and the commands are described in docker/neo4j/README.md.
+  # ---------------------------------------------------------------------------------------
+  neo4j:
+    # Pinned to the exact build the provider is verified against, by tag and by digest: the
+    # error codes, the value encodings and the captures the provider is tested on are claims
+    # about 5.26.31, not about Neo4j in general.
+    image: neo4j:5.26.31-community@sha256:d9cfe82983d27f5a75b3aaae8f316d04f9a698a3b7f6103a508f7caf8362f255
+    container_name: libredb-neo4j
+    restart: unless-stopped
+    ports:
+      # Loopback only, as the postgres service's. 7687 is Bolt, the provider's transport; 7474
+      # is HTTP, kept for the probe and the Browser a developer may open by hand.
+      - "127.0.0.1:7687:7687"
+      - "127.0.0.1:7474:7474"
+    environment:
+      # The test credential, as the clickhouse and couchbase services spell theirs. Neo4j
+      # refuses a password shorter than 8 characters, which rules out the postgres/postgres form.
+      NEO4J_AUTH: neo4j/password123
+      # Small enough to sit inside the bound below: heap plus page cache plus the JVM's own.
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 128m
+      # No usage report to Neo4j from a test fixture.
+      NEO4J_server_bolt_telemetry_enabled: "false"
+    # No data volume: removing the container resets the fixture.
+    healthcheck:
+      # The HTTP discovery document, answered once the server accepts connections. The image
+      # ships wget; cypher-shell would start a JVM per probe.
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:7474/ || exit 1"]
+      start_period: 60s
+      start_interval: 2s
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    # Bounded as the etcd and Kafka fixtures are; no swap past it.
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+    memswap_limit: 1G
+
+  # ---------------------------------------------------------------------------------------
+  # Databend over its own HTTP API (the databend provider), the surface Databend Cloud serves on
+  # 443 (docs/providers/databend.md). The compat `databend` service below is the mysql provider's
+  # MySQL-wire probe and is left alone. The fixture, the seed and the measured bounds are
+  # described in docker/databend/README.md.
+  # ---------------------------------------------------------------------------------------
+  databend-http:
+    # Pinned to the exact build the provider is verified against, by tag and by digest: the
+    # captures under tests/fixtures/databend are claims about this build, not about Databend in
+    # general.
+    image: datafuselabs/databend:v1.2.951-nightly@sha256:f63585cae3e096d62580ad51d92abd2f64b57b196af3b51cb01ecae381ec874b
+    container_name: libredb-databend-http
+    restart: unless-stopped
+    environment:
+      # The test credential, spelled as the compat service's.
+      QUERY_DEFAULT_USER: libredb
+      QUERY_DEFAULT_PASSWORD: "Probe123pass!"
+      # Tables live on the container's file system: removing the container resets the fixture.
+      QUERY_STORAGE_TYPE: fs
+    ports:
+      # Loopback only, as the postgres service's.
+      - "127.0.0.1:8000:8000"
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    healthcheck:
+      # /health needs no credential and adds no line to the query log (probe UC5); the image
+      # carries curl.
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8000/health"]
+      start_period: 30s
+      start_interval: 1s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # Bounded from the measured resident size (docker/databend/README.md); no swap past it.
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 1G
+    memswap_limit: 1G
+
+  databend-http-seed:
+    # One-shot seed (docker/databend/seed.sh) in the server's own image, which carries sh and
+    # curl, so the seed pulls no image of its own. It replaces what it creates, so a second run
+    # leaves the same fixture.
+    image: datafuselabs/databend:v1.2.951-nightly@sha256:f63585cae3e096d62580ad51d92abd2f64b57b196af3b51cb01ecae381ec874b
+    container_name: libredb-databend-http-seed
+    restart: "no"
+    depends_on:
+      databend-http:
+        condition: service_healthy
+    volumes:
+      - ./docker/databend:/fixtures:ro
+    environment:
+      # The server's default user above.
+      DATABEND_USER: libredb
+      DATABEND_PASSWORD: "Probe123pass!"
+    entrypoint: ["sh", "/fixtures/seed.sh", "http://databend-http:8000"]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+    memswap_limit: 128M
+
+  # ---------------------------------------------------------------------------------------
+  # S3-compatible object storage (the s3 provider). The four servers the provider is verified on
+  # (docs/providers/s3.md): MinIO, built here from its last community release because MinIO
+  # publishes no image any more, and the region-strict MinIO variant, both behind profiles
+  # because that build is frozen and unpatched (docker/minio/README.md); Silo, Garage and RustFS,
+  # pulled and pinned by tag and digest. Each server's principals and objects come from one-shots
+  # that create what is missing and leave what exists. docker/s3/README.md describes the servers,
+  # the principals and every seeded object.
+  # ---------------------------------------------------------------------------------------
+  minio:
+    build: { context: ./docker/minio, target: server }
+    image: libredb-fixture/minio:RELEASE.2025-10-15T17-29-55Z
+    pull_policy: build
+    container_name: libredb-minio
+    profiles: ["s3-minio"]
+    # Frozen and unpatched: never restarted by the daemon (docker/minio/README.md).
+    restart: "no"
+    environment: &minio-env
+      MINIO_ROOT_USER: libredb
+      MINIO_ROOT_PASSWORD: "Probe123pass!"
+      # MinIO checks dl.min.io for a newer release at startup unless this is off (docker/s3/README.md,
+      # "Telemetry"); Silo, which shares these variables, has no such check.
+      MINIO_UPDATE: "off"
+    ports:
+      - "127.0.0.1:9000:9000"
+    healthcheck: &minio-health
+      # The alpine build carries busybox wget and no curl.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/minio/health/ready"]
+      start_period: 30s
+      start_interval: 1s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # Four times the peak the first live run measured (docker/s3/README.md, "Bounds, as measured").
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 2816M
+    memswap_limit: 2816M
+
+  minio-principals:
+    build: { context: ./docker/minio, target: mc }
+    image: libredb-fixture/mc:RELEASE.2025-08-13T08-35-41Z
+    pull_policy: build
+    container_name: libredb-minio-principals
+    profiles: ["s3-minio"]
+    restart: "no"
+    depends_on: { minio: { condition: service_healthy } }
+    volumes: ["./docker/s3:/s3:ro"]
+    environment: &s3-root-env
+      S3_ROOT_ACCESS_KEY: libredb
+      S3_ROOT_SECRET_KEY: "Probe123pass!"
+    entrypoint: ["sh", "/s3/principals.sh", "http://minio:9000"]
+    # Four times the largest one-shot peak the first live run measured: pgsty/mc attaching a policy, which ran out of
+    # memory under the first 128M bound (docker/s3/README.md, "Bounds, as measured").
+    <<: &s3-one-shot-limits
+      deploy:
+        resources:
+          limits:
+            cpus: "0.5"
+            memory: 768M
+      memswap_limit: 768M
+
+  minio-seed:
+    # The seed signs with curl --aws-sigv4 and sends every key as written with --path-as-is, so the literal
+    # dot-segment keys reach each server. curl 8.14 and later refuse that pair (exit 43) and, without
+    # --path-as-is, sign the normalized path, so this pin must not move to 8.14 or later. It is an older image
+    # with known CVEs, accepted only because each seed one-shot talks to the compose network's own servers with
+    # fixed fixture bytes; garage-setup keeps the current curl.
+    image: &s3-seed-curl alpine/curl:8.12.1@sha256:edbbe6f64e9890474df2864d7ee92941bb03ce17b07fd9cadc1d14e9453fc031
+    container_name: libredb-minio-seed
+    profiles: ["s3-minio"]
+    restart: "no"
+    depends_on: { minio: { condition: service_healthy } }
+    volumes: &s3-seed-mounts ["./docker/s3:/s3:ro", "./tests/fixtures/s3/preview:/preview:ro"]
+    environment: &s3-seed-root-env
+      S3_SEED_ACCESS_KEY: libredb
+      S3_SEED_SECRET_KEY: "Probe123pass!"
+    entrypoint: ["sh", "/s3/seed.sh", "http://minio:9000", "us-east-1", "minio"]
+    <<: *s3-one-shot-limits
+
+  minio-region:
+    build: { context: ./docker/minio, target: server }
+    image: libredb-fixture/minio:RELEASE.2025-10-15T17-29-55Z
+    pull_policy: build
+    container_name: libredb-minio-region
+    profiles: ["s3-region"]
+    # Frozen and unpatched: never restarted by the daemon (docker/minio/README.md).
+    restart: "no"
+    environment:
+      <<: *minio-env
+      # Makes this MinIO refuse requests signed for another region (rows A6 and A7).
+      MINIO_SITE_REGION: eu-central-1
+    ports:
+      - "127.0.0.1:9030:9000"
+    healthcheck: *minio-health
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 2560M
+    memswap_limit: 2560M
+
+  minio-region-principals:
+    build: { context: ./docker/minio, target: mc }
+    image: libredb-fixture/mc:RELEASE.2025-08-13T08-35-41Z
+    pull_policy: build
+    container_name: libredb-minio-region-principals
+    profiles: ["s3-region"]
+    restart: "no"
+    depends_on: { minio-region: { condition: service_healthy } }
+    volumes: ["./docker/s3:/s3:ro"]
+    environment: *s3-root-env
+    entrypoint: ["sh", "/s3/principals.sh", "http://minio-region:9000"]
+    <<: *s3-one-shot-limits
+
+  minio-region-seed:
+    image: *s3-seed-curl
+    container_name: libredb-minio-region-seed
+    profiles: ["s3-region"]
+    restart: "no"
+    depends_on: { minio-region: { condition: service_healthy } }
+    volumes: *s3-seed-mounts
+    environment: *s3-seed-root-env
+    entrypoint: ["sh", "/s3/seed.sh", "http://minio-region:9000", "eu-central-1", "minio"]
+    <<: *s3-one-shot-limits
+
+  silo:
+    # A maintained AGPL fork of MinIO that keeps MINIO_* variables; pinned to the build the
+    # captures under tests/fixtures/s3/captures are claims about.
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
+    container_name: libredb-silo
+    restart: unless-stopped
+    environment: *minio-env
+    command: ["server", "/data"]
+    ports:
+      - "127.0.0.1:9010:9000"
+    healthcheck:
+      # Silo carries curl and no wget.
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9000/minio/health/ready"]
+      start_period: 30s
+      start_interval: 1s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 2560M
+    memswap_limit: 2560M
+
+  silo-principals:
+    image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z@sha256:cfc83108c3abb371f8fb84d99c1fdc88f8c237e022409b0081fb7c0a3be634dd
+    container_name: libredb-silo-principals
+    restart: "no"
+    depends_on: { silo: { condition: service_healthy } }
+    volumes: ["./docker/s3:/s3:ro"]
+    environment:
+      <<: *s3-root-env
+      MC_CONFIG_DIR: /tmp/.mc
+    entrypoint: ["sh", "/s3/principals.sh", "http://silo:9000"]
+    <<: *s3-one-shot-limits
+
+  silo-seed:
+    image: *s3-seed-curl
+    container_name: libredb-silo-seed
+    restart: "no"
+    depends_on: { silo: { condition: service_healthy } }
+    volumes: *s3-seed-mounts
+    environment: *s3-seed-root-env
+    entrypoint: ["sh", "/s3/seed.sh", "http://silo:9000", "us-east-1", "silo"]
+    <<: *s3-one-shot-limits
+
+  s3-certs:
+    # One-shot: the TLS fixture's CA and server certificate, written only when missing.
+    image: alpine/openssl:3.5.8@sha256:3f25da71f70eba788067daac3f3df03bd1de7a7c52ed89fa93b94ad2c92d986b
+    container_name: libredb-s3-certs
+    profiles: ["s3-tls"]
+    restart: "no"
+    volumes: ["./docker/s3:/s3:ro", "s3-certs:/certs"]
+    entrypoint: ["sh", "/s3/certs.sh", "/certs", "0"]
+    <<: *s3-one-shot-limits
+
+  silo-tls:
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
+    container_name: libredb-silo-tls
+    profiles: ["s3-tls"]
+    restart: unless-stopped
+    depends_on: { s3-certs: { condition: service_completed_successfully } }
+    environment: *minio-env
+    command: ["server", "/data", "--certs-dir", "/certs"]
+    volumes: ["s3-certs:/certs:ro"]
+    ports:
+      - "127.0.0.1:9443:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "--cacert", "/certs/CAs/ca.crt", "https://localhost:9000/minio/health/ready"]
+      start_period: 30s
+      start_interval: 1s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 2048M
+    memswap_limit: 2048M
+
+  garage-keys:
+    # One-shot: Garage's RPC secret, admin and metrics tokens and four key secrets, generated
+    # into s3-garage-keys only when missing, so no Garage secret is ever committed.
+    image: alpine/openssl:3.5.8@sha256:3f25da71f70eba788067daac3f3df03bd1de7a7c52ed89fa93b94ad2c92d986b
+    container_name: libredb-garage-keys
+    restart: "no"
+    volumes: ["./docker/s3:/s3:ro", "s3-garage-keys:/keys"]
+    entrypoint: ["sh", "/s3/garage-keys.sh", "/keys"]
+    <<: *s3-one-shot-limits
+
+  garage:
+    image: dxflrs/garage:v2.4.1@sha256:9c96caa2612d3411acc5b0e6701fb238dbfba33e533a6d7d3d811a4b12d0d020
+    container_name: libredb-garage
+    restart: unless-stopped
+    depends_on: { garage-keys: { condition: service_completed_successfully } }
+    environment:
+      GARAGE_RPC_SECRET_FILE: /keys/rpc.secret
+      GARAGE_ADMIN_TOKEN_FILE: /keys/admin.token
+      GARAGE_METRICS_TOKEN_FILE: /keys/metrics.token
+    volumes: ["./docker/s3/garage.toml:/etc/garage.toml:ro", "s3-garage-keys:/keys:ro"]
+    ports:
+      # Only the S3 API; RPC (3901) and admin (3903) stay on the compose network.
+      - "127.0.0.1:3900:3900"
+    healthcheck:
+      # The image has no shell, so the probe cannot read the answer's status: it exits 0 once the node
+      # answers, before a layout exists. garage-setup polls GetClusterHealth itself until the status is
+      # healthy (docker/s3/README.md).
+      test: ["CMD", "/garage", "json-api", "GetClusterHealth"]
+      start_period: 30s
+      start_interval: 1s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+    memswap_limit: 512M
+
+  garage-setup:
+    image: alpine/curl:8.21.0@sha256:a1c44bab54d88e18ea9a6a4ecefab7f2d230b968567b78960fcaff8d51b7f067
+    container_name: libredb-garage-setup
+    restart: "no"
+    # service_started: the health probe passes before any layout exists, so garage-setup polls
+    # GetClusterHealth itself until the status is healthy.
+    depends_on: { garage: { condition: service_started } }
+    volumes: ["./docker/s3:/s3:ro", "s3-garage-keys:/keys:ro"]
+    environment:
+      GARAGE_KEYS_DIR: /keys
+    entrypoint: ["sh", "/s3/garage-setup.sh", "http://garage:3903"]
+    <<: *s3-one-shot-limits
+
+  garage-seed:
+    image: *s3-seed-curl
+    container_name: libredb-garage-seed
+    restart: "no"
+    depends_on: { garage-setup: { condition: service_completed_successfully } }
+    volumes: ["./docker/s3:/s3:ro", "./tests/fixtures/s3/preview:/preview:ro", "s3-garage-keys:/keys:ro"]
+    environment:
+      S3_SEED_ACCESS_KEY: GK000000000000000000000001
+      S3_SEED_SECRET_KEY_FILE: /keys/rw.secret
+    entrypoint: ["sh", "/s3/seed.sh", "http://garage:3900", "garage", "garage"]
+    <<: *s3-one-shot-limits
+
+  rustfs:
+    image: rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
+    container_name: libredb-rustfs
+    restart: unless-stopped
+    environment:
+      RUSTFS_ACCESS_KEY: libredb
+      RUSTFS_SECRET_KEY: "Probe123pass!"
+      # RustFS asks version.rustfs.com for the latest release at startup unless this is false (docker/s3/README.md,
+      # "Telemetry").
+      RUSTFS_CHECK_UPDATE: "false"
+    ports:
+      - "127.0.0.1:9020:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9000/health/ready"]
+      start_period: 30s
+      start_interval: 1s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1792M
+    memswap_limit: 1792M
+
+  rustfs-principals:
+    # pgsty/mc, not the source-built mc: RustFS starts on a plain up, which must never build from
+    # source (docker/s3/README.md).
+    image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z@sha256:cfc83108c3abb371f8fb84d99c1fdc88f8c237e022409b0081fb7c0a3be634dd
+    container_name: libredb-rustfs-principals
+    restart: "no"
+    depends_on: { rustfs: { condition: service_healthy } }
+    volumes: ["./docker/s3:/s3:ro"]
+    environment:
+      <<: *s3-root-env
+      MC_CONFIG_DIR: /tmp/.mc
+    entrypoint: ["sh", "/s3/principals.sh", "http://rustfs:9000"]
+    <<: *s3-one-shot-limits
+
+  rustfs-seed:
+    image: *s3-seed-curl
+    container_name: libredb-rustfs-seed
+    restart: "no"
+    depends_on: { rustfs: { condition: service_healthy } }
+    volumes: *s3-seed-mounts
+    environment: *s3-seed-root-env
+    entrypoint: ["sh", "/s3/seed.sh", "http://rustfs:9000", "us-east-1", "rustfs"]
+    <<: *s3-one-shot-limits
 
   # ==========================================================================
   # Wire-compatible engines (issue #424, Phase 0)
@@ -810,6 +3379,12 @@ services:
       MARIADB_DATABASE: probe
     ports:
       - "3307:3306"
+    volumes:
+      # The MariaDB half of the object-browser fixture (#789), and it is a SEPARATE file
+      # from the MySQL one on purpose: this provider's `objectKinds` is resolved from the
+      # server's own version string, and MariaDB declares `package` and `sequence`, which
+      # MySQL does not have at all. See docs/providers/mysql.md.
+      - ./docker/mariadb-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD", "mariadb-admin", "ping", "-uroot", "-proot", "--silent"]
       interval: 5s
@@ -834,9 +3409,9 @@ services:
   # Databend serves a MySQL wire handler on 3307 (not 3306) beside its own HTTP API on 8000.
   # Connect as `mysql` on the published 13308.
   #
-  # It earns a `query-only` row and the reason is ours: every parameterised read answers
-  # `Prepare is not support in Databend`. So this service exists to reproduce that, and to
-  # re-measure it when the prepared-protocol question is settled.
+  # It implements no prepared statement (`Prepare is not support in Databend`), so the provider
+  # binds parameterised reads client-side there, and that is what this service reproduces. Its
+  # row is `partial`: the overview, health and session panels have no source on the engine.
   #
   # PINNED to a patch release rather than `nightly`, which is what the tag list mostly holds.
   databend:
@@ -1044,9 +3619,9 @@ services:
   # Microsoft Garnet, the fourth RESP relative. Single container, no configuration, and it
   # needs no password - it starts with none, like the `redis` service above.
   #
-  # PINNED to 2.1.5: Garnet is the one relative here that publishes its own version
-  # (`garnet_version` in INFO), so the tag and the caveat about which version the product
-  # displays have to stay in step.
+  # PINNED to 2.1.5: Garnet publishes its own version (`garnet_version` in INFO), as Valkey
+  # and DragonflyDB do, so the tag and the caveat about which version the product displays
+  # have to stay in step.
   #
   # No volume, deliberately: Garnet holds everything in memory here and a restart empties it
   # (measured - `dbsize` 71 before a `docker stop`, 0 after), so re-run the key seeding from
@@ -1131,10 +3706,207 @@ services:
       - "9142:9042"
     mem_limit: 4g
 
+  # -- Prometheus HTTP API -------------------------------------------------
+
+  # VictoriaMetrics single-node, the wire-compatible relative of the `prometheus` provider
+  # (#1085 section 7): the Prometheus querying API on 8428, evaluated by MetricsQL, its own
+  # query language. The relative is claimed for PromQL only.
+  #
+  # PINNED to v1.152.0, the build the gate-4 probe ran against. The v1.136.x LTS line is not
+  # published as an open-source image (#1085 section 7: `v1.136.15` answers 404 on Docker
+  # Hub), so there is no LTS tag to pin instead.
+  #
+  # It scrapes the targets of the `prometheus` service through the compose network
+  # (docker/victoriametrics/scrape.yml), so the two servers can be asked the same questions
+  # side by side, and it waits for that service to be healthy because its main target is that
+  # service. Single-node VictoriaMetrics evaluates no rules, so every metric the rule files in
+  # docker/prometheus/rules/ produce exists on 9090 only.
+  #
+  # No healthcheck, deliberately: which health path this build answers is one of the
+  # questions the probe asks, so a check here would presuppose the answer.
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.152.0
+    container_name: libredb-victoriametrics
+    profiles: ["compat"]
+    command:
+      - "-promscrape.config=/etc/victoriametrics/scrape.yml"
+    volumes:
+      - ./docker/victoriametrics:/etc/victoriametrics:ro
+    ports:
+      - "8428:8428"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+
+  # -- Kafka wire -------------------------------------------------------------
+
+  # Redpanda, the wire-compatible relative of the `kafka` provider (#1088 section 8), seeded
+  # by the same two scripts as the `kafka` service:
+  #   docker run --rm --network host -v "$PWD/docker/kafka/seed.sh:/seed.sh:ro" \
+  #     --entrypoint bash apache/kafka:4.3.1 /seed.sh localhost:29092
+  #   bun docker/kafka/seed-binary.ts localhost:29092
+  #
+  # PINNED to v26.2.2, the latest GitHub release on 2026-09-23. Docker Hub also carries
+  # v26.2.3 with no matching tag in redpanda-data/redpanda, so it is not treated as released.
+  # No healthcheck: which surfaces this build answers is what the probe asks.
+  redpanda:
+    image: redpandadata/redpanda:v26.2.2
+    container_name: libredb-redpanda
+    profiles: ["compat"]
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      # Seastar's own memory, fixed rather than sized from the container at start; the
+      # seeded fixture peaked at 219 MiB of the container.
+      - --memory=1G
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:29092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:29092
+    ports:
+      - "127.0.0.1:29092:29092"
+    # 512M above the 1G Seastar is given, for what it allocates outside that; one core for
+    # --smp=1 (measured peak 0.19 of one core); no swap past it.
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1536M
+    memswap_limit: 1536M
+
+  # ---------------------------------------------------------------------------------------
+  # Firestore (the firestore provider). The official Cloud SDK emulators image runs the
+  # Firestore emulator, which speaks plain HTTP and keeps everything in memory: removing the
+  # container resets it. A one-shot seeder on the same image writes docker/firestore/seed.json
+  # over REST. Studio reaches the emulator only through FIRESTORE_EMULATOR_HOST on the server,
+  # never through a connection field: firestore:8080 inside this network, 127.0.0.1:8380 from
+  # the host, because Trino holds host port 8080. docker/firestore/README.md describes the data.
+  # ---------------------------------------------------------------------------------------
+  firestore:
+    # Cloud SDK 587.0.0, whose cloud-firestore-emulator component is 1.22.0, the version the
+    # captures under tests/fixtures/firestore/ were recorded from.
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:587.0.0-emulators@sha256:8d8573471c489a409f03891d2c24d177fa531276184f7002b9a2d853d1b3ed54
+    container_name: libredb-firestore
+    restart: unless-stopped
+    command: ["gcloud", "emulators", "firestore", "start", "--host-port=0.0.0.0:8080", "--project=demo-libredb"]
+    ports:
+      - "127.0.0.1:8380:8080"
+    healthcheck:
+      # The emulator answers "Ok" on its root once it serves requests.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/"]
+      start_period: 60s
+      start_interval: 1s
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+    memswap_limit: 2G
+
+  firestore-seed:
+    # One-shot seed (docker/firestore/seed.py), standard-library Python on the same image, so
+    # nothing else is pulled. It rewrites the same documents on every run.
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:587.0.0-emulators@sha256:8d8573471c489a409f03891d2c24d177fa531276184f7002b9a2d853d1b3ed54
+    container_name: libredb-firestore-seed
+    restart: "no"
+    depends_on:
+      firestore:
+        condition: service_healthy
+    volumes:
+      - ./docker/firestore:/seed:ro
+    entrypoint: ["python3", "/seed/seed.py"]
+    command: ["--host", "firestore:8080"]
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256M
+    memswap_limit: 256M
+
+  # Kubernetes has no service here: a cluster is not a compose service. docker/kubernetes/README.md makes the
+  # throwaway k3s clusters its fixtures and its live pass use, and docs/providers/kubernetes.md connects to them.
+
+  # -- MTConnect, the agent and the device behind it (#1722) ---------------------
+
+  # FIXTURE CLASSES, declared rather than implied:
+  #  - the agent is class A, a third party image pinned by digest. It is the half that matters:
+  #    the provider reads XML cppagent produced, with its own Header, sequence numbers and 404s,
+  #    rather than XML this repository wrote.
+  #  - the adapter is class B, written here, and the declaration carries the three parts the test
+  #    surface contract asks for:
+  #    1. THE REFERENCE IMPLEMENTATION EXISTS AND IS NAMED: `mtconnect/demo`, the Institute's own
+  #       image, which runs `run_scenario.rb` replaying recorded Mazak and OKUMA logs into the same
+  #       agent. MEASURED on `mtconnect/demo:2.8.0.4`: two device models, 201 observations, 144 of
+  #       them carrying a value.
+  #    2. THE REASON IS MEASURED, not a preference. That image's devices and values come from its
+  #       own recorded logs: its X position reads 4773.5319 and its devices are Mazak and OKUMA.
+  #       The screen check this fixture exists for rests on a number that can only have come from
+  #       here, which is why the positions read 1722.5, 1723.5 and 1724.5 and the program is named
+  #       for the issue. Changing the demo's values means editing its data files, and an edited
+  #       third party image is no longer class A. The CONDITION and the asset are chosen the same
+  #       way: they exercise named paths (`nativeCode`, a CuttingTool document) that the recorded
+  #       scenarios do not reach on demand.
+  #    3. THE SCOPE IT DOES NOT IMITATE, so nobody reads this fixture as a machine: no timing
+  #       jitter, no fault or warning transitions over time (the condition is set once), no
+  #       UNAVAILABLE transitions, no reconnection behaviour, and only the single-line asset form
+  #       of SHDR. None of those were measured against a real machine here; what WAS verified is
+  #       that the agent accepts the stream, its `ConnectionStatus` reads ESTABLISHED, and the
+  #       values arrive in `/current` with the agent's own timestamps and sequence numbers. The
+  #       VALUES are this repository's choice; the ENCODING they are read back through is not.
+
+  # The agent republishes what an adapter tells it, so the fixture is two services: without the
+  # adapter every data item answers UNAVAILABLE and a read proves nothing. The provider therefore
+  # reads values that travelled device -> agent -> HTTP, which is the shape a real installation has.
+  #
+  # The published port is not 5000, the Institute's default: MEASURED on the development machine,
+  # macOS binds 5000 to Control Center's AirPlay receiver, so a fixture on 5000 is unreachable
+  # there. 17322 carries the issue number and is free.
+  mtconnect:
+    image: mtconnect/agent:2.8.0.4@sha256:c42f90850ab70d65ae5e73b14392b3041ed51065bd7bf287658db6f7260df641
+    container_name: libredb-mtconnect
+    init: true
+    depends_on:
+      - mtconnect-adapter
+    volumes:
+      - ./docker/mtconnect-init:/mtconnect/config:ro
+    ports:
+      - "127.0.0.1:17322:5000"
+    healthcheck:
+      # /probe is the one route that answers before any adapter data arrives.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:5000/probe > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # The device. Python's standard library only, so the image needs no install step; the digest is
+  # the one database-compose.yml already pins for the vector seeds.
+  mtconnect-adapter:
+    image: python:3.14-slim@sha256:0741d101873c12ab927e6f8653feb8862b9bd58771177acb1b885b95141f91b4
+    container_name: libredb-mtconnect-adapter
+    init: true
+    volumes:
+      - ./docker/mtconnect-init:/fixture:ro
+    command: ["python", "/fixture/adapter.py"]
+
 volumes:
-  # Named volumes only for Druid: it is the one service here whose processes must share
-  # state (deep storage) and whose task history is worth surviving a restart. Everything
-  # above uses the image's own anonymous volumes.
+  # Named volumes for Druid, for the certificates of kafka-auth and the etcd auth fixtures, and
+  # for the vector fixtures. Druid is the one service here whose processes must share state
+  # (deep storage) and whose task history is worth surviving a restart; kafka-auth-certs hands
+  # the generated CA and broker certificate from the one-shot kafka-auth-certs service to the
+  # broker, and etcd-auth-certs the generated certificates and passwords from etcd-auth-certs to
+  # the two etcd auth servers and their init one-shots. Each Milvus server keeps its data in a
+  # volume of its own, because the image runs as uid 999 and a bind mount crashed it;
+  # milvus-certs and milvus-credentials hold the generated certificates and the seeded users'
+  # passwords, and qdrant-keys the generated Qdrant keys, local.yaml files and certificates.
+  # influxdb2-read-token keeps the InfluxDB 2.x read-only token influxdb-seed created, whose
+  # value the server shows only once. oxia-auth-material carries the generated certificates, JWT
+  # keys and tokens from oxia-auth-certs to the Oxia auth server. s3-garage-keys keeps Garage's
+  # generated RPC secret, admin and metrics tokens and its four key secrets, and s3-certs the TLS
+  # fixture's generated CA and certificate. Everything else uses the image's own anonymous volumes.
   #
   # druid_shared is the deep-storage + indexing-log volume, mounted by the three processes
   # that write or read segments. A `down -v` resets the cluster to empty.
@@ -1144,3 +3916,16 @@ volumes:
   druid_middlemanager_var: {}
   druid_broker_var: {}
   druid_router_var: {}
+  kafka-auth-certs: {}
+  etcd-auth-certs: {}
+  oxia-auth-material: {}
+  milvus-data: {}
+  milvus-tls-data: {}
+  milvus-mtls-data: {}
+  milvus-certs: {}
+  milvus-credentials: {}
+  qdrant-keys: {}
+  influxdb2-read-token: {}
+  s3-garage-keys: {}
+  s3-certs: {}
+  rabbitmq-tls-certs: {}

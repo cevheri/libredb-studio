@@ -17,8 +17,13 @@ const mockLogin = mock(async () => {});
 
 mock.module("@/lib/auth", () => ({
   getSession: mockGetSession,
+  readSession: mock(async () => {
+    const s = await mockGetSession();
+    return s ? { kind: "authenticated", session: s } : { kind: "anonymous" };
+  }),
   logout: mockLogout,
   login: mockLogin,
+  shouldMarkCookieSecure: mock(async () => false),
   signJWT: mock(async () => "mock-token"),
   verifyJWT: mock(async () => null),
 }));
@@ -28,8 +33,10 @@ const mockDecryptState = mock(async () => ({
   state: "state",
   nonce: "nonce",
 }));
+/** An ID token's claims as openid-client hands them over: `iss` and `sub` are always there. */
+const ID_TOKEN_CLAIMS = { iss: "https://example.auth0.com", sub: "user-123", email: "user@example.com" };
 const mockExchangeCode = mock(
-  async () => ({ email: "user@example.com", sub: "user-123" }) as Record<string, unknown> | null,
+  async () => ({ claims: { ...ID_TOKEN_CLAIMS }, idToken: "raw.id.token" }) as Record<string, unknown> | null,
 );
 const mockDiscoverProvider = mock(async () => "mock-config");
 const mockGetOIDCConfig = mock(() => ({ roleClaim: "roles", adminRoles: ["admin"] }));
@@ -42,6 +49,8 @@ mock.module("@/lib/oidc", () => ({
   decryptState: mockDecryptState,
   exchangeCode: mockExchangeCode,
   mapOIDCRole: mock(() => "user" as "admin" | "user"),
+  readRoleClaimValues: mock(() => []),
+  mapOIDCClaimRoles: mock(() => ({ roles: [], overflow: false })),
   resetDiscoveryCache: mock(() => {}),
   buildLogoutUrl: mock(async () => null as string | null),
   getPublicOrigin: mock((req: Request) => new URL(req.url).origin),
@@ -76,7 +85,7 @@ beforeEach(() => {
     name === "oidc-state" ? { name, value: "state-cookie" } : undefined,
   );
   mockDecryptState.mockImplementation(async () => ({ code_verifier: "v", state: "s", nonce: "n" }));
-  mockExchangeCode.mockImplementation(async () => ({ email: "user@example.com", sub: "user-123" }));
+  mockExchangeCode.mockImplementation(async () => ({ claims: { ...ID_TOKEN_CLAIMS }, idToken: "raw.id.token" }));
   mockDiscoverProvider.mockImplementation(async () => "mock-config");
 });
 

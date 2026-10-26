@@ -6,7 +6,7 @@
 # Bun for fast dependency installation, Node.js for build
 # Bun's JIT compiler segfaults under QEMU emulation (ARM64 cross-build),
 # so we use Node.js for the Next.js build step.
-FROM oven/bun:1.4.0 AS deps
+FROM oven/bun:1.4.2 AS deps
 WORKDIR /usr/src/app
 RUN apt-get update && apt-get install -y python3 make g++ --no-install-recommends && rm -rf /var/lib/apt/lists/*
 COPY package.json bun.lock ./
@@ -28,13 +28,16 @@ RUN bun install --frozen-lockfile
 # between whichever ones are present. Every stage here is glibc, so the glibc
 # package is the one installed and the one loaded; keeping the stages on the
 # same base is what makes that hold.
-FROM node:26.8.1-trixie-slim AS builder
+FROM node:26.12.1-trixie-slim AS builder
 WORKDIR /usr/src/app
 COPY --from=deps /usr/src/app/node_modules ./node_modules
 COPY . .
 
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV DOCKER_BUILD=true
+
+# Next.js bakes this prefix into routes and browser bundles. Rebuild to change it.
+ARG BASE_PATH=""
 
 ARG JWT_SECRET_BUILD="build-time-placeholder-secret-32ch"
 ARG ADMIN_PASSWORD_BUILD="build"
@@ -47,9 +50,94 @@ ENV USER_PASSWORD=$USER_PASSWORD_BUILD
 # origin (issue #247). Explicit here: this bypasses the package.json build script.
 RUN node scripts/copy-monaco.mjs && npx next build
 
+# Drop the repo-root extras Next's output file tracing swept into the payload
+# (issue #124). Tracing walks the repository root, so `.next/standalone` carries
+# `src/`, `scripts/`, the lockfile, the tooling configs and this file - and the
+# runner below unpacks all of it onto /app. Shipping application source in a
+# production image is a security property before it is a size one.
+#
+# The deny-list is not reimplemented here: `prune-standalone-payload.sh` is the
+# one the release tarballs, .deb/.rpm, snap and the npx cache already use, so a
+# new root file leaves every artifact family through one edit. The script refuses
+# to run against anything that is not an assembled payload, and the asserts below
+# are what turn an over-eager future entry into a failed build rather than a
+# provider failing at runtime. `seed-assets/` is not on the list and is COPYed
+# explicitly below in any case; nothing else under /app is read at runtime
+# (src/lib/seed/sqlite-sample.ts is the only `process.cwd()` reader).
+#
+# HERE rather than in the runner: an `rm` after a COPY deletes the files in a
+# later layer while leaving every byte of them in the layer the COPY created.
+#
+# `public/screenshots` goes with it: 4.4 MB of README and marketing artwork that
+# no running container ever serves, because src/app/layout.tsx points social
+# previews at raw.githubusercontent.com. It is not a payload-root entry, so the
+# deny-list cannot reach it.
+#
+# The native payload is pruned in the same step, and it is the larger half.
+# Neither `@duckdb/node-bindings-<platform>-<arch>[-musl]` package declares a
+# libc field, so bun installs the glibc AND the musl one whatever the stage runs
+# on; sharp ships the same way; and better-sqlite3 13 carries eight prebuilds
+# (darwin, win32, linux, linuxmusl x two arches) plus the 9.9 MB SQLite
+# amalgamation it would compile from if it ever had to. Measured in the image
+# published on 2026-09-18: 71 MB of musl DuckDB bindings, 19 MB of musl libvips
+# and six unloadable prebuilds, none of which any process in a glibc image can
+# open. It lands twice, because `next build` writes a second traced copy of
+# those packages into `.next/standalone/node_modules` and the runner unpacks it
+# onto the same /app the explicit COPYs below land in - which is why the loop
+# below walks both trees, and why this step took the image from 892 MB to 649 MB
+# (292 MB to 203 MB compressed, amd64) rather than the ~115 MB one tree holds.
+#
+# GLOBS AND $(node -p process.arch), NEVER A LITERAL. The deps stage installs the
+# bindings package for the BUILD arch, so naming linux-x64 would break the arm64
+# leg of the same manifest (tests/unit/packaging-duckdb-native.test.ts asserts
+# that literal is absent). `*-linux-*` does not match `*-linuxmusl-*`, because
+# "linux-" is not a prefix of "linuxmusl-", so the two sharp patterns below are
+# each other's complement rather than overlapping.
+#
+# The `test` lines are the point of the step: a glob that took the payload this
+# image DOES load would otherwise surface as a provider failing at runtime, long
+# after the build went green.
+#
+# db2-node (#786) is the opposite of the @duckdb case: one package with all
+# eight prebuilt addons at its root, which its index.js reaches through static
+# require literals, so file tracing copies every one of them into
+# .next/standalone/node_modules/db2-node and nothing else needs a COPY. Only
+# that traced tree reaches the runner, so only it is pruned, to the glibc addon
+# for the build arch (glob plus $ARCH, as above), then counted and loaded:
+# builder and runner share the trixie-slim base, so a load here is a load there.
+#
+# oracledb keeps every platform's addon on purpose. This is the only variant
+# where Thick mode can be turned on at all, the whole build/ directory is ~3 MB,
+# and the package resolves the addon at runtime from its own __dirname.
+RUN set -eux; \
+    bash scripts/lib/prune-standalone-payload.sh .next/standalone; \
+    rm -rf public/screenshots .next/standalone/public/screenshots; \
+    ARCH="$(node -p 'process.arch')"; \
+    for root in node_modules .next/standalone/node_modules; do \
+      [ -d "$root/@duckdb" ] && find "$root/@duckdb" -maxdepth 1 -type d -name 'node-bindings-*-musl' -exec rm -rf {} + ; \
+      [ -d "$root/@img" ] && find "$root/@img" -maxdepth 1 -type d -name '*-linuxmusl-*' -exec rm -rf {} + ; \
+      [ -d "$root/better-sqlite3/prebuilds" ] && find "$root/better-sqlite3/prebuilds" -maxdepth 1 -type f -name '*.node' ! -name "linux-${ARCH}.node" -delete ; \
+      rm -rf "$root/better-sqlite3/deps" "$root/better-sqlite3/src" "$root/better-sqlite3/binding.gyp"; \
+      true; \
+    done; \
+    find .next/standalone/node_modules/db2-node -maxdepth 1 -type f -name 'db2-node.*.node' ! -name "db2-node.linux-${ARCH}-gnu.node" -delete; \
+    test -f ".next/standalone/node_modules/db2-node/db2-node.linux-${ARCH}-gnu.node"; \
+    test "$(find .next/standalone/node_modules/db2-node -name '*.node' | wc -l)" -eq 1; \
+    node -e "require('/usr/src/app/.next/standalone/node_modules/db2-node')"; \
+    test -f "node_modules/@duckdb/node-bindings-linux-${ARCH}/libduckdb.so"; \
+    test -d "node_modules/@img/sharp-libvips-linux-${ARCH}"; \
+    test -f "node_modules/better-sqlite3/prebuilds/linux-${ARCH}.node"; \
+    test -d node_modules/oracledb/build; \
+    test -f .next/standalone/server.js; \
+    test -d .next/standalone/node_modules; \
+    test ! -e .next/standalone/src; \
+    test ! -e .next/standalone/Dockerfile; \
+    echo "--- native payload surviving the prune ---"; \
+    find node_modules .next/standalone/node_modules \( -name '*.node' -o -name '*.so' -o -name '*.so.*' \) | sort | xargs -r ls -lh | awk '{print $5, $9}'
+
 # Production image - use Node.js slim for lower memory footprint
 # trixie-slim: glibc must match the stage where native modules were built (see builder).
-FROM node:26.8.1-trixie-slim AS runner
+FROM node:26.12.1-trixie-slim AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
@@ -111,6 +199,31 @@ COPY --from=builder /usr/src/app/node_modules/@libredb/libredb ./node_modules/@l
 COPY --from=builder /usr/src/app/node_modules/@duckdb ./node_modules/@duckdb
 COPY --from=builder /usr/src/app/node_modules/detect-libc ./node_modules/detect-libc
 
+# Copy the Oracle driver (#538). It is pure JavaScript in its default Thin mode,
+# which is why it was never copied before, but Thick mode
+# (ORACLE_CLIENT_LIB_DIR) makes node-oracledb load a native addon and that addon
+# is missed by BOTH build stages, for two separate reasons.
+# 1. Bundling: node-oracledb resolves the addon relative to its own __dirname,
+#    and Turbopack rewrote that to the literal string /ROOT/node_modules/
+#    oracledb/lib, so initOracleClient() died with NJS-045 before it ever looked
+#    at the Instant Client. That is why the package is now in
+#    serverExternalPackages (next.config.ts); this COPY is what makes "external"
+#    resolvable at runtime.
+# 2. Tracing: even externalized, Next's output file tracing copies index.js,
+#    lib/ and package.json but not build/Release/*.node, because the addon is
+#    reached through a computed require(path) rather than a literal specifier -
+#    the same blind spot as @libredb/libredb and the @duckdb scope.
+# The whole package directory, never one file: build/ holds a binary per
+# platform and arch (~3 MB total), and naming one would break the ARM64 leg.
+# This image stays Thin-only - no Instant Client, no libaio - so the addon sits
+# unused until an operator layers a client on top; see docs/providers/oracle.md.
+# Keep in sync with scripts/build-standalone-payload.sh.
+COPY --from=builder /usr/src/app/node_modules/oracledb ./node_modules/oracledb
+
+# Notices for the Rust crates compiled into db2-node's addons, which its npm
+# tarball does not carry (keep scripts/build-standalone-payload.sh in sync).
+COPY --from=builder /usr/src/app/THIRD_PARTY_NOTICES.txt ./THIRD_PARTY_NOTICES.txt
+
 # Vendored sample database templates (the SQLite employees sample). Read at
 # runtime via fs relative to process.cwd() (/app), so output file tracing
 # never sees them — copy explicitly (keep scripts/build-standalone-payload.sh
@@ -138,6 +251,13 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # outside the standalone payload so the native channels - which bind 127.0.0.1
 # by design (#134) - can never inherit container bind policy.
 COPY docker/bind-address.mjs /usr/local/lib/libredb-studio/bind-address.mjs
+# The CapRover discovery exporter (docker/discover.mjs) sits next to it for the
+# same two reasons. The auto-connect template runs it as a second app, as root
+# and with the Docker socket mounted, so it is copied WITHOUT --chown: the
+# uid 1001 web process must never be able to rewrite a script that holds the
+# socket. No image creates the directory it writes to; Docker creates the named
+# volume's root as root:root 0755, the only shape the exporter accepts.
+COPY docker/discover.mjs /usr/local/lib/libredb-studio/discover.mjs
 
 # Render uses PORT env variable, default to 3000
 EXPOSE 3000/tcp

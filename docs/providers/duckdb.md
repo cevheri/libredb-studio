@@ -12,7 +12,7 @@
 | **Status** | Implemented & shipped |
 | **Database type id** | `duckdb` |
 | **Family** | SQL (`src/lib/db/providers/sql/duckdb/`) — embedded / file-based, like `sqlite` |
-| **Driver** | `@duckdb/node-api` 1.5.5-r.4 — a **native N-API binding**, not a pure-JS client. Four packages, ~70 MB of shared library per platform (§9) |
+| **Driver** | `@duckdb/node-api` 1.5.5-r.4 — a **native N-API binding**, not a pure-JS client. Four packages, ~70 MB of shared library per platform (§11) |
 | **Query language** | `sql` (DuckDB's own PostgreSQL-flavoured dialect; `version()` answered `v1.5.5`) |
 | **Default port** | `null` — there is no network listener |
 | **Connection** | A **server-local file path** (or `:memory:`) — **not** a network endpoint |
@@ -21,15 +21,19 @@
 | **Connection pooling** | None — one instance, one connection, held for the life of the connection |
 | **EXPLAIN** | `duckdb-json` — `EXPLAIN (FORMAT JSON)`. The **ANALYZE variant is never emitted, permanently**: measured, `EXPLAIN (ANALYZE, FORMAT JSON) <statement>` **EXECUTES the statement** (§5) |
 | **Transactions** | Not exposed (`supportsTransactions: false`) — the provider holds no explicit begin/commit/rollback API |
+| **Result pagination** | `supportsResultPagination: true` — `prepareQuery` applies a positive offset as `LIMIT n OFFSET m` through the shared limiter, so the results grid offers Load More (#816) |
 | **Query cancellation** | Yes — `DuckDBConnection.prototype.interrupt()` exists in 1.5.5-r.4 and is what `cancelQuery` calls (§3.9) |
-| **Agent read-only profile** | Yes — a separate handle opened `access_mode: 'READ_ONLY'` **and** `enable_external_access: 'false'`, because the read-only flag alone is not a filesystem sandbox. The SQL denylist remains only as defence in depth (§3.10, §11) |
+| **Agent read-only profile** | Yes — a separate handle opened `access_mode: 'READ_ONLY'` **and** `enable_external_access: 'false'`, because the read-only flag alone is not a filesystem sandbox. The SQL denylist remains only as defence in depth (§3.10, §14)|
+| **Non-admin file access** | **Closed at statement level**: the editor handle opens `enable_external_access: 'false'`, read-write, for every non-admin role and for every role on a seed a non-admin role can use, so no statement reaches the network or a file other than the database's own and the handle's private temp directory, while that database stays editable and its path is still the connection's choice; an admin keeps full reach on an inline connection and on an admin-only seed, and the posture is server-derived from the session and the resolved connection, never the request body (§3.16, §14.3) |
 | **Maintenance** | `vacuum` and `analyze` (per table **and** global), `optimize` mapped onto `CHECKPOINT` (global only). `reindex`, `check` and `kill` are withheld — measured unsupported (§8) |
 | **Concurrency** | `singleWriterFile: true` — a **second process is refused even read-only** (§3.8) |
+| **Extensions** | Never installed or loaded implicitly: every handle opens with `autoinstall_known_extensions`, `autoload_known_extensions` and `allow_community_extensions` off, and a file that is not a DuckDB database is refused before the engine opens it; only DuckDB's signed extensions can load, `INSTALL` and `LOAD` in the admin editor are the way in, the denied posture refuses `INSTALL` and the `LOAD` of any extension that is not bundled (§3.14, §3.16), and the admin editor's remaining network reach is in §14.4 |
+| **Unwritable file** | Opened `READ_ONLY` in the editor, so reads work and the engine refuses writes (§3.15) |
 | **Source** | [`src/lib/db/providers/sql/duckdb/`](../../src/lib/db/providers/sql/duckdb/) |
 | **Tests** | [`tests/integration/db/duckdb-provider.test.ts`](../../tests/integration/db/duckdb-provider.test.ts) |
 | **Tracking issue** | [#424 — the database coverage map](https://github.com/libredb/libredb-studio/issues/424) |
 | **Probed against** | DuckDB **v1.5.5** embedded through `@duckdb/node-api` **1.5.5-r.4**, under **Node 24.14.0** and **Bun 1.3.14**, on **2026-08-27** |
-| **Reproducible with** | `bun add @duckdb/node-api@1.5.5-r.4` — the engine ships inside the package, so there is no image to pull and no service in `database-compose.yml` (§10). Every statement quoted below was run against a two-schema fixture built from scratch; the integration test builds the same fixture in a temp directory |
+| **Reproducible with** | `bun add @duckdb/node-api@1.5.5-r.4` — the engine ships inside the package, so there is no image to pull and no service in `database-compose.yml` (§11). Every statement quoted below was run against a two-schema fixture built from scratch; the integration test builds the same fixture in a temp directory |
 
 ---
 
@@ -45,8 +49,8 @@ is a native N-API addon carrying a 70 MB shared library rather than a runtime bu
 
 It is a separate type-id from `sqlite`, not a relative of it, for the same reason libSQL is: the
 execution layer has nothing in common. `bun:sqlite` is synchronous and returns JavaScript values;
-`@duckdb/node-api` is asynchronous, returns a reader, and can only be serialised through
-`getRowObjectsJson()` (§3.2). Every catalog statement differs. Every maintenance statement differs.
+`@duckdb/node-api` is asynchronous, returns a reader, and can only be serialised through its
+JSON readers (§3.2). Every catalog statement differs. Every maintenance statement differs.
 Sharing an id would mean one document describing two sets of measurements.
 
 ### 1.1 Deployment constraint
@@ -61,6 +65,15 @@ One consequence is sharper than SQLite's, and it is measured rather than inherit
 open by a writer **cannot be opened by a second process at all, not even read-only** (§3.8). Two
 Studio replicas pointed at one file is not a degraded configuration, it is a broken one.
 
+**Not in the `-alpine-slim` image.** The driver is four packages ending in a ~70 MB `libduckdb.so`,
+which makes it the largest removable item in that variant, so it is left out on purpose (issue #840,
+[DISTRIBUTION.md](../DISTRIBUTION.md)). Every other engine is unaffected, because `openDuckDBClient`
+reaches the driver through `await import(...)` and nothing else in the process touches it. Opening a
+DuckDB connection there fails with a `ConnectionError` naming the tags that do ship the driver —
+`describeDriverAbsence` in [client.ts](../../src/lib/db/providers/sql/duckdb/client.ts) — rather
+than a raw module-resolution stack. The default and `-alpine` tags ship it, and so does every
+non-Docker channel.
+
 ### 1.2 Concept mapping
 
 | DuckDB | This product | Note |
@@ -70,7 +83,10 @@ Studio replicas pointed at one file is not a degraded configuration, it is a bro
 | Schema (`main`, `analytics`, …) | Schema | The default is `main`, and it is flagged `internal` (§3.3) |
 | Table | Table | `duckdb_tables()` |
 | View | View | `duckdb_views()` |
-| Index | Index | `duckdb_indexes()` |
+| Index | Index | `duckdb_indexes()`; an attribute of a table here, not an object kind |
+| Macro (`CREATE MACRO`) | Routine | `duckdb_functions()` filtered on `function_type`; both the scalar and the table form |
+| Sequence | Sequence | `duckdb_sequences()` |
+| Secret | (none) | Outside the catalog hierarchy; not in the object tree (§6) |
 | — | Credential | None exists. The file's permissions are the only access control |
 | — | Session, slow-query log | Neither exists (§3.7) |
 
@@ -87,7 +103,7 @@ src/lib/db/providers/sql/duckdb/
 ```
 
 The driver seam is narrow by construction: `DuckDBInstance` / `DuckDBConnection` and the reader API
-(`runAndReadAll`, `getRowObjectsJson`, `columnNames`, `columnTypes`, `rowsChanged`, `interrupt`) are
+(`runAndReadAll`, `getRowsJson`, `columnNames`, `columnTypes`, `rowsChanged`, `interrupt`) are
 vocabulary of `@duckdb/node-api` and stay inside **`client.ts`** — `duckdb-seam-guard.test.ts` fails
 the build when any of it appears in a sibling. The import of the driver is dynamic and lives inside
 the open function, never at module scope, so the ~70 MB `libduckdb.so` is not loaded into a process
@@ -115,7 +131,7 @@ scoped with `database_name = current_database()` rather than by name, and object
 qualifies `schema.table`. A user who hits the binder error in the editor is being told about their
 own file name, and the doc says so here rather than leaving it to be rediscovered.
 
-### 3.2 `getRowObjects()` is banned; rows come from `getRowObjectsJson()`
+### 3.2 `getRowObjects()` is banned; rows come from `getRowsJson()`
 
 `getRowObjects()` throws the moment a result is serialised:
 
@@ -125,8 +141,9 @@ JSON.stringify cannot serialize BigInt       (Bun 1.3.14)
 ```
 
 Wide integers arrive as JavaScript `BigInt` values in that shape, so a table with a `BIGINT` primary
-key would break the whole API response rather than one cell. `getRowObjectsJson()` is the
-only reader used on the API path, and it hands back values that are already JSON-safe.
+key would break the whole API response rather than one cell. The JSON readers hand back values that
+are already JSON-safe, and `getRowsJson()`, which answers each row as an array, is the only reader
+used ([Result column names](#result-column-names) says why the array form and not `getRowObjectsJson()`).
 
 For
 
@@ -157,7 +174,7 @@ Wide integers staying as strings is the engine protecting exactness, and the pro
 "repair" it: `Number("9223372036854775807")` is a different number, and a rounded key is a
 corruption nothing downstream can detect. The grid renders the string as measured.
 
-**Columns come from `columnNames()`, never from the rows.** `getRowObjectsJson()` returns `[]` for an
+**Columns come from `columnNames()`, never from the rows.** `getRowsJson()` returns `[]` for an
 empty result set and carries no column information, while `columnNames()` and `columnTypes()` answer
 regardless. `columnTypes().map(String)` gives DuckDB's own type text — `INTEGER`, `VARCHAR`,
 `INTEGER[]`, `STRUCT("x" INTEGER)`, `HUGEINT`, `INTERVAL`, `UUID` — which is what populates
@@ -264,7 +281,7 @@ a nested `children`) — an OBJECT, not the array `physical_plan` publishes.
 So the provider offers the JSON **physical plan** and never the analyze form. There is no timing
 data to show and none is faked. This is not a version to wait out: a later DuckDB that emits valid
 analyze JSON makes the hazard **worse**, because the plan would then look usable while still
-executing whatever the user asked only to see (§12).
+executing whatever the user asked only to see (§15).
 
 ### 3.7 No slow-query log and no session list — the empties are the engine's
 
@@ -302,9 +319,9 @@ rather than a gap.
 
 | Scenario | Measured |
 |---|---|
-| Second read-write `DuckDBInstance.create` on the same file, **same process** | ALLOWED |
+| Second read-write `DuckDBInstance.create` on the same file, **same process** | ALLOWED on Linux and macOS, REFUSED on Windows (see below) |
 | `DuckDBInstance.fromCache` on the same file, same process | ALLOWED |
-| Second `access_mode: 'READ_ONLY'` instance, same process, while a writer is open | ALLOWED, and genuinely read-only — `current_setting('access_mode')` is `read_only`, `duckdb_databases().readonly` is true, `INSERT` is refused |
+| Second `access_mode: 'READ_ONLY'` instance, same process, while a writer is open | ALLOWED on Linux and macOS, and genuinely read-only: `current_setting('access_mode')` is `read_only`, `duckdb_databases().readonly` is true, `INSERT` is refused |
 | Second read-write **process** while a writer holds the file | `IO Error: Could not set lock on file …: Conflicting lock is held in … (PID nnn)` |
 | Second **READ_ONLY process** while a writer holds the file | **ALSO refused**, with the same lock error |
 | `READ_ONLY` open of a file that does not exist | `IO Error: Cannot open database … in read-only mode: database does not exist` — the engine does not create it |
@@ -314,8 +331,28 @@ is stricter than the usual one-writer-many-readers summary, so `singleWriterFile
 conservative default here — it is the measurement. Two Studio replicas sharing a file is not a
 supported deployment.
 
-The same table is why the agent's read-only handle works at all: it is a second handle **in the same
-process** as the writer, and same-process handles are permitted.
+The same-process rows are why the agent's read-only handle can sit beside an editor handle at all:
+it is a second handle **in the same process** as the writer.
+
+**That allowance is POSIX's, not the engine's.** Measured on windows-latest (2026-09, the same
+DuckDB v1.5.5 / `@duckdb/node-api` 1.5.5-r.4): a second handle on a file this process already holds
+is refused at the operating system, `IO Error: Cannot open file "…": The process cannot access the
+file because it is being used by another process`, with DuckDB naming this very process as the
+holder. Windows arbitrates the share mode per HANDLE, so "the lock is per process" simply does not
+apply there. `tests/integration/db/duckdb-provider.test.ts` asserts both answers, each positively,
+rather than the POSIX one twice.
+
+The consequence for the product is bounded but real, and it is not fixed here.
+Browsing serves one connection record from one cached handle, and the connection dialog's Test Connection borrows the handle already holding the file (`findOpenSingleWriterProvider`), so neither opens a second one.
+Two different connection records naming one file do get two handles, because `getOrCreateProvider` never borrows: on Linux and macOS each keeps its own catalog and whichever closes last checkpoints over the other's committed rows, and on Windows the second open is refused (BACKLOG D240).
+The one path that really does want two handles at once is an agent run reaching a connection the editor already has open: `acquireExecutionProfileProvider` opens the file under the profiled key while the writable handle is live.
+On Windows that open is refused, and the run fails with the engine's sentence instead of reading.
+Not yet measured against a running Studio on Windows, only against the engine.
+
+The file-access posture (§3.16) adds one more case.
+A handle is lent only to a caller of its own posture, and every role that can resolve one seed shares one posture, so the case is two connection records of different postures on one file: an admin's own connection and a standard user's, or an admin-only seed and a user's connection naming its file.
+Test Connection beside such a writer opens its test handle `READ_ONLY` with external access off rather than a second read-write handle: on Linux and macOS it reads beside the writer and leaves its file and `.wal` alone, and on Windows it is refused like any second handle.
+An `agent-operations` acquisition borrows only a handle of its requester's own editor posture, and otherwise opens its own read-only handle, which reads the file as it was when it opened.
 
 ### 3.9 `interrupt()` exists, so `cancelQuery` is real
 
@@ -344,8 +381,11 @@ true` answer `Invalid Input Error: Cannot enable external access while database 
 last measurement is what makes the option a boundary rather than a default — `SET memory_limit` IS
 accepted on a read-only handle, so "the engine refuses to be reconfigured" was not a given.
 
+The read-only handle also opens with a private temp directory, as every handle with external access off does: `openDuckDBClient` makes one under the operating system's temp directory and removes it when the handle closes.
+Its spill files land there rather than in `<file>.tmp` beside the database, and the engine allow-lists that directory in place of its default; §3.16 records what that leaves reachable.
+
 The SQL denylist stays, as **defence in depth** rather than as the boundary: it names the construct
-and says why, which the engine's sentence does not, and it costs nothing to run first. §11 records
+and says why, which the engine's sentence does not, and it costs nothing to run first. §14 records
 the three bypasses that proved a text guard cannot be the boundary here.
 
 ### 3.11 A multi-statement string runs the first statement only
@@ -381,6 +421,205 @@ that bites:
 `RENAME COLUMN` and `DROP COLUMN` — all measured, which is what the inline row editor and the schema
 tooling depend on (`supportsInlineRowEdit: true`).
 
+### 3.13 There is no auto-increment keyword — a sequence is the only route
+
+The provider declares `createTable` ([Create Table form](#create-table-form)), so
+[`CreateTableModal`](../../src/components/CreateTableModal.tsx) renders for this engine and its default
+column has to be a generated key. **Every keyword the other
+seven engines use for one is refused here.** Measured statement by statement on 1.5.5, the
+`@duckdb/node-api` version this repo pins:
+
+| Construct | Verdict on 1.5.5 |
+|---|---|
+| `id SERIAL PRIMARY KEY` | `Catalog Error: Type with name SERIAL does not exist!` |
+| `id BIGSERIAL` | `Catalog Error: Type with name BIGSERIAL does not exist!` |
+| `id INTEGER GENERATED BY DEFAULT AS IDENTITY` | `Not implemented Error: Constraint not implemented!` |
+| `id INTEGER GENERATED ALWAYS AS IDENTITY` | `Not implemented Error: Constraint not implemented!` |
+| `id INTEGER PRIMARY KEY AUTOINCREMENT` | `Parser Error: syntax error at or near "AUTOINCREMENT"` |
+| `id INTEGER AUTO_INCREMENT` | `Parser Error: syntax error at or near "AUTO_INCREMENT"` |
+| `a JSONB` | `Catalog Error: Type with name JSONB does not exist!` — the type is spelled `JSON` |
+
+The identity rows are the sharp ones: `GENERATED … AS IDENTITY` **parses** and is refused at
+execution, so this is a missing feature rather than a missing word, and a future DuckDB could
+implement it without any syntax changing.
+
+What works is a sequence the column defaults from, which is why the create-table form emits **two**
+statements for this engine and nothing else:
+
+```sql
+CREATE SEQUENCE IF NOT EXISTS widgets_id_seq;
+CREATE TABLE widgets (
+  id INTEGER PRIMARY KEY DEFAULT nextval('widgets_id_seq'),
+  name VARCHAR(255)
+);
+```
+
+Measured end to end: two inserts that omit `id` store 1 and 2, an insert that supplies `id = 99`
+is accepted (the default is a default, not an override), and a second `id = 99` is
+`Constraint Error: Duplicate key "id: 99" violates primary key constraint.`
+
+Three facts decide the exact text above, and each one breaks the form if ignored:
+
+1. **Order.** The sequence has to exist first — `CREATE TABLE t (id INTEGER DEFAULT nextval('nope'))`
+   is `Catalog Error: Sequence with name nope does not exist!`, so this is not a formatting choice.
+2. **`IF NOT EXISTS`.** A sequence **outlives** the table that defaults from it: after
+   `DROP TABLE widgets`, `SELECT nextval('widgets_id_seq')` still answers (with 3), and a bare
+   `CREATE SEQUENCE widgets_id_seq` is then
+   `Catalog Error: Sequence with name "widgets_id_seq" already exists!`. Without the guard, creating a
+   table, dropping it and creating it again through the form fails the second time. The surviving
+   sequence resumes its count, which costs a few ids and nothing else. `duckdb_sequences()` lists
+   what is left behind.
+3. **Two statements reach the engine as two.** §3.11 is the reason this needs saying: the driver's
+   `runAndReadAll` would run only the first. It does not apply here, because
+   `use-query-execution.ts` reads the buffer with `isMultiStatement` under this dialect's grammar and
+   routes it to `/api/db/multi-query`, which splits on that same grammar and hands the provider one
+   statement at a time.
+
+### 3.14 No extension is installed or loaded on its own, and a file that is not DuckDB's is refused (#1404)
+
+With every option at its default, DuckDB installs and loads a "known" extension the moment a
+statement or a file needs one. Measured on v1.5.5 before this was changed: a connection pointed at a
+**SQLite** file made the engine download `sqlite_scanner` (34,778,566 bytes, from
+`http://extensions.duckdb.org/...`) into `~/.duckdb/extensions/v1.5.5/<platform>/`, attach the file,
+checkpoint its `-wal` into it, and Studio answered "Connected successfully". So a Test Connection
+click made the server fetch native code from the internet, rewrote a file another connection held
+open, and on an air-gapped host hung until the download timed out.
+
+Three things close it, all in `client.ts`, on **every** handle (the editor's and the agent read-only
+profile's):
+
+1. **`autoinstall_known_extensions: 'false'` and `autoload_known_extensions: 'false'`** are passed at
+   open. Nothing is fetched or loaded behind the user's back. A statement that needs an extension
+   that is not loaded is refused by the engine, and its message names both ways forward:
+
+   ```
+   Catalog Error: Table Function with name "sqlite_scan" is not in the catalog, but it exists in the sqlite_scanner extension.
+
+   Please try installing and loading the sqlite_scanner extension by running:
+   INSTALL sqlite_scanner;
+   LOAD sqlite_scanner;
+
+   Alternatively, consider enabling auto-install and auto-load by running:
+   SET autoinstall_known_extensions=1;
+   SET autoload_known_extensions=1;
+   ```
+
+   **Opting in** is therefore per session and explicit, in the admin editor (the denied posture refuses `INSTALL` and the `LOAD` of any extension that is not bundled, §3.16): run `INSTALL <name>; LOAD <name>;` (measured working with both options off), or `SET` the two options back on for that session (measured accepted).
+   There is no server-wide switch: an extension is native code the server runs, and installing one is a decision to make in the open.
+   On an air-gapped host, `INSTALL` needs the extension file already under the server user's extension directory.
+   Extensions statically linked into `@duckdb/node-api` 1.5.5-r.4 are loaded anyway and unaffected: `core_functions`, `icu`, `json`, `parquet` and `autocomplete`.
+2. **The file's header is read before the engine opens it** (`assertDuckDBFile`). Every DuckDB file,
+   an encrypted one included, carries `DUCK` at byte 8 (measured); a SQLite file starts with
+   `SQLite format 3\0`. A file that is not a DuckDB database is refused without being opened, so it
+   and its `-wal` are left byte for byte as they were. This is needed beside step 1, not instead of
+   it: measured, with both options off, an extension **already installed** on the host is still
+   loaded to attach a file it recognises, so the options alone would still have checkpointed the
+   SQLite file on any machine that had `sqlite_scanner` installed.
+   Before the header is read, a path that exists and is not a regular file (a FIFO, a socket, a device or a directory) is refused by `assertRegularFilesOrMissing` ([`regular-file.ts`](../../src/lib/db/utils/regular-file.ts)), shared with the SQLite and LibreDB providers.
+   It asks `stat`, which never opens the path: opening a FIFO for reading waits for a writer that never comes, and this read is synchronous, so `connect()` on a FIFO never returned and a 1 s timer never fired (measured on bun 1.4.2).
+   The engine's own names beside the file, `.wal`, `.wal.checkpoint` and `.wal.recovery`, are checked the same way: DuckDB replays a `.wal` beside an existing file when it opens it, and on a FIFO `.wal` that open never returned, in the editor and the agent profile alike (measured on bun 1.4.2).
+   That open runs on a libuv threadpool thread rather than the server's own thread, so each such connect held one of the pool's few threads for good.
+   The header read itself opens without waiting and asks the descriptor it opened (`readRegularFileStart`), so a FIFO renamed onto the path after the check is refused the same way instead of read: a loop renaming a file and a FIFO onto the path by turns had blocked that read on the server's own thread for good (measured on bun 1.4.2).
+   The engine's own open still looks the path up again, so a swap at that moment holds a threadpool thread, not the server's own thread.
+   A path whose header cannot be read (missing, unreadable) is left to the engine, which creates a missing file or names the failure in its own words.
+3. **`allow_community_extensions: 'false'`** is passed at open. A community extension is third-party
+   native code DuckDB does not vet, and with this off `INSTALL <name> FROM community` is refused:
+   `IO Error: Attempting to install an extension file that doesn't have a valid signature`
+   (measured, nothing is written to the extension directory). Unlike the two options in step 1, it
+   cannot be turned back on inside a session: `SET` and `SET GLOBAL allow_community_extensions =
+   true` both answer `Invalid Input Error: Cannot change allow_community_extensions setting while
+   database is running` (measured). `allow_unsigned_extensions` is off by default and fixed at open
+   the same way, so **only DuckDB's own signed extensions can be loaded on any handle**.
+
+What this does **not** close is the admin editor's own reach, which is the admin editor's by design and is recorded in §14.4 (the denied posture closes it, §3.16).
+
+### 3.15 A file this process cannot write opens read-only in the editor
+
+A DuckDB file with mode 0444, on a `:ro` Docker mount or owned by another user cannot be opened
+read-write at all: measured on v1.5.5, the open answers `IO Error: Cannot open file "<path>":
+Permission denied`, so nothing in it can even be read. The editor now asks first whether the
+process can write the file and its directory (`isUnwritableExistingFile`, shared with the SQLite
+provider), and when it cannot, opens with `access_mode: 'READ_ONLY'`, logs
+`[DuckDB] Opened <path> read-only: this process cannot write the file or its directory`, and reads
+normally. A write is then refused by the engine, and the editor puts the reason in front of the
+engine's sentence (#1405), as the SQLite provider does:
+`DuckDB database <path> is open read-only because this process cannot write the file or its
+directory: Invalid Input Error: Cannot execute statement of type "INSERT" on database "<name>" which is
+attached in read-only mode!`. The reason is added only to that sentence as the engine words it,
+matched from its start, and only when the database it names is the editor's own file (its catalog
+name, read with `current_database()` at open): a write on another database `ATTACH`ed read-only, or
+the same words echoed inside a different error, keeps the engine's message alone. A file this
+process cannot even read still fails to open, with the
+engine's `Permission denied` in the ordinary `Failed to open DuckDB database <path>: ...` sentence.
+
+For an admin editor on an unwritable file, only `access_mode` is added, so `enable_external_access` stays on and the filesystem around the file is still reachable.
+Where the posture denies file access (§3.16), `enable_external_access: 'false'` joins it, so the file opens read-only and statement-level file reach is closed as §3.16 describes; the read-only-reason wrapping above is unchanged, because it keys on the catalog name, not on the external-access option.
+The directory counts because DuckDB writes its `<file>.wal` beside the database; measured, a writable file in a 0555 directory opens read-write and then fails its first commit on the `.wal`.
+
+### 3.16 The editor's file and network access is decided by the requester and the connection (non-admin DuckDB file access)
+
+`access_mode: 'READ_ONLY'` is one of the engine's two file-related options; `enable_external_access` is the other, and the two are **independent**.
+Measured on v1.5.5-r.5: a **writable** handle opened with `enable_external_access: 'false'` refuses every statement that reaches the network or a file outside its own database and its temp directory, while `CREATE`, `INSERT`, `UPDATE`, `DELETE`, `CHECKPOINT` and `ATTACH ':memory:'` on that database all still succeed.
+That is the denied posture: the database stays editable, and statement-level file and network reach is closed.
+
+**Who gets which posture.**
+`editorExecutionContext` (`src/lib/api/execution-context.ts`) decides it, server-side, from the verified session and the resolved connection:
+
+| Connection | Admin | Every other role |
+|---|---|---|
+| An inline connection, the requester's own | Full reach | Denied |
+| A seed only admins can use (`roles: [admin]`) | Full reach | Cannot resolve it |
+| A seed a non-admin role can use (`roles` holds `user` or `*`) | **Denied** | Denied |
+
+The last row is the price of DuckDB's single writer.
+Every role a seed is offered to resolves the same record, and one record is one cached handle, because DuckDB serves one file through one read-write handle per process.
+A second read-write handle on the same file opens on Linux and macOS, keeps its own copy of the catalog, and whichever closes last checkpoints over the other's committed rows; Windows refuses it (§3.8).
+Two postures on one record would be two cache keys and so two handles, so the record keeps one posture, the narrower one: **on a DuckDB seed a non-admin role can use, admins get no file access on that connection either.**
+Where admins need file access on a seed's database, the operator offers that seed to admins only.
+Changing a seed's roles across that line while Studio runs changes the posture its handle opens under, so the first request after the seed file is re-read closes the connection's open handle and opens a new one ([`SEED_CONNECTIONS.md`](../SEED_CONNECTIONS.md#hot-reload)).
+A statement still running on the old handle does not complete, and the old handle's session state, its temporary tables, `SET` values and variables, is lost; it happens once per such edit.
+
+A refusal under the denied posture names the policy in front of the engine's own sentence (§10):
+
+```
+File and network access is off on this DuckDB connection: the handle was opened with external access denied, which Studio does for every role but admin and for any connection a non-admin role can use, and which an embedder overrides by passing { allowExternalFileAccess: true }: Permission Error: Cannot access file "/etc/hostname" - file system operations are disabled by configuration
+```
+
+**What it closes, and what it does not.**
+Every form in §14.1's left column is refused under the denied posture, the quoted-name, bare-path and string-literal bypasses §14.2 records included, because the boundary is the engine option and not a statement guard: the SQL denylist is **not** added to this editor path, and stays the agent profile's defence in depth.
+The option is self-locked once the database runs: `SET enable_external_access = true` and its `SET GLOBAL` form both answer `Invalid Input Error: Cannot enable external access while database is running` (§3.10).
+It closes statement-level reach only.
+The database path is still the connection's own choice, which this change deliberately leaves alone: a denied handle still opens, reads and writes any DuckDB-format file the Studio process can access, and creates a missing one, because the main database is not external to the engine (§14.3).
+A file that is not a DuckDB database is refused before the engine opens it (§3.14), so a JSON or CSV file cannot be read by naming it as the database either.
+
+**What the denied posture keeps and loses.**
+It keeps creating, reading and writing the connection's own database and `:memory:`, browsing the catalog, running queries, and `ATTACH ':memory:'`.
+It loses every file outside the two places the next paragraph names: importing from CSV, Parquet or JSON files, `COPY` to or from such a file, `EXPORT`/`IMPORT DATABASE`, attaching other database files, `read_duckdb`, installing or loading extensions, and `httpfs`, which also removes the DuckDB server-side request-forgery surface.
+This is the intended security change, and it closes the CapRover discovery-export exposure for the standard login: it can no longer read `/app/discovery/services.json` through DuckDB, and that export is JSON, so it cannot be opened as a database either.
+
+**What a denied handle opens with, and what it still reaches.**
+Every handle with external access off, the denied editor and the agent read-only handle alike, opens with a private temp directory: `openDuckDBClient` makes it under the operating system's temp directory (`TMPDIR` on Linux and macOS, `TEMP` on Windows) as `libredb-duckdb-XXXXXX`, mode 0700, and removes it when the handle closes or its open fails.
+The handle's spill files land there rather than in the engine's default, which is `<file>.tmp` beside a file-backed database and the shared `<cwd>/.tmp` for every `:memory:` database in the process.
+The private directory keeps a denied `:memory:` handle out of other sessions' spill files: DuckDB allow-lists a handle's own temp directory even with external access off, and with the shared default a denied handle could list, read and write those files (measured).
+What the engine allow-lists is what the handle still reaches, measured on v1.5.5-r.5:
+
+- its private temp directory, where `COPY ... TO`, `read_csv` and `ATTACH` of a new database file all succeed, inside a directory no other handle uses and that goes when the handle closes;
+- its database's own file names, the database file and its `.wal`, `.wal.checkpoint` and `.wal.recovery` siblings, which for `:memory:` are four fixed names in the Studio process's working directory (`<cwd>/:memory:` and its three siblings), so a denied `:memory:` handle can write and read files with exactly those names there.
+
+Any other file, one beside the database included, answers the engine's `Permission Error`.
+When the operating system's temp directory cannot be used, a denied open is refused with a sentence that names it (§10) rather than given the shared default, and a full-reach editor, which makes no private directory, still opens.
+
+**How the posture reaches the engine.**
+It is carried on `ProviderExecutionContext.allowExternalFileAccess`, which only DuckDB reads; absent means deny (fail closed).
+It never travels on the connection or on `ProviderOptions`, both caller-supplied, so a request body cannot forge the admin posture.
+`getOrCreateProvider` keys the writable handle cache by it, and the single-writer borrow lends a handle only to a caller of the same posture, so nobody is handed a handle wider than their own.
+Test Connection beside a writer of the other posture opens its test handle read-only with external access off rather than a second read-write handle, and an `agent-operations` acquisition borrows only a handle of its requester's own editor posture (§3.8).
+The agent read-only profile (§3.10) is unchanged: it already opens `enable_external_access: 'false'` through `readOnly`, which keeps precedence.
+
+**For an embedder of `@libredb/studio/providers`.**
+The fail-closed default applies to the published factories too: `createDatabaseProvider` and `getOrCreateProvider` called without an execution context open a DuckDB handle with file access denied, which is a behaviour change for code written before the posture existed.
+Pass `{ allowExternalFileAccess: true }` as the third argument for the full reach; `ProviderExecutionContext` and `EditorExecutionContext` are exported from `@libredb/studio/types`, and [`docs/DATABASE_PROVIDERS.md`](../DATABASE_PROVIDERS.md) shows the call.
+
 ---
 
 ## 4. Connection
@@ -397,6 +636,14 @@ tooling depend on (`supportsInlineRowEdit: true`).
 `:memory:` opens a database that exists for the life of the connection and is discarded on
 disconnect. It is the zero-configuration way to try the editor, and it is what most of the
 integration tests use.
+
+A missing folder in the path is created on connect, one level at a time, by `createMissingDirectories` ([`create-directory.ts`](../../src/lib/db/utils/create-directory.ts)), shared with the SQLite provider.
+It walks up to the nearest existing folder and makes each missing one in order, never with a recursive mkdir: Node's recursive mkdir never returns for a path under `/proc`, because procfs answers ENOENT for a parent that exists and Node retries it forever (measured on Node v24.14.0), so one Test Connection hung the whole server.
+The first folder the filesystem refuses ends the connect at once with the open error in §10, which carries the filesystem's code and the folder.
+
+A path that exists and is not a regular file, a FIFO, a socket, a device or a directory, is refused at once with the open error in §10, naming the path and its kind, in the editor and the agent profile alike (§3.14).
+So is such a file at `<path>.wal`, `<path>.wal.checkpoint` or `<path>.wal.recovery`, and the error then names that file.
+The check follows a symlink to its target, so a symlink to a FIFO is refused like the FIFO, and a missing path is left to the engine as before.
 
 ### 4.2 There is no connection string
 
@@ -418,6 +665,15 @@ Explicitly **not** supported, so that a reader does not go looking:
   `database_name = current_database()` (§3.1, §3.3), so a database attached inside a session is
   queryable but is not enumerated in the tree.
 
+### Connection string
+
+`duckdb` has no connection string scheme, no `readTls` and no seed load check: every field of its row in `CONNECTION_STRING` is `null` ([`connection-string.ts`](../../src/lib/db/providers/sql/duckdb/connection-string.ts)).
+
+### Execution UI
+
+The rolled-back notice names `COMMIT` as the keyword that keeps an open transaction, and `duckdb` has no consent deadline, so the agent's consent card shows no deadline chip or sentence for it.
+Its row in `EXECUTION_UI` is declared in [`execution-ui.ts`](../../src/lib/db/providers/sql/duckdb/execution-ui.ts).
+
 ---
 
 ## 5. Query interface
@@ -425,13 +681,67 @@ Explicitly **not** supported, so that a reader does not go looking:
 `query(sql, params)` runs one statement and returns `{ rows, fields, rowCount, executionTime,
 columnTypes? }`.
 
-- **Rows** come from `getRowObjectsJson()`; `getRowObjects()` is never called (§3.2).
-- **`fields`** come from `columnNames()`, so an empty result still names its columns.
+- **Rows** come from `getRowsJson()`, keyed by position under `fields`; `getRowObjects()` is never called (§3.2).
+- **`fields`** come from `columnNames()`, so an empty result still names its columns, and a repeated name is numbered ([Result column names](#result-column-names)).
 - **`columnTypes`** carries `columnTypes().map(String)` — DuckDB's own type text — and the key is
   **omitted entirely** when there is nothing to publish, never emitted as `{}`.
 - **`rowCount`** is the row count for a read and `result.rowsChanged` for a write; the synthetic
   `Count` column is not surfaced (§3.4).
 - **Cancellation** calls `interrupt()` on the connection (§3.9).
+
+### Result column names
+
+Every result column comes back under a name that is non-empty and that no other column of the result has, with its own value.
+`client.ts` reads the rows as arrays (`getRowsJson()`) and keys them by position under `uniqueFieldNames(columnNames())` ([`result-fields.ts`](../../src/lib/db/utils/result-fields.ts)), and `columnTypes` is keyed by the same names.
+Measured 2026-10-07 in-process on @duckdb/node-api 1.5.5-r.4, pinned in `tests/integration/db/duckdb-provider.test.ts`:
+
+| Statement | `fields` | Row |
+|---|---|---|
+| `SELECT 1 AS a, 'x' AS a` | `a`, `a (2)` | `{ a: 1, "a (2)": "x" }`, typed `INTEGER` and `VARCHAR` |
+| `SELECT 2 AS "a:1", 3 AS a, 4 AS a, 4 + 5` | `a:1`, `a`, `a (2)`, `(4 + 5)` | every value under its own name |
+| `SELECT 1 AS ""` | none | the parser refuses it: *zero-length delimited identifier* |
+
+DuckDB names an unaliased expression by its text (`(4 + 5)`) and refuses an empty alias, so it never declares a column with no name.
+A repeated name was the defect: the driver's `getRowObjectsJson()` keys a repeat `a:1` while `columnNames()` lists `a` twice, so both grid headers showed the first value, and a column the statement itself named `a:1` was overwritten by the repeat.
+`queryReadOnly()` reads through the same client call.
+
+### A transaction a statement left open
+
+A `BEGIN` sent through `query()` opens a transaction on the ONE connection this provider holds
+(§3.8), and the provider is cached per `connection.id` for the whole process, so nothing in the
+request cycle closed it and it belonged to whoever borrowed the handle next.
+Measured 2026-09-13 through `POST /api/db/multi-query` on v1.5.5, the loss was silent: after
+`BEGIN; INSERT INTO t VALUES (1); SELECT * FROM <missing>`, the next user's `INSERT` answered
+HTTP 200 and read its own row back, and a later `ROLLBACK` through the app discarded it with no
+error at any point.
+
+`endOpenQueryTransaction()` ends it and reports `"none"` or `"rolled-back"`.
+
+**The ask and the act are one call, because on this engine they cannot be separated.** DuckDB v1.5.5
+publishes no transaction-state reading: `current_transaction_id()` answers in both states (a fresh id
+per implicit transaction outside one, the transaction's own id inside), `transaction_timestamp()` is
+an alias of `get_current_timestamp()`, and the client context object carries only a connection id.
+`duckdb_functions()` lists no other candidate. So the engine's own refusal of a `ROLLBACK` —
+"TransactionContext Error: cannot rollback - no transaction is active" — is the answer, and it costs
+the session nothing: measured, the very next statement runs normally. Any OTHER rollback failure is
+raised rather than read as an answer.
+
+Both query routes call this in a `finally` and report the outcome, `POST /api/db/multi-query` and
+`POST /api/db/query`, each under a call scope of its own (D74, D87).
+
+**WHAT IS NOT CLOSED: the ender cannot tell whose transaction it is ending.** The `scope` parameter
+is declared on the interface and ignored here, because this provider holds ONE connection and there
+is no other client to name, and that is not the same as the transaction being the caller's own.
+`getOrCreateProvider` caches the provider per `connection.id` for the whole process, so one
+connection is shared by every concurrent request on that stored connection: the sharing measured
+above is what makes another request's transaction REACHABLE here, not what puts it out of reach.
+The act is an unconditional `ROLLBACK` whose refusal is the reading, and a refusal cannot say WHOSE
+transaction it found, so a request whose own statements left nothing open still discards a
+concurrent request's, and that request is told nothing. That is the D87 shape on a single
+connection and it is NOT closed: closing it needs the transaction owned by a call scope rather than
+by a client, which is a design change and not a parameter, so it is recorded here rather than
+worked around. `sqlite.md` §3.5 and `redis.md` §5.2a carry the same residual for the same reason,
+and the three were checked rather than inferred from one another.
 
 ### EXPLAIN
 
@@ -444,56 +754,68 @@ does not merely fail to produce usable JSON — it **executes the statement it w
 (measured: three calls on an `INSERT` took a table from 0 rows to 3). "Explain this" must never run
 it, so the direct Explain action turns the feature off for DuckDB rather than emitting the analyze
 form; the strategy publishes no timings and fabricates none. See §3.6 for the full measurement and
-§12 for why a later engine version does not change this.
+§15 for why a later engine version does not change this.
 
 ---
 
+### What the SQL INSERT and DDL exports write
+
+`@duckdb/node-api` answers an INTERVAL as `{months, days, micros}`, a MAP as a list of `{key, value}` entries and a STRUCT as an object.
+Written as JSON, the INTERVAL and the MAP were `Conversion Error` on replay, so the SQL INSERT export reads the declared type (#1386, [`duckdb/typed-literals.ts`](../../src/lib/db/providers/sql/duckdb/typed-literals.ts)) and writes `INTERVAL '14 months 3 days 14706000001 microseconds'`, `MAP {'k': 1}` (`MAP {}` when empty), `{'a': 7, 'b': ['p']}` and `[1, 2, 3]`, recursing through the element types, with a number inside a container written bare.
+A quoted scalar (`'170141183460469231731687303715884105727'` into a `HUGEINT`) is left as it was, since DuckDB reads it back.
+The DDL keeps `STRUCT("a" INTEGER, "b" VARCHAR[])`, `INTEGER[3]`, `INTEGER[][]` and `MAP(INTEGER, VARCHAR[])` instead of writing `TEXT`.
+A composite that does not have its declared shape is skipped with a `-- Row N skipped` comment naming the column.
+
+Measured 2026-10-04 on DuckDB 1.5.5: a table of `INTERVAL`, `MAP(VARCHAR, INTEGER)`, `MAP(INTEGER, VARCHAR[])`, `INTEGER[]`, `VARCHAR[]` holding a quote and a comma, `STRUCT`, `HUGEINT`, `UBIGINT`, `DECIMAL(18,3)`, `TIMESTAMPTZ`, `TIMESTAMP_NS`, `UUID`, `BLOB`, an `ENUM`, `BIT`, `INTEGER[3]` and `INTEGER[][]` was exported through the provider and replayed into `CREATE TABLE copy AS SELECT * FROM src WHERE false` and into the exported DDL's own table, and `EXCEPT` both ways answered no row.
+
+### Create Table form
+
+The grammar the Create Table form writes is `DUCKDB_CREATE_TABLE` in [`sql/duckdb/create-table.ts`](../../src/lib/db/providers/sql/duckdb/create-table.ts), a driver-free module so a test reads it without loading the native addon (#1822).
+
+| Field | Value |
+|---|---|
+| Auto-increment clause | `INTEGER PRIMARY KEY`, sequence-backed (`sequence: true`) |
+| Column constraints (`PRIMARY KEY`, `UNIQUE`) | Yes |
+| Key type | `INTEGER` |
+| Types, in dropdown order | `VARCHAR(255)`, `TEXT`, `INTEGER`, `BIGINT`, `BOOLEAN`, `TIMESTAMP`, `DATE`, `JSON`, `UUID`, `DECIMAL(10,2)` |
+
+Measured on DuckDB 1.5.5 (`@duckdb/node-api` 1.5.5), statement by statement in [§3.13](#313-there-is-no-auto-increment-keyword--a-sequence-is-the-only-route):
+`SERIAL` is "Type with name SERIAL does not exist", `GENERATED BY DEFAULT AS IDENTITY` is "Not implemented Error: Constraint not implemented", `AUTOINCREMENT` is a parser error, and `JSONB` is "Type with name JSONB does not exist" while `JSON` is fine.
+A sequence works and numbers from 1, so this is the one grammar whose key needs a statement ahead of the `CREATE TABLE`.
+The form creates `CREATE SEQUENCE IF NOT EXISTS <table>_<column>_seq` in the table's own container and gives the key `DEFAULT nextval('<that name>')`.
+
+Two facts decide that text, and the modal's sequence code carries them too:
+
+- `IF NOT EXISTS`, because a DuckDB sequence outlives the table that defaults from it: measured on 1.5.5, `DROP TABLE widgets` leaves `widgets_id_seq` behind (`nextval` on it still answers), and a plain `CREATE SEQUENCE` then fails with `Sequence with name "widgets_id_seq" already exists!`.
+  Without the guard, creating a table, dropping it and creating it again through the form fails the second time.
+  The surviving sequence resumes its count, which costs a few ids and nothing else.
+- The sequence name goes into a string literal, so a quote in it is doubled there.
+  Measured on 1.5.5: a typed name holding a double quote makes `nextval` resolve a different sequence name, and the `CREATE TABLE` fails with DuckDB's own Catalog Error.
+
+The type list changes from the shared list only where the engine disagrees (`JSON`, not `JSONB`); a row that reads like the old shared list is the engine agreeing with it, not a row nobody looked at.
+
+### SQL grammar
+
+How this engine's statement text is read is declared once, in [`src/lib/db/providers/sql/duckdb/sql-grammar.ts`](../../src/lib/db/providers/sql/duckdb/sql-grammar.ts), the `duckdb` row of the SQL grammar registry in `src/lib/db/sql-grammar/`.
+Its grammar is `DUCKDB_GRAMMAR`, the one reading the statement splitter, the row limiter, the confirmation gate and query-event redaction share, so they cannot disagree about where a literal or a comment ends.
+Every fact was measured on v1.5.5 through `@duckdb/node-api` 1.5.5-r.4, and the object is separate from `POSTGRES_GRAMMAR` although the values coincide: DuckDB's dialect is Postgres-shaped rather than PostgreSQL's, and a divergence should be a value changing here rather than a split.
+`#` is code: `SELECT 1 # x` is `Parser Error: syntax error at or near "#"`.
+`[` is a subscript, not a name quote: `SELECT [1,2][1]` answers 1, a list literal followed by a 1-based index.
+Block comments nest: `/* a /* b */ still */ SELECT 1` runs.
+`SELECT q'[x]' AS a` is `Catalog Error: Type with name q does not exist!`, and `SELECT 1 AS a // note` is `Parser Error: syntax error at or near "//"`.
+The update-target reader takes `PIVOT`, `UNPIVOT`, `UNNEST`, `SUMMARIZE`, `DESCRIBE` and `SHOW` as words that open a query here alone: on DuckDB 1.5.5 `(PIVOT orders ON k USING max(note))` is a scalar subquery that answers with another table's value, and asking about them on every engine cost PostgreSQL a refusal for `coalesce(show, '')`.
+`readsSqlText` is `true`: the editor text is SQL, and the provider extends `SQLBaseProvider`.
+Redaction is `sql` with no name quote: a redacted statement keeps its words, and every literal and quoted run becomes `?`.
+
 ## 6. Schema introspection
 
-`getSchema()` issues **five catalog statements plus one counting statement**, and no per-object
-sweep. The five are the exported constants in
-[`introspect.ts`](../../src/lib/db/providers/sql/duckdb/introspect.ts) — copied here verbatim, so a
-change to one side is visible against the other:
+Every reading of this engine's objects goes through the object surface below. The flat reading that
+came before it issued five catalog statements over `duckdb_tables()`, `duckdb_views()`,
+`duckdb_columns()`, `duckdb_constraints()` and `duckdb_indexes()` plus one counting statement, all
+filtered `NOT internal AND database_name = current_database()`. It is deleted, and the filter is why
+that matters: scoped to `current_database()`, it could not see an `ATTACH`ed catalog at all.
 
-```sql
--- TABLES_SQL
-SELECT schema_name, table_name, estimated_size
-FROM duckdb_tables()
-WHERE NOT internal AND database_name = current_database()
-ORDER BY schema_name, table_name;
-
--- VIEWS_SQL
-SELECT schema_name, view_name
-FROM duckdb_views()
-WHERE NOT internal AND database_name = current_database()
-ORDER BY schema_name, view_name;
-
--- COLUMNS_SQL  (duckdb_columns() covers VIEWS as well as tables, so one read serves both)
-SELECT schema_name, table_name, column_name, data_type, is_nullable, column_default
-FROM duckdb_columns()
-WHERE NOT internal AND database_name = current_database()
-ORDER BY schema_name, table_name, column_index;
-
--- CONSTRAINTS_SQL  (primary keys AND foreign keys in one read)
-SELECT schema_name, table_name, constraint_type,
-       constraint_column_names, referenced_table, referenced_column_names
-FROM duckdb_constraints()
-WHERE database_name = current_database()
-  AND constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY');
-
--- INDEXES_SQL
-SELECT schema_name, table_name, index_name, is_unique, is_primary,
-       expressions::VARCHAR[] AS index_columns
-FROM duckdb_indexes()
-WHERE database_name = current_database()
-ORDER BY schema_name, table_name, index_name;
-```
-
-**No schema query is issued.** The `duckdb_schemas()` statement in §3.3 is the measurement that
-decided how the five above are filtered; it is not part of the object tree, which takes its schema
-names from the `schema_name` column every one of them already carries.
-
-Four shapes to know:
+Four shapes to know, all of which the object surface inherits:
 
 - `duckdb_constraints()` is filtered by `constraint_type` rather than by `NOT internal`, because it
   publishes every NOT NULL and UNIQUE constraint as its own row too. On a `PRIMARY KEY` row
@@ -505,11 +827,283 @@ Four shapes to know:
 - `duckdb_indexes().expressions` is declared `VARCHAR` and prints as `"[a, b]"`. The `::VARCHAR[]`
   cast makes the engine produce the real list (measured: `'[customer_id]'` → `["customer_id"]`).
 - `duckdb_tables().estimated_size` is a row count rather than a byte size, but it is an **estimate**
-  and is never published as the row count (§3.5). The sixth statement counts instead: one
-  `UNION ALL` arm per table, `SELECT '<schema>' , '<table>', count(*) FROM "<schema>"."<table>"`,
-  issued once for the whole catalog. DuckDB answers `count(*)` out of row-group metadata, so this is
-  affordable where it is not on the other engines here. A table that cannot be counted — dropped
-  between the two reads, for instance — is simply absent from the map rather than published as `0`.
+  and is never published as the row count (§3.5). DuckDB answers `count(*)` out of row-group
+  metadata, so counting is affordable here where it is not on the other engines. A table that cannot
+  be counted — dropped between two reads, for instance — is absent from the map rather than
+  published as `0`.
+
+### The object surface (#789)
+
+The lazy, container-aware object surface: `listContainers()`, `countObjects()`, `listObjects()`,
+`describeObject(path, kind)` and `describeObjects(container, kind, limit?)`, in
+[`objects.ts`](../../src/lib/db/providers/sql/duckdb/objects.ts) and
+[`index.ts`](../../src/lib/db/providers/sql/duckdb/index.ts). It reaches every `ATTACH`ed catalog,
+which the deleted flat reading could not.
+
+#### Two container levels, and both are real
+
+```ts
+containerLevels: [
+  { id: "catalog", label: "Database", labelPlural: "Databases" },
+  { id: "schema",  label: "Schema",   labelPlural: "Schemas" },
+]
+```
+
+DuckDB is the second two-level engine in #789, after SQL Server. The outer level is not the
+connection's own file restated: `ATTACH '<file>' AS warehouse` puts another whole catalog in the same
+session and a three-part name reaches into it, so one connection genuinely holds databases holding
+schemas holding objects. `ATTACH ':memory:' AS name` works too, which is what the tests use.
+
+A database alone is therefore a real address as well as a database and a schema, and the declaration states it as `containerPathShapes: "prefixes"`: a database-level read answers for every schema in that database.
+
+The connect-time inventory read (autocomplete, the ERD) is scoped to the session-default database, not walked across every `ATTACH`ed one (#1402): autocomplete and the ERD see the connected database's schemas, while the tree still lists every attached database lazily, one container at a time.
+
+#### Four kinds, and one `duckdb_*` function behind each
+
+| Kind | Role | Catalog function | Note |
+|---|---|---|---|
+| `table` | relation | `duckdb_tables()` | `acceptsRowWrites: true` |
+| `view` | relation | `duckdb_views()` | No row writes: measured, `INSERT INTO <view>` answers `Catalog Error: <view> is not an table` |
+| `macro` | routine | `duckdb_functions()` filtered on `function_type` | One kind for BOTH macro forms |
+| `sequence` | config | `duckdb_sequences()` | |
+
+**No trigger and no stored procedure**: DuckDB has neither, and `CREATE TRIGGER` / `CREATE PROCEDURE`
+are parser errors on 1.5.5. A declared kind draws a folder, and a folder for something the engine
+cannot have is a lie its zero badge makes look like a fact.
+
+**No `index` kind**: `duckdb_indexes()` is keyed by `table_oid` and an index cannot exist without a
+table, so an index belongs in `describeObject`'s output, where it is.
+
+**No `secret` kind, and this is the omission worth stating rather than leaving implicit.**
+`duckdb_secrets()` is real and answers `name, type, provider, persistent, storage, scope,
+secret_string`. A secret has no `database_name` and no `schema_name`: it lives outside the catalog
+hierarchy entirely, so there is no container in this model it could hang under. Out of Phase 1's
+scope.
+
+There is **no `duckdb_macros()`**, despite what the naming of the other functions suggests, and
+`information_schema` is partial here: it has no `.views` and no `.routines`. `duckdb_functions()`
+filtered on `function_type` is the only route to a macro.
+
+#### The macro vocabulary is the ENGINE's, and it is guarded against a live read
+
+`function_type` is the whole discriminator between a macro and a built-in, and between the two macro
+forms. The vocabulary is derived from **DuckDB's documented macro forms** (`CREATE MACRO f(x) AS
+<expression>` is a scalar macro and `CREATE MACRO f(x) AS TABLE <select>` is a table macro), and the
+fixture is built to hold **one of each**, rather than from a `SELECT DISTINCT` over whatever the
+fixture happened to contain.
+
+`FUNCTION_TYPE_RULES` in `objects.ts` carries both halves: the two macro spellings, and every other
+`function_type` with the reason it is excluded. The engine is embedded, so the guard needs no
+separate live script the way MySQL's does: `duckdb-provider.test.ts` asks the running engine for its
+own `SELECT DISTINCT function_type` (2951 built-in rows plus the fixture's two user macros) and fails
+NAMING anything the record does not account for.
+
+| `function_type` | Decision |
+|---|---|
+| `macro` | A scalar macro, written with `CREATE MACRO … AS <expression>` |
+| `table_macro` | A table macro, written with `CREATE MACRO … AS TABLE <select>` |
+| `scalar`, `aggregate`, `table`, `pragma` | Built into the engine; nobody wrote them in this database |
+
+Measured and load-bearing: **every built-in function lives in the `system` catalog** (`system.main`
+and `system.pg_catalog`), so the `database_name = $1` filter already excludes all 2949 of them. DuckDB
+has no `CREATE FUNCTION`, so a macro is the only user-defined function there is, and the
+`function_type` predicate therefore changes no count this engine can produce. It is kept because it
+is the vocabulary: it is what would keep a future non-macro user function out of the Macros folder,
+and what makes the two macro forms explicit. It is asserted on the STATEMENT rather than on a
+row count, because no fixture on this engine can distinguish it.
+
+#### The statements
+
+Every container is a bound STRING, never an interpolated identifier: each `duckdb_*` function
+publishes its container as a COLUMN. That removes the whole class of quoting defect a three-part name
+brings, and it is why this provider needs no `escapeIdentifier` anywhere in the object surface. The
+placeholders are NUMBERED (`$1`, `$2`) rather than positional, so one catalog is bound once across a
+`UNION ALL` of any number of arms.
+
+```sql
+-- CATALOGS_SQL: listContainers()
+SELECT database_name, database_name = current_database() AS is_session_default
+FROM duckdb_databases()
+WHERE NOT internal
+ORDER BY database_name;
+
+-- SCHEMAS_SQL: listContainers([catalog])
+SELECT schema_name,
+       database_name = current_database() AND schema_name = current_schema() AS is_session_default
+FROM duckdb_schemas()
+WHERE database_name = $1
+ORDER BY schema_name;
+
+-- countObjects(): one UNION ALL arm per DECLARED kind, built from the same table as the listings
+SELECT 'table' AS kind, COUNT(*) AS n FROM duckdb_tables() WHERE database_name = $1 [AND schema_name = $2]
+UNION ALL SELECT 'view', COUNT(*) FROM duckdb_views() WHERE …
+UNION ALL SELECT 'macro', COUNT(*) FROM duckdb_functions() WHERE … AND function_type IN ('macro', 'table_macro')
+UNION ALL SELECT 'sequence', COUNT(*) FROM duckdb_sequences() WHERE …;
+
+-- listObjects(container, kind)
+SELECT schema_name, <name column> AS name FROM <catalog function> WHERE <the same filter>;
+
+-- describeObject(path, kind), for a relation only
+SELECT column_name, data_type, is_nullable, column_default FROM duckdb_columns()
+  WHERE database_name = $1 AND schema_name = $2 AND table_name = $3 ORDER BY column_index;
+SELECT constraint_column_names FROM duckdb_constraints()
+  WHERE … AND constraint_type = 'PRIMARY KEY';
+SELECT constraint_column_names, referenced_table, referenced_column_names FROM duckdb_constraints()
+  WHERE … AND constraint_type = 'FOREIGN KEY';
+SELECT index_name, is_unique, expressions::VARCHAR[] AS index_columns FROM duckdb_indexes()
+  WHERE … ORDER BY index_name;
+```
+
+The count and the listing for one kind are built from ONE record, `DUCKDB_OBJECT_SOURCES`, so the
+listing holds exactly what the count counted by construction rather than by care. That is the rule
+two other providers in #789 broke on their first pass.
+
+#### Four measured shapes behind those statements
+
+- **`duckdb_schemas().internal` is TRUE for `main` in a USER database** (§3.3). `NOT internal` on the
+  schema listing would drop the default schema and with it most of the objects in the tree. The
+  catalog filter is what keeps `system` and `temp` out instead, and there `internal` means what a
+  reader expects.
+- **A DuckDB PRIMARY KEY writes NO `duckdb_indexes()` row.** The index listing needs no exclusion,
+  unlike SQL Server's.
+- **A foreign key never crosses a schema**: `Binder Error: Creating foreign keys across different
+  schemas or catalogs is not supported`. So `referencedTable` is always in the reading object's own
+  schema, and it is spelled bare in `main` and qualified anywhere else, because `ForeignKeySchema`
+  carries one string.
+- **A relation with no column row is a relation that is not there.** `CREATE TABLE t ()` is
+  `Parser Error: Table must have at least one column!`, and a view over an empty selection list is a
+  parser error too, so zero column rows raises rather than rendering a dropped table as a table with
+  no columns.
+
+`hasColumns: true` is declared on `table` and `view` and on nothing else, because `describeObject`
+gates the four reads above on `role: "relation"`: a `macro` and a `sequence` answer three empty
+arrays without a round trip, so both declare nothing and their rows are leaves in the object tree
+rather than twisties that open on nothing.
+
+#### `describeObject` takes the KIND, and on this engine that is not theoretical
+
+Measured on v1.5.5, in ONE schema: `CREATE SEQUENCE overlap` and `CREATE MACRO overlap(x)` both
+succeed while the table `overlap` exists, and only `CREATE VIEW overlap` is refused
+(`Catalog Error: Table with name "overlap" already exists!`). So the relation namespace is shared
+between a table and a view, while a sequence and a macro each have their own, and a table, a sequence
+and a macro really can share one name. A detail read keyed on the name alone would hand the sequence
+the table's columns.
+
+The same measurement is why `tests/helpers/object-surface-conformance.ts` keeps its uniqueness
+invariant inside a kind: a cross-kind assertion would report this correct provider as broken.
+
+**Macros are NOT overloaded on this engine.** `CREATE MACRO f(x, y)` after `CREATE MACRO f(x)`
+answers `Catalog Error: Macro Function with name "f" already exists!`, measured, so a macro's own
+name is its unique identifier within its schema and the path segment needs no disambiguated form of
+the kind a PostgreSQL routine needs.
+
+#### `describeObjects()` describes a whole folder in five statements (#789)
+
+`describeObjects(container, kind, limit?)` answers columns, indexes and foreign keys for EVERY object
+of one kind in one container, in FIVE round trips whatever the folder holds: the target read plus the
+four detail reads. The single read is four statements PER OBJECT, so a folder of 200 tables cost 800.
+Measured on DuckDB v1.5.5 against a 200-table schema, each table carrying three columns, a primary key
+and an index: **26 ms for one `describeObjects()` against 1,300 ms for 200 `describeObject()` calls**,
+the same 600 columns and 200 indexes.
+
+Each of the four detail statements is its `describeObject()` counterpart with the
+`schema_name = $2 AND table_name = $3` pair replaced by a join against the target set, and nothing else
+changed: the same catalog function, the same predicates, the same `::VARCHAR[]` cast. They are built by
+one function rather than hand-copied four times, because a rewritten statement is the one thing this
+file could get wrong that no fixture shows.
+
+The five decisions this engine had to make for itself, each measured rather than reasoned:
+
+**Which catalog.** The same `duckdb_columns()`, `duckdb_constraints()` and `duckdb_indexes()` the single
+read uses, and the target from the same `duckdb_tables()` / `duckdb_views()` the listing uses, through
+the same `objectSource()` and `kindFilter()`. It is NOT the deleted flat reading: that one filtered
+`NOT internal AND database_name = current_database()`, so it could not see an ATTACHed catalog at all,
+while the object surface binds the catalog the CALLER asked for. MEMBERSHIP comes from the target read
+and never from the column read, so an object the four detail reads answer nothing for comes back with
+three empty lists rather than missing.
+
+**Which kinds have no columns.** `macro` and `sequence`, which answer `{ details: [] }` with NO round
+trip at all. Measured on v1.5.5: `duckdb_columns()` holds rows for `customers`, `orders`, `t` and
+`v_orders` in a database that also holds `app.seq_a` and `app.m_a`, and none at all for the sequence or
+the macro. That is the same fact `describeObject()` answers as three empty arrays, and it is keyed on
+`role !== "relation"` here because on this engine the two coincide - which is NOT the general rule, as
+a PostgreSQL sequence has three columns and a MariaDB one has eight.
+
+**What bounds the read on the wire.** `LIMIT $n` inside the target, the placeholder BOUND rather than
+interpolated and carrying `limit + 1`, so a saturated read is told from an exact one with no second
+count. Measured accepted inside a CTE on v1.5.5. The placeholder NUMBER is derived from the container
+depth rather than written, because the container filter is `$1` alone at catalog level and `$1, $2` at
+schema level; DuckDB reuses a numbered parameter, which is what lets the same bind array serve the
+target and all four detail statements. The extra object is dropped in code and `truncated` carries the
+CALLER's limit. Nothing here caps the columns of an object.
+
+**What orders the cut, and under whose collation.** `ORDER BY schema_name, name` in the target.
+`schema_name` leads because a CATALOG-level container spans every schema under it, so `(schema, name)`
+is what is unique there. Two things about it were measured rather than assumed. First, no data this
+engine can hold separates the ordered statement from the unordered one: five tables created as
+`main.zz, main.aa, analytics.mm, analytics.bb, main.cc` come back from a bare
+`SELECT ... FROM duckdb_tables()` already sorted, because DuckDB walks its catalog's sorted maps. That
+fixture was built specifically to disprove the pin (standing ruling 5a) and did not, so the `ORDER BY`
+is pinned by statement TEXT and kept, since the natural order is an implementation detail of the
+catalog rather than a promise. Second, that sort runs under the UTF-8 BYTE order, which is NOT the order
+`comparePaths` produces: measured, a schema holding `U+E000` and `U+1F600` comes back from DuckDB as
+`U+E000, U+1F600` and from a JavaScript sort as `U+1F600, U+E000`, because JavaScript compares UTF-16
+code units. So the MEMBERSHIP of a bounded cut is the engine's and the ORDER of the answer is ours.
+
+**Mixed path depth (ruling 5f).** Not in this engine's relation set. Every DuckDB object of every
+declared kind sits in a schema, `objectShapes()` refuses a kind declaring `attachedTo`, and there are
+no triggers at all, so `table` and `view` are both `[catalog, schema, name]` at either container depth.
+
+The join is on BOTH `schema_name` and the name, never on the name alone, and the outer read keeps
+`database_name = $1` as well: the fixture holds `customers` in two schemas of one catalog with
+different columns AND in two catalogs with the same schema name, so a join on the name alone answers
+one table with another's columns rather than an error anybody would notice.
+
+#### Column defaults: the value, with the catalog text kept alongside (#1029)
+
+DuckDB reports a column default as the expression AS WRITTEN, through `information_schema.columns.column_default`. A string
+default therefore arrives quoted, with SQL standard quote doubling, while a number and an
+expression arrive bare. Measured 2026-09-21 on DuckDB v1.5.5 through `@duckdb/node-api`:
+
+| DDL | the value the column defaults to | catalog text |
+| --- | --- | --- |
+| `DEFAULT 'NULL'` | `NULL` | `'NULL'` |
+| `DEFAULT 'abc'` | `abc` | `'abc'` |
+| `DEFAULT ''` | the empty string | `''` |
+| `DEFAULT 'it''s'` | `it's` | `'it''s'` |
+| `DEFAULT 'a\b'` | `a\b` | `'a\b'` |
+| `DEFAULT 42` | `42` | `42` |
+| `DEFAULT CURRENT_TIMESTAMP` | the expression | `CURRENT_TIMESTAMP` |
+| `GENERATED ALWAYS AS (id * 2) VIRTUAL` | the expression | `CAST((id * 2) AS INTEGER)` |
+| no default | none | SQL NULL |
+
+Each column carries both readings. `defaultValue` is the value, decoded by `unquoteLiteral()`
+(`src/lib/sql/values.ts`) with the `unquoteStandard` reader this engine's SQL writing module names, so `'it''s'` reads as
+`it's` and a backslash stays ordinary data. Text that is not exactly one complete literal,
+a number or an expression such as a generated column's `CAST((id * 2) AS INTEGER)`, passes through unchanged. `defaultExpression` is the
+catalog text itself, which is always valid SQL here and is what the schema-diff migration
+generator writes after the word `DEFAULT`; without it, a decoded `abc` would be emitted as
+`DEFAULT abc`. The empty string default stays the empty string, never `undefined`, and a
+column with no default carries neither field. `readCatalogDefault()` is local to this
+provider, the way per-provider normalization is everywhere else in this tree; the escape
+knowledge it relies on is the shared part.
+
+#### No row count on a listed object, deliberately
+
+`estimated_size` is the only per-table cardinality DuckDB publishes and it is an ESTIMATE (§3.5), so
+publishing it as `rowCount` would put a wrong number on a folder row. The honest alternative, a
+`count(*)` per object, is the N+1 the inventory route already had `includeColumns` removed for. So a
+listed DuckDB object carries no `rowCount` at all.
+
+#### What is not carried
+
+- The `temp` catalog, and therefore TEMP tables. `duckdb_databases()` marks `temp` `internal = true`
+  alongside `system`, and both are excluded together. A session-scoped table is invisible in the
+  tree.
+- Secrets, for the reason above.
+- A macro's parameters. `duckdb_functions().parameters` is a `VARCHAR[]` of names, and a routine has
+  no columns, so `describeObject` answers three empty arrays for a macro and a sequence without a
+  round trip.
 
 `information_schema.tables` / `information_schema.columns` also answer, Postgres-shaped, with
 `table_type` of `BASE TABLE` or `VIEW`. They are **not** used: they carry no `internal` flag, so they
@@ -519,6 +1113,137 @@ needs. `CALL pragma_table_info('<table>')` additionally answers the SQLite-shape
 rather than selected bare, unlike the libSQL case recorded in [libsql.md](./libsql.md) §3.7.
 
 ---
+
+### Object source (#789)
+
+Every declared kind publishes a definition text, so **all four declare `hasSource`, all four with
+`sourceLanguage: "sql"`, and no kind declares nothing.** `readObjectSource(path, kind, limit?)` reads
+one object and answers a document of exactly one part.
+
+`sql` is the honest Monaco id rather than a compromise. DuckDB's dialect is PostgreSQL-shaped, the
+installed monaco-editor 0.57.0 registers no DuckDB id, and the text the engine publishes is ordinary
+SQL. This is unlike Oracle, SQL Server and Cassandra, where `plsql`, `tsql` and `cql` are not
+registrable ids in that bundle and `sql` really is a compromise those provider docs record.
+
+| kind | statement | what the text IS | `form` | `origin` |
+|---|---|---|---|---|
+| `table` | `SELECT sql AS definition FROM duckdb_tables() WHERE database_name = $1 AND schema_name = $2 AND table_name = $3` | a `CREATE TABLE` statement ending in `;`, rebuilt from the catalog | `complete` | `regenerated` |
+| `view` | `SELECT sql AS definition FROM duckdb_views() WHERE database_name = $1 AND schema_name = $2 AND view_name = $3` | a `CREATE VIEW` statement ending in `;` | `complete` | `regenerated` |
+| `sequence` | `SELECT sql AS definition FROM duckdb_sequences() WHERE database_name = $1 AND schema_name = $2 AND sequence_name = $3` | a `CREATE SEQUENCE` statement with every option spelled out | `complete` | `regenerated` |
+| `macro` | `SELECT macro_definition AS definition FROM duckdb_functions() WHERE database_name = $1 AND schema_name = $2 AND function_type IN ('macro', 'table_macro') AND function_name = $3` | the macro **body**, never a statement | **`partial`** | `regenerated` |
+
+#### The macro is `partial`, deliberately
+
+`duckdb_functions().macro_definition` is a BODY. Measured on v1.5.5 against
+`docker/duckdb-init/01-object-fixture.sql`: `CREATE MACRO main.add_one(x) AS x + 1` publishes
+`(x + 1)`, and `CREATE MACRO analytics.recent_events(n) AS TABLE SELECT * FROM analytics.events
+LIMIT n` publishes `SELECT * FROM analytics.events LIMIT n`. DuckDB publishes no `CREATE MACRO`
+statement anywhere: there is no `duckdb_macros()`, and `information_schema` has no `.routines` on this
+engine.
+
+The alternative was assembling a statement out of `duckdb_functions().parameters`. It is declined.
+Assembling would show a user a statement the engine never published, which they might copy and run,
+and the Source pane says `form: partial` with a caption that tells them the text is the body only.
+A less pretty pane that is more true. Phase 3 assembles, per the rule that the provider builds the
+statement and core never does.
+
+#### `origin` is `regenerated` on all four, and that is measured
+
+The three `sql` columns are **not** the author's bytes. Measured on v1.5.5:
+
+```
+CREATE TABLE main.customers (id INTEGER PRIMARY KEY, name VARCHAR NOT NULL, note VARCHAR DEFAULT 'none')
+  -> CREATE TABLE customers(id INTEGER PRIMARY KEY, "name" VARCHAR NOT NULL, note VARCHAR DEFAULT('none'));
+CREATE TABLE main.orders (id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES main.customers(id), total DECIMAL(12,2))
+  -> CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, total DECIMAL(12,2), FOREIGN KEY (customer_id) REFERENCES customers(id));
+CREATE SEQUENCE main.customer_seq START 1
+  -> CREATE SEQUENCE customer_seq INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START 1 NO CYCLE;
+```
+
+The schema qualification is dropped, `name` is quoted, the default is parenthesised, an inline
+`REFERENCES` becomes a table-level `FOREIGN KEY` clause, and every sequence option is spelled out
+whether the author wrote it or not. SQLite is the engine in this fleet where `origin: "stored"` has a
+producer; claiming it here would make the Source caption's distinction decoration.
+
+Both `form` and `origin` are declared **per kind, beside the statement that reads the text**, in the
+same record the count and the listing are built from. They are one shape of fact, so a kind added
+later whose text really is stored bytes has one place to say so and cannot inherit an origin from a
+literal somewhere else.
+
+The `partial` form is this engine's only one, not the fleet's: PostgreSQL `view` and
+`materialized_view` and Couchbase `function` produce the same arm, each for its own reason.
+
+#### The refusals: NONE, stated as a CANNOT
+
+**This engine has no privilege model and no refusal for a source read.** DuckDB has no users, no
+roles and no passwords (§14), so there is nothing a read can be denied for.
+
+Nor does it answer a row carrying nothing. Measured on v1.5.5 over a fresh instance holding the
+fixture: zero `duckdb_tables()` rows, zero of 47 `duckdb_views()` rows, zero `duckdb_sequences()`
+rows and zero of 136 macros carry a NULL or whitespace-only text. Even a macro written to have no
+body publishes something: `CREATE MACRO no_body() AS NULL` answers the four characters `NULL`.
+
+The provider still carries a blank arm, because an empty definition must never reach an editor as a
+definition, and it says **which of four shapes** produced it: the reply carried no definition column
+at all, the driver handed the column back as something other than a text, the column was NULL, or the
+column held no non-whitespace character. The first two are facts about the READ and the last two are
+facts about the ROW, and they are kept apart because a refusal stating a cause that is false for the
+shape in front of it is worse than one stating none. The non-text shape is not hypothetical:
+`@duckdb/node-api` 1.5.5-r.4 already hands a BIGINT `COUNT(*)` back as a decimal **string**, so this
+driver's JavaScript mapping is per column type rather than fixed, and the sentence for that shape
+names the type the driver answered with. Those four sentences are **ours**, not the engine's, which is
+this engine's one exception to the "the engine's own sentence, unprefixed" guarantee: from DuckDB's
+point of view the read SUCCEEDED and answered a row, so there is nothing to carry verbatim.
+
+#### A missing name is ABSENCE and raises
+
+A name nothing carries answers **zero rows**, not a row carrying nothing, so the read raises a
+`QueryError` naming the object and its container (`No DuckDB macro named no_such_macro in
+memory.main`). The container is in the message because on a two-level engine the same name in the
+neighbouring catalog is a real object, and a caller needs to be told which one was looked for.
+
+#### The kind is a required argument, and this engine is one of the three reasons
+
+Measured on v1.5.5, and held by `docker/duckdb-init/01-object-fixture.sql`: a table, a sequence and a
+macro can all be called `overlap` in one schema, and they answer three different definitions.
+
+```
+table    -> CREATE TABLE overlap(id INTEGER);
+sequence -> CREATE SEQUENCE overlap INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START 1 NO CYCLE;
+macro    -> x
+```
+
+A source read keyed on the path alone answers one of the three at random. The kind picks the catalog
+function; the three binds pick the row. MySQL, MariaDB and DuckDB are the three engines that made
+`kind` a required argument of `readObjectSource`.
+
+#### No escaper, and there is no identifier position to escape
+
+Every bind is a parameter. Each `duckdb_*` table function publishes its container as a COLUMN, so a
+catalog and a schema are bound STRINGS rather than parts of a three-part name, and the object's name
+is bound too. That removes the whole class of quoting defect ClickHouse and SQL Server need an
+identifier escaper for. The same statement builder that the count, the listing and the four detail
+reads use builds this one, so a change to the container filter or to the macro `function_type`
+predicate moves the source read with it.
+
+#### A macro's overloads
+
+There are none to disambiguate. Measured on v1.5.5: `CREATE MACRO main.pair(a) AS a` followed by
+`CREATE MACRO main.pair(a, b) AS a + b` is refused with
+`Catalog Error: Macro Function with name "pair" already exists!`, so a macro name is unique within its
+schema and the last path segment is the whole identity. This is unlike PostgreSQL, where the routine
+segment carries an argument type list.
+
+---
+
+### Object edit (#789)
+
+No kind here is editable on day one, and the four kinds get there two ways: `view` is DEFERRED, and the other three are REFUSED for two different reasons.
+`view` is the one DEFERRED case and is the cheapest second producer for the collateral machinery: a single `CREATE OR REPLACE` is atomic on failure, and the price is that a byte-identical replace DISCARDS the view's COMMENT.
+`macro` is refused while a Phase 2 defect stands: `CREATE OR REPLACE MACRO` replaces the NAME and deletes every other overload, and the macro read in [`index.ts`](../../src/lib/db/providers/sql/duckdb/index.ts) takes `rows[0]`, so the pane shows one overload and calls it the definition.
+`table` and `sequence` are refused because a SUCCESS would destroy what the user was never shown: `CREATE OR REPLACE TABLE` with the table's own published DDL deletes every row, and a sequence's published `START` is the reached value plus one, so the pane shows a clause the author never typed and which moves on every use.
+Shipping even the `view` case would make this provider the first producer of `revision.scope: "connection"`, which needs an identity for the PROVIDER INSTANCE that `getOrCreateProvider()` does not mint.
+No kind here declares `acceptsSourceEdits`, and `tests/isolated/object-edit-declarations.test.ts` is what holds that absence and this section together.
 
 ## 7. Monitoring & health
 
@@ -531,7 +1256,7 @@ and one index.
 | Version | `v1.5.5`, from `version()` |
 | Database size | `2.0 MiB` — a **string** from `pragma_database_size()`, parsed to bytes for the gauge (§3.5) |
 | Blocks | `block_size` 262144, `total_blocks` 8, `used_blocks` 8, `free_blocks` 0 |
-| WAL size | `0 bytes` on a checkpointed database — again a string |
+| WAL size | `0 bytes` on a checkpointed database — again a string; the Storage tab's WAL tile reads the `.wal` file itself (below) |
 | Memory usage | `2.0 MiB`; `duckdb_memory()` breaks it down in real bytes: `BASE_TABLE` 2097152 |
 | Memory limit | `50.0 GiB` on the probe machine — 80% of host RAM, so **never asserted in a test** |
 | Temporary files | Empty, from `duckdb_temporary_files()` — a real reading, not a gap |
@@ -543,11 +1268,31 @@ and one index.
 Where a reading is absent it is reported as absent with the reason, never as `0`: a zero on a size
 panel reads as an empty database, which is a claim about the user's data.
 
+### 7.1 Rows still in the `.wal` (#1449)
+
+Before its first checkpoint, a file database keeps every row in its `.wal`, and
+`pragma_database_size()` answers `database_size` `0 bytes` over it. Measured on v1.5.5 with
+1,000 rows: a 12,288-byte main file beside a 32,083-byte `.wal`, and Monitoring drew
+"DB Size 0 B" over a database holding data. That `0` is not the size of the database, so where
+the engine answers `0` for a **file** database, the provider falls back to the files on disk:
+
+- **Database size** (Overview and Health) is the main file plus its `.wal`
+  (`withFileSizes` in [`introspect.ts`](../../src/lib/db/providers/sql/duckdb/introspect.ts)).
+- **Storage** lists the main file at its own size and the `.wal` as a row of its own named
+  **WAL**, the row the Storage tab's WAL tile reads (the same shape the SQLite provider
+  publishes). A checkpointed database has no `.wal` file and gets no WAL row.
+
+`introspect.ts` reads only SQL, so the provider (`readFileSizes()` in
+[`index.ts`](../../src/lib/db/providers/sql/duckdb/index.ts)) stats the two files and hands the
+sizes in. A size the engine did measure is kept as it is, and an in-memory database is unchanged:
+it has no file, and still reports its memory usage (§3.5).
+
 ---
 
 ## 8. Maintenance
 
-Six members exist in the closed `MaintenanceType` union. DuckDB can honestly offer three.
+Nine members exist in the closed `MaintenanceOperation` union, the six of `MaintenanceType` and etcd's three.
+DuckDB can honestly offer three.
 
 | Operation | Offered | Statement / reason |
 |---|---|---|
@@ -557,6 +1302,9 @@ Six members exist in the closed `MaintenanceType` union. DuckDB can honestly off
 | `reindex` | withheld | `Parser Error: syntax error at or near "REINDEX"` — the statement does not exist |
 | `check` | withheld | `PRAGMA integrity_check` → `Catalog Error: Pragma Function with name integrity_check does not exist!` |
 | `kill` | withheld | There is no session to kill (§3.7) |
+| `compact` | withheld | etcd's history compaction; DuckDB has no revision history |
+| `defragment` | withheld | etcd's member defragmentation; `CHECKPOINT` is `optimize` above |
+| `disarm` | withheld | etcd's alarms; DuckDB raises none |
 
 `PRAGMA optimize` was probed too and does **not** exist
 (`Catalog Error: Pragma Function with name optimize does not exist!`) — which is why `optimize` maps
@@ -568,9 +1316,139 @@ per-entity control would fail at the point the user clicked it. `runMaintenance`
 withheld types **here**, naming the reason, rather than sending a statement the engine will reject
 with wording about a keyword the user never typed.
 
+`runMaintenance(type, target?, container?)` takes a `container` as the SCHEMA the row carries as
+`schemaName` (#772), the same reading PostgreSQL uses: the schema is quoted whole and prefixed to
+the quoted table name, and never recovered by splitting the target - a schema is allowed to contain
+a dot. Without one the old readings stand: `schema.table` is quoted part by part and a bare name
+falls back to `main`.
+
 ---
 
-## 9. Packaging
+## 9. Capabilities & labels
+
+### 9.1  `getCapabilities()` ([`index.ts`](../../src/lib/db/providers/sql/duckdb/index.ts))
+
+| Capability | Value | UI effect |
+|---|---|---|
+| `defaultPort` | `null` | No port field is needed; DuckDB has no network listener. |
+| `supportsConnectionString` | `false` | The connection form takes a database file path rather than a URI (§4.2). |
+| `supportsExplain` | `true` | Enables the Explain action. |
+| `explainFormat` | `duckdb-json` | The Explain view consumes DuckDB's JSON physical plan (§5). |
+| `supportsInlineRowEdit` | `true` | Enables inline row editing for writable table objects. |
+| `createTable` | declared, see [Create Table form](#create-table-form) | Shows the Create Table button, the object-tree "Create Table" item and the import into a new table; the form writes the sequence-backed grammar of `DUCKDB_CREATE_TABLE`. |
+| `supportsTestDataGeneration` | `true` | The row menus offer Generate Test Data on writable table objects; it writes one multi-row `INSERT INTO ... VALUES`. |
+| `supportsResultPagination` | `true` | Enables Load More; the shared limiter emits `LIMIT n OFFSET m`. |
+| `supportsTransactions` | `false` | Hides the transaction controls; the provider exposes no transaction API. |
+| `singleWriterFile` | `true` | Lets callers treat an already-open DuckDB file as a single-writer resource (§3.8). |
+| `readsFileAccessPosture` | `true` | The editor handle opens under the file-access posture of `ProviderExecutionContext.allowExternalFileAccess`, so the handle cache and the single-writer borrow split DuckDB handles by posture through `READS_FILE_ACCESS_POSTURE` (§3.16). |
+| `identifierQuoting` | `double` | Generated SQL quotes identifiers with double quotes. |
+| `maintenanceOperations` | `vacuum`, `analyze`, `optimize` | Offers only the maintenance operations implemented in §8. |
+| `containerLevels` | `Database`, `Schema` | The object browser nests schemas under databases (§6). |
+| `containerPathShapes` | `prefixes` | `[database]` and `[database, schema]` both address a container, because an attached database alone is a real address; the empty path and a longer path are both refused, by the object routes over HTTP and by this provider directly (§6, #1147). |
+| `objectKinds` | `table`, `view`, `macro`, `sequence` | These are the object folders exposed in the browser (§6). |
+
+The maintenance specs make `vacuum` and `analyze` available both per table and globally.
+`optimize` is global only and is labelled **Checkpoint Database** because it runs `CHECKPOINT`.
+See §8 for the statements and placement rules.
+
+### 9.2  `getLabels()` ([`index.ts`](../../src/lib/db/providers/sql/duckdb/index.ts))
+
+| Label | UI effect |
+|---|---|
+| `slowQueriesEmptyState` | Explains that DuckDB publishes no `duckdb_queries()` table function, so the Queries panel has no finished-statement store to show. |
+| `sessionsEmptyState` | Explains that DuckDB publishes no `duckdb_connections()` table function, so the Sessions panel cannot show rows. |
+| `vacuumGlobalDesc` | Describes the global `VACUUM` control and its checkpoint behaviour. |
+
+The first two replace generic empty-state copy with the engine-specific absence already measured
+in §3.7. The maintenance label does not add another operation; it only describes the global
+`vacuum` control declared above.
+
+### 9.3 Agent language pack
+
+Statement-language family: `sql`.
+Overlay: [`src/lib/agent/languages/sql/engines/duckdb.ts`](../../src/lib/agent/languages/sql/engines/duckdb.ts), with its client row in [`src/lib/agent/languages/sql/engines/client.ts`](../../src/lib/agent/languages/sql/engines/client.ts).
+The agent reads it through `runServerPack` and `agentEnginePack`, and the dialect through `engineServerDialect`.
+
+| Member | Kind | Value |
+| --- | --- | --- |
+| `catalogRead` | Dialect-bound | Supplied |
+| `planEstimate` | Dialect-bound | Supplied |
+| `profileComposition` | Dialect-bound | `"unsupported"` |
+| `statistics` | Dialect-bound | `"unsupported"` |
+| `catalogCapture` | Dialect-bound | `"unsupported"` |
+
+This overlay overrides no Shared member, so every Shared member is the `sql` statement-language family's own.
+`profile_table` is still offered here and answers `UNSUPPORTED_DIALECT` (B111).
+A pack does not open agent mode: execution is gated by `AGENT_EXECUTION_ENGINES` and the execution-profile check.
+
+### 9.4 SQL writing
+
+[`duckdb/sql-writing.ts`](../../src/lib/db/providers/sql/duckdb/sql-writing.ts) declares how a generated statement spells a literal, a name and a bind for this engine, and it is this engine's row of `SQL_WRITING` ([`src/lib/db/sql-writing/index.ts`](../../src/lib/db/sql-writing/index.ts)), which the readers in [`src/lib/sql/values.ts`](../../src/lib/sql/values.ts) and [`src/lib/sql/identifier.ts`](../../src/lib/sql/identifier.ts) look up.
+A literal is written by `literalStandard` and read back by `unquoteStandard`: the quote is doubled and a backslash is data.
+A name is quoted by `identifierDoubleQuoted`, the SQL standard form: a double-quoted name with an inner double quote doubled.
+A bind is spelled by `placeholderQuestion`, as `?` at every position.
+Measured on DuckDB v1.5.5, both directions: `SELECT 'it''s'` answers `it's`, and `SELECT 'a\b', length('a\b')` answers the three characters `a\b`, so a backslash is data, and doubling it would add a second one to the value.
+The name quote is measured on v1.5.5 too: `"quoted identifier"` works, and `[…]` is a LIST literal here rather than a name quote, so the bracket form would be wrong for it.
+DuckDB binds both forms, measured on v1.5.5: `runAndReadAll("SELECT ?::INTEGER AS a, ?::VARCHAR AS b", [7, "x"])` and `runAndReadAll("SELECT $1::INTEGER AS a", [9])` each answer, so `?` is a choice rather than a reading.
+`$` is overloaded in this dialect: `$tag$…$tag$` is a dollar-quoted string literal (measured), so a `$1` written into a generated statement sits one character away from a form the readers have to tell apart, while `?` has no second meaning anywhere in DuckDB's grammar.
+`?` also matches the positional order the driver binds by, which is the array's, not the digit's.
+Inline row editing reads a key column's kind through the shared `INSTANT_TYPE_NAMES`, `FLOAT64_TYPE_NAMES` and `EXACT_DECIMAL_TYPE_NAMES` of the module's `inlineEdit`, and binds every edit as typed.
+
+The module's `export` field writes a result export's column types from `STANDARD_DDL_TYPES`.
+Each name in `standsAlone` was measured on DuckDB v1.5.5, one `CREATE TABLE probe (c <name>)` per name read back out of `duckdb_columns().data_type`, and resolved to an unnarrowed type: the seven text spellings to `VARCHAR`, the four byte ones to `BLOB`, the four moment ones to `TIMESTAMP` (and `TIMESTAMP WITH TIME ZONE` to itself).
+`numeric` and `decimal` are the absences that matter: DuckDB accepts both and stores `DECIMAL(18,3)`, which rounds away every value past the third decimal, so they are re-spelled from their family.
+A binary cell is written by `binaryUnhex`, not the standard hex: measured on v1.5.5, `SELECT typeof(X'0102')` answers `VARCHAR` and `SELECT X'0102'` answers the five characters `x0102`, while `unhex('0102deadbeef')` answers a real `BLOB` that reads back as `hex(payload)` = `0102DEADBEEF` with `octet_length(payload)` 6, `unhex('')` inserts the zero-length blob, and `0x0102` is a parser error.
+`nonFinite` is `QUOTED_WORD_NON_FINITE`, which writes the quoted words `'NaN'`, `'Infinity'` and `'-Infinity'`, which DuckDB read back into `DOUBLE` and `FLOAT` when replayed (2026-10-04).
+`typedLiteral` writes intervals, maps, structs and the other cells whose JSON form DuckDB refuses, from the engine's own [`duckdb/typed-literals.ts`](../../src/lib/db/providers/sql/duckdb/typed-literals.ts).
+`NO_BARE_SPELLING` completes it.
+
+
+
+---
+
+
+
+
+## 10. Error handling
+
+DuckDB errors are classified by `mapDuckDBError()` before falling back to the shared database
+error mapper. The provider reads DuckDB's error-class prefix first so that words inside an engine
+message do not accidentally select an unrelated shared classification.
+
+| Condition | Provider error | What the user sees |
+|---|---|---|
+| `INTERRUPT Error` | `QueryCancelledError` | `Query was cancelled` |
+| Conflicting file lock | `ConnectionError` | `DuckDB file <path> is locked by <process>. DuckDB admits one operating-system process per database file, in read-only mode too, so the other process has to release it first. Engine message: <engine message>` |
+| A write in the editor on a file opened read-only because this process cannot write it (§3.15) | `QueryError` | `DuckDB database <path> is open read-only because this process cannot write the file or its directory: <engine message>` |
+| A `Permission Error` on an editor handle opened with file access denied (§3.16) | `QueryError` | `File and network access is off on this DuckDB connection: the handle was opened with external access denied, which Studio does for every role but admin and for any connection a non-admin role can use, and which an embedder overrides by passing { allowExternalFileAccess: true }: <engine message>` |
+| `Parser Error`, `Binder Error`, `Catalog Error`, `Conversion Error`, `Invalid Input Error`, `Constraint Error`, `Out of Range Error`, `Not implemented Error`, `Permission Error`, `Serialization Error`, `TransactionContext Error` | `QueryError` | The engine message, with the query attached when one is available |
+| Anything else | shared database error | `mapDatabaseError()` classifies the error using the common provider rules |
+
+A lock conflict uses the same `describeOpenFailure()` path whether it happens while opening the
+file or later in a session. When DuckDB includes the holder PID, the sentence names
+`process <pid>`; otherwise it says `another process`.
+
+Open-time failures have seven additional provider-specific diagnoses:
+
+| Condition | Provider error | What the user sees |
+|---|---|---|
+| `@duckdb/node-api` is not installed | `ConnectionError` | `DuckDB is not available in this deployment: the @duckdb/node-api driver is not installed. The libredb-studio -alpine-slim image leaves it out to stay small; the default and -alpine tags ship it. Use one of those tags, or install the driver, to open DuckDB connections.` |
+| Read-only open of a missing file | `ConnectionError` | `DuckDB database <path> does not exist and a read-only handle will not create one. Engine message: <engine message>` |
+| A SQLite file, refused before the engine opens it (§3.14) | `ConnectionError` | `<path> is a SQLite database file, not a DuckDB database file. Open it with a SQLite connection. DuckDB did not open it, so it is unchanged.` |
+| Any other file without DuckDB's header, an empty one included (§3.14) | `ConnectionError` | `<path> is not a DuckDB database file: a DuckDB file carries "DUCK" at byte 8, and this one does not. DuckDB did not open it, so it is unchanged.` |
+| A handle with file and network access off cannot make its private temp directory (§3.16) | `ConnectionError` | `Could not open DuckDB database <path>: a handle with file and network access off keeps its temporary files in a private directory, and creating one under <temp directory> failed: <system message>. Make that directory writable for the Studio process, or point TMPDIR (TEMP on Windows) at one that is.` |
+| A missing folder the filesystem refuses to create (§4.1) | `ConnectionError` | `Failed to open DuckDB database <path>: <filesystem message>`, for example `ENOENT: no such file or directory, mkdir '/proc/x'` |
+| A path, or one of the engine's files beside it, that exists and is not a regular file, refused before anything opens it (§3.14, §4.1) | `ConnectionError` | `Failed to open DuckDB database <path>: <path> is a named pipe (FIFO), not a regular file`, naming `<path>.wal` or the other file when it is the one, or `a socket`, `a character device`, `a block device` or `a directory` in place of the FIFO |
+| Other open failure | `ConnectionError` | `Failed to open DuckDB database <path>: <engine message>` |
+
+The lock and missing-file sentences above are the provider's wrapped messages, not the raw engine
+messages measured in §3.8. Driver absence is diagnosed only when module resolution fails and the
+failure names `@duckdb/node-api`; other import failures are re-raised unchanged.
+
+
+---
+
+## 11. Packaging
 
 DuckDB is the first new **native** dependency in this repo since `better-sqlite3`, and it is not
 shaped like it. `bun add @duckdb/node-api@1.5.5-r.4` installed four packages:
@@ -595,7 +1473,7 @@ and `parquet` were loaded, and `httpfs` was installed but not loaded.
 
 ---
 
-## 10. Testing
+## 12. Testing
 
 ```bash
 # Just this provider
@@ -612,7 +1490,36 @@ sibling test files.
 Two things the tests deliberately do **not** assert, both from §3.5 and §7: `memory_limit` (80% of
 host RAM, machine-dependent) and any absolute byte figure parsed from a formatted size string.
 
-### Verifying by hand
+The object-surface and object-source tests (§6) are the same shape and it matters more there:
+because the engine is in-process, every claim about `duckdb_databases()`, `duckdb_schemas()`,
+`function_type` and every definition text in this document is re-measured against a REAL DuckDB on
+every test run, and the fixture `ATTACH`es a second catalog so the two container levels are exercised
+live.
+
+**The fixture is a committed file**, `docker/duckdb-init/01-object-fixture.sql`, replayed by the
+suite through `docker/duckdb-init/build-fixture.ts`. The same reader builds a database FILE anybody
+can point Studio at:
+
+```bash
+bun docker/duckdb-init/build-fixture.ts                    # ./.duckdb-fixture/object-fixture.duckdb
+bun docker/duckdb-init/build-fixture.ts /tmp/demo.duckdb   # anywhere else
+```
+
+The fixture's second catalog is a placeholder the reader substitutes: the suite attaches `:memory:`
+and a file build attaches a sibling file, because DuckDB does **not** persist an attachment inside a
+database file. So opening the built file shows one catalog, and the builder prints the `ATTACH`
+statement that reaches the other. Two facts are asserted on the
+STATEMENT rather than on rows, because no fixture on this engine can distinguish them: the macro
+`function_type` predicate, and `ORDER BY column_index` on the column read.
+
+A refused count is driven with `SET max_expression_depth=1`, which is pure configuration and so
+always takes effect. `SET memory_limit='1KB'` was the obvious alternative and is not usable: measured,
+the SET itself starts failing with *could not free up enough memory for the new limit* once the
+fixture holds enough, so the refusal would come and go with the fixture's size. The control for it
+has to be a second handle, because once the depth is 1 even `SET max_expression_depth=1000` and
+`RESET` are refused by the same limit.
+
+### 12.1 Verifying by hand
 
 Create a directory and point a connection at a file inside it:
 
@@ -626,13 +1533,58 @@ second process is refused even for reading.
 
 ---
 
-## 11. Security
+
+
+
+
+## 13. Usage examples
+
+These examples assume a DuckDB file connection already configured as described in §4.
+DuckDB has no connection string or network endpoint; SQL runs against the file named by the
+connection's `database` field.
+
+Create a table and insert rows:
+
+```sql
+CREATE TABLE events (
+  id INTEGER,
+  name VARCHAR
+);
+
+INSERT INTO events VALUES
+  (1, 'created'),
+  (2, 'updated');
+```
+
+Read rows from the file:
+
+```sql
+SELECT id, name
+FROM events
+ORDER BY id;
+```
+
+Pagination is supported, so ordinary DuckDB `LIMIT` and `OFFSET` queries can also be run directly:
+
+```sql
+SELECT id, name
+FROM events
+ORDER BY id
+LIMIT 25 OFFSET 0;
+```
+
+For the provider's maintenance operations, use the controls described in §8 rather than repeating
+their setup here.
+
+---
+
+## 14. Security
 
 DuckDB has no users, no roles and no passwords: **the filesystem is the access control**, and Studio
 runs the engine in its own process with its own privileges. Two consequences drive the provider's
 security posture.
 
-### 11.1 `access_mode` alone does not bound the process — the escapes that proved it
+### 14.1 `access_mode` alone does not bound the process — the escapes that proved it
 
 With `access_mode: 'READ_ONLY'` genuinely in force — `INSERT` refused with *Cannot execute statement
 of type "INSERT" on database "w" which is attached in read-only mode!* in the same session — the
@@ -661,7 +1613,11 @@ Read the first column as: the engine flag protects the *database file*, and noth
 given only that handle could write CSV anywhere the Studio process can write, read any file the
 process can read, and pull an extension over the network.
 
-### 11.2 The boundary is in the engine, and the denylist is defence in depth
+The right column's `Permission Error` rows are also the editor's denied posture (§3.16): a non-admin, and every role on a seed a non-admin role can use, opens a WRITABLE handle with `enable_external_access: 'false'`, so every file or network form this table marks `Permission Error` is refused there too.
+It differs from this table in one way: the denied editor keeps the database writable, unlike the read-only agent handle measured here, so `INSERT`, `CREATE TEMP TABLE`, `SET`, `LOAD json` and ordinary reads all succeed on it.
+Only an admin editor on an inline connection or an admin-only seed keeps the left-column reach.
+
+### 14.2 The boundary is in the engine, and the denylist is defence in depth
 
 `queryReadOnly` opens its handle with **`access_mode: 'READ_ONLY'` and
 `enable_external_access: 'false'`**, both fixed at open. The second is what makes the profile a
@@ -671,11 +1627,8 @@ sandbox: the engine itself refuses every filesystem reach with
 Permission Error: Cannot access file "…" - file system operations are disabled by configuration
 ```
 
-and a session cannot climb back out — `SET enable_external_access = true` and its `SET GLOBAL` form
-both answer `Invalid Input Error: Cannot enable external access while database is running`
-(measured; `SET memory_limit` in the same session is accepted, so this refusal is a property of the
-option rather than of read-only mode). The **writable editor connection passes neither option**:
-there `COPY … TO` and `read_csv_auto('…')` are features, and they were measured unaffected.
+and a session cannot climb back out: `SET enable_external_access = true` and its `SET GLOBAL` form both answer `Invalid Input Error: Cannot enable external access while database is running` (measured; `SET memory_limit` in the same session is accepted, so this refusal is a property of the option rather than of read-only mode).
+The **admin's full-reach editor connection passes neither option** (the denied posture passes `enable_external_access: 'false'`, §3.16): there `COPY … TO` and `read_csv_auto('…')` are features, and they were measured unaffected.
 
 The SQL denylist in `index.ts` still runs first, and it is **defence in depth, not the boundary**: a
 refusal naming the construct and the reason is worth more to a reader than the engine's sentence, it
@@ -695,19 +1648,52 @@ The same measurement pass found one thing the option does **not** stop: `read_du
 connection's own file>')` still answers, because it reaches nothing the profile had not already
 granted.
 
-### 11.3 The file path is the whole trust boundary
+The same `enable_external_access: 'false'` boundary, on a **writable** handle, is the editor's denied posture (§3.16): the three bypasses above are refused there too, which is why the editor path relies on the engine option rather than on the statement denylist.
 
-Anyone who can create a DuckDB connection chooses a path on the server's filesystem, and the engine
-will happily read a CSV, Parquet or JSON file next to it. Grant connection-creation rights
-accordingly: on a shared deployment, a DuckDB connection is closer to a shell on the Studio host than
-to a database login.
+### 14.3 The file path is a trust boundary for every role, and statement reach is the admin's
+
+Anyone who can create a DuckDB connection chooses a path on the server's filesystem, and the handle opens whatever DuckDB database that path names, read-write, creating it when it is missing.
+That holds for every role, because the main database is not external to the engine (§3.16).
+Where the posture allows file access, the engine will also happily read a CSV, Parquet or JSON file next to it, so on a shared deployment an admin DuckDB connection is closer to a shell on the Studio host than to a database login: grant admin accordingly.
+
+Under the denied posture (§3.16), which is every non-admin's handle and every handle on a seed a non-admin role can use, `read_text`, `read_csv`, `COPY`, `ATTACH` of a file, `INSTALL`, `httpfs` and every other statement-level file or network route answer the engine's `Permission Error`, except inside the handle's own private temp directory and on its database's own file names, while the connection's own database stays read-write.
+So the "closer to a shell" caution is the admin's, but a standard user with a DuckDB connection still reaches any DuckDB-format file whose path they name: the path is not sandboxed for any role, the position [`sqlite.md`](./sqlite.md) section 14 records for SQLite (issue #125).
+
+### 14.4 Opening a connection reaches no network
+
+A path is the only thing a DuckDB connection carries, and before #1404 a path was enough to make the
+server download and load native code: the engine auto-installed the extension that could read
+whatever file the path named (§3.14). Every handle now opens with extension autoinstall and autoload
+off, community extensions refused and a file without DuckDB's header refused before the engine opens
+it, so opening a connection, Test Connection included, makes no network request and writes nothing to
+a file that is not a DuckDB database. Only DuckDB's own signed extensions can load on any handle.
+
+**The editor itself still reaches the network, and that is deliberate, not closed.** Measured on
+v1.5.5, from an editor session:
+
+- `SET custom_extension_repository = 'http://<any host>/...'` followed by `INSTALL <name>` makes the
+  Studio server send an HTTP request to that host. What it downloads still has to carry DuckDB's
+  signature to be installed, but the request is made.
+- `INSTALL httpfs; LOAD httpfs;` and then `read_csv('http://<any host>/...')` makes the server
+  request any URL a user names, internal addresses included: a server-side request forgery
+  surface, with the server's own network position.
+
+Both were open before this change as well, with a lower bar (an implicit autoinstall needed no `INSTALL` at all).
+They are the admin editor's features, the same way `COPY ... TO` and local `read_csv` are, and they are why §14.3 says an admin DuckDB connection is **closer to a shell on the Studio host than to a database login**: grant admin only to people you would trust with outbound network access from the server.
+`enable_external_access` and `lock_configuration` are not set on the admin's full-reach editor handle because they would also break those documented reads and writes, and the per-session opt-in in §3.14.
+Restricting that handle further is an operator policy decision that this provider does not make on its own; the denied posture already sets `enable_external_access: 'false'` for every non-admin role and for every role on a seed a non-admin role can use (§3.16).
+
+The agent read-only profile has none of this reach: `enable_external_access` is off there and its denylist refuses `INSTALL` and `LOAD` (§3.10).
+The editor's denied posture has none of it either, for the same reason: `enable_external_access` is off on its handle (§3.16), so the `custom_extension_repository` + `INSTALL` and the `httpfs` + `read_csv('http://...')` routes above both answer `Permission Error`.
+The reach described in this section is an admin editor's on an inline connection or an admin-only seed.
 
 ---
 
-## 12. Known limitations
+## 15. Known limitations
 
 | Limitation | Cause | Owner |
 |---|---|---|
+| Under the denied posture, which is a non-admin role and every role on a seed a non-admin role can use, a statement cannot reach the network or a file other than the database's own and the handle's private temp directory, so it cannot import CSV/Parquet/JSON, `COPY` to or from such a file, `ATTACH` one or install extensions, while the database path itself is still any DuckDB file the process can access | `enable_external_access: 'false'` on that editor handle, and one handle per seed record because DuckDB serves one file through one read-write handle per process | **Ours, and intended**: the security change, while an admin keeps full reach on an inline connection and an admin-only seed (§3.16, §14.3) |
 | The file must live on Studio's filesystem | Embedded engine, no network protocol | The engine's (§1.1) |
 | A second process cannot open the file, even read-only | Measured lock behaviour | The engine's (§3.8) |
 | No transaction controls | Not exposed by this provider | Ours — `supportsTransactions: false` |
@@ -715,18 +1701,45 @@ to a database login.
 | No `REINDEX`, no integrity check | Neither statement exists on 1.5.5 | The engine's (§8) |
 | No analyze/timing plan, ever | `EXPLAIN (ANALYZE, FORMAT JSON)` **executes the statement** — measured, an `INSERT` explained three times inserted three rows | **Ours, and permanent.** A later DuckDB emitting valid analyze JSON makes this worse, not better: the plan would look usable while still running what the user asked only to see (§3.6) |
 | Sizes arrive as formatted strings | `pragma_database_size()` publishes no raw bytes | The engine's (§3.5) |
-| Wide integers render as strings | `getRowObjectsJson()` quotes them to stay exact | The engine's, and deliberate (§3.2) |
+| Wide integers render as strings | `getRowsJson()` quotes them to stay exact | The engine's, and deliberate (§3.2) |
 | A multi-statement string runs only its first statement | The driver's `runAndReadAll` behaviour | The driver's (§3.11) |
-| ~140 MB of bindings on a Linux tree | glibc and musl packages both install | Ours to prune in the AppImage build (§9) |
+| No `SERIAL`, no `IDENTITY`, no `AUTOINCREMENT` | None of the three exists; `GENERATED … AS IDENTITY` parses and is refused at execution | The engine's — the create-table form defaults from a sequence instead (§3.13) |
+|  ~140 MB of bindings on a Linux tree | glibc and musl packages both install | Ours to prune in the AppImage build (§11) |
 | MotherDuck / `md:` / Quack / DuckLake unsupported | Different products, different authentication | Ours — out of scope for v1 (§4.3) |
-| `ATTACH`-ed catalogs are not in the tree | Catalog reads are scoped to `current_database()` | Ours (§4.3) |
+| TEMP tables are absent from the object tree | `duckdb_databases()` marks `temp` `internal`, alongside `system` | Ours, §6 |
+| Secrets are not an object kind | A secret has no catalog and no schema, so nothing in the model can hold it | Ours, out of Phase 1's scope (§6) |
+| A listed object carries no row count | `estimated_size` is an estimate, and `count(*)` per object is an N+1 | Ours, §6 and §3.5 |
+| A macro's Source pane shows a BODY, not a `CREATE MACRO` statement | `duckdb_functions().macro_definition` is the only text the engine publishes, and there is no `duckdb_macros()` | The engine's; ours to assemble in a later phase, and the pane says `form: partial` meanwhile (§6, Object source) |
+| Every definition text is a regeneration, never the author's bytes | The catalog stores a parsed object, not the submitted statement | The engine's (§6, Object source) |
 
 ---
 
-## 13. References
+## Migration DDL
+
+[`DUCKDB_MIGRATION_DDL`](../../src/lib/db/providers/sql/duckdb/migration-ddl.ts) is what the schema-diff migration generator writes for `duckdb`, read through `migrationDdlFor` in `src/lib/db/migration-ddl/`.
+DuckDB writes the shared statements wrapped in `BEGIN;` and `COMMIT;`, except for foreign keys, which it declares only as a `CREATE TABLE` table constraint.
+Measured on DuckDB v1.5.5: `CREATE TABLE "users" (..., PRIMARY KEY ("id"), FOREIGN KEY ("dept_id") REFERENCES "departments"("id"))` lands and `duckdb_constraints()` reports the key, so an added table takes the key inside the statement.
+`ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES u(id)` parses and then answers "Not implemented Error: No support for that ALTER TABLE option yet!" on v1.5.5, as does the `UNIQUE` form, so an added foreign key on an existing table is a comment.
+`ALTER TABLE t DROP CONSTRAINT IF EXISTS fk_x` answers the same "Not implemented" error, which is not an `IF EXISTS` no-op, so a dropped foreign key is a comment too.
+The fields it takes unchanged from `src/lib/db/migration-ddl/shared.ts` are `BEGIN_COMMIT`, `standardAddColumn`, `standardColumnDef`, `standardCreateIndex`, `standardDropColumn`, `standardDropIndex`, `standardDropTable`, `standardModifyColumn` and `standardPrimaryKey`.
+
+Every refusal reason it can print, verbatim:
+
+- "ALTER TABLE cannot add one yet; recreate the table and copy the rows."
+- "Requires table recreation."
+
+---
+
+## 16. References
 
 - DuckDB — <https://duckdb.org>
 - `@duckdb/node-api` — <https://www.npmjs.com/package/@duckdb/node-api>
 - [`docs/ADDING_A_PROVIDER.md`](../ADDING_A_PROVIDER.md) — the registration checklist this provider followed
 - [`docs/providers/sqlite.md`](sqlite.md) — the other embedded, file-based engine, and the same deployment constraint
 - [`docs/providers/postgres.md`](postgres.md) — the canonical SQL-family walkthrough
+
+
+Connection targets reserve Studio's storage database, its WAL/SHM files and bootstrap
+credentials (including backups and temporary files). This applies to every role.
+Checks normalize paths, resolve symbolic links and compare existing file identities
+so hard links cannot alias reserved files. Other user database files beside them remain usable.

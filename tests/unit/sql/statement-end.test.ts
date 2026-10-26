@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { resolveSqlGrammar, type SqlGrammar } from "@/lib/sql/grammar";
+import { DEFAULT_SQL_GRAMMAR, resolveSqlGrammar, type SqlGrammar } from "@/lib/sql/grammar";
 import { readStatementEnd } from "@/lib/sql/statement-end";
 import type { DatabaseType } from "@/lib/types";
 
@@ -233,6 +233,55 @@ describe("readStatementEnd", () => {
       const clickhouse = resolveSqlGrammar("clickhouse");
 
       expect(readStatementEnd("SELECT [1,2 AS a", clickhouse).rewritable).toBe(false);
+    });
+
+    // A dialect without the tagged dollar form (`dollarTags: false`) reads the `$` that would open one as code, so a
+    // run that never closes there is no unterminated span and the cut is allowed.
+    test("a tagged dollar run that never closes allows the cut only where the dialect has no tagged form", () => {
+      const untagged: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, dollarTags: false };
+
+      expect(readStatementEnd("SELECT $t$x FROM t", untagged)).toEqual({ end: 18, rewritable: true });
+      expect(readStatementEnd("SELECT $t$x FROM t").rewritable).toBe(false);
+    });
+
+    // Spark's raw string and its hint are read whole, so the cut lands after them; without the two facts both texts
+    // hold a literal that never closes and no cut is allowed.
+    test("a raw string and a hint holding `*/` in a string allow the cut only where the dialect declares them", () => {
+      const spark = resolveSqlGrammar("spark");
+      const withoutFacts: SqlGrammar = {
+        ...DEFAULT_SQL_GRAMMAR,
+        blockComment: "nesting",
+        backslashAlwaysEscapes: true,
+      };
+      const raw = "SELECT r'C:\\' AS a -- note";
+      const hint = "SELECT /*+ REPARTITION(3, '*/') */ a FROM t -- note";
+
+      expect(split(raw, spark)).toEqual(["SELECT r'C:\\' AS a", " -- note"]);
+      expect(split(hint, spark)).toEqual(["SELECT /*+ REPARTITION(3, '*/') */ a FROM t", " -- note"]);
+      expect(readStatementEnd(raw, withoutFacts).rewritable).toBe(false);
+      expect(readStatementEnd(hint, withoutFacts).rewritable).toBe(false);
+    });
+
+    // Spark continues a `--` comment past a line feed a backslash stands right before, so the cut lands before the
+    // comment and the WHERE on its second line is comment text; with CR LF endings the comment ends at the line break.
+    test("a `--` comment a backslash continues takes the next line with it only where the dialect declares the fact", () => {
+      const spark = resolveSqlGrammar("spark");
+      const lf = "SELECT * FROM t -- note \\\nWHERE x = 1";
+      const crlf = "SELECT * FROM t -- note \\\r\nWHERE x = 1";
+
+      expect(split(lf, spark)).toEqual(["SELECT * FROM t", " -- note \\\nWHERE x = 1"]);
+      expect(split(lf, DEFAULT_SQL_GRAMMAR)).toEqual([lf, ""]);
+      expect(split(crlf, spark)).toEqual([crlf, ""]);
+    });
+
+    // Spark ends a `--` comment at a lone carriage return and the default runs it on to the line feed, but servers on
+    // one connection type disagree about it, so no reading may cut the text: either one misplaces the bound on the other.
+    test("a lone carriage return in a `--` comment leaves the end uncut under every dialect", () => {
+      const cr = "SELECT * FROM t -- note\rWHERE x = 1";
+
+      for (const grammar of [resolveSqlGrammar("spark"), DEFAULT_SQL_GRAMMAR]) {
+        expect(readStatementEnd(cr, grammar)).toEqual({ end: cr.length, rewritable: false });
+      }
     });
   });
 

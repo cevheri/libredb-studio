@@ -1,5 +1,13 @@
 import { describe, test, expect } from "bun:test";
-import { describeWarning, formatCellValue } from "@/components/results-grid/utils";
+import {
+  describeWarning,
+  formatCellCopy,
+  formatCellValue,
+  generatedFieldNames,
+  renderContextFor,
+} from "@/components/results-grid/utils";
+import { uniqueFieldNames } from "@/lib/db/utils/result-fields";
+import type { VectorColumn } from "@/lib/db/vector/types";
 
 // =============================================================================
 // formatCellValue — output parity pins (#96)
@@ -21,38 +29,38 @@ describe("formatCellValue parity", () => {
   test("object compact-stringifies on a single line", () => {
     expect(formatCellValue({ a: 1, b: "x" })).toEqual({
       display: '{"a":1,"b":"x"}',
-      className: "text-blue-400/80 italic font-light",
+      className: "text-hue-blue/80 italic font-light",
     });
   });
 
   test("array compact-stringifies on a single line", () => {
     expect(formatCellValue([1, 2, 3])).toEqual({
       display: "[1,2,3]",
-      className: "text-blue-400/80 italic font-light",
+      className: "text-hue-blue/80 italic font-light",
     });
   });
 
   test("number renders via String()", () => {
-    expect(formatCellValue(42)).toEqual({ display: "42", className: "text-amber-500/90 font-medium" });
-    expect(formatCellValue(0)).toEqual({ display: "0", className: "text-amber-500/90 font-medium" });
-    expect(formatCellValue(-1.5)).toEqual({ display: "-1.5", className: "text-amber-500/90 font-medium" });
+    expect(formatCellValue(42)).toEqual({ display: "42", className: "text-hue-amber/90 font-medium" });
+    expect(formatCellValue(0)).toEqual({ display: "0", className: "text-hue-amber/90 font-medium" });
+    expect(formatCellValue(-1.5)).toEqual({ display: "-1.5", className: "text-hue-amber/90 font-medium" });
   });
 
-  test("boolean true is emerald, false is rose", () => {
-    expect(formatCellValue(true)).toEqual({ display: "true", className: "text-emerald-500/90" });
-    expect(formatCellValue(false)).toEqual({ display: "false", className: "text-rose-500/90" });
+  test("boolean true takes the emerald hue token, false the rose one", () => {
+    expect(formatCellValue(true)).toEqual({ display: "true", className: "text-hue-emerald/90" });
+    expect(formatCellValue(false)).toEqual({ display: "false", className: "text-hue-rose/90" });
   });
 
-  test("truthy status strings are emerald, case preserved", () => {
-    expect(formatCellValue("true")).toEqual({ display: "true", className: "text-emerald-500/90" });
-    expect(formatCellValue("ACTIVE")).toEqual({ display: "ACTIVE", className: "text-emerald-500/90" });
-    expect(formatCellValue("Enabled")).toEqual({ display: "Enabled", className: "text-emerald-500/90" });
+  test("truthy status strings take the emerald hue token, case preserved", () => {
+    expect(formatCellValue("true")).toEqual({ display: "true", className: "text-hue-emerald/90" });
+    expect(formatCellValue("ACTIVE")).toEqual({ display: "ACTIVE", className: "text-hue-emerald/90" });
+    expect(formatCellValue("Enabled")).toEqual({ display: "Enabled", className: "text-hue-emerald/90" });
   });
 
-  test("falsy status strings are rose, case preserved", () => {
-    expect(formatCellValue("false")).toEqual({ display: "false", className: "text-rose-500/90" });
-    expect(formatCellValue("INACTIVE")).toEqual({ display: "INACTIVE", className: "text-rose-500/90" });
-    expect(formatCellValue("Disabled")).toEqual({ display: "Disabled", className: "text-rose-500/90" });
+  test("falsy status strings take the rose hue token, case preserved", () => {
+    expect(formatCellValue("false")).toEqual({ display: "false", className: "text-hue-rose/90" });
+    expect(formatCellValue("INACTIVE")).toEqual({ display: "INACTIVE", className: "text-hue-rose/90" });
+    expect(formatCellValue("Disabled")).toEqual({ display: "Disabled", className: "text-hue-rose/90" });
   });
 
   test("plain string renders as-is", () => {
@@ -89,5 +97,93 @@ describe("describeWarning", () => {
 
   test("still reports an entry that carries neither message nor code", () => {
     expect(describeWarning({ message: "" })).toBe("Warning");
+  });
+
+  test("leads with the severity the engine reported, the way psql prints it (#1401)", () => {
+    expect(
+      describeWarning({ message: 'table "nope" does not exist, skipping', code: "00000", severity: "NOTICE" }),
+    ).toBe('NOTICE: table "nope" does not exist, skipping');
+    expect(describeWarning({ message: "", code: "01000", severity: "WARNING" })).toBe("WARNING: Warning 01000");
+  });
+});
+
+describe("formatCellCopy", () => {
+  test("a renderer with no copy form copies its compact display, as Copy Cell always did", () => {
+    expect(formatCellCopy("Alice")).toBe("Alice");
+    expect(formatCellCopy(42)).toBe("42");
+    expect(formatCellCopy({ a: 1 })).toBe('{"a":1}');
+    expect(formatCellCopy('{\n  "id": 1\n}')).toBe('{\n  "id": 1\n}');
+    expect(formatCellCopy(null)).toBe("NULL");
+  });
+
+  test("a binary value copies every byte, where its display is a preview", () => {
+    const bytes = { type: "Buffer", data: Array.from({ length: 100 }, (_, index) => index) };
+    const hex = bytes.data.map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    expect(formatCellValue(bytes).display).toHaveLength(77);
+    expect(formatCellCopy(bytes)).toBe(`\\x${hex}`);
+    expect(formatCellCopy(new Uint8Array([1, 2, 171, 255]))).toBe("\\x0102abff");
+  });
+});
+
+describe("renderContextFor", () => {
+  const embedding: VectorColumn = { kind: "dense", dtype: "float32", dimension: 2 };
+
+  test("a declared column gets its declaration, and any other column none", () => {
+    expect(renderContextFor({ embedding }, "embedding")).toEqual({ vector: embedding });
+    expect(renderContextFor({ embedding }, "id")).toBeUndefined();
+    expect(renderContextFor(undefined, "embedding")).toBeUndefined();
+  });
+
+  test("a column named like an Object.prototype member finds no declaration", () => {
+    for (const field of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+      expect(renderContextFor({ embedding }, field)).toBeUndefined();
+    }
+  });
+});
+
+describe("formatCellValue and formatCellCopy with a column's declaration", () => {
+  const context = { vector: { kind: "dense", dtype: "float32", dimension: 2 } } as const;
+
+  test("a declared cell draws and copies as a vector", () => {
+    expect(formatCellValue([1, 0.5], context)).toEqual({
+      display: "[1.0, 0.5] 2 dims",
+      className: "text-hue-teal font-mono",
+    });
+    expect(formatCellCopy([1, 0.5], context)).toBe("[1.0,0.5]");
+  });
+
+  test("a masked cell's text in a declared column draws and copies as the text", () => {
+    expect(formatCellValue("***", context).display).toBe("***");
+    expect(formatCellCopy("***", context)).toBe("***");
+  });
+});
+
+describe("generatedFieldNames", () => {
+  test("names the columns a result had to name itself", () => {
+    expect([...generatedFieldNames(["id", "name", "id (2)", "(No column name)", "(No column name) (2)"])]).toEqual([
+      "id (2)",
+      "(No column name)",
+      "(No column name) (2)",
+    ]);
+  });
+
+  // The direction of every doubt is a refusal: a column the statement aliased `id (2)` beside
+  // an `id` cannot be told from a numbered repeat, and neither is a column of the table.
+  test("counts a numbered name as generated only when its base is in the result too", () => {
+    expect([...generatedFieldNames(["total (2)", "a (3)", "a"])]).toEqual(["a (3)"]);
+  });
+
+  // Pinned against the producer, so a change to the numbered form fails here and not only there.
+  test("names every column uniqueFieldNames made up, and no column the statement named", () => {
+    const fields = uniqueFieldNames(["id", "", "id", "", "name", "id"]);
+    expect([...generatedFieldNames(fields)]).toEqual(["(No column name)", "id (2)", "(No column name) (2)", "id (3)"]);
+  });
+
+  test("counts any digits in the numbered form, as it always has", () => {
+    expect([...generatedFieldNames(["a", "a (1)", "a (02)", "a(2)"])]).toEqual(["a (1)", "a (02)"]);
+  });
+
+  test("leaves a result with no repeat and no unnamed column alone", () => {
+    expect(generatedFieldNames(["id", "name", "price (usd)"]).size).toBe(0);
   });
 });

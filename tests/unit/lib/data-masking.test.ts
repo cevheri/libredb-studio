@@ -8,20 +8,19 @@ if (typeof globalThis.window === "undefined") {
 import {
   maskByType,
   maskValueByPattern,
-  maskValue,
   detectSensitiveColumnsFromConfig,
-  detectSensitiveColumns,
-  hasSensitiveColumns,
   applyMaskingToRows,
   shouldMask,
   canToggleMasking,
   canReveal,
+  maskingInForce,
   loadMaskingConfig,
   saveMaskingConfig,
   getPreviewMasked,
   DEFAULT_MASKING_CONFIG,
   MASKING_CONFIG_KEY,
 } from "@/lib/data-masking";
+import { uniqueFieldNames } from "@/lib/db/utils/result-fields";
 import type { MaskingPattern, MaskingConfig, MaskType } from "@/lib/data-masking";
 import {
   mockMaskingConfigEnabled,
@@ -50,10 +49,18 @@ function makePattern(maskType: MaskType, customMask?: string): MaskingPattern {
 describe("maskByType", () => {
   test("masks email address", () => {
     const result = maskByType("john.doe@example.com", makePattern("email"));
-    expect(result).toContain("@");
-    expect(result).toStartWith("j");
-    expect(result).toContain("*");
-    expect(result).not.toBe("john.doe@example.com");
+    expect(result).toBe("j*******@e**********");
+  });
+
+  test.each([
+    ["@example.com", "***@***.***"],
+    ["bob@", "***@***.***"],
+    ["@", "***@***.***"],
+    ["a@b", "a**@b**"],
+    ["bob@example@com", "***@***.***"],
+    ["😀lice@🌐xample.com", "😀****@🌐**********"],
+  ])("email mask maps %j to %j", (value, expected) => {
+    expect(maskByType(value, makePattern("email"))).toBe(expected);
   });
 
   test("masks malformed email (no @)", () => {
@@ -94,16 +101,49 @@ describe("maskByType", () => {
     expect(result).toBe("********");
   });
 
-  test("partial mask preserves first/last 4 chars for long values", () => {
+  test("partial mask scales the visible ends for a short token", () => {
     const result = maskByType("sk-proj-abc123xyz789", makePattern("partial"));
-    expect(result).toStartWith("sk-p");
-    expect(result).toEndWith("z789");
-    expect(result).toContain("*");
+    expect(result).toBe("sk****************89");
+  });
+
+  test.each([
+    ["", ""],
+    ["a", "*"],
+    ["abcdefghi", "a*******i"],
+    ["abcdefghij", "a********j"],
+    ["abcdefghijkl", "a**********l"],
+    ["abcdefghijklmno", "a*************o"],
+    ["abcdefghijklmnop", "ab************op"],
+    ["abcdefghijklmnopqrstuvw", "ab*******************vw"],
+    ["abcdefghijklmnopqrstuvwx", "abc******************vwx"],
+    ["abcdefghijklmnopqrstuvwxyz12345", "abc*************************345"],
+    ["abcdefghijklmnopqrstuvwxyz123456", "abcd************************3456"],
+    ["abcdefghijklmnopqrstuvwxyz1234567", "abcd*************************4567"],
+    ["abcdefghijklmnopqrstuvwxyz1234567890ABCD", "abcd********************************ABCD"],
+    ["sk-pro...789j", "s***********j"],
+    ["😀bcdefghij😀", "😀*********😀"],
+    ["😀bcdefghijk😀", "😀**********😀"],
+    ["😀😀😀😀😀", "*****"],
+    ["😀bcdefgh", "********"],
+  ])("partial mask maps %j to %j by code point", (value, expected) => {
+    expect(maskByType(value, makePattern("partial"))).toBe(expected);
   });
 
   test("partial mask fully masks short values (<=8 chars)", () => {
     const result = maskByType("abcd1234", makePattern("partial"));
     expect(result).toBe("********");
+  });
+
+  test("default config masks token and malformed email columns without mutating rows", () => {
+    const fields = ["id", "api_key", "email"];
+    const rows = [{ id: 1, api_key: "abcdefghi", email: "@example.com" }];
+    const originalRows = structuredClone(rows);
+    const sensitiveColumns = detectSensitiveColumnsFromConfig(fields, DEFAULT_MASKING_CONFIG);
+
+    const result = applyMaskingToRows(rows, fields, sensitiveColumns);
+
+    expect(result).toEqual([{ id: 1, api_key: "a*******i", email: "***@***.***" }]);
+    expect(rows).toEqual(originalRows);
   });
 
   test("masks IP address", () => {
@@ -124,6 +164,19 @@ describe("maskByType", () => {
   test("masks short date", () => {
     const result = maskByType("05", makePattern("date"));
     expect(result).toBe("****-**-**");
+  });
+
+  test("date mask keeps the day of a timestamp, not its last two characters (#1917)", () => {
+    expect(maskByType("1990-05-17T00:00:00.000Z", makePattern("date"))).toBe("****-**-17");
+    expect(maskByType("1990-05-17 12:34:56", makePattern("date"))).toBe("****-**-17");
+    expect(maskByType("1990-05-17 12:34:56+05:30", makePattern("date"))).toBe("****-**-17");
+  });
+
+  test("date mask hides a value that is not an ISO date whole (#1917)", () => {
+    expect(maskByType("17/05/1990", makePattern("date"))).toBe("****-**-**");
+    expect(maskByType("Thu May 17 1990 00:00:00 GMT+0000", makePattern("date"))).toBe("****-**-**");
+    expect(maskByType("1990-05-170", makePattern("date"))).toBe("****-**-**");
+    expect(maskByType("abcd", makePattern("date"))).toBe("****-**-**");
   });
 
   test("masks financial value", () => {
@@ -165,29 +218,6 @@ describe("maskValueByPattern", () => {
   });
 });
 
-// ─── maskValue (legacy) ─────────────────────────────────────────────────────
-
-describe("maskValue", () => {
-  test("returns NULL for null value", () => {
-    const rule = { pattern: /test/, label: "Test", mask: () => "MASKED" };
-    expect(maskValue(null, rule)).toBe("NULL");
-  });
-
-  test("returns NULL for undefined value", () => {
-    const rule = { pattern: /test/, label: "Test", mask: () => "MASKED" };
-    expect(maskValue(undefined, rule)).toBe("NULL");
-  });
-
-  test("applies mask function to string value", () => {
-    const rule = {
-      pattern: /test/,
-      label: "Test",
-      mask: (v: string) => v.toUpperCase(),
-    };
-    expect(maskValue("hello", rule)).toBe("HELLO");
-  });
-});
-
 // ─── detectSensitiveColumnsFromConfig ───────────────────────────────────────
 
 describe("detectSensitiveColumnsFromConfig", () => {
@@ -220,6 +250,52 @@ describe("detectSensitiveColumnsFromConfig", () => {
     expect(result.has("public_field")).toBe(false);
   });
 
+  test("a repeated sensitive column the result numbered is masked like the column it repeats", () => {
+    const result = detectSensitiveColumnsFromConfig(
+      ["email", "email (2)", "ssn", "ssn (3)", "credit_card (2)"],
+      DEFAULT_MASKING_CONFIG,
+    );
+    expect(result.get("email (2)")).toBe(result.get("email")!);
+    expect(result.get("ssn (3)")).toBe(result.get("ssn")!);
+    expect(result.has("credit_card (2)")).toBe(true);
+  });
+
+  test("a numbered name is masked by its base even alone, and after a second numbering", () => {
+    expect(detectSensitiveColumnsFromConfig(["phone (2)"], mockMaskingConfigEnabled).has("phone (2)")).toBe(true);
+    expect(detectSensitiveColumnsFromConfig(["email (2) (2)"], mockMaskingConfigEnabled).has("email (2) (2)")).toBe(
+      true,
+    );
+  });
+
+  // Pinned against the producer, so a change to the numbered form fails here and not only there.
+  test("every repeat uniqueFieldNames numbers is masked like the column it repeats", () => {
+    const fields = uniqueFieldNames(["email", "id", "email", "email", "id"]);
+    const result = detectSensitiveColumnsFromConfig(fields, DEFAULT_MASKING_CONFIG);
+    expect([...result.keys()]).toEqual(["email", "email (2)", "email (3)"]);
+  });
+
+  test("only the numbered form reads back to its base; any other name keeps its own rule", () => {
+    const config: MaskingConfig = {
+      enabled: true,
+      patterns: [
+        { ...makePattern("email"), id: "base", columnPatterns: ["email"] },
+        { ...makePattern("full"), id: "own", columnPatterns: ["email \\(work\\)"] },
+      ],
+      roleSettings: DEFAULT_MASKING_CONFIG.roleSettings,
+    };
+    const result = detectSensitiveColumnsFromConfig(
+      ["id", "id (2)", "(No column name)", "email (2)", "email (work)", "email (2)x"],
+      config,
+    );
+    // `email (2)` repeats `email` and takes its rule; `email (work)` is not a repeat and matches its own
+    // pattern; `email (2)x` is not the numbered form, so nothing reads it back to `email`; `id` and its
+    // repeat match no pattern.
+    expect([...result.entries()].map(([field, pattern]) => [field, pattern.id])).toEqual([
+      ["email (2)", "base"],
+      ["email (work)", "own"],
+    ]);
+  });
+
   test("returns empty map for no fields", () => {
     const result = detectSensitiveColumnsFromConfig([], mockMaskingConfigEnabled);
     expect(result.size).toBe(0);
@@ -250,87 +326,6 @@ describe("detectSensitiveColumnsFromConfig", () => {
   });
 });
 
-// ─── detectSensitiveColumns (legacy) ────────────────────────────────────────
-
-describe("detectSensitiveColumns", () => {
-  test("detects email column", () => {
-    const result = detectSensitiveColumns(["id", "email", "name"]);
-    expect(result.has("email")).toBe(true);
-    expect(result.get("email")!.label).toBe("Email");
-  });
-
-  test("detects password column", () => {
-    const result = detectSensitiveColumns(["password"]);
-    expect(result.has("password")).toBe(true);
-    expect(result.get("password")!.label).toBe("Password");
-  });
-
-  test("detects SSN column", () => {
-    const result = detectSensitiveColumns(["ssn"]);
-    expect(result.has("ssn")).toBe(true);
-  });
-
-  test("detects credit_card column", () => {
-    const result = detectSensitiveColumns(["credit_card"]);
-    expect(result.has("credit_card")).toBe(true);
-  });
-
-  test("returns empty map for non-sensitive columns", () => {
-    const result = detectSensitiveColumns(["id", "name", "created_at"]);
-    expect(result.size).toBe(0);
-  });
-
-  test("is case insensitive", () => {
-    const result = detectSensitiveColumns(["Email", "PASSWORD"]);
-    expect(result.has("Email")).toBe(true);
-    expect(result.has("PASSWORD")).toBe(true);
-  });
-});
-
-// ─── Legacy MASKING_RULES mask functions ────────────────────────────────────
-
-describe("legacy masking rules: mask functions", () => {
-  test("email rule masks a valid address keeping first chars", () => {
-    const rule = detectSensitiveColumns(["email"]).get("email")!;
-    expect(maskValue("john.doe@example.com", rule)).toBe("j*******@e**********");
-  });
-
-  test("email rule masks a malformed address entirely", () => {
-    const rule = detectSensitiveColumns(["email"]).get("email")!;
-    expect(maskValue("notanemail", rule)).toBe("***@***.***");
-  });
-
-  test("phone rule keeps the last 4 digits", () => {
-    const rule = detectSensitiveColumns(["phone"]).get("phone")!;
-    expect(maskValue("+1-555-123-4567", rule)).toBe("*******4567");
-  });
-
-  test("phone rule fully masks short numbers", () => {
-    const rule = detectSensitiveColumns(["phone"]).get("phone")!;
-    expect(maskValue("12", rule)).toBe("***");
-  });
-
-  test("ip rule keeps first and last IPv4 octets", () => {
-    const rule = detectSensitiveColumns(["ip_address"]).get("ip_address")!;
-    expect(maskValue("192.168.1.100", rule)).toBe("192.***.***.100");
-  });
-
-  test("ip rule fully masks non-IPv4 values", () => {
-    const rule = detectSensitiveColumns(["ip_address"]).get("ip_address")!;
-    expect(maskValue("::1", rule)).toBe("***");
-  });
-
-  test("birthdate rule keeps the day part", () => {
-    const rule = detectSensitiveColumns(["date_of_birth"]).get("date_of_birth")!;
-    expect(maskValue("1990-05-15", rule)).toBe("****-**-15");
-  });
-
-  test("birthdate rule fully masks short values", () => {
-    const rule = detectSensitiveColumns(["date_of_birth"]).get("date_of_birth")!;
-    expect(maskValue("05", rule)).toBe("****-**-**");
-  });
-});
-
 // ─── shouldMask ─────────────────────────────────────────────────────────────
 
 describe("shouldMask", () => {
@@ -357,6 +352,25 @@ describe("shouldMask", () => {
 
   test("undefined role is treated as user", () => {
     expect(shouldMask(undefined, mockMaskingConfigEnabled)).toBe(true);
+  });
+});
+
+// ─── maskingInForce ─────────────────────────────────────────────────────────
+
+describe("maskingInForce", () => {
+  test("is off whenever the role and config say no masking, whatever the shell's switch says", () => {
+    expect(maskingInForce("admin", mockMaskingConfigDisabled, true)).toBe(false);
+    expect(maskingInForce("admin", mockMaskingConfigDisabled, undefined)).toBe(false);
+  });
+
+  test("follows the shell's switch when the role and config allow masking", () => {
+    expect(maskingInForce("admin", mockMaskingConfigEnabled, true)).toBe(true);
+    expect(maskingInForce("admin", mockMaskingConfigEnabled, false)).toBe(false);
+  });
+
+  test("falls back to the config's own flag when the shell passes no switch", () => {
+    expect(maskingInForce("user", mockMaskingConfigEnabled, undefined)).toBe(true);
+    expect(maskingInForce("user", { ...mockMaskingConfigUserCanToggle, enabled: false }, undefined)).toBe(false);
   });
 });
 
@@ -397,26 +411,6 @@ describe("canReveal", () => {
 
   test("undefined role treated as user", () => {
     expect(canReveal(undefined, mockMaskingConfigEnabled)).toBe(false);
-  });
-});
-
-// ─── hasSensitiveColumns ────────────────────────────────────────────────────
-
-describe("hasSensitiveColumns", () => {
-  test("returns true when sensitive columns present", () => {
-    expect(hasSensitiveColumns(["id", "email", "name"])).toBe(true);
-  });
-
-  test("returns true for password column", () => {
-    expect(hasSensitiveColumns(["password"])).toBe(true);
-  });
-
-  test("returns false for non-sensitive columns", () => {
-    expect(hasSensitiveColumns(["id", "name", "created_at"])).toBe(false);
-  });
-
-  test("returns false for empty array", () => {
-    expect(hasSensitiveColumns([])).toBe(false);
   });
 });
 

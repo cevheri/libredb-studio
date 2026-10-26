@@ -1,7 +1,15 @@
 import { describe, test, expect, mock, beforeEach } from "bun:test";
+import { createFakeEtcdClient, type FakeEtcdClient } from "../../helpers/etcd-fake-client";
+import { KEY_SPACE_HEADER } from "../../helpers/etcd-key-space";
 import { createMockRequest, parseResponseJSON } from "../../helpers/mock-next";
 import { createMockProvider } from "../../helpers/mock-provider";
 import { clearRateLimitState } from "@/lib/api/rate-limit";
+import type { EtcdAlarm, EtcdMember, EtcdStatus } from "@/lib/db/providers/keyvalue/etcd/client";
+import { EtcdProvider } from "@/lib/db/providers/keyvalue/etcd/index";
+import { readOnlySentence } from "@/lib/db/providers/keyvalue/etcd/write-policy";
+import type { DatabaseConnection } from "@/lib/types";
+import { buildQueryEvent } from "@/lib/query-events/build";
+import type { QueryEventInput } from "@/lib/query-events/types";
 import {
   QueryError,
   DatabaseError,
@@ -42,6 +50,10 @@ const mockAuditPush = mock((_event?: unknown) => ({
 // ─── Mock dependencies BEFORE importing route ───────────────────────────────
 mock.module("@/lib/auth", () => ({
   getSession: mockGetSession,
+  readSession: mock(async () => {
+    const s = await mockGetSession();
+    return s ? { kind: "authenticated", session: s } : { kind: "anonymous" };
+  }),
   signJWT: mock(async () => "mock-token"),
   verifyJWT: mock(async () => null),
   login: mock(async () => {}),
@@ -102,8 +114,18 @@ mock.module("@/lib/db", () => ({
   mapDatabaseError,
 }));
 
+// ─── Mock the query event sink and the admission gate (docs/GOVERNANCE.md#query-events) ───
+// The recorder captures each event the route describes, and a test builds its row with the real builder. The gate
+// admits by default, which is what it does with governance off; a test makes it refuse.
+const mockRecordQueryEvent = mock((_input: QueryEventInput) => {});
+const mockAdmitQueryExecution = mock(() => {});
+const realSink = { ...(await import("@/lib/query-events/sink")) };
+mock.module("@/lib/query-events/sink", () => ({ ...realSink, recordQueryEvent: mockRecordQueryEvent }));
+mock.module("@/lib/query-events/admission", () => ({ admitQueryExecution: mockAdmitQueryExecution }));
+
 // ─── Import route handler AFTER mocking ─────────────────────────────────────
 const { POST } = await import("@/app/api/db/maintenance/route");
+const { SeedConnectionError } = await import("@/lib/seed/resolve-connection");
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 const validConnection = {
@@ -115,6 +137,70 @@ const validConnection = {
   database: "testdb",
 };
 
+/** A single-member etcd with authentication off, for E6 through this route (#1089, spec 3.6). */
+const etcdConnection = {
+  id: "etcd-e6",
+  name: "etcd E6",
+  type: "etcd",
+  host: "etcd.test",
+  port: 2379,
+};
+
+const ETCD_STATUS: EtcdStatus = {
+  header: KEY_SPACE_HEADER,
+  version: "3.7.2",
+  dbSize: "20480",
+  dbSizeInUse: "16384",
+  dbSizeQuota: "0",
+  leader: KEY_SPACE_HEADER.memberId,
+  raftIndex: "40",
+  raftTerm: "2",
+  raftAppliedIndex: "40",
+  errors: [],
+  isLearner: false,
+  storageVersion: "3.7.0",
+};
+const ETCD_MEMBER: EtcdMember = {
+  id: KEY_SPACE_HEADER.memberId,
+  name: "etcd-1",
+  peerUrls: ["http://127.0.0.1:2380"],
+  clientUrls: ["http://127.0.0.1:2379"],
+  isLearner: false,
+};
+/** A raised NOSPACE alarm, so a disarm has a request to send. */
+const ETCD_ALARM: EtcdAlarm = { memberId: ETCD_MEMBER.id, alarm: "nospace" };
+
+/** One provider the factory stand-in built, its client, and how many calls its connect sent. */
+interface OpenedEtcd {
+  readonly client: FakeEtcdClient;
+  readonly connectCalls: number;
+}
+
+/**
+ * The next `getOrCreateProvider` call answered as the factory answers an etcd connection: a provider built
+ * from the connection this route hands it, connected to a fake client that records every call. It reads the
+ * route's argument, so a route that dropped or rewrote the posted connection's `readOnly` on its way to the
+ * factory builds a read-write provider here, and the operation is sent.
+ */
+function nextEtcdProvider(opened: OpenedEtcd[]): void {
+  mockGetOrCreateProvider.mockImplementationOnce(async (...args: unknown[]) => {
+    const client = createFakeEtcdClient({
+      authStatus: async () => ({ enabled: false, authRevision: "1" }),
+      status: async () => ETCD_STATUS,
+      memberList: async () => ({ header: KEY_SPACE_HEADER, members: [ETCD_MEMBER] }),
+      compact: async () => {},
+      defragment: async () => {},
+      alarmList: async () => [ETCD_ALARM],
+      alarmDisarm: async (alarm) => [alarm],
+      close: async () => {},
+    });
+    const etcd = new EtcdProvider(args[0] as DatabaseConnection, {}, {}, async () => client);
+    await etcd.connect();
+    opened.push({ client, connectCalls: client.calls.length });
+    return etcd as never;
+  });
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 describe("POST /api/db/maintenance", () => {
   beforeEach(() => {
@@ -122,6 +208,8 @@ describe("POST /api/db/maintenance", () => {
     mockGetSession.mockClear();
     mockGetOrCreateProvider.mockClear();
     mockAuditPush.mockClear();
+    mockRecordQueryEvent.mockClear();
+    mockAdmitQueryExecution.mockReset();
     (mockProvider.runMaintenance as ReturnType<typeof mock>).mockClear();
     (mockProvider.getCapabilities as ReturnType<typeof mock>).mockClear();
 
@@ -139,13 +227,31 @@ describe("POST /api/db/maintenance", () => {
       queryLanguage: "sql",
       supportsExplain: true,
       supportsExternalQueryLimiting: true,
-      supportsCreateTable: true,
       supportsMaintenance: true,
       maintenanceOperations: ["vacuum", "analyze", "reindex"],
       supportsConnectionString: true,
       defaultPort: 5432,
       schemaRefreshPattern: "(?:CREATE|ALTER|DROP|TRUNCATE)\\s",
     }));
+  });
+
+  test.each<[string, string]>([
+    ["null", "null"],
+    ["an array", "[]"],
+    ["a number", "7"],
+    ["text that is not JSON", "{"],
+  ])("a body that is %s answers 400 with a fixed sentence and opens no provider", async (_label, raw) => {
+    const res = await POST(
+      new Request("http://localhost:3000/api/db/maintenance", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: raw,
+      }) as never,
+    );
+
+    expect(res.status).toBe(400);
+    expect(await parseResponseJSON<{ error: string }>(res)).toEqual({ error: "Invalid request body" });
+    expect(mockGetOrCreateProvider).not.toHaveBeenCalled();
   });
 
   test("admin with valid params returns maintenance result", async () => {
@@ -161,6 +267,125 @@ describe("POST /api/db/maintenance", () => {
     expect(data.success).toBe(true);
     expect(data.executionTime).toBe(100);
     expect(data.message).toBe("OK");
+  });
+
+  // #772: the wire contract carries the table's container beside its target, and the route
+  // passes it through untouched. Reading only `target` was the whole defect - every provider
+  // then had to guess a namespace from a bare name.
+  test("passes the container through to the provider", async () => {
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target: "users", container: "reporting", connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+
+    expect(res.status).toBe(200);
+    expect(mockProvider.runMaintenance).toHaveBeenCalledWith("vacuum", "users", "reporting");
+  });
+
+  // #1091 review: the audit row recorded only `target`, so `app.orders` and `public.orders`
+  // logged identically. The container is what tells them apart.
+  test("the audit event records the container beside the target", async () => {
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target: "orders", container: "app", connection: validConnection },
+    });
+
+    await POST(req as never);
+
+    expect(mockAuditPush).toHaveBeenCalledTimes(1);
+    const event = mockAuditPush.mock.calls[0]![0] as Record<string, unknown>;
+    expect(event.target).toBe("orders");
+    expect(event.container).toBe("app");
+  });
+
+  test("a whole-database request records no container, and the target keeps its `all` fallback", async () => {
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", connection: validConnection },
+    });
+
+    await POST(req as never);
+
+    expect(mockAuditPush).toHaveBeenCalledTimes(1);
+    const event = mockAuditPush.mock.calls[0]![0] as Record<string, unknown>;
+    expect(event.target).toBe("all");
+    expect(event.container).toBeUndefined();
+  });
+
+  test("a request with no container reaches the provider with it undefined", async () => {
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target: "users", connection: validConnection },
+    });
+
+    await POST(req as never);
+
+    expect(mockProvider.runMaintenance).toHaveBeenCalledWith("vacuum", "users", undefined);
+  });
+
+  // #1091 review: a non-string container used to reach the provider, where it failed as
+  // `identifier.replace is not a function` - a 500 for what is a malformed request. The route
+  // answers 400 and runs nothing.
+  test.each<[string, unknown]>([
+    ["an object", { schema: "app" }],
+    ["a number", 7],
+    ["an array", ["app"]],
+    ["null", null],
+    ["false", false],
+  ])("a non-string container (%s) answers 400 and runs nothing", async (_label, container) => {
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target: "users", container, connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(data.error).toContain("container");
+    expect(mockProvider.runMaintenance).not.toHaveBeenCalled();
+    expect(mockAuditPush).not.toHaveBeenCalled();
+  });
+
+  // A non-string target reached the provider the same way, where a number failed as
+  // `identifier.replace is not a function` (a 500 quoting provider source), and the audit row
+  // recorded the serialized value. The route answers 400, opens no provider and records nothing.
+  test.each<[string, unknown]>([
+    ["an object", { name: "users" }],
+    ["a number", 7],
+    ["an array", ["users"]],
+    ["null", null],
+    ["false", false],
+  ])("a non-string target (%s) answers 400 and runs nothing", async (_label, target) => {
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target, connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+
+    expect(res.status).toBe(400);
+    expect(await parseResponseJSON<{ error: string }>(res)).toEqual({
+      error: `"target" must be a string naming the object to run against`,
+    });
+    expect(mockGetOrCreateProvider).not.toHaveBeenCalled();
+    expect(mockProvider.runMaintenance).not.toHaveBeenCalled();
+    expect(mockAuditPush).not.toHaveBeenCalled();
+  });
+
+  test("an empty-string container is a container the caller omitted, not a malformed one", async () => {
+    // The same reading `target: ""` gets below: a falsy string is the absence of the field.
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target: "users", container: "", connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+
+    expect(res.status).toBe(200);
+    expect(mockProvider.runMaintenance).toHaveBeenCalledWith("vacuum", "users", undefined);
   });
 
   // Threat: runMaintenance() has already completed by the time emitAuditEvent runs (see the route's
@@ -319,7 +544,6 @@ describe("POST /api/db/maintenance", () => {
       queryLanguage: "sql",
       supportsExplain: false,
       supportsExternalQueryLimiting: true,
-      supportsCreateTable: false,
       supportsMaintenance: false,
       maintenanceOperations: [],
       supportsConnectionString: false,
@@ -369,7 +593,6 @@ describe("POST /api/db/maintenance", () => {
     queryLanguage: "sql",
     supportsExplain: true,
     supportsExternalQueryLimiting: true,
-    supportsCreateTable: true,
     supportsMaintenance: true,
     maintenanceOperations: ["vacuum", "analyze", "reindex"],
     maintenanceOperationSpecs: {
@@ -513,5 +736,419 @@ describe("POST /api/db/maintenance", () => {
 
     expect(res.status).toBe(500);
     expect(data.error).toContain("Internal maintenance failure");
+  });
+
+  // #1387: the engine refusing the statement is the engine's answer, not Studio failing. These are
+  // the driver errors measured on 2026-10-04, raw as the driver raises them, which the route used
+  // to hand to the generic branch as a 500 INTERNAL_ERROR.
+  test.each<[string, Error]>([
+    [
+      "CockroachDB's syntax error for VACUUM",
+      Object.assign(new Error('at or near "vacuum": syntax error'), { code: "42601" }),
+    ],
+    [
+      "TiDB's CHECK TABLE parse error",
+      Object.assign(new Error('You have an error in your SQL syntax; ... near "CHECK TABLE t"'), {
+        errno: 1064,
+        sqlState: "42000",
+      }),
+    ],
+    ["YugabyteDB's REINDEX refusal", Object.assign(new Error("REINDEX not supported yet"), { code: "0A000" })],
+  ])("%s answers 400 QUERY_ERROR with the engine's own message", async (_label, refusal) => {
+    (mockProvider.runMaintenance as ReturnType<typeof mock>).mockImplementation(async () => {
+      throw refusal;
+    });
+
+    const res = await POST(
+      createMockRequest("/api/db/maintenance", {
+        method: "POST",
+        body: { type: "vacuum", connection: validConnection },
+      }) as never,
+    );
+    const data = await parseResponseJSON<{ error: string; code: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(data.code).toBe("QUERY_ERROR");
+    expect(data.error).toBe(refusal.message);
+  });
+
+  test("a thrown error that carries no statement code still answers 500", async () => {
+    (mockProvider.runMaintenance as ReturnType<typeof mock>).mockImplementation(async () => {
+      throw new TypeError("rows.filter is not a function");
+    });
+
+    const res = await POST(
+      createMockRequest("/api/db/maintenance", {
+        method: "POST",
+        body: { type: "analyze", connection: validConnection },
+      }) as never,
+    );
+
+    expect(res.status).toBe(500);
+  });
+
+  // #1091 review (R04 G8): a runMaintenance that threw left no audit event at all, so the log an
+  // operator reconstructs a database's history from had no line for an operation that may have
+  // reached the engine before it failed. The row is the success row's shape with a closed reason
+  // and the time the call took, and it never carries the thrown message.
+  test("a maintenance run that throws is audited as a failure with a closed reason", async () => {
+    (mockProvider.runMaintenance as ReturnType<typeof mock>).mockImplementation(async () => {
+      throw new DatabaseError("Internal maintenance failure", "postgres", "DATABASE_ERROR");
+    });
+
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target: "orders", container: "app", connection: validConnection },
+    });
+
+    await POST(req as never);
+
+    expect(mockAuditPush).toHaveBeenCalledTimes(1);
+    const event = mockAuditPush.mock.calls[0]![0] as Record<string, unknown>;
+    expect(event.type).toBe("maintenance");
+    expect(event.action).toBe("VACUUM");
+    expect(event.target).toBe("orders");
+    expect(event.container).toBe("app");
+    expect(event.connectionName).toBe("Test DB");
+    expect(event.user).toBe("admin");
+    expect(event.result).toBe("failure");
+    expect(event.reason).toBe("maintenance_execution_failed");
+    expect(typeof event.duration).toBe("number");
+    expect(JSON.stringify(event)).not.toContain("Internal maintenance failure");
+  });
+
+  test("a thrown whole-database run is audited with the `all` target and no container", async () => {
+    (mockProvider.runMaintenance as ReturnType<typeof mock>).mockImplementation(async () => {
+      throw new DatabaseError("Internal maintenance failure", "postgres", "DATABASE_ERROR");
+    });
+
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", connection: { ...validConnection, name: "" } },
+    });
+
+    await POST(req as never);
+
+    expect(mockAuditPush).toHaveBeenCalledTimes(1);
+    const event = mockAuditPush.mock.calls[0]![0] as Record<string, unknown>;
+    expect(event.target).toBe("all");
+    expect(event.container).toBeUndefined();
+    expect(event.connectionName).toBe("testdb");
+  });
+
+  test("a thrown kill is audited as a kill_session failure", async () => {
+    (mockProvider.getCapabilities as ReturnType<typeof mock>).mockImplementation(() => ({
+      supportsMaintenance: true,
+      maintenanceOperations: ["kill"],
+    }));
+    (mockProvider.runMaintenance as ReturnType<typeof mock>).mockImplementation(async () => {
+      throw new DatabaseError("backend already gone", "postgres", "DATABASE_ERROR");
+    });
+
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "kill", target: "4711", connection: validConnection },
+    });
+
+    await POST(req as never);
+
+    expect(mockAuditPush).toHaveBeenCalledTimes(1);
+    const event = mockAuditPush.mock.calls[0]![0] as Record<string, unknown>;
+    expect(event.type).toBe("kill_session");
+    expect(event.action).toBe("KILL");
+    expect(event.target).toBe("4711");
+    expect(event.result).toBe("failure");
+  });
+
+  // The HTTP answer for a thrown run is the one the thrown error maps to, before and after the
+  // audit row existed: the row records the failure and changes nothing the caller reads.
+  test.each<[string, Error, number]>([
+    ["a DatabaseError", new DatabaseError("Internal maintenance failure", "postgres", "DATABASE_ERROR"), 500],
+    ["a QueryError", new QueryError("relation does not exist", "postgres"), 400],
+  ])("a thrown run answers what %s maps to", async (_label, thrown, status) => {
+    (mockProvider.runMaintenance as ReturnType<typeof mock>).mockImplementation(async () => {
+      throw thrown;
+    });
+
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target: "users", connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(status);
+    expect(data.error).toContain(thrown.message);
+  });
+
+  // A broken sink must not replace the operation's own failure with its own: the caller still
+  // reads what the thrown error maps to, not a 500 about the audit log.
+  test("a broken audit sink does not change the answer for a thrown run", async () => {
+    (mockProvider.runMaintenance as ReturnType<typeof mock>).mockImplementation(async () => {
+      throw new QueryError("relation does not exist", "postgres");
+    });
+    mockAuditPush.mockImplementationOnce(() => {
+      throw new Error("audit sink unavailable");
+    });
+
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target: "users", connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(data.error).toContain("relation does not exist");
+    expect(data.error).not.toContain("audit sink");
+  });
+
+  // The closed reason names a thrown run and nothing else: a completed run, and one the engine
+  // refused in its own answer, carry no reason, so the three stay apart in the log.
+  test.each<[string, boolean]>([
+    ["a completed run", true],
+    ["a run the engine refused", false],
+  ])("%s carries no reason", async (_label, success) => {
+    (mockProvider.runMaintenance as ReturnType<typeof mock>).mockImplementation(async () => ({
+      success,
+      executionTime: 1,
+      message: "done",
+    }));
+
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "vacuum", target: "users", connection: validConnection },
+    });
+
+    await POST(req as never);
+
+    expect(mockAuditPush).toHaveBeenCalledTimes(1);
+    expect((mockAuditPush.mock.calls[0]![0] as Record<string, unknown>).reason).toBeUndefined();
+  });
+
+  // Refusals the route decides before calling the provider are not maintenance runs and write no
+  // maintenance row, thrown or otherwise.
+  test("a request refused before the provider is called writes no maintenance row", async () => {
+    const req = createMockRequest("/api/db/maintenance", {
+      method: "POST",
+      body: { type: "optimize", target: "users", connection: validConnection },
+    });
+
+    const res = await POST(req as never);
+
+    expect(res.status).toBe(400);
+    expect(mockProvider.runMaintenance).not.toHaveBeenCalled();
+    expect(mockAuditPush).not.toHaveBeenCalled();
+  });
+
+  // #1089 E6: the provider refuses every maintenance operation on a read-only connection, and only the
+  // connection this route hands the factory tells it so.
+  test.each([
+    ["compact", "compact"],
+    ["defragment", "defragment"],
+    ["disarm", "alarmDisarm"],
+  ] as const)(
+    "an etcd %s on a connection carrying readOnly: true answers 400 naming the mode and sends nothing; without it, it sends %s",
+    async (type, rpc) => {
+      const opened: OpenedEtcd[] = [];
+      nextEtcdProvider(opened);
+      const refused = await POST(
+        createMockRequest("/api/db/maintenance", {
+          method: "POST",
+          body: { type, connection: { ...etcdConnection, readOnly: true } },
+        }) as never,
+      );
+      expect(refused.status).toBe(400);
+      expect((await parseResponseJSON<{ error: string }>(refused)).error).toBe(readOnlySentence("connection"));
+      const [readOnlyProvider] = opened;
+      expect(readOnlyProvider.client.calls.slice(readOnlyProvider.connectCalls)).toEqual([]);
+
+      // The control: the same request on the connection without readOnly sends the operation's own call.
+      nextEtcdProvider(opened);
+      const ran = await POST(
+        createMockRequest("/api/db/maintenance", {
+          method: "POST",
+          body: { type, connection: etcdConnection },
+        }) as never,
+      );
+      expect(ran.status).toBe(200);
+      const [, writer] = opened;
+      expect(writer.client.calls.slice(writer.connectCalls).map((call) => call.method)).toContain(rpc);
+    },
+  );
+
+  // Spec 3.11: every row this route writes names the engine principal, for a provider that reports one. The shared
+  // mock provider implements no `engineUser`, so each test adds it and takes it away again.
+  const reportingEngineUser = (name: string | undefined): (() => void) => {
+    const provider = mockProvider as { engineUser?: () => string | undefined };
+    provider.engineUser = mock(() => name);
+    return () => {
+      delete provider.engineUser;
+    };
+  };
+
+  test.each<[string, () => void, "success" | "failure"]>([
+    ["a completed run", () => {}, "success"],
+    [
+      "a run the engine refused",
+      () => {
+        (mockProvider.runMaintenance as ReturnType<typeof mock>).mockImplementation(async () => ({
+          success: false,
+          executionTime: 1,
+          message: "refused",
+        }));
+      },
+      "failure",
+    ],
+    [
+      "a run that throws",
+      () => {
+        (mockProvider.runMaintenance as ReturnType<typeof mock>).mockImplementation(async () => {
+          throw new DatabaseError("Internal maintenance failure", "postgres", "DATABASE_ERROR");
+        });
+      },
+      "failure",
+    ],
+  ])("%s writes the engine principal on its row", async (_label, arrange, result) => {
+    const restore = reportingEngineUser("app_maintainer");
+    try {
+      arrange();
+      await POST(
+        createMockRequest("/api/db/maintenance", {
+          method: "POST",
+          body: { type: "vacuum", target: "orders", container: "app", connection: validConnection },
+        }) as never,
+      );
+
+      expect(mockAuditPush).toHaveBeenCalledTimes(1);
+      const event = mockAuditPush.mock.calls[0]![0] as Record<string, unknown>;
+      expect(event.engineUser).toBe("app_maintainer");
+      expect(event.result).toBe(result);
+    } finally {
+      restore();
+    }
+  });
+
+  test("a provider that does not implement engineUser writes a row with no such key", async () => {
+    await POST(
+      createMockRequest("/api/db/maintenance", {
+        method: "POST",
+        body: { type: "vacuum", target: "orders", connection: validConnection },
+      }) as never,
+    );
+
+    expect(mockAuditPush).toHaveBeenCalledTimes(1);
+    expect(Object.hasOwn(mockAuditPush.mock.calls[0]![0] as object, "engineUser")).toBe(false);
+  });
+
+  test("a provider whose engineUser names no one writes a row with no such key", async () => {
+    const restore = reportingEngineUser(undefined);
+    try {
+      await POST(
+        createMockRequest("/api/db/maintenance", {
+          method: "POST",
+          body: { type: "vacuum", target: "orders", connection: validConnection },
+        }) as never,
+      );
+
+      expect(mockAuditPush).toHaveBeenCalledTimes(1);
+      expect(Object.hasOwn(mockAuditPush.mock.calls[0]![0] as object, "engineUser")).toBe(false);
+    } finally {
+      restore();
+    }
+  });
+  describe("governance query events", () => {
+    const SUBJECT = "8d0f6a4e-2b1c-4f3a-9e7d-5c6b4a3f2e1d";
+    /** A governed connection as `resolveConnection` hands it out: the `seed:` id and the level of its credential. */
+    const governedConnection = { ...validConnection, id: "seed:orders", grantLevel: "write" };
+
+    beforeEach(() => {
+      mockGetSession.mockImplementation(
+        async () => ({ role: "admin", username: "ada", idpSubject: SUBJECT }) as { role: string; username: string },
+      );
+    });
+
+    const recorded = (): QueryEventInput[] => mockRecordQueryEvent.mock.calls.map(([input]) => input);
+    const maintenance = (body: Record<string, unknown>) =>
+      POST(
+        createMockRequest("/api/db/maintenance", {
+          method: "POST",
+          body: { connection: governedConnection, ...body },
+        }) as never,
+      );
+
+    test("governance: one maintenance event per action with its status", async () => {
+      const runMaintenance = mockProvider.runMaintenance as ReturnType<typeof mock>;
+      expect((await maintenance({ type: "vacuum", target: "orders" })).status).toBe(200);
+      // The engine's verdict, not the request's: a run the engine would not do is an error.
+      runMaintenance.mockImplementationOnce(async () => ({ success: false, executionTime: 1, message: "refused" }));
+      expect((await maintenance({ type: "analyze" })).status).toBe(200);
+      // A run that threw may have reached the engine, so it is recorded too.
+      runMaintenance.mockImplementationOnce(async () => {
+        throw new QueryError('relation "orders" does not exist', "postgres");
+      });
+      expect((await maintenance({ type: "reindex", target: "orders" })).status).toBe(400);
+
+      expect(recorded().map(({ source, status }) => [source, status])).toEqual([
+        ["maintenance", "success"],
+        ["maintenance", "error"],
+        ["maintenance", "error"],
+      ]);
+      expect(mockAdmitQueryExecution).toHaveBeenCalledTimes(3);
+
+      const row = buildQueryEvent(
+        recorded()[0]!,
+        { statementCapture: "full", maxStatementBytes: 4096 },
+        { studioInstance: "libredb-studio" },
+      );
+      expect(row).toMatchObject({
+        source: "maintenance",
+        status: "success",
+        subject: SUBJECT,
+        username: "ada",
+        session_role: "admin",
+        connection_id: "orders",
+        connection_name: "Test DB",
+        engine: "postgres",
+        access_level: "write",
+        // The provider builds the statement inside `runMaintenance`, so the route has no text to record.
+        statement: null,
+        statement_type: "OTHER",
+        error_code: null,
+      });
+    });
+
+    test("governance: refuse mode answers 503 AUDIT_UNAVAILABLE before the action runs and records a refused event", async () => {
+      mockAdmitQueryExecution.mockImplementationOnce(() => {
+        throw Object.assign(new SeedConnectionError("Query execution is unavailable", 503), {
+          code: "AUDIT_UNAVAILABLE",
+        });
+      });
+
+      const res = await maintenance({ type: "vacuum", target: "orders" });
+
+      expect(res.status).toBe(503);
+      expect((await parseResponseJSON<{ code: string }>(res)).code).toBe("AUDIT_UNAVAILABLE");
+      expect(mockProvider.runMaintenance).not.toHaveBeenCalled();
+      expect(mockAuditPush).not.toHaveBeenCalled();
+      expect(recorded()).toHaveLength(1);
+      expect(recorded()[0]).toMatchObject({
+        source: "maintenance",
+        status: "refused",
+        errorCode: "AUDIT_UNAVAILABLE",
+        statement: null,
+        connection: { id: "seed:orders", engine: "postgres", accessLevel: "write" },
+      });
+    });
+
+    test("a request refused before the action is admitted records nothing", async () => {
+      const res = await maintenance({ type: "optimize", target: "orders" });
+
+      expect(res.status).toBe(400);
+      expect(mockAdmitQueryExecution).not.toHaveBeenCalled();
+      expect(recorded()).toEqual([]);
+    });
   });
 });

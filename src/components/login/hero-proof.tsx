@@ -55,7 +55,7 @@ export const HERO_CLAIMS: readonly { key: string; value: number; unit: string; d
     // at, so counting it here claimed one external engine more than the product has and put
     // this page one out of step with the number README.md publishes. The pill for it stays -
     // it is a provider the connection picker offers - marked as embedded so the reader can
-    // see why seventeen pills sit under a claim of sixteen.
+    // see why the pills outnumber the claim by exactly one.
     value: EXTERNAL_DATABASE_TYPES.length,
     unit: "database engines",
     detail: "one client, one workspace, every one of them",
@@ -90,10 +90,14 @@ export function HeroProof() {
   const claims = HERO_CLAIMS;
 
   return (
-    <div className="space-y-3">
+    // `space-y-1`, and no wider: the agent claim's detail names every engine agent mode
+    // executes on, and at 1280x800 the login page fits without scrolling (#541) with a few
+    // pixels to spare, so a wider gap here, or one more wrapped line in the detail, scrolls
+    // it. Why the claim should stop growing with the engine list is `docs/BACKLOG.md` U139.
+    <div className="space-y-1">
       <dl data-testid="hero-proof" className="grid grid-cols-3 gap-x-6 gap-y-2 select-none">
         {claims.map((claim) => (
-          <div key={claim.key} className="space-y-1">
+          <div key={claim.key} className="space-y-0.5">
             <dt className="flex items-baseline gap-1.5">
               <span className="text-2xl xl:text-3xl font-semibold text-white tabular-nums tracking-tight">
                 {claim.value}
@@ -101,7 +105,11 @@ export function HeroProof() {
               <span className="text-xs text-fg-tertiary">{claim.unit}</span>
             </dt>
             <dd
-              className="text-xs text-fg-tertiary leading-relaxed"
+              // `leading-snug`, not `leading-normal`: at 1280x800 the agent detail wraps to
+              // six lines, which at 12px pay 9px for the wider leading, and the row this
+              // cell sets is the row the page's 800px budget feels. The 1.375 leading still
+              // reads as prose at this size.
+              className="text-xs text-fg-tertiary leading-snug"
               data-testid={claim.key === "agent" ? "agent-claim" : undefined}
             >
               {claim.detail}

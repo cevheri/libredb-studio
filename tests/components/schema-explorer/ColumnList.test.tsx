@@ -20,22 +20,22 @@ mock.module("framer-motion", () => ({
 // ── Imports after mocks ─────────────────────────────────────────────────────
 
 import { ColumnList } from "@/components/schema-explorer/ColumnList";
-import type { TableSchema } from "@/lib/types";
+import type { DetailedObject } from "@/lib/db/detailed-object";
 
 // ── Test data ───────────────────────────────────────────────────────────────
 
-const columnsWithPrimary: TableSchema["columns"] = [
+const columnsWithPrimary: DetailedObject["columns"] = [
   { name: "id", type: "SERIAL", nullable: false, isPrimary: true },
   { name: "email", type: "VARCHAR(255)", nullable: true, isPrimary: false },
   { name: "created_at", type: "timestamp", nullable: false, isPrimary: false },
 ];
 
-const columnsNoPrimary: TableSchema["columns"] = [
+const columnsNoPrimary: DetailedObject["columns"] = [
   { name: "key", type: "TEXT", nullable: false, isPrimary: false },
   { name: "value", type: "JSONB", nullable: true, isPrimary: false },
 ];
 
-const indexesSample: TableSchema["indexes"] = [
+const indexesSample: DetailedObject["indexes"] = [
   { name: "idx_email", columns: ["email"], unique: true },
   { name: "idx_created", columns: ["created_at"], unique: false },
 ];
@@ -69,12 +69,33 @@ describe("ColumnList", () => {
     expect(queryByText("VARCHAR(255)")).toBeNull();
   });
 
+  test("a long type name does not push the column name to zero width", () => {
+    const columns: DetailedObject["columns"] = [
+      { name: "created_at", type: "timestamp without time zone", nullable: false, isPrimary: false },
+    ];
+    const { queryByText } = render(<ColumnList columns={columns} indexes={[]} />);
+    const typeEl = queryByText("timestamp without time zone");
+    expect(typeEl).not.toBeNull();
+    // The name span keeps flex-1 (grows into the space the type span gives up).
+    const nameEl = queryByText("created_at");
+    expect(nameEl).not.toBeNull();
+    expect(nameEl!.className).toContain("flex-1");
+    // The type span truncates instead of forcing the name out: shrink-0 plus a
+    // capped, truncating width, with the full type available on hover. The cap
+    // is the class actually doing the work: dropping it (or widening it enough)
+    // leaves shrink-0/truncate in place but the name is pushed to zero width again.
+    expect(typeEl!.className).toContain("shrink-0");
+    expect(typeEl!.className).toContain("max-w-[40%]");
+    expect(typeEl!.className).toContain("truncate");
+    expect(typeEl!.getAttribute("title")).toBe("timestamp without time zone");
+  });
+
   // ── Primary key indicator ───────────────────────────────────────────────
 
   test("renders Key icon for primary key columns", () => {
     const { container } = render(<ColumnList columns={columnsWithPrimary} indexes={[]} />);
-    // Key icon has text-yellow-500/70 class
-    const keyIcons = container.querySelectorAll(".text-yellow-500\\/70");
+    // Key icon has the text-hue-yellow/70 token class
+    const keyIcons = container.querySelectorAll(".text-hue-yellow\\/70");
     expect(keyIcons.length).toBe(1); // only 'id' is primary
   });
 
@@ -84,7 +105,7 @@ describe("ColumnList", () => {
     const dots = container.querySelectorAll(".bg-muted-foreground\\/50");
     expect(dots.length).toBe(2); // both columns are non-primary
     // No key icons
-    const keyIcons = container.querySelectorAll(".text-yellow-500\\/70");
+    const keyIcons = container.querySelectorAll(".text-hue-yellow\\/70");
     expect(keyIcons.length).toBe(0);
   });
 
@@ -113,6 +134,16 @@ describe("ColumnList", () => {
     expect(indexEl!.getAttribute("title")).toBe("email");
   });
 
+  test("renders unavailable indexes banner when indexes are refused", () => {
+    const { getByTestId } = render(
+      <ColumnList columns={columnsWithPrimary} indexes={{ unavailable: "permission denied" }} />,
+    );
+    const element = getByTestId("indexes-unavailable");
+    expect(element).not.toBeNull();
+    expect(element.textContent).toBe("permission denied");
+    expect(element.getAttribute("title")).toBe("permission denied");
+  });
+
   // ── Edge cases ──────────────────────────────────────────────────────────
 
   test("renders empty column list without crashing", () => {
@@ -121,8 +152,75 @@ describe("ColumnList", () => {
   });
 
   test("handles columns with simple types (no parens)", () => {
-    const columns: TableSchema["columns"] = [{ name: "active", type: "boolean", nullable: false, isPrimary: false }];
+    const columns: DetailedObject["columns"] = [{ name: "active", type: "boolean", nullable: false, isPrimary: false }];
     const { queryByText } = render(<ColumnList columns={columns} indexes={[]} />);
     expect(queryByText("boolean")).not.toBeNull();
+  });
+
+  test("a modifier recorded beside the base type is the tooltip, and the row still shows the base", () => {
+    const columns: DetailedObject["columns"] = [
+      {
+        name: "title",
+        type: "character varying",
+        declaredType: "character varying(50)",
+        nullable: true,
+        isPrimary: false,
+      },
+      { name: "amount", type: "numeric", declaredType: "numeric(12,2)", nullable: false, isPrimary: false },
+      { name: "embedding", type: "vector", declaredType: "vector(1536)", nullable: true, isPrimary: false },
+      { name: "body", type: "text", declaredType: "text", nullable: true, isPrimary: false },
+    ];
+    const { getByText, queryByText } = render(<ColumnList columns={columns} indexes={[]} />);
+    expect(getByText("character varying").getAttribute("title")).toBe("character varying(50)");
+    expect(getByText("numeric").getAttribute("title")).toBe("numeric(12,2)");
+    expect(getByText("vector").getAttribute("title")).toBe("vector(1536)");
+    expect(getByText("text").getAttribute("title")).toBe("text");
+    // The row keeps the base name. The modifier is the tooltip.
+    expect(queryByText("character varying(50)")).toBeNull();
+    expect(queryByText("numeric(12,2)")).toBeNull();
+    expect(queryByText("vector(1536)")).toBeNull();
+  });
+});
+
+describe("ColumnList and a column the engine only inferred from sampled data", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  test("adds (sampled) to the type it shows and to its title, and leaves a declared column as it was", () => {
+    const columns: DetailedObject["columns"] = [
+      { name: "category", type: "KEYWORD", nullable: true, isPrimary: false },
+      { name: "payload_tag", type: "TEXT(64)", nullable: true, isPrimary: false, provenance: "sampled" },
+    ];
+    const { getByTitle, getByText } = render(<ColumnList columns={columns} indexes={[]} />);
+    expect(getByTitle("TEXT(64) (sampled)").textContent).toBe("TEXT (sampled)");
+    expect(getByText("KEYWORD").getAttribute("title")).toBe("KEYWORD");
+  });
+});
+
+describe("ColumnList and EXCLUDE constraints (#1778)", () => {
+  afterEach(cleanup);
+
+  const exclusion = [
+    {
+      name: "reservations_no_overlapping_active",
+      definition: "EXCLUDE USING gist (table_id WITH =, tsrange(starts_at, ends_at, '[)'::text) WITH &&)",
+    },
+  ];
+
+  test("shows the constraint name, with its definition as a muted second line", () => {
+    const { getByText, getByTitle } = render(
+      <ColumnList columns={columnsWithPrimary} indexes={[]} exclusionConstraints={exclusion} />,
+    );
+    expect(getByText("Exclusion constraints")).toBeTruthy();
+    expect(getByText("reservations_no_overlapping_active")).toBeTruthy();
+    // Mobile has no title tooltip, so the definition is a visible truncated line under the name.
+    expect(getByText(exclusion[0].definition)).toBeTruthy();
+    expect(getByTitle(exclusion[0].definition)).toBeTruthy();
+  });
+
+  test("draws no section when there are none", () => {
+    const { queryByText } = render(<ColumnList columns={columnsWithPrimary} indexes={[]} />);
+    expect(queryByText("Exclusion constraints")).toBeNull();
   });
 });

@@ -10,6 +10,7 @@ import {
   type AgentEvidenceReference,
   type AgentReadingDenyCode,
   type AgentReportClaim,
+  type AgentResourceQuantities,
   type AgentRunEvent,
   type AgentRunFailureReason,
   type AgentRunMode,
@@ -74,8 +75,17 @@ type PlanStatementEvent = Extract<AgentRunEvent, { kind: "plan-statement-drafted
 const GUIDANCE_HEADLINE: Record<Extract<AgentRunEvent, { kind: "guidance-issued" }>["notice"], string> = {
   "report-reminder": "Asked to file its report",
   "plan-statement": "Asked for a runnable statement",
+  // Named for what the reader can see happened rather than for the limit that did it: the turn
+  // produced nothing and the run kept going.
+  "turn-cut-off": "A turn ran long and was cut; asked again",
   "report-reserve": "Told this is its last turn",
+  "plan-bar": "Told what the report is judged on",
+  "usage-bar": "Told what the report is judged on",
+  // The call the model wrote out instead of making: the reader sees a turn that did nothing,
+  // and this names what it actually was.
+  "tool-call-as-text": "Wrote a tool call as text; asked to make it properly",
   "unread-stop": "Asked to read the database itself",
+  "tool-call-unreadable": "Told its tool call could not be read",
   /*
     The three notices delivered INSTEAD of running a call. They reach a reader through the
     `call-held` entry that records the hold, which is where the rail shows them — one entry
@@ -110,7 +120,10 @@ const GUIDANCE_HEADLINE: Record<Extract<AgentRunEvent, { kind: "guidance-issued"
  * (`if (!draft.guardApplicable)`) is the WRONG one: it would tell a reader that this
  * engine's statements are not SQL about every PostgreSQL draft recorded before #414.
  */
-export type AgentPlanStatementView = Pick<PlanStatementEvent, "sql" | "readOnly" | "guardViolation" | "identifiers"> & {
+export type AgentPlanStatementView = Pick<
+  PlanStatementEvent,
+  "sql" | "readOnly" | "guardViolation" | "identifiers" | "language"
+> & {
   /** Whether the SQL statement guard could read this draft at all. */
   readonly guardApplicable: boolean;
   /**
@@ -185,7 +198,8 @@ export interface AgentTimelineItem {
   readonly isAnswer?: true;
   /**
    * What the RUN already did with this entry's statement, when the entry is an
-   * answer the run handed to the editor (§2.3 of `docs/AGENT_ANALYST_DESIGN.md`).
+   * answer the run handed to the editor (see the "Handing the answer to the editor
+   * (auto-execute)" section of `docs/AGENT.md`).
    *
    * Present only for a handover that happened: `none` is the setting being off, and
    * carrying it here would ask the rail to act on a decision to do nothing. The
@@ -365,6 +379,15 @@ export interface AgentRunTimeline {
    * can say why a run ended without walking the timeline it renders.
    */
   readonly failureReason: AgentRunFailureReason | null;
+  /**
+   * How the loop ended, as `run-finished` recorded it; null before the run finishes or for a
+   * ledger written before the field existed.
+   *
+   * Folded beside `failureReason` because a run the loop itself ended as `failed` (a model
+   * timeout, a deadline) carries a stop reason and NO failure reason, and a surface that read
+   * only the failure reason called that run unclassified (#1461).
+   */
+  readonly stopReason: AgentRunStopReason | null;
   readonly budget: readonly AgentBudgetGauge[];
   /**
    * How many of this run's CHARGED statements carry no duration on the ledger, so the
@@ -473,7 +496,24 @@ const FAILURE_SENTENCES = {
   // Names the credential, because that is the only thing to fix and the engine is
   // not at fault: this refusal reaches PostgreSQL and SQLite too (B47).
   "agent-credential-unusable":
-    "This connection's agent credential cannot be used: check that both the agent user and password are set, that the password still decrypts under the current secret key, and that no connection string is set beside it.",
+    "This connection's agent credential cannot be used: check that it is complete (an agent user and password, or where the database takes one, an agent token alone), that the password still decrypts under the current secret key, and that no connection string is set beside it.",
+  // Names the database user, because the engine is supported and the credential was
+  // applied: the profile refused the principal it opened as. Folded into the engine
+  // sentence, an operator connected as `sa` was told to change engines. The repair is
+  // the connection's own user, since no run can carry an agent credential (B85).
+  "agent-principal-refused":
+    "The database user this run would execute as holds privileges the read-only boundary cannot contain, so the profile refused it. Connect as a user holding only read privileges.",
+  // The opposite repair to the sentence above: one more privilege, never a narrower user.
+  "agent-principal-underprivileged":
+    "The database user this run would execute as lacks a privilege the read-only path needs, so the profile refused it. Grant it that privilege, or connect as a user that holds it.",
+  // Neither user repair helps on a server that holds no user read-only, so this names the
+  // server setting; engine-neutral, with MongoDB's spelling of it in parentheses.
+  "server-authorization-off":
+    "This database server does not enforce authorization, so no user's read-only boundary holds there and agent mode cannot run. Turn on the server's authorization (on MongoDB, security.authorization) and connect as a read-only user.",
+  // One code for several targets on several engines, so it names examples of each kind
+  // and claims nothing about the engine itself, which does run agent mode.
+  "profile-target-unsupported":
+    "Agent mode runs on this engine, but not against this server or target: a compatible server whose read-only enforcement is not measured, such as FerretDB on the MongoDB wire or Percona on the MySQL wire, or an in-memory database. Plan mode and the operations workflow still work.",
   "connection-unresolvable": "This run's database connection no longer resolves on the server.",
   internal: "The server could not carry this run. The reason is in the server log.",
 } as const satisfies Record<AgentRunFailureReason, string>;
@@ -492,6 +532,74 @@ const PLAN_ESTIMATE_CAVEAT =
 
 /** Said on every recommendation, because the run does not make the change. */
 const NOT_APPLIED_CAVEAT = "Not applied: nothing here runs this statement.";
+
+/**
+ * One side of a resources change, as a user would read it beside a manifest: both quantities, with the one that is
+ * not set named as unset, or `unset` alone when the container sets neither.
+ */
+function describeResourceSide(quantities: AgentResourceQuantities): string {
+  if (quantities.cpu === undefined && quantities.memory === undefined) return "unset";
+  return `cpu ${quantities.cpu ?? "unset"}, memory ${quantities.memory ?? "unset"}`;
+}
+
+/**
+ * A document index as the mongosh helper that creates it, which is what the card offers to the clipboard.
+ *
+ * The helper rather than the createIndexes command because the helper names the index itself: the command with no
+ * `name` in its index spec is refused by the server (FailedToParse, measured on 9.0.4 and 7.0.43), and nothing obliges
+ * a run to name one. Every name is JSON-quoted and read through getCollection, so a collection named with a dot or a
+ * dash pastes as written, and the database is named only where the run knew which one it read.
+ */
+function documentIndexText(
+  event: Extract<AgentRunEvent, { kind: "recommendation"; change: "document-index" }>,
+): string {
+  const collection = `getCollection(${JSON.stringify(event.collection)})`;
+  const reach =
+    event.database === undefined
+      ? `db.${collection}`
+      : `db.getSiblingDB(${JSON.stringify(event.database)}).${collection}`;
+  const options = event.options === undefined ? "" : `, ${JSON.stringify(event.options)}`;
+  return `${reach}.createIndex(${JSON.stringify(event.keys)}${options})`;
+}
+
+/** A recommendation's entry, told apart by its `change`: each card offers the user something different. */
+function describeRecommendation(
+  event: Extract<AgentRunEvent, { kind: "recommendation" }>,
+): Omit<AgentTimelineItem, "id" | "atMs"> {
+  switch (event.change) {
+    // A resources change has no statement to quote or to hand the editor: it is a change to a workload's manifest,
+    // which this runtime never writes, so the card offers nothing to apply.
+    case "resources":
+      return {
+        tone: "progress",
+        headline: "Resources recommended",
+        detail: `${event.rationale} Not applied: nothing here changes the cluster.`,
+        // The change itself, quoted rather than narrated because the owner and container names are the cluster's own
+        // text; it is what the user writes into the manifest, so it is offered to the clipboard and nowhere else.
+        quoted: `${event.ownerKind}/${event.ownerName}, container ${event.container}: requests ${describeResourceSide(event.current.requests)} to ${describeResourceSide(event.proposed.requests)}; limits ${describeResourceSide(event.current.limits)} to ${describeResourceSide(event.proposed.limits)}`,
+      };
+    // A document index is stated as data for the reason the resources card states its own: the editor's command
+    // envelope creates no index, so there is nothing to hand it, and the card offers it to the clipboard instead.
+    case "document-index":
+      return {
+        tone: "progress",
+        headline: "Index recommended",
+        detail: event.rationale === undefined ? NOT_APPLIED_CAVEAT : `${event.rationale} ${NOT_APPLIED_CAVEAT}`,
+        quoted: documentIndexText(event),
+      };
+    case "index":
+    case "rewrite":
+      return {
+        tone: "progress",
+        headline: event.change === "index" ? "Index recommended" : "Rewrite recommended",
+        detail: `${event.rationale} ${NOT_APPLIED_CAVEAT}`,
+        quoted: event.statement,
+        // The whole affordance: the statement is handed to the editor and to nobody else. Nothing in this runtime
+        // executes it.
+        applySql: event.statement,
+      };
+  }
+}
 
 /**
  * What an answer's `handover` means, in the app's own words.
@@ -596,8 +704,15 @@ function guardSentence(
  * takes "everything it names exists" for "this will run".
  *
  * The objects are named in the engine's own word (#414) and not in this product's
- * storage shape: the check reads the same inventory the prompt was written from, and
- * on Druid that inventory's rows are datasources however `TableSchema` spells them.
+ * storage shape: the check reads the same inventory the prompt was written from, and on
+ * Druid that inventory's rows are datasources whatever the shape recording them is called.
+ *
+ * WHAT IT CHECKED NARROWED with the object model (#789), and the sentences below are worded
+ * the way they are because of it. The inventory a run reads carries the schema's views,
+ * sequences and functions beside its tables, and `validatePlanStatement` answers only for
+ * the kinds whose declared role says a statement can name one - so a name reported here may
+ * be an object the run WAS shown, under a kind nothing can be selected from. The claim the
+ * sentence makes is still exactly true: the statement may not run as written.
  *
  * `not-applicable` is the third branch and, like the guard's, it is about the CHECK
  * and not about the draft (#414). It is deliberately not worded as `no-inventory` is:
@@ -667,6 +782,9 @@ const WORKFLOW_WORDS: Readonly<Record<AgentRunWorkflowType, string>> = {
   "data-analysis": "a data analysis",
 };
 
+/** The step-limit sentence, shared by the timeline entry and the off-timeline wording below. */
+const TURN_LIMIT_SENTENCE = "The run reached its step limit before it finished.";
+
 /**
  * How the loop ended, said plainly. Total over the union, so a stop reason added to
  * the durable contract cannot reach a user as an unlabelled ending.
@@ -695,8 +813,18 @@ const AGENT_STOP_SENTENCES = {
   cancelled: "Stopped because it was cancelled.",
   "deadline-exceeded": "The run reached its time limit before it finished.",
   "model-timeout": "The model did not answer in time. Starting the run again is reasonable.",
-  "turn-limit": "The run reached its step limit before it finished. What it had gathered is above.",
+  "turn-limit": `${TURN_LIMIT_SENTENCE} What it had gathered is above.`,
 } as const satisfies Record<AgentRunStopReason, string | null>;
+
+/**
+ * The endings whose timeline sentence points at the entries above it, said without
+ * that clause for a surface that sits ABOVE the timeline: the answer card and the
+ * rail's status line. Read by `describeRunFailure` before `STOP_SENTENCES`, so the
+ * base wording lives once and only the position changes.
+ */
+const OFF_TIMELINE_STOP_SENTENCES: Readonly<Partial<Record<AgentRunStopReason, string>>> = {
+  "turn-limit": TURN_LIMIT_SENTENCE,
+};
 
 const STOP_SENTENCES: Readonly<Record<AgentRunMode, Record<AgentRunStopReason, string | null>>> = {
   agent: AGENT_STOP_SENTENCES,
@@ -804,6 +932,8 @@ const SHORTFALL_SENTENCES: Readonly<Record<AgentGoalShortfall, string>> = {
     "No before-and-after plan comparison was recorded, and no index was recommended: a query optimization rests on one or the other.",
   "no-plan-evidence":
     "The index was recommended without citing a plan this run read, so nothing the engine said backs it.",
+  "no-plan-cited":
+    "No index was recommended and the report cites no plan this run read: a query optimization rests on how the engine reaches its documents.",
   // Stays "table" (#414): the profile is `sql.table.profile`, an SQL-only operation
   // offered on engines whose rows really are tables, so the engine's own word and this
   // one are the same word wherever this verdict can be reached.
@@ -820,6 +950,10 @@ const SHORTFALL_SENTENCES: Readonly<Record<AgentGoalShortfall, string>> = {
     "The run reported what it found but never produced an answer to show, so there is nothing to put in front of you.",
   "answer-uncited":
     "The run presented one result as the answer and its report rests on other evidence entirely, so the claims and the picture are not about the same thing.",
+  "no-usage-reading": "No usage was read, so how the containers use their requests was never established.",
+  "no-usage-evidence": "The report rests on no usage reading of this run.",
+  "no-usage-metrics": "This cluster serves no usage metrics: install metrics-server to measure usage.",
+  "no-workload-profile": "No workloads were profiled, so the namespace's health was never established.",
   cancelled: "The run was stopped before it could finish.",
 };
 
@@ -832,16 +966,55 @@ const SHORTFALL_SENTENCES: Readonly<Record<AgentGoalShortfall, string>> = {
 const READING_REFUSAL_HEADLINES: Readonly<Record<AgentReadingDenyCode, string>> = {
   KIND_UNSUPPORTED_BY_PROVIDER: "This engine serves no reading of that kind",
   READING_OVER_BUDGET: "The reading was larger than the run may carry",
+  METRICS_UNAVAILABLE: "This cluster serves no usage metrics",
 };
 
 /**
  * The sentence for a reason, for a surface that shows it outside the timeline.
  *
- * Exported so the rail's status line and the timeline entry cannot drift into two
- * wordings of the same failure.
+ * Read through `describeRunFailure` below, so the rail's status line, the answer card and
+ * the timeline entry cannot drift into two wordings of the same failure.
  */
-export function describeFailureReason(reason: AgentRunFailureReason): string {
+function describeFailureReason(reason: AgentRunFailureReason): string {
   return FAILURE_SENTENCES[reason];
+}
+
+/**
+ * The failures that are a refusal of the CONNECTION as it is configured, before the run read anything: its user, its
+ * credential, or the server behind it. Any run on that connection meets the same refusal until it is changed.
+ */
+const CONNECTION_REFUSALS: ReadonlySet<AgentRunFailureReason> = new Set<AgentRunFailureReason>([
+  "agent-credential-unusable",
+  "agent-principal-refused",
+  "agent-principal-underprivileged",
+  "server-authorization-off",
+  "profile-target-unsupported",
+]);
+
+/** The sentence a run that failed for its connection was refused with, or null for every other run. */
+export function connectionRefusalSentence(timeline: AgentRunTimeline): string | null {
+  const reason = timeline.failureReason;
+  return reason !== null && CONNECTION_REFUSALS.has(reason) ? FAILURE_SENTENCES[reason] : null;
+}
+
+/**
+ * The sentence a FAILED run is described with outside the timeline, or null when its record
+ * names no cause at all (#1461).
+ *
+ * The failure reason wins, as it does in `endingSentence`. Without one, a run the loop ended as
+ * `failed` still says how: `model-timeout` and `deadline-exceeded` are on the record, and the
+ * sentence is the one the timeline entry shows for the run's mode, from the same map, so the
+ * card, the rail and the timeline cannot disagree. `turn-limit` reads its off-timeline
+ * wording, because "is above" is true of the timeline entry and false of the card and the
+ * rail, which sit above the timeline. A run that did not fail never gets a stop
+ * sentence here, because the surfaces that read this are failure lines.
+ */
+export function describeRunFailure(timeline: AgentRunTimeline): string | null {
+  if (timeline.failureReason !== null) return describeFailureReason(timeline.failureReason);
+  if (timeline.status !== "failed" || timeline.stopReason === null) return null;
+  return (
+    OFF_TIMELINE_STOP_SENTENCES[timeline.stopReason] ?? STOP_SENTENCES[timeline.mode]?.[timeline.stopReason] ?? null
+  );
 }
 
 function describeRefusal(refusal: AgentToolRefusal): Omit<AgentTimelineItem, "id" | "atMs" | "tone"> {
@@ -854,6 +1027,10 @@ function describeRefusal(refusal: AgentToolRefusal): Omit<AgentTimelineItem, "id
       return { headline: "Approval required", detail: refusal.operationId };
     case "reading-refused":
       return { headline: READING_REFUSAL_HEADLINES[refusal.reasonCode], detail: refusal.reasonCode };
+    case "not-sent":
+      // The tool's own sentence, which is the server's voice (a reader's or the inventory's refusal, never the
+      // engine's), so it is the detail rather than a quote.
+      return { headline: "Refused before the database", detail: refusal.detail };
     default:
       return { headline: "The database refused the statement", quoted: refusal.message };
   }
@@ -1007,15 +1184,7 @@ function describeEvent(
         applySql: event.after.sql,
       };
     case "recommendation":
-      return {
-        tone: "progress",
-        headline: event.change === "index" ? "Index recommended" : "Rewrite recommended",
-        detail: `${event.rationale} ${NOT_APPLIED_CAVEAT}`,
-        quoted: event.statement,
-        // The whole affordance: the statement is handed to the editor and to nobody
-        // else. Nothing in this runtime executes it.
-        applySql: event.statement,
-      };
+      return describeRecommendation(event);
     case "table-profiled":
       return {
         tone: "progress",
@@ -1028,6 +1197,29 @@ function describeEvent(
             : `${event.profile.rowCount} row(s) at ${event.profile.depth} depth. ${event.profile.findings
                 .map((finding) => `${finding.column}: ${finding.code} — ${finding.detail}`)
                 .join(" ")}`,
+      };
+    // The namespace is spoken in the headline the way a profiled table's name is: it is the subject of the entry.
+    case "usage-read":
+      return {
+        tone: "progress",
+        headline: `Read container usage in ${event.namespace}`,
+        detail: `${event.artifact.summary.rowCount} container(s), against their requests and limits.`,
+        artifactId: event.artifact.correlationId,
+      };
+    case "workloads-profiled":
+      return {
+        tone: "progress",
+        headline: `Profiled the workloads of ${event.namespace}`,
+        detail: `${event.artifact.summary.rowCount} workload(s).`,
+        artifactId: event.artifact.correlationId,
+      };
+    case "usage-unavailable":
+      // `neutral`, for the reason a schema that was not captured is: the run continues without the reading, so
+      // `progress` would claim it got somewhere and `refused` would claim the server turned a call back.
+      return {
+        tone: "neutral",
+        headline: "No usage metrics",
+        detail: "This cluster serves no metrics.k8s.io, so usage could not be read: install metrics-server.",
       };
     case "answer-composed":
       return {
@@ -1178,12 +1370,26 @@ function describeEvent(
           guardApplicable,
           ...(event.guardViolation === undefined ? {} : { guardViolation: event.guardViolation }),
           identifiers: event.identifiers,
+          // Copied where the server recorded it, and left absent where it did not: the card reads
+          // an absent language the way it always has (#1089).
+          ...(event.language === undefined ? {} : { language: event.language }),
           // The word this run's own capture used, so the card's marks and this
           // entry's detail cannot describe one inventory in two vocabularies.
           noun,
         },
       };
     }
+    case "run-paused":
+      return {
+        tone: "progress",
+        headline: "Paused",
+        detail: "The run is paused; resume it to continue from where it stopped.",
+      };
+    case "run-resumed":
+      return {
+        tone: "progress",
+        headline: "Resumed",
+      };
     default:
       return {
         tone: TERMINAL_TONES[event.status],
@@ -1402,6 +1608,7 @@ export function foldLedgerEntries(entries: readonly AgentLedgerEntry[]): AgentRu
   let status: AgentRunStatus = "queued";
   let stopRequested = false;
   let failureReason: AgentRunFailureReason | null = null;
+  let stopReason: AgentRunStopReason | null = null;
   let statements = 0;
   let databaseMs = 0;
   /** Charged statements whose entry records no duration (#512). See the field's doc. */
@@ -1533,9 +1740,14 @@ export function foldLedgerEntries(entries: readonly AgentLedgerEntry[]): AgentRu
       if (event.kind === "run-started") {
         status = "running";
         mode = event.mode;
+      } else if (event.kind === "run-paused") {
+        status = "paused";
+      } else if (event.kind === "run-resumed") {
+        status = "running";
       } else if (event.kind === "run-finished") {
         status = event.status;
         failureReason = event.reason ?? null;
+        stopReason = event.stopReason ?? null;
       } else if (event.kind === "closing-statement") closings.push({ index: items.length, mode });
       else if (event.kind === "plan-statement-drafted") drafted = true;
       else if (event.kind === "context-captured") {
@@ -1643,6 +1855,7 @@ export function foldLedgerEntries(entries: readonly AgentLedgerEntry[]): AgentRu
     stopRequested,
     mode,
     failureReason,
+    stopReason,
     workflowType,
     workflowSource,
     workflowReading,

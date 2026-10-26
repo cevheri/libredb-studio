@@ -6,16 +6,7 @@
 import { NextResponse } from "next/server";
 import { logger } from "@/lib/logger";
 import { ApiErrorCode } from "./error-codes";
-import {
-  DatabaseError,
-  DatabaseConfigError,
-  ConnectionError,
-  AuthenticationError,
-  PoolExhaustedError,
-  QueryError,
-  QueryCancelledError,
-  TimeoutError,
-} from "@/lib/db/errors";
+import { databaseErrorBody, internalErrorBody, type ApiErrorResponse } from "./error-body";
 import {
   LLMError,
   LLMAuthError,
@@ -23,23 +14,17 @@ import {
   LLMRateLimitError,
   LLMSafetyError,
   LLMStreamError,
+  isContextLengthError,
 } from "@/lib/llm/types";
 import { RateLimitError } from "@/lib/api/rate-limit";
 import { SeedConnectionError } from "@/lib/seed/resolve-connection";
+import { VaultError } from "@/lib/seed/vault-client";
 
 // ============================================================================
 // Types
 // ============================================================================
 
-export type { ApiErrorCode } from "./error-codes";
-
-export interface ApiErrorResponse {
-  error: string;
-  code?: ApiErrorCode;
-  statusCode: number;
-  retryable?: boolean;
-  details?: unknown;
-}
+export type { ApiErrorResponse } from "./error-body";
 
 // ============================================================================
 // Error → HTTP Mapping
@@ -51,114 +36,43 @@ export function createErrorResponse(error: unknown, context?: { route?: string }
   // --- Seed Connection Error ---
   if (error instanceof SeedConnectionError) {
     logger.warn("Seed connection error", { route, statusCode: error.statusCode });
+    // A refusal that names its own code keeps it (the custom-connections switch); every other one
+    // takes the code its status implies, as before.
     const code =
-      error.statusCode === 403 || error.statusCode === 401
+      error.code ??
+      (error.statusCode === 403 || error.statusCode === 401
         ? ApiErrorCode.AUTH_ERROR
         : error.statusCode === 400
           ? ApiErrorCode.CONFIG_ERROR
-          : undefined;
+          : undefined);
     return NextResponse.json(
       { error: error.message, ...(code ? { code } : {}), statusCode: error.statusCode },
       { status: error.statusCode },
     );
   }
 
-  // --- Query Cancelled ---
-  if (error instanceof QueryCancelledError) {
-    logger.info("Query cancelled", { route, provider: error.provider });
-    return NextResponse.json(
-      {
-        error: error.message,
-        code: ApiErrorCode.QUERY_CANCELLED,
-        statusCode: 499,
-      },
-      { status: 499 },
-    );
-  }
-
-  // --- DB: QueryError (syntax / execution) ---
-  if (error instanceof QueryError) {
-    logger.warn("Query error", { route, provider: error.provider });
-    return NextResponse.json(
-      {
-        error: error.message,
-        code: ApiErrorCode.QUERY_ERROR,
-        statusCode: 400,
-        details:
-          error.position !== undefined || error.detail ? { position: error.position, detail: error.detail } : undefined,
-      },
-      { status: 400 },
-    );
-  }
-
-  // --- DB: DatabaseConfigError ---
-  if (error instanceof DatabaseConfigError) {
-    logger.warn("Database config error", { route, provider: error.provider });
+  // --- Seed Connection: Vault reference ---
+  // Every way a `${vault:...}` reference fails is an operator configuration fault: an
+  // unset VAULT_ADDR, a v1-shaped path, a key that is not in the secret, a policy that
+  // does not grant the path, or a Vault this deployment cannot reach. None of those is
+  // the product failing, so it takes the same class as DatabaseConfigError rather than
+  // the generic 500, and the message - which names the variable or the path - is what
+  // an operator reads to fix it.
+  if (error instanceof VaultError) {
+    logger.warn("Vault reference error", { route });
     return NextResponse.json(
       { error: error.message, code: ApiErrorCode.CONFIG_ERROR, statusCode: 400 },
       { status: 400 },
     );
   }
 
-  // --- DB: AuthenticationError ---
-  if (error instanceof AuthenticationError) {
-    logger.warn("Database auth error", { route, provider: error.provider });
-    return NextResponse.json({ error: error.message, code: ApiErrorCode.AUTH_ERROR, statusCode: 401 }, { status: 401 });
-  }
-
-  // --- DB: TimeoutError ---
-  if (error instanceof TimeoutError) {
-    logger.warn("Query timeout", { route, provider: error.provider, duration: error.timeout });
-    return NextResponse.json(
-      {
-        error: "Query timed out. Please try a simpler query or increase timeout.",
-        code: ApiErrorCode.TIMEOUT_ERROR,
-        statusCode: 408,
-        retryable: true,
-      },
-      { status: 408 },
-    );
-  }
-
-  // --- DB: ConnectionError ---
-  if (error instanceof ConnectionError) {
-    logger.error("Connection error", error, { route, provider: error.provider });
-    return NextResponse.json(
-      {
-        error: error.message,
-        code: ApiErrorCode.CONNECTION_ERROR,
-        statusCode: 503,
-        retryable: true,
-      },
-      { status: 503 },
-    );
-  }
-
-  // --- DB: PoolExhaustedError ---
-  if (error instanceof PoolExhaustedError) {
-    logger.error("Pool exhausted", error, { route, provider: error.provider });
-    return NextResponse.json(
-      {
-        error: error.message,
-        code: ApiErrorCode.POOL_EXHAUSTED,
-        statusCode: 503,
-        retryable: true,
-      },
-      { status: 503 },
-    );
-  }
-
-  // --- DB: generic DatabaseError (base class catch-all) ---
-  if (error instanceof DatabaseError) {
-    logger.error("Database error", error, { route, provider: error.provider });
-    return NextResponse.json(
-      {
-        error: error.message,
-        code: (error.code as ApiErrorCode) ?? ApiErrorCode.DATABASE_ERROR,
-        statusCode: 500,
-      },
-      { status: 500 },
-    );
+  // --- DB: every DatabaseError class, answered by the Next-free error body ---
+  const answer = databaseErrorBody(error);
+  if (answer !== null) {
+    const { level, message, context: logContext } = answer.log;
+    if (level === "error") logger.error(message, error, { route, ...logContext });
+    else logger[level](message, { route, ...logContext });
+    return NextResponse.json(answer.body, { status: answer.body.statusCode });
   }
 
   // --- LLM: Safety ---
@@ -196,12 +110,25 @@ export function createErrorResponse(error: unknown, context?: { route?: string }
   // --- LLM: Config ---
   if (error instanceof LLMConfigError) {
     logger.warn("LLM config error", { route, provider: error.provider });
-    return NextResponse.json({ error: error.message, code: ApiErrorCode.LLM_CONFIG, statusCode: 503 }, { status: 503 });
+    // Missing credentials may be intentional; a malformed model, URL or provider is still a setup error.
+    const code = error.reason === "missing_credentials" ? ApiErrorCode.LLM_UNCONFIGURED : ApiErrorCode.LLM_CONFIG;
+    return NextResponse.json({ error: error.message, code, statusCode: 503 }, { status: 503 });
   }
 
   // --- LLM: Stream ---
   if (error instanceof LLMStreamError) {
     logger.error("LLM stream error", error, { route, provider: error.provider });
+    if (isContextLengthError(error)) {
+      return NextResponse.json(
+        {
+          error: "The request is too large for the configured model's context.",
+          code: ApiErrorCode.LLM_STREAM,
+          statusCode: 502,
+          retryable: false,
+        },
+        { status: 502 },
+      );
+    }
     return NextResponse.json(
       { error: error.message, code: ApiErrorCode.LLM_STREAM, statusCode: 502, retryable: true },
       { status: 502 },
@@ -239,7 +166,6 @@ export function createErrorResponse(error: unknown, context?: { route?: string }
   }
 
   // --- Generic Error ---
-  const message = error instanceof Error ? error.message : "Internal server error";
   logger.error("Unhandled error", error, { route });
-  return NextResponse.json({ error: message, code: ApiErrorCode.INTERNAL_ERROR, statusCode: 500 }, { status: 500 });
+  return NextResponse.json(internalErrorBody(error), { status: 500 });
 }

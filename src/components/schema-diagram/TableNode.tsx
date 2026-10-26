@@ -3,7 +3,9 @@
 import React, { memo, useEffect } from "react";
 import { Handle, Position, useUpdateNodeInternals, type NodeProps } from "@xyflow/react";
 import { Database, Hash, Key, Link2, Type } from "lucide-react";
+import { objectPathLabel } from "@/lib/db/object-path";
 import type { ColumnSchema } from "@/lib/types";
+import { isNumericType } from "../results-grid/numeric-sort";
 import { TABLE_SOURCE_HANDLE, TABLE_TARGET_HANDLE, type TableFlowNode } from "./graph";
 import { useDiagramActions } from "./diagram-context";
 import { useTableHighlighted } from "./highlight-store";
@@ -21,7 +23,11 @@ const ColumnRow = memo(function ColumnRow({ column, isFk, hasSourceHandle, hasTa
     column.isPrimary ? "PRIMARY KEY" : null,
     isFk ? "FOREIGN KEY" : null,
     column.nullable === false ? "NOT NULL" : null,
-    column.defaultValue ? `Default: ${column.defaultValue}` : null,
+    // `undefined` is how a column says it has no default; the empty string IS a default and
+    // needs a spelling a reader can tell apart from "none", so the test is not truthiness (#1030).
+    column.defaultValue !== undefined
+      ? `Default: ${column.defaultValue === "" ? "'' (empty string)" : column.defaultValue}`
+      : null,
   ]
     .filter(Boolean)
     .join("\n");
@@ -52,25 +58,25 @@ const ColumnRow = memo(function ColumnRow({ column, isFk, hasSourceHandle, hasTa
 
       <div className="flex items-center gap-2">
         {column.isPrimary ? (
-          <Key strokeWidth={1.5} className="w-2.5 h-2.5 text-yellow-500" />
+          <Key strokeWidth={1.5} className="w-2.5 h-2.5 text-hue-yellow" />
         ) : isFk ? (
-          <Link2 strokeWidth={1.5} className="w-2.5 h-2.5 text-blue-400" />
-        ) : column.type.toLowerCase().includes("int") ? (
+          <Link2 strokeWidth={1.5} className="w-2.5 h-2.5 text-hue-blue" />
+        ) : isNumericType(column.baseType ?? column.type) ? (
           <Hash strokeWidth={1.5} className="w-2.5 h-2.5 text-fg-muted" />
         ) : (
           <Type strokeWidth={1.5} className="w-2.5 h-2.5 text-fg-muted" />
         )}
         <span
           className={
-            column.isPrimary ? "text-yellow-500/90 font-medium" : isFk ? "text-blue-400/80" : "text-fg-tertiary"
+            column.isPrimary ? "text-hue-yellow/90 font-medium" : isFk ? "text-hue-blue/80" : "text-fg-tertiary"
           }
         >
           {column.name}
         </span>
       </div>
       <div className="flex items-center gap-1">
-        {column.nullable === false && <span className="text-[0.5rem] text-red-500/60">NN</span>}
-        <span className="text-[0.625rem] text-fg-subtle font-mono uppercase">{column.type}</span>
+        {column.nullable === false && <span className="text-[0.5rem] text-hue-red/60">NN</span>}
+        <span className="text-[0.625rem] text-fg-subtle font-mono">{column.type}</span>
       </div>
     </div>
   );
@@ -80,7 +86,7 @@ export const TableNode = memo(function TableNode({ id, data }: NodeProps<TableFl
   const highlighted = useTableHighlighted(id);
   const { toggleExpand } = useDiagramActions();
   const updateNodeInternals = useUpdateNodeInternals();
-  const { table, compact, visibleColumns, hiddenCount, sourceAnchors, targetAnchors } = data;
+  const { table, kindLabel, compact, visibleColumns, hiddenCount, sourceAnchors, targetAnchors } = data;
 
   // The rendered handle set changes with compact mode, column visibility and
   // FK anchors (which arrive asynchronously via the second-phase relations
@@ -103,10 +109,10 @@ export const TableNode = memo(function TableNode({ id, data }: NodeProps<TableFl
   return (
     <div
       className={`bg-raised border rounded-lg overflow-hidden min-w-[200px] shadow-2xl transition-all ${
-        highlighted ? "border-blue-500/60 ring-1 ring-blue-500/30" : "border-hairline-strong"
+        highlighted ? "border-brand-tint/60 ring-1 ring-brand-tint/30" : "border-hairline-strong"
       }`}
     >
-      <div className="relative bg-blue-600/10 px-3 py-2 border-b border-hairline flex items-center gap-2">
+      <div className="relative bg-brand-solid/10 px-3 py-2 border-b border-hairline flex items-center gap-2">
         <Handle
           type="target"
           position={Position.Left}
@@ -121,8 +127,16 @@ export const TableNode = memo(function TableNode({ id, data }: NodeProps<TableFl
           isConnectable={false}
           style={{ opacity: 0, right: -5 }}
         />
-        <Database strokeWidth={1.5} className="w-3.5 h-3.5 text-blue-400" />
-        <span className="text-xs font-medium text-fg">{table.name}</span>
+        <Database strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-blue" />
+        {/* The LABEL is what a person reads on the card, and the dotted ADDRESS is the
+            tooltip: two objects in two containers carry one label, and the card that says
+            only `customers` cannot say which (#789). */}
+        <span className="text-xs font-medium text-fg" title={objectPathLabel(table.path)}>
+          {table.name}
+        </span>
+        {kindLabel && (
+          <span className="text-[0.625rem] text-fg-secondary border border-hairline rounded px-1">{kindLabel}</span>
+        )}
         <span className="text-[0.625rem] text-fg-subtle ml-auto">{table.columns?.length || 0} cols</span>
       </div>
       {!compact && (
@@ -140,7 +154,7 @@ export const TableNode = memo(function TableNode({ id, data }: NodeProps<TableFl
             <button
               type="button"
               className="w-full text-left px-2 py-1 text-[0.625rem] text-fg-muted hover:text-fg-secondary transition-colors"
-              onClick={() => toggleExpand(table.name)}
+              onClick={() => toggleExpand(id)}
             >
               +{hiddenCount} more
             </button>

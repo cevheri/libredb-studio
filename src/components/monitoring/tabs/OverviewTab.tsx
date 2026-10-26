@@ -8,7 +8,8 @@ import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { MonitoringData } from "@/lib/db/types";
 import type { TimeSeriesPoint } from "@/lib/time-series-buffer";
-import { evaluateThreshold, getThresholdColor, DEFAULT_THRESHOLDS } from "@/lib/monitoring-thresholds";
+import { evaluateThreshold, getThresholdColor, thresholdFor } from "@/lib/monitoring-thresholds";
+import { storage } from "@/lib/storage";
 import { CACHE_HIT_RATIO_UNAVAILABLE } from "@/lib/monitoring-cache-ratio";
 import { MetricChart } from "./MetricChart";
 import { PanelUnavailable } from "../PanelUnavailable";
@@ -69,16 +70,18 @@ export function OverviewTab({ data, loading, history = [] }: OverviewTabProps) {
       ? Math.round((activeConnections / connectionLimit) * 100)
       : null;
 
-  // Evaluate thresholds. No published limit cannot be near a limit, so it scores as
-  // healthy rather than as the 0 that a missing reading would once have implied.
-  const connThreshold = evaluateThreshold(
-    connectionPercent ?? 0,
-    DEFAULT_THRESHOLDS.find((t) => t.metric === "connectionPercent")!,
-  );
-  const cacheThreshold = evaluateThreshold(
-    cacheHitRatio ?? 100,
-    DEFAULT_THRESHOLDS.find((t) => t.metric === "cacheHitRatio")!,
-  );
+  // Read storage here: storage-facade imports the defaults, so the threshold helper
+  // must stay pure to avoid a circular dependency.
+  const thresholds = storage.getThresholdConfig();
+  // An unavailable measurement stays ungraded even if a saved threshold includes zero or 100.
+  const connThreshold =
+    connectionPercent === null
+      ? "healthy"
+      : evaluateThreshold(connectionPercent, thresholdFor(thresholds, "connectionPercent"));
+  const cacheThreshold =
+    cacheHitRatio === undefined
+      ? "healthy"
+      : evaluateThreshold(cacheHitRatio, thresholdFor(thresholds, "cacheHitRatio"));
 
   // Build chart data from history. A sample with no published count is dropped
   // rather than plotted as zero - the same rule PerformanceTab.tsx's `metricSeries`
@@ -88,6 +91,16 @@ export function OverviewTab({ data, loading, history = [] }: OverviewTabProps) {
     const value = h.data.overview?.activeConnections;
     return value === undefined ? [] : [{ timestamp: h.timestamp, value }];
   });
+
+  // A floor, and not the whole count, when the provider names what it counted from: etcd counts
+  // only the ranges a user who is not root may read. The mark is `+` in the number's own text and
+  // the sentence is the tree's floor-badge wording (`formatCount` in object-tree/flatten.ts), its
+  // `en-US` digit grouping included, so one floor reads one way on both surfaces. PRESENCE decides,
+  // as `isCountSampled` does: a provider that set the field has said the number is not the whole
+  // count. Without it the card renders exactly as it always has.
+  const tableCount = overview?.tableCount ?? 0;
+  const tableCountSampledFrom = overview?.tableCountSampledFrom;
+  const tableFloor = tableCount.toLocaleString("en-US");
 
   return (
     <div className="p-3 sm:p-6 space-y-4 sm:space-y-6">
@@ -114,7 +127,7 @@ export function OverviewTab({ data, loading, history = [] }: OverviewTabProps) {
         <Card className={`p-0 border-2 transition-colors ${getThresholdColor(connThreshold)}`}>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
             <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Connections</CardTitle>
-            <Zap strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-yellow-500" />
+            <Zap strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-hue-yellow" />
           </CardHeader>
           <CardContent className="p-3 sm:p-4 pt-0">
             <div
@@ -142,7 +155,7 @@ export function OverviewTab({ data, loading, history = [] }: OverviewTabProps) {
         <Card className="p-0">
           <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
             <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">DB Size</CardTitle>
-            <Database strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-blue-500" />
+            <Database strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-hue-blue" />
           </CardHeader>
           <CardContent className="p-3 sm:p-4 pt-0">
             <div className="text-lg sm:text-2xl font-medium">{overview?.databaseSize || "N/A"}</div>
@@ -154,7 +167,7 @@ export function OverviewTab({ data, loading, history = [] }: OverviewTabProps) {
         <Card className={`p-0 border-2 transition-colors ${getThresholdColor(cacheThreshold)}`}>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
             <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Cache Hit</CardTitle>
-            <Activity strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-green-500" />
+            <Activity strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-hue-green" />
           </CardHeader>
           <CardContent className="p-3 sm:p-4 pt-0">
             {cacheHitRatio === undefined ? (
@@ -180,10 +193,20 @@ export function OverviewTab({ data, loading, history = [] }: OverviewTabProps) {
         <Card className="p-0">
           <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
             <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Tables</CardTitle>
-            <Table2 strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-purple-500" />
+            <Table2 strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-hue-purple" />
           </CardHeader>
           <CardContent className="p-3 sm:p-4 pt-0">
-            <div className="text-lg sm:text-2xl font-medium">{overview?.tableCount ?? 0}</div>
+            <div className="text-lg sm:text-2xl font-medium">
+              {tableCountSampledFrom === undefined ? tableCount : `${tableFloor}+`}
+            </div>
+            {tableCountSampledFrom !== undefined && (
+              <p
+                className="text-xs sm:text-xs text-muted-foreground mt-1 break-words"
+                data-testid="overview-table-count-scope"
+              >
+                {`At least ${tableFloor}: counted from ${tableCountSampledFrom}`}
+              </p>
+            )}
             <p className="text-xs sm:text-xs text-muted-foreground mt-1">{overview?.indexCount ?? 0} indexes</p>
           </CardContent>
         </Card>
@@ -325,7 +348,7 @@ function PerformanceSummaryCard({
  * `getSlowQueries` and `getActiveSessions`, and MonitoringDashboard overrides neither (it
  * sets only the three `include*` flags). The providers that fill the session list apply the
  * ceiling in SQL or in memory - `$2` in postgres.ts, `LIMIT` in mysql.ts, `SELECT TOP` in
- * mssql.ts, `ROWNUM <=` in oracle.ts, `.slice(0, limit)` over `currentOp` in mongodb.ts -
+ * mssql.ts, `ROWNUM <=` in oracle.ts, `.slice(0, limit)` over `currentOp` in mongodb/index.ts -
  * so a server past either ceiling hands this card a truncated list and nothing in the
  * payload says how much was cut.
  *

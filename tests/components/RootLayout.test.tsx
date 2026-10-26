@@ -1,4 +1,5 @@
 import "../setup-dom";
+import { readFileSync } from "node:fs";
 import { mock } from "bun:test";
 import React from "react";
 import ReactDOMServer from "react-dom/server";
@@ -25,6 +26,7 @@ mock.module("@/components/ui/sonner", () => ({
 // Dynamic import so mocks are registered first
 const { default: RootLayout, metadata } = await import("@/app/layout");
 const { ThemeProvider } = await import("@/components/theme-provider");
+const { SessionEndedRedirect } = await import("@/components/auth/SessionEndedRedirect");
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { cleanup, render } from "@testing-library/react";
@@ -38,8 +40,43 @@ describe("RootLayout", () => {
     expect(metadata.title).toBe("LibreDB Studio | Universal Database Editor");
   });
 
-  test("exports correct metadata description", () => {
-    expect(metadata.description).toBe("Manage PostgreSQL, MySQL, MongoDB, and Redis in one web-based interface.");
+  test("shares a branded static image with matching Open Graph and Twitter metadata", () => {
+    const screenshot = readFileSync(new URL("../../public/screenshots/hero-editor.png", import.meta.url));
+    const image = {
+      url: "https://raw.githubusercontent.com/libredb/libredb-studio/main/public/screenshots/hero-editor.png",
+      alt: "LibreDB Studio SQL editor and query results",
+    };
+    expect(metadata.openGraph).toMatchObject({
+      type: "website",
+      url: "https://libredb.org",
+      title: metadata.title,
+      description: metadata.description,
+      siteName: "LibreDB Studio",
+      images: [{ ...image, width: screenshot.readUInt32BE(16), height: screenshot.readUInt32BE(20) }],
+    });
+    expect(metadata.twitter).toMatchObject({
+      card: "summary_large_image",
+      title: metadata.title,
+      description: metadata.description,
+      images: [image],
+    });
+  });
+
+  test("describes the database scope in a search-result snippet", () => {
+    const description = metadata.description ?? "";
+    expect(description.length).toBeGreaterThanOrEqual(150);
+    expect(description.length).toBeLessThanOrEqual(160);
+    expect(description).toContain("self-hosted");
+    expect(description).toContain("SQL and NoSQL");
+    expect(description).toContain("database management platform");
+    expect(description).not.toMatch(/\d/);
+  });
+
+  test("links the web app manifest and iOS home-screen icon", () => {
+    expect(metadata.manifest).toBe("/site.webmanifest");
+    expect(metadata.icons).toMatchObject({
+      apple: [{ url: "/apple-touch-icon.png", sizes: "180x180", type: "image/png" }],
+    });
   });
 
   test("renders children", () => {
@@ -93,6 +130,14 @@ describe("RootLayout", () => {
   test("mounts ThemeProvider — theme selection is standalone studio's own", () => {
     const element = RootLayout({ children: React.createElement("span") });
     expect(element.props.children.props.children.type).toBe(ThemeProvider);
+  });
+
+  // Every page of the standalone app gets the session-ended redirect (#1420); the published
+  // components never pass through this layout, so an embedding application keeps its own handling.
+  test("mounts the session-ended redirect for every page", () => {
+    const element = RootLayout({ children: React.createElement("span") });
+    const themed = React.Children.toArray(element.props.children.props.children.props.children) as React.ReactElement[];
+    expect(themed.map((child) => child.type)).toContain(SessionEndedRedirect);
   });
 
   test("renders multiple children correctly", () => {

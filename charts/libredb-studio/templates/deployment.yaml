@@ -32,8 +32,22 @@ at all (docs/BACKLOG.md B16), so this is refused rather than rendered broken (#3
 {{- if and (include "libredb-studio.agentPossible" .) (include "libredb-studio.multiReplica" .) (not (include "libredb-studio.agentPostgresWorld" .)) }}
 {{- fail "the agent runtime is single-instance: its zero-config ledger keeps run state on each pod's own disk behind file locks, so above one replica a run started on one pod is invisible to the next request. This release can run agents (an AI configuration is set in these values, or agent.enabled=true) and asks for more than one replica. Set replicaCount=1 (with autoscaling off) to keep the agent, or agent.enabled=false to run Studio on many replicas with no agent. The one backend that lifts the constraint, WORKFLOW_TARGET_WORLD=@workflow/world-postgres, is not loadable in the published container image today (B16 in docs/BACKLOG.md), so multi-replica agent runs are unsupported rather than merely unconfigured: set it (with WORKFLOW_POSTGRES_URL) through extraEnv only if image.repository points at an image that carries that world" }}
 {{- end }}
+{{- include "libredb-studio.governanceGuards" . }}
 {{- if and .Values.persistence.fixPermissions (include "libredb-studio.adaptOpenShiftSecurityContext" .) }}
 {{- fail "persistence.fixPermissions cannot be combined with the OpenShift security-context adaptation: restricted-v2 rejects the root init container, and the pod's UID/GID come from the namespace range rather than podSecurityContext, so the chown would target the wrong owner. On OpenShift, use a storage class whose volumes the kubelet applies fsGroup to (or pre-chown the volume) and leave persistence.fixPermissions=false; set global.compatibility.openshift.adaptSecurityContext=disabled only if this is not an OpenShift cluster" }}
+{{- end }}
+{{- /*
+The MCP server (#246) accepts a token only when both channel values are set, and only the
+operator knows the public address and its basePath, so an enabled block without them is refused
+rather than rendered as an endpoint that accepts nothing. `default dict` keeps a values set that
+predates the block, as an upgrade with --reuse-values carries, rendering as before.
+*/}}
+{{- $mcp := .Values.mcp | default dict }}
+{{- if and (get $mcp "enabled") (not (get $mcp "url")) }}
+{{- fail "mcp.enabled is true but mcp.url is empty: set it to the address MCP clients use, such as https://studio.example.com/api/mcp, including config.basePath when one is set" }}
+{{- end }}
+{{- if and (get $mcp "enabled") (not (get $mcp "tokenLabel")) }}
+{{- fail "mcp.enabled is true but mcp.tokenLabel is empty: set it to any value, and change it to revoke every MCP token at once" }}
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment
@@ -84,6 +98,12 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "libredb-studio.serviceAccountName" . }}
+      {{- /* Set on the pod as well as on the ServiceAccount: with serviceAccount.create=false
+             the pod runs as an account this chart does not render, usually the namespace's
+             default one, whose own setting would mount its API token. Studio reads that token
+             only for Vault Kubernetes auth (VAULT_ROLE). Only an explicit true mounts it, so a
+             removed value renders false, never empty. */}}
+      automountServiceAccountToken: {{ if .Values.serviceAccount.automountServiceAccountToken }}true{{ else }}false{{ end }}
       securityContext:
         {{- include "libredb-studio.podSecurityContext" . | nindent 8 }}
       {{- /* The kubelet does not apply fsGroup to hostPath (and some local) volumes, so a
@@ -154,7 +174,9 @@ spec:
                   key: {{ .Values.secrets.existingSecretKeys.adminEmail }}
                   optional: true
             {{- end }}
-            {{- if or .Values.secrets.adminPassword .Values.secrets.existingSecret }}
+            {{- /* Never under governance, whose preflight refuses ADMIN_PASSWORD and USER_PASSWORD:
+                   the guards refuse the inline values, and an existingSecret is not read for them. */}}
+            {{- if and (or .Values.secrets.adminPassword .Values.secrets.existingSecret) (not (include "libredb-studio.governanceEnabled" .)) }}
             - name: ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -167,7 +189,7 @@ spec:
                   optional: true
                   {{- end }}
             {{- end }}
-            {{- if or .Values.secrets.userPassword .Values.secrets.existingSecret }}
+            {{- if and (or .Values.secrets.userPassword .Values.secrets.existingSecret) (not (include "libredb-studio.governanceEnabled" .)) }}
             - name: USER_EMAIL
               valueFrom:
                 secretKeyRef:
@@ -179,6 +201,26 @@ spec:
                 secretKeyRef:
                   name: {{ include "libredb-studio.secretName" . }}
                   key: {{ .Values.secrets.existingSecretKeys.userPassword }}
+                  optional: true
+            {{- end }}
+            {{- /* TOTP second factor. Always optional: MFA is opt-in per account, so a missing
+                   key must never keep the pod from starting, and the app treats an absent value
+                   as "no second factor". Keyed separately from the passwords rather than nested
+                   under them so an operator can rotate a secret without touching a credential. */}}
+            {{- if or .Values.secrets.adminTotpSecret .Values.secrets.existingSecret }}
+            - name: ADMIN_TOTP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "libredb-studio.secretName" . }}
+                  key: {{ .Values.secrets.existingSecretKeys.adminTotpSecret }}
+                  optional: true
+            {{- end }}
+            {{- if or .Values.secrets.userTotpSecret .Values.secrets.existingSecret }}
+            - name: USER_TOTP_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "libredb-studio.secretName" . }}
+                  key: {{ .Values.secrets.existingSecretKeys.userTotpSecret }}
                   optional: true
             {{- end }}
             {{- if or .Values.secrets.llmApiKey .Values.secrets.existingSecret }}
@@ -221,6 +263,24 @@ spec:
                   key: {{ .Values.secrets.existingSecretKeys.storagePostgresUrl }}
                   optional: true
             {{- end }}
+            {{- /* Governance: the URL from the Secret, never optional, and a stable instance id. One pod
+                   reports the chart's fullname (or governance.instanceId), so a rollout updates the same
+                   heartbeat row (docs/GOVERNANCE.md#instance-id); more than one reports each pod's own name. */}}
+            {{- if include "libredb-studio.governanceEnabled" . }}
+            - name: GOVERNANCE_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "libredb-studio.secretName" . }}
+                  key: {{ include "libredb-studio.governanceSecretKey" (dict "root" . "name" "governancePostgresUrl") }}
+            - name: GOVERNANCE_INSTANCE_ID
+              {{- if include "libredb-studio.governanceMultiReplica" . }}
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+              {{- else }}
+              value: {{ get .Values.governance "instanceId" | default (include "libredb-studio.fullname" .) | quote }}
+              {{- end }}
+            {{- end }}
             {{- if .Values.seedConnections.enabled }}
             - name: SEED_CONFIG_PATH
               value: "/app/config/{{ .Values.seedConnections.configMapKey | default "seed-connections.yaml" }}"
@@ -251,6 +311,22 @@ spec:
             - name: AGENT_MODEL_TUNING_PATH
               value: "/app/model-tuning/{{ include "libredb-studio.agentTuningKey" . }}"
             {{- end }}
+            {{- /* The MCP server (#246): nothing by default, and all four variables as strings
+                   when mcp.enabled is true; the guards at the top of this file have already
+                   refused an enabled block without url or tokenLabel. Written before extraEnv,
+                   like the agent flag, so an extraEnv entry of the same name still wins. */}}
+            {{- with (.Values.mcp | default dict) }}
+            {{- if .enabled }}
+            - name: LIBREDB_MCP_ENABLED
+              value: "true"
+            - name: LIBREDB_MCP_URL
+              value: {{ .url | quote }}
+            - name: LIBREDB_MCP_TOKEN_LABEL
+              value: {{ .tokenLabel | quote }}
+            - name: LIBREDB_MCP_TOKEN_TTL_DAYS
+              value: {{ .tokenTtlDays | default 30 | quote }}
+            {{- end }}
+            {{- end }}
             {{- /* The agent's ledger directory, set by the chart because the image a
                    default install pulls does not yet set it. image.tag defaults to
                    .Chart.AppVersion, and the Dockerfile's own
@@ -270,15 +346,15 @@ spec:
             {{- end }}
           {{- with .Values.startupProbe }}
           startupProbe:
-            {{- toYaml . | nindent 12 }}
+            {{- include "libredb-studio.probe" (dict "probe" . "basePath" ($.Values.config.basePath | default "")) | nindent 12 }}
           {{- end }}
           {{- with .Values.readinessProbe }}
           readinessProbe:
-            {{- toYaml . | nindent 12 }}
+            {{- include "libredb-studio.probe" (dict "probe" . "basePath" ($.Values.config.basePath | default "") "ready" (include "libredb-studio.governanceEnabled" $ | eq "true")) | nindent 12 }}
           {{- end }}
           {{- with .Values.livenessProbe }}
           livenessProbe:
-            {{- toYaml . | nindent 12 }}
+            {{- include "libredb-studio.probe" (dict "probe" . "basePath" ($.Values.config.basePath | default "")) | nindent 12 }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
@@ -298,6 +374,14 @@ spec:
             - name: agent-model-tuning
               mountPath: /app/model-tuning
               readOnly: true
+            {{- end }}
+            {{- if include "libredb-studio.governanceEnabled" . }}
+            - name: governance-keyring
+              mountPath: {{ include "libredb-studio.governanceKeyringDir" . }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
       volumes:
         - name: next-cache
@@ -329,6 +413,22 @@ spec:
         - name: agent-model-tuning
           configMap:
             name: {{ get (get .Values.agent "modelTuning") "existingConfigMap" | default (printf "%s-agent-model-tuning" (include "libredb-studio.fullname" .)) }}
+        {{- end }}
+        {{- /* The keyring, from the same Secret as the URL, as one read-only file. 256 is mode 0400,
+               written in decimal because YAML 1.2 readers take 0400 as four hundred. The file is
+               root-owned and the kubelet adds group read for podSecurityContext.fsGroup, the group
+               uid 1001 reads it through, which the governance guards require (docs/GOVERNANCE.md#keyring). */}}
+        {{- if include "libredb-studio.governanceEnabled" . }}
+        - name: governance-keyring
+          secret:
+            secretName: {{ include "libredb-studio.secretName" . }}
+            defaultMode: 256
+            items:
+              - key: {{ include "libredb-studio.governanceSecretKey" (dict "root" . "name" "governancePrivateKeys") }}
+                path: keyring.json
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

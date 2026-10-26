@@ -1,0 +1,331 @@
+import { describe, expect, test } from "bun:test";
+import { connectionIdentity } from "@/lib/agent/context-snapshot";
+import { connectionFingerprint } from "@/lib/db/connection-fingerprint";
+import { providerCacheKey } from "@/lib/db/provider-cache-key";
+import {
+  CONNECTION_FIELDS,
+  type FieldClass,
+  SECRET_FIELD_MAPS,
+  SSH_TUNNEL_FIELDS,
+  SSL_FIELDS,
+} from "@/lib/storage/connection-secrets";
+import type { DatabaseConnection } from "@/lib/types";
+
+/**
+ * The read-only mode in the provider cache key, and in nothing else (#1089).
+ *
+ * A provider opened read-only refuses every write, so the cache may not hand a read-only caller a
+ * pool opened read-write, nor the reverse: the mode is the key's fourth length-framed part. It is part
+ * of no identity digest, because the fingerprint says which server a plan is sealed to and the run
+ * identity which database a reading came from, and the mode changes neither: the fingerprint's
+ * digests are pinned byte for byte in connection-fingerprint.test.ts, and a run's stored identity is
+ * compared on every follow-up.
+ */
+const base: DatabaseConnection = {
+  id: "cluster",
+  name: "Cluster",
+  type: "postgres",
+  host: "db.internal",
+  port: 5432,
+  database: "app",
+  user: "app",
+  password: "app-password",
+  createdAt: new Date(0),
+};
+
+describe("providerCacheKey frames the read-only mode (#1089)", () => {
+  test("false and an absent readOnly are one mode, so they answer one key", async () => {
+    expect(await providerCacheKey({ ...base, readOnly: false })).toBe(await providerCacheKey(base));
+  });
+
+  test("readOnly: true answers a key neither of the other two shares", async () => {
+    const readOnly = await providerCacheKey({ ...base, readOnly: true });
+
+    expect(readOnly).not.toBe(await providerCacheKey(base));
+    expect(readOnly).not.toBe(await providerCacheKey({ ...base, readOnly: false }));
+  });
+
+  test("the mode is the fourth length-framed part, after the id, the server and the credentials", async () => {
+    expect((await providerCacheKey({ ...base, readOnly: true })).endsWith("9:read-only")).toBe(true);
+    expect((await providerCacheKey(base)).endsWith("10:read-write")).toBe(true);
+  });
+});
+
+describe("providerCacheKey frames the DuckDB file-access posture, and only DuckDB's (non-admin DuckDB file access)", () => {
+  const duck: DatabaseConnection = {
+    id: "warehouse",
+    name: "Warehouse",
+    type: "duckdb",
+    database: "/srv/data/warehouse.duckdb",
+    createdAt: new Date(0),
+  };
+
+  test("a non-admin (deny) DuckDB handle keys apart from an admin (allow) one, so they never share a handle", async () => {
+    const deny = await providerCacheKey(duck, false);
+    const allow = await providerCacheKey(duck, true);
+
+    expect(deny).not.toBe(allow);
+  });
+
+  test("only the deny posture adds bytes: allow and an absent posture are the key as it was before this field", async () => {
+    const bare = await providerCacheKey(duck);
+    expect(await providerCacheKey(duck, true)).toBe(bare);
+    expect((await providerCacheKey(duck, false)).endsWith("23:duckdb-deny-file-access")).toBe(true);
+  });
+
+  test("the posture segment follows the mode, length-framed like every other part", async () => {
+    expect((await providerCacheKey(duck, false)).endsWith("10:read-write23:duckdb-deny-file-access")).toBe(true);
+  });
+
+  test("a non-DuckDB connection's key is byte-identical whatever the posture, because only DuckDB reads it", async () => {
+    const baseline = await providerCacheKey(base);
+    expect(await providerCacheKey(base, true)).toBe(baseline);
+    expect(await providerCacheKey(base, false)).toBe(baseline);
+  });
+});
+
+describe("the read-only mode is part of no identity digest (#1089)", () => {
+  test("the server a plan is sealed to does not move with it", async () => {
+    expect(await connectionFingerprint({ ...base, readOnly: true })).toBe(await connectionFingerprint(base));
+  });
+
+  test("the database a reading came from does not move with it", () => {
+    expect(connectionIdentity({ ...base, readOnly: true })).toBe(connectionIdentity(base));
+  });
+});
+
+describe("providerCacheKey frames Db2's consent to a cleartext password (#786)", () => {
+  const db2: DatabaseConnection = { ...base, type: "db2", port: 50000, database: "TESTDB" };
+
+  test("a connection whose consent was taken back is not handed the provider opened under it", async () => {
+    const consented = await providerCacheKey({ ...db2, allowInsecureAuth: true });
+
+    expect(consented).not.toBe(await providerCacheKey(db2));
+    expect(await providerCacheKey({ ...db2, allowInsecureAuth: false })).toBe(await providerCacheKey(db2));
+  });
+});
+
+describe("providerCacheKey frames the data servers a token may be sent to", () => {
+  test("a connection whose list changed is not handed a provider whose policy admitted other hosts", async () => {
+    const listed = await providerCacheKey({ ...base, dataServers: "a.internal:6648" });
+    expect(listed).not.toBe(await providerCacheKey(base));
+    expect(listed).not.toBe(await providerCacheKey({ ...base, dataServers: "b.internal:6648" }));
+    expect(await providerCacheKey({ ...base, dataServers: "" })).toBe(await providerCacheKey(base));
+  });
+});
+
+describe("providerCacheKey frames the Databend warehouse a statement runs on", () => {
+  const databend: DatabaseConnection = { ...base, type: "databend", port: 8000 };
+
+  test("two connections differing only in the warehouse answer different keys", async () => {
+    const analytics = await providerCacheKey({ ...databend, warehouse: "analytics" });
+    expect(analytics).not.toBe(await providerCacheKey({ ...databend, warehouse: "etl" }));
+    expect(analytics).not.toBe(await providerCacheKey(databend));
+    expect(await providerCacheKey({ ...databend, warehouse: "" })).toBe(await providerCacheKey(databend));
+  });
+});
+
+describe("providerCacheKey frames the BigQuery location", () => {
+  test("identical connections share a key, and a changed location changes it", async () => {
+    const bq: DatabaseConnection = { ...base, type: "bigquery", location: "EU" };
+    expect(await providerCacheKey({ ...bq })).toBe(await providerCacheKey(bq));
+    expect(await providerCacheKey({ ...bq, location: "US" })).not.toBe(await providerCacheKey(bq));
+  });
+});
+
+describe("providerCacheKey frames the Elasticsearch API key pair", () => {
+  test("two connections differing only in either half, or in having a pair at all, answer different keys", async () => {
+    const paired = await providerCacheKey({ ...base, apiKeyId: "key-one", apiKeySecret: "secret-one" });
+
+    expect(paired).not.toBe(await providerCacheKey(base));
+    expect(paired).not.toBe(await providerCacheKey({ ...base, apiKeyId: "key-two", apiKeySecret: "secret-one" }));
+    expect(paired).not.toBe(await providerCacheKey({ ...base, apiKeyId: "key-one", apiKeySecret: "secret-two" }));
+    expect(await providerCacheKey({ ...base, apiKeyId: "key-one", apiKeySecret: "secret-one" })).toBe(paired);
+  });
+});
+
+const ssl: NonNullable<DatabaseConnection["ssl"]> = {
+  mode: "verify-full",
+  caCert: "ca",
+  clientCert: "cert",
+  clientKey: "key",
+  rejectUnauthorized: true,
+};
+const tunnel: NonNullable<DatabaseConnection["sshTunnel"]> = {
+  enabled: true,
+  host: "bastion.internal",
+  port: 22,
+  username: "ops",
+  authMethod: "password",
+};
+
+/**
+ * Every field the connection store classifies as `secret` moves the key, so the next field classified
+ * secret cannot be added without the cache key seeing it.
+ *
+ * `credentialDigest` is a hand-kept list, and the API key pair was once left out of it.
+ * The maps in `src/lib/storage/secret-fields.ts` fail typecheck when a field goes unclassified,
+ * so walking them here turns a forgotten field into a red test. A field may be framed by
+ * `credentialDigest` or by the fingerprint (`connectionString` is); the walk asks the whole key.
+ * A public field that decides identity is outside this walk, so it is added to `credentialDigest` by
+ * hand and gets a row in the table of the next block.
+ */
+describe("providerCacheKey frames every field the connection store classifies as secret", () => {
+  /** Where a field of each map sits on a connection: at its root, in `ssl`, or in `sshTunnel`. */
+  const placements = new Map<Readonly<Record<string, FieldClass>>, (key: string, value: string) => DatabaseConnection>([
+    [CONNECTION_FIELDS, (key, value) => ({ ...base, [key]: value }) as DatabaseConnection],
+    [SSL_FIELDS, (key, value) => ({ ...base, ssl: { ...ssl, [key]: value } })],
+    [SSH_TUNNEL_FIELDS, (key, value) => ({ ...base, sshTunnel: { ...tunnel, [key]: value } })],
+  ]);
+  const placementOf = (map: Readonly<Record<string, FieldClass>>) => {
+    const place = placements.get(map);
+    if (place === undefined) throw new Error("a classification map has no placement in this test");
+    return place;
+  };
+  const secretFields = SECRET_FIELD_MAPS.flatMap((map) =>
+    Object.keys(map)
+      .filter((key) => map[key] === "secret")
+      .map((key) => ({ map, key })),
+  );
+
+  test("every classification map has a placement here", () => {
+    expect(SECRET_FIELD_MAPS.filter((map) => !placements.has(map))).toEqual([]);
+  });
+
+  test("the walk reaches the secrets of all three maps", () => {
+    const keys = secretFields.map(({ key }) => key);
+    for (const known of ["password", "connectionString", "apiKeyId", "apiKeySecret", "clientKey", "privateKey"]) {
+      expect(keys).toContain(known);
+    }
+  });
+
+  test("changing any one of them alone changes the key", async () => {
+    const unframed: string[] = [];
+    for (const { map, key } of secretFields) {
+      const place = placementOf(map);
+      if ((await providerCacheKey(place(key, "one"))) === (await providerCacheKey(place(key, "two")))) {
+        unframed.push(key);
+      }
+    }
+    expect(unframed).toEqual([]);
+  });
+
+  test("the comparison can see two equal keys: a field framed nowhere leaves the key where it was", async () => {
+    const place = placementOf(CONNECTION_FIELDS);
+    expect(await providerCacheKey(place("color", "one"))).toBe(await providerCacheKey(place("color", "two")));
+  });
+});
+
+/**
+ * The public fields `credentialDigest` frames, each moved alone. The walk above reaches only the
+ * fields classified `secret`, so these rows are kept by hand, as the digest's own list is: a field
+ * added to the digest gets a row here, and a row whose field the digest drops turns red.
+ */
+describe("providerCacheKey frames every public field that decides who a connection opens as", () => {
+  const rows: [string, DatabaseConnection, DatabaseConnection][] = [
+    ["agentUser", { ...base, agentUser: "reader" }, { ...base, agentUser: "writer" }],
+    ["ssl.mode", { ...base, ssl: { ...ssl, mode: "require" } }, { ...base, ssl }],
+    ["ssl.caCert", { ...base, ssl: { ...ssl, caCert: "other-ca" } }, { ...base, ssl }],
+    ["ssl.clientCert", { ...base, ssl: { ...ssl, clientCert: "other-cert" } }, { ...base, ssl }],
+    ["ssl.rejectUnauthorized", { ...base, ssl: { ...ssl, rejectUnauthorized: false } }, { ...base, ssl }],
+    ["saslMechanism", { ...base, saslMechanism: "SCRAM-SHA-256" }, { ...base, saslMechanism: "SCRAM-SHA-512" }],
+    ["authSource", { ...base, authSource: "admin" }, { ...base, authSource: "app" }],
+    ["allowInsecureAuth", { ...base, allowInsecureAuth: true }, base],
+    ["dataServers", { ...base, dataServers: "a.internal:6648" }, { ...base, dataServers: "b.internal:6648" }],
+    ["warehouse", { ...base, warehouse: "analytics" }, { ...base, warehouse: "etl" }],
+    ["location", { ...base, location: "EU" }, { ...base, location: "US" }],
+    ["region", { ...base, region: "eu-central-1" }, { ...base, region: "us-east-1" }],
+    ["namespaces", { ...base, namespaces: "shop" }, { ...base, namespaces: "web" }],
+    ["role", { ...base, role: "STUDIO_RO" }, { ...base, role: "STUDIO_RW" }],
+    ["authMethod", { ...base, authMethod: "keypair" }, { ...base, authMethod: "pat" }],
+    [
+      "sshTunnel.authMethod",
+      { ...base, sshTunnel: { ...tunnel, authMethod: "privateKey" } },
+      { ...base, sshTunnel: tunnel },
+    ],
+    [
+      "sshTunnel.hostKeyFingerprint",
+      { ...base, sshTunnel: { ...tunnel, hostKeyFingerprint: "SHA256:one" } },
+      { ...base, sshTunnel: { ...tunnel, hostKeyFingerprint: "SHA256:two" } },
+    ],
+  ];
+
+  test.each(rows)("%s", async (_field, one, two) => {
+    expect(await providerCacheKey(one)).not.toBe(await providerCacheKey(two));
+  });
+
+  test("an absent authSource and a named one answer different keys", async () => {
+    expect(await providerCacheKey({ ...base, authSource: "admin" })).not.toBe(await providerCacheKey(base));
+  });
+
+  test("an empty region and an absent one answer the same key, because both mean us-east-1", async () => {
+    expect(await providerCacheKey({ ...base, region: "" })).toBe(await providerCacheKey(base));
+  });
+});
+
+/**
+ * The owner of a per-user provider (docs/GOVERNANCE.md#per-user-providers). Under governance every user of a connection
+ * gets a provider of their own, so the key frames the user's identity provider subject as one more length-framed part.
+ * Without an owner the key is today's, byte for byte, which is what keeps an install without governance exactly as it
+ * was. An engine that keeps one handle per file (`SINGLE_WRITER_FILE`) leaves the owner out, because a provider per
+ * user would be a second handle on the file.
+ */
+describe("providerCacheKey frames the owner of a per-user provider", () => {
+  const libredb: DatabaseConnection = {
+    id: "store",
+    name: "Store",
+    type: "libredb",
+    database: "/srv/data/store.libredb",
+    createdAt: new Date(0),
+  };
+  const duck: DatabaseConnection = {
+    id: "warehouse",
+    name: "Warehouse",
+    type: "duckdb",
+    database: "/srv/data/warehouse.duckdb",
+    createdAt: new Date(0),
+  };
+  const sqlite: DatabaseConnection = {
+    id: "local",
+    name: "Local",
+    type: "sqlite",
+    database: "/srv/data/local.db",
+    createdAt: new Date(0),
+  };
+
+  test("an owner appends a framed segment, no owner is byte-identical, and duckdb and libredb ignore the owner", async () => {
+    // The key this connection answered before owners existed, pinned byte for byte.
+    const today =
+      "7:cluster64:e2db789313b86b9d6312f61cf097d28ccb162834df6429c22d049c2d64f138c564:a955208a182148bc3f483b9983aab19b4d188b568948e46de77efd445e57d7c210:read-write";
+    expect(await providerCacheKey(base)).toBe(today);
+    expect(await providerCacheKey(base, undefined, undefined)).toBe(today);
+
+    // The owner is the last part, framed like every other one, so two subjects never answer one key.
+    expect(await providerCacheKey(base, undefined, "alice-subject")).toBe(`${today}19:owner:alice-subject`);
+    expect(await providerCacheKey(base, true, "f:ldap-1:bob")).toBe(`${today}18:owner:f:ldap-1:bob`);
+    // After the file-access posture, on an engine that reads one.
+    expect(await providerCacheKey(sqlite, false, "alice-subject")).toBe(
+      `${await providerCacheKey(sqlite, false)}19:owner:alice-subject`,
+    );
+
+    for (const connection of [duck, libredb]) {
+      for (const posture of [true, false]) {
+        expect(await providerCacheKey(connection, posture, "alice-subject")).toBe(
+          await providerCacheKey(connection, posture),
+        );
+      }
+    }
+  });
+});
+
+test("SQLite denied callers cannot reuse an administrator's handle", async () => {
+  const connection: DatabaseConnection = {
+    id: "sqlite-posture",
+    name: "SQLite",
+    type: "sqlite",
+    database: ":memory:",
+    createdAt: new Date(0),
+  };
+  expect(await providerCacheKey(connection, false)).not.toBe(await providerCacheKey(connection, true));
+  expect((await providerCacheKey(connection, false)).endsWith("23:sqlite-deny-file-access")).toBe(true);
+});

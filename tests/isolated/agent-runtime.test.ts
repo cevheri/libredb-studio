@@ -21,13 +21,13 @@ import { AGENT_WORKFLOW_BUDGETS } from "@/lib/agent/execution-policy";
 import * as realRunStore from "@/lib/agent/run-store";
 import { AgentRunServiceError } from "@/lib/agent/run-service";
 import { LLMAuthError, LLMConfigError, LLMRateLimitError } from "@/lib/llm/types";
-import { ExecutionProfileError } from "@/lib/db/errors";
+import { type ExecutionProfileDenyCode, ExecutionProfileError } from "@/lib/db/errors";
 import { SeedConnectionError } from "@/lib/seed/resolve-connection";
-import { acquireExecutionProfileProvider } from "@/lib/db/factory";
+import * as realFactory from "@/lib/db/factory";
 import type { AgentToolResources } from "@/lib/agent/investigation";
 import { TABLE_LABELS } from "../fixtures/provider-labels";
 import type { ProviderCapabilities } from "@/lib/db/types";
-import type { AgentRunWorkflowType } from "@/lib/agent/types";
+import type { AgentRunFailureReason, AgentRunWorkflowType } from "@/lib/agent/types";
 import type { DatabaseConnection } from "@/lib/types";
 
 const dataDirs: string[] = [];
@@ -64,6 +64,15 @@ mock.module("@/lib/agent/run-store", () => ({ ...realRunStore, resolveAgentLedge
 mock.module("@/lib/seed/resolve-connection", () => ({ resolveConnection: mockResolveConnection }));
 mock.module("@/lib/db", () => ({
   createDatabaseProvider: async () => ({ getCapabilities: mockGetCapabilities, getLabels: mockGetLabels }),
+}));
+// The profiled seam itself, so what the run's acquirer hands it can be read back.
+const mockAcquireExecutionProfileProvider = mock(async (...args: unknown[]) => {
+  void args;
+  return {} as never;
+});
+mock.module("@/lib/db/factory", () => ({
+  ...realFactory,
+  acquireExecutionProfileProvider: mockAcquireExecutionProfileProvider,
 }));
 mock.module("@/lib/agent/model-adapter", () => ({ createAgentModel: mockCreateAgentModel }));
 mock.module("@/lib/agent/investigation", () => ({ runInvestigation: mockRunInvestigation }));
@@ -151,6 +160,25 @@ describe("driveAgentRun", () => {
     expect(await (await getAgentRunService()).status("arun_neverwas")).toBeNull();
   });
 
+  test("a run on a server-level connection reads the one database it opened on (#1530)", async () => {
+    const service = await getAgentRunService();
+    await service.start({
+      mode: "agent",
+      actor: ACTOR,
+      connectionId: "seed:sales",
+      catalog: "shop",
+      objective: "why is checkout slow",
+      runId: "arun_catalog",
+    });
+    expect((await service.status("arun_catalog"))?.record.catalog).toBe("shop");
+
+    await driveAgentRun("arun_catalog");
+
+    // That database's session IS the connection naming it, so the run is a single-database run.
+    const { resources } = investigationCalls[investigationCalls.length - 1];
+    expect(resources.connection).toEqual({ ...CONNECTION, database: "shop" });
+  });
+
   test("resolves the connection as the run's persisted actor, not as the caller", async () => {
     await openRun("arun_actor");
 
@@ -178,7 +206,16 @@ describe("driveAgentRun", () => {
     expect(resources.labels).toEqual(TABLE_LABELS);
     // Never the shared writable cache: a provider is acquired for the run's
     // execution profile, which is the only seam the tool layer is allowed to use.
-    expect(resources.acquireProvider).toBe(acquireExecutionProfileProvider);
+    mockAcquireExecutionProfileProvider.mockClear();
+    await resources.acquireProvider(CONNECTION, "agent-operations");
+    // With the editor posture the run's persisted actor gets on this connection (non-admin DuckDB file access): it decides
+    // only which open single-writer handle an operations acquisition may borrow. A user is denied.
+    expect(mockAcquireExecutionProfileProvider).toHaveBeenCalledWith(
+      CONNECTION,
+      "agent-operations",
+      {},
+      { allowExternalFileAccess: false },
+    );
   });
 
   test("gives the run a canonical registry, a deadline and an empty repair ledger", async () => {
@@ -302,14 +339,14 @@ describe("a drive that fails before the loop", () => {
   });
 
   test("records an engine the agent cannot execute on read-only", async () => {
-    // The default connection of a zero-config deployment is the LibreDB sample,
-    // which has no database-native read-only profile. Reported as "internal", that
+    // The LibreDB sample, a built-in connection of a zero-config deployment, is served by
+    // a provider that implements no read-only statement path. Reported as "internal", that
     // is a server fault the user should report; reported as itself, it is a
     // connection they should switch away from.
     await openRun("arun_noprofile");
     mockResolveConnection.mockImplementationOnce(async () => {
       throw new ExecutionProfileError(
-        'Provider type "libredb" has no database-native read-only execution profile',
+        'Provider type "libredb" implements no read-only statement path (queryReadOnly)',
         "PROFILE_UNSUPPORTED_BY_PROVIDER",
       );
     });
@@ -363,6 +400,84 @@ describe("a drive that fails before the loop", () => {
       reason: "agent-credential-unusable",
     });
   });
+
+  test("records a principal the profile refused as itself, not as an unsupported engine", async () => {
+    // The third cause of the same error type, and the one the SQL Server work of
+    // 2026-09-18 found folded in. `PROFILE_PRIVILEGES_TOO_BROAD` is raised AFTER the
+    // credential resolved and the provider was built: the engine grants the profile
+    // and the profile refuses the user. `sa` is exactly that user, and it is the only
+    // SQL Server credential this repository's own `database-compose.yml` ships, so
+    // the folded label told an operator to change engines when the fix is one
+    // CREATE LOGIN.
+    await openRun("arun_broadprincipal");
+    mockResolveConnection.mockImplementationOnce(async () => {
+      throw new ExecutionProfileError(
+        "The agent read-only execution profile requires a least-privilege SQL Server principal; this principal is unverified or too broad (sysadmin)",
+        "PROFILE_PRIVILEGES_TOO_BROAD",
+      );
+    });
+
+    await expect(driveAgentRun("arun_broadprincipal")).rejects.toThrow(ExecutionProfileError);
+
+    expect(await finishedEvent("arun_broadprincipal")).toMatchObject({
+      status: "failed",
+      reason: "agent-principal-refused",
+    });
+  });
+
+  test("records a target the profile cannot be granted against as the target, not as the engine", async () => {
+    // The control for the test above, and the reason the split cannot quietly
+    // collapse again: a classifier that answered the principal reason for every
+    // `ExecutionProfileError` would pass that test and fail this one. The engine runs
+    // agent mode; what it cannot do is grant the profile against THIS target, an
+    // in-memory SQLite database here and a FerretDB server on the MongoDB wire
+    // elsewhere, so the engine sentence would send the user away from an engine that works.
+    await openRun("arun_stillnoprofile");
+    mockResolveConnection.mockImplementationOnce(async () => {
+      throw new ExecutionProfileError(
+        "The agent read-only execution profile cannot be granted against an in-memory SQLite database",
+        "PROFILE_UNSUPPORTED_TARGET",
+      );
+    });
+
+    await expect(driveAgentRun("arun_stillnoprofile")).rejects.toThrow(ExecutionProfileError);
+
+    expect(await finishedEvent("arun_stillnoprofile")).toMatchObject({
+      status: "failed",
+      reason: "profile-target-unsupported",
+    });
+  });
+
+  /*
+    Every deny code against the reason a run records for it, total over the code union, so a code added to
+    `ExecutionProfileDenyCode` does not compile here until it is given a reason. Read by code and never by message:
+    each case below throws the same sentence, so a classifier that read the message could not tell them apart.
+  */
+  const REASON_OF_DENY_CODE = {
+    UNSUPPORTED_PROFILE: "engine-unsupported",
+    PROFILE_UNSUPPORTED_BY_PROVIDER: "engine-unsupported",
+    PROFILE_UNSUPPORTED_TARGET: "profile-target-unsupported",
+    PROFILE_PRIVILEGES_TOO_BROAD: "agent-principal-refused",
+    PROFILE_PRIVILEGES_TOO_NARROW: "agent-principal-underprivileged",
+    PROFILE_SERVER_UNENFORCED: "server-authorization-off",
+    AGENT_CREDENTIAL_UNRESOLVABLE: "agent-credential-unusable",
+    AGENT_CREDENTIAL_WITH_CONNECTION_STRING: "agent-credential-unusable",
+  } as const satisfies Record<ExecutionProfileDenyCode, AgentRunFailureReason>;
+
+  test.each(Object.entries(REASON_OF_DENY_CODE) as [ExecutionProfileDenyCode, AgentRunFailureReason][])(
+    "records %s as %s",
+    async (code, reason) => {
+      const runId = `arun_code_${code.toLowerCase()}`;
+      await openRun(runId);
+      mockResolveConnection.mockImplementationOnce(async () => {
+        throw new ExecutionProfileError("the profile refused this connection", code);
+      });
+
+      await expect(driveAgentRun(runId)).rejects.toThrow(ExecutionProfileError);
+
+      expect(await finishedEvent(runId)).toMatchObject({ status: "failed", reason });
+    },
+  );
 
   test("records a connection that no longer resolves", async () => {
     await openRun("arun_connectiongone");

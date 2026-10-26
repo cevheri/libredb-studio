@@ -32,7 +32,7 @@
  */
 
 import { DEFAULT_SQL_GRAMMAR, hashRunIsAmbiguous, type SqlGrammar } from "./grammar";
-import { readSqlSpan, type SqlSpanKind } from "./spans";
+import { hasLoneCarriageReturnInLineComment, readSqlSpan, type SqlSpanKind } from "./spans";
 
 export interface StatementEnd {
   /**
@@ -99,15 +99,16 @@ function isStatementText(kind: SqlSpanKind): boolean {
  * is another statement rather than trivia. Splitting statements is
  * `statement-splitter.ts`'s job; this reader only has to find the LAST end.
  *
- * Two shapes answer `rewritable: false`, and both then report the terminator
+ * Three shapes answer `rewritable: false`, and all three then report the terminator
  * strip as their end:
  *
  * 1. **A span that never closes** - an unterminated block comment or literal, or
  *    a quote behind an odd backslash run, which `spans.ts` reports as
  *    undeterminable because MySQL escapes with backslashes and PostgreSQL does
  *    not, so the two readings end the statement in different places. (A `$` in a
- *    bare identifier reaches this too: `a$b$c` opens a dollar-quote tag that
- *    never closes.) Inserting on a guess emits `… 'O\'Brien'; LIMIT 500`, a bound
+ *    bare identifier reaches this too under the tagged reading: `a$b$c` opens a
+ *    dollar-quote tag that never closes; a row with `dollarTags: false` reads it
+ *    as a name.) Inserting on a guess emits `… 'O\'Brien'; LIMIT 500`, a bound
  *    after the statement's own `;`, which is a syntax error rather than too many
  *    rows.
  * 2. **A `#` line comment in the trailing run, and ONLY where no dialect was
@@ -126,11 +127,20 @@ function isStatementText(kind: SqlSpanKind): boolean {
  *    opposite mistake only reports a bound the caller responds to by leaving the
  *    statement alone - which is what it does here anyway.
  *
+ * 3. **A line comment that holds a lone carriage return with code after it.**
+ *    Engines that share a connection type end that comment in different places
+ *    (`hasLoneCarriageReturnInLineComment`), so the code after the carriage return
+ *    is the statement's tail on one server and comment text on the other. A bound
+ *    placed by either reading is misplaced on the other server: inside the comment,
+ *    or ahead of a clause that server still reads.
+ *
  * A `#` comment with code after it on a later line is unaffected: the end then
  * advances past it, and inserting at the end of the statement is correct under
  * both readings.
  */
 export function readStatementEnd(sql: string, grammar: SqlGrammar = DEFAULT_SQL_GRAMMAR): StatementEnd {
+  if (hasLoneCarriageReturnInLineComment(sql, grammar)) return { end: endBeforeTerminator(sql), rewritable: false };
+
   let end = 0;
   let i = 0;
   // Whether the run since the last code character contains a `#` line comment

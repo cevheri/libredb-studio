@@ -2,9 +2,11 @@
 export { StudioWorkspace } from "../workspace/StudioWorkspace";
 export type {
   StudioWorkspaceProps,
+  StudioWorkspaceHandle,
   WorkspaceConnection,
   WorkspaceUser,
   WorkspaceQueryResult,
+  WorkspaceObjectReader,
   WorkspaceFeatures,
   SavedQueryInput,
 } from "../workspace/types";

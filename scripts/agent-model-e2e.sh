@@ -19,7 +19,7 @@ MODELS=("$@")
 if [ ${#MODELS[@]} -eq 0 ]; then
   # Fastest first, so the run reports something early, and the hosted model last because it needs
   # its own environment file swapped in rather than a line rewritten.
-  MODELS=(granite4.1:8b granite4.2:8b granite4.1:30b ornith:9b qwen3.5:9b qwen3:8b gemma4:12b gemma4:26b qwen3:14b nemotron3:33b nemotron-3.5-lightning:30b nemotron-3-nano:30b qwen3.6:27b qwen3.8:latest muse-glimmer:latest qwen3:4b gemini-3.5-flash-lite)
+  MODELS=(qwen2.5:7b cogito:14b ministral-3:8b granite4.1:8b ministral-3:14b qwen2.5:14b qwen3.5:4b qwen2.5-coder:14b qwen2.5:32b cogito:32b granite4.2:8b granite4.1:30b ornith:9b ornith:35b qwen3.5:9b qwen3:8b gemma4:12b gemma4:26b gemma4:31b qwen3:14b nemotron3:33b nemotron-3.5-lightning:30b nemotron-3-nano:30b qwen3.6:27b qwen3.6:35b qwen3.5:27b qwen3.8:latest muse-glimmer:latest qwen3:4b gemini-3.5-flash-lite qwen3-coder:30b magistral:24b glm-4.7-flash:latest gpt-oss:20b qwq:32b)
 fi
 
 # Watchable by default: the browser opens on screen and every click is visible, and a video of
@@ -95,8 +95,8 @@ do
       exit 1
     fi
     # The hosted one: provider, key and model all change together, so its own file is swapped in
-    # whole rather than one line being rewritten.
-    grep -vE '^(LLM_PROVIDER|LLM_MODEL|LLM_API_KEY|LLM_API_URL)=' "$BACKUP" > .env.local
+    # whole rather than one line being rewritten. LLM_MODEL_EFFORT goes too: Gemini refuses it.
+    grep -vE '^(LLM_PROVIDER|LLM_MODEL|LLM_API_KEY|LLM_API_URL|LLM_MODEL_EFFORT)=' "$BACKUP" > .env.local
     grep -E '^(LLM_PROVIDER|LLM_MODEL|LLM_API_KEY)=' .env.gemini.local >> .env.local
   else
     cp "$BACKUP" .env.local

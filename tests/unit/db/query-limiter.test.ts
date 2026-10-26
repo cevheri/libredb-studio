@@ -1,11 +1,17 @@
 import { describe, test, expect } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   analyzeQuery,
+  appendedBoundNote,
   applyQueryLimit,
   hasQueryLimit,
+  noteAppendedBound,
+  assertRowBounds,
+  isRowBound,
   isSelectQuery,
   type ParsedQueryInfo,
 } from "@/lib/db/utils/query-limiter";
+import { QueryError } from "@/lib/db/errors";
 
 // ─── analyzeQuery ───────────────────────────────────────────────────────────
 
@@ -485,6 +491,90 @@ describe("a CTE is typed by the keyword its list operates", () => {
       expect(result.wasLimited).toBe(false);
     });
 
+    // A CTE body that writes runs exactly once and always to completion,
+    // however few of its rows the outer SELECT reads (PostgreSQL manual 7.8.4). A
+    // bound on such a statement made it pageable, and every Load more page re-ran
+    // the DELETE in full: measured on PostgreSQL 17.6, a 3000-row queue lost 1000
+    // rows per page. So the statement is typed by the write its body does, and the
+    // limiter leaves it alone.
+    test.each<[string, ParsedQueryInfo["type"], string]>([
+      [
+        "a DELETE body",
+        "DELETE",
+        "WITH d AS (DELETE FROM queue WHERE id IN (SELECT id FROM queue ORDER BY id LIMIT 1000) RETURNING *) SELECT * FROM d",
+      ],
+      ["an UPDATE body", "UPDATE", "WITH u AS (UPDATE t SET seen = true RETURNING id) SELECT * FROM u"],
+      ["an INSERT body", "INSERT", "WITH i AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM i"],
+      [
+        "a MERGE body",
+        "OTHER",
+        "WITH m AS (MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE RETURNING *) SELECT * FROM m",
+      ],
+      ["a MATERIALIZED body", "DELETE", "WITH d AS MATERIALIZED (DELETE FROM t RETURNING *) SELECT * FROM d"],
+      ["a NOT MATERIALIZED body", "DELETE", "WITH d AS NOT MATERIALIZED (DELETE FROM t RETURNING *) SELECT * FROM d"],
+      [
+        "a nested WITH operated by a write",
+        "DELETE",
+        "WITH o AS (WITH i AS (SELECT 1) DELETE FROM t WHERE id IN (SELECT * FROM i) RETURNING *) SELECT * FROM o",
+      ],
+      [
+        "several CTEs where only the second writes",
+        "DELETE",
+        "WITH a AS (SELECT 1), d AS (DELETE FROM t RETURNING *) SELECT * FROM a, d",
+      ],
+    ])("leaves a SELECT over %s unbounded, typed %s", (_label, expected, sql) => {
+      expect(analyzeQuery(sql).type).toBe(expected);
+
+      const result = applyQueryLimit(sql, 1000);
+
+      expect(result.sql).toBe(sql);
+      expect(result.wasLimited).toBe(false);
+    });
+
+    // CockroachDB, which connects as `postgres`, also takes an UPSERT as a CTE
+    // body. The union has no name for it, so it is OTHER, like MERGE, and OTHER
+    // is never bounded.
+    test("leaves a SELECT over an UPSERT body unbounded, typed OTHER", () => {
+      const sql = "WITH u AS (UPSERT INTO t VALUES (1) RETURNING *) SELECT * FROM u";
+
+      expect(analyzeQuery(sql, "postgres").type).toBe("OTHER");
+
+      const result = applyQueryLimit(sql, 1000, 0, {}, "postgres");
+
+      expect(result.sql).toBe(sql);
+      expect(result.wasLimited).toBe(false);
+    });
+
+    // The operative statement's own write still answers first: this was typed
+    // INSERT before the body was read and stays so.
+    test("keeps a write after a writing CTE typed by the operative write", () => {
+      expect(
+        analyzeQuery("WITH t AS (UPDATE logs SET seen = true RETURNING id) INSERT INTO audit SELECT id FROM t").type,
+      ).toBe("INSERT");
+    });
+
+    // Precision is the other half: a body that only MENTIONS a write word keeps
+    // its bound (#275).
+    test.each<[string, string]>([
+      [
+        "a table and a value named like a write",
+        "WITH r AS (SELECT * FROM delete_queue WHERE action = 'delete') SELECT * FROM r",
+      ],
+      ["a write word in a string", "WITH r AS (SELECT 'DELETE FROM t' AS s) SELECT * FROM r"],
+      ["a write word in a comment", "WITH r AS ( /* DELETE */ SELECT 1) SELECT * FROM r"],
+      [
+        "a nested WITH whose main query is parenthesised",
+        "WITH a AS (WITH b AS (SELECT 1 AS x) (SELECT * FROM b)) SELECT * FROM a",
+      ],
+    ])("still bounds a read-only CTE with %s", (_label, sql) => {
+      expect(analyzeQuery(sql).type).toBe("SELECT");
+
+      const result = applyQueryLimit(sql, 1000);
+
+      expect(result.sql).toBe(`${sql} LIMIT 1000`);
+      expect(result.wasLimited).toBe(true);
+    });
+
     test("reports a writing CTE as not a SELECT through isSelectQuery", () => {
       expect(isSelectQuery("WITH t AS (SELECT 1) INSERT INTO u SELECT * FROM t")).toBe(false);
       expect(isSelectQuery("WITH t AS (SELECT 1) SELECT * FROM t")).toBe(true);
@@ -534,6 +624,33 @@ describe("applyQueryLimit", () => {
       expect(result.wasLimited).toBe(false);
       expect(result.originalLimit).toBe(50);
       expect(result.appliedLimit).toBe(50);
+    });
+
+    /**
+     * The diagnosis behind #816, pinned so the design above it cannot be undone quietly.
+     *
+     * A statement that carries its own bound is returned untouched, and the offset the
+     * CALLER asked for is discarded with it: `appliedOffset` is the statement's own 0,
+     * not the 50 that was requested. That is why the route may not offer page two on a
+     * `wasLimited: false` result — the second click would re-run page one — and why the
+     * preview cap had to leave the generated SQL text rather than the limiter learn to
+     * read intent out of it.
+     */
+    test("a statement carrying its own bound discards the offset it was asked for", () => {
+      const result = applyQueryLimit("SELECT * FROM public.orders LIMIT 50;", 500, 50, {}, "postgres");
+
+      expect(result.sql).toBe("SELECT * FROM public.orders LIMIT 50;");
+      expect(result.wasLimited).toBe(false);
+      expect(result.appliedLimit).toBe(50);
+      expect(result.appliedOffset).toBe(0);
+    });
+
+    test("the same statement WITHOUT its own bound takes both clauses", () => {
+      const result = applyQueryLimit("SELECT * FROM public.orders;", 500, 50, {}, "postgres");
+
+      expect(result.sql).toBe("SELECT * FROM public.orders LIMIT 500 OFFSET 50;");
+      expect(result.wasLimited).toBe(true);
+      expect(result.appliedOffset).toBe(50);
     });
 
     test("preserves existing LIMIT OFFSET", () => {
@@ -631,6 +748,58 @@ describe("applyQueryLimit", () => {
       const result = applyQueryLimit("SELECT * FROM t", 100, 50);
       expect(result.sql).toBe("SELECT * FROM t LIMIT 100 OFFSET 50");
       expect(result.appliedOffset).toBe(50);
+    });
+  });
+
+  // ── A limit and an offset are non-negative integers, the rule the routes hold options to ──
+
+  describe("limit and offset values", () => {
+    const outOfRule: Array<[string, unknown]> = [
+      ["a numeric string", "10"],
+      ["a fraction", 1.5],
+      ["a negative number", -1],
+      ["NaN", Number.NaN],
+      ["an infinity", Number.POSITIVE_INFINITY],
+      ["null", null],
+      ["an array", [10]],
+      ["the first integer past Number.MAX_SAFE_INTEGER", 2 ** 53],
+      ["a number JavaScript prints in exponent form", 1e21],
+    ];
+
+    test.each(outOfRule)("refuses %s as the limit with a QueryError", (_name, limit) => {
+      const run = () => applyQueryLimit("SELECT * FROM t", limit as number, 0, {}, "postgres");
+      expect(run).toThrow(QueryError);
+      expect(run).toThrow("The row limit must be a non-negative integer");
+    });
+
+    test.each(outOfRule)("refuses %s as the offset with a QueryError", (_name, offset) => {
+      const run = () => applyQueryLimit("SELECT * FROM t", 100, offset as number, {}, "postgres");
+      expect(run).toThrow(QueryError);
+      expect(run).toThrow("The row offset must be a non-negative integer");
+    });
+
+    test("refuses a value out of the rule whatever the query is", () => {
+      expect(() => applyQueryLimit("UPDATE t SET a = 1", "10" as unknown as number)).toThrow(QueryError);
+      expect(() => applyQueryLimit("SELECT * FROM t LIMIT 5", 100, "10" as unknown as number)).toThrow(QueryError);
+    });
+
+    test("keeps zero and every larger safe integer as it was given", () => {
+      expect(applyQueryLimit("SELECT * FROM t", 0).sql).toBe("SELECT * FROM t LIMIT 0");
+      expect(applyQueryLimit("SELECT * FROM t", Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER).sql).toBe(
+        "SELECT * FROM t LIMIT 9007199254740991 OFFSET 9007199254740991",
+      );
+    });
+
+    test("assertRowBounds throws the same QueryError for either bound and passes two row bounds", () => {
+      expect(() => assertRowBounds("10", 0)).toThrow("The row limit must be a non-negative integer");
+      expect(() => assertRowBounds(10, 1.5)).toThrow("The row offset must be a non-negative integer");
+      expect(() => assertRowBounds(null, 0)).toThrow(QueryError);
+      expect(() => assertRowBounds(0, Number.MAX_SAFE_INTEGER)).not.toThrow();
+    });
+
+    test("holds the same rule as a request's page options", () => {
+      for (const [, value] of outOfRule) expect(isRowBound(value)).toBe(false);
+      for (const value of [0, 1, 500, Number.MAX_SAFE_INTEGER]) expect(isRowBound(value)).toBe(true);
     });
   });
 });
@@ -1404,5 +1573,481 @@ describe("analyzeQuery: a mention in a comment or a literal is not the statement
     expect(analyzeQuery(sql, "postgres").hasLimit).toBe(true);
     expect(analyzeQuery(commented, "mysql").hasLimit).toBe(false);
     expect(analyzeQuery(commented, "postgres").hasLimit).toBe(true);
+  });
+});
+
+// ─── clauses that must follow the bound (#1398) ─────────────────────────────
+
+/*
+  Materialize's `AS OF` and ScyllaDB's `BYPASS CACHE` / `USING TIMEOUT` are written
+  AFTER the row bound, so the dialect grammar declares them as trailing clauses and
+  the limiter places the bound BEFORE the run and recognises an existing bound
+  followed by one. `ALLOW FILTERING` was transposed after the fact by the Cassandra
+  provider's own regex, and `LIMIT 3 ALLOW FILTERING` - an existing bound followed
+  by a trailing clause - was not read as bounded at all, so the old path emitted
+  `LIMIT 3 LIMIT 500 ALLOW FILTERING`. All four now come from the one declaration.
+*/
+describe("a declared trailing clause keeps its place after the bound (#1398)", () => {
+  test("Materialize AS OF AT LEAST: the bound goes before it", () => {
+    const result = applyQueryLimit("SELECT * FROM ui_mv AS OF AT LEAST 0", 500, 0, {}, "postgres");
+    expect(result.sql).toBe("SELECT * FROM ui_mv LIMIT 500 AS OF AT LEAST 0");
+    expect(result.wasLimited).toBe(true);
+  });
+
+  test("Materialize AS OF a literal: the bound goes before it", () => {
+    const result = applyQueryLimit("SELECT * FROM ui_mv AS OF '2026-01-01 00:00:00'", 500, 0, {}, "postgres");
+    expect(result.sql).toBe("SELECT * FROM ui_mv LIMIT 500 AS OF '2026-01-01 00:00:00'");
+  });
+
+  test("ScyllaDB BYPASS CACHE: the bound goes before it", () => {
+    const result = applyQueryLimit("SELECT * FROM shop.e2e_t BYPASS CACHE", 500, 0, {}, "cassandra");
+    expect(result.sql).toBe("SELECT * FROM shop.e2e_t LIMIT 500 BYPASS CACHE");
+    expect(result.wasLimited).toBe(true);
+  });
+
+  test("ScyllaDB USING TIMEOUT: the bound goes before it", () => {
+    const result = applyQueryLimit("SELECT * FROM shop.e2e_t USING TIMEOUT 5s", 500, 0, {}, "cassandra");
+    expect(result.sql).toBe("SELECT * FROM shop.e2e_t LIMIT 500 USING TIMEOUT 5s");
+  });
+
+  test("both ScyllaDB clauses in one statement: the bound goes before the run", () => {
+    const result = applyQueryLimit("SELECT * FROM shop.e2e_t USING TIMEOUT 5s BYPASS CACHE", 500, 0, {}, "cassandra");
+    expect(result.sql).toBe("SELECT * FROM shop.e2e_t LIMIT 500 USING TIMEOUT 5s BYPASS CACHE");
+  });
+
+  test("ALLOW FILTERING: the bound goes before it, the writer's spacing preserved", () => {
+    const result = applyQueryLimit(
+      "SELECT * FROM probe.orders WHERE amount > 5 ALLOW FILTERING",
+      500,
+      0,
+      {},
+      "cassandra",
+    );
+    expect(result.sql).toBe("SELECT * FROM probe.orders WHERE amount > 5 LIMIT 500 ALLOW FILTERING");
+  });
+
+  test("an existing bound followed by a trailing clause is recognised and left alone", () => {
+    for (const [sql, type] of [
+      ["SELECT * FROM shop.e2e_t LIMIT 10 BYPASS CACHE", "cassandra"],
+      ["SELECT * FROM probe.orders WHERE amount > 5 LIMIT 3 ALLOW FILTERING", "cassandra"],
+      ["SELECT * FROM ui_mv LIMIT 10 AS OF AT LEAST 0", "postgres"],
+    ] as const) {
+      const result = applyQueryLimit(sql, 500, 0, {}, type);
+      expect(result.wasLimited).toBe(false);
+      expect(result.sql).toBe(sql);
+      expect(analyzeQuery(sql, type).hasLimit).toBe(true);
+    }
+  });
+
+  test("forceLimit replaces the bound once, keeping the clause after it", () => {
+    const result = applyQueryLimit(
+      "SELECT * FROM shop.e2e_t LIMIT 10 BYPASS CACHE",
+      20,
+      0,
+      { forceLimit: true },
+      "cassandra",
+    );
+    expect(result.sql).toBe("SELECT * FROM shop.e2e_t LIMIT 20 BYPASS CACHE");
+  });
+
+  test("forceLimit strips an OFFSET bound before the clause too", () => {
+    const result = applyQueryLimit(
+      "SELECT * FROM shop.e2e_t LIMIT 10 OFFSET 5 BYPASS CACHE",
+      20,
+      0,
+      { forceLimit: true },
+      "cassandra",
+    );
+    expect(result.sql).toBe("SELECT * FROM shop.e2e_t LIMIT 20 BYPASS CACHE");
+  });
+
+  test("trailing trivia is still re-attached after the clause", () => {
+    const result = applyQueryLimit("SELECT * FROM shop.e2e_t BYPASS CACHE; -- note", 500, 0, {}, "cassandra");
+    expect(result.sql).toBe("SELECT * FROM shop.e2e_t LIMIT 500 BYPASS CACHE; -- note");
+  });
+
+  test("the clause words inside a literal are not a clause", () => {
+    const result = applyQueryLimit("SELECT * FROM t WHERE note = 'BYPASS CACHE'", 500, 0, {}, "cassandra");
+    expect(result.sql).toBe("SELECT * FROM t WHERE note = 'BYPASS CACHE' LIMIT 500");
+  });
+
+  test("an alias spelled OF is not a trailing clause", () => {
+    // `SELECT a AS of FROM t` carries the words `AS OF` and then more statement:
+    // the trailing-clause reading must not eat the FROM.
+    const result = applyQueryLimit("SELECT a AS of FROM t", 500, 0, {}, "postgres");
+    expect(result.sql).toBe("SELECT a AS of FROM t LIMIT 500");
+  });
+
+  test("a dialect without the clause is untouched by its words", () => {
+    // The same BYPASS CACHE words under MySQL's grammar: no trailing clause is
+    // declared there, so the statement is treated as ending with a column named
+    // CACHE and the bound is appended, which the engine refuses either way.
+    const result = applyQueryLimit("SELECT * FROM shop.e2e_t BYPASS CACHE", 500, 0, {}, "mysql");
+    expect(result.sql).toBe("SELECT * FROM shop.e2e_t BYPASS CACHE LIMIT 500");
+  });
+});
+
+describe("the clause patterns keep their guards (#1398)", () => {
+  // The argument is restricted to a number, a single-quoted literal or one bare
+  // token, and the pattern must reach `\s*` to the end, so a `)` after the
+  // argument ends the match: an `AS OF` written inside a subquery is not the
+  // statement's trailing clause, and the bound keeps its place at the end.
+  test("an AS OF inside a subquery is not the statement's trailing clause", () => {
+    const result = applyQueryLimit("SELECT * FROM (SELECT * FROM s AS OF 123) t", 500, 0, {}, "postgres");
+    expect(result.sql).toBe("SELECT * FROM (SELECT * FROM s AS OF 123) t LIMIT 500");
+  });
+
+  test("an AS OF inside a subquery that ends the statement is not either", () => {
+    const result = applyQueryLimit("SELECT * FROM (SELECT * FROM s AS OF '2026-01-01')", 500, 0, {}, "postgres");
+    expect(result.sql).toBe("SELECT * FROM (SELECT * FROM s AS OF '2026-01-01') LIMIT 500");
+  });
+
+  test("a USING TIMEOUT followed by a parenthesis is not the clause", () => {
+    const result = applyQueryLimit(
+      "SELECT * FROM t WHERE id IN (SELECT id FROM u USING TIMEOUT 5s)",
+      500,
+      0,
+      {},
+      "cassandra",
+    );
+    expect(result.sql).toBe("SELECT * FROM t WHERE id IN (SELECT id FROM u USING TIMEOUT 5s) LIMIT 500");
+  });
+});
+
+// ─── a comment before a trailing clause keeps the bound in code (#1398 review) ─
+//
+// The clause patterns match from `\s+`, which also takes the newline that CLOSES a
+// line comment, so the clause run once started at that newline and the stripped
+// body ended inside the comment: the bound was written INTO the comment while
+// `wasLimited: true` was reported, and a commented-out bound read as real. The
+// stripped body is now cut at its code end, so the comment sits BETWEEN the bound
+// and the clause and the probes read code only.
+describe("a comment before a trailing clause keeps the bound in code (#1398 review)", () => {
+  test("-- note before ALLOW FILTERING: the bound is written before the comment", () => {
+    const result = applyQueryLimit("SELECT * FROM big -- note\nALLOW FILTERING", 500, 0, {}, "cassandra");
+    expect(result.sql).toBe("SELECT * FROM big LIMIT 500 -- note\nALLOW FILTERING");
+    expect(result.wasLimited).toBe(true);
+  });
+
+  test("// note before BYPASS CACHE: the bound is written before the comment", () => {
+    const result = applyQueryLimit("SELECT * FROM shop.e2e_t // note\nBYPASS CACHE", 500, 0, {}, "cassandra");
+    expect(result.sql).toBe("SELECT * FROM shop.e2e_t LIMIT 500 // note\nBYPASS CACHE");
+    expect(result.wasLimited).toBe(true);
+  });
+
+  test("-- note before AS OF: the bound is written before the comment", () => {
+    const result = applyQueryLimit("SELECT * FROM ui_mv -- note\nAS OF AT LEAST 0", 500, 0, {}, "postgres");
+    expect(result.sql).toBe("SELECT * FROM ui_mv LIMIT 500 -- note\nAS OF AT LEAST 0");
+    expect(result.wasLimited).toBe(true);
+  });
+
+  test("a commented-out bound before the clause is not read as real", () => {
+    const info = analyzeQuery("SELECT * FROM big -- LIMIT 5\nALLOW FILTERING", "cassandra");
+    expect(info.hasLimit).toBe(false);
+
+    const result = applyQueryLimit("SELECT * FROM big -- LIMIT 5\nALLOW FILTERING", 500, 0, {}, "cassandra");
+    expect(result.sql).toBe("SELECT * FROM big LIMIT 500 -- LIMIT 5\nALLOW FILTERING");
+    expect(result.wasLimited).toBe(true);
+  });
+
+  test("a real bound before a comment before the clause is still recognised", () => {
+    const result = applyQueryLimit("SELECT * FROM big LIMIT 5 -- note\nALLOW FILTERING", 500, 0, {}, "cassandra");
+    expect(result.wasLimited).toBe(false);
+    expect(result.sql).toBe("SELECT * FROM big LIMIT 5 -- note\nALLOW FILTERING");
+  });
+});
+
+describe("a dialect's declared non-numeric LIMIT and OFFSET values are bounds (SF-021)", () => {
+  // Measured on Snowflake (2026-10-14): `LIMIT NULL`, `LIMIT ''` and `LIMIT $$$$` return every row, and `OFFSET NULL`,
+  // `OFFSET ''` and `OFFSET $$$$` skip none, any case. Appending a second LIMIT after one of them is a syntax error.
+  const read = "SELECT ID FROM E_TYPES ORDER BY ID";
+
+  for (const value of ["NULL", "null", "''", "$$$$"]) {
+    test(`Snowflake LIMIT ${value} is an existing, unlimited bound: nothing is appended`, () => {
+      const result = applyQueryLimit(`${read} LIMIT ${value}`, 501, 0, {}, "snowflake");
+      expect(result.sql).toBe(`${read} LIMIT ${value}`);
+      expect(result.wasLimited).toBe(false);
+      expect(result.appliedLimit).toBe(0);
+      const info = analyzeQuery(`${read} LIMIT ${value}`, "snowflake");
+      expect(info.hasLimit).toBe(true);
+      expect(info.existingLimit).toBeUndefined();
+    });
+
+    test(`Snowflake LIMIT 2 OFFSET ${value} keeps its count and skips nothing`, () => {
+      const result = applyQueryLimit(`${read} LIMIT 2 OFFSET ${value}`, 501, 0, {}, "snowflake");
+      expect(result.sql).toBe(`${read} LIMIT 2 OFFSET ${value}`);
+      expect(result.wasLimited).toBe(false);
+      expect(result.appliedLimit).toBe(2);
+      expect(result.appliedOffset).toBe(0);
+      expect(analyzeQuery(`${read} LIMIT 2 OFFSET ${value}`, "snowflake")).toMatchObject({
+        hasLimit: true,
+        existingLimit: 2,
+        hasOffset: true,
+        existingOffset: 0,
+      });
+    });
+  }
+
+  test("Snowflake LIMIT NULL OFFSET 1, a trailing comment and a FOR UPDATE run all read as bounded", () => {
+    for (const sql of [
+      `${read} LIMIT NULL OFFSET 1`,
+      `${read} limit null offset null`,
+      `${read} LIMIT  NULL -- every row`,
+      `${read} LIMIT NULL FOR UPDATE`,
+      `${read} OFFSET NULL ROWS FETCH NEXT NULL ROWS ONLY`,
+      `${read} FETCH FIRST $$$$ ROWS ONLY`,
+    ]) {
+      expect(applyQueryLimit(sql, 501, 0, {}, "snowflake")).toMatchObject({ sql, wasLimited: false });
+    }
+    expect(analyzeQuery(`${read} LIMIT NULL OFFSET 1`, "snowflake")).toMatchObject({ existingOffset: 1 });
+  });
+
+  for (const value of ["NULL", "null", "''", "$$$$"]) {
+    test(`Snowflake lone OFFSET ${value} is the statement's own bound: nothing is appended after it`, () => {
+      // Measured on Snowflake (2026-10-14): a lone OFFSET, with or without ROWS, is "unexpected '<EOF>'", and an
+      // OFFSET followed by LIMIT is "unexpected 'LIMIT'". Appending nothing leaves Snowflake's own error, about the
+      // text as written, instead of one that names a LIMIT Studio added.
+      const sql = `${read} OFFSET ${value}`;
+      const result = applyQueryLimit(sql, 501, 0, {}, "snowflake");
+      expect(result).toMatchObject({ sql, wasLimited: false, appliedLimit: 0, appliedOffset: 0 });
+      expect(result.originalLimit).toBeUndefined();
+      expect(analyzeQuery(sql, "snowflake")).toMatchObject({
+        hasLimit: true,
+        existingLimit: undefined,
+        hasOffset: true,
+        existingOffset: 0,
+      });
+      expect(applyQueryLimit(`${read} OFFSET ${value} -- skip none`, 501, 0, {}, "snowflake").wasLimited).toBe(false);
+    });
+  }
+
+  test("forceLimit drops a lone non-numeric OFFSET, which skips nothing, and writes its own bound", () => {
+    expect(applyQueryLimit(`${read} OFFSET NULL`, 10, 0, { forceLimit: true }, "snowflake").sql).toBe(
+      `${read} LIMIT 10`,
+    );
+    expect(applyQueryLimit(`${read} offset $$$$`, 10, 20, { forceLimit: true }, "snowflake").sql).toBe(
+      `${read} LIMIT 10 OFFSET 20`,
+    );
+  });
+
+  test("a lone OFFSET spelled inside a literal is not a bound, and a lone digit OFFSET reads as before", () => {
+    expect(analyzeQuery("SELECT $$ OFFSET $$$$", "snowflake")).toMatchObject({ hasLimit: false, hasOffset: false });
+    expect(applyQueryLimit(`${read} OFFSET 2`, 501, 0, {}, "snowflake").sql).toBe(`${read} OFFSET 2 LIMIT 501`);
+    expect(analyzeQuery(`${read} OFFSET 2`, "snowflake")).toMatchObject({
+      hasLimit: false,
+      hasOffset: true,
+      existingOffset: 2,
+    });
+    // forceLimit over a TOP leaves a digit OFFSET where it stood, as it always did.
+    expect(
+      applyQueryLimit("SELECT TOP 5 * FROM t ORDER BY a OFFSET 2", 10, 0, { forceLimit: true }, "snowflake").sql,
+    ).toBe("SELECT TOP 5 * FROM t ORDER BY a OFFSET 2 LIMIT 10");
+  });
+
+  test("forceLimit replaces a non-numeric bound instead of appending a second one", () => {
+    expect(applyQueryLimit(`${read} LIMIT NULL OFFSET ''`, 10, 0, { forceLimit: true }, "snowflake").sql).toBe(
+      `${read} LIMIT 10`,
+    );
+  });
+
+  test("a value only spelled like one, inside a literal or a comment, is not a bound", () => {
+    expect(applyQueryLimit("SELECT 'LIMIT NULL' AS x", 501, 0, {}, "snowflake").sql).toBe(
+      "SELECT 'LIMIT NULL' AS x LIMIT 501",
+    );
+    expect(applyQueryLimit("SELECT 1 /* LIMIT NULL */", 501, 0, {}, "snowflake").sql).toBe(
+      "SELECT 1 LIMIT 501 /* LIMIT NULL */",
+    );
+    expect(applyQueryLimit(`${read} LIMIT 'x'`, 501, 0, {}, "snowflake").sql).toBe(`${read} LIMIT 'x' LIMIT 501`);
+    // `LIMIT` inside a dollar string, the text ending in `$$$$`: the end-anchored pattern matches, the word is not code.
+    expect(analyzeQuery("SELECT $$ LIMIT $$$$", "snowflake").hasLimit).toBe(false);
+  });
+
+  test("every other dialect reads these forms exactly as before: a LIMIT is appended", () => {
+    for (const type of [
+      "postgres",
+      "mysql",
+      "clickhouse",
+      "duckdb",
+      "sqlite",
+      "trino",
+      "databend",
+      "bigquery",
+    ] as const) {
+      for (const tail of ["LIMIT NULL", "LIMIT ''", "LIMIT 2 OFFSET NULL", "OFFSET NULL", "OFFSET $$$$"]) {
+        const result = applyQueryLimit(`${read} ${tail}`, 501, 0, {}, type);
+        expect(result.sql).toBe(`${read} ${tail} LIMIT 501`);
+        expect(analyzeQuery(`${read} ${tail}`, type).hasLimit).toBe(false);
+      }
+    }
+  });
+});
+
+describe("PostgreSQL's LIMIT ALL is the statement's own unlimited bound (#1926)", () => {
+  const read = "SELECT ID FROM E_TYPES ORDER BY ID";
+
+  for (const value of ["ALL", "all", "All"]) {
+    test(`LIMIT ${value} is an existing, unlimited bound: nothing is appended`, () => {
+      const result = applyQueryLimit(`${read} LIMIT ${value}`, 501, 0, {}, "postgres");
+      expect(result.sql).toBe(`${read} LIMIT ${value}`);
+      expect(result.wasLimited).toBe(false);
+      expect(result.appliedLimit).toBe(0);
+      const info = analyzeQuery(`${read} LIMIT ${value}`, "postgres");
+      expect(info.hasLimit).toBe(true);
+      expect(info.existingLimit).toBeUndefined();
+    });
+  }
+
+  test("a trailing comment and a WITH statement read the bound the same way", () => {
+    for (const sql of [`${read} LIMIT ALL -- every row`, "WITH t AS (SELECT 1) SELECT * FROM t LIMIT ALL"]) {
+      expect(applyQueryLimit(sql, 501, 0, {}, "postgres").wasLimited).toBe(false);
+    }
+    expect(analyzeQuery(`${read} LIMIT ALL -- every row`, "postgres").hasLimit).toBe(true);
+    expect(analyzeQuery("WITH t AS (SELECT 1) SELECT * FROM t LIMIT ALL", "postgres").hasLimit).toBe(true);
+  });
+
+  test("FETCH FIRST ALL ROWS ONLY reads as a bound, though PostgreSQL itself takes no ALL there", () => {
+    // The FETCH count is a value the probe family shares with LIMIT, so it reads as declared
+    // here too. PostgreSQL's parser has no ALL arm for the FETCH count (gram.y:
+    // select_fetch_first_value), so the text is the engine's own refusal either way; what the
+    // reading buys is that Studio no longer appends a second bound to it.
+    const sql = `${read} FETCH FIRST ALL ROWS ONLY`;
+    expect(applyQueryLimit(sql, 501, 0, {}, "postgres")).toMatchObject({ sql, wasLimited: false, appliedLimit: 0 });
+    expect(analyzeQuery(sql, "postgres")).toMatchObject({ hasLimit: true, existingLimit: undefined });
+  });
+
+  test("forceLimit replaces an ALL bound instead of appending a second one", () => {
+    expect(applyQueryLimit(`${read} LIMIT ALL`, 10, 0, { forceLimit: true }, "postgres").sql).toBe(`${read} LIMIT 10`);
+  });
+
+  test("a word only spelled like the value, inside a literal or a comment, is not a bound", () => {
+    // `ALL` is a word, so unlike Snowflake's quoted values the literal case cannot end in it;
+    // the comment case can, and the code-word check must still keep it out.
+    expect(applyQueryLimit("SELECT 'ALL' AS x FROM t", 501, 0, {}, "postgres").sql).toBe(
+      "SELECT 'ALL' AS x FROM t LIMIT 501",
+    );
+    expect(applyQueryLimit(`${read} /* LIMIT ALL */`, 501, 0, {}, "postgres").sql).toBe(
+      `${read} LIMIT 501 /* LIMIT ALL */`,
+    );
+  });
+
+  test("every other dialect keeps reading LIMIT ALL as before: a LIMIT is appended", () => {
+    for (const type of [
+      "mysql",
+      "clickhouse",
+      "duckdb",
+      "sqlite",
+      "trino",
+      "databend",
+      "bigquery",
+      "snowflake",
+    ] as const) {
+      const result = applyQueryLimit(`${read} LIMIT ALL`, 501, 0, {}, type);
+      expect(result.sql).toBe(`${read} LIMIT ALL LIMIT 501`);
+      expect(analyzeQuery(`${read} LIMIT ALL`, type).hasLimit).toBe(false);
+    }
+  });
+});
+
+describe("an error that points into the bound Studio added says so (SF-022)", () => {
+  const written = "SELECT * FROM D_PARENT WHERE";
+  const sent = "SELECT * FROM D_PARENT WHERE LIMIT 501";
+  const noted = (message: string, w = written, x = sent) => {
+    const error = new Error(message);
+    noteAppendedBound(error, w, x);
+    return error.message;
+  };
+
+  test("Snowflake's position into the appended LIMIT gets the note, the error's class and text kept", () => {
+    const error = new SyntaxError(
+      "Snowflake: SQL compilation error: syntax error line 1 at position 35 unexpected '501'. (code 001003, SQLSTATE 42000)",
+    );
+    const original = error.message;
+    expect(noteAppendedBound(error, written, sent)).toBe(error);
+    expect(error).toBeInstanceOf(SyntaxError);
+    expect(error.message).toBe(`${original} ${appendedBoundNote("LIMIT 501")}`);
+  });
+
+  test("the note is plain text, since the results panel shows an error message as text", () => {
+    expect(appendedBoundNote("LIMIT 501")).toBe(
+      "Studio added the clause LIMIT 501 to this statement to bound its rows, so a position or token this error names may be in that clause rather than in your text.",
+    );
+    expect(appendedBoundNote("LIMIT 501")).not.toContain("`");
+  });
+
+  // Each message below is the engine's own text for a statement whose syntax error falls on the clause Studio added,
+  // taken from PostgreSQL 16, MySQL 8.4, SQLite (bun:sqlite), SQL Server 2025, ClickHouse and Snowflake.
+  test("each engine's syntax error at the clause gets the note", () => {
+    for (const message of [
+      'syntax error at or near "LIMIT"',
+      "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'LIMIT 501' at line 1",
+      'near "LIMIT": syntax error',
+      "Code: 62. DB::Exception: Syntax error: failed at position 38 (501): 501. Expected one of: token sequence, Dot, LIMIT, OFFSET, end of query. (SYNTAX_ERROR)",
+      "SQL compilation error:\nsyntax error line 1 at position 29 unexpected 'LIMIT'.",
+      "Snowflake: SQL compilation error:\nsyntax error line 1 at position 36 unexpected '501'. (code 001003, SQLSTATE 42000)",
+    ]) {
+      expect(noted(message)).toEndWith(` ${appendedBoundNote("LIMIT 501")}`);
+    }
+  });
+
+  test("an error that only contains the clause's word or number gets no note", () => {
+    for (const message of [
+      // PostgreSQL
+      'column "limit" does not exist',
+      'column "LIMIT" does not exist',
+      'invalid input syntax for type integer: "foo 501"',
+      'syntax error at or near "FROM"',
+      // PostgreSQL and SQLite echo the token as the user spelt it; Studio writes LIMIT in capitals
+      'syntax error at or near "limit"',
+      'near "limit": syntax error',
+      // MySQL: the quoted rest of the statement starts in the user's text
+      "Unknown column 'limit' in 'field list'",
+      "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'FROM t LIMIT 501' at line 1",
+      // SQLite
+      "no such column: LIMIT",
+      // SQL Server
+      "Invalid column name 'limit'.",
+      "Conversion failed when converting the varchar value 'foo 501' to data type int.",
+      "Incorrect syntax near 'WHERE'.",
+      "A TOP can not be used in the same query or sub-query as a OFFSET.",
+      // ClickHouse: the list of expected tokens, and a message that quotes the statement sent
+      "Code: 62. DB::Exception: Syntax error: failed at position 30 (WHERE): WHERE LIMIT 501. Expected one of: ORDER BY, LIMIT, OFFSET, end of query.",
+      "Code: 47. DB::Exception: Unknown expression identifier `limit`. In scope SELECT limit FROM system.one LIMIT 501. (UNKNOWN_IDENTIFIER)",
+      // Snowflake
+      "Snowflake: SQL compilation error: error line 1 at position 7\ninvalid identifier 'LIMIT' (code 000904, SQLSTATE 42000)",
+      "Snowflake: SQL compilation error: error line 1 at position 7\ninvalid identifier '\"limit\"' (code 000904, SQLSTATE 42000)",
+      "Object 'D_PARENT' does not exist or not authorized.",
+      // a number that only contains the limit's digits
+      'syntax error at or near "15012"',
+    ]) {
+      expect(noted(message)).toBe(message);
+    }
+  });
+
+  test("a bound inserted mid-statement (TOP) and a probe with an offset are named as written", () => {
+    expect(
+      noted("Incorrect syntax near the keyword 'TOP'.", "SELECT * FROM t WHERE", "SELECT TOP 501 * FROM t WHERE"),
+    ).toEndWith(appendedBoundNote("TOP 501"));
+    expect(noted("unexpected '500'", "SELECT 1 -- note\n", "SELECT 1 LIMIT 501 OFFSET 500 -- note\n")).toEndWith(
+      appendedBoundNote("LIMIT 501 OFFSET 500"),
+    );
+  });
+
+  test("nothing changes when nothing was added, or it is not an Error", () => {
+    expect(noted('syntax error at or near "LIMIT"', "SELECT 1 LIMIT", "SELECT 1 LIMIT")).toBe(
+      'syntax error at or near "LIMIT"',
+    );
+    expect(noteAppendedBound("LIMIT 501", written, sent)).toBe("LIMIT 501");
+  });
+
+  test("docs/editor/query-optimization.md quotes the note word for word", () => {
+    const doc = readFileSync("docs/editor/query-optimization.md", "utf8").replace(/\s*\n\s*/g, " ");
+    expect(doc).toContain(`\`${appendedBoundNote("LIMIT 501")}\``);
+  });
+
+  test("the note is added once, however often the error passes", () => {
+    const error = new Error("unexpected 'LIMIT'");
+    noteAppendedBound(error, written, sent);
+    noteAppendedBound(error, written, sent);
+    expect(error.message.split("Studio added").length).toBe(2);
   });
 });

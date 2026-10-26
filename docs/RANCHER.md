@@ -35,8 +35,9 @@ upstream.
 
 ## Commercial support
 
-LibreDB Studio is developed and maintained by **Sekoya Grup Bilişim ve
-Teknoloji Ltd. Şti.** (Istanbul, Türkiye), trading publicly as **LibreDB**.
+LibreDB Studio is developed and maintained by
+**SEKOYA GRUP BİLİŞİM VE TEKNOLOJİ LİMİTED ŞİRKETİ** (Istanbul, Türkiye),
+trading publicly as **LibreDB**.
 Sekoya is the primary developer and maintainer of the software.
 
 **Sekoya provides commercial support for LibreDB Studio on every Rancher,
@@ -74,6 +75,8 @@ and serious defects are disclosed in the release notes.
    ```bash
    kubectl --namespace <namespace> exec deploy/<release>-libredb-studio -- cat /app/data/auth-bootstrap.json
    ```
+
+   Set `LIBREDB_NO_BANNER=1` (or `true`) to suppress the startup banner entirely.
 
 5. Expose the UI with a port-forward (or enable `ingress.*` values):
 

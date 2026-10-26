@@ -2,7 +2,7 @@
 
 [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/libredb-studio)](https://artifacthub.io/packages/search?repo=libredb-studio)
 
-Web-based SQL IDE for cloud-native teams supporting sixteen engines - PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino and Apache Cassandra.
+Web-based SQL IDE for cloud-native teams supporting forty-one engines - PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Redis, Couchbase, Firestore, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, BigQuery, Snowflake, Apache Spark, Apache Cassandra, Prometheus, Apache Kafka, MQTT, RabbitMQ, etcd, Neo4j, Milvus, Qdrant, InfluxDB, InfluxDB 3, Oxia, Databend, S3-compatible object storage, Kubernetes, OPC UA, MTConnect, Modbus, NETCONF, SNMP and Sparkplug B.
 
 ## Prerequisites
 
@@ -40,7 +40,7 @@ helm install libredb libredb/libredb-studio \
 
 ```bash
 helm install libredb oci://ghcr.io/libredb/charts/libredb-studio \
-  --version 0.1.58 \
+  --version 0.1.103 \
   --set secrets.jwtSecret=$(openssl rand -base64 32) \
   --set secrets.adminPassword=MyAdmin123
 ```
@@ -147,6 +147,36 @@ browser still speaks `https`, so it accepts the cookie. `false` is only for the 
 the browser's own connection is cleartext - and it means session cookies travel in
 cleartext, so keep it to a trusted network. `true` forces the flag on.
 
+## Two-Factor Authentication (TOTP)
+
+Optional, local-provider only, and opt-in per account. Set a base32 secret and that account must
+present a 6-digit authenticator code after its password:
+
+```bash
+# Generate it, enrol the printed value in your authenticator app, then install.
+ADMIN_TOTP_SECRET="$(openssl rand 20 | base32 | tr -d '=')"
+echo "$ADMIN_TOTP_SECRET"
+
+helm upgrade --install libredb libredb/libredb-studio \
+  --set secrets.adminPassword=MyAdmin123 \
+  --set secrets.adminTotpSecret="$ADMIN_TOTP_SECRET"
+```
+
+No example secret is printed here on purpose. One that looks real invites being copied and left in
+place, and a second factor whose secret is published is worse than none.
+
+The value travels in the chart's Secret and is referenced from the pod, so it never appears in the
+Deployment spec - which is why `extraEnv` is the wrong tool for it. Both `ADMIN_TOTP_SECRET` and
+`USER_TOTP_SECRET` refs are always optional, including in strict mode, so a second factor nobody
+asked for can never keep the pod from starting. `values.schema.json` applies the same test the app
+does, base32 and at least the 128 bits RFC 4226 requires, so a bad secret fails at install time
+rather than at the login screen.
+
+Under `authProvider=oidc` the login page shows no password form and MFA belongs to the identity
+provider - but `POST /api/auth/login` stays reachable whenever `secrets.adminPassword` is also set,
+and this guards that route in every mode. Full setup, enrolment and recovery:
+[`docs/MFA.md`](https://github.com/libredb/libredb-studio/blob/main/docs/MFA.md).
+
 ## OIDC SSO
 
 ```bash
@@ -160,6 +190,81 @@ helm install libredb libredb/libredb-studio \
 
 `secrets.adminPassword` is not part of an OIDC install: the issuer authenticates every user, and the app still signs its own session cookie with `secrets.jwtSecret`. Strict mode (`config.authBootstrap=off`) therefore requires only the JWT secret here.
 
+The optional single sign-on settings have typed values, each written only when set: `config.oidcUserRoles` (`OIDC_USER_ROLES`), `config.oidcPrompt` (`OIDC_PROMPT`, such as `omit` for silent single sign-on), `config.oidcAutoRedirect` and `config.oidcLogoutHint` (`true` writes the variable), and `config.sessionTtlSeconds` (`AUTH_SESSION_TTL_SECONDS`, 300 to 86400).
+
+## Governance
+
+Governance runs Studio under a control plane: the governance source in PostgreSQL becomes the only catalog of connections and grants, and the identity provider the only way to sign in ([docs/GOVERNANCE.md](https://github.com/libredb/libredb-studio/blob/main/docs/GOVERNANCE.md)).
+Until `governance.enabled` is true the chart writes no `GOVERNANCE_*` variable.
+
+```yaml
+authProvider: oidc
+governance:
+  enabled: true
+config:
+  authBootstrap: "off"
+  oidcIssuer: https://auth.example.com/realms/libredb
+  oidcRoleClaim: libredb_roles
+  oidcUserRoles: user
+  storageProvider: postgres
+  storagePostgresSchema: studio
+secrets:
+  existingSecret: libredb-studio
+```
+
+An installer writes the Secret with the usual keys plus two for governance:
+
+- `governance-postgres-url`: the governance source URL for Studio's own role, written to `GOVERNANCE_POSTGRES_URL` through a `secretKeyRef`.
+- `governance-private-keys`: the keyring document, mounted read-only at `/etc/libredb/governance/keyring.json` with mode 0400 and never an environment variable; `GOVERNANCE_PRIVATE_KEYS_FILE` points at it.
+
+Without `secrets.existingSecret`, `secrets.governancePostgresUrl` and `secrets.governancePrivateKeys` put the same two values in the chart's own Secret.
+The pod keeps `podSecurityContext.fsGroup` 1001, because the keyring file is root-owned and uid 1001 reads it through the group.
+The readiness probe moves to `/api/ready`, which answers 503 until the first snapshot loads, and liveness stays on `/api/db/health`.
+
+The instance id that Studio reports in its heartbeat (`GOVERNANCE_INSTANCE_ID`) is `governance.instanceId`, or the chart's fullname when it is empty, so a rollout updates the same heartbeat row.
+With more than one replica every pod reports its own name instead, and a set `governance.instanceId` fails the render.
+
+The render fails, naming the value to fix, for every combination Studio would refuse to start with: `authProvider` other than `oidc`, an empty `config.oidcRoleClaim`, `config.oidcUserRoles` or `config.storagePostgresSchema`, a governance URL or keyring with neither an inline value nor `secrets.existingSecret`, `seedConnections.enabled`, `mcp.enabled` or `agent.enabled=true`, a set `secrets.adminPassword` or `secrets.userPassword`, or an `extraEnv` entry named `GOVERNANCE_*`.
+Under governance the chart also writes no `ADMIN_PASSWORD`, `USER_EMAIL` or `USER_PASSWORD` from `secrets.existingSecret`.
+More than one replica, or `autoscaling.enabled`, renders only with `stickySessions.enabled=true`, which records that cookie affinity is configured at the ingress, because Studio keeps transactions, rate limits and per-user providers in process memory.
+The chart renders no affinity annotation itself.
+
+## Trusting a private CA
+
+When the OIDC issuer or Vault uses a certificate from an internal CA, Node.js rejects it unless the CA is added to `NODE_EXTRA_CA_CERTS`.
+A database connection takes its CA in its own TLS settings instead, except where the provider's page under [docs/providers](https://github.com/libredb/libredb-studio/tree/main/docs/providers) says `ssl.caCert` is not honoured; such a database needs this too.
+Mount the CA from a ConfigMap or Secret already in the namespace with `extraVolumes` and `extraVolumeMounts`, and point the variable at the file through `extraEnv`:
+
+```yaml
+extraVolumes:
+  - name: internal-ca
+    configMap:
+      name: internal-ca          # holds ca.crt
+extraVolumeMounts:
+  - name: internal-ca
+    mountPath: /etc/ssl/internal
+    readOnly: true
+extraEnv:
+  - name: NODE_EXTRA_CA_CERTS
+    value: /etc/ssl/internal/ca.crt
+```
+
+Without it the OIDC login fails with a TLS error such as `UNABLE_TO_VERIFY_LEAF_SIGNATURE`.
+
+When the CA sits in a Secret that also holds a private key, such as a cert-manager or Elasticsearch certificate Secret, project only the CA key so the private key never reaches the pod:
+
+```yaml
+extraVolumes:
+  - name: internal-ca
+    secret:
+      secretName: elasticsearch-master-certs
+      items:
+        - key: ca.crt
+          path: ca.crt
+```
+
+Node reads the file only when the container starts, and the chart's restart-on-change checksums cover only the ConfigMap and Secret it renders itself, so after the CA changes, run `kubectl rollout restart` on the Deployment.
+
 ## AI Configuration
 
 ```bash
@@ -170,6 +275,9 @@ helm install libredb libredb/libredb-studio \
   --set secrets.jwtSecret=$(openssl rand -base64 32) \
   --set secrets.adminPassword=MyAdmin123
 ```
+
+With `config.llmProvider=openai`, `config.llmModelEffort` sets the model's reasoning effort, for example `--set config.llmModelEffort=low`.
+Leave it empty for the model's own default; the values table below lists the accepted values.
 
 ## Agent Runtime
 
@@ -391,6 +499,7 @@ would otherwise lose reachability. One line in the pod log names the address it 
 `config.bindAddress` overrules the resolver when you would rather state it than leave it to the
 image:
 
+| `config.basePath` | Must match `BASE_PATH` baked into your custom image; prefixes default health probes | `""` |
 | `config.bindAddress` | Effect |
 |---|---|
 | `""` (default) | the container resolves it, preferring a verified dual-stack `::` |
@@ -541,7 +650,33 @@ helm install libredb libredb/libredb-studio \
 
 Your external secret is referenced with these keys (customizable via `secrets.existingSecretKeys`):
 - `jwt-secret`, `admin-password` — required in strict mode (the pod waits for them); in zero-config mode missing ones are generated at first start
-- Optional: `admin-email`, `user-email`, `user-password` (the non-admin account exists only when `user-password` is set), `llm-api-key`, `oidc-client-id`, `oidc-client-secret`, `storage-postgres-url`
+- Optional: `admin-email`, `user-email`, `user-password` (the non-admin account exists only when `user-password` is set), `admin-totp-secret`, `user-totp-secret`, `llm-api-key`, `oidc-client-id`, `oidc-client-secret`, `storage-postgres-url`
+- With `governance.enabled`: `governance-postgres-url` and `governance-private-keys` (see [Governance](#governance))
+
+To ship the `ExternalSecret` with the release, so it is installed, upgraded and removed with it, list it in `extraObjects`:
+
+```yaml
+config:
+  authBootstrap: "off"
+secrets:
+  existingSecret: libredb-secrets
+extraObjects:
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: libredb-secrets
+    spec:
+      secretStoreRef:
+        kind: SecretStore
+        name: vault
+      target:
+        name: libredb-secrets
+      dataFrom:
+        - extract:
+            key: libredb/studio
+```
+
+Strict mode (`config.authBootstrap: "off"`) matters here: it makes the pod wait for the Secret the ExternalSecret creates, where zero-config mode would start without it and generate credentials of its own first.
 
 ## Upgrading
 
@@ -557,6 +692,11 @@ helm upgrade libredb libredb/libredb-studio
 > whose external Secret is missing a key now starts with generated credentials instead of
 > waiting in `CreateContainerConfigError`. To keep the previous fail-closed behavior, set
 > `config.authBootstrap=off` explicitly.
+
+> **Behavior change (chart 0.1.83):** `serviceAccount.automountServiceAccountToken` is now set on the pod spec too.
+> With `serviceAccount.create=false`, the pod used to mount the API token of the account it ran as, usually the namespace's `default` one; it now mounts none.
+> Studio reads that token only for Vault Kubernetes auth (`VAULT_ROLE`), so an install with `serviceAccount.create=false` that logs in to Vault this way loses its Vault-backed seed connections on upgrade unless it takes one of two steps.
+> Set `serviceAccount.automountServiceAccountToken=true`, or project a token through `extraVolumes` and `extraVolumeMounts` and point `VAULT_K8S_TOKEN_PATH` at it through `extraEnv`.
 
 ## Uninstalling
 
@@ -580,19 +720,42 @@ helm uninstall libredb
 | `authProvider` | Auth mode: local or oidc | `local` |
 | `config.authBootstrap` | Auth bootstrap: `""` (zero-config, app default), `on` (explicit zero-config), `off` (strict) | `""` |
 | `config.authCookieSecure` | Whether auth cookies carry the `Secure` flag (`AUTH_COOKIE_SECURE`). Unset writes nothing and the app decides (Secure in production, except a loopback host reached over plain http); `false` drops the flag, which is what a browser reaching a non-loopback host over plain http needs - it rejects a Secure cookie and login silently loops; `true` forces it on. TLS terminated at an ingress does not need this | unset |
+| `config.passkeyOrigin` | The public origin people open Studio at, written to `PASSKEY_ORIGIN` when set: scheme, host and port, no path (so no `config.basePath`), such as `https://studio.example.com`. Passkeys also need `config.storageProvider` `sqlite` or `postgres` and `authProvider` `local`; browsers offer them only over https or on `http://localhost`, and the app validates the value. Changing the host means users register their passkeys again. Needs an application image that includes passkey sign-in (#785): appVersion 0.17.0 does not read it. Guide: [`docs/PASSKEYS.md`](https://github.com/libredb/libredb-studio/blob/main/docs/PASSKEYS.md) | `""` |
 | `secrets.jwtSecret` | JWT signing secret: empty (zero-config) or >= 32 chars (schema-enforced) | `""` |
 | `secrets.adminEmail` | Admin email | `admin@libredb.org` |
 | `secrets.adminPassword` | Admin password | `""` |
 | `secrets.userEmail` | User email | `user@libredb.org` |
 | `secrets.userPassword` | User password (optional; enables the non-admin account) | `""` |
+| `secrets.adminTotpSecret` | Base32 TOTP secret for the admin account (optional second factor) | `""` |
+| `secrets.userTotpSecret` | Base32 TOTP secret for the user account (optional second factor) | `""` |
 | `secrets.existingSecret` | Use existing Secret | `""` |
 | `config.bindAddress` | Container bind address (`HOSTNAME`): empty lets the image resolve one, preferring a verified dual-stack `::`; `::` forces it; `0.0.0.0` pins IPv4 | `""` |
 | `config.storageProvider` | Storage: local, sqlite, postgres | `local` |
+| `config.storagePostgresSchema` | Schema of the PostgreSQL storage tables (`STORAGE_POSTGRES_SCHEMA`); empty writes nothing. Studio never creates it. Required under governance | `""` |
+| `config.oidcUserRoles` | Role values that make a user (`OIDC_USER_ROLES`); empty writes nothing. Required under governance | `""` |
+| `config.oidcPrompt` | Prompt sent on sign-in (`OIDC_PROMPT`): `login`, `omit`, `consent` or `select_account`; empty writes nothing | `""` |
+| `config.oidcAutoRedirect` | `true` writes `OIDC_AUTO_REDIRECT=true`, sending a signed-out visitor of `/login` to the identity provider | `false` |
+| `config.oidcLogoutHint` | `true` writes `OIDC_LOGOUT_HINT=true`, sending `id_token_hint` on logout | `false` |
+| `config.sessionTtlSeconds` | Session lifetime in seconds, 300 to 86400 (`AUTH_SESSION_TTL_SECONDS`); unset keeps the app's 86400 | unset |
+| `governance.enabled` | Run Studio under governance (`GOVERNANCE_SOURCE=postgres`); see [Governance](#governance) | `false` |
+| `governance.postgresSchema` | Schema of the governance source (`GOVERNANCE_POSTGRES_SCHEMA`) | `bridge` |
+| `governance.instanceId` | Heartbeat instance id; empty uses the chart's fullname with one replica and each pod's name with more | `""` |
+| `governance.refreshMs` | `GOVERNANCE_REFRESH_MS`, 1000 to 600000; unset keeps the app's 30000 | unset |
+| `governance.maxStalenessMs` | `GOVERNANCE_MAX_STALENESS_MS`, up to 3600000; unset keeps the app's 120000 | unset |
+| `governance.allowedEngines` | `GOVERNANCE_ALLOWED_ENGINES`, comma-separated type ids; empty keeps the app's default list | `""` |
+| `secrets.governancePostgresUrl` | Governance source URL, stored in the chart's Secret under `governance-postgres-url` | `""` |
+| `secrets.governancePrivateKeys` | Keyring document, stored in the chart's Secret under `governance-private-keys` and mounted as a file | `""` |
+| `stickySessions.enabled` | Records that cookie affinity is configured at the ingress; under governance, more than one replica or autoscaling renders only with it. Renders nothing itself | `false` |
 | `config.llmProvider` | AI provider | `""` |
+| `config.llmModelEffort` | `LLM_MODEL_EFFORT`, the reasoning effort for `config.llmProvider=openai` only: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. Empty writes nothing and the model keeps its own default. Which values a model takes is the model's own (GPT-6.1 Sol has no `none`). Needs an application image after 1.0.0 | `""` |
 | `agent.enabled` | Explicit off-switch for the agent runtime. Unset writes nothing and the app derives availability (a configured model plus a writable ledger); `false` writes `LIBREDB_AGENT_ENABLED=false`; `true` declines the off-switch but cannot conjure a model. Rendering fails when an agent could run above one replica | unset |
 | `agent.modelTuning.existingConfigMap` | A ConfigMap holding measured per-model settings to layer over the ones the image ships with. Naming a source is what enables the feature — there is no separate flag — and this one is the natural home for a document you were handed: `kubectl create configmap my-tuning --from-file=model-tuning.json`. Mounted read-only at `/app/model-tuning` and named to the app through `AGENT_MODEL_TUNING_PATH` | `""` |
 | `agent.modelTuning.document` | The same document inline, rendered into a ConfigMap by this chart and converted to JSON. For a short overlay; `existingConfigMap` wins when both are given | `{}` |
 | `agent.modelTuning.configMapKey` | The key the document sits under, which is also the file name it is mounted as | `model-tuning.json` |
+| `mcp.enabled` | Serve the MCP endpoint at `/api/mcp` (docs/MCP.md). `false` writes no `LIBREDB_MCP_*` variable; `true` writes all four as strings and requires `mcp.url` and `mcp.tokenLabel`, and the render fails without them | `false` |
+| `mcp.url` | The address MCP clients use, which every token is bound to: an absolute http(s) URL ending in `/api/mcp`, with `config.basePath` when one is set | `""` |
+| `mcp.tokenLabel` | Any non-empty value; changing it revokes every MCP token at once, which is the only revocation | `""` |
+| `mcp.tokenTtlDays` | Days a minted MCP token stays valid, 1 to 365 | `30` |
 | `persistence.enabled` | Enable PVC | `false` |
 | `persistence.size` | PVC size | `1Gi` |
 | `persistence.emptyDirSizeLimit` | Cap the `/app/data` emptyDir used when persistence is off (e.g. `512Mi`); empty means unlimited | `""` |
@@ -623,7 +786,12 @@ helm uninstall libredb
 | `podDisruptionBudget.minAvailable` | Min available pods (set only one of minAvailable/maxUnavailable) | `1` |
 | `podDisruptionBudget.maxUnavailable` | Max unavailable pods (unset minAvailable with `null` to use) | unset |
 | `networkPolicy.enabled` | Enable NetworkPolicy | `false` |
+| `serviceAccount.create` | Create a ServiceAccount for the pod; `false` runs it as `serviceAccount.name`, or the namespace's `default` account when that is empty | `true` |
+| `serviceAccount.automountServiceAccountToken` | Mount an API token into the pod. Set on the pod spec as well as on the created ServiceAccount, so it also holds for an account the chart does not create; only `true` mounts one. Studio reads the token only for Vault Kubernetes auth (`VAULT_ROLE`) | `false` |
 | `postgresql.enabled` | Deploy PostgreSQL subchart | `false` |
+| `extraVolumes` | Additional pod volumes (Kubernetes `Volume` objects), such as a private CA from a ConfigMap or Secret | `[]` |
+| `extraVolumeMounts` | Additional volume mounts for the app container (Kubernetes `VolumeMount` objects). With a CA mounted, set `NODE_EXTRA_CA_CERTS` to the file through `extraEnv` so an OIDC issuer or Vault on an internal CA is trusted | `[]` |
+| `extraObjects` | Additional Kubernetes manifests deployed with the release, each rendered through `tpl` so it can use release values and the chart's helpers; a string item is taken as a template as it is. Write a literal `{{`, such as one in a Prometheus alert, as `{{ "{{" }}`, or the install fails. Not available through the OpenShift operator, whose CRD refuses it | `[]` |
 | `global.compatibility.openshift.adaptSecurityContext` | Drop fixed UID/GID fields for the OpenShift SCC: `auto`, `force`, or `disabled` | `auto` |
 
 See [values.yaml](values.yaml) for the complete list of configurable parameters.
@@ -639,3 +807,14 @@ fixed `runAsUser`/`runAsGroup`/`fsGroup` so the SCC can assign valid IDs;
 UIDs: every writable path is a volume mount. Set `force` to always adapt (for
 example when templating manifests offline for an OpenShift cluster) or
 `disabled` to keep the fixed IDs everywhere.
+
+## Deployment under a subpath
+
+Build a custom image with `docker build --build-arg BASE_PATH=/tools/libredb ...`, then set
+`config.basePath: /tools/libredb` and the matching image repository/tag. This prefixes the default
+startup, readiness and liveness probes. It does not change routes in an already-built image.
+Explicit custom probe paths are preserved. Set Ingress paths or HTTPRoute matches to the same
+prefix and preserve it when forwarding; do not strip or rewrite it.
+
+See [subpath deployment](https://github.com/libredb/libredb-studio/blob/main/docs/SUBPATH.md)
+for complete build, reverse-proxy and OIDC examples.

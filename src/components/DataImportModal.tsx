@@ -18,15 +18,38 @@ import {
   LoaderCircle,
   X,
 } from "lucide-react";
-import type { DatabaseType, TableSchema } from "@/lib/types";
+import type { DatabaseType } from "@/lib/types";
+import { rowWritableObjects, type DetailedObject } from "@/lib/db/detailed-object";
+import { objectPathLabel, pathKey } from "@/lib/db/object-path";
+import type { ProviderCapabilities } from "@/lib/db/types";
+import { declaredKinds } from "@/lib/db/object-kinds";
+import { quoteIdentifier, quoteObjectPath } from "@/lib/query-generators";
 import { quoteLiteral } from "@/lib/sql/values";
+import type { CsvDelimiter } from "@/lib/export/csv";
 
 interface DataImportModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onImport: (sql: string) => void;
-  tables: TableSchema[];
+  /**
+   * Runs the import. `false` together with a message handed to `onFailure` says the database or
+   * the editor refused it, and the dialog then stays open with the file, the target and the mapping
+   * as they were, showing that message (#1396). Anything else closes it: success, a host that
+   * reports no outcome, and a `false` with no message, which is a run handed to the safety dialog
+   * (it runs the statement on Proceed) or cancelled, as before.
+   */
+  onImport: (sql: string, onFailure: (message: string) => void) => Promise<boolean | void> | void;
+  tables: readonly DetailedObject[];
   databaseType?: string;
+  /**
+   * The provider's own declaration, used for one question: which of `tables` an import may
+   * be pointed at. The gate is `acceptsRowWrites` on the entry's KIND and nothing else,
+   * because the engine-wide `supportsInlineRowEdit` is a different fact about the results
+   * grid, and MongoDB, Couchbase and Cassandra declare it false while declaring a kind that
+   * genuinely takes row writes (standing ruling 4 against #789). Optional, because the
+   * metadata read is asynchronous and until it answers nothing has said a target is not
+   * writable.
+   */
+  capabilities?: ProviderCapabilities;
 }
 
 export interface ParsedData {
@@ -37,7 +60,7 @@ export interface ParsedData {
 
 type ImportStep = "upload" | "preview" | "configure" | "ready";
 
-export function parseCSV(text: string): ParsedData {
+export function parseCSV(text: string, firstRowIsHeader = true, delimiter: CsvDelimiter = ","): ParsedData {
   const lines = text.split(/\r?\n/).filter((line) => line.trim());
   if (lines.length === 0) return { headers: [], rows: [], totalRows: 0 };
 
@@ -58,7 +81,7 @@ export function parseCSV(text: string): ParsedData {
         } else {
           inQuotes = false;
         }
-      } else if (ch === "," && !inQuotes) {
+      } else if (ch === delimiter && !inQuotes) {
         result.push(current.trim());
         current = "";
       } else {
@@ -69,8 +92,9 @@ export function parseCSV(text: string): ParsedData {
     return result;
   };
 
-  const headers = parseLine(lines[0]);
-  const rows = lines.slice(1).map((line) => parseLine(line));
+  const firstRow = parseLine(lines[0]);
+  const headers = firstRowIsHeader ? firstRow : firstRow.map((_, index) => `column_${index + 1}`);
+  const rows = lines.slice(firstRowIsHeader ? 1 : 0).map((line) => parseLine(line));
   return { headers, rows, totalRows: rows.length };
 }
 
@@ -131,18 +155,111 @@ export function escapeSQL(value: string, dialect?: DatabaseType): string {
   return quoteLiteral(value, dialect);
 }
 
+/**
+ * What an import is pointed at, and the two are different KINDS of thing (#789, Task 36).
+ *
+ * An existing object is addressed by its `path`: the label the select used to carry is shared
+ * by two objects in two containers, measured on the live SQL Server, so a bare
+ * `INSERT INTO customers` wrote into whichever one the connection's session default answers
+ * rather than the one the operator picked. A new table is a NAME the operator typed, which
+ * addresses nothing yet and is emitted as they wrote it.
+ *
+ * One discriminated value rather than the three fields this used to take (a flag, a typed
+ * name and a selected label): only one of the three was ever read, and which one was decided
+ * by the flag at every call site.
+ */
+export type ImportTarget =
+  | { readonly kind: "existing"; readonly path: readonly string[] }
+  | { readonly kind: "new"; readonly name: string };
+
+/**
+ * The target as the statement spells it: fully qualified and quoted per segment for the
+ * connected dialect, exactly as `TestDataGenerator` spells its INSERT.
+ *
+ * With no declaration yet the dotted address is the fallback rather than the label, so the
+ * statement still names the object the operator chose; it can only lack the quoting.
+ *
+ * A new table is the name the operator typed, read as a dotted address (`sales.imported` is a
+ * table in `sales`) and quoted always, as its columns are (see `newColumnIdentifier`).
+ */
+function targetIdentifier(target: ImportTarget, capabilities: ProviderCapabilities | undefined): string {
+  if (target.kind === "new") {
+    const name = target.name || "imported_data";
+    return capabilities === undefined ? name : quoteObjectPath(name.split("."), capabilities, { always: true });
+  }
+  return capabilities === undefined ? objectPathLabel(target.path) : quoteObjectPath(target.path, capabilities);
+}
+
+/**
+ * A column of a table the import creates, as both of its statements spell it (#1396).
+ *
+ * Quoted always, not only when the name would not round-trip bare: a header is whatever the file
+ * says, and a lowercase reserved word (`when`, `order`, `user`, `group`) passes the bare test, so
+ * `CREATE TABLE imp_csv (..., when TEXT)` was refused with a syntax error. The CREATE and the INSERT
+ * spell the name the same way, so the quoting cannot make one miss the other on any engine.
+ *
+ * An existing table's columns stay as the mapping spells them: they name columns the engine
+ * already has, and quoting a name a bare spelling folds (`Name` for PostgreSQL's `name`) would
+ * address a different column.
+ */
+function newColumnIdentifier(name: string, capabilities: ProviderCapabilities | undefined): string {
+  return capabilities === undefined ? name : quoteIdentifier(name, capabilities, { always: true });
+}
+
+/**
+ * Whether an import may create the table it writes into: only where the engine declares a
+ * `createTable` grammar (#786). Loaded capabilities that declare none withhold it; unknown
+ * capabilities keep the choice, as they keep every target in `rowWritableObjects`, because the
+ * declaration has not arrived yet rather than refused anything.
+ */
+export function offersNewTableImport(capabilities: ProviderCapabilities | undefined): boolean {
+  return capabilities === undefined || capabilities.createTable !== undefined;
+}
+
+/**
+ * What the dialog says on an engine that offers an import nothing to write into (#786).
+ *
+ * It names Studio's import as what has no target, not the engine as taking no data: it used to read "This connection
+ * takes no imported data", which on Databend contradicted an INSERT the same person had just run in the editor (D4).
+ * `docs/providers/databend.md` section 9 quotes it.
+ */
+export const IMPORT_NO_TARGET =
+  "Studio's import has no target on this connection: it offers no existing table here to write into and cannot create one.";
+
+/**
+ * Why this engine takes no import at all, or null when it takes one (#786).
+ *
+ * An import writes rows into an existing object of a kind that accepts row writes, or into a table
+ * it creates. An engine that declares neither has nothing an import could write into, so the dialog
+ * refuses up front rather than walking a reader through three steps to a statement it must not run.
+ * Db2 is the engine this was written for: on db2-node 1.0.22, which misread non-ASCII text, no Db2
+ * kind accepted row writes and Db2 declared no create-table.
+ */
+export function importRefusal(capabilities: ProviderCapabilities | undefined): string | null {
+  if (capabilities === undefined || offersNewTableImport(capabilities)) return null;
+  if (declaredKinds(capabilities).some((kind) => kind.acceptsRowWrites === true)) return null;
+  return IMPORT_NO_TARGET;
+}
+
 export function generateImportSQL(
   parsedData: ParsedData | null,
-  targetTable: string,
-  createNewTable: boolean,
-  newTableName: string,
+  target: ImportTarget | null,
   columnMapping: Record<string, string>,
   dialect?: DatabaseType,
+  capabilities?: ProviderCapabilities,
 ): string {
   if (!parsedData) return "";
+  if (target === null) return "";
+  // The generator refuses on its own as well as the dialog, so no caller can build the statements
+  // an engine declared it does not take.
+  const refusal = importRefusal(capabilities);
+  if (refusal !== null) throw new Error(refusal);
+  if (target.kind === "new" && !offersNewTableImport(capabilities)) {
+    throw new Error("This connection's engine declares no create-table, so an import cannot create its target table.");
+  }
 
-  const tableName = createNewTable ? newTableName || "imported_data" : targetTable;
-  if (!tableName) return "";
+  const tableName = targetIdentifier(target, capabilities);
+  const createNewTable = target.kind === "new";
 
   const statements: string[] = [];
 
@@ -156,15 +273,18 @@ export function generateImportSQL(
   // CREATE TABLE if new
   if (createNewTable) {
     const colDefs = parsedData.headers.map((h, idx) => {
-      const colName = columnMapping[h] || h;
+      const colName = newColumnIdentifier(columnMapping[h] || h, capabilities);
       return `  ${colName} ${columnTypes[idx]}`;
     });
     statements.push(`CREATE TABLE ${tableName} (\n${colDefs.join(",\n")}\n);`);
   }
 
-  // INSERT statements (batch in groups of 100)
-  const mappedHeaders = parsedData.headers.map((h) => columnMapping[h] || h);
-  const batchSize = 100;
+  // INSERT statements, in groups of 100 rows, or one row each where the engine's INSERT takes
+  // a single row (CQL, #1410).
+  const mappedHeaders = parsedData.headers.map((h) =>
+    createNewTable ? newColumnIdentifier(columnMapping[h] || h, capabilities) : columnMapping[h] || h,
+  );
+  const batchSize = capabilities?.supportsMultiRowInsert === false ? 1 : 100;
 
   for (let i = 0; i < parsedData.rows.length; i += batchSize) {
     const batch = parsedData.rows.slice(i, i + batchSize);
@@ -196,32 +316,59 @@ export function generateImportSQL(
   return statements.join("\n\n");
 }
 
-export function DataImportModal({ isOpen, onClose, onImport, tables, databaseType }: DataImportModalProps) {
+export function DataImportModal({
+  isOpen,
+  onClose,
+  onImport,
+  tables,
+  databaseType,
+  capabilities,
+}: DataImportModalProps) {
   const [step, setStep] = useState<ImportStep>("upload");
   const [parsedData, setParsedData] = useState<ParsedData | null>(null);
   const [fileName, setFileName] = useState("");
   const [fileType, setFileType] = useState<"csv" | "json">("csv");
-  const [targetTable, setTargetTable] = useState("");
+  const [firstRowIsHeader, setFirstRowIsHeader] = useState(true);
+  // The selected object's ADDRESS as one comparable string, because a `<select>` value is a
+  // string and the label two objects share cannot be one (#789).
+  const [targetKey, setTargetKey] = useState("");
   const [createNewTable, setCreateNewTable] = useState(false);
   const [newTableName, setNewTableName] = useState("");
   const [columnMapping, setColumnMapping] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [isImporting, setIsImporting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  // Bumped on every close, so an outcome that arrives after the dialog was closed is dropped
+  // rather than written into the next opening.
+  const openingRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const csvTextRef = useRef("");
+  const [csvDelimiter, setCsvDelimiter] = useState<CsvDelimiter>(",");
+
+  // A view has columns and is a relation, and an INSERT into it is meaningless on most
+  // engines, so only the provider's own per-kind declaration can tell the two apart (#789).
+  const targets = useMemo(() => rowWritableObjects(tables, capabilities), [tables, capabilities]);
+  const refusal = importRefusal(capabilities);
+  const newTableOffered = offersNewTableImport(capabilities);
 
   const resetState = useCallback(() => {
     setStep("upload");
     setParsedData(null);
     setFileName("");
-    setTargetTable("");
+    setFirstRowIsHeader(true);
+    setCsvDelimiter(",");
+    csvTextRef.current = "";
+    setTargetKey("");
     setCreateNewTable(false);
     setNewTableName("");
     setColumnMapping({});
     setError(null);
     setIsImporting(false);
+    setImportError(null);
   }, []);
 
   const handleClose = () => {
+    openingRef.current += 1;
     resetState();
     onClose();
   };
@@ -245,6 +392,7 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
           return;
         }
 
+        csvTextRef.current = isJSON ? "" : text;
         setParsedData(data);
         // Auto-map columns 1:1
         const mapping: Record<string, string> = {};
@@ -273,34 +421,93 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
     e.preventDefault();
   }, []);
 
+  const updateCsvPreview = (hasHeader: boolean, delimiter: CsvDelimiter) => {
+    const data = parseCSV(csvTextRef.current, hasHeader, delimiter);
+    setFirstRowIsHeader(hasHeader);
+    setCsvDelimiter(delimiter);
+    setParsedData(data);
+    if (data.headers.some((header, index) => header !== parsedData?.headers[index])) {
+      // Retain mappings when switching header or delimiter interpretations and back.
+      setColumnMapping((mapping) => ({
+        ...Object.fromEntries(data.headers.map((header) => [header, header])),
+        ...mapping,
+      }));
+    }
+  };
+
+  const selectedTarget = useMemo(
+    () => targets.find((object) => pathKey(object.path) === targetKey) ?? null,
+    [targets, targetKey],
+  );
+
+  const importTarget: ImportTarget | null = createNewTable
+    ? { kind: "new", name: newTableName }
+    : selectedTarget && { kind: "existing", path: selectedTarget.path };
+
   const generatedSQL = useMemo(
     () =>
       generateImportSQL(
         parsedData,
-        targetTable,
-        createNewTable,
-        newTableName,
+        importTarget,
         columnMapping,
         databaseType as DatabaseType | undefined,
+        capabilities,
       ),
-    [parsedData, targetTable, createNewTable, newTableName, columnMapping, databaseType],
+    [parsedData, importTarget, columnMapping, databaseType, capabilities],
   );
 
-  const handleImport = () => {
+  /**
+   * Close only once the import landed (#1396). It used to close 200ms after starting, whatever
+   * happened, so a statement the engine refused took the file and the column mapping with it and
+   * the user picked and mapped everything again to retry.
+   */
+  const handleImport = async () => {
     if (!generatedSQL) return;
     setIsImporting(true);
-    onImport(generatedSQL);
-    setTimeout(() => {
-      handleClose();
-    }, 200);
+    setImportError(null);
+    const opening = openingRef.current;
+    let failure: string | undefined;
+    const outcome = await onImport(generatedSQL, (message) => {
+      failure = message;
+    });
+    if (opening !== openingRef.current) return;
+    if (outcome === false && failure !== undefined) {
+      setIsImporting(false);
+      setImportError(failure);
+      return;
+    }
+    handleClose();
   };
+
+  if (refusal !== null) {
+    return (
+      <Dialog open={isOpen} onOpenChange={handleClose}>
+        <DialogContent className="bg-surface border-hairline-strong text-fg max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Upload strokeWidth={1.5} className="w-5 h-5 text-brand" />
+              {"Import Data"}
+            </DialogTitle>
+          </DialogHeader>
+          <p data-testid="import-refused" className="text-xs text-fg-tertiary">
+            {refusal}
+          </p>
+          <div className="flex justify-end">
+            <Button data-testid="import-refused-close" variant="outline" size="sm" onClick={handleClose}>
+              Close
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    );
+  }
 
   return (
     <Dialog open={isOpen} onOpenChange={handleClose}>
       <DialogContent className="bg-surface border-hairline-strong text-fg max-w-2xl max-h-[85vh] overflow-hidden flex flex-col">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            <Upload strokeWidth={1.5} className="w-5 h-5 text-blue-400" />
+            <Upload strokeWidth={1.5} className="w-5 h-5 text-brand" />
             {"Import Data"}
             {fileName && <span className="text-xs text-fg-muted font-normal ml-2">{fileName}</span>}
           </DialogTitle>
@@ -312,11 +519,11 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
             <React.Fragment key={s}>
               <div
                 className={cn(
-                  "flex items-center gap-1.5 text-xs font-mediumr",
+                  "flex items-center gap-1.5 text-xs font-medium",
                   step === s
-                    ? "text-blue-400"
+                    ? "text-brand"
                     : idx < ["upload", "preview", "configure", "ready"].indexOf(step)
-                      ? "text-emerald-400"
+                      ? "text-success"
                       : "text-fg-subtle",
                 )}
               >
@@ -324,9 +531,9 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
                   className={cn(
                     "w-5 h-5 rounded-full flex items-center justify-center text-[0.625rem]",
                     step === s
-                      ? "bg-blue-500/20 border border-blue-500/40"
+                      ? "bg-brand-tint/20 border border-brand-tint/40"
                       : idx < ["upload", "preview", "configure", "ready"].indexOf(step)
-                        ? "bg-emerald-500/20 border border-emerald-500/40"
+                        ? "bg-success-tint/20 border border-success-tint/40"
                         : "bg-fill border border-hairline-strong",
                   )}
                 >
@@ -354,7 +561,7 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
                 onDrop={handleDrop}
                 onDragOver={handleDragOver}
                 onClick={() => fileInputRef.current?.click()}
-                className="w-full border-2 border-dashed border-hairline-strong rounded-xl p-12 text-center cursor-pointer hover:border-blue-500/30 hover:bg-blue-500/5 transition-all"
+                className="w-full border-2 border-dashed border-hairline-strong rounded-xl p-12 text-center cursor-pointer hover:border-brand-tint/30 hover:bg-brand-tint/5 transition-all"
               >
                 <Upload strokeWidth={1.5} className="w-10 h-10 text-fg-subtle mx-auto mb-4" />
                 <p className="text-xs text-fg-tertiary mb-1">Drop a file here or click to browse</p>
@@ -381,9 +588,9 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
                 }}
               />
               {error && (
-                <div className="mt-4 p-3 rounded-lg bg-red-500/10 border border-red-500/20 flex items-center gap-2">
-                  <TriangleAlert strokeWidth={1.5} className="w-3.5 h-3.5 text-red-400 shrink-0" />
-                  <span className="text-xs text-red-400">{error}</span>
+                <div className="mt-4 p-3 rounded-lg bg-danger-tint/10 border border-danger-tint/20 flex items-center gap-2">
+                  <TriangleAlert strokeWidth={1.5} className="w-3.5 h-3.5 text-danger shrink-0" />
+                  <span className="text-xs text-danger">{error}</span>
                 </div>
               )}
             </div>
@@ -395,9 +602,9 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
                   {fileType === "json" ? (
-                    <FileBraces strokeWidth={1.5} className="w-5 h-5 text-amber-400" />
+                    <FileBraces strokeWidth={1.5} className="w-5 h-5 text-hue-amber" />
                   ) : (
-                    <FileText strokeWidth={1.5} className="w-5 h-5 text-emerald-400" />
+                    <FileText strokeWidth={1.5} className="w-5 h-5 text-hue-emerald" />
                   )}
                   <div>
                     <p className="text-xs font-medium">{fileName}</p>
@@ -417,6 +624,37 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
                   <X strokeWidth={1.5} className="w-3 h-3 mr-1" /> Reset
                 </Button>
               </div>
+
+              {fileType === "csv" && (
+                <div className="flex flex-wrap items-center gap-4">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={firstRowIsHeader}
+                      onChange={(e) => updateCsvPreview(e.target.checked, csvDelimiter)}
+                      className="rounded border-edge bg-panel"
+                    />
+                    <span className="text-xs text-fg-secondary">First row is header</span>
+                  </label>
+                  <label className="flex items-center gap-2 text-xs text-fg-secondary">
+                    CSV delimiter
+                    <select
+                      value={csvDelimiter}
+                      onChange={(e) => {
+                        const delimiter = e.target.value;
+                        if (delimiter === "," || delimiter === ";" || delimiter === "\t") {
+                          updateCsvPreview(firstRowIsHeader, delimiter);
+                        }
+                      }}
+                      className="rounded border border-edge bg-panel px-2 py-1 text-fg"
+                    >
+                      <option value=",">Comma (,)</option>
+                      <option value=";">Semicolon (;)</option>
+                      <option value={"\t"}>Tab</option>
+                    </select>
+                  </label>
+                </div>
+              )}
 
               {/* Preview Table */}
               <div className="border border-hairline rounded-lg overflow-auto max-h-60">
@@ -458,7 +696,7 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
               <div className="flex justify-end">
                 <Button
                   size="sm"
-                  className="bg-blue-600 hover:bg-blue-500 h-8 text-xs gap-1"
+                  className="bg-brand-solid hover:bg-brand-solid-hover h-8 text-xs gap-1"
                   onClick={() => setStep("configure")}
                 >
                   Configure Import <ArrowRight strokeWidth={1.5} className="w-3 h-3" />
@@ -478,7 +716,7 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
                     className={cn(
                       "flex-1 px-3 py-2 rounded-lg border text-xs text-left transition-all",
                       !createNewTable
-                        ? "border-blue-500/40 bg-blue-500/10 text-blue-400"
+                        ? "border-brand-tint/40 bg-brand-tint/10 text-brand"
                         : "border-hairline-strong text-fg-muted hover:bg-fill",
                     )}
                     onClick={() => setCreateNewTable(false)}
@@ -486,18 +724,20 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
                     <Table2 strokeWidth={1.5} className="w-3.5 h-3.5 mb-1" />
                     {"Existing Table"}
                   </button>
-                  <button
-                    className={cn(
-                      "flex-1 px-3 py-2 rounded-lg border text-xs text-left transition-all",
-                      createNewTable
-                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400"
-                        : "border-hairline-strong text-fg-muted hover:bg-fill",
-                    )}
-                    onClick={() => setCreateNewTable(true)}
-                  >
-                    <FileSpreadsheet strokeWidth={1.5} className="w-3.5 h-3.5 mb-1" />
-                    {"New Table"}
-                  </button>
+                  {newTableOffered && (
+                    <button
+                      className={cn(
+                        "flex-1 px-3 py-2 rounded-lg border text-xs text-left transition-all",
+                        createNewTable
+                          ? "border-success-tint/40 bg-success-tint/10 text-success"
+                          : "border-hairline-strong text-fg-muted hover:bg-fill",
+                      )}
+                      onClick={() => setCreateNewTable(true)}
+                    >
+                      <FileSpreadsheet strokeWidth={1.5} className="w-3.5 h-3.5 mb-1" />
+                      {"New Table"}
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -521,13 +761,16 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
                   </label>
                   <select
                     id="import-target-table"
-                    value={targetTable}
-                    onChange={(e) => setTargetTable(e.target.value)}
-                    className="w-full mt-1 bg-overlay border border-hairline-strong rounded-md px-3 py-2 text-xs text-fg-secondary outline-none focus:border-blue-500/40"
+                    value={targetKey}
+                    onChange={(e) => setTargetKey(e.target.value)}
+                    className="w-full mt-1 bg-overlay border border-hairline-strong rounded-md px-3 py-2 text-xs text-fg-secondary outline-none focus:border-brand-tint/40"
                   >
                     <option value="">-- Select a table --</option>
-                    {tables.map((t) => (
-                      <option key={t.name} value={t.name}>
+                    {/* VALUED by the address and LABELLED by the name: two objects in two
+                        containers share a label, and it was both the React key and the value
+                        an INSERT was built from (#789). */}
+                    {targets.map((t) => (
+                      <option key={pathKey(t.path)} value={pathKey(t.path)}>
                         {t.name}
                       </option>
                     ))}
@@ -576,9 +819,9 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
                 </Button>
                 <Button
                   size="sm"
-                  className="bg-blue-600 hover:bg-blue-500 h-8 text-xs gap-1"
+                  className="bg-brand-solid hover:bg-brand-solid-hover h-8 text-xs gap-1"
                   onClick={() => setStep("ready")}
-                  disabled={!createNewTable && !targetTable}
+                  disabled={!createNewTable && selectedTarget === null}
                 >
                   Review SQL <ArrowRight strokeWidth={1.5} className="w-3 h-3" />
                 </Button>
@@ -593,7 +836,8 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
                 <div>
                   <p className="text-xs font-medium">Ready to Import</p>
                   <p className="text-xs text-fg-muted mt-0.5">
-                    {parsedData?.totalRows} rows into {createNewTable ? newTableName || "imported_data" : targetTable}
+                    {parsedData?.totalRows} rows into{" "}
+                    {createNewTable ? newTableName || "imported_data" : objectPathLabel(selectedTarget?.path ?? [])}
                   </p>
                 </div>
                 {databaseType && (
@@ -608,6 +852,16 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
                   {generatedSQL.length > 3000 && "\n\n... (truncated for preview)"}
                 </pre>
               </div>
+
+              {importError && (
+                <div
+                  role="alert"
+                  className="p-3 rounded-lg bg-danger-tint/10 border border-danger-tint/20 flex items-start gap-2"
+                >
+                  <TriangleAlert strokeWidth={1.5} className="w-3.5 h-3.5 text-danger shrink-0 mt-0.5" />
+                  <span className="text-xs text-danger whitespace-pre-wrap">{importError}</span>
+                </div>
+              )}
 
               <div className="flex justify-between">
                 <Button
@@ -633,7 +887,7 @@ export function DataImportModal({ isOpen, onClose, onImport, tables, databaseTyp
                   />
                   <Button
                     size="sm"
-                    className="bg-emerald-600 hover:bg-emerald-500 h-8 text-xs gap-1"
+                    className="bg-success-solid hover:bg-success-solid-hover h-8 text-xs gap-1"
                     onClick={handleImport}
                     disabled={isImporting}
                   >

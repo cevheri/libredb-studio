@@ -32,6 +32,7 @@
  *   applied. The number the server gave is the number reported.
  */
 
+import { randomUUID } from "node:crypto";
 import { SQLBaseProvider } from "../sql-base";
 import {
   AuthenticationError,
@@ -52,6 +53,12 @@ import {
   type MaintenanceType,
   type PerformanceMetrics,
   type PreparedQuery,
+  type Container,
+  type DatabaseObject,
+  type KindCount,
+  type ObjectDetail,
+  type ObjectDetailBatch,
+  type ObjectSourceDocument,
   type ProviderCapabilities,
   type ProviderLabels,
   type ProviderOptions,
@@ -60,8 +67,6 @@ import {
   type SlowQuery,
   type SlowQueryStats,
   type StorageStats,
-  type TableRelations,
-  type TableSchema,
   type TableStats,
 } from "@/lib/db/types";
 import { formatCacheHitRatio } from "@/lib/monitoring-cache-ratio";
@@ -69,12 +74,18 @@ import { formatBytes } from "@/lib/db/utils/pool-manager";
 import { resolveSqlGrammar, type SqlGrammar } from "@/lib/sql/grammar";
 import { readStatementEnd } from "@/lib/sql/statement-end";
 import { ClickHouseHttpTransport } from "./http-transport";
+import { CLICKHOUSE_SYSTEM_DATABASES } from "./introspect";
 import {
-  CLICKHOUSE_SYSTEM_DATABASES,
-  getSchema as introspectSchema,
-  getSchemaList as introspectSchemaList,
-  getSchemaRelations as introspectSchemaRelations,
-} from "./introspect";
+  CLICKHOUSE_CONTAINER_LEVELS,
+  CLICKHOUSE_OBJECT_KINDS,
+  countObjects as readObjectCounts,
+  describeObject as readObjectDetail,
+  describeObjects as readObjectDetails,
+  listContainers as readContainers,
+  listObjects as readObjects,
+  literal,
+  readObjectSource as readSourceDocument,
+} from "./objects";
 import {
   type ClickHouseQueryResult,
   type ClickHouseRow,
@@ -362,15 +373,6 @@ function rowLimit(limit: number | undefined, fallback: number): number {
 }
 
 /**
- * A value as a ClickHouse string literal. The backslash escape has to be applied
- * as well as the doubled quote: ClickHouse honours both inside a literal
- * (live-verified), so escaping only the quote would leave `\'` as a way out.
- */
-function literal(value: string): string {
-  return `'${value.replace(/\\/g, "\\\\").replace(/'/g, "''")}'`;
-}
-
-/**
  * `database.table` when the target names one, otherwise the pinned database.
  * The same rule `postgres.ts` applies to `public`, and the same limitation: a
  * dot inside a name cannot be told apart from the separator.
@@ -471,6 +473,8 @@ function toQueryResult(result: ClickHouseQueryResult, measuredMs: number): Query
 
   return {
     rows,
+    // The transport already numbered a name the server declared twice, so these
+    // are unique and are the keys every row uses.
     fields: textual ? [RAW_TEXT_COLUMN] : (result.fieldNames ?? []),
     // A write returns no rows, so its row count is what the server says it
     // changed - verbatim, including the zero a queued mutation reports.
@@ -490,6 +494,16 @@ export class ClickHouseProvider extends SQLBaseProvider {
   /** The configuration with a hand-typed connection string already resolved. */
   private readonly connection: DatabaseConnection;
 
+  /**
+   * The statements running now: the caller's id for each, and the query id it runs under
+   * on the server, which this provider makes up (a random UUID) rather than taking the
+   * caller's. ClickHouse keeps a query id unique per server USER only, so a caller-chosen id
+   * that another Studio user's run already carries, on the same ClickHouse account, would
+   * let `KILL QUERY WHERE query_id = ...` stop both. `cancelQuery` refuses an id this map does
+   * not hold, so the cancel route reaches only statements this provider started.
+   */
+  private readonly runningQueryIds = new Map<string, string>();
+
   constructor(config: DatabaseConnection, options: ProviderOptions = {}) {
     super(config, options);
     this.validate();
@@ -508,19 +522,28 @@ export class ClickHouseProvider extends SQLBaseProvider {
       supportsExternalQueryLimiting: true,
       // Live-verified, and deliberate rather than an oversight: `CREATE TABLE t
       // (id Int32, name String)` succeeds on 26.x, but what CreateTableModal
-      // EMITS does not. Its default column is `id SERIAL PRIMARY KEY` (code 50,
-      // unknown data type family SERIAL) and its UNIQUE checkbox emits `UNIQUE`
+      // EMITS does not. Its default column is an auto-increment primary key (measured
+      // as `id SERIAL PRIMARY KEY`, code 50, unknown data type family SERIAL; #648 made
+      // that spelling per-engine and added no ClickHouse row, and PostgreSQL's identity
+      // clause is not a ClickHouse type either) and its
+      // UNIQUE checkbox emits `UNIQUE`
       // (code 62, syntax error), so the modal's default state produces invalid
       // SQL and it offers no ClickHouse type list. A control that can only
-      // produce invalid input is not a supported capability. DDL typed into the
+      // produce invalid input is not a supported capability, so this provider
+      // declares no `createTable`. DDL typed into the
       // editor works normally, which is how a ClickHouse user creates a table.
-      supportsCreateTable: false,
       // Live-verified against 26.7.1 and the reason issue #269 exists: a bare
       // `UPDATE ... SET`, which is what the inline row editor builds, answers code
       // 48 NOT_IMPLEMENTED (HTTP 501). ClickHouse spells a row mutation
       // `ALTER TABLE t UPDATE c = v WHERE ...`, an asynchronous mutation rather
       // than a statement the shared hook can emit, so the control is hidden here.
       supportsInlineRowEdit: false,
+      supportsTestDataGeneration: false,
+      // `LIMIT n OFFSET m` from the shared limiter. A statement whose end the limiter
+      // declines to rewrite - a trailing `FORMAT` or `SETTINGS` clause - comes back with
+      // `wasLimited: false`, and the route's `hasMore` requires that, so those statements
+      // offer no control without this flag having to know about them (#816).
+      supportsResultPagination: true,
       // Reached over stateless HTTP, and ClickHouse has no general transaction anyway.
       supportsTransactions: false,
       // ClickHouse parses REFERENCES in a column definition and enforces nothing by
@@ -541,6 +564,16 @@ export class ClickHouseProvider extends SQLBaseProvider {
       },
       supportsConnectionString: true,
       defaultPort: 8123,
+      // #789. One level and no second one to add: ClickHouse has no schema below a
+      // database, and `CREATE SCHEMA` is not an alias for anything. The five kinds,
+      // the two that are deliberately absent (no trigger, no stored procedure) and the
+      // absence of `acceptsRowWrites` on every one of them are all argued in
+      // `./objects.ts`.
+      containerLevels: CLICKHOUSE_CONTAINER_LEVELS,
+      // Only the declared depth is an address: a partial path would leave a level unbound and
+      // answer an empty folder. Read through `acceptedContainerShapes()` (#1147).
+      containerPathShapes: "exact",
+      objectKinds: CLICKHOUSE_OBJECT_KINDS,
       schemaRefreshPattern: "\\b(CREATE|DROP|ALTER|RENAME|TRUNCATE|ATTACH|DETACH)\\b",
     };
   }
@@ -581,6 +614,32 @@ export class ClickHouseProvider extends SQLBaseProvider {
       // used to advertise (#463).
       slowQueriesEmptyState: "Query stats come from system.query_log, which records nothing while log_queries is off.",
     };
+  }
+
+  // ==========================================================================
+  // SQL dialect overrides
+  // ==========================================================================
+
+  /**
+   * A double-quoted identifier, with the BACKSLASH escaped before the quote.
+   *
+   * The inherited escaper doubles only the quote character, and on this engine a backslash
+   * inside a quoted identifier is processed as an ESCAPE - MEASURED (#789 probe 11): a table
+   * created as `"x\\"` stores `hex(name) = 785C`, exactly one trailing backslash, and a name
+   * ending in one therefore SWALLOWS its own closing quote while the parser keeps reading into
+   * whatever the name was followed by. Over a maintenance target that is statement injection
+   * rather than a quoting inconvenience (#1091 review): a container of `x\\` emitted through the
+   * inherited spelling turns the target that follows into more statement text. `objects.ts`
+   * documents the same measurement where it explains why that file's reads take no identifier
+   * position at all.
+   *
+   * The ORDER is the one `literal()` in `objects.ts` uses, and it is forced: doubling the quote
+   * first would leave the backslash that precedes the original quote looking like an escape of
+   * the quote's own doubled pair.
+   */
+  protected override escapeIdentifier(identifier: string): string {
+    const escaped = identifier.replace(/\\/g, "\\\\").replace(/"/g, '""');
+    return `"${escaped}"`;
   }
 
   /**
@@ -646,7 +705,7 @@ export class ClickHouseProvider extends SQLBaseProvider {
 
   private describeConnectFailure(error: unknown): Error {
     const mapped = this.mapClickHouseError(error);
-    if (mapped instanceof AuthenticationError) return mapped;
+    if (mapped instanceof AuthenticationError || mapped instanceof DatabaseConfigError) return mapped;
 
     return new ConnectionError(
       `Failed to connect to ClickHouse: ${mapped.message}`,
@@ -671,7 +730,7 @@ export class ClickHouseProvider extends SQLBaseProvider {
   // Query execution
   // ==========================================================================
 
-  public async query(sql: string, params?: unknown[]): Promise<QueryResult> {
+  public async query(sql: string, params?: unknown[], queryId?: string): Promise<QueryResult> {
     const transport = this.requireTransport();
     if (params !== undefined && params.length > 0) {
       // The HTTP interface binds named `{name:Type}` parameters only, so there
@@ -690,17 +749,48 @@ export class ClickHouseProvider extends SQLBaseProvider {
           // Both halves of the same promise: max_execution_time bounds the server
           // once it has accepted the statement, timeoutMs bounds everything before
           // and after that - connect, handshake, and the body still arriving.
+          const serverQueryId = queryId === undefined ? undefined : randomUUID();
+          if (queryId !== undefined && serverQueryId !== undefined) this.runningQueryIds.set(queryId, serverQueryId);
           return await transport.query(sql, {
             settings: { max_execution_time: this.deadlineSeconds() },
             timeoutMs: this.queryTimeout,
+            ...(serverQueryId !== undefined && { queryId: serverQueryId }),
           });
         } catch (error) {
           throw this.mapClickHouseError(error, sql);
+        } finally {
+          if (queryId !== undefined) this.runningQueryIds.delete(queryId);
         }
       });
 
       return toQueryResult(result, executionTime);
     });
+  }
+
+  /**
+   * Stop a statement `query()` is running under `queryId` (#1364).
+   *
+   * Aborting the HTTP request does not stop a ClickHouse statement: measured on 26.9.9.28,
+   * `system.processes` still listed it 19 s and 29 s after the editor's Cancel, until it
+   * was killed by hand. `KILL QUERY ... SYNC` answers once the statement has stopped, with
+   * one row per statement it reached (`kill_status` `finished`, measured on 26.9.9.28), and
+   * with an empty body when nothing matched because the statement had already ended. So
+   * true means stopped, and anything else, including `cant_cancel`, is false. The KILL names
+   * the server query id `query()` generated for this run, never the caller's own id.
+   */
+  public async cancelQuery(queryId: string): Promise<boolean> {
+    const serverQueryId = this.runningQueryIds.get(queryId);
+    if (serverQueryId === undefined) return false;
+    const transport = this.requireTransport();
+    try {
+      const { rows } = await transport.query(`KILL QUERY WHERE query_id = ${literal(serverQueryId)} SYNC`, {
+        timeoutMs: this.queryTimeout,
+      });
+      return rows.some((row) => row.kill_status === "finished");
+    } catch (error) {
+      this.logError("cancelQuery", error);
+      return false;
+    }
   }
 
   /**
@@ -737,9 +827,15 @@ export class ClickHouseProvider extends SQLBaseProvider {
       return new ConnectionError(error.message, this.type, this.connection.host, this.connection.port);
     }
     if (error.code === CLICKHOUSE_FAILURE_CODES.NO_SERVER_CODE) {
-      // Nothing below the SQL layer answered, so there is no code to key on and
-      // the shared message-based mapping - which recognises a refused socket and
-      // a timeout - is the best classification available.
+      // A connection that never opened is a connection problem. Its message says
+      // "timed out", which the shared message-based mapping would read as a slow
+      // query and answer with query advice, so the transport's kind decides first.
+      if (error.failure === "timed-out") {
+        return new ConnectionError(error.message, this.type, this.connection.host, this.connection.port);
+      }
+      // Otherwise nothing below the SQL layer answered, so there is no code to key
+      // on and the shared message-based mapping - which recognises a refused socket
+      // and a query deadline - is the best classification available.
       return this.mapError(error, sql);
     }
 
@@ -761,19 +857,52 @@ export class ClickHouseProvider extends SQLBaseProvider {
   // Schema
   // ==========================================================================
 
-  public async getSchema(): Promise<TableSchema[]> {
+  // ==========================================================================
+  // Object surface (#789)
+  // ==========================================================================
+  //
+  // Four thin wrappers. The statements, the declaration and every derivation over it
+  // live in `./objects.ts`; what belongs here is the connection check and the error
+  // mapping, which are this class's own. `countObjects` is deliberately NOT wrapped in
+  // `guarded`: a refused count is reported per kind as the server's own sentence
+  // rather than thrown, so there is nothing for the mapper to classify.
+
+  public async listContainers(parent?: readonly string[]): Promise<Container[]> {
     const transport = this.requireTransport();
-    return this.guarded(() => introspectSchema(transport, this.pinnedDatabase));
+    return this.guarded(() => readContainers(transport, parent));
   }
 
-  public async getSchemaList(): Promise<TableSchema[]> {
+  public async countObjects(container: readonly string[]): Promise<Record<string, KindCount>> {
     const transport = this.requireTransport();
-    return this.guarded(() => introspectSchemaList(transport, this.pinnedDatabase));
+    return readObjectCounts(transport, this.getCapabilities(), container);
   }
 
-  public async getSchemaRelations(): Promise<TableRelations[]> {
+  public async listObjects(container: readonly string[], kind: string): Promise<DatabaseObject[]> {
     const transport = this.requireTransport();
-    return this.guarded(() => introspectSchemaRelations(transport, this.pinnedDatabase));
+    return this.guarded(() => readObjects(transport, this.getCapabilities(), container, kind));
+  }
+
+  public async describeObject(path: readonly string[], kind: string): Promise<ObjectDetail> {
+    const transport = this.requireTransport();
+    return this.guarded(() => readObjectDetail(transport, this.getCapabilities(), path, kind));
+  }
+
+  public async describeObjects(container: readonly string[], kind: string, limit?: number): Promise<ObjectDetailBatch> {
+    const transport = this.requireTransport();
+    return this.guarded(() => readObjectDetails(transport, this.getCapabilities(), container, kind, limit));
+  }
+
+  /**
+   * One object's definition text (#789 Phase 2).
+   *
+   * The fifth thin wrapper, and it is OPTIONAL on `DatabaseProvider` while the five above are
+   * required: a provider that declares no source-bearing kind implements nothing, and
+   * `assertObjectSurface` asserts the pairing in both directions. ClickHouse declares all five
+   * of its kinds source-bearing, so the method is here and the pairing holds.
+   */
+  public async readObjectSource(path: readonly string[], kind: string, limit?: number): Promise<ObjectSourceDocument> {
+    const transport = this.requireTransport();
+    return this.guarded(() => readSourceDocument(transport, this.getCapabilities(), path, kind, limit));
   }
 
   // ==========================================================================
@@ -1010,10 +1139,10 @@ export class ClickHouseProvider extends SQLBaseProvider {
   // Maintenance
   // ==========================================================================
 
-  public async runMaintenance(type: MaintenanceType, target?: string): Promise<MaintenanceResult> {
+  public async runMaintenance(type: MaintenanceType, target?: string, container?: string): Promise<MaintenanceResult> {
     const transport = this.requireTransport();
     const { result, executionTime } = await this.measureExecution(() =>
-      this.guarded(() => this.dispatchMaintenance(transport, type, target)),
+      this.guarded(() => this.dispatchMaintenance(transport, type, target, container)),
     );
 
     return { ...result, executionTime };
@@ -1023,15 +1152,16 @@ export class ClickHouseProvider extends SQLBaseProvider {
     transport: ClickHouseTransport,
     type: MaintenanceType,
     target?: string,
+    container?: string,
   ): Promise<Omit<MaintenanceResult, "executionTime">> {
     switch (type) {
       case "optimize":
-        return this.optimizeTable(transport, this.requireTarget(type, target));
+        return this.optimizeTable(transport, this.requireTarget(type, target), container);
       // No target is legitimate here, unlike optimize: MaintenanceModal's global
       // Analyze button sends none, and a database's parts are as well defined as a
       // table's. Demanding one made a control the UI always offers always fail.
       case "analyze":
-        return this.describeParts(transport, target);
+        return this.describeParts(transport, target, container);
       case "kill":
         return this.cancelQueryById(transport, this.requireTarget(type, target));
     }
@@ -1051,7 +1181,13 @@ export class ClickHouseProvider extends SQLBaseProvider {
     return target;
   }
 
-  private qualify(target: string): string {
+  private qualify(target: string, container?: string): string {
+    // A caller-supplied container removes the dot ambiguity that `splitTarget` documents
+    // below: `database.table` cannot be told apart from a name that contains a dot, while a
+    // container is already the database on its own.
+    if (container) {
+      return `${this.escapeIdentifier(container)}.${this.escapeIdentifier(target)}`;
+    }
     const [database, table] = splitTarget(target, this.pinnedDatabase);
     return `${this.escapeIdentifier(database)}.${this.escapeIdentifier(table)}`;
   }
@@ -1064,8 +1200,9 @@ export class ClickHouseProvider extends SQLBaseProvider {
   private async optimizeTable(
     transport: ClickHouseTransport,
     target: string,
+    container?: string,
   ): Promise<Omit<MaintenanceResult, "executionTime">> {
-    await transport.query(`OPTIMIZE TABLE ${this.qualify(target)} FINAL`);
+    await transport.query(`OPTIMIZE TABLE ${this.qualify(target, container)} FINAL`);
     return { success: true, message: `Optimized ${target}` };
   }
 
@@ -1078,10 +1215,16 @@ export class ClickHouseProvider extends SQLBaseProvider {
   private async describeParts(
     transport: ClickHouseTransport,
     target?: string,
+    container?: string,
   ): Promise<Omit<MaintenanceResult, "executionTime">> {
-    // Without a target the scope is the whole pinned database, which is what the
-    // global Analyze button asks for.
-    const [database, table] = target ? splitTarget(target, this.pinnedDatabase) : [this.pinnedDatabase, undefined];
+    // Without a target the scope is the whole pinned database, which is what the global
+    // Analyze button asks for. A container states the database outright, so the name is not
+    // split to recover one; without a container the old reading stands.
+    const [database, table] = container
+      ? [container, target]
+      : target
+        ? splitTarget(target, this.pinnedDatabase)
+        : [this.pinnedDatabase, undefined];
     const scope = target ?? database;
     const where = table
       ? `database = ${literal(database)} AND table = ${literal(table)}`

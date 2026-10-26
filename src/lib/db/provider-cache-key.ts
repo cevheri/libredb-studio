@@ -1,0 +1,227 @@
+import { connectionFingerprint } from "./connection-fingerprint";
+import { READS_FILE_ACCESS_POSTURE, SINGLE_WRITER_FILE } from "./compatibility";
+import type { DatabaseConnection, WithTunnelFarEnd } from "@/lib/types";
+
+/**
+ * The key `providerCache` holds a live provider under, and why it is not `connection.id`
+ * (GHSA-3wh2-8x78-jfw4).
+ *
+ * A cache key is an EQUALITY CLAIM: two callers answering the same key are told they may share
+ * one open connection. `getOrCreateProvider` used to key on `connection.id`, and that id arrives
+ * in the request body - `resolveConnection` in `src/lib/seed/resolve-connection.ts` returned an
+ * inline `connection` verbatim, id included. So the equality claim was written by the caller.
+ * Naming an id another session had open returned THAT session's provider, already authenticated
+ * as them, with the sent credentials never compared; a `seed:` id is an operator-chosen slug and
+ * is guessable, and the role filter that guards the `connectionId` path is not on the inline one.
+ * Reproduced against the real sqlite driver before this existed, in
+ * `tests/isolated/factory.test.ts` ("getOrCreateProvider cache isolation").
+ *
+ * So the key still carries the id, but the id is no longer the WHOLE of it. Four parts, framed
+ * together so none can be forged on its own:
+ *
+ * - `connection.id`, which keeps the cache's existing per-record behaviour: two stored records
+ *   naming the same server with the same credentials go on having a pool each, `removeProvider`
+ *   goes on finding what it deletes, and nothing about reuse changes for honest callers. Keying
+ *   it out entirely was tried first and is what a reader will reach for, so the measurement is
+ *   recorded: three sqlite records differing only in `id` collapsed onto ONE entry, whose
+ *   `connectionId` was whichever opened first, so deleting either of the other two left a live
+ *   pool behind under a third record's name.
+ * - {@link connectionFingerprint}, the server. Taken rather than re-derived, for the reason its
+ *   own docblock gives for taking `connectionIdentity`'s field set: two hand-kept lists of the
+ *   same fields drift, and that file already records the measurement this bug is another face of
+ *   ("`connection.id` is a string the caller typed on the majority path"). A field added there
+ *   narrows this key with it, which is the safe direction.
+ * - {@link credentialDigest}, as whom. The fingerprint frames `user` because a different user is
+ *   a different identity, but not `password`, because rotating a secret does not change which
+ *   server you reach. For a CACHE key it must: a caller who sends the wrong password may not be
+ *   handed a pool someone opened with the right one.
+ * - The read-only mode (#1089), spelled `read-only` for `readOnly: true` and `read-write` for
+ *   everything else, so `false` and an absent value are one mode and share a pool. A provider opened
+ *   read-only refuses every write, so a read-write caller handed its entry would have its writes
+ *   refused, and a read-only caller handed a read-write entry would have them sent. It is not in
+ *   `credentialDigest` or the fingerprint, whose rules are as whom a connection authenticates and
+ *   which server it reaches, and the mode changes neither.
+ * - The file-access posture (the non-admin DuckDB file-access change), for an engine that opens its
+ *   editor handle under one: `READS_FILE_ACCESS_POSTURE` in `./compatibility.ts` answers which, so
+ *   this is not a `connection.type` branch (CLAUDE.md), and today DuckDB and SQLite answer true. A denied
+ *   editor handle opens with `enable_external_access: 'false'` and a full-reach one without it, so the
+ *   two must never share a cached handle: a caller of one posture would otherwise be handed the
+ *   other's handle. (A seed a non-admin role can use gets one posture for every role in
+ *   `editorExecutionContext`, so that record still keeps one key.) The deny posture appends a segment;
+ *   the allow/admin posture and an absent posture append NOTHING, so every other engine's key stays
+ *   byte-identical to before this change, and `profiledCacheKey` passes a definite posture, absent
+ *   read as denied, so the profiled key splits the same way. The posture
+ *   lives on `ProviderExecutionContext`, server-derived from the session role and the resolved
+ *   connection's audience, never on the
+ *   connection, so a request body cannot move a handle between the two pools.
+ * - The owner, under governance (docs/GOVERNANCE.md#per-user-providers): `ProviderExecutionContext.owner`, the identity
+ *   provider subject of the session the provider is opened for, so every user of a connection gets a provider, a pool
+ *   and a database session state of their own. It is appended last, as `owner:<subject>`, and only when an owner is
+ *   given, so a key without one stays byte-identical to the key before owners existed. An engine that keeps one handle
+ *   per file (`SINGLE_WRITER_FILE`) leaves it out, see {@link providerOwner}.
+ *
+ * WHY THE ID IS SAFE IN THE KEY. Reaching a cached entry now costs the victim's id AND their
+ * server AND their credentials. The first is guessable and the second is often public; the third
+ * is the one an attacker does not have, and holding it would let them open the connection
+ * honestly anyway. So the forged id buys nothing, which is the whole of the fix.
+ *
+ * WHY `queryTimeout` IS NOT IN THE KEY, though the report suggests it. `getOrCreateProvider`
+ * tears down a cached provider whose timeout differs from the request's, so a saved change
+ * reaches the next query. Under the old key that was a denial of service: any caller could evict
+ * a stranger's live connection by naming their id with a different number. It is not one now, and
+ * for the reason above - the caller had to prove the credentials to reach the entry at all - so
+ * the teardown keeps doing its job and stays where it is. Putting the timeout in the key would
+ * instead leave the old provider connected until the 30-minute idle sweep, which is the behaviour
+ * that change was written to avoid.
+ *
+ * THE ID ALSO SITS ON THE ENTRY, because the key is a digest and cannot be read back:
+ * `removeProvider`, the idle sweep and `connectionStillServed` ask "which entries serve
+ * connection X" and match on that field. `profiledProviderCache` has worked this way since #328
+ * and is the shape copied here.
+ *
+ * WHAT IT DOES NOT CATCH, stated as a limit rather than left to be found: the same limit
+ * `connectionFingerprint` states, a different server answering on the same host and port.
+ */
+export async function providerCacheKey(
+  connection: DatabaseConnection & WithTunnelFarEnd,
+  allowExternalFileAccess?: boolean,
+  owner?: string,
+): Promise<string> {
+  const [server, credentials] = await Promise.all([connectionFingerprint(connection), credentialDigest(connection)]);
+  const mode = connection.readOnly === true ? "read-only" : "read-write";
+  const parts = [connection.id, server, credentials, mode];
+  // Only an engine that reads a file-access posture, and only its deny posture, adds bytes: the
+  // admin/allow and absent postures leave the key byte-identical to before this field existed, which
+  // keeps every other engine's key unchanged. A denied handle must not be shared with a full-reach one
+  // on the same connection, so its key carries this extra segment (the non-admin DuckDB file-access
+  // change), on the profiled key too, which always passes a definite posture. The
+  // engine is read from `READS_FILE_ACCESS_POSTURE`, not a `connection.type` branch (CLAUDE.md).
+  if (READS_FILE_ACCESS_POSTURE[connection.type] && allowExternalFileAccess === false) {
+    parts.push(`${connection.type}-deny-file-access`);
+  }
+  // Last, and only when there is one: without an owner the key is byte-identical to before owners existed.
+  const keyedOwner = providerOwner(connection, owner);
+  if (keyedOwner !== undefined) parts.push(`owner:${keyedOwner}`);
+  // Length-framed like the two digests it joins: an id ending in a digit must not be able to
+  // answer the same key as a shorter id followed by a longer fingerprint.
+  return parts.map((value) => `${value.length}:${value}`).join("");
+}
+
+/**
+ * The owner a provider of `connection` is kept apart for (docs/GOVERNANCE.md#per-user-providers): `owner` as given, or
+ * undefined when every caller shares the provider, because none was given or because the engine keeps one handle per
+ * file.
+ *
+ * A provider per user on such an engine would be a second handle on one file, which DuckDB lets checkpoint over
+ * the first one's committed rows and LibreDB refuses, so `SINGLE_WRITER_FILE` decides it before any provider
+ * exists, not a `connection.type` branch (CLAUDE.md). Governance admits no engine that opens a local file
+ * (`OPENS_LOCAL_FILE`), so Studio never names an owner here; an embedder of the factory that does gets the one
+ * shared handle. The key and the factory both ask this, so the entry the factory records and the key it is cached
+ * under always name the same owner.
+ */
+export function providerOwner(connection: DatabaseConnection, owner: string | undefined): string | undefined {
+  return SINGLE_WRITER_FILE[connection.type] ? undefined : owner;
+}
+
+/**
+ * A digest of every secret and secondary identity that decides WHO a connection opens as.
+ *
+ * Length-framed before hashing, the way `connectionFingerprint` frames its fields and for the
+ * same reason: without it, two fields can slide across their boundary and answer one digest for
+ * two different credential sets.
+ *
+ * The criterion for a field belonging here is the mirror of the fingerprint's: changing this
+ * field ALONE, with the others held equal, makes the connection authenticate as someone else or
+ * be trusted differently by the server.
+ *
+ * Every field `src/lib/storage/secret-fields.ts` classifies as `secret` has to move this digest
+ * or the fingerprint, and `tests/unit/lib/db/provider-cache-key.test.ts` walks those maps to hold it,
+ * because this list is hand-kept and the API key pair was once missing from it. The public fields
+ * below (the agent user, what TLS presents and trusts, the mechanism, the auth database, the consent,
+ * the data servers, the warehouse, the region, the sign-in method, the role, the tunnel's auth method and host key) are outside that walk, so the same file
+ * holds them in a table of their own, one row per field.
+ *
+ * - `password` is the connection's own secret. `connectionString` is NOT here because the
+ *   fingerprint already frames it whole, credentials and all.
+ * - `apiKeyId` and `apiKeySecret` are who an Elasticsearch connection authenticates as: its
+ *   transport sends `Authorization: ApiKey` built from the pair in preference to `user` and
+ *   `password` (`src/lib/db/providers/sql/search/http-transport.ts`), so a connection differing
+ *   only in either half must not be handed a provider opened with the other.
+ * - `agentUser` and `agentPassword` are the least-privilege identity the execution profiles open
+ *   as (#328). They are an identity, so a connection differing only in them must not be handed a
+ *   pool opened as the privileged user.
+ * - `ssl` decides both what the client PRESENTS (`clientCert`, `clientKey`, which are an
+ *   authentication method on their own under PostgreSQL's `cert` auth) and what it TRUSTS
+ *   (`mode`, `caCert`, `rejectUnauthorized`).
+ * - `saslMechanism` decides which stored credential the broker checks the password against,
+ *   because Kafka keeps a SCRAM credential per mechanism (#1088), so the same user and password
+ *   under another mechanism are another principal's secret. Nothing asks for it here: this list is
+ *   hand-kept and no compiler walks `DatabaseConnection` for it, and without it two connections
+ *   differing only in the mechanism would share one cached provider.
+ * - `authSource` names the database MongoDB looks the user up in (`buildConnectionString` in
+ *   `src/lib/db/providers/document/mongodb/index.ts`), so the same user and password under another auth
+ *   database are another principal's record. `connectionIdentity` in
+ *   `src/lib/agent/context-snapshot.ts` frames it for the same reason.
+ * - `allowInsecureAuth` decides whether a Db2, InfluxDB or Databend provider sends its secret with no TLS (#786,
+ *   InfluxDB spec I7), whether an Oxia provider sends its token without TLS, and whether an S3 provider connects over
+ *   plain HTTP at all (and whether a RabbitMQ provider sends its password without TLS on both endpoints), so a
+ *   connection whose consent was taken back must not be handed a provider opened under it.
+ * - `dataServers` decides which hosts receive the token (O6), so a connection whose list changed must
+ *   not be handed a provider whose policy admitted other hosts.
+ * - `warehouse` decides which Databend compute every statement runs on (`X-DATABEND-WAREHOUSE`), and so which
+ *   servers receive the password and which warehouse Cloud resumes and bills, so a connection naming another
+ *   warehouse must not be handed a provider whose requests name this one. The fingerprint does not frame it, and
+ *   `connectionIdentity` leaves it out on purpose: it picks compute, not the catalog.
+ * - `location` decides where a BigQuery job runs, so a connection whose location moved must not be handed a
+ *   provider opened with the old one.
+ * - `region` decides the scope every S3 request is signed for, so a connection naming another region must not be
+ *   handed a provider whose signer uses this one. The fingerprint does not frame it and `connectionIdentity` leaves it
+ *   out: it names a signing scope, not a server or a catalog.
+ * - `namespaces` decides which namespaces a Kubernetes provider lists as containers, and a cached provider holds the
+ *   list it was opened with, so a connection whose list changed must not be handed one that draws the old list. It
+ *   changes no identity: the fingerprint and `connectionIdentity` leave it out.
+ * - `authMethod`, `privateKey`, `privateKeyPassphrase` and `role` decide who a Snowflake connection signs in as and
+ *   which role every statement runs as, so a connection differing in any of them must not be handed a provider opened
+ *   with the other; the two secrets are also held by the census through `CONNECTION_FIELDS`, and `role` and
+ *   `authMethod` by the public-field table.
+ * - The tunnel's SECRETS and `hostKeyFingerprint`. Its ROUTE is deliberately absent: `tunnelRoute`
+ *   frames the four route values inside the fingerprint already, and this is the half that file
+ *   explicitly leaves out as "a credential, not a route".
+ */
+async function credentialDigest(connection: DatabaseConnection): Promise<string> {
+  const ssl = connection.ssl;
+  const tunnel = connection.sshTunnel;
+  const framed = [
+    connection.password ?? "",
+    connection.apiKeyId ?? "",
+    connection.apiKeySecret ?? "",
+    connection.agentUser ?? "",
+    connection.agentPassword ?? "",
+    ssl?.mode ?? "",
+    ssl?.caCert ?? "",
+    ssl?.clientCert ?? "",
+    ssl?.clientKey ?? "",
+    ssl === undefined ? "" : String(ssl.rejectUnauthorized ?? ""),
+    connection.saslMechanism ?? "",
+    connection.authSource ?? "",
+    connection.allowInsecureAuth === true ? "insecure-auth" : "",
+    connection.dataServers ?? "",
+    connection.warehouse ?? "",
+    connection.location ?? "",
+    connection.region ?? "",
+    connection.namespaces ?? "",
+    connection.authMethod ?? "",
+    connection.privateKey ?? "",
+    connection.privateKeyPassphrase ?? "",
+    connection.role ?? "",
+    tunnel?.authMethod ?? "",
+    tunnel?.password ?? "",
+    tunnel?.privateKey ?? "",
+    tunnel?.passphrase ?? "",
+    tunnel?.hostKeyFingerprint ?? "",
+  ]
+    .map((value) => `${value.length}:${value}`)
+    .join("");
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(framed));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}

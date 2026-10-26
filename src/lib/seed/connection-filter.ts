@@ -1,4 +1,5 @@
-import type { SSLConfig } from "@/lib/types";
+import { SEED_ONLY_FIELDS } from "@/lib/db/connection-fields";
+import type { DatabaseConnection, SSLConfig } from "@/lib/types";
 import type { SeedConnection, SeedDefaults, ManagedConnection } from "./types";
 
 export function mergeDefaults(conn: SeedConnection, defaults: SeedDefaults | undefined): SeedConnection {
@@ -16,34 +17,125 @@ function rolesMatch(connectionRoles: string[], userRoles: string[]): boolean {
   return connectionRoles.some((r) => userRoles.includes(r));
 }
 
+/** The mapper's own gate on a field only one engine reads: why, at that engine's row of SEED_ONLY_FIELDS in src/lib/db/connection-fields.ts. */
+function assertSeedOnlyFieldsBelong(conn: SeedConnection): void {
+  const fields = conn as Readonly<Record<string, unknown>>;
+  for (const [owner, row] of Object.entries(SEED_ONLY_FIELDS)) {
+    if (!row?.projectionRefusal || owner === conn.type) continue;
+    if (!row.fields.some((field) => fields[field])) continue;
+    throw new Error(row.projectionRefusal(conn.id, conn.type));
+  }
+}
+
+/**
+ * A read-only seed must be managed (#1089). The seed schema already refuses the pair at load, with
+ * `defaults.managed` taken into account; this is the mapper's own gate, checked on the connection
+ * `mergeDefaults` produced, so a SeedConnection built in memory (bypassing zod) cannot be projected as
+ * a read-only connection whose password and client key reach the browser, where a duplicate of it
+ * can clear the mode.
+ */
+function assertReadOnlySeedIsManaged(conn: SeedConnection): void {
+  if (conn.readOnly !== true || conn.managed !== false) return;
+  throw new Error(
+    `Seed connection "${conn.id}" sets readOnly: true with managed: false. A read-only seed stays managed, because an unmanaged one is copied into the browser with its credentials, where a duplicate of it can clear the mode; the seed is refused rather than projected as a read-only connection that is not.`,
+  );
+}
+
 export function filterByRoles(connections: SeedConnection[], userRoles: string[]): ManagedConnection[] {
   return connections
     .filter((conn) => rolesMatch(conn.roles, userRoles))
-    .map((conn) => ({
-      id: `seed:${conn.id}`,
-      name: conn.name,
-      type: conn.type,
-      host: conn.host,
-      port: conn.port,
-      database: conn.database,
-      user: conn.user,
-      password: conn.password,
-      connectionString: conn.connectionString,
-      environment: conn.environment,
-      group: conn.group,
-      color: conn.color,
-      ssl: conn.ssl as SSLConfig | undefined,
-      serviceName: conn.serviceName,
-      instanceName: conn.instanceName,
-      // Cassandra's required data centre. Dropping it here would list a seeded ring
-      // the product cannot open, because the driver refuses to connect without one.
-      localDataCenter: conn.localDataCenter,
-      // MongoDB's auth database. Dropping it here would list a seeded connection that
-      // authenticates against the wrong database and reports a credentials error.
-      authSource: conn.authSource,
-      createdAt: new Date(),
-      managed: conn.managed ?? true,
-      roles: conn.roles,
-      seedId: conn.id,
-    }));
+    .map((conn) => {
+      assertSeedOnlyFieldsBelong(conn);
+      assertReadOnlySeedIsManaged(conn);
+      return {
+        id: `seed:${conn.id}`,
+        name: conn.name,
+        type: conn.type,
+        host: conn.host,
+        port: conn.port,
+        database: conn.database,
+        user: conn.user,
+        password: conn.password,
+        connectionString: conn.connectionString,
+        environment: conn.environment,
+        group: conn.group,
+        color: conn.color,
+        ssl: conn.ssl as SSLConfig | undefined,
+        serviceName: conn.serviceName,
+        instanceName: conn.instanceName,
+        // Cassandra's required data centre. Dropping it here would list a seeded ring
+        // the product cannot open, because the driver refuses to connect without one.
+        localDataCenter: conn.localDataCenter,
+        // MongoDB's auth database. Dropping it here would list a seeded connection that
+        // authenticates against the wrong database and reports a credentials error.
+        authSource: conn.authSource,
+        // Elasticsearch's API key pair (#708). Dropping either half here would seed a
+        // connection that falls back to user/password silently, which is the exact "a
+        // field validated above and not copied here" failure this comment block warns
+        // about for skipObjectScan below.
+        apiKeyId: conn.apiKeyId,
+        apiKeySecret: conn.apiKeySecret,
+        // Kafka's SASL mechanism (#1088). Dropping it here would list a seeded SCRAM connection
+        // with its user and password and no mechanism to send them by, which the provider refuses.
+        saslMechanism: conn.saslMechanism,
+        schema: conn.schema,
+        // The second half of the seed round-trip, and the half a zod field cannot cover:
+        // this mapper is a hand-written field list, so a field validated above and not
+        // copied here reaches the browser as `undefined` and the seeded connection scans
+        // the catalog the deployment asked it not to (#765).
+        skipObjectScan: conn.skipObjectScan,
+        // The MCP opt-in (#246), copied for the reason skipObjectScan is: dropped here, a seed that
+        // opted in would reach the MCP context without its opt-in and never be visible.
+        mcp: conn.mcp,
+        // The read-only mode (#1089), copied for the reason skipObjectScan is: dropped here, a seed the
+        // operator declared read-only would be listed and opened as a connection that writes.
+        readOnly: conn.readOnly,
+        // Db2's consent to a cleartext password (#786), copied for the reason skipObjectScan is:
+        // dropped here, a seed the operator declared it for would be refused by the provider.
+        allowInsecureAuth: conn.allowInsecureAuth,
+        // Oxia's data servers (O6), copied for the reason skipObjectScan is: dropped here, a seeded cluster would be
+        // refused by the provider for leaders the file did list.
+        dataServers: conn.dataServers,
+        // The warehouse, copied for the reason skipObjectScan is: dropped here, a seeded Databend Cloud connection
+        // would be refused for the warehouse the file did name, and a seeded Snowflake one would run on the user's
+        // default warehouse instead.
+        warehouse: conn.warehouse,
+        location: conn.location,
+        // Snowflake's sign-in method, key, passphrase and role, copied for the reason skipObjectScan is: dropped here,
+        // a seeded Snowflake connection would be refused for a credential or a role the file did name. The method is a
+        // string in the seed schema, so that a reference resolves; the provider refuses any value it does not know.
+        authMethod: conn.authMethod as DatabaseConnection["authMethod"],
+        privateKey: conn.privateKey,
+        privateKeyPassphrase: conn.privateKeyPassphrase,
+        role: conn.role,
+        // S3's signing region, copied for the reason skipObjectScan is: dropped here, a seeded connection to Garage or a
+        // MinIO with a site region would be refused for the region the file did name.
+        region: conn.region,
+        // Kubernetes' three fields, copied for the reason skipObjectScan is: dropped here, a seeded connection behind a
+        // Rancher proxy would reach the proxy's own API, and a namespace-bound seed would lose its namespace list.
+        apiPath: conn.apiPath,
+        namespaces: conn.namespaces,
+        tlsServerName: conn.tlsServerName,
+        // The AMQP port, copied for the reason skipObjectScan is: dropped here, a seeded port would never reach the
+        // connection the file declared it for.
+        amqpPort: conn.amqpPort,
+        // OPC UA's mode and certificate pin (#1677), copied for the reason skipObjectScan is, and
+        // this is the pair where dropping them is worst: the seeded connection would still open, to
+        // the right address, and it would trust whatever certificate the server presented. A
+        // connection listed as pinned that is not pinned is the failure the pin exists to prevent.
+        securityMode: conn.securityMode,
+        serverCertificateThumbprint: conn.serverCertificateThumbprint,
+        // And the three with no dialog box, copied for the same reason: dropped here, a deployment
+        // that mounted a client certificate would dial with a freshly generated one instead, which
+        // a server holding a trust list refuses with BadSecurityChecksFailed.
+        securityPolicyUri: conn.securityPolicyUri,
+        clientCertificatePath: conn.clientCertificatePath,
+        clientPrivateKeyPath: conn.clientPrivateKeyPath,
+        createdAt: new Date(),
+        managed: conn.managed ?? true,
+        // Send only the roles the caller holds (plus wildcard), so browser never sees other teams' roles
+        roles: conn.roles.filter((r) => r === "*" || userRoles.includes(r)),
+        seedId: conn.id,
+      };
+    });
 }

@@ -43,7 +43,6 @@ import type {
   HealthInfo,
   PerformanceMetrics,
   SlowQueryStats,
-  TableSchema,
 } from "@/lib/db/types";
 import type { CassandraRow, CassandraTransport } from "./transport";
 import { CassandraTransportError } from "./transport";
@@ -200,7 +199,7 @@ export function cassandraIndexCountCql(keyspace: string): string {
  * A keyspace name as a CQL string literal.
  *
  * Through the shared quoter rather than by hand, so the dialect's escape rule is the
- * one recorded in `lib/sql/values.ts` - CQL doubles the quote and reads a backslash
+ * one recorded in `lib/db/providers/sql/cassandra/sql-writing.ts` - CQL doubles the quote and reads a backslash
  * as data, both measured. A keyspace name cannot contain a quote today, and that is
  * exactly the kind of assumption this function exists to not depend on.
  */
@@ -451,7 +450,12 @@ function toColumnSchema(row: CassandraRow): ColumnSchema {
   };
 }
 
-function tableColumns(rows: CassandraRow[]): ColumnSchema[] {
+/**
+ * Exported because the object surface describes a table and a materialized view with
+ * the same ordering rule (#789): partition key, then clustering, then the rest by name.
+ * One definition rather than two spellings of a measured rule.
+ */
+export function cassandraTableColumns(rows: CassandraRow[]): ColumnSchema[] {
   return rows
     .slice()
     .sort((left, right) => {
@@ -463,57 +467,6 @@ function tableColumns(rows: CassandraRow[]): ColumnSchema[] {
       return readText(left.column_name).localeCompare(readText(right.column_name));
     })
     .map(toColumnSchema);
-}
-
-/**
- * The tables and materialized views of one keyspace, with their columns and indexes.
- *
- * Three reads rather than one join, because CQL has no join at all - and three
- * rather than four because a view's columns are in the same `system_schema.columns`
- * the tables' are, keyed by the view's name.
- *
- * Every table carries `foreignKeys: []`, and the provider declares
- * `declaresForeignKeys: false` so a reader knows that means "this engine has none"
- * rather than "this schema declares none".
- *
- * These four reads deliberately do NOT degrade on a refused grant, unlike the
- * monitoring reads below: measured, `system_schema` is readable by a least-privilege
- * role for every table in every keyspace, so a denial here is abnormal and an empty
- * tree would hide it. (The consequence of that same measurement is worth knowing from
- * the other side: the tree therefore lists tables the connected role cannot SELECT
- * from, which is Cassandra's own permission model rather than a defect here.)
- */
-export async function getSchema(transport: CassandraTransport, keyspace: string): Promise<TableSchema[]> {
-  const [tables, views, columns, indexes] = await Promise.all([
-    transport.execute(cassandraTableListCql(keyspace)),
-    transport.execute(cassandraViewListCql(keyspace)),
-    transport.execute(cassandraColumnListCql(keyspace)),
-    transport.execute(cassandraIndexListCql(keyspace)),
-  ]);
-
-  const names = [
-    ...tables.rows.map((row) => readText(row.table_name)),
-    ...views.rows.map((row) => readText(row.view_name)),
-  ];
-
-  return names.map((name) => ({
-    name,
-    columns: tableColumns(columns.rows.filter((row) => readText(row.table_name) === name)),
-    indexes: indexes.rows
-      .filter((row) => readText(row.table_name) === name)
-      .map((row) => ({
-        name: readText(row.index_name),
-        // `options` is a map, and `target` is the indexed column. A legacy secondary
-        // index (kind COMPOSITES) targets exactly one; the field also carries the
-        // full target expression for the newer index kinds.
-        columns: [readText((row.options as Record<string, unknown> | null)?.target)],
-        // No index in Cassandra enforces uniqueness. `CREATE UNIQUE INDEX` is a
-        // syntax error - the keyword is not in the grammar (measured) - so `false`
-        // here is the engine's answer rather than this schema's.
-        unique: false,
-      })),
-    foreignKeys: [],
-  }));
 }
 
 // ============================================================================

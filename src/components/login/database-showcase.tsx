@@ -36,12 +36,66 @@ export function DatabaseShowcase({ variant }: DatabaseShowcaseProps) {
   return <MobileDatabases />;
 }
 
+/**
+ * The gaps are the hero's vertical budget, which has none to spare at 1280x800 and 1366x768
+ * (#541, #550, pinned by e2e/login.spec.ts). At a 20px column gap the nineteenth entry (#1088)
+ * wrapped the list into a fourth row at both sizes and scrolled the page by 4 and 19px; at 14px
+ * 1366x768 kept three rows, and the row gap - 6px then, 4px now - paid for the fourth row 1280x800
+ * still takes.
+ * The twenty-second entry (#786) took the fourth row at 1366x768 too. The hero column's vertical
+ * padding in login-form.tsx pays for that one, because an 8px column gap bought the third row back
+ * with 38px left on it, which the next entry would have spent.
+ * The twenty-eighth entry (Databend) wrapped the list into a fifth row at 1366x768 and scrolled the
+ * page to 781px. A 12px column gap keeps four rows there, with the page needing 759px of the 768;
+ * 1280x800 takes five rows at either gap and needs 798px of its 800.
+ * The twenty-ninth entry (S3-compatible object storage, the longest label on the page) put
+ * 1366x768 back on five rows and scrolled it by 13px at both the 12px and the 10px column gap;
+ * at the 6px gap it holds four rows and the page measured 800, 768, 900 and 1080px of 800, 768,
+ * 900 and 1080, needing 798, 759, 759 and 701px of them.
+ * Two engines landed at once, so the count changed again and the list now carries a thirty-sixth
+ * entry. Each of the two paragraphs below measured its own engine as the thirty-fifth, with
+ * thirty-five entries on the page, and both landed on the same 4px row gap, which stays until the
+ * page is swept at thirty-six.
+ * The thirty-fifth entry (Snowflake) wrapped the list into a sixth row at 1280x800 and scrolled the
+ * page to 804px; 1366x768 and 1440x900 stayed on five rows needing 765px, 1920x1080 on four needing
+ * 707. No column gap down to 4px buys the row back, so the row gap pays: at 4px the four sizes need
+ * 794, 757, 757 and 701px of 800, 768, 900 and 1080.
+ * The thirty-fifth entry (OPC UA) takes a sixth row at 1280x800 on its own and scrolled that size
+ * by 4px, the other three unchanged. THE COLUMN GAP CANNOT PAY FOR THIS ONE, measured in a browser:
+ * at 4px and at 2px the label still wraps, and 2px buys the fifth row back only by crowding every
+ * label on the page against the next one's icon. The ROW gap pays for it instead, at 4px, which
+ * leaves all four row counts as they are and measures 800, 768, 900 and 1080px of 800, 768, 900 and
+ * 1080. 1280x800 needs 794 of its 800, measured by sweeping the viewport height at that width, so
+ * the 4px gap leaves 6px rather than nothing and the entry after next is what spends the padding.
+ * The thirty-seventh entry (Apache Spark) wrapped 1366x768 into a sixth row and scrolled it to
+ * 777px at the 4px row gap, while 1280x800 kept its six rows needing 794 and 1440x900 and 1920x1080
+ * kept five and four; at the 2px row gap the four sizes need 784, 767, 749 and 695px of 800, 768,
+ * 900 and 1080.
+ * The forty-second entry (Sparkplug B, #1720) took a SEVENTH row at 1280x800 and scrolled that size
+ * to 802px of its 800, the other three unchanged on six, six and four rows. THIS ONE THE GAPS
+ * CANNOT PAY FOR, and the sweep is why rather than a hunch: measured in a container at the four
+ * sizes, moving one lever at a time, 1280x800 needs
+ *
+ *     gap-x 6 / gap-y 2 / py-8   802 of 800   (this is the overflow)
+ *     gap-x 6 / gap-y 1 / py-8   796           4px left
+ *     gap-x 6 / gap-y 0 / py-8   790          10px left
+ *     gap-x 4 / gap-y 1 / py-8   796           the column gap buys NOTHING here
+ *     gap-x 6 / gap-y 2 / py-7   794           6px left
+ *     gap-x 6 / gap-y 2 / py-6   786          14px left
+ *
+ * so the hero column's padding pays, 32px to 24px (login-form.tsx), and both gaps stay as they
+ * are. A 1px or 0px row gap would buy less than the padding does AND put seven rows of 12px type
+ * against each other; the column gap is at its floor and moving it down to 4px does not change a
+ * single one of the four row counts. 14px left is what the page had at forty-one entries (784 of
+ * 800), so the next entry is the one that spends it. The control is in the same sweep: with the
+ * last item hidden, forty-one entries need 784 of 800 on six rows, which is what main measures.
+ */
 function DesktopDatabases() {
   return (
     <ul
       aria-label="Supported databases"
       data-testid="database-showcase-desktop"
-      className="flex flex-wrap gap-x-5 gap-y-2.5 pointer-events-none select-none"
+      className="flex flex-wrap gap-x-1.5 gap-y-0.5 pointer-events-none select-none"
     >
       {listShowcaseDatabases().map((db) => {
         const Icon = db.icon;

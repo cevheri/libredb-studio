@@ -7,15 +7,20 @@
  * flag is off.
  */
 
-import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import { configureAgentModel, restoreAgentModel } from "../../helpers/agent-model-env";
 import { createMockRequest, parseResponseJSON } from "../../helpers/mock-next";
 import { AGENT_ENABLED_ENV } from "@/lib/agent/config";
 import { AgentRunServiceError } from "@/lib/agent/run-service";
+import { logger } from "@/lib/logger";
 import { clearRateLimitState } from "@/lib/api/rate-limit";
 import * as realAuth from "@/lib/auth";
 import * as realSeed from "@/lib/seed/resolve-connection";
 import * as realGate from "@/lib/agent/capability-gate";
+import * as realDb from "@/lib/db";
+import * as realManifest from "@/lib/agent/agent-manifest";
+import { DatabaseConfigError } from "@/lib/db/errors";
+import { LLMConfigError } from "@/lib/llm/types";
 import { AgentRunStoreError } from "@/lib/agent/run-store";
 import { agentPosture } from "@/lib/agent/posture";
 import { AGENT_WORKFLOW_SENDS_STATEMENTS, type AgentRunWorkflowType } from "@/lib/agent/types";
@@ -42,6 +47,13 @@ const mockResolveConnection = mock(async (body: { connectionId?: string }) => ({
   type: "postgres",
 }));
 
+const mockForCatalog = mock(async (_catalog: string) => ({}));
+const mockGetOrCreateProvider = mock(async () => ({
+  type: "postgres",
+  getCapabilities: () => ({ catalogSessions: true }),
+  forCatalog: mockForCatalog,
+}));
+
 // ─── The runtime: service and drive ─────────────────────────────────────────
 
 interface FakeRun {
@@ -55,6 +67,7 @@ interface FakeRun {
   actor: { sessionId: string; role: string };
   connectionId: string;
   connectionIdentity?: string;
+  catalog?: string;
   objective: string;
   events: unknown[];
   thread: { threadId: string; steps: { runId: string; objective: string }[]; text: string; declined?: string };
@@ -98,9 +111,11 @@ const mockStart = mock(
     workflowSource?: string;
     workflowReading?: string;
     autoExecute?: boolean;
+    statementLanguage?: string;
     actor: FakeRun["actor"];
     connectionId: string;
     connectionIdentity?: string;
+    catalog?: string;
     objective: string;
     thread?: { threadId: string; steps: { runId: string; objective: string }[]; text: string; declined?: string };
   }) => {
@@ -120,6 +135,18 @@ const mockCancel = mock(async (runId: string) => {
   return { record, cancellationRequested: true };
 });
 
+const mockPause = mock(async (runId: string) => {
+  const record = runs.get(runId);
+  if (record === undefined) return null;
+  return { ...record, status: "paused" };
+});
+
+const mockUnpause = mock(async (runId: string) => {
+  const record = runs.get(runId);
+  if (record === undefined) return null;
+  return { ...record, status: "running" };
+});
+
 const mockStream = mock(
   async () =>
     new ReadableStream({
@@ -133,6 +160,13 @@ const mockStream = mock(
 const mockDriveAgentRun = mock(async () => ({ runId: "arun_new", status: "succeeded" }));
 
 /**
+ * The manifest's own answer unless a test names another. The route has two refusals the manifest cannot produce
+ * today, a missing variant and an unmet requirement, and this is how their branch is driven.
+ */
+const realWorkflowAvailability = realManifest.workflowAvailability;
+const mockWorkflowAvailability = mock(realWorkflowAvailability);
+
+/**
  * Re-applied in `beforeEach` as well as at import time: `mock.module` replaces a
  * module process-wide, and `tests/api/agent/drive.test.ts` mocks the same runtime
  * module in the same process under `bun run test`. Re-registering makes the file
@@ -142,17 +176,32 @@ function installMocks(): void {
   // Spread over the real modules rather than listing their exports: a partial
   // replacement stays installed for the rest of the process and breaks the next
   // file that imports an export this one forgot.
-  mock.module("@/lib/auth", () => ({ ...realAuth, getSession: mockGetSession }));
+  mock.module("@/lib/auth", () => ({
+    ...realAuth,
+    getSession: mockGetSession,
+    readSession: mock(async () => {
+      const s = await mockGetSession();
+      return s ? { kind: "authenticated", session: s } : { kind: "anonymous" };
+    }),
+  }));
   // The gate would otherwise build a real model and, where a key is configured, put a
   // live probe call inside this suite.
   mock.module("@/lib/agent/capability-gate", () => ({ ...realGate, admitAgentModel: mockAdmitAgentModel }));
   mock.module("@/lib/seed/resolve-connection", () => ({ ...realSeed, resolveConnection: mockResolveConnection }));
+  // Opening a database's session connects; the suite answers it instead (#1530).
+  mock.module("@/lib/db", () => ({ ...realDb, getOrCreateProvider: mockGetOrCreateProvider }));
+  mock.module("@/lib/agent/agent-manifest", () => ({
+    ...realManifest,
+    workflowAvailability: mockWorkflowAvailability,
+  }));
   mock.module("@/lib/agent/runtime", () => ({
     getAgentRunService: mock(async () => ({
       start: mockStart,
       status: mockStatus,
       cancel: mockCancel,
       stream: mockStream,
+      pause: mockPause,
+      unpause: mockUnpause,
     })),
     driveAgentRun: mockDriveAgentRun,
     // Listed although this file's routes never call it: the replacement is
@@ -164,7 +213,7 @@ function installMocks(): void {
 installMocks();
 
 const { POST } = await import("@/app/api/agent/runs/route");
-const { GET, DELETE } = await import("@/app/api/agent/runs/[runId]/route");
+const { GET, DELETE, PATCH } = await import("@/app/api/agent/runs/[runId]/route");
 const { GET: STREAM } = await import("@/app/api/agent/runs/[runId]/stream/route");
 
 function params(runId: string): { params: Promise<{ runId: string }> } {
@@ -192,6 +241,11 @@ beforeEach(() => {
   mockAdmitAgentModel.mockImplementation(async () => ({ kind: "allowed", protocol: "native" }));
   mockStart.mockClear();
   mockResolveConnection.mockClear();
+  mockPause.mockClear();
+  mockUnpause.mockClear();
+  mockWorkflowAvailability.mockClear();
+  // The captured original, not the namespace's: once the module is replaced, the namespace answers the mock itself.
+  mockWorkflowAvailability.mockImplementation(realWorkflowAvailability);
 });
 
 afterEach(() => {
@@ -287,6 +341,47 @@ describe("POST /api/agent/runs", () => {
     } finally {
       // Restored by hand: `mock.module` is re-applied per test with the SAME mock
       // object, so an implementation left here would outlive this test.
+      if (original !== undefined) mockResolveConnection.mockImplementation(original);
+    }
+  });
+
+  // The same decline for a role edit: the role decides what every statement may read, so a conversation started
+  // under one role is not carried under another although the record and its address are unchanged.
+  test("a follow-up after the connection's role changed declines as re-pointed", async () => {
+    const original = mockResolveConnection.getMockImplementation();
+    const underRole = (role: string) => async (body: { connectionId?: string }) => ({
+      id: body.connectionId ?? "seed:sales",
+      name: "Sales",
+      type: "postgres",
+      role,
+    });
+    try {
+      mockResolveConnection.mockImplementation(underRole("A"));
+      await POST(startRequest(VALID_BODY));
+      const establishedIdentity = mockStart.mock.calls.at(-1)?.[0].connectionIdentity;
+      expect(establishedIdentity).toEqual(expect.any(String));
+      runs.set(
+        "arun_1",
+        fakeRun({
+          status: "succeeded",
+          connectionIdentity: establishedIdentity,
+          events: [
+            {
+              kind: "report-composed",
+              atMs: 1,
+              claims: [{ claim: "A fact", evidence: [{ source: "artifact", correlationId: "corr_1" }] }],
+            },
+          ],
+        }),
+      );
+
+      mockResolveConnection.mockImplementation(underRole("B"));
+      const res = await POST(startRequest({ ...VALID_BODY, previousRunId: "arun_1" }));
+
+      expect(res.status).toBe(202);
+      expect(mockStart.mock.calls.at(-1)?.[0].thread).toMatchObject({ steps: [], text: "", declined: "repointed" });
+      expect(mockStart.mock.calls.at(-1)?.[0].connectionIdentity).not.toBe(establishedIdentity);
+    } finally {
       if (original !== undefined) mockResolveConnection.mockImplementation(original);
     }
   });
@@ -504,6 +599,35 @@ describe("POST /api/agent/runs", () => {
   });
 
   /*
+    A configuration the model refuses (an `LLM_MODEL_EFFORT` the model does not take) is not
+    a capability verdict: the gate throws the configuration error, and the route answers it
+    the way every route answers one, so the rail shows the sentence and offers no other mode.
+  */
+  test.each(["agent", "planning"])(
+    "a reasoning effort the model refuses is answered as a configuration error before a %s run opens",
+    async (mode) => {
+      const message =
+        'LLM_MODEL_EFFORT "none" was refused for the model "gpt-6.1-sol" (openai). Change LLM_MODEL_EFFORT or unset it.';
+      mockAdmitAgentModel.mockImplementation(async () => {
+        throw new LLMConfigError(message, "openai", "effort_refused");
+      });
+
+      const res = await POST(startRequest({ ...VALID_BODY, mode }));
+      const body = await parseResponseJSON<{ error: string; code: string; missing?: unknown }>(res);
+
+      // Planning is asked too, since it sends the same effort. This pins the route's half only: the
+      // gate's own refusal at the build, in both modes, is pinned in agent-capability-gate.test.ts.
+      expect(mockAdmitAgentModel).toHaveBeenCalledWith(mode);
+      expect(res.status).toBe(503);
+      expect(body.error).toBe(message);
+      expect(body.code).toBe("LLM_CONFIG");
+      expect(body.missing).toBeUndefined();
+      expect(mockStart).not.toHaveBeenCalled();
+      expect(mockDriveAgentRun).not.toHaveBeenCalled();
+    },
+  );
+
+  /*
     What the probe WATCHED fail travels too, because `missing` alone cannot answer the
     question the rail asks of it. An endpoint that refused the tool request establishes
     nothing about streaming; one that answered a streamed request with a buffered body
@@ -629,6 +753,133 @@ describe("POST /api/agent/runs", () => {
     expect(res.status).toBe(202);
     expect(mockStart).toHaveBeenCalledTimes(1);
   });
+
+  test("a Cassandra investigation is refused with the posture's own paragraph", async () => {
+    mockResolveConnection.mockResolvedValueOnce({ id: "seed:docs", name: "Docs", type: "cassandra" });
+
+    const res = await POST(startRequest({ ...VALID_BODY, workflowType: "investigation" }));
+    const body = await parseResponseJSON<{ error: string; refused?: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(body.error).toBe(
+      agentPosture({ mode: "agent", engine: "cassandra", engineLabel: getDBConfig("cassandra").label, handover: false })
+        .body,
+    );
+    // The listed engines include a cluster, which no database bounds, so the refusal
+    // promises a declared boundary rather than a database-native one.
+    expect(body.error).toContain("a read-only statement path under a boundary it declares");
+    expect(body.error).not.toContain("database-native");
+    expect(body.refused).toBe("engine-unsupported");
+    expect(mockStart).not.toHaveBeenCalled();
+  });
+
+  test("a MongoDB investigation opens under the mongo language (issue #1614)", async () => {
+    mockResolveConnection.mockResolvedValueOnce({ id: "seed:docs", name: "Docs", type: "mongodb" });
+
+    const res = await POST(startRequest({ ...VALID_BODY, workflowType: "investigation" }));
+
+    expect(res.status).toBe(202);
+    expect(mockStart).toHaveBeenCalledTimes(1);
+    expect(mockStart.mock.calls[0]?.[0].statementLanguage).toBe("mongo");
+  });
+
+  test("a Postgres run is opened with no statement language and no verifier, so its header is unchanged", async () => {
+    for (const mode of ["agent", "planning"]) {
+      mockStart.mockClear();
+      const res = await POST(startRequest({ ...VALID_BODY, mode, workflowType: "query-optimization" }));
+      expect(res.status, mode).toBe(202);
+      const input = mockStart.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(Object.hasOwn(input, "statementLanguage"), mode).toBe(false);
+      expect(Object.hasOwn(input, "verifier"), mode).toBe(false);
+    }
+  });
+
+  test("a run opened under another language persists it, and its verifier", async () => {
+    const variant = {
+      ...realManifest.requiredVariant("sql", "investigation"),
+      verifier: "agent-database-assessment.1" as const,
+    };
+    mockWorkflowAvailability.mockImplementationOnce(() => ({ open: true, statementLanguage: "kubectl", variant }));
+
+    const res = await POST(startRequest({ ...VALID_BODY, workflowType: "investigation" }));
+
+    expect(res.status).toBe(202);
+    expect(mockStart.mock.calls[0]?.[0]).toMatchObject({
+      statementLanguage: "kubectl",
+      verifier: "agent-database-assessment.1",
+    });
+  });
+
+  test("auto-execute is refused on a Kubernetes data-analysis run, whose answer is never run in the editor", async () => {
+    mockResolveConnection.mockResolvedValueOnce({ id: "seed:cluster", name: "Cluster", type: "kubernetes" });
+
+    const res = await POST(startRequest({ ...VALID_BODY, workflowType: "data-analysis", autoExecute: true }));
+    const body = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(body.error).toBe(
+      "autoExecute is not offered for this workflow on this engine: its answer is never run in the editor.",
+    );
+    expect(mockStart).not.toHaveBeenCalled();
+    expect(mockDriveAgentRun).not.toHaveBeenCalled();
+  });
+
+  test("the same Kubernetes data-analysis run without auto-execute opens under the kubectl variant", async () => {
+    mockResolveConnection.mockResolvedValueOnce({ id: "seed:cluster", name: "Cluster", type: "kubernetes" });
+
+    const res = await POST(startRequest({ ...VALID_BODY, workflowType: "data-analysis" }));
+
+    expect(res.status).toBe(202);
+    expect(mockStart.mock.calls[0]?.[0]).toMatchObject({ workflowType: "data-analysis", statementLanguage: "kubectl" });
+  });
+
+  // No plan of a MongoDB answer can be weighed, so the gate could only ever decline: the setting is refused at the
+  // door, before a run id or a model call, exactly as on a cluster.
+  test("auto-execute is refused on a MongoDB data-analysis run, whose answer is never run in the editor", async () => {
+    mockResolveConnection.mockResolvedValueOnce({ id: "seed:docs", name: "Docs", type: "mongodb" });
+
+    const res = await POST(startRequest({ ...VALID_BODY, workflowType: "data-analysis", autoExecute: true }));
+    const body = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(body.error).toBe(
+      "autoExecute is not offered for this workflow on this engine: its answer is never run in the editor.",
+    );
+    expect(mockStart).not.toHaveBeenCalled();
+    expect(mockDriveAgentRun).not.toHaveBeenCalled();
+  });
+
+  test("the same MongoDB data-analysis run without auto-execute opens under the mongo variant", async () => {
+    mockResolveConnection.mockResolvedValueOnce({ id: "seed:docs", name: "Docs", type: "mongodb" });
+
+    const res = await POST(startRequest({ ...VALID_BODY, workflowType: "data-analysis" }));
+
+    expect(res.status).toBe(202);
+    expect(mockStart.mock.calls[0]?.[0]).toMatchObject({ workflowType: "data-analysis", statementLanguage: "mongo" });
+  });
+
+  test("a Postgres data-analysis run with auto-execute still opens", async () => {
+    const res = await POST(startRequest({ ...VALID_BODY, workflowType: "data-analysis", autoExecute: true }));
+
+    expect(res.status).toBe(202);
+    expect(mockStart).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["no-variant", "requirement-unmet"] as const)(
+    "a %s refusal answers its own sentence under the engine marker, before a run or a model call",
+    async (cause) => {
+      mockWorkflowAvailability.mockImplementationOnce(() => ({ open: false, cause, sentence: `refused: ${cause}` }));
+
+      const res = await POST(startRequest({ ...VALID_BODY, workflowType: "investigation" }));
+      const body = await parseResponseJSON<{ error: string; refused?: string }>(res);
+
+      expect(res.status).toBe(400);
+      expect(body).toEqual({ error: `refused: ${cause}`, refused: "engine-unsupported" });
+      expect(mockWorkflowAvailability).toHaveBeenCalledWith("agent", "investigation", "postgres");
+      expect(mockStart).not.toHaveBeenCalled();
+      expect(mockAdmitAgentModel).not.toHaveBeenCalled();
+    },
+  );
 
   test("an engine that HAS a read-only statement path opens every workflow", async () => {
     // The negative control: without it the refusal above could be refusing everything.
@@ -961,12 +1212,36 @@ describe("POST /api/agent/runs", () => {
   test("the surface does not exist when no model is configured at all", async () => {
     // The other half of the derived answer (#331 T5). A server with the AI
     // configuration removed has no agent to route to, and says so the same way.
-    for (const key of ["LLM_PROVIDER", "LLM_API_KEY", "LLM_MODEL", "LLM_API_URL"]) delete process.env[key];
+    for (const key of ["LLM_PROVIDER", "LLM_API_KEY", "LLM_MODEL", "LLM_API_URL", "LLM_MODEL_EFFORT"])
+      delete process.env[key];
 
     const res = await POST(startRequest(VALID_BODY));
 
     expect(res.status).toBe(404);
     expect(mockStart).not.toHaveBeenCalled();
+  });
+
+  /*
+    Governance mode holds the agent off in this version (docs/GOVERNANCE.md). The boot
+    refuses LIBREDB_AGENT_ENABLED switched on, and this sets GOVERNANCE_SOURCE after
+    boot beside a configured model, so the 404 is the runtime's own refusal.
+  */
+  test("governance: POST /api/agent/runs answers 404 although an LLM is configured", async () => {
+    const saved = process.env.GOVERNANCE_SOURCE;
+    process.env.GOVERNANCE_SOURCE = "postgres";
+    try {
+      const res = await POST(startRequest(VALID_BODY));
+      const body = await parseResponseJSON<{ error: string }>(res);
+
+      expect(res.status).toBe(404);
+      expect(body.error).toBe("The agent runtime is not enabled on this server");
+      expect(mockAdmitAgentModel).not.toHaveBeenCalled();
+      expect(mockResolveConnection).not.toHaveBeenCalled();
+      expect(mockStart).not.toHaveBeenCalled();
+    } finally {
+      if (saved === undefined) delete process.env.GOVERNANCE_SOURCE;
+      else process.env.GOVERNANCE_SOURCE = saved;
+    }
   });
 
   test("an unknown mode is refused", async () => {
@@ -1147,6 +1422,143 @@ describe("DELETE /api/agent/runs/[runId]", () => {
   });
 });
 
+describe("PATCH /api/agent/runs/[runId]", () => {
+  test("pauses a run", async () => {
+    const res = await PATCH(
+      createMockRequest("/api/agent/runs/arun_1", { method: "PATCH", body: { action: "pause" } }),
+      params("arun_1"),
+    );
+    const body = await parseResponseJSON<{ status: string }>(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("paused");
+    expect(mockPause).toHaveBeenCalledWith("arun_1");
+  });
+
+  test("resumes a run and drives it again in this process", async () => {
+    const res = await PATCH(
+      createMockRequest("/api/agent/runs/arun_1", { method: "PATCH", body: { action: "resume" } }),
+      params("arun_1"),
+    );
+    const body = await parseResponseJSON<{ status: string }>(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("running");
+    expect(mockUnpause).toHaveBeenCalledWith("arun_1");
+    // The whole point of Resume: the run is picked up now, not at the reaper's
+    // staleness threshold.
+    expect(mockDriveAgentRun).toHaveBeenCalledWith("arun_1");
+  });
+
+  test("a resume whose re-drive fails logs the failure without failing the resume", async () => {
+    mockDriveAgentRun.mockRejectedValueOnce(new Error("model unreachable"));
+    const error = spyOn(logger, "error").mockImplementation(() => {});
+    try {
+      const res = await PATCH(
+        createMockRequest("/api/agent/runs/arun_1", { method: "PATCH", body: { action: "resume" } }),
+        params("arun_1"),
+      );
+      const body = await parseResponseJSON<{ status: string }>(res);
+      // The re-drive is fire-and-forget: its failure lands on the server log, not on
+      // the response, which already answered from the ledger.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      expect(res.status).toBe(200);
+      expect(body.status).toBe("running");
+      expect(mockDriveAgentRun).toHaveBeenCalledWith("arun_1");
+      expect(error).toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  test("a resume that lost the race to the run's end answers it without driving an ended run", async () => {
+    // `unpause` answered a terminal record — another writer ended the run between the
+    // render and the click. That is a normal answer (item 5), not a run to drive:
+    // driving it would resolve a connection and build a provider for a run already over.
+    mockUnpause.mockResolvedValueOnce(fakeRun({ status: "cancelled" }));
+
+    const res = await PATCH(
+      createMockRequest("/api/agent/runs/arun_1", { method: "PATCH", body: { action: "resume" } }),
+      params("arun_1"),
+    );
+    const body = await parseResponseJSON<{ status: string }>(res);
+
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("cancelled");
+    expect(mockUnpause).toHaveBeenCalledWith("arun_1");
+    expect(mockDriveAgentRun).not.toHaveBeenCalled();
+  });
+
+  test("a pause that fails for a reason the service cannot name still answers 500, not 409", async () => {
+    mockPause.mockRejectedValueOnce(new Error("ledger corrupted"));
+
+    const res = await PATCH(
+      createMockRequest("/api/agent/runs/arun_1", { method: "PATCH", body: { action: "pause" } }),
+      params("arun_1"),
+    );
+
+    expect(res.status).toBe(500);
+  });
+
+  test("refuses an action the service has no words for", async () => {
+    const res = await PATCH(
+      createMockRequest("/api/agent/runs/arun_1", { method: "PATCH", body: { action: "explode" } }),
+      params("arun_1"),
+    );
+
+    expect(res.status).toBe(400);
+  });
+
+  test("refuses a body that is not JSON", async () => {
+    const req = new Request("http://localhost:3000/api/agent/runs/arun_1", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: "not-json",
+    });
+
+    const res = await PATCH(req, params("arun_1"));
+
+    expect(res.status).toBe(400);
+  });
+
+  test("reports a service refusal as a 409, never a 500", async () => {
+    mockPause.mockRejectedValueOnce(new AgentRunServiceError("RUN_NOT_RUNNING", "the run is not running"));
+
+    const res = await PATCH(
+      createMockRequest("/api/agent/runs/arun_1", { method: "PATCH", body: { action: "pause" } }),
+      params("arun_1"),
+    );
+
+    expect(res.status).toBe(409);
+  });
+
+  test("refuses to pause a run that was already asked to stop, with a 409", async () => {
+    mockPause.mockRejectedValueOnce(
+      new AgentRunServiceError("RUN_CANCELLATION_PENDING", "the run has a pending cancellation"),
+    );
+
+    const res = await PATCH(
+      createMockRequest("/api/agent/runs/arun_1", { method: "PATCH", body: { action: "pause" } }),
+      params("arun_1"),
+    );
+
+    expect(res.status).toBe(409);
+  });
+
+  test("another session cannot pause the run", async () => {
+    mockGetSession.mockResolvedValue({ role: "user", username: "grace" });
+
+    const res = await PATCH(
+      createMockRequest("/api/agent/runs/arun_1", { method: "PATCH", body: { action: "pause" } }),
+      params("arun_1"),
+    );
+
+    expect(res.status).toBe(404);
+    expect(mockPause).not.toHaveBeenCalled();
+  });
+});
+
 describe("GET /api/agent/runs/[runId]/stream", () => {
   test("streams the run's timeline as newline-delimited entries", async () => {
     const res = await STREAM(createMockRequest("/api/agent/runs/arun_1/stream"), params("arun_1"));
@@ -1162,5 +1574,47 @@ describe("GET /api/agent/runs/[runId]/stream", () => {
     const res = await STREAM(createMockRequest("/api/agent/runs/arun_1/stream"), params("arun_1"));
 
     expect(res.status).toBe(404);
+  });
+});
+
+// ─── Server-level connections (#1530) ───────────────────────────────────────
+describe("POST /api/agent/runs on a server-level connection (#1530)", () => {
+  const SERVER = { id: "seed:sales", name: "Sales", type: "postgres", host: "db.internal", database: "" };
+  const defaultConnection = async (body: { connectionId?: string }) => ({
+    id: body.connectionId ?? "seed:sales",
+    name: "Sales",
+    type: "postgres",
+  });
+
+  beforeEach(() => {
+    mockResolveConnection.mockImplementation(async () => SERVER);
+    mockForCatalog.mockImplementation(async () => ({}));
+    mockStart.mockClear();
+  });
+
+  afterEach(() => {
+    mockResolveConnection.mockImplementation(defaultConnection);
+  });
+
+  test("a run reads the database it names, which is part of its identity and echoed back", async () => {
+    const res = await POST(startRequest({ ...VALID_BODY, catalog: "shop" }));
+    expect(res.status).toBe(202);
+    expect((await parseResponseJSON<{ catalog?: string }>(res)).catalog).toBe("shop");
+    const shop = mockStart.mock.calls.at(-1)?.[0];
+    expect(shop?.catalog).toBe("shop");
+    await POST(startRequest({ ...VALID_BODY, catalog: "analytics" }));
+    expect(mockStart.mock.calls.at(-1)?.[0].connectionIdentity).not.toBe(shop?.connectionIdentity);
+  });
+
+  test("no database, one the role cannot open, a malformed one, or one on a pinned connection is refused", async () => {
+    expect((await POST(startRequest(VALID_BODY))).status).toBe(400);
+    expect((await POST(startRequest({ ...VALID_BODY, catalog: 5 }))).status).toBe(400);
+    mockForCatalog.mockImplementation(async () => {
+      throw new DatabaseConfigError('"payroll" is not a database this PostgreSQL connection can open', "postgres");
+    });
+    expect((await POST(startRequest({ ...VALID_BODY, catalog: "payroll" }))).status).toBe(400);
+    mockResolveConnection.mockImplementation(async () => ({ ...SERVER, database: "sales" }));
+    expect((await POST(startRequest({ ...VALID_BODY, catalog: "shop" }))).status).toBe(400);
+    expect(mockStart).not.toHaveBeenCalled();
   });
 });

@@ -1,0 +1,19 @@
+# WHY THE SNMP live check STEP IS NOT IN THIS FILE ANY MORE.
+#
+# This file used to carry the step itself, staged here because five engines were landing in
+# one round and five sessions editing one workflow would have been that round's merge in
+# miniature. Whoever owned the workflow was to paste it in. MEASURED 19 October 2026: the
+# paste never happened for any of the six engines, so none of the nineteen workflow files
+# mentioned this fixture and the live check ran only by hand.
+#
+# The step now lives in `.github/workflows/ci.yml`, in the `functional-smoke` job, named
+# `SNMP live check`. It is not duplicated here on purpose: the pin this fixture runs is held equal to
+# the compose fragment's by a test, and a pin that lives in a third file nobody compares is a
+# third pin. What stays here is the reasoning the step is too short to carry.
+#
+# It goes after the RabbitMQ read-only check, whose shape it follows. The fixture is built rather
+# than pulled (class A2: third-party source, pinned - the base image by digest and the two Net-SNMP
+# packages by version), so there is no image digest to name here; what is pinned, and what this
+# step carries, is the BASE digest, and tests/unit/db/snmp/fixture-pin.test.ts holds the value
+# below equal to the one in docker/snmp/Dockerfile. A digest that lives in two files and is
+# compared by nobody is two digests.

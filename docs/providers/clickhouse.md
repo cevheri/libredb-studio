@@ -6,6 +6,8 @@
 > ClickHouse provider: design, architecture, usage, and tests. If you are reading the code, extending
 > ClickHouse support, or authoring a new provider, start here.
 
+`DB_HTTP_BLOCK_PRIVATE_HOSTS=true` blocks loopback, private, link-local and other non-public HTTP destinations; it is off by default so local connections work.
+
 | | |
 |---|---|
 | **Status** | Implemented & shipped |
@@ -18,7 +20,7 @@
 | **Connection string** | Supported (`clickhouse://`, plain `http://` / `https://`) |
 | **EXPLAIN** | `clickhouse-json` — estimate only; ClickHouse's `EXPLAIN` never executes the statement, so there is no separate analyze mode |
 | **Transactions** | Not exposed (ClickHouse has no multi-statement transactions to expose) |
-| **Query cancellation** | No `cancelQuery`; a running statement is killed via maintenance `kill` |
+| **Query cancellation** | Yes: each run gets a generated `query_id`, and `cancelQuery` sends `KILL QUERY ... SYNC` for it ([§5.4](#54-cancellation)) |
 | **Source** | [`src/lib/db/providers/sql/clickhouse/`](../../src/lib/db/providers/sql/clickhouse/) |
 | **Tests** | [`tests/integration/db/clickhouse-provider.test.ts`](../../tests/integration/db/clickhouse-provider.test.ts) + [`tests/unit/db/clickhouse/`](../../tests/unit/db/clickhouse/) + [`tests/unit/lib/explain/clickhouse-json.test.ts`](../../tests/unit/lib/explain/clickhouse-json.test.ts) |
 | **Tracking issue** | [#264 — Add ClickHouse provider](https://github.com/libredb/libredb-studio/issues/264) |
@@ -54,16 +56,30 @@ from:
 
 | `DatabaseProvider` slot | ClickHouse realisation | Mechanism |
 |-------------------------|-------------------------|-----------|
-| "Table" (`TableSchema`) | A table, displayed as `name` or `database.name` | `system.tables`, filtered to non-system databases |
-| "Row" | One result row | JSON `data` array element |
+| "Table" (the relation kind) | A table, displayed as `name` or `database.name` | `system.tables`, filtered to non-system databases |
+| "Row" | One result row | JSONCompact `data` array element, read by position |
 | Columns | The declared column list, types verbatim | `system.columns` / the query response `meta` |
 | Primary key | The MergeTree sparse primary index | `system.tables.primary_key`, `is_in_primary_key` |
-| `query(sql)` | One SQL statement | `POST /?default_format=JSON` |
-| Indexes | The primary key, the sorting key (when it differs), and data-skipping indexes | `system.tables` + `system.data_skipping_indices` |
+| `query(sql)` | One SQL statement | `POST /?default_format=JSONCompact` |
+| Indexes | Data-skipping indexes, and nothing else ([below](#indexes-are-only-the-skipping-indexes)) | `system.data_skipping_indices` |
 | Foreign keys | none (ClickHouse has none) | always `[]` |
 | `getOverview()` / storage | Server identity, connection counts, part sizes | `version()`, `uptime()`, `system.metrics`, `system.parts`, `system.disks` |
 | `getSlowQueries()` / `getActiveSessions()` | Finished and in-flight statements | `system.query_log`, `system.processes` |
 | Maintenance | `optimize` / `analyze` / `kill` | `OPTIMIZE TABLE ... FINAL`, a `system.parts` summary, `KILL QUERY ... SYNC` |
+
+#### Indexes are only the skipping indexes
+
+A MergeTree table with no data-skipping index reports **no index at all**, and that is a change from
+the flat schema reading this replaced. That reading synthesized two entries out of the table's
+engine clause, one labelled `PRIMARY KEY` and one `ORDER BY`, so every MergeTree table appeared to
+carry two indexes. Neither is an index object: ClickHouse's primary index is a sparse mark file the
+sorting key defines, it has no name of its own, and `system.data_skipping_indices` - the one catalog
+of named index objects on this engine - holds no row for it.
+
+The key columns are still reported, where they belong: a column that is part of the primary key is
+marked `isPrimary` from `system.columns.is_in_primary_key`, which is the catalog's own answer rather
+than a parse of the DDL. So nothing was measured and then dropped; what went was a pair of rows that
+named a structure ClickHouse does not model as an index.
 
 ---
 
@@ -109,25 +125,31 @@ ClickHouseProvider (clickhouse/index.ts)
 Couchbase does — because the dialect really is standard on the points the shared helpers care
 about: double-quoted identifiers and `LIMIT n OFFSET m` are both correct here, live-verified
 (`SELECT "id" FROM "probe"` and the bare unquoted form both parse). This is exactly the case
-[`docs/ADDING_A_PROVIDER.md`](../ADDING_A_PROVIDER.md) names ClickHouse for. Only `prepareQuery()`
-is overridden, for the trailing-clause trap in [§3.8](#38-the-preparequery-override).
+[`docs/ADDING_A_PROVIDER.md`](../ADDING_A_PROVIDER.md) names ClickHouse for. `escapeIdentifier()`
+carries one dialect correction, below; `prepareQuery()` is overridden for the trailing-clause trap
+in [§3.8](#38-the-preparequery-override).
 
 ### 2.3 What `SQLBaseProvider` gives for free
 
-`ClickHouseProvider` reuses these inherited members rather than reimplementing them:
+`ClickHouseProvider` reuses these inherited members rather than reimplementing them, except where
+the table says otherwise:
 
 | Member | Purpose |
 |--------|---------|
-| `escapeIdentifier()` | Double-quoted, since `this.type` (`clickhouse`) falls through to the default branch — the same quoting PostgreSQL uses. Both quoted and unquoted forms parse (live-verified) |
+| `escapeIdentifier()` | **Overridden here.** Double-quoted, the same quoting PostgreSQL uses, plus a doubled BACKSLASH: the inherited form doubles only the quote character, and a backslash is an ESCAPE inside a quoted identifier on this engine, so a name ending in one swallowed its own closing quote (#1091 review). See [§8](#8-maintenance) |
 | `buildLimitClause()` | `LIMIT n` / `LIMIT n OFFSET m` |
-| `getPlaceholder()` | Falls through to `?`, but is moot here: ClickHouse binds only named `{name:Type}` parameters over HTTP, and `query()` throws rather than send an unbound `?` ([§5.1](#51-execution)) |
 | `shouldEnableSSL()` | Inherited but **never called**, and deliberately so. It infers TLS from substrings in the host (`cloud`, `aws`, …), which would silently switch a self-hosted node whose hostname merely contains one of them. TLS here comes from the connection's own `ssl` config or from an `https://` scheme, never from a guess ([§4.3](#43-tls)) |
 | `prepareQuery()` (base) | The shared query limiter; `ClickHouseProvider` calls it first and only overrides the trailing-clause case |
 
+Not in the list: a placeholder helper. `SQLBaseProvider` no longer has one (#304 removed it), and
+ClickHouse would not use it anyway — the HTTP interface binds only named `{name:Type}` parameters,
+so a positional `?` never applies, and `query()` throws rather than send one unbound
+([§5.1](#51-execution)).
+
 ### 2.4 Registration & lifecycle
 
-The factory wires ClickHouse in via a dynamic import
-([`factory.ts:87`](../../src/lib/db/factory.ts)):
+The factory wires ClickHouse in via a dynamic import inside `createDatabaseProvider()`
+([`factory.ts`](../../src/lib/db/factory.ts)):
 
 ```ts
 case 'clickhouse': {
@@ -166,7 +188,7 @@ Couchbase makes in [`docs/ADDING_A_PROVIDER.md`](../ADDING_A_PROVIDER.md).
 ### 3.2 The transport seam: one interface, one implementation
 
 Provider logic never calls `fetch`. It goes through `ClickHouseTransport`
-([transport.ts:114](../../src/lib/db/providers/sql/clickhouse/transport.ts)), so adopting the
+([`transport.ts`](../../src/lib/db/providers/sql/clickhouse/transport.ts)), so adopting the
 native protocol later would be one new file implementing the same contract rather than a rewrite:
 
 ```ts
@@ -181,8 +203,8 @@ There is no second entry point next to `query()`, unlike Couchbase's `manage()`:
 metric, session and storage statistic the provider needs is a `system.*` table reachable by SQL, so
 a permanent second HTTP surface would buy nothing.
 
-The result type is deliberately **neutral** rather than the HTTP response envelope
-([transport.ts:37](../../src/lib/db/providers/sql/clickhouse/transport.ts)):
+The result type, `ClickHouseQueryResult`, is deliberately **neutral** rather than the HTTP
+response envelope ([`transport.ts`](../../src/lib/db/providers/sql/clickhouse/transport.ts)):
 
 ```ts
 interface ClickHouseQueryResult {
@@ -200,13 +222,14 @@ ClickHouse client — HTTP or native — knows the type of the columns it receiv
 artefact. `rawText` is neutral for the same reason: output formats are a server feature, not a REST
 feature. Errors follow the same rule: the transport throws one normalized
 `ClickHouseTransportError { code, name, message }`
-([transport.ts:178](../../src/lib/db/providers/sql/clickhouse/transport.ts)), where `code` is
+([`transport.ts`](../../src/lib/db/providers/sql/clickhouse/transport.ts)), where `code` is
 ClickHouse's own numeric exception code, so the provider switches on a number instead of sniffing
 message strings.
 
 > **Seam rule.** The HTTP envelope identifiers (`X-ClickHouse-Summary`,
 > `X-ClickHouse-Exception-Code`, `X-ClickHouse-Exception-Tag`, `X-ClickHouse-Format`,
-> `default_format`, `output_format_json_quote_64bit_integers`, `elapsed_ns`,
+> `default_format`, `output_format_json_quote_64bit_integers`, `output_format_json_quote_decimals`,
+> `output_format_json_quote_denormals`, `elapsed_ns`,
 > `rows_before_limit_at_least`) must appear **only** in `http-transport.ts`.
 > [`seam-guard.test.ts`](../../tests/unit/db/clickhouse/seam-guard.test.ts) parses every source file
 > in the directory with the TypeScript compiler API — not a grep — and fails the build the moment
@@ -223,7 +246,7 @@ Verified with a purpose-made restricted user granted `SELECT` on one table only:
 
 | Surface as a restricted user | Status | Code |
 |---|---|---|
-| `system.query_log`, `system.processes`, `system.metrics`, `system.data_skipping_indices` | **`500`** | `497` `ACCESS_DENIED` |
+| `system.query_log`, `system.processes`, `system.metrics`, `system.data_skipping_indices`, `system.dictionaries` | **`500`** | `497` `ACCESS_DENIED` |
 | `OPTIMIZE TABLE`, `KILL QUERY` | **`500`** | `497` |
 | `system.tables`, `system.columns` | `200` | — implicitly filtered to what the user may see |
 | `uptime()`, `version()` | `200` | — needs no grant |
@@ -232,29 +255,56 @@ The `497` message reads *"Not enough privileges. To execute this query, it's nec
 grant SELECT"* — it contains neither "access denied" nor "permission denied", so message sniffing
 would miss it entirely. **Detecting** a failure is status-based (`!response.ok`, inside the
 transport); **classifying** it is code-based, from `X-ClickHouse-Exception-Code`
-([index.ts:637](../../src/lib/db/providers/sql/clickhouse/index.ts)). A permission problem looks
-like a server fault by status alone, so any logic keyed on `403` would miss every real denial.
+(`mapClickHouseError()`, [`index.ts`](../../src/lib/db/providers/sql/clickhouse/index.ts)). A
+permission problem looks like a server fault by status alone, so any logic keyed on `403` would
+miss every real denial.
 
 The upside is real: **the schema tree and the overview panel survive a restricted user** — only the
 monitoring panels and maintenance operations that need their own grant degrade
 ([§7](#7-monitoring--health)).
 
-### 3.4 `default_format=JSON` as a URL parameter, never appended to the SQL
+#### Privileges and grants for schema inspection (#1768)
 
-`POST /?default_format=JSON` with the raw statement as the body returns the JSON envelope. User SQL
+Restricted users without server-wide administrative privileges can browse databases and inspect tables safely. Three grants govern what is unlocked in the object tree and schema explorer:
+
+1. **`GRANT SELECT ON system.dictionaries TO <user>`**
+   - **What it unlocks:** Querying the `system.dictionaries` catalog.
+   - When granted, Studio queries `system.dictionaries` to count dictionaries and check dictionary names for the folder split.
+   - When denied (code `497`), only the Dictionaries folder count is marked `{ unavailable: "<refusal reason>" }`, while `listObjects(..., "dictionary")` rejects with `AuthenticationError` (because it queries `system.dictionaries` directly). Tables, views, materialized views, and user-defined functions remain fully usable, and DDL dictionaries (or tables with `ENGINE = Dictionary(...)`) remain listed under the Tables folder rather than breaking the tree or crashing the provider.
+
+2. **`GRANT dictGet ON <database>.* TO <user>`** (or `GRANT SHOW DICTIONARIES ON <database>.* TO <user>`)
+   - **What it unlocks:** The table / dictionary folder split.
+   - **Why this grant is needed for the split:** Measured in #1768, `SELECT ON system.dictionaries` alone returns 0 rows (`dictionary: 0`) for dictionaries in `<database>` if the user lacks dictionary access privileges, so DDL dictionaries still list under the Tables folder. Granting `dictGet ON <database>.*` (or `SHOW DICTIONARIES`) allows ClickHouse to return the database's dictionary rows from `system.dictionaries`, which enables Studio to pull DDL dictionaries out of the Tables folder and list them in the Dictionaries folder.
+
+3. **`GRANT SELECT ON system.data_skipping_indices TO <user>`**
+   - **What it unlocks:** Data-skipping index details on tables.
+   - When granted, skipping indexes defined on MergeTree tables are read and rendered under the Indexes section.
+   - When denied (code `497`), Studio does not fail table description or falsely assert that the table has 0 indexes: visible columns are returned intact with `indexes: { readonly unavailable: string }`, displaying a refusal notice in the UI and preserving the refusal shape across schema diffs, Agent inventories, and MCP tools.
+
+### 3.4 `default_format=JSONCompact` as a URL parameter, never appended to the SQL
+
+`POST /?default_format=JSONCompact` with the raw statement as the body returns the JSONCompact envelope. User SQL
 is never rewritten to add a format — the editor sends exactly what the user typed.
 
+JSONCompact and not JSON, because only a positional row keeps every value.
+Its `meta` is the same as JSON's, and each `data` row is an array of values in `meta` order instead of an object keyed by column name.
+Measured on 26.7.1.1315: the engine qualifies a joined column itself (`b.x`), and that name can collide with a column the statement already calls `b.x`.
+``SELECT a.x, b.x, 3 AS `b.x` FROM (SELECT 1 AS x) a, (SELECT 2 AS x) b`` declares `b.x` twice; under JSON the row is `{"x": 1,"b.x": 2,"b.x": 3}` and `JSON.parse` keeps only `3`, under JSONCompact it is `[1, 2, 3]`.
+The transport numbers the repeated name with the shared `uniqueFieldNames` helper and keys each row by position ([§5.2](#52-result-shaping)).
+A row that is not an array, or whose value count differs from the `meta` column count, is refused with an error rather than shown under guessed names.
+
 **An explicit `FORMAT` in the user's own SQL wins over `default_format`, live-verified.**
-`SELECT 1 FORMAT TSV` genuinely comes back as TSV even with `default_format=JSON` on the URL. The
+`SELECT 1 FORMAT TSV` genuinely comes back as TSV even with `default_format=JSONCompact` on the URL. The
 response header `X-ClickHouse-Format` reports the format the server actually used, and the transport
 branches on it before parsing the body
 ([`toQueryResult`](../../src/lib/db/providers/sql/clickhouse/http-transport.ts)): when it is not
-`JSON`, the raw text comes back as `rawText` rather than being parsed or thrown away — the user asked
-for that format deliberately. The provider then surfaces it as one synthetic column,
-`__text` ([`RAW_TEXT_COLUMN`, index.ts:102](../../src/lib/db/providers/sql/clickhouse/index.ts)),
+`JSONCompact`, the raw text comes back as `rawText` rather than being parsed or thrown away: the user asked
+for that format deliberately.
+That includes an explicit `FORMAT JSON`: it comes back as the server's text under `__text`, like any other format the user chose. The provider then surfaces it as one synthetic column,
+`__text` (`RAW_TEXT_COLUMN`, [`index.ts`](../../src/lib/db/providers/sql/clickhouse/index.ts)),
 the same convention Couchbase uses for a scalar projection.
 
-### 3.5 64-bit integers are quoted on purpose, to stop `JSON.parse` from rounding them
+### 3.5 64-bit integers and decimals are quoted on purpose, to stop `JSON.parse` from rounding them
 
 By default `SELECT toUInt64(18446744073709551615)` returns the **unquoted** JSON number
 `18446744073709551615`, which `JSON.parse` silently rounds to `18446744073709552000` — a real,
@@ -267,6 +317,42 @@ an unquoted number. This matches the `pg` driver's existing `int8`-as-string beh
 already renders it correctly with no further change. Every reader in the provider and the
 introspection module accepts both encodings, because `system.asynchronous_metrics` is `Float64` and
 genuinely arrives unquoted in the same response cycle as a quoted `UInt64` counter elsewhere.
+
+**That setting does not cover `Decimal`, so the transport also sends
+`output_format_json_quote_decimals=1`.** Measured on 26.9.9.28 on 2026-10-04: a `Decimal(38, 10)`
+holding `12345678901234567890.1234567891` arrives under the 64-bit setting alone as that **unquoted**
+number, and the grid, the API and every export showed `12345678901234567000` while
+`toString(amount)` in the same row was right. A decimal fraction cannot be rescued after the fact the
+way [`quoteUnsafeIntegers`](../../src/lib/db/utils/json-integers.ts) rescues an integer, because a
+client reading the text cannot tell a lossy `Decimal` from a `Float64` the server printed in full;
+only the server knows the column type, so the server is asked. With both settings:
+
+| Column type | Value | Arrives as |
+|---|---|---|
+| `Decimal(38, 10)` | 12345678901234567890.1234567891 | `"12345678901234567890.1234567891"` |
+| `Decimal(10, 2)` | 12.34 | `"12.34"` |
+| `Int64` | 9223372036854775807 | `"9223372036854775807"` |
+| `UInt32` | 1 | `1` |
+| `Float64` | 1.5 | `1.5` |
+
+Every `Decimal` is therefore a string, small ones included, which is how the `pg` driver already
+hands over `NUMERIC`; integers up to 32 bits and floats stay numbers. So a `Decimal(10, 2)` column
+now behaves in the UI exactly as a PostgreSQL `NUMERIC` one does: the grid sorts it as text, and the
+pivot table's auto-detection no longer offers it as a value field. No reader in the provider or
+the introspection module reads a `Decimal` column, so nothing internal changed type.
+
+**A non-finite float needs a third setting, `output_format_json_quote_denormals=1`.** JSON has no
+number for `inf`, `-inf` or `nan`, and without it ClickHouse writes each of them as `null`: measured on
+26.9.18.11 on 2026-10-14, a non-`Nullable` `Float64` holding `inf` was shown as NULL, written as an
+empty CSV cell and as `NULL` by the SQL INSERT export, and replayed as `0`. With the setting they
+arrive as the strings `"inf"`, `"-inf"` and `"nan"`, scalar and nested alike, and the transport turns
+them into the words every provider hands over (`Infinity`, `-Infinity`, `NaN`) **by the declared
+type**: a `Float32`, `Float64` or `BFloat16`, inside `Nullable`, `LowCardinality`, `Array`, `Tuple`
+(named or not) and a `Map`'s values. A `String` holding `inf` stays that string, and a `Variant`,
+`Dynamic` or `JSON` column, which declares no single element type, keeps the text as sent. The SQL
+INSERT export writes the words back as ClickHouse's bare `inf`, `-inf` and `nan`, which a replay
+read back exactly into `Float64`, `Nullable(Float64)`, `Float32` and `Array(Float64)`; the CSV
+export writes them as `Infinity`, `-Infinity` and `NaN`.
 
 ### 3.6 Writes return an empty 200 body; the row count lives in a header
 
@@ -289,7 +375,8 @@ misclassify it.
 verified independently. Both statement types are queued as background mutations rather than applied
 synchronously, and ClickHouse counts no rows written for either. The provider reports this number
 verbatim and never derives or fabricates a plausible-looking count in its place
-([transport.ts:69](../../src/lib/db/providers/sql/clickhouse/transport.ts)).
+(`ClickHouseQueryResult.mutationCount`,
+[`transport.ts`](../../src/lib/db/providers/sql/clickhouse/transport.ts)).
 
 ### 3.7 A mid-stream failure still arrives as 200
 
@@ -361,7 +448,7 @@ error, live-verified:
 works.
 
 `ClickHouseProvider.prepareQuery()`
-([index.ts:562](../../src/lib/db/providers/sql/clickhouse/index.ts)) detects a trailing `FORMAT` or
+([`index.ts`](../../src/lib/db/providers/sql/clickhouse/index.ts)) detects a trailing `FORMAT` or
 `SETTINGS` clause with two patterns anchored at the **end** of the statement — as
 `src/lib/sql/statement-end.ts` delimits it, so the terminating semicolon and any trailing comment are
 outside what the patterns read — and, when either matches, returns the query
@@ -374,7 +461,7 @@ favour not rewriting: rewriting wrongly turns a working statement into a syntax 
 it alone at worst returns more rows than the page size.
 
 Both the detection and the inherited limiter read the statement under **ClickHouse's** grammar, which
-this provider passes down from its own `type` ([`grammar.ts`](../../src/lib/sql/grammar.ts)).
+this provider passes down from its own `type` ([`sql-grammar.ts`](../../src/lib/db/providers/sql/clickhouse/sql-grammar.ts)).
 ClickHouse's syntax reference lists `#` and `#!` beside `--` as single-line comment forms, and the
 shared reader used to guess PostgreSQL's rule instead — a hash followed by `>`, `-` or `#` is an
 operator — so a comment written that way was read as SQL, and an ordinary one at the end of a
@@ -462,10 +549,10 @@ Types come back exactly as declared, with no normalization attempted:
 `LowCardinality(String)` · `Decimal(10,3)` · `DateTime64(3)` · `UUID`
 
 **Decision: `ColumnSchema.type` carries the declared type string unchanged**
-([introspect.ts:290](../../src/lib/db/providers/sql/clickhouse/introspect.ts)). It is precise, it
-is what a ClickHouse user already reads in `SHOW CREATE TABLE`, and collapsing it onto a generic
-family would throw away the wrapper — which is exactly the part that says nullable, low-cardinality,
-parameterised, or enumerated.
+(`readColumn()`, [`introspect.ts`](../../src/lib/db/providers/sql/clickhouse/introspect.ts)). It is
+precise, it is what a ClickHouse user already reads in `SHOW CREATE TABLE`, and collapsing it onto a
+generic family would throw away the wrapper — which is exactly the part that says nullable,
+low-cardinality, parameterised, or enumerated.
 
 **Nullability is derived by testing for the `Nullable(...)` wrapper, not by a bare substring
 search**, because the wrapper is not always outermost and not always the column's own:
@@ -473,14 +560,14 @@ search**, because the wrapper is not always outermost and not always the column'
 `Array(Nullable(String))`, `Map(String, Nullable(String))`, and
 `SimpleAggregateFunction(any, Nullable(UInt64))` all qualify an *inner* type and are not nullable
 columns themselves
-([introspect.ts:186](../../src/lib/db/providers/sql/clickhouse/introspect.ts)).
+(`isNullableType()`, [`introspect.ts`](../../src/lib/db/providers/sql/clickhouse/introspect.ts)).
 
 **There is a spacing inconsistency between the two surfaces that carry types**, and it matters
 because they must never be compared as strings: the query-response `meta` array renders
 `Map(String, UInt8)` with a space after the comma, while `system.columns.type` renders the same
 type as `Map(String,String)` with no space.
 
-### 3.10 `supportsCreateTable` is false — live-disproved the issue's own guess
+### 3.10 No `createTable` is declared — live-disproved the issue's own guess
 
 The tracking issue expected `ENGINE` / `ORDER BY` to be the blocker for `CREATE TABLE`. They are
 not: `CREATE TABLE t (id Int32, name String)` succeeds outright on ClickHouse 26.x, because it
@@ -490,7 +577,7 @@ The real blocker is what `CreateTableModal` actually emits:
 
 | Modal output | ClickHouse result (live-verified) |
 |---|---|
-| `id SERIAL PRIMARY KEY` (the modal's **default** column) | `Code: 50 ... Unknown data type family: SERIAL` |
+| `id SERIAL PRIMARY KEY` (the modal's **default** column when this was measured; #648 made the spelling per-engine and added no ClickHouse row, so it falls back to PostgreSQL's identity clause — also not a ClickHouse type) | `Code: 50 ... Unknown data type family: SERIAL` |
 | `email VARCHAR(255) UNIQUE` | `Code: 62 ... Syntax error ... (UNIQUE)` |
 | `id Int32 PRIMARY KEY, name VARCHAR(255) NOT NULL` | works — `VARCHAR(255)` aliases to `String` |
 
@@ -510,7 +597,7 @@ does **not** pin one:
 - One HTTP request per statement keeps the provider stateless and safely concurrent — nothing to
   coordinate, nothing to leak across users of a shared connection.
 - A pinned session serializes requests server-side: ClickHouse rejects concurrent use of one
-  `session_id`, which would break parallel schema introspection (`getSchema()` reads three catalogs
+  `session_id`, which would break parallel schema introspection (the object surface reads three catalogs
   at once with `Promise.all`).
 - `SET` and temp tables are the only things lost to this, and neither is reachable from the editor's
   one-statement-per-execution model regardless.
@@ -549,6 +636,29 @@ instance.
   and each data-skipping index) and each deserves its own line, with the selected-over-initial ratio
   shown when both counts are present.
 
+### 3.13 `endOpenQueryTransaction()` is not implemented, because the engine has no transaction to leave open
+
+The providers that implement `endOpenQueryTransaction()` ([`types.ts`](../../src/lib/db/types.ts)) let `POST /api/db/multi-query` end a transaction a failed script left open on the session the next request borrows; the set is read from the type rather than listed here, because a list repeated across provider docs goes stale the moment it grows.
+This provider does not, and the reason is the one [§3.11](#311-statelessness-no-session_id-is-pinned) already states: **the engine has no transaction to leave open** on anything this provider holds.
+
+The transport sends one HTTP request per statement and pins no `session_id` ([`http-transport.ts`](../../src/lib/db/providers/sql/clickhouse/http-transport.ts) sets `default_format`, `output_format_json_quote_64bit_integers`, `output_format_json_quote_decimals`, `output_format_json_quote_denormals` and `database`, and nothing else identifies a session), and `close()` there has nothing to release for the same reason.
+Session state is what a transaction would live in: `SET max_block_size` was verified to persist inside a pinned `session_id` and not outside one, and ClickHouse's own transaction support is experimental and setting-gated ([§11](#11-testing) and the limitations section).
+So there is no handle between two statements for a `BEGIN TRANSACTION` to survive on, and nothing for a later caller to inherit.
+
+This is a declared boundary, not a default: `endOpenQueryTransaction` is optional on `DatabaseProvider` with no default value, and the route shape-checks for it rather than assuming `"none"`.
+
+### 3.14 What the SQL INSERT and DDL exports write for composite types
+
+A result reaches the export through JSON, where an `Array` is a JS array, a `Map` an object, an unnamed `Tuple` an array and a named one an object.
+Written as quoted JSON those were `Code: 26 ... Cannot parse quoted string` on replay, so the SQL INSERT export reads the declared type ([§3.9](#39-column-types-are-the-declared-strings-verbatim)) and writes `[1, 2, 3]`, `map('k', 1)` and `tuple(7, ['p', 'q'])`, recursing through the element types, `Nullable` and `LowCardinality` included (#1386, [`clickhouse/typed-literals.ts`](../../src/lib/db/providers/sql/clickhouse/typed-literals.ts)).
+A named tuple's elements are written in the declared order, and a 64-bit integer or a decimal that `output_format_json_quote_64bit_integers` / `output_format_json_quote_decimals` turned into a string is written bare inside a container (a scalar column takes the quoted form as it is).
+
+A composite that does not have its declared shape (a tuple of the wrong length, a scalar where an `Array` belongs) is skipped with a `-- Row N skipped` comment naming the column, and a non-finite word in a `Float` column or inside a `Float` element is written as `nan`, `inf` or `-inf`.
+
+The DDL keeps a type with a quoted argument, `DateTime64(3, 'Europe/Istanbul')`, `DateTime('UTC')` and `Enum8('a' = 1, 'b' = 2)`, instead of writing `TEXT`.
+
+Measured 2026-10-04 on ClickHouse 26.9: a `MergeTree` table of `Array(Int32)`, `Array(String)` holding a quote and a backslash, `Map(String, Int32)`, `Map(String, Array(String))`, `Array(Array(Nullable(Int32)))`, named and unnamed `Tuple`, `DateTime64(3, 'Europe/Istanbul')`, `DateTime('UTC')`, `Date32`, `UInt64` and `Int128` at their limits, `Decimal(18, 4)`, `Bool`, `UUID`, `IPv4`, `IPv6`, `Enum8` and `LowCardinality(String)` exported and replayed with `clickhouse-client`, into `CREATE TABLE copy AS src` and into the exported DDL's own table, and the TSV of both tables differed in one cell: a `Float64` `-0`, which JavaScript prints as `0`.
+
 ---
 
 ## 4. Connection
@@ -582,13 +692,13 @@ const connection = {
 
 `supportsConnectionString` is `true`. Two related but distinct paths exist:
 
-- **A pasted URL** goes through the shared parser
-  ([`connection-string-parser.ts:66`](../../src/lib/connection-string-parser.ts)), which decomposes
+- **A pasted URL** goes through the shared parser, `parseConnectionString()`
+  ([`connection-string-parser.ts`](../../src/lib/connection-string-parser.ts)), which decomposes
   it into discrete fields (host/port/user/password/database) before the provider ever sees it, and
   stores no `connectionString` on the connection.
 - **A hand-typed connection string** (the ConnectionModal's URI tab clears host, port, user and
   password when it submits) is resolved by the provider itself,
-  `resolveConnection()` ([index.ts:402](../../src/lib/db/providers/sql/clickhouse/index.ts)), which
+  `resolveConnection()` ([`index.ts`](../../src/lib/db/providers/sql/clickhouse/index.ts)), which
   is not optional politeness: for a connection typed there, the URL is the *only* place any of those
   fields exist. Percent-encoded credentials are decoded (`p%40ss%2Fword` → `p@ss/word`), an
   unparsable string leaves every configured field untouched rather than emptying a working
@@ -610,27 +720,73 @@ database where an HTTP URL would mean nothing.
 default port from `8123` to `8443`
 ([the transport constructor](../../src/lib/db/providers/sql/clickhouse/http-transport.ts)). There is no
 separate CA/client-certificate plumbing the way Couchbase's `node:https` path has: the transport
-uses the runtime's own `fetch`, whose TLS trust follows the platform's default certificate store.
+uses the runtime's own `fetch`, so the set of trusted CAs is the runtime's, not the connection's.
+Under Node (the Docker image and `npx @libredb/studio`) that set is Node's bundled CA list plus
+whatever `NODE_EXTRA_CA_CERTS` names; it does NOT include the operating system's store unless
+`NODE_USE_SYSTEM_CA=1` is set, and the runner image ships no OS store at all (no `ca-certificates`
+package, no `/etc/ssl/certs`). Under Bun (`bun dev`) `fetch` reads the OS store by default.
 
 `verify-system` (D26) is the mode that DESCRIBES this transport: `fetch` always verifies the chain
-against the platform's certificate store and cannot be told otherwise, so of the four non-`disable`
+against the runtime's trusted CAs and cannot be told otherwise, so of the four non-`disable`
 modes it is the only one whose name matches the handshake. `require` here does not mean "encrypt
 without checking" the way it does on the driver-based providers — nothing in this transport can skip a
 check — and `verify-ca`/`verify-full` cannot pin against a pasted CA. Nothing in the code branches on
 which one is selected.
 
-Two consequences worth stating plainly:
+Three consequences worth stating plainly:
 
 - **`ssl.caCert`, `ssl.clientCert` and `ssl.rejectUnauthorized` are not honoured.** Global `fetch`
   cannot carry a custom CA or relax verification without an undici `Agent` as its `dispatcher`, and
-  undici is not a dependency. A self-hosted node behind a **self-signed** certificate therefore fails
-  verification; ClickHouse Cloud and any node with a publicly-trusted certificate work. Honouring
-  them needs the `node:https` path Couchbase already has, which is a follow-up rather than a
-  limitation of the scheme.
+  undici is not a dependency. A self-hosted node behind a **self-signed** or **private-CA**
+  certificate therefore fails verification out of the box; ClickHouse Cloud and any node with a
+  publicly-trusted certificate work. Honouring them per connection needs the `node:https` path
+  Couchbase already has, which is a follow-up rather than a limitation of the scheme.
+- **A private CA is trusted per deployment, not per connection.** Start the server with
+  `NODE_EXTRA_CA_CERTS` naming a PEM file that holds the CA, or the server's own certificate when
+  it is self-signed. It adds to the bundled list, so publicly-trusted endpoints keep working.
+  Measured on 2026-10-12 with the `0.18.3` image against a ClickHouse 26.7 node on `8443`, through
+  `POST /api/db/test-connection`:
+
+  | Deployment setting | Private-CA certificate | Self-signed certificate |
+  |---|---|---|
+  | none | `UNABLE_TO_VERIFY_LEAF_SIGNATURE` | `DEPTH_ZERO_SELF_SIGNED_CERT` |
+  | CA pasted as `ssl.caCert` (`verify-ca`) | `UNABLE_TO_VERIFY_LEAF_SIGNATURE` | — |
+  | CA in `/etc/ssl/certs` only | `UNABLE_TO_VERIFY_LEAF_SIGNATURE` | — |
+  | CA in `/etc/ssl/certs` + `NODE_USE_SYSTEM_CA=1` | connects | — |
+  | `NODE_EXTRA_CA_CERTS=<CA or server cert>` | connects | connects |
 - **A pasted `https://` URL keeps its TLS intent.** `parseConnectionString` returns
   `sslMode: "require"` for that scheme and the connection form applies it, because the parsed
   host/port fields alone cannot express TLS — without it the connection would go out as plaintext
-  HTTP to the TLS port and fail with a bare `fetch failed`.
+  HTTP to the TLS port, where the server drops it and the error reads
+  `ClickHouse request failed: connection to <host>:<port> was reset (...)`.
+
+
+### 4.4 Endpoint validation and redirects
+
+`host` and `port` are validated when the transport is constructed, which happens in `connect()`, so
+a bad value fails Test Connection and never a capability read. A host must be a hostname, an IPv4
+address or an IPv6 address (bracketed or not), and a port must be an integer from 1 to 65535.
+Anything else is a `DatabaseConfigError` that names the field and does not repeat the value.
+Every request URL is built by the shared [`endpoint.ts`](../../src/lib/db/http/endpoint.ts) with
+`URL` and `URLSearchParams` and checked against the intended hostname, port and path before it is
+sent, so no value can move a request to another path or another server. A scheme's default port
+(80 for `http`, 443 for `https`) is left out of the URL the way `URL` serializes it.
+
+Redirects are not followed. Every request sets `redirect: "manual"`, and a 3xx answer becomes a
+`ConnectionError` naming the status and only the origin of its `Location`, since a followed
+redirect would take the Basic credential and the statement to wherever the server pointed.
+
+### Connection string
+
+The scheme shown for ClickHouse is `clickhouse://`, and the parser also accepts `http://` and `https://`.
+Its row in `CONNECTION_STRING` is declared in [`connection-string.ts`](../../src/lib/db/providers/sql/clickhouse/connection-string.ts).
+It has no `readTls`: `clickhouse://` names no transport and leaves the form's SSL mode alone, while for `http(s)://` the scheme is the transport and already decided, `disable` for `http://` and `require` for `https://`.
+It runs no seed load check.
+
+### Execution UI
+
+The rolled-back notice names `COMMIT` as the keyword that keeps an open transaction, and `clickhouse` has no consent deadline, so the agent's consent card shows no deadline chip or sentence for it.
+Its row in `EXECUTION_UI` is declared in [`execution-ui.ts`](../../src/lib/db/providers/sql/clickhouse/execution-ui.ts).
 
 ---
 
@@ -638,7 +794,7 @@ Two consequences worth stating plainly:
 
 ### 5.1 Execution
 
-`query(sql, params?)` ([index.ts:593](../../src/lib/db/providers/sql/clickhouse/index.ts)) sends one
+`query(sql, params?)` ([`index.ts`](../../src/lib/db/providers/sql/clickhouse/index.ts)) sends one
 statement under **two** deadlines, both derived from `queryTimeout` (default 60 seconds), because
 neither covers the other:
 
@@ -671,12 +827,21 @@ that is how the rest of the application calls every provider uniformly.
 
 | Source | `QueryResult` field | Notes |
 |--------|----------------------|-------|
-| `data` array | `rows` | Objects exactly as the server returned them |
-| `meta` array | `fields` | Declared column order; `[]` when the source could not describe the rows (a non-JSON format, or a write) |
+| `data` array | `rows` | One object per row, built by position from the row's array of values and keyed by the names in `fields`; 64-bit integers and every `Decimal` arrive as strings ([§3.5](#35-64-bit-integers-and-decimals-are-quoted-on-purpose-to-stop-jsonparse-from-rounding-them)) |
+| `meta` array | `fields` | Declared column order, a repeated name numbered (see below); `[]` when the source could not describe the rows (a format the user chose, or a write) |
 | — | `rowCount` | `rows.length` when there are rows; otherwise `mutationCount` from `X-ClickHouse-Summary`, verbatim, zero included ([§3.6](#36-writes-return-an-empty-200-body-the-row-count-lives-in-a-header)) |
 | `X-ClickHouse-Summary.elapsed_ns` | `executionTime` | The server's own duration, preferred because it excludes network latency; falls back to the envelope's `statistics.elapsed` (seconds), then to the measured wall clock when neither source reported anything |
-| a non-JSON `X-ClickHouse-Format` | `rows` / `fields` | One synthetic row `{ __text: "<raw body>" }` under the single column `__text` ([§3.4](#34-default_formatjson-as-a-url-parameter-never-appended-to-the-sql)) |
+| any `X-ClickHouse-Format` but `JSONCompact` | `rows` / `fields` | One synthetic row `{ __text: "<raw body>" }` under the single column `__text` ([§3.4](#34-default_formatjsoncompact-as-a-url-parameter-never-appended-to-the-sql)) |
 | `meta` array | `columnTypes` | The declared type per column, keyed by its name in `fields` and spelled exactly as ClickHouse spells it — `Nullable(String)`, `LowCardinality(String)`, `Enum8('x' = 1)` — because the wrapper is what tells the user the column is nullable or low-cardinality. **Absent** when the envelope described no columns: a write, a format the user chose, or a statement with no result set. For a computed column such as `count()` this is the only source of a type at all, since no catalog entry exists for it (issue #273) |
+
+Every name in `fields` is non-empty and appears once, and every column keeps its own value, measured on 26.7.1.1315.
+An empty quoted alias is a syntax error, so no column comes back unnamed.
+Two expressions under one alias (`SELECT 1 AS a, 2 AS a`) are refused with `MULTIPLE_EXPRESSIONS_FOR_ALIAS`, and a join qualifies a repeated column itself (`id`, `t2.id`).
+But the server can still declare two `meta` columns of one name, in two ways.
+`SELECT number, number FROM numbers(2)` and `SELECT rand(), rand()` repeat one expression, which ClickHouse evaluates once, so both columns carry the same value.
+The qualified name can also collide with a name the statement already has: ``SELECT a.x, b.x, 3 AS `b.x` FROM (SELECT 1 AS x) a, (SELECT 2 AS x) b`` declares `x`, `b.x`, `b.x` with the values `1`, `2`, `3`.
+The same holds for ``SELECT * FROM (SELECT 1 AS x) a JOIN (SELECT 2 AS x, 7 AS `b.x`) b ON 1=1`` (`1`, `2`, `7`), and `b.x` is also how a Nested sub-column is named.
+Rows are read by position ([§3.4](#34-default_formatjsoncompact-as-a-url-parameter-never-appended-to-the-sql)), so both values survive, and the repeat is numbered as every provider numbers it: `fields` is `["x", "b.x", "b.x (2)"]`, the row is `{ x: 1, "b.x": 2, "b.x (2)": 3 }`, and `columnTypes` is keyed by the numbered names.
 
 ### 5.3 EXPLAIN
 
@@ -684,59 +849,579 @@ The EXPLAIN button is available (`supportsExplain: true`) and renders the plan t
 [§3.12](#312-explain-reuses-the-shared-tree-model). ClickHouse has no analyze mode, so both the
 direct action and the background pre-warm show the same estimated plan.
 
+### 5.4 Cancellation
+
+Aborting the HTTP request does not stop a ClickHouse statement. Measured on 26.9.9.28 before #1364,
+when the provider had no `cancelQuery`: after the editor's Cancel, `system.processes` still listed
+`SELECT count() FROM numbers(200000000000) WHERE sipHash64(number) % 7 = 3` 19 s and 29 s later,
+and the editor had said "Query Cancelled".
+
+Now `query(sql, params, queryId)` runs the statement under a `query_id` the provider generates (a
+random UUID, sent through a neutral `queryId` option on the transport seam) and remembers it against
+the caller's id; `cancelQuery(queryId)` looks that up and sends
+`KILL QUERY WHERE query_id = '<generated id>' SYNC`. The caller's id never reaches the server:
+ClickHouse keeps a query id unique per server user only, so two Studio users sharing one ClickHouse
+account could otherwise run under the same id, and one KILL would stop both. `SYNC` answers once the statement has stopped: one row with
+`kill_status` `finished` per statement it reached, or a 200 with an empty body when nothing matched
+because the statement had already ended (both measured on 26.9.9.28). `cancelQuery` answers true only
+for a `finished` row, so `cant_cancel`, an empty answer and a refused KILL are all false, and the
+editor then says the cancel was not confirmed.
+
+An id this provider is not running is refused before anything is sent, so the cancel route cannot be
+used to kill another session's statement by guessing its id.
+
 ---
+
+### 5.5 SQL grammar
+
+How this engine's statement text is read is declared once, in [`src/lib/db/providers/sql/clickhouse/sql-grammar.ts`](../../src/lib/db/providers/sql/clickhouse/sql-grammar.ts), the `clickhouse` row of the SQL grammar registry in `src/lib/db/sql-grammar/`.
+Its grammar is `CLICKHOUSE_GRAMMAR`, the one reading the statement splitter, the row limiter, the confirmation gate and query-event redaction share, so they cannot disagree about where a literal or a comment ends.
+`#` and `#!` open a line comment beside `--`, and `[...]` is an array literal or a subscript that nests, both from the ClickHouse SQL syntax reference (checked 2026-08-05), since ClickHouse is reached over HTTP and has no driver artifact to check them against.
+That `[...]` is not a name quote is corroborated inside this repository: `identifier.ts` quotes this dialect's names with `"..."`.
+Block comments nest, as the same reference states with a nested example.
+`//` is a line comment, the one fact established by probe, on 26.7.1 over HTTP: `SELECT 1 AS a // note; SELECT 999` answers 1 with no error, while two statements are otherwise refused as multi-statements, so the `;` was hidden, and `SELECT 1 AS a // note` followed by `, 2 AS b` on the next line answers two columns, so the run ends at the newline.
+Read as code, `SELECT number FROM numbers(1000) // note` was bounded as `... // note LIMIT 5` and returned 1000 rows while reporting `wasLimited: true`; with the fact carried it is `... LIMIT 5 // note` and returns 5 (both measured).
+`readsSqlText` is `true`: the editor text is SQL, and the provider extends `SQLBaseProvider`.
+Redaction is `sql` with no name quote: a redacted statement keeps its words, and every literal and quoted run becomes `?`.
 
 ## 6. Schema introspection
 
-Three separate reads of the `system.*` catalogs, run in parallel with `Promise.all`, all through the
-transport seam:
+Everything this provider knows about a database's contents is read through the OBJECT SURFACE, in
+[`objects.ts`](../../src/lib/db/providers/sql/clickhouse/objects.ts), and §6.1 below is the whole of
+it. The flat three-catalog reading that used to sit here was deleted with `getSchema` (#789); four
+of its decisions outlived it and are recorded here because they are container-level facts rather than
+per-object ones.
 
-| Data | Source |
-|------|--------|
-| Tables | `system.tables` — name, `total_rows`, `total_bytes`, `sorting_key`, `primary_key`, filtered to non-system databases |
-| Columns | `system.columns` — name, type, `is_in_primary_key`, `default_kind`/`default_expression`, ordered by declaration `position` |
-| Indexes | `system.data_skipping_indices` — the nearest thing ClickHouse has to a secondary index object, plus the synthesized `PRIMARY KEY` / `ORDER BY` entries |
-| Foreign keys | always `[]` — ClickHouse has no foreign-key concept anywhere: no engine, no table setting, no DDL declares one |
+**Which databases are listed.** `system`, `information_schema` and `INFORMATION_SCHEMA` are excluded.
+The last exists as its own separate row in `system.databases`, live-verified, so excluding only one
+leaves a duplicate ANSI catalog in the tree. `default` is deliberately **kept**: it is an ordinary
+writable database and the one a connection that names none lands in, so hiding it would empty the
+commonest setup. The session's own database comes from `currentDatabase()`, the server's answer,
+rather than from the string a person typed into the connection form.
 
-Non-system databases are `system`, `information_schema`, and `INFORMATION_SCHEMA` (the last exists
-as its own separate row in `system.databases`, live-verified, so excluding only one leaves a
-duplicate ANSI catalog in the tree). `default` is deliberately **kept** — it is an ordinary writable
-database and the one a connection that names none lands in, so hiding it would empty the commonest
-setup.
+**A key expression is a comma-separated list that can itself contain commas**,
+`a, b, cityHash64(c, c)`, so splitting is parenthesis-depth-aware, never a naive `.split(',')`. The
+parser strips exactly one wrapping pair when the whole expression is parenthesized.
 
-Load-bearing details:
+**The primary key and the sorting key are NOT reported as index entries, and that is a change the
+flat reading's deletion made.** That reading synthesized a `PRIMARY KEY` entry out of
+`system.tables.primary_key`, and an `ORDER BY` entry beside it where the sorting key extended it. The
+object surface reads `system.data_skipping_indices` and nothing else, so a MergeTree table with no
+skipping index reports no index at all. What the primary key still decides is the COLUMNS:
+`system.columns.is_in_primary_key` is what `isPrimary` reads, and the sorting key's trailing columns
+are correctly not primary. Whether the sparse primary index deserves an entry of its own is a product
+question for Phase 2 rather than something to reinstate silently.
 
-- **`total_rows` / `total_bytes` are `Nullable(UInt64)` and really are null** for a view and for
-  every non-MergeTree engine (live-verified). Null is reported as `undefined` — unknown — never
-  coerced to zero; a table shown as "0 rows" when the server never said so is a number the explorer
-  would have invented.
-- **A key expression is a comma-separated list that can itself contain commas** —
-  `a, b, cityHash64(c, c)` — so splitting is parenthesis-depth-aware, never a naive `.split(',')`.
-  A one-element key renders as `(a)` while a multi-element one renders as `a, b`; the parser strips
-  exactly one wrapping pair when the whole expression is parenthesized.
-- **The primary key and the sorting key are reported as separate index entries only when they
-  differ.** ClickHouse's primary index is a real sparse index over the sort order — reporting no
-  index at all on a MergeTree table would be misleading — but `ORDER BY` may extend `PRIMARY KEY`
-  with trailing columns that genuinely shape the on-disk order and the query plan, so those are
-  surfaced as a second `ORDER BY` entry when they add anything the primary key entry does not
-  already say (comparing the split element lists, because the server renders the same one-element
-  key as `(a)` in one column and `a` in the other).
-- **No index ClickHouse reports is unique** — not the data-skipping indexes, which only prune
-  granules, and not the primary key either: live-verified, three identical values were accepted into
-  a table declared `PRIMARY KEY (a)`.
-- **Each catalog degrades independently.** `system.tables` and `system.columns` are pre-filtered to
-  what the connected user may read and answer `200`; `system.data_skipping_indices` needs its own
-  grant and answers `500` / code `497` without it (live-verified). A denied index catalog still
-  yields a full table-and-column tree; only the data-skipping-index list is empty. Any *other*
-  failure propagates rather than degrading — an empty tree standing in for a real error would hide
-  it forever.
+**No index ClickHouse reports is unique**: not the data-skipping indexes, which only prune granules,
+and not the primary key either. Live-verified, three identical values were accepted into a table
+declared `PRIMARY KEY (a)`.
 
-`getSchemaList()` defers the index catalog entirely so a third catalog read never blocks the table
-list, exactly as the SQL providers' two-phase loading does; `getSchemaRelations()` reads it and
-returns an entry — empty list included — for every table, so the client can merge indexes in
-without losing a table that legitimately has none.
+**Foreign keys are always `[]`.** ClickHouse has no foreign-key concept anywhere: no engine, no table
+setting, no DDL declares one.
+
+### 6.1 The object surface (#789)
+
+The object surface answers a lazy,
+container-aware, kind-tagged tree through four methods, and it lives in
+[`objects.ts`](../../src/lib/db/providers/sql/clickhouse/objects.ts) rather than in the provider
+class: the statements and every derivation over the declaration are there, the connection check and
+the error mapping stay on the class.
+
+Everything below was measured on **ClickHouse 26.7.1.1315**, the build `database-compose.yml` pins.
+
+#### The declaration
+
+One container level, and there is no second one to add: ClickHouse has no schema level below a
+database, and `CREATE SCHEMA` is not an alias for anything. The level's structural `id` is `schema`
+because that is what `ContainerLevelSpec` calls the innermost level on every engine; the **label** is
+the engine's own word, Database.
+
+| Kind | Role | Catalog |
+|---|---|---|
+| `table` | `relation` | `system.tables`, the DEFAULT arm |
+| `view` | `relation` | `system.tables`, `engine = 'View'` |
+| `materialized_view` | `relation` | `system.tables`, `engine = 'MaterializedView'` |
+| `dictionary` | `config` | `system.dictionaries`, covering both DDL and config-file ones |
+| `function` | `routine` | `system.functions`, `origin != 'System'` |
+
+Two kinds are **absent rather than declared and zero**: ClickHouse has no trigger and no stored
+procedure. A declared kind draws a folder, and a folder for a concept the engine does not have is a
+lie its 0 badge makes look like a fact.
+
+No kind declares `acceptsRowWrites`. A row mutation here is spelled `ALTER TABLE ... UPDATE`, which
+is the same measurement behind `supportsInlineRowEdit: false` (section 13).
+
+#### The vocabulary comes from the ENGINE, not from the fixture
+
+`system.tables.engine` is an **open** set: 129 distinct values on a bare server, one per storage
+engine. So `table` is the DEFAULT arm and only three engine names are diverted off it. An inclusion
+list of engine names would make every engine this code has never heard of invisible, and invisible is
+the worst shape of absence, because the count and the listing lose it together and the badge keeps
+agreeing with its own folder.
+
+`system.functions.origin` needs no list at all, because **the column type IS the vocabulary**:
+
+```
+Enum8('System' = 0, 'SQLUserDefined' = 1, 'ExecutableUserDefined' = 2, 'WasmUserDefined' = 3)
+```
+
+So the filter is written as `origin != 'System'`. That admits all three user-defined origins ClickHouse
+has today - SQL, executable and WASM - and a fourth one a later build adds to the enum, rather than
+losing it silently.
+
+One consequence worth stating plainly: a **dictionary is a row of `system.tables` too**, so counting
+everything in that catalog as a table counts each dictionary twice. The kind expression diverts it.
+
+#### A dictionary is published in TWO catalogs, and neither one holds all of them
+
+Measured on a server carrying both flavours:
+
+| Dictionary | `system.dictionaries` | `system.tables` | `system.columns` |
+|---|---|---|---|
+| `demo.dict_customers`, created by `CREATE DICTIONARY` | Yes, `database = 'demo'` | Yes, engine `Dictionary` | Yes |
+| `dict_regions_config`, declared in `/etc/clickhouse-server/regions_dictionary.xml` | Yes, `database = ''` | **No row at all** | **No row at all** |
+
+So sourcing dictionaries from `system.tables` alone loses every config-file dictionary from the count
+and the listing **together**. That is standing ruling 5a's exact absence: invisible in the tree while
+the badge keeps agreeing with its own folder, so ruling 5f still holds and nothing detects it.
+
+`system.dictionaries` is therefore read in its own statement for the dictionary kind (`WHERE database = {database} OR database = ''`),
+which captures both DDL dictionaries and server-global config-file ones without joining `system.dictionaries` into the
+`system.tables` query.
+
+The engine name is not what identifies a dictionary either. Measured:
+
+| Statement | Answer |
+|---|---|
+| `CREATE TABLE demo.dict_customers_proxy (id UInt64, name String) ENGINE = Dictionary(demo.dict_customers)` | accepted |
+
+That produces a `system.tables` row with engine `Dictionary` and **no** `system.dictionaries` row. It
+is a table that reads a dictionary, and `engine = 'Dictionary'` would file it under Dictionaries,
+where its detail read would then find nothing. So the kind expression checks `system.dictionaries` for
+**membership**, filtering out only tables whose names match verified dictionaries in the database, so that
+proxy table stays a table. Crucially, querying `system.dictionaries` separately ensures that a restricted user
+without grants on `system.dictionaries` only sees `dictionary` marked unavailable: `table` and other kinds
+proceed against `system.tables`, keeping tables (including dictionary-engine tables) intact under `table`.
+`docker/clickhouse-init/01-object-fixture.sql` carries all three shapes, so the rule can be re-measured rather than re-argued.
+
+#### The implicit inner table, and why the obvious rule is wrong
+
+A materialised view declared without a `TO` clause owns an implicit inner table holding its state.
+Measured: `CREATE MATERIALIZED VIEW probe.mv_inner ENGINE = MergeTree ... AS SELECT` produces
+``probe.`.inner_id.0ec1eae5-fa15-41b8-98bb-9a0a01d5df45` `` with engine `MergeTree`, and that suffix
+is the view's own `uuid`. Such a table must appear in neither the count nor the listing: it is
+storage the server created, not an object a person named.
+
+The obvious rule is a name pattern, and it is **refuted rather than merely unattractive**. Measured:
+
+| Statement | Answer |
+|---|---|
+| ``CREATE TABLE probe.`.inner_id.fake` (x UInt8) ENGINE = MergeTree ORDER BY x`` | accepted |
+
+So `name LIKE '.inner%'` would hide a table a person created. The rule used instead is structural and
+reads only columns the server publishes: a table is an implicit inner table exactly when some
+MaterializedView's `(target_database, target_table)` names it **and** that view's `target_table` is
+`concat('.inner_id.', toString(uuid))`. The uuid equality is the half that separates an inner table
+from an explicit `TO` target, which is an ordinary user table.
+
+Measured against a fixture built to break it:
+
+| Object | In the listing |
+|---|---|
+| `.inner_id.<mv_inner's uuid>`, the implicit inner table | No |
+| `.inner_id.fake`, created by a person under the same prefix | Yes |
+| `mv_target`, the explicit `TO` target of `mv_to` | Yes |
+
+The Ordinary-database era spelling `.inner.<view name>` is unreachable on this build:
+`CREATE DATABASE ... ENGINE = Ordinary` answers code 336 `UNKNOWN_DATABASE_ENGINE`.
+
+#### `countObjects()` and `listObjects()` read ONE subquery
+
+The kind-tagged subquery is built once. The count `GROUP BY`s it and the listing `WHERE`s it. That is
+how the listing is guaranteed to contain exactly what the count counted: there is no second `WHERE`
+clause for the two to drift apart in, and no seam where a count over one catalog meets a listing over
+another.
+
+`total_rows` / `total_bytes` are `Nullable(UInt64)` and really are null for a view, for a dictionary
+and for a materialised view with a `TO` clause (measured). Null is reported as `undefined` - unknown -
+never coerced to zero.
+
+A refused count is reported per kind as `{ unavailable }` carrying **the server's own sentence**,
+verbatim and unprefixed, because that text is rendered to a person as the reason a folder has no
+number. It is a live case rather than a defensive arm: `system.dictionaries` needs its own grant and a
+restricted user sees code `497` (while `system.functions` needs no catalog grant, measured in the `src_probe` table below).
+
+#### What the last path segment carries
+
+The last segment of a `DatabaseObject.path` is the object's **bare name**, for every one of the five
+kinds, and it is unique within its parent. Nothing is appended to disambiguate it, because there is
+nothing to disambiguate: **ClickHouse has no routine overloading**. `CREATE FUNCTION f AS (x) -> x`
+followed by a second `CREATE FUNCTION f AS (x, y) -> x` answers code 609 `FUNCTION_ALREADY_EXISTS`,
+so a name identifies one function and an argument-type list in the segment - the form PostgreSQL needs
+(standing ruling 2) - would carry no information here and would change identity whenever a parameter
+list changed.
+
+The one qualification is which parent a bare name is unique within, and two kinds answer it
+differently. A `table`, `view`, `materialized_view` or DDL `dictionary` is unique within its
+**database**, which is the container segment above it. A `function`, and a config-file `dictionary`,
+is unique within the **server**: neither has a database, and the container segment of its path records
+where it was reached from. The next section is that measurement.
+
+#### Functions are SERVER-GLOBAL, and the path says where they were reached
+
+`system.functions` has no database column, and that is the engine: `CREATE FUNCTION` takes no
+qualified name and the function resolves from any database. So the Functions folder holds the same
+objects under every database, and the container segment of a function's path records the container it
+was **reached through**, not one that owns it. The alternative - showing functions under one chosen
+database - would leave the folder empty everywhere else while the functions are callable there.
+
+#### `describeObject()` takes the KIND, and only the table-backed kinds read a catalog
+
+The kind decides everything and nothing reads the name to work out what it is holding. The four
+`system.tables` kinds read columns and data-skipping indexes; a `function` answers three empty arrays
+with **no round trip**, which is a true fact about the kind rather than a failed read.
+
+A **dictionary does describe**, out of `system.dictionaries` rather than `system.columns`. That is the
+only catalog both flavours are in: `system.columns` answers a DDL dictionary's columns (measured) and
+holds nothing at all for a config-file one. The catalog publishes the columns as four parallel arrays,
+`key.names` / `key.types` / `attribute.names` / `attribute.types`, which the statement zips and
+flattens in SQL so the transport still reads scalar columns; a key column is reported `isPrimary`,
+which is the catalog's own split rather than a guess. A dictionary reports no index, because its
+LAYOUT is not one and `system.data_skipping_indices` holds nothing for it. The branch is keyed on the
+CATALOG rather than on `role === 'relation'` - a dictionary is declared `config` - and a declared kind
+with no catalog entry **raises in both `listObjects` and `describeObject`**, so a kind added to the
+declaration alone cannot draw a real-looking empty detail panel. The kind is checked before the path
+in both methods, so one bad call reports the same thing either way.
+
+An empty column answer raises for a dictionary too, for the same reason as for a table: a dictionary
+always declares at least a key, so nothing there under that name is the only way to read it.
+
+`hasColumns` is declared on exactly the four kinds that read a catalog, `table`, `view`,
+`materialized_view` and `dictionary`, so those rows expand to their columns in the object tree, while
+`function` declares nothing and stays a leaf because `describeObject()` answers it `columns: []`
+without a round trip.
+The dictionary is one of the fleet's five refutations of `role === 'relation'` as that gate: it is
+declared `config` and still answers its structure, out of `system.dictionaries`, which is why the
+declaration is per kind and measured rather than derived from the role.
+
+`foreignKeys` is always `[]`, the same fact as in section 6: ClickHouse parses `REFERENCES` and
+enforces nothing by it, and `system.*` holds no constraint catalog to read one back from.
+
+Zero columns **raises**: `CREATE TABLE t ()` is a syntax error (code 62), so every table-backed object
+has at least one column and an empty answer means the object is not there under that name.
+
+The index read here **does not degrade to empty**, unlike the object surface's.
+`system.data_skipping_indices` needs its own grant and answers code `497` without it, and "this
+object has no skipping index" is a different fact from "you may not see its indexes". On refusal,
+`describeObject()` and `describeObjects()` preserve the visible columns and report `indexes: { unavailable: message }`
+instead of failing the entire table detail or claiming the object has no indexes.
+
+#### `describeObjects()` describes a whole folder in four statements (#789)
+
+`describeObjects(container, kind, limit?)` answers columns and indexes for EVERY object of one kind in
+one database, in FOUR round trips for a table folder (dictionary preflight, target tables, columns, and data skipping indexes),
+THREE for views or materialized views, and TWO for a dictionary folder, whatever
+the folder holds. The single read is two statements per table-backed object and one per dictionary, so a
+folder of 200 tables cost 400. Measured on clickhouse-server 26.7.1.1315 against a 200-table database:
+**42 ms for one `describeObjects()` against 614 ms for 200 `describeObject()` calls**, the same 600
+columns and 200 skipping indexes.
+
+Each detail statement is its `describeObject()` counterpart with the name equality replaced by
+membership of the target set, and nothing else changed.
+
+The five decisions this engine had to make for itself, each measured rather than reasoned:
+
+**Which catalog.** The same three the single read uses - `system.columns`,
+`system.data_skipping_indices` and `system.dictionaries` - and the target is the same kind-tagged
+subquery the count GROUPs and the listing FILTERs, so all three cannot disagree about which rows are in
+scope. That is also what keeps the implicit inner table out of the batch: it is excluded structurally,
+by the view's own uuid, in the one place all three read. MEMBERSHIP comes from the target read and never
+from the column read, so an object the detail reads answer nothing for comes back with empty lists
+rather than missing, and this read does not repeat the single read's zero-column throw - there an empty
+answer means the object is not there under that name, here the catalog has just said it is.
+
+**Which kinds have no columns.** `function` alone, which answers `{ details: [] }` with no round trip.
+A ClickHouse UDF is server-global and resolves in no column catalog at all. A DICTIONARY is NOT one of
+them - `system.dictionaries` carries its key and attribute columns - which is why the rule is keyed on
+the CATALOG map and not on `role === "relation"`: a dictionary is declared `config`.
+
+**What bounds the read on the wire.** `LIMIT n` inside the target, carrying `limit + 1` so a saturated
+read is told from an exact one with no second count. The value is INTERPOLATED rather than bound,
+because this transport binds named `{name:Type}` parameters and nothing else; it is safe by
+construction, since the caller's value is refused unless it is a positive whole number, so nothing that
+reaches the template can be anything but digits. That guard therefore protects the STATEMENT here as
+well as the answer: a fractional limit would reach the server as a syntax error. The extra object is
+dropped in code and `truncated` carries the CALLER's limit.
+
+**What orders the cut, and under whose collation.** `ORDER BY objectName ASC` in the target, which runs
+under ClickHouse's own String comparison. Measured: that comparison is the UTF-8 BYTE order, so a
+database holding `U+E000` and `U+1F600` answers `U+E000` first, where a JavaScript sort answers the
+reverse because it compares UTF-16 code units and the surrogate `0xD83D` sorts below `0xE000`. So the
+MEMBERSHIP of a bounded cut is the server's and the ORDER of the answer is ours.
+
+**Mixed path depth (ruling 5f).** Not in this engine's relation set, and there is nothing here that
+could produce one: no kind declares `attachedTo`, and every object of every declared kind is addressed
+`[database, name]`. A function's database segment records the container it was REACHED through rather
+than one that owns it, which is unchanged from the listing.
+
+**The dictionary folder needed its own shape, and the reason is a PER NAME choice.** The single read
+prefers a DDL dictionary over a config-file one of the same name with `ORDER BY database DESC LIMIT 1`.
+A bulk read over many names cannot use a `LIMIT` at all, so it groups by name and takes each of the four
+parallel arrays with `argMax(..., database)`. Measured on 26.7.1.1315, and the collision really is
+creatable: `CREATE DICTIONARY demo.dict_regions_config` beside the config-file one of that name gives
+`system.dictionaries` two rows, and both readings then answer the DDL one's columns, column for column.
+Dropping `argMax` is not a wrong answer on this engine, it is a server error - code 215,
+*"Column 'system.dictionaries.`key.names`' is not under aggregate function and not in GROUP BY keys"* -
+which is why the clause is pinned by statement TEXT in the suite. The four `key.*` and `attribute.*`
+names are backtick-quoted inside `argMax`, where a dotted name would otherwise parse as tuple access.
+
+The index read is NOT degraded to empty on a refusal, for the reason the single read gives:
+`system.data_skipping_indices` needs its own grant and answers code 497 without it, and "these objects
+have no skipping index" is a different fact from "you may not see their indexes".
+
+#### Paths are derived, never indexed positionally
+
+The container depth comes from `containerDepth()`, the database segment from the declared level whose
+`id` is `schema`, and the object's own name from the last segment. None of those is a literal index.
+On a one-level engine all three are behaviour-identical to the positional spellings, which is exactly
+why three spellings of that defect shipped elsewhere in #789 before being caught, so the suite hands
+this provider a synthetic **two-level** declaration through `spyOn` and drives it all the way to the
+bound database and the bound object name, not merely to the refusal.
+
+Sorting is over the path segment by segment and never over `JSON.stringify(path)`, which is wrong
+twice: at mixed depth the deeper path sorts first, because `,` (0x2C) is below `]` (0x5D), and JSON
+escaping reorders names holding a quote or a backslash - all of which ClickHouse accepts in a
+backquoted identifier.
 
 ---
+
+### 6.2 Object source (#789)
+
+`readObjectSource(path, kind, limit?)` answers ONE object's definition text as a document of
+named parts.
+Every declared kind has one, so there is no kind here that declares nothing, and every
+document this engine produces carries exactly ONE part: ClickHouse has no package, no
+specification-and-body split, and a materialised view's implicit inner table is storage the
+server created rather than a second definition of the view.
+
+Everything below was measured on **ClickHouse 26.7.1.1315** against
+`docker/clickhouse-init/01-object-fixture.sql` applied through the mount
+`database-compose.yml` declares.
+
+| Kind | Statement | Monaco id | `form` | `origin` |
+|---|---|---|---|---|
+| `table`, `view`, `materialized_view` | `SELECT formatQuery(t.create_table_query) AS objectSource FROM system.tables AS t WHERE t.database = <literal> AND t.name = <literal>` | `sql` | `complete` | `regenerated` |
+| `dictionary` | the same statement; a row that is missing asks `SELECT d.origin AS objectOrigin FROM system.dictionaries AS d WHERE d.name = <literal> AND d.database = ''` | `sql` | `complete` | `regenerated` |
+| `function` | `SELECT f.origin AS objectOrigin, f.create_query AS objectSource FROM system.functions AS f WHERE f.name = <literal>` | `sql` | `complete` | `regenerated` |
+
+`complete` in words: each of these is a statement that RUNS AS GIVEN, never a body or a bare
+SELECT.
+`regenerated` in words: the server REBUILT it from its own catalog rather than storing what
+the author typed, so a reader must never be shown it as an original. The fixture's
+`total Decimal(12, 2) DEFAULT 0` comes back backquoted, and every MergeTree table comes back
+carrying a `SETTINGS index_granularity = 8192` clause nobody wrote.
+
+`sql` is the right Monaco id and no part of it is a compromise: ClickHouse SQL is SQL, and the
+installed monaco-editor 0.57.0 registers `sql`. The three ids this design had to refuse
+elsewhere, `plsql`, `tsql` and `cql`, are not registered at all and are not needed here.
+
+#### The read takes NO identifier position, and that is the security decision
+
+`SHOW CREATE TABLE|VIEW|DICTIONARY` is the statement a ClickHouse user knows, and it takes an
+IDENTIFIER where a bind would go.
+On this engine that position is a statement-injection hazard rather than a quoting
+inconvenience.
+
+MEASURED (#789 probe 11): a backslash inside a QUOTED IDENTIFIER is processed as an ESCAPE, in
+the double-quote form and the backtick form alike.
+`SELECT 1 AS "a\"b"` and `SELECT 1 AS "a""b"` produce the SAME identifier, and a table created
+as `"x\\"` stores `hex(name) = 785C`, exactly one trailing backslash.
+So a name ending in a backslash SWALLOWS the closing quote and the parser KEEPS READING: the
+naive statement answers code 62, `Double quoted string is not closed`, and the error position
+MOVES with whatever follows, which is how the swallow was told from a plain error.
+
+Two consequences, and both are why neither existing helper is used here:
+
+| Helper | Why not |
+|---|---|
+| `SQLBaseProvider.escapeIdentifier` | doubles ONLY the quote character, so it leaves the backslash escape open. Unsafe on this engine |
+| `literal()` in `objects.ts` | a STRING escaper that emits single quotes. `SHOW CREATE DICTIONARY 'db'.'name'` is a parse error |
+
+The position is therefore REMOVED rather than escaped. All three statements above are
+`WHERE x = <literal>` reads of a system table, which is the same VALUE position the other nine
+`literal()` call sites in that file use, and where the doubled quote plus the escaped backslash
+are both measured to be correct. The fixture carries the two adversarial objects that make
+that testable rather than assertable:
+
+| Object | Measured |
+|---|---|
+| ``demo.`bs_one\` `` | `hex(name) = 62735F6F6E655C`, `length(name) = 7`: exactly one trailing backslash |
+| ``demo.`dq"two` `` | a double quote inside a backquoted identifier is an ordinary character |
+
+Reading ``bs_one\`` back with the backslash ESCAPED answers its definition; with the backslash
+left alone the same statement fails with code 62, `Single quoted string is not closed`, at the
+position of the clause that followed it, which is the value-position twin of what probe 11
+measured for identifiers.
+
+#### Nothing is lost by avoiding `SHOW CREATE`, and that is a measurement
+
+`formatQuery(create_table_query)` is BYTE-IDENTICAL to what `SHOW CREATE <kind>` answers:
+
+| Object | `SHOW CREATE` | `formatQuery(create_table_query)` |
+|---|---|---|
+| `demo.orders` | 323 bytes | 323 bytes, identical |
+| `demo.order_summary` | 238 bytes | 238 bytes, identical |
+| `demo.dict_customers` | 212 bytes | 212 bytes, identical |
+| `demo.mv_rollup` | identical | identical |
+
+The catalog column ON ITS OWN is a single line. That is the same statement and a much worse
+thing to hand a reader, so the engine's own formatter supplies the spelling and the engine's
+own catalog supplies the text.
+
+A `function` is the one kind NOT formatted, and that is forced rather than chosen:
+`formatQuery('')` raises code 62 `Empty query`, `system.functions.create_query` really IS empty
+for a non-SQL origin, and turning that per-object refusal into a hard error would take the
+whole document away. Measured: the formatter leaves the one SQL function's text byte-identical
+anyway, so the column is read raw. On `system.tables` the formatter is safe because 0 of 186
+rows on a bare server carry an empty `create_table_query`.
+
+#### `system.functions.create_query` is documented Obsolete and CARRIES THE TEXT
+
+The ClickHouse documentation marks that column Obsolete. The server does not: on 26.7.1.1315 it
+answers `CREATE FUNCTION order_total_with_tax AS total -> (total * 1.2)`, 62 characters, for the
+fixture's SQL function (#789 probe 10).
+The measurement wins over the label, and both are recorded here so a later reader knows the
+column is DEPRECATED rather than ABSENT. The control that makes it a per-object fact rather
+than a server-wide one: grouped over the whole table, `System` has 1858 rows with 1858 EMPTY
+`create_query` values beside the one `SQLUserDefined` row that is not.
+
+#### The three refusals, each PER OBJECT inside a declared kind
+
+`hasSource` answers for the KIND and the READ answers per object. A refusal is a PART carrying
+a sentence, never a dropped declaration and never an absence.
+
+**A CONFIG-FILE dictionary.** It has no `system.tables` row at all and sits in
+`system.dictionaries` with an EMPTY `database` and an `origin` naming the file, so the read that
+answers for every other object of this kind answers no row for it. It sits beside a DDL
+dictionary of the SAME KIND in the same fixture, which is what makes the refusal per object.
+The sentence is OURS and names the engine's own `origin` value, and the reason it is not the
+engine's own is measured: `SHOW CREATE DICTIONARY dict_regions_config` answers code 390
+`CANNOT_GET_CREATE_TABLE_QUERY`, ``Table `dict_regions_config` doesn't exist.``, which is a
+FALSE claim about a dictionary the server is serving. That is the same shape as Oracle's
+ORA-31603 "not found in schema", and the ruling there applies here: a refusal must say WHICH
+absence it is.
+
+**A function with no SQL text.** `system.functions.origin` is
+`Enum8('System' = 0, 'SQLUserDefined' = 1, 'ExecutableUserDefined' = 2, 'WasmUserDefined' = 3)`,
+and an `ExecutableUserDefined` or `WasmUserDefined` function's body is an external program or a
+WASM module rather than SQL, so its `create_query` is empty. The refusal carries the ORIGIN the
+server reported, because that column is the only thing that can say WHICH absence an empty text
+is. DISCLOSED: neither origin exists on this server and neither is in the fixture, because an
+executable or WASM function is declared by a `*_function.xml` in the server configuration
+directory beside the script it runs, and `database-compose.yml` mounts neither, so this origin
+cannot be created on the shipped fixture. The arm is driven in the suite by a server that
+answers an empty `create_query`, and the live half stays UNMEASURED.
+
+Both refusal sentences also have an arm for an origin the server does not report, which no
+ClickHouse build produces: `system.dictionaries.origin` names the XML file and
+`system.functions.origin` is an `Enum8`. It exists because a blank column would otherwise put a
+hole in a sentence a reader is shown as the engine's own fact, and it is DRIVEN in the suite
+rather than left to line coverage, which reported the line as hit while the arm was dead
+(#789).
+
+**A privilege denial.** It arrives as HTTP 500 with exception code 497 and never as 403
+(section 3.3), and the sentence is the server's own, VERBATIM and unprefixed, never through the
+provider's error mapping. Measured with a `src_probe` user holding only `SELECT ON demo.orders`:
+
+```
+Code: 497. DB::Exception: src_probe: Not enough privileges. To execute this query, it's
+necessary to have the grant SELECT ON system.dictionaries. (ACCESS_DENIED)
+```
+
+Every OTHER failure RAISES. A timeout or a dropped socket is nobody answering at all, and
+rendering it in the Source pane as this object's own refusal would present a symptom as a fact
+about the object.
+
+#### `system.tables` FILTERS by grant where `system.dictionaries` DENIES
+
+Measured with the same restricted user, and it is the reason the denial above is reachable on
+one catalog and not the other:
+
+| Read | As `src_probe`, holding `SELECT ON demo.orders` |
+|---|---|
+| `create_table_query` for `demo.orders` | the full definition |
+| `create_table_query` for `demo.customers` | ZERO ROWS, no denial |
+| `system.dictionaries` | code 497, ACCESS_DENIED |
+| `system.functions` | answered, no grant needed |
+
+So on the table-backed kinds a privilege problem looks exactly like an absence, and this
+provider raises `No ClickHouse table named customers in demo` for it. That is not a false claim
+a user can meet from the tree: the SAME filtering hides the object from `system.tables` for the
+count and the listing, so a caller who cannot see it never lists it and never reaches this read.
+
+#### An absence RAISES and an empty text is a refusal
+
+An object the provider cannot find raises a `QueryError` naming the object's last segment:
+`No ClickHouse table named no_such_table in demo`, `No ClickHouse dictionary named ghost in demo`,
+`No ClickHouse function named ghost`. It never answers a document and never answers a refusal
+part, because the document's `parts` tuple leaves no empty value an absence could be confused
+with.
+
+An empty or whitespace-only text is a REFUSAL and never a part with no text in it: an empty
+definition is not a definition, and an editor buffer opened over one is the failure this whole
+design exists to prevent.
+
+#### A DDL dictionary's credential comes back REDACTED
+
+`SOURCE(CLICKHOUSE(... PASSWORD '[HIDDEN]'))` is the SERVER's own substitution under
+`format_display_secrets_in_show_and_select = 0`, which is the default, and `SHOW CREATE` does
+exactly the same. The text is still `complete`: it is the statement the server publishes for
+that object. Nothing in this product redacts anything, and a reader meeting the placeholder is
+looking at the server's own answer rather than a password lost in transit.
+
+#### Paths, again, and the same rule
+
+The database is the container segment the DECLARATION names `schema` and the object's own name
+is the LAST segment, never a literal index. A FUNCTION is server-global, so the container
+segment of its path records where it was REACHED from and is deliberately not part of the
+statement that reads it. The suite pins both derivations with a synthetic TWO-LEVEL declaration
+AND with one that SWAPS the two levels over and feeds the path in the swapped order, where the
+same three values must still reach the server.
+
+#### Reproducing the whole section
+
+```bash
+docker compose -f database-compose.yml up -d clickhouse
+# The user and the password are the compose service's own, read from the file that sets
+# them rather than copied, so this block cannot go stale against it and carries no literal
+# credential of its own.
+CH_PASSWORD=$(awk '/CLICKHOUSE_PASSWORD/{print $2}' database-compose.yml)
+# every object below is created by docker/clickhouse-init/01-object-fixture.sql
+curl -s "http://127.0.0.1:8123/?user=libredb&password=$CH_PASSWORD&database=demo" \
+  --data-binary "SELECT formatQuery(create_table_query) FROM system.tables WHERE database='demo' AND name='orders' FORMAT TSVRaw"
+curl -s "http://127.0.0.1:8123/?user=libredb&password=$CH_PASSWORD&database=demo" \
+  --data-binary "SHOW CREATE TABLE demo.orders FORMAT TSVRaw"   # byte-identical to the line above
+curl -s "http://127.0.0.1:8123/?user=libredb&password=$CH_PASSWORD&database=demo" \
+  --data-binary "SELECT database, origin FROM system.dictionaries ORDER BY name FORMAT TSV"
+curl -s "http://127.0.0.1:8123/?user=libredb&password=$CH_PASSWORD&database=demo" \
+  --data-binary "SELECT name, origin, create_query FROM system.functions WHERE origin != 'System' FORMAT TSV"
+# the escaper, both ways round, against the fixture's own adversarial table
+curl -s "http://127.0.0.1:8123/?user=libredb&password=$CH_PASSWORD&database=demo" \
+  --data-binary "SELECT name FROM system.tables WHERE database='demo' AND name='bs_one\\\\' FORMAT TSV"
+curl -s "http://127.0.0.1:8123/?user=libredb&password=$CH_PASSWORD&database=demo" \
+  --data-binary "SELECT name FROM system.tables WHERE database='demo' AND name='bs_one\\' FORMAT TSV"
+```
+
+---
+
+### 6.3 Object edit (#789)
+
+This engine is a REFUSAL, recorded because no escaper for its identifiers had been measured.
+A backslash inside a quoted identifier is an ESCAPE in both the double-quote and the backtick form on 26.7.1.1315, and the shared quoters (the default branch of `SQLBaseProvider.escapeIdentifier`, `quoteIdentifier` in [`src/lib/sql/identifier.ts`](../../src/lib/sql/identifier.ts) and `escapeIdentifier` in [`pool-manager.ts`](../../src/lib/db/utils/pool-manager.ts)) emit `"x\"` for the name `x\`, so a statement built through any of them is not the statement the author addressed.
+Since #1091 this provider's own `escapeIdentifier()` escapes the backslash as well, and it is measured ([§8](#8-maintenance)).
+No edit statement is built through it and none has been measured, so the refusal stands.
+One question here is UNMEASURED and is recorded as such rather than answered: whether a dictionary's credential is really redacted in the text the Phase 2 read returns.
+No kind here declares `acceptsSourceEdits`, and `tests/isolated/object-edit-declarations.test.ts` is what holds that absence and this section together.
 
 ## 7. Monitoring & health
 
@@ -769,9 +1454,14 @@ Two honest zeroes in the overview, so neither reads as a measurement:
 
 ## 8. Maintenance
 
-`runMaintenance(type, target?)`
-([index.ts:920](../../src/lib/db/providers/sql/clickhouse/index.ts)). `optimize` and `kill` **require**
+`runMaintenance(type, target?, container?)`
+([`index.ts`](../../src/lib/db/providers/sql/clickhouse/index.ts)). `optimize` and `kill` **require**
 a target; `analyze` does not.
+
+A `container` is the DATABASE the row carries as `schemaName` (#772), used as the database outright:
+`database.table` cannot be told apart from a name that contains a dot, while a container is already
+the database on its own. Without one the old reading stands, splitting the name and falling back to
+the pinned database.
 
 | Type | ClickHouse action | Notes |
 |------|--------------------|-------|
@@ -786,6 +1476,15 @@ Calling `runMaintenance` with one directly throws a `QueryError` naming the thre
 operations. A target is qualified through
 `escapeIdentifier()` (`"database"."table"`, defaulting the database to the pinned one when the
 target names none), so a hostile or oddly-named table cannot break out of the generated statement.
+That helper is OVERRIDDEN here rather than inherited, and the reason is the identifier escape
+measured in [§6.3](#63-object-edit-789): a backslash inside a quoted identifier is an escape on this
+engine, so the inherited form, which doubles only the quote character, left a name ending in one
+with its closing quote swallowed and the rest of the statement reparsed around it. A container of
+`x\` was the reachable case (#1091 review): the target that followed became more statement text
+rather than a second segment. The override escapes the backslash first, the order `literal()` in
+`objects.ts` uses.
+Live-verified on 26.7.1.1315 against the fixture's own `` demo.`bs_one\` ``: the target `bs_one\`, the target `demo.bs_one\`, and the target `bs_one\` with the container `demo` all optimize it, where the inherited spelling answers `Double quoted string is not closed` on the same table.
+The container `x\` with the target `.t FINAL SETTINGS optimize_throw_if_noop = 1 --` is refused with `UNKNOWN_DATABASE`, for a database named `x\`.
 
 ### Where each operation may be offered (`maintenanceOperationSpecs`)
 
@@ -826,7 +1525,7 @@ rather than silent.
 
 ## 9. Capabilities & labels
 
-### `getCapabilities()` ([index.ts:461](../../src/lib/db/providers/sql/clickhouse/index.ts))
+### `getCapabilities()` ([`index.ts`](../../src/lib/db/providers/sql/clickhouse/index.ts))
 
 | Capability | Value |
 |------------|-------|
@@ -834,20 +1533,25 @@ rather than silent.
 | `supportsExplain` | `true` |
 | `explainFormat` | `clickhouse-json` |
 | `supportsExternalQueryLimiting` | `true` |
-| `supportsCreateTable` | `false` |
+| `createTable` | absent |
 | `supportsInlineRowEdit` | `false` — a bare `UPDATE ... SET` is code `48` `NOT_IMPLEMENTED` here ([§13](#13-known-limitations--future-work)) |
+| `supportsTestDataGeneration` | `false` - no kind here declares a row write, so the row menus would not offer Generate Test Data either way |
+| `supportsResultPagination` | `true` — `LIMIT n OFFSET m` from the shared limiter. A statement ending in `FORMAT` or `SETTINGS` comes back `wasLimited: false` and is therefore offered no Load More, which is the intended answer and needs no branch of its own (#816) |
 | `supportsTransactions` | `false` — reached over stateless HTTP, and ClickHouse has no general transaction to wrap anyway, so the trio and SANDBOX are not offered (#464) |
 | `declaresForeignKeys` | `false` — `REFERENCES` parses in a column definition and enforces nothing, and `system.*` holds no constraint catalog to read one back from |
 | `supportsMaintenance` | `true` |
 | `maintenanceOperations` | `['optimize', 'analyze', 'kill']` |
 | `supportsConnectionString` | `true` |
 | `defaultPort` | `8123` |
+| `containerLevels` | one level, `schema`, labelled Database: ClickHouse has no schema level below a database ([§6.1](#61-the-object-surface-789)) |
+| `containerPathShapes` | `exact`: only `[database]` addresses a container ([§6.1](#61-the-object-surface-789)), so a shorter or a longer path is refused, by the object routes over HTTP and by this provider for a caller that reaches it directly (#1147) |
+| `objectKinds` | `table`, `view`, `materialized_view`, `dictionary`, `function` ([§6.1](#61-the-object-surface-789)) |
 | `schemaRefreshPattern` | `\b(CREATE\|DROP\|ALTER\|RENAME\|TRUNCATE\|ATTACH\|DETACH)\b` |
 
-`supportsCreateTable: false` is deliberate, not an oversight — see
-[§3.10](#310-supportscreatetable-is-false--live-disproved-the-issues-own-guess).
+Declaring no `createTable` is deliberate, not an oversight — see
+[§3.10](#310-no-createtable-is-declared--live-disproved-the-issues-own-guess).
 
-### `getLabels()` ([index.ts:489](../../src/lib/db/providers/sql/clickhouse/index.ts))
+### `getLabels()` ([`index.ts`](../../src/lib/db/providers/sql/clickhouse/index.ts))
 
 Tables and rows are the right words here, so only the maintenance vocabulary changes — ClickHouse
 has no VACUUM and no ANALYZE, and offering either by that name would describe an operation that does
@@ -865,6 +1569,26 @@ log_queries is off."* The Queries panel's empty state was hardcoded to PostgreSQ
 `pg_stat_statements` advice for every engine (#463), and `system.query_log`
 ([§7](#7-monitoring--health)) is what an operator here can actually act on.
 
+### SQL writing
+
+[`clickhouse/sql-writing.ts`](../../src/lib/db/providers/sql/clickhouse/sql-writing.ts) declares how a generated statement spells a literal, a name and a bind for this engine, and it is this engine's row of `SQL_WRITING` ([`src/lib/db/sql-writing/index.ts`](../../src/lib/db/sql-writing/index.ts)), which the readers in [`src/lib/sql/values.ts`](../../src/lib/sql/values.ts) and [`src/lib/sql/identifier.ts`](../../src/lib/sql/identifier.ts) look up.
+A literal is written by `literalDoubleAndBackslash` and read back by `unquoteDoubleAndBackslash`: the quote is doubled and a backslash escapes, so the backslash is doubled first.
+A name is quoted by `identifierDoubleQuoted`, the SQL standard form: a double-quoted name with an inner double quote doubled.
+There is no placeholder (`placeholder: null`), so a generator quotes the value with `quoteLiteral` instead of emitting a bind.
+This matches what the ClickHouse provider already does when it builds its own literals ([`index.ts`](../../src/lib/db/providers/sql/clickhouse/index.ts)).
+ClickHouse binds named parameters only, and its provider refuses positional ones outright.
+Inline row editing reads a key column's kind through the shared `INSTANT_TYPE_NAMES`, `FLOAT64_TYPE_NAMES` and `EXACT_DECIMAL_TYPE_NAMES` of the module's `inlineEdit`, and binds every edit as typed.
+
+The module's `export` field spells a result export's column types through `ddlTypes`, the standard spelling with `String` for a binary column: ClickHouse has no BLOB, and its byte container is `String`, a byte sequence rather than a text encoding.
+Measured on 26.7.1, the other standard spellings all resolve to a whole type (`TEXT` to `String`, `BIGINT` to `Int64`, `DOUBLE PRECISION` to `Float64`, `TIMESTAMP` to `DateTime`).
+Each name in `standsAlone` was measured, one `CREATE TABLE probe (c <name>)` per name on ClickHouse 26.7.1, read back out of `system.columns`, and is listed only because ClickHouse both accepted it and stored it unnarrowed.
+ClickHouse resolves every character and byte alias it knows to `String`.
+ClickHouse's `decimal` is absent because it is stored as `Decimal(10, 0)`, the MySQL narrowing again, and so is `set`: MySQL's SET is a character type, while ClickHouse accepts the word and stores `UInt64`, the widest silent mistranslation measured.
+A binary cell is written by `binaryUnhex`: measured on 26.7.1, `unhex('0102deadbeef')` into a `String` column reads back as `hex(payload)` = `0102DEADBEEF` with `length(payload)` 6, and `length(unhex(''))` is 0.
+`nonFinite` writes the bare `nan`, `inf` and `-inf`, which ClickHouse 26.9.18.11 read back into `Float64` and `Float32` (2026-10-14).
+`typedLiteral` writes arrays, maps, tuples and the other cells whose quoted JSON form ClickHouse refuses, from the engine's own [`clickhouse/typed-literals.ts`](../../src/lib/db/providers/sql/clickhouse/typed-literals.ts).
+`NO_BARE_SPELLING` completes it.
+
 ---
 
 ## 10. Error handling
@@ -872,7 +1596,7 @@ log_queries is off."* The Queries panel's empty state was hardcoded to PostgreSQ
 The transport normalizes every failure into `ClickHouseTransportError { code, name, message }`; the
 provider maps that one numeric space onto the shared classes from
 [`src/lib/db/errors.ts`](../../src/lib/db/errors.ts)
-([index.ts:637](../../src/lib/db/providers/sql/clickhouse/index.ts)):
+(`mapClickHouseError()`, [`index.ts`](../../src/lib/db/providers/sql/clickhouse/index.ts)):
 
 | Code | Meaning | Error raised |
 |------|---------|--------------|
@@ -945,9 +1669,9 @@ including identifier quoting and literal escaping.
 
 ```bash
 # Just this provider
-bun test tests/integration/db/clickhouse-provider.test.ts
-bun test tests/unit/db/clickhouse
-bun test tests/unit/lib/explain/clickhouse-json.test.ts
+bun tests/run-tests.ts tests/integration/db/clickhouse-provider.test.ts
+bun tests/run-tests.ts tests/unit/db/clickhouse
+bun tests/run-tests.ts tests/unit/lib/explain/clickhouse-json.test.ts
 
 # Full isolated suite (CI-equivalent)
 bun run test
@@ -967,6 +1691,16 @@ docker compose -f database-compose.yml up clickhouse
 
 Port `9000` (the native protocol) is deliberately not exposed — there is no native-protocol
 transport in this codebase to connect with it.
+
+Two mounts seed the object surface's own fixture, and the service is useless for #789 without them:
+
+| Mount | Holds |
+|---|---|
+| `docker/clickhouse-init/01-object-fixture.sql` | one object of every declared kind, plus the three shapes the exclusion rules are measured against: a materialized view with an implicit inner table, one with a `TO` target, a user table named `.inner_id.fake`, and a table whose engine is `Dictionary`. It also seeds rows: two in `reporting.regions`, two in `demo.customers`, two in `demo.orders` and one in ``demo.`.inner_id.fake` ``, the last so that the dotted name a generated statement must quote as ONE segment can be shown returning a row rather than an empty result either spelling produces |
+| `docker/clickhouse-config/regions_dictionary.xml` | the config-file dictionary, which SQL cannot create and which has no `system.tables` row |
+
+Both run on a **fresh data directory only**, so an already-initialized container has to be recreated
+(`docker compose -f database-compose.yml rm -sfv clickhouse`) before an edit to either takes effect.
 
 ---
 
@@ -988,9 +1722,8 @@ const provider = await createDatabaseProvider({
 await provider.connect();
 
 const result = await provider.query('SELECT id, email FROM users LIMIT 50');
-const schema = await provider.getSchema();           // tables + columns + indexes, one round trip
-const list = await provider.getSchemaList();          // fast: tables + columns, no index catalog
-const relations = await provider.getSchemaRelations(); // indexes to merge in
+const objects = await provider.listObjects(container, 'table');
+const { details } = await provider.describeObjects(container, 'table');
 
 await provider.disconnect();
 ```
@@ -1001,7 +1734,8 @@ await provider.disconnect();
 provider uses. `POST /api/db/maintenance` (admin) accepts `optimize` / `analyze` / `kill`;
 `optimize` and `kill` require a `target`, while `analyze` treats a missing one as "the whole pinned
 database" ([§8](#8-maintenance)) — so a client should omit it rather than invent one for
-database-wide statistics. Transaction and cancel routes do not apply — see
+database-wide statistics. `POST /api/db/cancel` stops a statement `POST /api/db/query` started
+under a `queryId` ([§5.4](#54-cancellation)); the transaction routes do not apply, see
 [§13](#13-known-limitations--future-work).
 
 ---
@@ -1010,8 +1744,10 @@ database-wide statistics. Transaction and cancel routes do not apply — see
 
 - **No transactions.** ClickHouse has no multi-statement transaction model to expose over this
   interface, so there is no begin/commit/rollback API here.
-- **No `cancelQuery`.** A running statement is terminated through maintenance `kill` with its
-  `query_id`, which needs its own grant like any other `system.processes` operation.
+- **Maintenance `kill` is a different path from Cancel.** Cancel reaches only a statement this
+  provider started ([§5.4](#54-cancellation)); a statement anyone else runs is terminated through
+  maintenance `kill` with its `query_id`, which needs its own grant like any other
+  `system.processes` operation.
 - **No analyze-mode EXPLAIN.** ClickHouse's `EXPLAIN` never executes the statement; see
   [§3.12](#312-explain-reuses-the-shared-tree-model).
 - **`ALTER TABLE ... UPDATE` and lightweight `DELETE FROM` report zero rows changed even on
@@ -1073,9 +1809,28 @@ database-wide statistics. Transaction and cancel routes do not apply — see
   is displayed and generated as `database.table`, so `a.b` + `c` renders as `a.b.c` and every consumer
   that splits on the dot reads it as three parts. Introspection is internally safe — the grouping key
   joins on `NUL`, not a dot — so only the *display name* is ambiguous. This is the same limitation
-  `postgres.ts` carries for schema-qualified names; removing it means giving `TableSchema` structured
+  `postgres.ts` carries for schema-qualified names; removing it means giving the object shape structured
   segments instead of one string, which is a cross-provider change rather than a ClickHouse one.
   Dotted database names are vanishingly rare in practice.
+
+---
+
+## Migration DDL
+
+[`CLICKHOUSE_MIGRATION_DDL`](../../src/lib/db/providers/sql/clickhouse/migration-ddl.ts) is what the schema-diff migration generator writes for `clickhouse`, read through `migrationDdlFor` in `src/lib/db/migration-ddl/`.
+ClickHouse's transaction support is experimental and setting-gated, so `transactionWrapper` is `null` (#284).
+It has no foreign-key constraint, and its index changes are a comment, because the diff records column names and uniqueness, not the index kind, expression or granularity.
+A default whose value starts with `MATERIALIZED`, `ALIAS` or `EPHEMERAL` (`CLICKHOUSE_DEFAULT_KINDS`) already names its own clause and is written without `DEFAULT` in front of it.
+Live-probed on `clickhouse-server:26.7.1.1315`: `MODIFY COLUMN "y" Int32 DEFAULT MATERIALIZED toYear(d)` is a syntax error (code 62), while `MODIFY COLUMN "y" Int32 MATERIALIZED toYear(d)` is accepted.
+A dropped default is written as `REMOVE <kind>`, because omitting the clause leaves the old default in place; `REMOVE` takes `DEFAULT`, `MATERIALIZED` or `ALIAS` only (`CLICKHOUSE_REMOVABLE_KINDS`), `REMOVE EPHEMERAL` is code 62, and `REMOVE DEFAULT` on a column with no default is code 36.
+Nullability is part of the type (`Nullable(T)`), so a modified column restates its declared type and there is no `SET NOT NULL`.
+The fields it takes unchanged from `src/lib/db/migration-ddl/shared.ts` are `standardAddColumn`, `standardDropColumn`, `standardDropTable` and `standardPrimaryKey`.
+
+Every refusal reason it can print, verbatim:
+
+- "ClickHouse: Cannot generate index DDL. The diff does not record the index kind, expression or granularity; write the index change by hand."
+- "The engine has no foreign-key constraint."
+- "REMOVE accepts DEFAULT, MATERIALIZED or ALIAS only; recreate the column."
 
 ---
 
@@ -1095,4 +1850,4 @@ database-wide statistics. Transaction and cancel routes do not apply — see
   <https://clickhouse.com/docs/en/operations/system-tables/columns>,
   <https://clickhouse.com/docs/en/operations/system-tables/data_skipping_indices>
 - EXPLAIN: <https://clickhouse.com/docs/en/sql-reference/statements/explain>
-- Sibling provider docs: [PostgreSQL](./postgres.md) · [MySQL](./mysql.md) · [Oracle](./oracle.md) · [SQL Server](./mssql.md) · [SQLite](./sqlite.md) · [MongoDB](./mongodb.md) · [Couchbase](./couchbase.md) · [Apache Trino](./trino.md) · [Redis](./redis.md) · [LibreDB](./libredb.md)
+- Sibling provider docs: [PostgreSQL](./postgres.md) · [MySQL](./mysql.md) · [Oracle](./oracle.md) · [SQL Server](./mssql.md) · [SQLite](./sqlite.md) · [MongoDB](./mongodb.md) · [Couchbase](./couchbase.md) · [Trino](./trino.md) · [Redis](./redis.md) · [LibreDB](./libredb.md)

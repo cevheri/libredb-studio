@@ -30,6 +30,9 @@ import type { DatabaseType } from "@/lib/types";
  */
 const SHIPPED: Readonly<Record<DatabaseType, true>> = Object.freeze({
   postgres: true,
+  bigquery: true,
+  snowflake: true,
+  spark: true,
   mysql: true,
   sqlite: true,
   // libSQL (#424 Phase 5): its own provider, doc and integration test. A separate
@@ -42,6 +45,10 @@ const SHIPPED: Readonly<Record<DatabaseType, true>> = Object.freeze({
   // be it. Nothing is recorded as a relative below for that reason.
   duckdb: true,
   oracle: true,
+  // IBM Db2 LUW (#786): its own provider, doc and integration test. Db2 for z/OS and for IBM i
+  // speak the same DRDA protocol and are recorded below as relatives only once a gate-4 probe has
+  // measured each, never because the protocol answers.
+  db2: true,
   mssql: true,
   clickhouse: true,
   druid: true,
@@ -63,6 +70,72 @@ const SHIPPED: Readonly<Record<DatabaseType, true>> = Object.freeze({
   mongodb: true,
   couchbase: true,
   redis: true,
+  // Prometheus (#1085): its own provider, doc and integration test, and the first member of
+  // the `timeseries/` family. A relative that speaks the same HTTP API is recorded below only
+  // once a gate-4 probe has measured one, never because the API answers.
+  prometheus: true,
+  // Apache Kafka (#1088): its own provider, doc and integration test, and the first member of the
+  // `stream/` family. A broker that speaks the same protocol is recorded below as a relative only
+  // once a gate-4 probe has measured one, never because the protocol answers.
+  kafka: true,
+  // etcd (#1089): its own provider, doc and integration test, and the second member of the `keyvalue/`
+  // family. kine and Xline speak etcd's API and are recorded below as relatives only once a gate-4
+  // probe has measured each, never because the API answers.
+  etcd: true,
+  // Neo4j (#424): its own provider, doc and integration test, and the first member of the `graph/`
+  // family. Memgraph speaks Bolt and Cypher and is recorded below as a relative only once a gate-4
+  // probe has measured it, never because the protocol answers.
+  neo4j: true,
+  // Milvus (vector-family spec 5): its own provider, doc and integration test, and the first member of the
+  // `vector/` family. Zilliz Cloud speaks the same API and is recorded nowhere until a test cluster passes gate 4.
+  milvus: true,
+  // Qdrant (vector-family spec 6): its own provider, doc and integration test, a member of the `vector/` family.
+  // Qdrant Cloud speaks the same API and is recorded nowhere until a test cluster passes gate 4 (vector-family spec 6.2).
+  qdrant: true,
+  // InfluxDB (InfluxDB spec I2): its own provider class, doc and integration test; the first of two type-ids served by
+  // `timeseries/influxdb/`, one per query language. InfluxDB Cloud, Clustered and Enterprise 1.x are claimed nowhere
+  // until a gate-4 probe measures one.
+  influxdb: true,
+  // InfluxDB 3 (InfluxDB spec I2): its own provider class, doc and integration test, sharing the connection layer of
+  // `timeseries/influxdb/` with `influxdb`. A different engine generation (Rust, Arrow, DataFusion), counted as its
+  // own engine.
+  influxdb3: true,
+  // Oxia (#424): its own provider, doc and integration test, read over its gRPC client API (DECISIONS O2).
+  oxia: true,
+  // Databend: its own provider, doc and integration test, read and written over its HTTP query API.
+  databend: true,
+  // S3-compatible object storage: its own provider, doc and integration test, read over the S3 REST API.
+  s3: true,
+  // Kubernetes: its own provider, doc and integration test, the first member of the `platform/` family: a cluster read
+  // over the API server's REST API, beside the databases rather than one of them.
+  kubernetes: true,
+  // MQTT (#1635): its own provider, doc and integration test. A broker rather than a store, and the first
+  // engine here whose read cannot be proved complete, which the provider states on every read rather than
+  // hiding. No relative is recorded: every broker speaks the same standard, and a standard is not a
+  // compatibility claim about a product.
+  mqtt: true,
+  // Firestore: its own provider, doc and integration test, read over Firestore REST v1 by a client of this
+  // repository's own. Native mode only; no relative is recorded.
+  firestore: true,
+  // RabbitMQ (#1656): its own provider, doc and integration test, the second member of the `stream/` family. A
+  // service that speaks the same management API is recorded below as a relative only once a gate-4 probe has measured
+  // one, never because the API answers.
+  rabbitmq: true,
+  // OPC UA (#1677): its own provider, doc and integration test, the first member of the `industrial/` family.
+  // A plant's address space rather than a store, read through a client seam that names eight read services, so
+  // the read-only guarantee is a type rather than a setting.
+  opcua: true,
+  // MTConnect (#1722): its own provider, doc and integration test, the second member of the `industrial/` family.
+  // An agent's device model and its observations rather than a store, read through a request table of nine routes
+  // that are all GET, so the read-only guarantee is a type rather than a setting.
+  mtconnect: true,
+  modbus: true,
+  netconf: true,
+  snmp: true,
+  // Eclipse Sparkplug B (#1720): its own provider, doc and integration test, the third member of the
+  // `industrial/` family. An MQTT broker's published certificates and data rather than a store, and the
+  // read-only guarantee is the absence of code: the encoder has no function that writes a PUBLISH.
+  sparkplug: true,
   libredb: true,
 });
 
@@ -79,10 +152,10 @@ export const SHIPPED_DATABASE_TYPES: readonly DatabaseType[] = Object.freeze(Obj
 /**
  * Which shipped ids are databases a user already runs, and which one is not.
  *
- * `libredb` is the embedded store this app carries with it; the other sixteen are
- * external engines you point the product at. Everything published as a database
- * count means the external sixteen - README.md's "sixteen drivers reach
- * forty-two named engines", the login hero's engine claim - so the split needs a
+ * `libredb` is the embedded store this app carries with it; every other id is an
+ * external engine you point the product at. Everything published as a database
+ * count means the external set - README.md's "<N> drivers reach <M> named
+ * engines", the login hero's engine claim - so the split needs a
  * definition somewhere, and it belongs beside `SHIPPED` rather than in the UI that
  * prints it. That is the same reason `SHIPPED` itself lives here.
  *
@@ -92,6 +165,9 @@ export const SHIPPED_DATABASE_TYPES: readonly DatabaseType[] = Object.freeze(Obj
  */
 const EXTERNAL: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
   postgres: true,
+  bigquery: true,
+  snowflake: true,
+  spark: true,
   mysql: true,
   sqlite: true,
   libsql: true,
@@ -99,6 +175,8 @@ const EXTERNAL: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
   // `sqlite` below, and external for the same reason.
   duckdb: true,
   oracle: true,
+  // A server the user already runs, reached over DRDA.
+  db2: true,
   mssql: true,
   clickhouse: true,
   druid: true,
@@ -109,6 +187,44 @@ const EXTERNAL: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
   mongodb: true,
   couchbase: true,
   redis: true,
+  // A server the user already runs, reached over its HTTP API.
+  prometheus: true,
+  // A cluster the user already runs, reached over the Kafka protocol.
+  kafka: true,
+  // A cluster the user already runs, reached over etcd's gRPC API.
+  etcd: true,
+  // A server the user already runs, reached over Bolt.
+  neo4j: true,
+  // A server or cluster the user already runs, reached over Milvus's gRPC API.
+  milvus: true,
+  // A server or cluster the user already runs, reached over Qdrant's REST API.
+  qdrant: true,
+  // A server the user already runs, reached over InfluxDB's v1 HTTP API.
+  influxdb: true,
+  // A server the user already runs, reached over InfluxDB 3's HTTP SQL API.
+  influxdb3: true,
+  // A server or cluster the user already runs, reached over Oxia's gRPC client API.
+  oxia: true,
+  // A self-hosted server or a Databend Cloud warehouse, reached over its HTTP query API.
+  databend: true,
+  // A server or service the user already runs, reached over the S3 REST API.
+  s3: true,
+  // A cluster the user already runs, reached over the Kubernetes API server's REST API.
+  kubernetes: true,
+  mqtt: true,
+  // A Firestore database the user already runs in Google Cloud, or the emulator the server names.
+  firestore: true,
+  // A broker the user already runs, reached over its management API and AMQP 0-9-1.
+  rabbitmq: true,
+  // A server the plant already runs, reached over opc.tcp at one endpoint the reader types.
+  opcua: true,
+  // An agent the plant already runs, reached over HTTP at one address the reader types.
+  mtconnect: true,
+  modbus: true,
+  netconf: true,
+  snmp: true,
+  // A broker the plant already runs, reached over MQTT at one address the reader types.
+  sparkplug: true,
   // The one false entry. SQLite is a file rather than a server and is still
   // external: it is the user's file, opened from a path they give us. libredb is
   // ours, created by this app, so it is the only id that answers no here.
@@ -120,8 +236,8 @@ const EXTERNAL: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
  *
  * Also the DENOMINATOR the outward-facing catalog copy is counted against:
  * `tests/unit/lib/catalog-copy-engine-count.test.ts` compares this length with every
- * numeral qualifying "engines" in nine storefront files, which until #D47 were only ever
- * corrected by somebody noticing.
+ * numeral qualifying "engines" in each storefront file its `COPY_FILES` lists, which until
+ * #D47 were only ever corrected by somebody noticing.
  */
 export const EXTERNAL_DATABASE_TYPES: readonly DatabaseType[] = Object.freeze(
   SHIPPED_DATABASE_TYPES.filter((type) => EXTERNAL[type]),
@@ -131,6 +247,569 @@ export const EXTERNAL_DATABASE_TYPES: readonly DatabaseType[] = Object.freeze(
 export function isExternalDatabaseType(type: DatabaseType): boolean {
   return EXTERNAL[type] === true;
 }
+
+/**
+ * Which shipped engines keep a read-only connection's promise: their provider refuses every write,
+ * object edit and maintenance operation before any request while the connection's `readOnly` is true
+ * (#1089). The static answer `ProviderCapabilities.enforcesReadOnly` gives once a provider is built.
+ *
+ * Static because every reader decides before a provider exists: the seed schema refuses
+ * `readOnly: true` at load where this answers false, `assertReadOnlyHonoured` in
+ * `src/lib/db/factory.ts` refuses it before anything is built or dialled, and the connection form
+ * draws its toggle, and writes the field, only where this answers true. Refused rather than ignored,
+ * because a mode an engine ignores lists a connection as read-only and sends its writes.
+ *
+ * An exhaustive Record for the reason `EXTERNAL` gives, so a new type-id cannot join without someone
+ * answering, and `tests/unit/db/read-only-enforced-capability.test.ts` holds every entry equal to
+ * what that engine's provider declares, so the two cannot drift. Frozen like the records above it.
+ */
+export const READ_ONLY_ENFORCED: Record<DatabaseType, boolean> = Object.freeze({
+  postgres: false,
+  bigquery: false,
+  snowflake: false,
+  spark: false,
+  mysql: false,
+  sqlite: false,
+  libsql: false,
+  duckdb: false,
+  oracle: false,
+  db2: false,
+  mssql: false,
+  clickhouse: false,
+  druid: false,
+  trino: false,
+  cassandra: false,
+  elasticsearch: false,
+  opensearch: false,
+  mongodb: false,
+  couchbase: false,
+  redis: false,
+  prometheus: false,
+  kafka: false,
+  // The first engine that keeps the mode (#1089 E6): its provider refuses every write command, value edit
+  // and maintenance operation before any request while the mode holds.
+  etcd: true,
+  // Read-only whatever the flag says: this version of the provider refuses every write before it is sent,
+  // offers no object edit and no maintenance operation, so a connection marked read-only keeps the promise.
+  neo4j: true,
+  // Its provider refuses Load and Release before any request while the mode holds, and every v1 console request is
+  // a read (vector-family E8).
+  milvus: true,
+  // Every v1 console request is a read and the provider has no maintenance operation, and while the mode holds it
+  // refuses every route that is not a read before any request (vector-family spec 4.4).
+  qdrant: true,
+  // Read-only whatever the flag says: on 1.x and 2.x the InfluxQL lexer policy (`influxql-policy.ts`) is the only
+  // boundary between a Studio user and `DROP DATABASE`, so it refuses every statement that is not one `SELECT`, `SHOW`
+  // or `EXPLAIN` before any request; the route table reaches no write endpoint.
+  influxdb: true,
+  // Read-only whatever the flag says: the closed route table reaches no write, configure, token, cache or plugin
+  // endpoint, the SQL policy refuses every statement that does not lead with a read keyword before any request, and
+  // the 3.12 planner refuses every write besides.
+  influxdb3: true,
+  // Read-only whatever the flag says: the adapter's stub holds only `GetShardAssignments`, `Read`, `List`, `RangeScan`
+  // and `Health/Check` (O8), and the parser refuses every write verb by name, naming the read-only mode while it
+  // holds (O1).
+  oxia: true,
+  // No read-only mode: the provider sends the statement the editor holds, as Db2's does.
+  databend: false,
+  // Read-only whatever the flag says: the console's closed command table reaches no write, and the provider sends only
+  // GET and HEAD.
+  s3: true,
+  // Read-only whatever the flag says: the request policy admits GET and the three self reviews only, before any
+  // socket, and the provider offers no object edit and no maintenance operation.
+  kubernetes: true,
+  // Structural rather than a mode: the encoder has no function that writes a PUBLISH, so there is no
+  // write to enforce against. The valve repeats the check on the bytes.
+  mqtt: true,
+  // Read-only whatever the flag says: the client builds only the read requests of its closed table, before any
+  // socket, and the provider offers no object edit and no maintenance operation.
+  firestore: true,
+  // Read-only whatever the flag says: the management client's closed route table holds GET routes only, and the AMQP
+  // client has no encoder for a publish, a get, a reject or any queue or exchange method, so no request path writes.
+  rabbitmq: true,
+  // Structural rather than a mode: the client seam names eight read services and none of them writes, so there
+  // is no write to enforce against (`src/lib/db/providers/industrial/opcua/client.ts`).
+  opcua: true,
+  // Structural rather than a mode: the request table holds nine routes and every one of them is a GET, so there
+  // is no write to enforce against (`src/lib/db/providers/industrial/mtconnect/routes.ts`).
+  mtconnect: true,
+  // Structural rather than configured: the encoder names four read function codes and device
+  // identification, and there is no code in the provider that can build a write (#1723 MB-S1,
+  // `src/lib/db/providers/industrial/modbus/valve.ts` re-checks every outbound byte).
+  modbus: true,
+  // `get-schema` answered data.
+  netconf: true,
+  snmp: true,
+  // Structural rather than a mode, and the structure is an absence: `encoder.ts` encodes CONNECT, SUBSCRIBE,
+  // UNSUBSCRIBE, PINGREQ and DISCONNECT and has no function that writes a PUBLISH, while the CONNECT takes no
+  // will parameter at all, so no later edit can register a death certificate by passing a value (5.4).
+  sparkplug: true,
+  libredb: false,
+});
+
+/**
+ * Which shipped engines open their editor handle under a file-access posture: their provider reads
+ * `ProviderExecutionContext.allowExternalFileAccess` and opens with external access off when it is
+ * denied, while the database stays writable for DuckDB. SQLite refuses denied access entirely
+ * because its drivers cannot confine statement-level file access. The static answer is
+ * `ProviderCapabilities.readsFileAccessPosture`.
+ *
+ * Static because its readers decide before a provider exists: `providerCacheKey` carries the deny
+ * posture as a key segment so a denied and a full-reach handle of one connection never share an
+ * entry, and `findOpenSingleWriterProvider` lends a handle only to a caller of its own posture. Both
+ * run while computing the key to find or open a provider, so neither can ask one. Reading
+ * `connection.type` at those two call sites was the alternative and is forbidden by `CLAUDE.md`; this
+ * map is how the behaviour stays capability-driven, exactly as `READ_ONLY_ENFORCED` is.
+ *
+ * An exhaustive Record for the reason `EXTERNAL` gives, so a new type-id cannot join without someone
+ * answering, and `tests/unit/db/reads-file-access-posture-capability.test.ts` holds every entry equal
+ * to what that engine's provider declares. Frozen like the records above it.
+ */
+export const READS_FILE_ACCESS_POSTURE: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
+  postgres: false,
+  bigquery: false,
+  snowflake: false,
+  spark: false,
+  mysql: false,
+  sqlite: true,
+  libsql: false,
+  // The engine whose editor handle opens under the posture: external access off for every role but
+  // admin, and for every role on a seed a non-admin role can use. SQLite refuses a denied handle instead.
+  duckdb: true,
+  oracle: false,
+  db2: false,
+  mssql: false,
+  clickhouse: false,
+  druid: false,
+  trino: false,
+  cassandra: false,
+  elasticsearch: false,
+  opensearch: false,
+  mongodb: false,
+  couchbase: false,
+  redis: false,
+  prometheus: false,
+  kafka: false,
+  etcd: false,
+  neo4j: false,
+  milvus: false,
+  qdrant: false,
+  influxdb: false,
+  influxdb3: false,
+  oxia: false,
+  databend: false,
+  s3: false,
+  kubernetes: false,
+  mqtt: false,
+  firestore: false,
+  rabbitmq: false,
+  opcua: false,
+  mtconnect: false,
+  modbus: false,
+  // `tests/unit/db/reads-file-access-posture-capability.test.ts`.
+  netconf: false,
+  snmp: false,
+  sparkplug: false,
+  libredb: false,
+});
+
+/**
+ * Which shipped engines keep one handle per database file in this process: the static answer
+ * `ProviderCapabilities.singleWriterFile` gives once a provider is built.
+ *
+ * Static because `providerCacheKey` decides before a provider exists: under governance every user of a
+ * connection gets a provider of their own (docs/GOVERNANCE.md#per-user-providers), and the key frames the user as its
+ * owner, except on these engines, where a provider per user would be a second handle on one file. DuckDB keeps its own
+ * copy of the catalog in a second read-write handle and checkpoints it over the file when it closes, and LibreDB
+ * refuses the second open outright, so every user of such a connection is served the one open handle. Reading
+ * `connection.type` there was the alternative and is forbidden by `CLAUDE.md`.
+ *
+ * An exhaustive Record for the reason `EXTERNAL` gives, so a new type-id cannot join without someone
+ * answering, and `tests/unit/db/compatibility.test.ts` holds every entry equal to what that engine's
+ * provider declares. Frozen like the records above it.
+ */
+export const SINGLE_WRITER_FILE: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
+  postgres: false,
+  bigquery: false,
+  snowflake: false,
+  spark: false,
+  mysql: false,
+  sqlite: false,
+  libsql: false,
+  duckdb: true,
+  oracle: false,
+  db2: false,
+  mssql: false,
+  clickhouse: false,
+  druid: false,
+  trino: false,
+  cassandra: false,
+  elasticsearch: false,
+  opensearch: false,
+  mongodb: false,
+  couchbase: false,
+  redis: false,
+  prometheus: false,
+  kafka: false,
+  etcd: false,
+  neo4j: false,
+  milvus: false,
+  qdrant: false,
+  influxdb: false,
+  influxdb3: false,
+  oxia: false,
+  databend: false,
+  s3: false,
+  kubernetes: false,
+  mqtt: false,
+  firestore: false,
+  rabbitmq: false,
+  opcua: false,
+  mtconnect: false,
+  modbus: false,
+  netconf: false,
+  snmp: false,
+  sparkplug: false,
+  libredb: true,
+});
+
+/**
+ * Which shipped engines a seed connection may expose to MCP clients (#246): the seed schema refuses
+ * `mcp: true` at load on an engine where this answers false, naming the engine, so an opt-in the
+ * product does not honour fails the file instead of listing a connection. Static for the reason
+ * `READ_ONLY_ENFORCED` is: the seed file is validated before any provider exists.
+ *
+ * The etcd provider (#1089) is the engine this record exists for: MCP is outside its first version, so
+ * its entry answers false, and that entry lands with the provider's registration, which the compiler
+ * forces. Each entry that answers false carries its reason beside it, so the record below is the list; every
+ * other engine answers true. An exhaustive Record for the reason `EXTERNAL` gives, so a new type-id cannot join
+ * without someone answering, and frozen like the records above it.
+ */
+export const MCP_EXPOSABLE: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
+  postgres: true,
+  bigquery: true,
+  snowflake: true,
+  spark: true,
+  mysql: true,
+  sqlite: true,
+  libsql: true,
+  duckdb: true,
+  oracle: true,
+  db2: true,
+  mssql: true,
+  clickhouse: true,
+  druid: true,
+  trino: true,
+  cassandra: true,
+  elasticsearch: true,
+  opensearch: true,
+  mongodb: true,
+  couchbase: true,
+  redis: true,
+  prometheus: true,
+  kafka: true,
+  // The first engine MCP is not offered for (#1089 E12): the provider implements no read-only query path, and a seed
+  // that sets `mcp: true` on an etcd connection is refused when the seed file loads.
+  etcd: false,
+  // Offered for the two metadata tools, `list_connections` and `inspect_schema` (Neo4j spec 6.4).
+  // `run_read_query` does not serve it, because the provider implements no `queryReadOnly`.
+  neo4j: true,
+  // Offered for the two metadata tools (vector-family E17); `run_read_query` does not serve it, because the provider
+  // implements no `queryReadOnly`.
+  milvus: true,
+  // Offered for the two metadata tools, carrying names and types only (vector-family spec 4.4); `run_read_query` does not
+  // serve it, because the provider implements no `queryReadOnly`.
+  qdrant: true,
+  // Both offered for the two metadata tools (InfluxDB spec I13); `run_read_query` does not serve either, because
+  // neither provider implements `queryReadOnly`.
+  influxdb: true,
+  influxdb3: true,
+  // Outside this version, as etcd's: Oxia key paths name Pulsar tenants, namespaces and topics (SEC-05), so no MCP
+  // surface lists them until one is designed (BACKLOG B100).
+  oxia: false,
+  databend: true,
+  // Outside this version, as etcd's and Oxia's: the provider implements no queryReadOnly, and no MCP surface
+  // that lists buckets but never an object key is designed yet (BACKLOG B104).
+  s3: false,
+  // Agent mode reads it under machine redaction; MCP stays closed until an MCP surface for it is designed (BACKLOG
+  // B105).
+  kubernetes: false,
+  // Outside this version, as for etcd, Oxia and S3: a read whose completeness cannot be proved is not a
+  // read an agent should be handed without a reader looking at it.
+  mqtt: false,
+  // Outside this version, as for etcd, Oxia, S3, Kubernetes and MQTT: the provider implements no read-only query
+  // path an MCP client could drive, and every read is billed to the user's project.
+  firestore: false,
+  // Offered for the two metadata tools, carrying stream names and the fixed read columns only; `run_read_query` does
+  // not serve it, because the provider implements no `queryReadOnly`.
+  rabbitmq: true,
+  // Outside this version, as for etcd, Oxia, S3 and MQTT. NOT because there is no read to hand over:
+  // the console reads one JSON request and is read-only by construction. Because a node's value
+  // without its plant is a number with no unit, no range and no neighbour - the engineering units
+  // and the EU range live on nodes of their own, and this version reads neither - so an agent
+  // grounded on an address space would be reasoning about figures it cannot qualify.
+  opcua: false,
+  mtconnect: true,
+  // MCP is outside this provider's first version. A read also needs the register map kept with
+  // the connection, because Modbus has no discovery and a name means only what that document
+  // says it means, so an MCP client has nothing to form a read from on its own.
+  modbus: false,
+  // not taken by default.
+  netconf: false,
+  snmp: false,
+  // Outside this version, for the reason MQTT's entry gives rather than for the absence of a read query path:
+  // a read whose completeness cannot be proved is not a read an agent should be handed without a reader looking
+  // at it. Sparkplug has no command that lists edge nodes, so a read reports what it saw during its window and
+  // an edge node that published nothing in that window is indistinguishable from one that is gone. The
+  // criterion is provable completeness and not the query path: an engine whose own answer enumerates the
+  // whole model can answer true here without a `queryReadOnly` of its own.
+  sparkplug: false,
+  libredb: true,
+});
+
+/**
+ * Which shipped engines' connection form offers a URI mode (Spec A section 7): the answer
+ * `DB_UI_CONFIG[type].showConnectionStringToggle` gives in `src/lib/db-ui-config.ts`. Kept here because the seed
+ * layer must not load `db-ui-config.ts`: it value-imports the React icon components, the reason
+ * `src/lib/db/credential-warnings.ts` exists. No seed module reads it yet; the environment-URL source of PR A2
+ * will, to keep a pasted URI verbatim only where this answers true, as the form's paste keeps it.
+ *
+ * An exhaustive Record for the reason `EXTERNAL` gives, so a new type-id cannot join without someone answering,
+ * frozen like the records above it, and held equal to the form's own answer for every type by
+ * `tests/unit/db/connection-string-records.test.ts`.
+ */
+export const CONNECTION_FORM_URI_MODE: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
+  postgres: false,
+  bigquery: false,
+  snowflake: false,
+  spark: false,
+  mysql: false,
+  sqlite: false,
+  libsql: true,
+  duckdb: false,
+  oracle: false,
+  db2: false,
+  mssql: false,
+  clickhouse: true,
+  druid: false,
+  trino: false,
+  cassandra: false,
+  elasticsearch: false,
+  opensearch: false,
+  mongodb: true,
+  couchbase: true,
+  redis: false,
+  prometheus: false,
+  kafka: false,
+  etcd: false,
+  neo4j: false,
+  milvus: false,
+  qdrant: false,
+  influxdb: false,
+  influxdb3: false,
+  oxia: false,
+  databend: false,
+  s3: false,
+  kubernetes: false,
+  mqtt: false,
+  firestore: false,
+  rabbitmq: false,
+  opcua: false,
+  mtconnect: false,
+  modbus: false,
+  // No URI mode: the form names a host, a port, an account and the device's host key fingerprint,
+  // and `netconf://` is a scheme nothing in this product parses. Held equal to
+  // `DB_UI_CONFIG[type].showConnectionStringToggle` by `connection-string-records.test.ts`.
+  netconf: false,
+  snmp: false,
+  // Host and port are the address, as MQTT's are, so there is no string form to parse.
+  sparkplug: false,
+  libredb: false,
+});
+
+/**
+ * The types whose provider reads `connectionString` (Spec A section 7):
+ * getCapabilities().supportsConnectionString, except sqlite (declares false, opens the field as the file path)
+ * and mssql (declares true for the form's paste, builds from the fields only). Static for the reason
+ * `READ_ONLY_ENFORCED` is: the seed schema decides at load, before any provider exists, and refuses a
+ * `connectionString` where this answers false, naming the connection and the type, because a provider that
+ * ignores the string would list a connection that opens somewhere else than the file says.
+ *
+ * An exhaustive Record for the reason `EXTERNAL` gives, frozen like the records above it, held equal to every
+ * other shipped provider's declaration by the census in `tests/unit/db/connection-string-records.test.ts`, and
+ * pinned there for the two exceptions by behavioural tests: sqlite opens the file a `file:` string names, and
+ * mssql builds a string-only config against localhost.
+ */
+export const CONNECTION_STRING_ACCEPTED: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
+  postgres: true,
+  bigquery: false,
+  snowflake: false,
+  spark: false,
+  mysql: true,
+  // The provider's supportsConnectionString flag is false, yet it opens this field as the database file path:
+  // sqlite.ts getDatabasePath, docs/providers/sqlite.md.
+  sqlite: true,
+  libsql: true,
+  duckdb: false,
+  oracle: true,
+  db2: true,
+  // Declared true for the form's paste, documented UI-only, while buildConfig builds from the fields only, so a
+  // seed carrying only connectionString would open localhost: mssql.ts buildConfig, docs/providers/mssql.md.
+  mssql: false,
+  clickhouse: true,
+  druid: false,
+  trino: false,
+  cassandra: false,
+  elasticsearch: false,
+  opensearch: false,
+  mongodb: true,
+  couchbase: true,
+  redis: false,
+  prometheus: false,
+  kafka: false,
+  etcd: false,
+  neo4j: false,
+  milvus: false,
+  qdrant: false,
+  influxdb: false,
+  influxdb3: false,
+  oxia: false,
+  databend: false,
+  s3: false,
+  kubernetes: false,
+  mqtt: false,
+  firestore: false,
+  rabbitmq: false,
+  // The endpoint URL is the whole address: host and port are read from it, so there is no second string to parse.
+  opcua: false,
+  // Host and port are the address and `apiPath` is a field of its own, so there is no string form to parse.
+  mtconnect: false,
+  modbus: false,
+  // in one box.
+  netconf: false,
+  snmp: false,
+  sparkplug: false,
+  libredb: false,
+});
+
+/**
+ * Which shipped engines open a file on Studio's own host rather than reach a server: the connection is a path, and
+ * the provider opens it inside Studio's process. A governance source can never grant one
+ * (docs/GOVERNANCE.md#row-admission-and-skip-codes): row admission in `src/lib/governance/admission.ts` skips it as
+ * ENGINE_UNSUPPORTED whatever `GOVERNANCE_ALLOWED_ENGINES` says, because a grant would hand its users a file of the
+ * host Studio runs on.
+ *
+ * Static because admission decides from a row before any provider exists, and reads this record rather than a type
+ * id. Kept here because the governance layer must not load `src/lib/db-ui-config.ts`, which value-imports the React
+ * icon components; `tests/unit/db/compatibility.test.ts` holds every entry equal to that file's `isFileBased()`, the
+ * connection form's own answer. An exhaustive Record for the reason `EXTERNAL` gives, frozen like the records above it.
+ */
+export const OPENS_LOCAL_FILE: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
+  postgres: false,
+  bigquery: false,
+  snowflake: false,
+  spark: false,
+  mysql: false,
+  // A database file opened through `bun:sqlite` or `node:sqlite` in Studio's own process.
+  sqlite: true,
+  libsql: false,
+  // A database file (or `:memory:`) opened by the native DuckDB addon in Studio's own process.
+  duckdb: true,
+  oracle: false,
+  db2: false,
+  mssql: false,
+  clickhouse: false,
+  druid: false,
+  trino: false,
+  cassandra: false,
+  elasticsearch: false,
+  opensearch: false,
+  mongodb: false,
+  couchbase: false,
+  redis: false,
+  prometheus: false,
+  kafka: false,
+  etcd: false,
+  neo4j: false,
+  milvus: false,
+  qdrant: false,
+  influxdb: false,
+  influxdb3: false,
+  oxia: false,
+  databend: false,
+  s3: false,
+  kubernetes: false,
+  mqtt: false,
+  firestore: false,
+  rabbitmq: false,
+  opcua: false,
+  mtconnect: false,
+  modbus: false,
+  netconf: false,
+  snmp: false,
+  sparkplug: false,
+  // The embedded store this app creates, a file on Studio's own volume.
+  libredb: true,
+});
+
+/**
+ * Which shipped engines reach the whole server when a connection names no database (#1530): the provider then
+ * declares `catalogSessions` and opens a session of its own to each database the caller picks, so one credential
+ * reaches every database it can sign in to. A governance source grants one database per connection, so row admission
+ * in `src/lib/governance/admission.ts` skips such an engine's definition without a database as
+ * SERVER_LEVEL_NOT_ALLOWED (docs/GOVERNANCE.md#row-admission-and-skip-codes).
+ *
+ * Static for the reason `OPENS_LOCAL_FILE` is. `tests/unit/db/compatibility.test.ts` builds every shipped provider
+ * with no database and no connection string, nothing connecting, and holds this record equal to the engines whose
+ * provider then reports `catalogSessions`. An exhaustive Record for the reason `EXTERNAL` gives, frozen like the
+ * records above it.
+ */
+export const OPENS_SERVER_LEVEL_WITHOUT_DATABASE: Readonly<Record<DatabaseType, boolean>> = Object.freeze({
+  // An empty `database` on discrete fields reaches the whole server (`serverLevel` in providers/sql/postgres.ts);
+  // a connection string never does.
+  postgres: true,
+  bigquery: false,
+  snowflake: false,
+  spark: false,
+  mysql: false,
+  sqlite: false,
+  libsql: false,
+  duckdb: false,
+  oracle: false,
+  db2: false,
+  mssql: false,
+  clickhouse: false,
+  druid: false,
+  trino: false,
+  cassandra: false,
+  elasticsearch: false,
+  opensearch: false,
+  mongodb: false,
+  couchbase: false,
+  redis: false,
+  prometheus: false,
+  kafka: false,
+  etcd: false,
+  neo4j: false,
+  milvus: false,
+  qdrant: false,
+  influxdb: false,
+  influxdb3: false,
+  oxia: false,
+  databend: false,
+  s3: false,
+  kubernetes: false,
+  mqtt: false,
+  firestore: false,
+  rabbitmq: false,
+  opcua: false,
+  mtconnect: false,
+  modbus: false,
+  netconf: false,
+  snmp: false,
+  sparkplug: false,
+  libredb: false,
+});
 
 /**
  * How much of the product works against a wire-compatible engine.
@@ -164,7 +843,15 @@ export interface WireCompatibleEngine {
  * AlloyDB Omni from a fourth run the same day, OceanBase Community Edition
  * and SingleStore from a fifth run the same day, ScyllaDB from a sixth run on
  * 2026-08-21/22, Apache Doris, Garnet and both Percona distributions from a seventh run
- * on 2026-08-26, and ParadeDB, OrioleDB and Databend from an eighth on 2026-08-27.
+ * on 2026-08-26, ParadeDB and OrioleDB from an eighth on 2026-08-27, and
+ * VictoriaMetrics, the first relative of the `prometheus` driver, from a ninth on 2026-09-23, and
+ * Redpanda, the first relative of the `kafka` driver, from a tenth on 2026-09-25.
+ * Databend, probed in the eighth run, is no longer a relative: it ships as the `databend`
+ * type-id over its own HTTP query API, and one product is never counted twice.
+ * The nine MySQL-wire relatives of the day, Databend among them, were re-measured together on 2026-09-06 for issues
+ * #573 and #574, at the wire and then in a browser against the built app, and the
+ * outcome per engine is recorded in `docs/providers/mysql.md` section 5.5 for the
+ * EXPLAIN grammar and section 8 for the SHOW STATUS reads.
  * Names still awaiting an instance are tracked in issue #424, never here: there
  * is no "pending" state on purpose, because a reader cannot tell a pending entry
  * from a probed one. A name that WAS probed and did not earn an entry has no
@@ -195,31 +882,46 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     name: "CockroachDB",
     via: "postgres",
     tier: "partial",
-    probedVersion: "CockroachDB CCL v26.2.5",
+    probedVersion: "CockroachDB CCL v26.2.6",
     caveats: [
-      "The object browser is empty: CockroachDB has no pg_total_relation_size() builtin, which our schema query calls.",
-      "Health, overview, monitoring, table, index and storage panels are unavailable: pg_size_pretty(), pg_postmaster_start_time() and pg_tablespace_location() do not exist there.",
+      "The object browser now lists real tables (previously empty, #38680): the schema query recovers from the missing pg_total_relation_size() builtin by falling back to an unmeasured (0-byte) size instead of failing outright. Foreign keys and indexes are unaffected by this and continue to work.",
+      "The overview panel loads with connections/size/uptime marked unavailable rather than failing outright: pg_postmaster_start_time(), pg_size_pretty() and pg_tablespace_location() do not exist there.",
+      "Its table and index counts are the user's own. CockroachDB documents exactly four system schemas, and crdb_internal objects reach pg_tables even though information_schema's BASE TABLE filter never shows them - so before those two schemas were excluded, the overview counted 98 tables (93 crdb_internal, 3 pg_extension) for the 2 the object browser listed, and the two panels disagreed inside one app.",
       "Performance metrics, slow queries and active sessions do work: the pg_stat_* views CockroachDB provides are enough for them.",
+      'The Explain panel works, and shows what the query really did. CockroachDB refuses PostgreSQL\'s parenthesised options (`at or near "analyze": syntax error`, and `JSON` is legal there only beside DISTSQL, where it answers a processor diagram rather than a plan), so the grammar is measured at connect and this server gets its own unparenthesised EXPLAIN ANALYZE. Until it was measured the panel showed its "no execution plan" empty state, so a failed plan request read as a query with no plan.',
+      "Maintenance offers Analyze on one table and nothing else. CockroachDB has no VACUUM, no REINDEX and no whole-database ANALYZE (each a 42601 syntax error), so the provider asks the server at connect which of PostgreSQL's six maintenance statements its grammar has and draws no control for the rest; measured on v26.3.2 on 2026-10-04 (#1387). Until then all three were offered and each click answered HTTP 500 with the parser's error.",
+      "Monitoring > Tables and Storage, and the Admin > Operations table list, work. Two things were in the way. The size builtins took a concatenated name, which CockroachDB refused with `pg_size_pretty(): unknown signature: pg_table_size(string)` and which failed the whole read; they take pg_stat_user_tables.relid now (#1436). The rows were then still missing, because pg_stat_user_tables and pg_stat_all_tables both carry zero rows here while pg_class holds the user's tables, so the read falls back to pg_class when the view answers none (#1540). Measured on v26.3.2 on 2026-10-05: three user tables, listed with their names and no figures at all - reltuples, pg_table_size(), pg_indexes_size() and pg_total_relation_size() each answer NULL for a table it has, so every number is absent rather than zero, and the per-table maintenance actions are reachable again.",
+      "The Source tab shows a function's or procedure's definition with no Edit control. An edit is applied between two DO blocks that check the routine was not changed meanwhile, and CockroachDB runs an empty DO block but refuses PERFORM inside one (0A000, `unimplemented: this syntax`) and has no pg_proc.xmin (42703), so the provider asks the server at connect whether it runs that guard and offers no edit where it does not; measured on v26.3.2 on 2026-10-08 (#1437). Until then Edit was offered and every apply was refused after the reader had typed it.",
     ],
   },
   {
     name: "Materialize",
     via: "postgres",
-    tier: "query-only",
-    probedVersion: "Materialize 26.37.0 (advertises PostgreSQL 9.5)",
+    tier: "partial",
+    probedVersion: "Materialize 26.40.0 (advertises PostgreSQL 9.5)",
     caveats: [
-      "Only the SQL editor works. The object browser, the monitoring dashboard and every statistics panel are unavailable.",
-      "Materialize has no pg statistics catalog and no size functions, and it reserves the MATERIALIZED keyword our schema query uses.",
+      'The object browser lists tables and columns (previously nothing worked at all, #38680). The object reads carry none of the constructs Materialize refuses or lacks - no MATERIALIZED CTE hint, no pg_total_relation_size(), and jsonb_agg()/jsonb_build_object() rather than the json_agg()/json_build_object() it does not have (#1075) - and they read keys from pg_constraint rather than information_schema.constraint_column_usage, which Materialize does not implement, so they answer on the first attempt, measured on v26.44.1 on 2026-10-24. Foreign keys and primary keys are empty for a reason that is not ours: Materialize has neither. CREATE TABLE refuses both, "a primary key or unique constraint is not supported" and "column constraint: REFERENCES ... not yet supported", and its pg_constraint holds no row for a user table because there is nothing to put in it. An index made with CREATE INDEX is read with its columns, measured 2026-09-24.',
+      "The monitoring dashboard loads with every statistic marked unavailable rather than erroring the whole page: Materialize has no pg statistics catalog and no size functions. All seven tabs render. Three panels - the Tables tab's breakdown and the Storage tab's tablespaces and largest-tables list - are absent rather than empty, each showing Materialize's own sentence under the heading \"This engine does not publish this\" rather than an error, because the message names a pg_ object that is simply not there.",
+      "Materialized views are listed beside tables in the object browser, with their columns. Materialize reports them through information_schema.tables as table_type = 'MATERIALIZED VIEW' and they are what its users actually work with, so a browser that listed only BASE TABLE hid the product: revenue_by_region was invisible while the three plain tables showed.",
+      "The Explain panel works. Materialize has no rule for EXPLAIN's parenthesised options at all - `(FORMAT JSON)` is refused the same way `(ANALYZE, BUFFERS, FORMAT JSON)` is, and the error names only the first token inside them - and no EXPLAIN ANALYZE either, so the grammar is measured at connect and this server gets the plain EXPLAIN, whose physical plan names the relations it reads, the join strategy and the filters it pushed down. The JSON form its docs publish is not used: it carries no relation names, only internal ids.",
+      "Row counts are blank rather than zero. Materialize answers -1 from pg_class.reltuples - PostgreSQL's never-counted sentinel - for tables, views and materialized views alike, so there is no estimate to show and the browser draws no badge. It used to show 0, which read as a measurement nobody made; a table holding three rows said it held none.",
+      "In the object tree, the Functions and Procedures folders show Materialize's own sentence, column \"p.prokind\" does not exist, and do not open; every other folder in the tree counts and lists. Materialize's pg_proc has no prokind column, so it cannot say which routine is a function and which a procedure. It reports that as SQLSTATE XX000 rather than PostgreSQL's 42703, and while the object browser keyed its fallback on 42703 every folder in every schema showed that sentence and nothing could be opened. The fallback now keys on the column the refusal names, under any SQLSTATE, measured on Materialize v26.44.1 on 2026-10-04. Object search, the object inventory and the agent's inventory grounding still list the routine kinds and fail there (D226 in docs/BACKLOG.md). A source created from a load generator is listed under Tables, because Materialize's pg_class reports it as an ordinary table.",
     ],
   },
   {
     name: "RisingWave",
     via: "postgres",
-    tier: "query-only",
-    probedVersion: "RisingWave 3.0.3 (advertises PostgreSQL 13.14.0)",
+    tier: "partial",
+    probedVersion: "RisingWave 3.0.4 (advertises PostgreSQL 13.14.0)",
     caveats: [
-      "Only the SQL editor works. The object browser, the monitoring dashboard and every statistics panel are unavailable.",
-      "RisingWave rejects a parameterised LIMIT, so the slow-query and active-session panels cannot run at all.",
+      'The object browser lists tables and materialized views. It was unavailable until the listing learned to drop pg_class.reltuples, which RisingWave has no column for. The earlier reading of this blamed the schema query\'s LEFT JOIN pg_class ON (...)::regclass, which measurement refuted: that join binds, and RisingWave simply reports an unbindable column as "missing FROM-clause entry for table c", so a column defect reads as a join defect.',
+      "Row counts and sizes are blank rather than zero: neither pg_class.reltuples nor pg_total_relation_size() exists to answer, and an unmeasured number is shown as absent rather than as 0.",
+      "The monitoring dashboard loads rather than erroring the whole page, with most statistics marked unavailable. Slow-query and active-session panels stay empty (not merely unavailable) because RisingWave also rejects a parameterised LIMIT. This caveat used to say RisingWave has no pg statistics catalog at all, which measurement refuted: pg_stat_user_tables exists and carries a row per table, relid included, while pg_stat_all_tables does not exist, so the absence is per view and not wholesale.",
+      "Monitoring > Tables lists the user's tables with their real table and index sizes, where the whole read used to fail. RisingWave binds neither pg_size_pretty() nor pg_total_relation_size(), but answers pg_table_size(relid) and pg_indexes_size(relid), so the byte counts are formatted in-process and only the total is left unmeasured. Measured on 3.1.0 on 2026-10-04 (#1436): a seeded table reads 44 B of table and 0 B of indexes with the total shown as N/A, where before the panel carried `Failed to bind expression: pg_size_pretty(pg_table_size(quote_ident(schemaname) ...))`.",
+      "Expanding a table, a view or a materialized view shows its columns, with their types and in the table's own order, through describeObject() and describeObjects() alike, measured 2026-09-24 (#1075). This caveat used to call the gap the engine's, and it was ours: RisingWave has no json type and refused the json_agg(), json_build_object() and '[]'::json the reads were built with, while it answers every jsonb form, which is what the reads use now. It also refuses a subquery inside an aggregate call, which is how an index's column list was built; that is a LATERAL join now.",
+      "Nullability and defaults are read from the engine's catalog, which states neither: pg_attribute answers attnotnull false for every column, so a NOT NULL column and a primary key both read nullable, and pg_attrdef is empty, so no column shows a default, one declared with DEFAULT included. The nullability half is filed as D119.",
+      "Foreign keys are empty because RisingWave has none: CREATE TABLE refuses REFERENCES in both its column and its table form. The primary key is listed as an index named after its table, and an index lists every column pg_index.indkey names, which on RisingWave is the key columns followed by every column the index carries, the primary key always among them: an index on (amount, customer_id) of a four-column table reads as amount, customer_id, order_id, note.",
+      "No maintenance operation is offered. RisingWave has none of VACUUM, ANALYZE and REINDEX in PostgreSQL's form, and because its BEGIN opens no transaction the connect-time probe cannot ask about them without running them, so it asks nothing and offers none; measured on 3.1.0 on 2026-10-04 (#1387).",
     ],
   },
   {
@@ -240,10 +942,10 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     tier: "full",
     probedVersion: "TimescaleDB 2.29.2 on PostgreSQL 17.11",
     caveats: [
-      "Row counts and sizes for a hypertable are wrong rather than missing: PostgreSQL statistics describe the empty parent table, not the chunks the rows live in.",
-      "Every chunk of a hypertable appears as its own table and index, so the object browser fills with _timescaledb_internal chunks and the _timescaledb_catalog and _timescaledb_cache schemas.",
+      "Row counts and sizes for a hypertable are wrong rather than missing: PostgreSQL statistics describe the empty parent table, not the chunks the rows live in. Measured on a 31-chunk hypertable, pg_total_relation_size() answered 24576 bytes where the extension's own hypertable_size() answered 2498560 - about a hundredfold understatement. Excluding the chunk schemas from the browser does not change this, because the parent is what the size is read from either way.",
+      "The object browser now lists only user tables. TimescaleDB's own seven schemas are excluded, so a database whose sole hypertable had 31 chunks went from 61 objects to the 2 the user created: 34 came from _timescaledb_internal, 22 from _timescaledb_catalog and 3 from _timescaledb_cache.",
       "The overview shows the PostgreSQL version, not the TimescaleDB extension version.",
-      "The agent cannot ground a run on a stock install: its schema capture is one row per column against a 200-row budget, and the extension's own catalogs answer 473 of 478 rows before the user has created anything.",
+      "The agent grounds a stock install: the column capture is one row per table rather than one row per column, so the extension's own catalogs no longer overflow the 200-row budget. On a database with real hypertable data every chunk still appears as its own table in the inventory.",
     ],
   },
   {
@@ -256,6 +958,7 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
       "Index sizes always read 0 bytes, before and after ANALYZE: index storage lives in DocDB, where pg_relation_size() cannot see it.",
       "The overview's database size reads 0 bytes even with populated tables.",
       "Index types read lsm rather than btree - that is YugabyteDB's real storage, not a misreading.",
+      "Reindex is not offered: YugabyteDB refuses REINDEX in both forms (0A000 REINDEX not supported yet), and the provider asks at connect. Vacuum is offered, and its result quotes the server's NOTICE that VACUUM is a no-op there rather than claiming it completed; measured on 2026.1.2.0 on 2026-10-04 (#1387).",
     ],
   },
   {
@@ -264,12 +967,12 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     tier: "partial",
     probedVersion: "PostgreSQL 14.4 (Apache Cloudberry 2.1.0-incubating)",
     caveats: [
-      'The monitoring dashboard, table statistics and index statistics are unavailable: all three fail with the same engine error, "query plan with multiple segworker groups is not supported", which is Cloudberry\'s MPP planner restriction rather than a missing catalog.',
+      "Table statistics and index statistics are unavailable: both fail with the same engine error, \"query plan with multiple segworker groups is not supported\", which is Cloudberry's MPP planner restriction rather than a missing catalog. The monitoring dashboard itself answers - its overview and performance tabs read connections, database size, table count, deadlocks and checkpoint stats normally - and it is specifically the Tables tab's per-table breakdown and the Storage tab's largest-tables list that fail. Each failing panel says \"This database could not answer this panel\" and prints the engine's error under it, so the planner restriction is not presented as a connection fault.",
       "Row counts and sizes read after ANALYZE are correct - 2000 rows for 2000 rows and 576 KB for 589824 bytes - so the object browser here is not the kind that misleads; what they read before ANALYZE was not probed.",
-      "Two internal tables appear in the object browser, pg_ext_aux.pg_pax_fastsequence and pg_ext_aux.pg_pax_tables, so it lists 4 objects for 2 user tables.",
-      "A foreign key is read back as if it were enforced but is not: Cloudberry accepts ALTER TABLE ... ADD CONSTRAINT with a warning that referential integrity constraints are not supported, and an orphan insert then succeeds.",
+      "The object browser now lists only user tables: pg_ext_aux, which holds the PAX auxiliary tables pg_pax_fastsequence and pg_pax_tables, is excluded along with gp_toolkit, pg_aoseg and pg_bitmapindex, so the count went from 4 objects to the 2 the user created. Cloudberry's schema documentation lists the latter three but not pg_ext_aux, which is here on measurement rather than on the doc's authority.",
+      'Its two failing panels keep the heading "This database could not answer this panel" and print the planner\'s own sentence, which is the right reading: pg_stat_user_tables exists here and is readable, so a differently shaped statement could still succeed - unlike an engine that simply has no such function. A foreign key is read back as if it were enforced but is not: Cloudberry accepts ALTER TABLE ... ADD CONSTRAINT with a warning that referential integrity constraints are not supported, and an orphan insert then succeeds.',
       "The overview's database size reads 62 MB against roughly 900 KB of user tables, which is catalog and segment overhead rather than your data.",
-      "The agent cannot ground a run: connecting as the cluster's own gpadmin is refused because the execution profile reads that role as too broad, and a least-privilege agent role is refused at 289 rows against a 200-row budget, 282 of those rows belonging to Cloudberry's own gp_toolkit schema.",
+      "The agent needs a least-privilege agent role to ground a run: connecting as the cluster's own gpadmin is refused because the execution profile reads that role as too broad. With that role the capture succeeds.",
       "Apache publishes build images only, so the probe ran on a third-party image (woblerr/cloudberry:2.1.0-incubating); no image from the project itself was measured.",
     ],
   },
@@ -281,12 +984,12 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     caveats: [
       'The version panel cannot be told apart from a stock PostgreSQL 17: version() reports only "PostgreSQL 17.9 on x86_64-pc-linux-gnu" and names AlloyDB nowhere, so the product identity is visible only in the alloydb.* settings and in the image tag.',
       "Row counts and sizes are exact, checked against the engine: 2000 rows read as 2000, and 270336 total bytes as 270336 (180224 table plus 90112 index). Foreign keys are both read back and enforced.",
-      "Eight of AlloyDB's own google_ml tables appear in the object browser, so it lists 10 objects for 2 user tables: auth_info, embed_gen_progress, embed_gen_settings, model_family_info, models, native_models, proxy_models_query_mapping and supported_vertex_models.",
+      "The object browser now lists only user tables, and by ownership rather than by name: pg_depend is asked which schemas an extension created, which answers google_ml AND ai where a hardcoded name list had caught only the first. The count went from 10 objects to the 2 the user created. Google's documentation names the google_ml_integration extension but never its schema. Excluding by name would have hidden a schema from any user who happened to call one google_ml; a user's own schema is never extension-owned.",
       "The browser understates what the image installed: outside the system schemas there are 70 objects for 2 user tables, because 49 extension VIEWS are installed into public itself (g_columnar_* x27, google_db_advisor_* x18, g_agg_stat_statements, g_lap_timer, hypopg_list_indexes and a columnar vectorized-join view), plus 4 views in ai and 11 more in google_ml. They are hidden only because the schema query filters table_type = 'BASE TABLE'.",
       "Those eight google_ml tables are readable by a role with no grants at all: a LOGIN role given only CONNECT, with ALL revoked on schema public, still lists them and answered SELECT count(*) FROM google_ml.supported_vertex_models with 15 rows.",
       'The slow-query panel is always empty and health says why: pg_stat_statements ships with the image but is not installed in it, reported as "pg_stat_statements extension not enabled".',
       "The columnar engine is off by default and turning it on needs ALTER SYSTEM plus a restart, not a reload. With it on, the on-disk sizes stay exact but do not count the columnar copy.",
-      "The agent cannot ground a run: the image's own postgres superuser is refused as too broad, and a least-privilege role acquires both profiles but has its schema capture refused at 536 rows against a 200-row budget, of which only 7 are the user's - 341 of the rest are the 49 extension views installed into public itself, so narrowing the capture to public alone still refuses at 348 rows (B52).",
+      "The agent needs a least-privilege agent role to ground a run: the image's own postgres superuser is refused because the execution profile reads that role as too broad. With that role the capture succeeds, over an inventory of 69 objects of which 2 are the user's.",
       "Probed on the 17.9.0 image only; the 15.x and 16.x lines were not probed.",
     ],
   },
@@ -338,7 +1041,7 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     probedVersion: "Percona Server for MySQL 8.4.11-11 (version() reports 8.4.11-11)",
     caveats: [
       "Behaves as MySQL throughout: all fifteen surfaces answer, row counts and sizes are correct (2000 rows read as 2000, 114688 bytes as 114688), indexes and a foreign key are read back, and Analyze, Optimize and Check all succeed.",
-      "Nothing on screen says Percona: version() answers a bare 8.4.11-11 and the product name lives in @@version_comment (Percona Server (GPL), Release 11), which the provider does not read - so the overview is indistinguishable from a stock MySQL 8.4.",
+      "version() answers a bare 8.4.11-11 and the product name lives only in @@version_comment (Percona Server (GPL), Release 11), so the overview reads that comment and names the server Percona Server 8.4.11-11 (#1444); before that it was indistinguishable from a stock MySQL 8.4.",
     ],
   },
   {
@@ -348,10 +1051,11 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     probedVersion: "8.0.11-TiDB-v8.5.1",
     caveats: [
       "A freshly loaded table reads 0 rows and 0 B until TiDB's own background statistics collection catches up; the numbers correct themselves with no ANALYZE.",
-      "Max connections reads 0, because TiDB's max_connections defaults to 0 meaning unlimited.",
+      "Max connections reads 0, because TiDB's max_connections defaults to 0 meaning unlimited, and the connection count beside it reads not published: TiDB answers SHOW STATUS with 13 rows and none of them is Threads_connected (wire, 2026-09-06).",
       "The slow-query panel is always empty: TiDB keeps its slow log in information_schema.SLOW_QUERY, not in the performance_schema view the provider reads.",
       "Storage stats list a phantom InnoDB entry at ibdata1:12M:autoextend, which is a MySQL default echoed back by a server that has no InnoDB.",
-      "The Explain panel does not work: TiDB rejects EXPLAIN FORMAT='json' outright, so the editor's plan request fails while the query itself runs normally.",
+      "The Explain panel renders TiDB's own operator tree rather than a MySQL JSON plan: TiDB rejects EXPLAIN FORMAT='json' outright, so the provider sends a plain EXPLAIN and the panel shows the operator tree with estRows as the row estimate (browser, 2026-09-06).",
+      "Of the maintenance actions only Analyze is offered: TiDB answers OPTIMIZE TABLE with 8200 OPTIMIZE TABLE is not supported and does not parse CHECK TABLE, and the provider asks at connect which of the three it has; measured on v8.5.8 on 2026-10-04 (#1387).",
       "Probed on a standalone --store=unistore server only; a PD + TiKV deployment was not probed.",
     ],
   },
@@ -362,11 +1066,13 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     probedVersion: "StarRocks 3.3.22-753696f (version() reports 5.1.0)",
     caveats: [
       "The version shown is MySQL 5.1: version() returns a fictitious compatibility number, and the real build is only in current_version(), which the provider does not call.",
-      "The overview and health panels are unavailable: StarRocks refuses their statements through the prepared-statement protocol the provider uses.",
-      "Active sessions and the monitoring dashboard are unavailable: StarRocks has no information_schema.PROCESSLIST.",
-      "Row counts and sizes are always 0: information_schema.TABLES reports 0 rows and 0 bytes for a populated table.",
+      "The overview panel renders but publishes no uptime and no connection count: StarRocks answers a bare SHOW STATUS with zero rows and SHOW VARIABLES LIKE 'max_connections' with zero rows, so both read N/A, not published, where they used to read a fabricated 0/151 (browser, 2026-09-06).",
+      "The health request and the active-session panel are unavailable: StarRocks has no information_schema.PROCESSLIST, which is the engine's own, and the health read still failed on it when it was re-measured in the browser on 2026-09-06. Every other monitoring panel is read independently, so the missing table costs only those two: getMonitoringData() answered overview, performance, slowQueries, tables, indexes and storage through the provider on 2026-08-24.",
+      "A freshly loaded table's row count reads 0 until StarRocks' own background statistics collector catches up, not because the provider fails to read it: measured 2026-09-16, a 5-row table read 0 for 45s on StarRocks 4.1.4 and for roughly 4.5 minutes on 3.3.22 before both reported 5. Sizes used to read 0 regardless of that wait, for a different reason - StarRocks answers INDEX_LENGTH NULL for every BASE TABLE, never a real number the way Doris's 0 is, and DATA_LENGTH + INDEX_LENGTH in SQL is NULL-poisoned by that alone even once DATA_LENGTH itself is real. Fixed 2026-09-16 to DATA_LENGTH + COALESCE(INDEX_LENGTH, 0) everywhere this provider sums the two, so a table's size now tracks its row count on the same collector delay instead of staying absent.",
       "No index information at all: StarRocks exposes no secondary-index catalog, so the object browser and the index panel show none.",
-      "The Explain panel does not work: StarRocks does not parse EXPLAIN FORMAT='json', so the editor's plan request fails while the query itself runs normally.",
+      "A parameter cannot sit in the LIMIT position under the binary prepared protocol, and this engine says so in as many words: measured 2026-09-22 through mysql2, LIMIT ? answers 'using parameter(?) as limit or offset not supported' while the identical statement with the number written in succeeds. Same constraint as Doris, which it is a fork of, and it cost the object browser the same 500 on every folder read until the bulk read wrote its bound in. Verified through the provider afterwards against a seeded database: describeObjects() reads 2 objects with 3 columns on the first, and a bound of 1 reads 1 object and reports its own truncation.",
+      "The Explain panel renders StarRocks's own text plan: StarRocks does not parse EXPLAIN FORMAT='json', so the provider sends a plain EXPLAIN, which answered a 13-node tree for a constant SELECT (browser, 2026-09-06).",
+      "Inline row edit saves. StarRocks prepares SELECT ? but refuses to prepare an UPDATE, INSERT or DELETE with errno 1295 (This command is not supported in the prepared statement protocol yet), and nothing has run when it does, so such a statement is sent once more as text with its values written in; before that every Apply failed. Measured on 4.1.6 and 3.3.22 on 2026-10-09 (#1403).",
     ],
   },
   {
@@ -379,30 +1085,16 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     // never an inheritance.
     name: "Apache Doris",
     via: "mysql",
-    tier: "partial",
+    tier: "full",
     probedVersion: "Apache Doris 4.1.3-rc02-7126cf65d96 (version() reports 5.7.99)",
     caveats: [
-      "The overview and health panels are unavailable, and one statement form is the whole reason: Doris parses SHOW STATUS but rejects the LIKE filter both panels use, so they fail with a syntax error instead of reading an empty result.",
-      "The version shown is MySQL 5.7.99: version() returns a fictitious compatibility number, the real build is only in @@version_comment, and Doris has no current_version() function to read it from.",
+      "The overview and health panels render since 2026-09-06, and the overview publishes no uptime and no connection count: Doris answers a bare SHOW STATUS with zero rows and SHOW VARIABLES LIKE 'max_connections' with zero rows, so uptime reads N/A and connections read N/A, not published (browser, 2026-09-06).",
       "No index information at all: information_schema.statistics is empty on Doris, so the index panel and the object browser report none however many keys a table declares.",
       "A declared foreign key is invisible and unenforced: Doris accepts ADD CONSTRAINT ... FOREIGN KEY and lists it in SHOW CONSTRAINTS, but information_schema.KEY_COLUMN_USAGE is empty, so the ER diagram draws no relationship - and an orphan row inserts successfully, because the constraint is a planner hint there.",
       "Optimize and Check are unavailable: neither statement exists in the Doris grammar. Analyze works.",
-      "The Explain panel does not work: Doris rejects EXPLAIN FORMAT='json', while a plain EXPLAIN runs in the editor.",
+      "A parameter cannot sit in the LIMIT position under the binary prepared protocol: measured 2026-09-22 through mysql2, the identical statement answers with a literal LIMIT and fails with LIMIT ? on 'mismatched input LIMIT expecting {<EOF>, ;}', while the text protocol takes either. It cost the object browser a 500 on every folder read until the bulk read wrote its bound into the statement instead of binding it. Stock MySQL 8 binds it happily, so this is the relative's constraint and the same one StarRocks states outright.",
       "Row counts and sizes are correct but late: a table read 0 rows and 0 B immediately after a 2000-row insert and the true 2000 rows / 10187 bytes about a minute later, with an ANALYZE in between changing nothing. The lag is self-correcting, so a freshly loaded table looks empty for a while.",
       "A UNIQUE KEY table declares no primary key to the product: information_schema reports COLUMN_KEY as UNI rather than PRI, so the object browser marks no column primary.",
-    ],
-  },
-  {
-    name: "Databend",
-    via: "mysql",
-    tier: "query-only",
-    probedVersion: "Databend v1.2.925-patch-11 (advertises MySQL 8.0.90)",
-    caveats: [
-      "The SQL editor works and a plain EXPLAIN shows Databend's own plan. Nothing else does: the object browser, every statistics panel and the monitoring dashboard are unavailable.",
-      "The cause is ours rather than Databend's, which is why the catalogs are worth naming: asked with literal SQL, information_schema.tables answers the true 3 and 2000 rows with sizes. Every parameterised read fails instead with Prepare is not support in Databend, because those still go through mysql2's prepared protocol.",
-      "Databend has no SHOW STATUS statement at all and no information_schema.processlist, so the overview, health and session panels have no source even once the protocol question is settled.",
-      "Strings must be single-quoted: Databend follows the SQL standard and reads a double-quoted value as an identifier, so a double-quoted literal is an unknown-column error.",
-      "EXPLAIN FORMAT='json' does not parse, and neither Optimize nor Check exists. Analyze runs but the provider mis-reads its reply.",
     ],
   },
   {
@@ -415,6 +1107,7 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
       "Table and index statistics name the physical shard database (vt_probe_0), not the keyspace the connection points at.",
       "Per-index sizes always read 0 bytes: the size query matches information_schema.INNODB_TABLES.NAME against '<database>/%', and Vitess names the InnoDB table after the shard database, so on a keyspace called probe nothing matches.",
       "Setting a session variable can fail where reading it works: SET @@cte_max_recursion_depth is rejected with VT05006 unknown system variable, while SELECT @@cte_max_recursion_depth answers 1000.",
+      "Check Table is not offered: vtgate does not parse CHECK TABLE (syntax error at position 6 near 'CHECK'), and the provider asks at connect which of the three maintenance verbs it has, so Analyze and Optimize are drawn; measured on 24.0.4 on 2026-10-04 (#1387).",
       "Probed on an unsharded single-shard keyspace only (show vitess_shards returns probe/0); nothing here is measured about a sharded keyspace.",
       "No permission-error class could be measured, and the reason is the test image rather than Vitess: vttestserver accepts any username with any password and grants it full rights, and CREATE USER is a vtgate parse error, so no restricted role could be created to test with.",
     ],
@@ -446,8 +1139,9 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     tier: "partial",
     probedVersion: "SingleStoreDB 9.1.1 (advertises MySQL 5.7.32)",
     caveats: [
-      'Ten of the fifteen surfaces answer. Test Connection, health, the overview and the monitoring dashboard all fail with one engine message, "This command is not supported in the prepared statement protocol yet", and the Explain panel fails with a syntax error on EXPLAIN FORMAT=JSON.',
-      "No version is displayed anywhere, because the panel that carries it is one of the unavailable ones. Were it fixed it would read MySQL 5.7.32, the wire version SingleStore advertises, not SingleStoreDB 9.1.1.",
+      "Ten of the fifteen surfaces answered when this engine was first probed. Four of those failures were ours rather than SingleStore's and are fixed: Test Connection, health, the overview and the monitoring dashboard all failed with one engine message, \"This command is not supported in the prepared statement protocol yet\", until every parameterless statement moved to MySQL's text protocol on 2026-08-24, and all four answer since (browser, 2026-09-06).",
+      "The Explain panel renders SingleStore's own text plan: EXPLAIN FORMAT=JSON is still a parse error here, so the provider no longer sends it and asks for a plain EXPLAIN instead (browser, 2026-09-06).",
+      "The version shown is MySQL 5.7.32: now that the overview renders, it displays the wire version SingleStore advertises rather than SingleStoreDB 9.1.1 (browser, 2026-08-24).",
       "Row counts and sizes are missing rather than wrong: a 2000-row table reads rowCount 0 and 0 B in the object browser, the table statistics and the storage panel, against a ground truth of 2000 rows and 77046 bytes measured four independent ways.",
       "SingleStore leaves information_schema.TABLES zeroed and keeps the real numbers elsewhere - SHOW TABLE STATUS, information_schema.OPTIMIZER_STATISTICS.ROW_COUNT and the EXPLAIN plan's est_table_rows - and running ANALYZE does not change what the panels read.",
       "The index panel lists 4 rows for 2 tables against the MySQL baseline's 2: SingleStore auto-creates a shard key on every table and reports it as an index named __SHARDKEY with indexType SHARD, beside PRIMARY.",
@@ -464,7 +1158,7 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     via: "redis",
     tier: "full",
     probedVersion: "Valkey 9.1.1",
-    caveats: ["The overview shows Valkey's Redis emulation level (7.2.4), not the Valkey version."],
+    caveats: [],
   },
   {
     name: "DragonflyDB",
@@ -472,9 +1166,7 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     tier: "full",
     probedVersion: "DragonflyDB df-v1.40.1",
     caveats: [
-      "The overview shows DragonflyDB's Redis emulation level (7.4.0), not the Dragonfly version.",
-      "Max connections reads 0, because Dragonfly's INFO reports no usable maxclients.",
-      "Active sessions show a numeric id instead of a username: Dragonfly's CLIENT LIST sets name= to the connection id.",
+      "Every active session's user reads default, whatever ACL user authenticated: Dragonfly's CLIENT LIST publishes no user= field at all.",
       "Every active session reads idle with state N: Dragonfly's CLIENT LIST carries no cmd= or flags= field.",
     ],
   },
@@ -489,20 +1181,20 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
     ],
   },
   {
-    // The fourth Redis relative and the only one that publishes its own version while the
-    // product shows the emulation level anyway: `garnet_version` and `server_name` are both
-    // in its INFO output. Valkey and DragonflyDB publish only an emulation level, and KeyDB
-    // publishes nothing of its own, so on those three the displayed version is the best
-    // available reading. Here it is not.
+    // The fourth Redis relative. Valkey, DragonflyDB and Garnet all publish a version field
+    // of their own beside the emulation level (`valkey_version`, `dragonfly_version`,
+    // `garnet_version` in INFO), and the provider reads it, labeling the overview ahead of
+    // the emulation level (e.g. "Garnet 2.1.5 (Redis 7.4.3)"). KeyDB alone publishes nothing
+    // of its own, so it is the only one of the four where the emulation level is the real
+    // version.
     name: "Garnet",
     via: "redis",
     tier: "full",
     probedVersion: "Garnet 2.1.5 (advertises Redis 7.4.3)",
     caveats: [
-      "The overview shows the Redis emulation level (7.4.3), not Garnet's version. Unlike the other Redis relatives, Garnet does publish its own - garnet_version:2.1.5 and server_name:garnet in INFO - and the provider reads redis_version instead.",
       "Every size reads 0 B: Garnet's INFO publishes no used_memory field at all, so the database size and the memory storage panel are a derived zero rather than a measurement.",
       "The cache hit ratio reads 100%: Garnet publishes neither keyspace_hits nor keyspace_misses, and 100 is the fallback both counters being absent produces (D14).",
-      "Max connections reads 0, as on DragonflyDB: Garnet publishes no maxclients.",
+      "Max connections reads 0: Garnet's INFO publishes no client-limit field at all, unlike Dragonfly, which publishes one under the underscored max_clients.",
       "Connected clients reads 0 even with a client attached, because Garnet's connected_clients stays 0; the session list itself is correct and shows the connection.",
       "Key prefixes group as expected: 71 keys across user:*, session:* and queue:* were read back as three patterns.",
     ],
@@ -536,6 +1228,47 @@ export const WIRE_COMPATIBLE_ENGINES: readonly WireCompatibleEngine[] = [
       "ScyllaDB 2025.1.14-0.20260612.103b84070f3b was probed in the 2026-08-21/22 pass and behaved identically on every surface, including the same verbatim refusal the fix keys on, so this entry describes both the 2025.1 and the 2026.2 line - but only these two builds, only a single-node container, and only 2026.2.4 was re-probed after the fix.",
     ],
   },
+  {
+    // The first relative of a driver whose query language is neither SQL-shaped nor JSON: it
+    // answers the Prometheus HTTP API, so the `prometheus` provider serves it unchanged. Probed as a
+    // single node scraping the compose fixture's targets, with Prometheus 3.13.3 as the baseline in
+    // the same pass (#1085 section 7). Claimed for PromQL only: nothing written in MetricsQL, its own
+    // query language, was measured, and one PromQL subquery answered different points here than on
+    // Prometheus, as a caveat says. The advertised 2.24.0 is in the version string and in no caveat:
+    // the overview, the one panel that shows a version, fails here, as the first caveat says.
+    name: "VictoriaMetrics",
+    via: "prometheus",
+    tier: "partial",
+    probedVersion: "VictoriaMetrics v1.152.0 (advertises Prometheus 2.24.0)",
+    caveats: [
+      "The Overview and Storage tabs of the monitoring dashboard fail, and so does the Scrape pools folder, whose count reads unavailable: VictoriaMetrics answers /api/v1/status/runtimeinfo, /api/v1/status/flags and /api/v1/scrape_pools with HTTP 400 and the text 'unsupported path requested', and the message shown names the path and the status, with a server that does not serve the path among the causes it offers.",
+      "A metric's Source tab shows its type and help and no unit: VictoriaMetrics' /api/v1/metadata entries carry no unit, and the provider leaves it out rather than inventing an empty one.",
+      "A target's Source tab has no scrapeInterval or scrapeTimeout: VictoriaMetrics' /api/v1/targets entries carry neither, and keep them as __scrape_interval__ and __scrape_timeout__ among the discovered labels, which the tab shows.",
+      "A target VictoriaMetrics has not scraped yet reads as down: VictoriaMetrics reports it with health down, no error and a last scrape of 1970-01-01T00:00:00Z, where Prometheus reports health unknown.",
+      "The Rule groups, Recording rules and Alerting rules folders are empty: a single-node server evaluates no rules, so its /api/v1/rules answered no group, and it answers that path from vmalert only when it is started with -vmalert.proxyURL.",
+      'A string expression such as "libredb" returns no rows: VictoriaMetrics answers it with an empty vector, where Prometheus answers a string.',
+      "A subquery's points are counted back from its evaluation time, both ends of its window kept: avg_over_time(up[5m])[30m:1m] answered 31 points ending at that time, where Prometheus 3.13.3 answers 30 on whole minutes.",
+      "PromQL infos and warnings do not appear beside a result: VictoriaMetrics answered rate(up[5m]) with no notice where Prometheus 3.13.3 attaches 'PromQL info: metric might not be a counter', and it sent none with any other answer measured.",
+    ],
+  },
+  {
+    // The first relative of the `kafka` driver: it answers the Kafka protocol, so the provider serves
+    // it unchanged. Probed as a single node seeded by the Kafka fixture's own scripts, through a real
+    // provider run by tests/live/kafka-read-only.ts, with Apache Kafka 4.3.1 as the baseline in the
+    // same pass (#1088 section 8). Every surface answered and the broker's state was unchanged by the
+    // run; the caveats name the figures Redpanda does not publish over the protocol, and the group
+    // type it cannot report, which is right there because it has no other kind of group.
+    name: "Redpanda",
+    via: "kafka",
+    tier: "full",
+    probedVersion: "Redpanda v26.2.2",
+    caveats: [
+      "Max connections reads 0, no limit published: Redpanda's DescribeConfigs answer for a broker holds no max.connections, and it keeps its connection limits in its cluster configuration, which the Kafka protocol does not read.",
+      "A broker's Source tab lists nine configs where Apache Kafka 4.3.1 lists 340: Redpanda answers DescribeConfigs for a broker with those nine entries only.",
+      "The Storage tab shows no usage percentage: Redpanda's DescribeLogDirs answer carries no total or usable bytes for its data directory, so only the size is shown.",
+      "Every consumer group reads as classic, which on Redpanda is always right: it answers ListGroups up to v4, which carries no group type, and it has no KIP-848 consumer group protocol at all.",
+    ],
+  },
 ];
 
 /** The verified relatives served by one shipped driver, in registry order. */
@@ -558,8 +1291,9 @@ export function compatibleEnginesFor(type: DatabaseType): readonly WireCompatibl
  * app at it, so the embedded store is out of both halves of the sum.
  *
  * Still no runtime consumer: README.md and the docs table are markdown and quote the
- * number as prose, and the login hero prints the two halves separately - sixteen in
- * the proof row, twenty-six in the relatives line - rather than their sum. This exists
+ * number as prose, and the login hero prints the two halves separately - the external
+ * count in the proof row, the relatives count in the relatives line - rather than their
+ * sum. This exists
  * so the arithmetic has one definition, and the unit test pins it.
  */
 export function connectableProductCount(): number {

@@ -4,8 +4,10 @@ import { describe, test, expect, mock } from "bun:test";
 import { renderHook, act } from "@testing-library/react";
 
 import { useConnectionAdapter } from "@/workspace/hooks/use-connection-adapter";
-import type { WorkspaceConnection } from "@/workspace/types";
-import type { TableSchema } from "@/lib/types";
+import type { WorkspaceConnection, WorkspaceObjectReader } from "@/workspace/types";
+import { relationObjects, type DetailedObject } from "@/lib/db/detailed-object";
+import type { Container, DatabaseObject, KindCount, ObjectDetail, ProviderCapabilities } from "@/lib/db/types";
+import { SAMPLED_MARKER } from "../fixtures/sampled-schema";
 
 // ── Test Data ───────────────────────────────────────────────────────────────
 
@@ -16,9 +18,21 @@ const makeWorkspaceConnection = (overrides: Partial<WorkspaceConnection> = {}): 
   ...overrides,
 });
 
-const makeSchema = (): TableSchema[] => [
+/**
+ * The host's object reader (#789, B76). Required on the hook, so every case supplies one; the
+ * cases that exercise it replace it with their own and assert what it was asked.
+ */
+const noObjectReads: WorkspaceObjectReader = {
+  listContainers: async () => [],
+  countObjects: async () => ({}),
+  listObjects: async () => [],
+};
+
+const makeSchema = (): DetailedObject[] => [
   {
     name: "users",
+    kind: "table",
+    path: ["users"],
     columns: [
       { name: "id", type: "integer", nullable: false, isPrimary: true },
       { name: "email", type: "varchar", nullable: false, isPrimary: false },
@@ -28,6 +42,8 @@ const makeSchema = (): TableSchema[] => [
   },
   {
     name: "orders",
+    kind: "table",
+    path: ["orders"],
     columns: [
       { name: "id", type: "integer", nullable: false, isPrimary: true },
       { name: "user_id", type: "integer", nullable: false, isPrimary: false },
@@ -50,7 +66,9 @@ describe("useConnectionAdapter", () => {
     ];
     const onSchemaFetch = mock(() => Promise.resolve([]));
 
-    const { result } = renderHook(() => useConnectionAdapter({ connections, onSchemaFetch }));
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
 
     expect(result.current.activeConnection).not.toBeNull();
     expect(result.current.activeConnection!.id).toBe("c1");
@@ -63,7 +81,9 @@ describe("useConnectionAdapter", () => {
   test("returns null activeConnection when connections array is empty", () => {
     const onSchemaFetch = mock(() => Promise.resolve([]));
 
-    const { result } = renderHook(() => useConnectionAdapter({ connections: [], onSchemaFetch }));
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections: [], onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
 
     expect(result.current.connections).toEqual([]);
     expect(result.current.activeConnection).toBeNull();
@@ -81,7 +101,9 @@ describe("useConnectionAdapter", () => {
     ];
     const onSchemaFetch = mock(() => Promise.resolve([]));
 
-    const { result } = renderHook(() => useConnectionAdapter({ connections, onSchemaFetch }));
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
 
     expect(result.current.activeConnection!.id).toBe("c1");
 
@@ -101,7 +123,9 @@ describe("useConnectionAdapter", () => {
 
     const connections = [makeWorkspaceConnection({ id: "c1" })];
 
-    const { result } = renderHook(() => useConnectionAdapter({ connections, onSchemaFetch }));
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
 
     await act(async () => {
       await result.current.fetchSchema(result.current.connections[0]);
@@ -121,18 +145,73 @@ describe("useConnectionAdapter", () => {
     expect(result.current.isLoadingSchema).toBe(false);
   });
 
+  /**
+   * etcd spec 3.4 and E13, on the embedded shell: a host's object may carry the readable ranges of
+   * a user who is not root, and a piece can be a single key. The schema keeps the host's array for
+   * the two generators, and `schemaContext`, which the AI panels post to the model, leaves it out.
+   */
+  test("schemaContext leaves out the readable ranges the schema keeps as the host gave them", async () => {
+    const ranges = [
+      { key: "grant-key-a" },
+      { prefix: "grant-prefix-b/" },
+      { start: "grant-start-c", end: "grant-end-d" },
+    ];
+    const [users, orders] = makeSchema();
+    const onSchemaFetch = mock(() => Promise.resolve([{ ...users, readRanges: ranges }, orders]));
+    const connections = [makeWorkspaceConnection({ id: "c1" })];
+
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
+
+    await act(async () => {
+      await result.current.fetchSchema(result.current.connections[0]);
+    });
+
+    expect(result.current.schema[0]?.readRanges).toBe(ranges);
+    expect(result.current.schemaContext).toBe(JSON.stringify(makeSchema()));
+    expect(result.current.schemaContext).not.toContain("grant-");
+  });
+
+  /** The workspace's `schemaContext` drops a sampled column, and its `schema` keeps it. */
+  test("schemaContext leaves out a column the engine only inferred from sampled data", async () => {
+    const [users, orders] = makeSchema();
+    const sampled = {
+      name: SAMPLED_MARKER,
+      type: "text",
+      nullable: true,
+      isPrimary: false,
+      provenance: "sampled" as const,
+    };
+    const onSchemaFetch = mock(() => Promise.resolve([{ ...users, columns: [...users.columns, sampled] }, orders]));
+    const connections = [makeWorkspaceConnection({ id: "c1" })];
+
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
+
+    await act(async () => {
+      await result.current.fetchSchema(result.current.connections[0]);
+    });
+
+    expect(result.current.schema[0]?.columns.map((column) => column.name)).toContain(SAMPLED_MARKER);
+    expect(result.current.schemaContext).toBe(JSON.stringify(makeSchema()));
+  });
+
   // ── fetchSchema sets isLoadingSchema during fetch ───────────────────────
 
   test("fetchSchema sets isLoadingSchema during fetch", async () => {
-    let resolveSchema: ((value: TableSchema[]) => void) | undefined;
-    const schemaPromise = new Promise<TableSchema[]>((resolve) => {
+    let resolveSchema: ((value: DetailedObject[]) => void) | undefined;
+    const schemaPromise = new Promise<DetailedObject[]>((resolve) => {
       resolveSchema = resolve;
     });
     const onSchemaFetch = mock(() => schemaPromise);
 
     const connections = [makeWorkspaceConnection({ id: "c1" })];
 
-    const { result } = renderHook(() => useConnectionAdapter({ connections, onSchemaFetch }));
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
 
     // Start fetching schema (don't await)
     let fetchPromise: Promise<void>;
@@ -161,7 +240,9 @@ describe("useConnectionAdapter", () => {
 
     const connections = [makeWorkspaceConnection({ id: "c1" })];
 
-    const { result } = renderHook(() => useConnectionAdapter({ connections, onSchemaFetch }));
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
 
     await act(async () => {
       await result.current.fetchSchema(result.current.connections[0]);
@@ -177,9 +258,12 @@ describe("useConnectionAdapter", () => {
     const initialConnections = [makeWorkspaceConnection({ id: "c1", name: "DB One" })];
     const onSchemaFetch = mock(() => Promise.resolve([]));
 
-    const { result, rerender } = renderHook(({ connections }) => useConnectionAdapter({ connections, onSchemaFetch }), {
-      initialProps: { connections: initialConnections },
-    });
+    const { result, rerender } = renderHook(
+      ({ connections }) => useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      {
+        initialProps: { connections: initialConnections },
+      },
+    );
 
     expect(result.current.connections).toHaveLength(1);
     expect(result.current.connections[0].id).toBe("c1");
@@ -208,9 +292,12 @@ describe("useConnectionAdapter", () => {
     ];
     const onSchemaFetch = mock(() => Promise.resolve([]));
 
-    const { result, rerender } = renderHook(({ connections }) => useConnectionAdapter({ connections, onSchemaFetch }), {
-      initialProps: { connections: initialConnections },
-    });
+    const { result, rerender } = renderHook(
+      ({ connections }) => useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      {
+        initialProps: { connections: initialConnections },
+      },
+    );
 
     // Set active to c2
     act(() => {
@@ -236,9 +323,12 @@ describe("useConnectionAdapter", () => {
     const initialConnections = [makeWorkspaceConnection({ id: "c1", name: "DB One" })];
     const onSchemaFetch = mock(() => Promise.resolve([]));
 
-    const { result, rerender } = renderHook(({ connections }) => useConnectionAdapter({ connections, onSchemaFetch }), {
-      initialProps: { connections: initialConnections },
-    });
+    const { result, rerender } = renderHook(
+      ({ connections }) => useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      {
+        initialProps: { connections: initialConnections },
+      },
+    );
 
     expect(result.current.activeConnection!.id).toBe("c1");
 
@@ -270,7 +360,9 @@ describe("useConnectionAdapter", () => {
     ];
     const onSchemaFetch = mock(() => Promise.resolve([]));
 
-    const { result } = renderHook(() => useConnectionAdapter({ connections, onSchemaFetch }));
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
 
     act(() => {
       result.current.setActiveConnection(result.current.connections[1]);
@@ -294,9 +386,12 @@ describe("useConnectionAdapter", () => {
   test("the active connection follows the host's latest object for that id", () => {
     const onSchemaFetch = mock(() => Promise.resolve([]));
 
-    const { result, rerender } = renderHook(({ connections }) => useConnectionAdapter({ connections, onSchemaFetch }), {
-      initialProps: { connections: [makeWorkspaceConnection({ id: "c1", name: "DB One" })] },
-    });
+    const { result, rerender } = renderHook(
+      ({ connections }) => useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      {
+        initialProps: { connections: [makeWorkspaceConnection({ id: "c1", name: "DB One" })] },
+      },
+    );
 
     expect(result.current.activeConnection!.name).toBe("DB One");
 
@@ -320,9 +415,12 @@ describe("useConnectionAdapter", () => {
     const a = makeWorkspaceConnection({ id: "c1", name: "DB One" });
     const b = makeWorkspaceConnection({ id: "c2", name: "DB Two" });
 
-    const { result, rerender } = renderHook(({ connections }) => useConnectionAdapter({ connections, onSchemaFetch }), {
-      initialProps: { connections: [a, b] },
-    });
+    const { result, rerender } = renderHook(
+      ({ connections }) => useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      {
+        initialProps: { connections: [a, b] },
+      },
+    );
 
     expect(result.current.activeConnection!.id).toBe("c1");
 
@@ -340,9 +438,12 @@ describe("useConnectionAdapter", () => {
     const c2 = makeWorkspaceConnection({ id: "c2", name: "DB Two" });
     const c3 = makeWorkspaceConnection({ id: "c3", name: "DB Three" });
 
-    const { result, rerender } = renderHook(({ connections }) => useConnectionAdapter({ connections, onSchemaFetch }), {
-      initialProps: { connections: [c1, c2, c3] },
-    });
+    const { result, rerender } = renderHook(
+      ({ connections }) => useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      {
+        initialProps: { connections: [c1, c2, c3] },
+      },
+    );
 
     act(() => {
       result.current.setActiveConnection(result.current.connections[2]);
@@ -364,7 +465,9 @@ describe("useConnectionAdapter", () => {
     const connections = [makeWorkspaceConnection({ id: "c1", name: "Platform DB", type: "mysql" })];
     const onSchemaFetch = mock(() => Promise.resolve([]));
 
-    const { result } = renderHook(() => useConnectionAdapter({ connections, onSchemaFetch }));
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
 
     const mapped = result.current.connections[0];
     expect(mapped.id).toBe("c1");
@@ -380,7 +483,9 @@ describe("useConnectionAdapter", () => {
     const connections = [makeWorkspaceConnection({ id: "c1" })];
     const onSchemaFetch = mock(() => Promise.resolve([]));
 
-    const { result } = renderHook(() => useConnectionAdapter({ connections, onSchemaFetch }));
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
 
     // Calling setConnections should not throw and should not change connections
     act(() => {
@@ -396,7 +501,9 @@ describe("useConnectionAdapter", () => {
     const connections = [makeWorkspaceConnection({ id: "c1" })];
     const onSchemaFetch = mock(() => Promise.resolve([]));
 
-    const { result } = renderHook(() => useConnectionAdapter({ connections, onSchemaFetch }));
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
 
     expect(result.current.connectionPulse).toBeNull();
   });
@@ -416,7 +523,9 @@ describe("useConnectionAdapter", () => {
       const connections = [makeWorkspaceConnection({ id: "c1" })];
       const onSchemaFetch = mock(() => Promise.resolve([]));
 
-      const { result } = renderHook(() => useConnectionAdapter({ connections, onSchemaFetch }));
+      const { result } = renderHook(() =>
+        useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      );
 
       expect(result.current.metadata).toBeNull();
     });
@@ -428,7 +537,9 @@ describe("useConnectionAdapter", () => {
       ];
       const onSchemaFetch = mock(() => Promise.resolve([]));
 
-      const { result } = renderHook(() => useConnectionAdapter({ connections, onSchemaFetch }));
+      const { result } = renderHook(() =>
+        useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      );
 
       expect(result.current.metadata?.capabilities.queryDialect).toBe("redis");
     });
@@ -440,7 +551,9 @@ describe("useConnectionAdapter", () => {
       ];
       const onSchemaFetch = mock(() => Promise.resolve([]));
 
-      const { result } = renderHook(() => useConnectionAdapter({ connections, onSchemaFetch }));
+      const { result } = renderHook(() =>
+        useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      );
 
       act(() => {
         result.current.setActiveConnection(result.current.connections[1]);
@@ -456,7 +569,9 @@ describe("useConnectionAdapter", () => {
       ];
       const onSchemaFetch = mock(() => Promise.resolve([]));
 
-      const { result } = renderHook(() => useConnectionAdapter({ connections, onSchemaFetch }));
+      const { result } = renderHook(() =>
+        useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      );
 
       expect(result.current.metadata?.labels?.vacuumAction).toBe("Memory Doctor");
     });
@@ -468,9 +583,430 @@ describe("useConnectionAdapter", () => {
       const connections = [makeWorkspaceConnection({ id: "c1", type: "redis", capabilities: redisCapabilities })];
       const onSchemaFetch = mock(() => Promise.resolve([]));
 
-      const { result } = renderHook(() => useConnectionAdapter({ connections, onSchemaFetch }));
+      const { result } = renderHook(() =>
+        useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      );
 
       expect(result.current.metadata?.labels).toBeUndefined();
     });
+  });
+
+  // ── The no-scan escape hatch, embedded (#765) ──────────────────────────────
+  //
+  // The two shells render different chrome and a change verified in one is not verified
+  // in the other (CLAUDE.md), so the deferral is asserted here on its own terms: this hook
+  // is the embedded shell's whole connection layer, and the host is the only party that
+  // can declare the flag.
+  describe("deferring the object scan", () => {
+    test("a host connection that defers its scan is never read", async () => {
+      const onSchemaFetch = mock(() => Promise.resolve(makeSchema()));
+      const connections = [makeWorkspaceConnection({ id: "c1", skipObjectScan: true })];
+
+      const { result } = renderHook(() =>
+        useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      );
+
+      await act(async () => {
+        await result.current.fetchSchema(result.current.connections[0]);
+      });
+
+      expect(onSchemaFetch).not.toHaveBeenCalled();
+      expect(result.current.objectScanDeferred).toBe(true);
+    });
+
+    // The control for the assertion above: same hook, same host callback, flag removed.
+    test("control: the same connection without the flag is read", async () => {
+      const onSchemaFetch = mock(() => Promise.resolve(makeSchema()));
+      const connections = [makeWorkspaceConnection({ id: "c1" })];
+
+      const { result } = renderHook(() =>
+        useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      );
+
+      await act(async () => {
+        await result.current.fetchSchema(result.current.connections[0]);
+      });
+
+      expect(onSchemaFetch).toHaveBeenCalledWith("c1");
+      expect(result.current.objectScanDeferred).toBe(false);
+    });
+
+    test("the host's flag survives the mapping into a DatabaseConnection", () => {
+      const onSchemaFetch = mock(() => Promise.resolve([]));
+      const connections = [makeWorkspaceConnection({ id: "c1", skipObjectScan: true })];
+
+      const { result } = renderHook(() =>
+        useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      );
+
+      // The mapper writes a fixed field list, so a field it forgets is dropped silently -
+      // and the tree would then read the catalog the host asked it not to.
+      expect(result.current.connections[0].skipObjectScan).toBe(true);
+    });
+
+    test("loadObjects performs the read the host deferred, and stops deferring", async () => {
+      const onSchemaFetch = mock(() => Promise.resolve(makeSchema()));
+      const connections = [makeWorkspaceConnection({ id: "c1", skipObjectScan: true })];
+
+      const { result } = renderHook(() =>
+        useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      );
+
+      await act(async () => {
+        await result.current.fetchSchema(result.current.connections[0]);
+      });
+      expect(onSchemaFetch).not.toHaveBeenCalled();
+
+      await act(async () => {
+        result.current.loadObjects();
+      });
+
+      expect(onSchemaFetch).toHaveBeenCalledWith("c1");
+      expect(result.current.objectScanDeferred).toBe(false);
+      expect(result.current.schema).toHaveLength(2);
+    });
+
+    // D31, embedded: the host's previous connection is not evidence about this one.
+    test("deferring a connection drops the tables the previous one loaded", async () => {
+      const onSchemaFetch = mock(() => Promise.resolve(makeSchema()));
+      const connections = [
+        makeWorkspaceConnection({ id: "c1" }),
+        makeWorkspaceConnection({ id: "c2", skipObjectScan: true }),
+      ];
+
+      const { result } = renderHook(() =>
+        useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+      );
+
+      await act(async () => {
+        await result.current.fetchSchema(result.current.connections[0]);
+      });
+      expect(result.current.schema).toHaveLength(2);
+
+      await act(async () => {
+        await result.current.fetchSchema(result.current.connections[1]);
+      });
+
+      expect(result.current.schema).toEqual([]);
+      expect(result.current.schemaContext).toBe("[]");
+    });
+
+    test("loadObjects with no active connection reads nothing", async () => {
+      const onSchemaFetch = mock(() => Promise.resolve(makeSchema()));
+
+      const { result } = renderHook(() =>
+        useConnectionAdapter({ connections: [], onSchemaFetch, onObjectsFetch: noObjectReads }),
+      );
+
+      await act(async () => {
+        result.current.loadObjects();
+      });
+
+      expect(onSchemaFetch).not.toHaveBeenCalled();
+      expect(result.current.objectScanDeferred).toBe(false);
+    });
+  });
+});
+
+// =============================================================================
+// The object model in the embedded shell (#789, Task 25c)
+// =============================================================================
+//
+// This shell has NO object routes: it holds no credentials and calls back into its host for
+// every reading, so unlike the standalone app it cannot fetch an inventory and tag anything
+// itself. What it can do is stop flattening what the host already knows, which is what
+// `onSchemaFetch` returning `DetailedObject[]` buys. CLAUDE.md is explicit that the two
+// shells are different chrome and that a change verified in one is not verified in the
+// other, so the same property is asserted here rather than inferred from the other hook.
+describe("useConnectionAdapter and the object model", () => {
+  const capabilities = {
+    queryLanguage: "sql",
+    objectKinds: [
+      { id: "table", role: "relation", label: "Table", labelPlural: "Tables", acceptsRowWrites: true },
+      { id: "procedure", role: "routine", label: "Procedure", labelPlural: "Procedures" },
+    ],
+  } as unknown as ProviderCapabilities;
+
+  test("the kind and the segments the HOST declares reach the consumers unchanged", async () => {
+    const hostObjects: DetailedObject[] = [
+      { name: "users", kind: "table", path: ["public", "users"], columns: [], indexes: [] },
+      {
+        name: "recalculate_totals",
+        kind: "procedure",
+        path: ["public", "recalculate_totals"],
+        columns: [],
+        indexes: [],
+      },
+    ];
+    const connections = [makeWorkspaceConnection()];
+    const onSchemaFetch = mock(() => Promise.resolve(hostObjects));
+
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
+
+    await act(async () => {
+      await result.current.fetchSchema(result.current.activeConnection!);
+    });
+
+    expect(result.current.schema.map((object) => [object.name, object.kind])).toEqual([
+      ["users", "table"],
+      ["recalculate_totals", "procedure"],
+    ]);
+    expect(result.current.schema[0].path).toEqual(["public", "users"]);
+    // The consumer-level consequence: the routine is not drawn as a relation. Nothing in
+    // the flat shape could have expressed this, because it had no kind to refuse by.
+    expect(relationObjects(result.current.schema, capabilities).map((object) => object.name)).toEqual(["users"]);
+  });
+
+  test("a host that declares no kinds keeps every object, because nothing said otherwise", async () => {
+    // The control, and the compatibility statement: `kind` and `path` are optional, so a
+    // host answering exactly what it answered before this migration loses nothing.
+    const connections = [makeWorkspaceConnection()];
+    const onSchemaFetch = mock(() => Promise.resolve(makeSchema()));
+
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
+
+    await act(async () => {
+      await result.current.fetchSchema(result.current.activeConnection!);
+    });
+
+    expect(relationObjects(result.current.schema, capabilities).map((object) => object.name)).toEqual([
+      "users",
+      "orders",
+    ]);
+  });
+});
+
+// =============================================================================
+// The read generation guard (#789)
+// =============================================================================
+//
+// The host supplies `onSchemaFetch`, so its latency is not this hook's to bound: a read for
+// connection A can settle after the reader has moved to B. `src/hooks/use-connection-manager.ts`
+// has held this guard since the flat reading; the embedded adapter shipped without it.
+describe("useConnectionAdapter and a slow host read", () => {
+  /** One deferred answer per connection id, so a test can settle them out of order. */
+  function pendingReader() {
+    const settle = new Map<string, (value: DetailedObject[]) => void>();
+    const onSchemaFetch = mock(
+      (id: string) =>
+        new Promise<DetailedObject[]>((resolve) => {
+          settle.set(id, resolve);
+        }),
+    );
+    return { onSchemaFetch, settle };
+  }
+
+  const objectNamed = (name: string): DetailedObject => ({
+    name,
+    kind: "table",
+    path: [name],
+    columns: [],
+    indexes: [],
+  });
+
+  test("a read that settles after the reader switched connections is discarded", async () => {
+    const { onSchemaFetch, settle } = pendingReader();
+    const connections = [makeWorkspaceConnection({ id: "a" }), makeWorkspaceConnection({ id: "b" })];
+
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
+
+    let readA: Promise<void>;
+    let readB: Promise<void>;
+    act(() => {
+      readA = result.current.fetchSchema(result.current.connections[0]);
+      readB = result.current.fetchSchema(result.current.connections[1]);
+    });
+
+    // B answers first, then A: the reader is on B, so A's objects must never land.
+    await act(async () => {
+      settle.get("b")!([objectNamed("b_table")]);
+      await readB!;
+      settle.get("a")!([objectNamed("a_table")]);
+      await readA!;
+    });
+
+    expect(result.current.schema.map((object) => object.name)).toEqual(["b_table"]);
+  });
+
+  test("a superseded read that fails does not clear the current connection's objects", async () => {
+    const settle = new Map<string, (value: DetailedObject[]) => void>();
+    const reject = new Map<string, (reason: Error) => void>();
+    const onSchemaFetch = mock(
+      (id: string) =>
+        new Promise<DetailedObject[]>((resolve, fail) => {
+          settle.set(id, resolve);
+          reject.set(id, fail);
+        }),
+    );
+    const connections = [makeWorkspaceConnection({ id: "a" }), makeWorkspaceConnection({ id: "b" })];
+
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
+
+    let readA: Promise<void>;
+    let readB: Promise<void>;
+    act(() => {
+      readA = result.current.fetchSchema(result.current.connections[0]);
+      readB = result.current.fetchSchema(result.current.connections[1]);
+    });
+
+    await act(async () => {
+      settle.get("b")!([objectNamed("b_table")]);
+      await readB!;
+      reject.get("a")!(new Error("Connection refused"));
+      await readA!;
+    });
+
+    expect(result.current.schema.map((object) => object.name)).toEqual(["b_table"]);
+    // The flag belongs to the read that is current. A superseded one clearing it would report
+    // the newer read as finished while it is still in flight; here both have settled, so the
+    // assertion is that the failure did not leave it stuck on either.
+    expect(result.current.isLoadingSchema).toBe(false);
+  });
+
+  test("a superseded read does not report the newer read as finished", async () => {
+    const { onSchemaFetch, settle } = pendingReader();
+    const connections = [makeWorkspaceConnection({ id: "a" }), makeWorkspaceConnection({ id: "b" })];
+
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
+
+    let readA: Promise<void>;
+    act(() => {
+      readA = result.current.fetchSchema(result.current.connections[0]);
+      void result.current.fetchSchema(result.current.connections[1]);
+    });
+
+    await act(async () => {
+      settle.get("a")!([objectNamed("a_table")]);
+      await readA!;
+    });
+
+    // B is still in flight.
+    expect(result.current.isLoadingSchema).toBe(true);
+    expect(result.current.schema).toEqual([]);
+  });
+
+  test("moving to a connection that defers its scan supersedes the read in flight", async () => {
+    const { onSchemaFetch, settle } = pendingReader();
+    const connections = [
+      makeWorkspaceConnection({ id: "a" }),
+      makeWorkspaceConnection({ id: "b", skipObjectScan: true }),
+    ];
+
+    const { result } = renderHook(() =>
+      useConnectionAdapter({ connections, onSchemaFetch, onObjectsFetch: noObjectReads }),
+    );
+
+    let readA: Promise<void>;
+    act(() => {
+      readA = result.current.fetchSchema(result.current.connections[0]);
+    });
+
+    // The deferred connection issues no request at all and must still supersede A's.
+    await act(async () => {
+      await result.current.fetchSchema(result.current.connections[1]);
+      settle.get("a")!([objectNamed("a_table")]);
+      await readA!;
+    });
+
+    expect(result.current.schema).toEqual([]);
+    expect(result.current.isLoadingSchema).toBe(false);
+  });
+});
+
+// =============================================================================
+// The describe seam (#789, columns under an object row)
+// =============================================================================
+//
+// `objectSource` is what the object tree reads through in this shell, and its fourth arm is the
+// one an adopter can decline: `describeObject` is optional, so the two answers this block pins
+// are "the host's own method, bound" and "a rejection nobody can render a twisty over". The tree
+// never issues the second, because `readsColumns` withholds the affordance, and that is exactly
+// why the arm is asserted here: it is unreachable through the component and still executable.
+describe("useConnectionAdapter and the describe seam", () => {
+  /**
+   * A host as a CLASS, which is what makes the receiver assertion real.
+   *
+   * Every field this method needs is reached through `this`, so a seam that read the method off
+   * the object as a value and called it with no receiver gets a TypeError out of `this.details`
+   * rather than a detail. `readObjectSource`'s docblock in `src/workspace/types.ts` records the
+   * same fault for the read seam; the methods are on the prototype rather than arrow properties
+   * for that reason, since an arrow property would be bound whatever the caller did.
+   */
+  class HostWithDetail implements WorkspaceObjectReader {
+    public readonly asked: unknown[][] = [];
+    constructor(private readonly details: Record<string, ObjectDetail>) {}
+    async listContainers(): Promise<readonly Container[]> {
+      return [];
+    }
+    async countObjects(): Promise<Record<string, KindCount>> {
+      return {};
+    }
+    async listObjects(): Promise<readonly DatabaseObject[]> {
+      return [];
+    }
+    async describeObject(connectionId: string, path: readonly string[], kind: string): Promise<ObjectDetail> {
+      this.asked.push([connectionId, path, kind]);
+      return this.details[connectionId];
+    }
+  }
+
+  function adapterFor(onObjectsFetch: WorkspaceObjectReader) {
+    const connections = [makeWorkspaceConnection({ id: "host-conn-1" })];
+    return renderHook(() => useConnectionAdapter({ connections, onSchemaFetch: async () => [], onObjectsFetch }));
+  }
+
+  test("a describe read reaches the host's method, bound, with the connection id, path and kind", async () => {
+    const detail: ObjectDetail = {
+      path: ["app", "orders"],
+      columns: [{ name: "id", type: "integer", nullable: false, isPrimary: true }],
+      indexes: [],
+      foreignKeys: [],
+    };
+    const host = new HostWithDetail({ "host-conn-1": detail });
+    const { result } = adapterFor(host);
+
+    // NOT `table`, and the value is the assertion. An arm that dropped `request.kind` and passed
+    // the literal `"table"` was indistinguishable from one that threads it while this seam only
+    // ever asked about a table, and that mutant survived the suite. A host is asked about the
+    // kind the row declares: Cassandra answers a `materialized_view`, a `type` and a `table`
+    // through three different catalogs, so the wrong word here reads the wrong object or refuses.
+    const answer = await result.current.objectSource(result.current.connections[0], {
+      route: "describe",
+      path: ["app", "orders"],
+      kind: "materialized_view",
+    });
+
+    expect(answer).toBe(detail);
+    expect(host.asked).toEqual([["host-conn-1", ["app", "orders"], "materialized_view"]]);
+  });
+
+  test("a host that declares no describe read rejects, rather than answering nothing", async () => {
+    const { result } = adapterFor(noObjectReads);
+
+    // A rejection and not `undefined`: `undefined` fails the tree's shape check and is reported
+    // as "answered with a body this tree cannot render", which blames the host's answer for a
+    // method the host never declared.
+    await expect(
+      result.current.objectSource(result.current.connections[0], {
+        route: "describe",
+        path: ["app", "orders"],
+        kind: "table",
+      }),
+    ).rejects.toThrow("This host reads no object detail");
+  });
+
+  test("readsColumns is true only where the host declared the member", () => {
+    expect(adapterFor(new HostWithDetail({})).result.current.readsColumns).toBe(true);
+    expect(adapterFor(noObjectReads).result.current.readsColumns).toBe(false);
   });
 });

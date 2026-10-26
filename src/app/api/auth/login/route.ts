@@ -1,19 +1,17 @@
 import { login } from "@/lib/auth";
 import { AuthConfigError } from "@/lib/auth-errors";
-import { getAuthUsers } from "@/lib/local-auth";
+import { rehashStoredPassword, resolveLocalAuthUsers } from "@/lib/local-accounts";
+import { needsRehash, placeholderPasswordHash, verifyPassword } from "@/lib/password-hash";
 import { NextRequest, NextResponse } from "next/server";
 import { createErrorResponse } from "@/lib/api/errors";
 import { clientAddress } from "@/lib/api/client-address";
-import {
-  consumeRateLimit,
-  peekRateLimit,
-  RateLimitError,
-  resetRateLimit,
-  type RateLimitBucket,
-} from "@/lib/api/rate-limit";
+import { enforceLoginLimit } from "@/lib/api/login-budget";
+import { consumeRateLimit, resetRateLimit } from "@/lib/api/rate-limit";
 import { hmacHex, secretsMatch } from "@/lib/auth-compare";
-import { emitAuditEvent, MAX_AUDIT_FIELD_LENGTH } from "@/lib/audit";
+import { emitAuditEvent, MAX_AUDIT_FIELD_LENGTH, type AuditReason } from "@/lib/audit";
+import { governanceEnabled } from "@/lib/governance/config";
 import { logger } from "@/lib/logger";
+import { claimTotpStep, verifyTotp } from "@/lib/totp";
 
 const ROUTE = "POST /api/auth/login";
 
@@ -25,38 +23,12 @@ const ROUTE = "POST /api/auth/login";
  */
 const DUMMY_PASSWORD = "libredb-dummy-password-never-a-credential";
 
-type LoginBucket = Extract<RateLimitBucket, "login_client" | "login_account">;
-
-/**
- * Peek, not consume: a legitimate user who logs in repeatedly must not throttle themselves, so
- * only FAILURES spend budget. The trip is audited once per window, on the transition. The bucket
- * is recorded on the event so an operator can tell a broad address flood (login_client) apart
- * from a targeted attack on one account (login_account).
- */
-function enforceLoginLimit(bucket: LoginBucket, key: string, actor: string, ip: string): void {
-  const decision = peekRateLimit(bucket, key);
-  if (decision.allowed) return;
-
-  if (decision.tripped) {
-    // Isolated for the same reason as the two emits in POST below: the 429 is already decided
-    // (the throw below fires regardless), and a broken audit sink must not turn it into a 500.
-    try {
-      emitAuditEvent({
-        type: "rate_limit_exceeded",
-        action: "throttled",
-        target: ROUTE,
-        user: actor,
-        result: "failure",
-        reason: "rate_limited",
-        ip,
-        bucket,
-      });
-    } catch (auditError) {
-      logger.error("Failed to record rate_limit_exceeded audit event", auditError, { route: ROUTE });
-    }
-  }
-  throw new RateLimitError(decision.retryAfterSeconds);
-}
+// Single-line and module-scoped, matching the auth messages in local-auth.ts and auth-env.ts:
+// bun's line coverage under-counts the continuation lines of a wrapped string.
+const MFA_REQUIRED_MESSAGE = "Enter the 6-digit code from your authenticator app";
+const MFA_INVALID_MESSAGE = "Invalid authentication code";
+const PASSWORD_LOGIN_DISABLED_MESSAGE =
+  "Password sign-in is disabled: this server signs in through the identity provider only";
 
 export async function POST(request: NextRequest) {
   const ip = clientAddress(request);
@@ -67,12 +39,36 @@ export async function POST(request: NextRequest) {
     // body to compute. Doing this first means an address that already tripped the bucket is
     // refused before this route ever attempts to parse anything - including a malformed body,
     // which the catch below cannot reach for the same reason it cannot be enforced afterwards.
-    enforceLoginLimit("login_client", clientKey, "anonymous", ip);
+    enforceLoginLimit("login_client", clientKey, "anonymous", ip, ROUTE);
+
+    // Under governance the identity provider is the only way in (docs/GOVERNANCE.md), so every caller is refused here,
+    // before the body is read, even when the boot check that refuses ADMIN_PASSWORD was bypassed. The refusal is a
+    // wasted attempt from this address, as a malformed body is: it spends the client bucket, so a flood is refused
+    // with 429 and its audit lines stay bounded.
+    if (governanceEnabled()) {
+      consumeRateLimit("login_client", clientKey);
+      // Isolated like every other emit in this route: the 403 below is already decided.
+      try {
+        emitAuditEvent({
+          type: "login_failure",
+          action: "login",
+          target: ROUTE,
+          user: "anonymous",
+          result: "failure",
+          reason: "password_login_disabled",
+          ip,
+        });
+      } catch (auditError) {
+        logger.error("Failed to record login_failure audit event", auditError, { route: ROUTE });
+      }
+      return NextResponse.json({ success: false, message: PASSWORD_LOGIN_DISABLED_MESSAGE }, { status: 403 });
+    }
 
     let email: unknown;
     let password: unknown;
+    let totp: unknown;
     try {
-      ({ email, password } = await request.json());
+      ({ email, password, totp } = await request.json());
     } catch {
       // A malformed body is a client error, not a server error, and - like a wrong password - is
       // a wasted attempt from this address: consume the client bucket so a caller who floods this
@@ -104,6 +100,9 @@ export async function POST(request: NextRequest) {
     // distinguishable response.
     const submittedEmail = typeof email === "string" ? email : "";
     const submittedPassword = typeof password === "string" ? password : "";
+    // Same coercion, same reason: a non-string `totp` must read as "no code supplied", never
+    // reach verifyTotp's string methods and become a 500 that stands out from the uniform 401.
+    const submittedTotp = typeof totp === "string" ? totp.trim() : "";
     // MAX_AUDIT_FIELD_LENGTH, not a locally redeclared copy of the same number: the actor becomes
     // an AuditEvent field either way, so both truncations must move together.
     const actor = submittedEmail.slice(0, MAX_AUDIT_FIELD_LENGTH) || "anonymous";
@@ -113,16 +112,89 @@ export async function POST(request: NextRequest) {
     // oracle. This is the coupling between control 1.2 and control 1.5.
     const accountKey = hmacHex(submittedEmail.toLowerCase());
 
-    enforceLoginLimit("login_account", accountKey, actor, ip);
+    enforceLoginLimit("login_account", accountKey, actor, ip, ROUTE);
 
-    const users = getAuthUsers();
-    const user = users.find((u) => u.email === submittedEmail);
-    const candidate = user?.password ?? DUMMY_PASSWORD;
-    const passwordMatches = secretsMatch(submittedPassword, candidate);
-    const matched = user && passwordMatches ? user : null;
+    const users = await resolveLocalAuthUsers();
+    // Store mode hashes. Env mode still does exactly one secretsMatch, which is what the
+    // enumeration test counts. An unknown store account verifies a placeholder hash instead, so
+    // it pays the same scrypt as a real one. A disabled account verifies and then fails closed.
+    const storeMode = users.some((entry) => entry.passwordHash !== undefined);
+    const user = storeMode
+      ? users.find((entry) => entry.email.toLowerCase() === submittedEmail.toLowerCase())
+      : users.find((entry) => entry.email === submittedEmail);
+    let passwordMatches: boolean;
+    if (storeMode) {
+      passwordMatches = await verifyPassword(
+        submittedPassword,
+        user?.passwordHash ?? (await placeholderPasswordHash()),
+      );
+      if (passwordMatches && user && !user.disabled && user.passwordHash && needsRehash(user.passwordHash)) {
+        await rehashStoredPassword(user.email, submittedPassword);
+      }
+    } else {
+      passwordMatches = secretsMatch(submittedPassword, user?.password ?? DUMMY_PASSWORD);
+    }
+    const matched = user && !user.disabled && passwordMatches ? user : null;
+
+    // Second factor. Reached only once the password already matched, so answering "code required"
+    // here is not the account-enumeration oracle the uniform 401 below exists to prevent: an
+    // unknown email and a known email with a wrong password both still take that path, and a
+    // caller who can reach this branch necessarily holds a working password for the account -
+    // without MFA configured, that same request would simply have logged them in.
+    if (matched?.totpSecret) {
+      // No "did they send one?" pre-check: verifyTotp's own digit test already answers null for
+      // an empty or malformed code, so a guard here would be a second copy of that decision - and
+      // a user-controlled value guarding the session mint is what CodeQL flags as
+      // js/user-controlled-bypass. `submittedTotp` still picks the audit reason below, which is a
+      // logging branch and decides nothing.
+      const step = verifyTotp(matched.totpSecret, submittedTotp);
+      // claimTotpStep is what makes an accepted code single-use (RFC 6238 §5.2). A replayed code
+      // verifies but fails to claim, and lands here as an ordinary bad code.
+      const accepted = step !== null && claimTotpStep(accountKey, step);
+
+      if (!accepted) {
+        const reason: AuditReason = submittedTotp ? "bad_totp" : "mfa_required";
+        // A wrong code is a failed attempt and is charged for: it is the only thing between an
+        // attacker holding a stolen password and a session, so guessing has to be bounded. Not
+        // having supplied one yet is NOT a failed attempt - it is the first half of a
+        // two-request flow, and charging it would spend the whole five-failure client budget on
+        // five ordinary logins.
+        if (reason === "bad_totp") {
+          consumeRateLimit("login_client", clientKey);
+          consumeRateLimit("login_account", accountKey);
+        }
+        // Isolated like every other emit in this route: the 401 below is already decided, and a
+        // broken audit sink must not turn it into an unrelated 500. The mfa_required branch is
+        // uncharged and therefore unbounded in volume for whoever holds the password - the same
+        // property login_success already has, since a successful login resets both buckets.
+        try {
+          emitAuditEvent({
+            type: "login_failure",
+            action: "login",
+            target: ROUTE,
+            user: matched.email,
+            result: "failure",
+            reason,
+            ip,
+          });
+        } catch (auditError) {
+          logger.error("Failed to record login_failure audit event", auditError, { route: ROUTE });
+        }
+        // `mfaRequired` tells the client to render the code field. It carries no information the
+        // caller did not already supply the password to learn (see the note above this block).
+        return NextResponse.json(
+          {
+            success: false,
+            mfaRequired: true,
+            message: reason === "bad_totp" ? MFA_INVALID_MESSAGE : MFA_REQUIRED_MESSAGE,
+          },
+          { status: 401 },
+        );
+      }
+    }
 
     if (matched) {
-      await login(matched.role, matched.email);
+      await login(matched.role, matched.email, matched.sessionVersion);
       resetRateLimit("login_client", clientKey);
       resetRateLimit("login_account", accountKey);
       // Isolated in its own try/catch, separate from login() above, matching logout and the OIDC

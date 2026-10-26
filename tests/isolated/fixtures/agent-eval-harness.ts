@@ -61,7 +61,7 @@ import { createCanonicalOperationRegistry } from "@/lib/db/operations/descriptor
 import { createTargetScope } from "@/lib/db/operations/policy";
 import type { DatabaseProvider, ProviderCapabilities, ProviderLabels } from "@/lib/db/types";
 import { TABLE_LABELS } from "../../fixtures/provider-labels";
-import type { DatabaseConnection, QueryResult, TableSchema } from "@/lib/types";
+import type { DatabaseConnection, QueryResult } from "@/lib/types";
 import { type ScriptedTurn, modelOver, scriptedModel } from "./agent-scripted-model";
 
 // ─── the two Phase 1 engines ────────────────────────────────────────────────
@@ -105,8 +105,8 @@ export interface EvalEnginePreset {
   /**
    * Whether the stub provider carries `queryReadOnly` at all.
    *
-   * The engine property that decides which workflows may run: only PostgreSQL and
-   * SQLite implement it, and `acquireExecutionProfileProvider` refuses the
+   * The engine property that decides which workflows may run: the providers of
+   * `AGENT_EXECUTION_ENGINES` implement it, and `acquireExecutionProfileProvider` refuses the
    * `agent-read-only` profile without it. A preset that does not serve it therefore
    * cannot answer a statement AT ALL — which is what makes "this run sent none" a
    * property the fixture enforces rather than one the assertions merely observe.
@@ -119,7 +119,6 @@ const POSTGRES_CAPABILITIES: ProviderCapabilities = {
   supportsExplain: true,
   explainFormat: "postgres-json",
   supportsExternalQueryLimiting: true,
-  supportsCreateTable: true,
   supportsInlineRowEdit: true,
   supportsMaintenance: false,
   maintenanceOperations: [],
@@ -151,10 +150,14 @@ export const DEPARTMENTS = [
   "research",
 ] as const;
 
-const PG_COLUMN_ROWS = DEPARTMENTS.flatMap((table) => [
-  { table_schema: "public", table_name: table, column_name: "id", data_type: "integer", is_nullable: "NO" },
-  { table_schema: "public", table_name: table, column_name: "name", data_type: "text", is_nullable: "YES" },
-]);
+const PG_COLUMN_ROWS = DEPARTMENTS.map((table) => ({
+  table_schema: "public",
+  table_name: table,
+  columns: [
+    { name: "id", type: "integer", nullable: "NO" },
+    { name: "name", type: "text", nullable: "YES" },
+  ],
+}));
 
 const SQLITE_DDL_ROWS = DEPARTMENTS.map((table) => ({
   name: table,
@@ -220,7 +223,7 @@ export const EVAL_ENGINES: Readonly<Record<EvalEngine, EvalEnginePreset>> = Obje
     groundingReads: ["information_schema.columns", "pg_constraint", "pg_index", "pg_stats"],
     catalogAnswer: (sql) => {
       if (sql.includes("information_schema.columns")) {
-        return result(PG_COLUMN_ROWS, ["table_schema", "table_name", "column_name", "data_type", "is_nullable"]);
+        return result(PG_COLUMN_ROWS, ["table_schema", "table_name", "columns"]);
       }
       if (sql.includes("pg_constraint")) return result([], ["table_name"]);
       // Before `pg_index`: the statistics read joins `pg_class` to `pg_stats` and
@@ -272,21 +275,32 @@ export const EVAL_ENGINES: Readonly<Record<EvalEngine, EvalEnginePreset>> = Obje
    * A THIRD engine, and the only one here that is not a Phase 1 engine.
    *
    * It exists to make the operations workflow's whole claim observable: that
-   * workflow is offered on engines with no database-native read-only statement path,
-   * and until this preset the harness could not express one.
+   * workflow is offered on engines with no read-only statement path, and until this
+   * preset the harness could not express one.
    *
-   * It carries NO `queryReadOnly`, exactly as the real MySQL provider does not, so it
-   * can answer neither a catalog read nor a statement: a run that sent one dies
-   * visibly here instead of being quietly answered by PostgreSQL's default fixture
-   * row. That is the difference between a fixture that observes the workflow's
-   * central property and one that enforces it.
+   * It carries NO `queryReadOnly`, so it stands for an engine outside
+   * `AGENT_EXECUTION_ENGINES` under MySQL's name and capabilities: the real MySQL
+   * provider has implemented `queryReadOnly` since #1629. It can answer neither a
+   * catalog read nor a statement: a run that sent one dies visibly here instead of
+   * being quietly answered by PostgreSQL's default fixture row. That is the difference
+   * between a fixture that observes the workflow's central property and one that
+   * enforces it.
    */
   mysql: {
     connection: { id: "conn_eval", name: "Company (MySQL)", type: "mysql", createdAt: new Date(0) },
-    capabilities: { ...POSTGRES_CAPABILITIES, explainFormat: "mysql-json", defaultPort: 3306 },
+    // The kind is DECLARED so the grounding walk reaches the provider and is refused by
+    // it, which is the state this preset exists to express. A preset declaring no kind
+    // would be refused one step earlier, by this server rather than by the database, and
+    // the run would be told something true about the declaration instead of the engine.
+    capabilities: {
+      ...POSTGRES_CAPABILITIES,
+      explainFormat: "mysql-json",
+      defaultPort: 3306,
+      objectKinds: [{ id: "table", role: "relation", label: "Table", labelPlural: "Tables" }],
+    },
     catalogReads: [],
     // None, and that is the honest limit rather than an omission: grounding is served
-    // for the dialects `CATALOG_COMPOSERS` covers, so a run here — plan or agent —
+    // for the dialects that supply a `catalogCapture`, so a run here — plan or agent —
     // reads no catalog and no statistics at all.
     groundingReads: [],
     catalogAnswer: () => null,
@@ -507,13 +521,25 @@ export async function openEvalRun(options: EvalRunOptions = {}): Promise<EvalRun
     // somebody might later delete as redundant.
     const provider = {
       ...(engine.servesReadOnlyStatements ? { queryReadOnly } : {}),
-      // `getSchema` is a REQUIRED member of `DatabaseProvider`, so a preset without one
-      // is a provider shape that cannot exist and an eval driven against it would prove
-      // nothing about a run. What a provider that cannot describe this database really
-      // does is REJECT, so that is what this one does: the grounding read on a dialect
-      // with no catalog plan (#414) then fails the way it fails in production, and the
-      // ungrounded plan path these evals exercise is reached through a real state.
-      getSchema: async (): Promise<readonly TableSchema[]> => {
+      // The object surface is REQUIRED on `DatabaseProvider`, so a preset without it is a
+      // provider shape that cannot exist and an eval driven against it would prove nothing
+      // about a run. What a provider that cannot describe this database really does is
+      // REJECT, so that is what this one does: the grounding read on a dialect with no
+      // catalog plan (#414) then fails the way it fails in production, and the ungrounded
+      // plan path these evals exercise is reached through a real state.
+      listContainers: async (): Promise<never> => {
+        throw new QueryError("this database refused to describe its own schema");
+      },
+      countObjects: async (): Promise<never> => {
+        throw new QueryError("this database refused to describe its own schema");
+      },
+      listObjects: async (): Promise<never> => {
+        throw new QueryError("this database refused to describe its own schema");
+      },
+      describeObject: async (): Promise<never> => {
+        throw new QueryError("this database refused to describe its own schema");
+      },
+      describeObjects: async (): Promise<never> => {
         throw new QueryError("this database refused to describe its own schema");
       },
       ...DEFAULT_CURATED,
@@ -573,6 +599,12 @@ export async function openEvalRun(options: EvalRunOptions = {}): Promise<EvalRun
       ...(driveOptions.maxTurns === undefined ? {} : { maxTurns: driveOptions.maxTurns }),
       ...(driveOptions.turnTimeoutMs === undefined ? {} : { turnTimeoutMs: driveOptions.turnTimeoutMs }),
     });
+
+    if (outcome.status === "paused") {
+      // A paused drive is not an eval outcome: the harness never asks to pause, so a
+      // paused return can only mean the run was stopped from outside the script.
+      throw new Error(`run ${record.runId} paused mid-eval`);
+    }
 
     const view = await store.read(record.runId);
     if (!view) throw new Error(`run ${record.runId} has no ledger`);

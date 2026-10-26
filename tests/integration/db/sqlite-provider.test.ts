@@ -7,11 +7,31 @@
  *   forced deterministically via LIBREDB_SQLITE_DRIVER=node
  */
 
-import { describe, test, expect, afterEach, beforeAll, afterAll } from "bun:test";
+import { describe, test, expect, afterEach, beforeAll, beforeEach, afterAll, spyOn } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { Database as BunDatabase, constants as sqliteConstants } from "bun:sqlite";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
+/** A namespace import, not the named `statSync` above: `spyOn` needs an object it can
+ * reassign a property on, and this is the same module object the provider's own
+ * `import * as fs from "fs"` reads `statSync` off. */
+import * as fsNode from "node:fs";
+
+/** The repository root, anchored to this file so nothing here depends on the launcher's cwd. */
+const REPO_ROOT = resolve(import.meta.dir, "../../..");
 import {
   SQLiteProvider,
   assertQueryOnlyEnabled,
@@ -19,11 +39,42 @@ import {
   readDbstatSizes,
 } from "@/lib/db/providers/sql/sqlite";
 import { resolveSQLiteDriverName } from "@/lib/db/providers/sql/sqlite-driver";
+import { SQLITE_CREATE_TABLE } from "@/lib/db/providers/sql/sqlite-create-table";
+import {
+  containerDepth,
+  declaredKinds,
+  isCountUnavailable,
+  isSourcePartUnavailable,
+  kindHasColumns,
+  sourceBoundTruncationReason,
+} from "@/lib/db/object-kinds";
+import { flattenTree } from "@/components/object-tree/flatten";
+import type { SQLiteDatabase, SQLiteStatement } from "@/lib/db/providers/sql/sqlite-driver";
+import { assertObjectSurface } from "../../helpers/object-surface-conformance";
 import { rowBudgetIn } from "@/lib/agent/context-snapshot";
 import type { DatabaseConnection } from "@/lib/types";
-import type { ReadOnlyStatementBudget } from "@/lib/db/types";
-import { ConnectionError, DatabaseConfigError, ExecutionProfileError, QueryError } from "@/lib/db/errors";
+import type { ObjectKindSpec, ReadOnlyStatementBudget } from "@/lib/db/types";
+import {
+  ConnectionError,
+  DatabaseConfigError,
+  DatabaseError,
+  ExecutionProfileError,
+  QueryError,
+} from "@/lib/db/errors";
 import { CACHE_HIT_RATIO_UNAVAILABLE } from "@/lib/monitoring-cache-ratio";
+import { buildResultExport } from "@/lib/export/result-export";
+import { comparePaths } from "@/lib/db/object-path";
+import { readFixtureStatements } from "../../../docker/sqlite-init/build-fixture";
+import { logger } from "@/lib/logger";
+import { MISSING_POSIX_FILE_MODES, describeIf, testIf } from "../../helpers/posix-tools";
+import { howItFailed } from "../../helpers/spawn-outcome";
+import {
+  CHILD_TEST_TIMEOUT_MS,
+  MISSING_POSIX_SPECIAL_FILES,
+  connectInChild,
+  makeFifo,
+  runInChild,
+} from "../../helpers/special-files";
 
 // ============================================================================
 // Helpers
@@ -55,6 +106,22 @@ async function hasDbstat(db: SQLiteProvider): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Await an engine refusal without `expect(...).rejects`. Bun 1.4.x's
+ * `expect(promise).rejects` hangs on a rejection that arrives from the worker
+ * child's stdout (the read-only profile's engine refusals), so the worker path
+ * reads the outcome directly: it resolves with the error, and throws when the
+ * statement resolved instead of being refused.
+ */
+async function engineRefusal(promise: Promise<unknown>): Promise<Error> {
+  const outcome = await promise.then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  if (outcome === undefined) throw new Error("expected the statement to be refused, but it resolved");
+  return outcome as Error;
 }
 
 // ============================================================================
@@ -125,13 +192,23 @@ describe("SQLiteProvider", () => {
 
   describe("getDatabasePath() via connect()", () => {
     let pathTmpDir: string;
+    let sameVolumeTmpDir: string;
 
     beforeAll(() => {
       pathTmpDir = mkdtempSync(join(tmpdir(), "libredb-sqlite-path-"));
+      // A second fixture directory, deliberately on the same volume as the process cwd: the
+      // relative-path test below needs path.relative(cwd, target) to BE relative, and on Windows a
+      // clone on D: with %TEMP% on C: makes that impossible to express, so path.relative hands
+      // back the absolute target and the test fails on that machine only. node_modules/.cache is
+      // ignored by the VCS, so nothing here is visible to a working-tree drift guard.
+      const cache = join(REPO_ROOT, "node_modules", ".cache");
+      mkdirSync(cache, { recursive: true });
+      sameVolumeTmpDir = mkdtempSync(join(cache, "libredb-sqlite-path-"));
     });
 
     afterAll(() => {
-      rmSync(pathTmpDir, { recursive: true, force: true });
+      rmSync(pathTmpDir, { recursive: true });
+      rmSync(sameVolumeTmpDir, { recursive: true });
     });
 
     test("a path containing a NUL byte throws DatabaseConfigError without claiming traversal protection", async () => {
@@ -151,15 +228,24 @@ describe("SQLiteProvider", () => {
     test("a relative path with '..' segments is accepted and resolves to an absolute location", async () => {
       // Pins intended behavior: sqlite paths are trusted server-side paths, so
       // ".." segments are legal and simply resolve against the process cwd.
-      const relPath = relative(process.cwd(), join(pathTmpDir, "dotdot-ok.db"));
+      // The ".." is built explicitly, by leaving the working directory and coming straight back
+      // into it, rather than by pointing at a directory outside the tree and letting
+      // path.relative produce the hops. That used to be a path under the system temp directory:
+      // on Windows a clone on D: with %TEMP% on C: has no relative spelling at all, so
+      // path.relative returns the absolute target and the assertion below fails on that machine
+      // only. This form carries the same ".." segments on every platform.
+      const target = join(sameVolumeTmpDir, "dotdot-ok.db");
+      const cwd = process.cwd();
+      const relPath = join("..", basename(cwd), relative(cwd, target));
       expect(isAbsolute(relPath)).toBe(false);
       expect(relPath).toContain("..");
+      expect(resolve(relPath)).toBe(target);
 
       provider = new SQLiteProvider(makeSQLiteConfig({ database: relPath }));
       await provider.connect();
       expect(provider.isConnected()).toBe(true);
       // The database file materializes at the resolved absolute location.
-      expect(existsSync(join(pathTmpDir, "dotdot-ok.db"))).toBe(true);
+      expect(existsSync(join(sameVolumeTmpDir, "dotdot-ok.db"))).toBe(true);
     });
 
     test("a connectionString with a file: prefix is accepted and the prefix is stripped", async () => {
@@ -178,6 +264,205 @@ describe("SQLiteProvider", () => {
       await provider.connect();
       expect(provider.isConnected()).toBe(true);
       expect(existsSync(dbPath)).toBe(true);
+    });
+
+    test("a missing parent folder is created one level at a time, never with a recursive mkdir", async () => {
+      // Node's recursive mkdir never returns for a path under /proc, so the provider must not ask for one.
+      const dbPath = join(pathTmpDir, "nested", "deeper", "created.db");
+      const mkdirSpy = spyOn(fsNode, "mkdirSync");
+      try {
+        provider = new SQLiteProvider(makeSQLiteConfig({ database: dbPath }));
+        await provider.connect();
+        expect(provider.isConnected()).toBe(true);
+        expect(existsSync(dbPath)).toBe(true);
+        expect(mkdirSpy.mock.calls.map(([dir, options]) => [String(dir), options])).toEqual([
+          [join(pathTmpDir, "nested"), undefined],
+          [join(pathTmpDir, "nested", "deeper"), undefined],
+        ]);
+      } finally {
+        mkdirSpy.mockRestore();
+      }
+    });
+
+    testIf(
+      existsSync("/proc/self") ? null : "no /proc on this platform: the folder procfs refuses is Linux-only",
+      "a folder under /proc fails at once with the open error, naming ENOENT and the folder",
+      async () => {
+        const folder = `/proc/libredb-${process.pid}-${Date.now()}`;
+        provider = new SQLiteProvider(makeSQLiteConfig({ database: join(folder, "x", "app.db") }));
+        const error = await provider.connect().then(
+          () => null,
+          (e: unknown) => e,
+        );
+        expect(error).toBeInstanceOf(ConnectionError);
+        expect((error as Error).message).toStartWith("Failed to open SQLite database: ENOENT");
+        // The first missing level, not the deepest one: Bun's recursive mkdir also throws ENOENT here,
+        // but names the full path, so this is what tells the one-level-at-a-time walk apart.
+        expect((error as Error).message).toContain(`mkdir '${folder}'`);
+        expect(provider.isConnected()).toBe(false);
+      },
+    );
+  });
+
+  // --------------------------------------------------------------------------
+  // A database path that exists and is not a regular file
+  // --------------------------------------------------------------------------
+
+  describe("a path that is not a regular file", () => {
+    let specialDir: string;
+
+    beforeEach(() => {
+      specialDir = mkdtempSync(join(tmpdir(), "libredb-sqlite-special-"));
+    });
+
+    afterEach(() => {
+      rmSync(specialDir, { recursive: true, force: true });
+    });
+
+    test("a directory is refused before SQLite opens it, naming the path", async () => {
+      const dir = join(specialDir, "a-directory");
+      mkdirSync(dir);
+      provider = new SQLiteProvider(makeSQLiteConfig({ database: dir }));
+      const error = await provider.connect().then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(error).toBeInstanceOf(ConnectionError);
+      expect((error as Error).message).toBe(
+        `Failed to open SQLite database: ${dir} is a directory, not a regular file`,
+      );
+      expect(provider.isConnected()).toBe(false);
+    });
+
+    // SQLite used to report a connection to a character device: Test Connection said "Connected".
+    testIf(MISSING_POSIX_SPECIAL_FILES, "a character device is refused instead of reported connected", async () => {
+      provider = new SQLiteProvider(makeSQLiteConfig({ database: "/dev/null" }));
+      const error = await provider.connect().then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(error).toBeInstanceOf(ConnectionError);
+      expect((error as Error).message).toBe(
+        "Failed to open SQLite database: /dev/null is a character device, not a regular file",
+      );
+      expect(provider.isConnected()).toBe(false);
+    });
+
+    // A FIFO opened for reading waits for a writer that never comes: the agent's read-only open, and the
+    // editor's read-only open of a file it cannot write, never returned (measured on bun 1.4.2). Each
+    // case connects in a child under a hard limit, so a regression fails here instead of hanging.
+    describeIf(MISSING_POSIX_SPECIAL_FILES, "a FIFO", () => {
+      const sqliteModule = join(REPO_ROOT, "src/lib/db/providers/sql/sqlite.ts");
+
+      test.each([
+        ["the editor", "644", {}],
+        ["the editor, on a FIFO it cannot write and would open read-only", "444", {}],
+        ["the agent read-only profile", "644", { readOnly: true }],
+      ] as const)(
+        "%s refuses it at once, naming the path, and leaves no file beside it",
+        async (_who, mode, execution) => {
+          const fifo = join(specialDir, "nobody-writes.db");
+          makeFifo(fifo, mode);
+          const outcome = await connectInChild(
+            sqliteModule,
+            "SQLiteProvider",
+            { id: "fifo", name: "fifo", type: "sqlite", database: fifo },
+            execution,
+          );
+          expect(outcome).toEqual({
+            report: {
+              connected: false,
+              error: "ConnectionError",
+              message: `Failed to open SQLite database: ${fifo} is a named pipe (FIFO), not a regular file`,
+            },
+            failure: null,
+          });
+          expect(readdirSync(specialDir)).toEqual(["nobody-writes.db"]);
+          expect(statSync(fifo).isFIFO()).toBe(true);
+        },
+        CHILD_TEST_TIMEOUT_MS,
+      );
+
+      // SQLite opens a `-journal` beside the database read-only to see whether it is hot, and that open of
+      // a FIFO never returned, in the worker and in-process alike. A FIFO `-wal` or `-shm` let the connect
+      // through, and the first write then failed with "disk I/O error" (measured on bun 1.4.2).
+      test.each([
+        ["the editor", "-journal", {}],
+        ["the editor", "-wal", {}],
+        ["the editor", "-shm", {}],
+        ["the agent read-only profile", "-journal", { readOnly: true }],
+      ] as const)(
+        "%s refuses a FIFO at the database's %s at once, naming it",
+        async (_who, suffix, execution) => {
+          const dbPath = join(specialDir, "beside-a-fifo.db");
+          const seed = new BunDatabase(dbPath, { create: true });
+          seed.exec("PRAGMA journal_mode = DELETE; CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);");
+          seed.close();
+          makeFifo(`${dbPath}${suffix}`);
+          const outcome = await connectInChild(
+            sqliteModule,
+            "SQLiteProvider",
+            { id: "fifo", name: "fifo", type: "sqlite", database: dbPath },
+            execution,
+          );
+          expect(outcome).toEqual({
+            report: {
+              connected: false,
+              error: "ConnectionError",
+              message: `Failed to open SQLite database: ${dbPath}${suffix} is a named pipe (FIFO), not a regular file`,
+            },
+            failure: null,
+          });
+          expect(readdirSync(specialDir).sort()).toEqual(["beside-a-fifo.db", `beside-a-fifo.db${suffix}`]);
+        },
+        CHILD_TEST_TIMEOUT_MS,
+      );
+
+      // A worker that a cancel or a deadline killed is started again on the same path, which may have been
+      // replaced since connect() checked it. On a FIFO the agent's restarted read-only open never returned,
+      // and the statement waiting on it never answered; the editor's answered "disk I/O error" (measured on
+      // bun 1.4.2). The child runs the worker, which is what restarts.
+      test.each([
+        ["the editor", {}],
+        ["the agent read-only profile", { readOnly: true }],
+      ] as const)(
+        "%s checks the path again when it restarts a killed worker, refusing a FIFO renamed onto it",
+        async (_who, execution) => {
+          const dbPath = join(specialDir, "replaced.db");
+          const seed = new BunDatabase(dbPath, { create: true });
+          seed.exec("CREATE TABLE t (a INTEGER)");
+          seed.close();
+          const fifo = join(specialDir, "stand-in");
+          makeFifo(fifo);
+          const outcome = await runInChild(
+            [
+              "delete process.env.LIBREDB_SQLITE_DRIVER;",
+              'process.env.LIBREDB_SQLITE_WORKER = "1";',
+              'const fs = await import("node:fs");',
+              `const { SQLiteProvider: Provider } = await import(${JSON.stringify(sqliteModule)});`,
+              `const provider = new Provider(${JSON.stringify({ id: "r", name: "r", type: "sqlite", database: dbPath })}, {}, ${JSON.stringify(execution)});`,
+              "await provider.connect();",
+              `fs.renameSync(${JSON.stringify(fifo)}, ${JSON.stringify(dbPath)});`,
+              "provider.worker.terminate();",
+              "try {",
+              '  await provider.query("SELECT 1 AS one");',
+              "  report({ answered: true });",
+              "} catch (error) {",
+              "  report({ answered: false, error: error.constructor.name, message: error.message });",
+              "}",
+            ].join("\n"),
+          );
+          expect(outcome).toEqual({
+            report: {
+              answered: false,
+              error: "ConnectionError",
+              message: `Failed to open SQLite database: ${dbPath} is a named pipe (FIFO), not a regular file`,
+            },
+            failure: null,
+          });
+        },
+        CHILD_TEST_TIMEOUT_MS,
+      );
     });
   });
 
@@ -241,21 +526,22 @@ describe("SQLiteProvider", () => {
       expect(select.rows).toEqual([{ id: 1, name: "Ann" }]);
     });
 
-    test("SELECT with no matching rows returns empty rows and fields", async () => {
+    test("SELECT with no matching rows returns no rows and still names its columns", async () => {
       provider = new SQLiteProvider(makeSQLiteConfig());
       await provider.connect();
 
       await provider.query("CREATE TABLE empty_result (id INTEGER PRIMARY KEY)");
       const result = await provider.query("SELECT * FROM empty_result WHERE id = 999");
       expect(result.rows).toEqual([]);
-      expect(result.fields).toEqual([]);
+      expect(result.fields).toEqual(["id"]);
       expect(result.rowCount).toBe(0);
     });
 
-    // The provider picks `all()` vs `run()` from `isReadOnlyQuery`, so a SELECT
-    // misread as a write used to come back with no rows and `changes: 0` - the
-    // same comment-blind classification as the missing LIMIT in #275, with a
-    // worse symptom: the user sees an empty grid for a query that has data.
+    // The provider used to pick `all()` vs `run()` from `isReadOnlyQuery`, so a SELECT
+    // misread as a write came back with no rows and `changes: 0` - the same
+    // comment-blind classification as the missing LIMIT in #275, with a worse
+    // symptom: the user sees an empty grid for a query that has data. It now asks
+    // the driver for the result column count, which no comment can hide.
     test("a comment-led SELECT returns its rows instead of an empty write result", async () => {
       provider = new SQLiteProvider(makeSQLiteConfig());
       await provider.connect();
@@ -276,6 +562,52 @@ describe("SQLiteProvider", () => {
       await provider.connect();
 
       await expect(provider.query("SELECT * FROM missing_table")).rejects.toThrow("no such table");
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // A transaction left open on the handle (D71)
+  // --------------------------------------------------------------------------
+
+  describe("endOpenQueryTransaction()", () => {
+    test("rolls back a transaction a statement left open on this handle", async () => {
+      provider = new SQLiteProvider(makeSQLiteConfig());
+      await provider.connect();
+      await provider.query("CREATE TABLE t (id INTEGER)");
+
+      await provider.query("BEGIN");
+      await provider.query("INSERT INTO t VALUES (1)");
+
+      expect(await provider.endOpenQueryTransaction()).toBe("rolled-back");
+
+      const after = await provider.query("SELECT count(*) AS n FROM t");
+      expect((after.rows[0] as Record<string, unknown>).n).toBe(0);
+    });
+
+    test("answers none when no transaction is open, instead of raising", async () => {
+      // The reason the route cannot simply issue ROLLBACK. Measured on
+      // bun:sqlite 1.4.2: a ROLLBACK with no transaction active throws
+      // "cannot rollback - no transaction is active", so an unconditional
+      // rollback would report an error on every script that ended cleanly.
+      provider = new SQLiteProvider(makeSQLiteConfig());
+      await provider.connect();
+
+      expect(await provider.endOpenQueryTransaction()).toBe("none");
+      await expect(provider.query("ROLLBACK")).rejects.toThrow("cannot rollback - no transaction is active");
+    });
+
+    test("leaves a committed transaction alone", async () => {
+      provider = new SQLiteProvider(makeSQLiteConfig());
+      await provider.connect();
+      await provider.query("CREATE TABLE t (id INTEGER)");
+
+      await provider.query("BEGIN");
+      await provider.query("INSERT INTO t VALUES (1)");
+      await provider.query("COMMIT");
+
+      expect(await provider.endOpenQueryTransaction()).toBe("none");
+      const after = await provider.query("SELECT count(*) AS n FROM t");
+      expect((after.rows[0] as Record<string, unknown>).n).toBe(1);
     });
   });
 
@@ -311,10 +643,16 @@ describe("SQLiteProvider", () => {
       // `UPDATE t SET c = v WHERE pk = v` is core SQLite DML — the shape the inline
       // row editor builds (#269).
       expect(caps.supportsInlineRowEdit).toBe(true);
+      expect(caps.supportsTestDataGeneration).toBe(true);
+      // `LIMIT n OFFSET m` from the shared limiter (#816).
+      expect(caps.supportsResultPagination).toBe(true);
       // False although SQLite HAS transactions: this provider holds no session for
       // one, so POST /api/db/transaction refuses the call and the controls must not
       // be offered (#464). The flag describes the provider's surface, not the engine.
       expect(caps.supportsTransactions).toBe(false);
+      // Both drivers are synchronous, so a running statement holds the server's thread and
+      // the editor disables Cancel rather than offering "Stop waiting" (#1364).
+      expect(caps.blocksServerWhileRunning).toBe(true);
       // Inherited from the base capabilities: this engine declares foreign keys, so
       // an empty `foreignKeys` list is a fact about the schema or the role, never
       // about the engine (#414).
@@ -324,74 +662,17 @@ describe("SQLiteProvider", () => {
       expect(caps.maintenanceOperations).toContain("reindex");
       expect(caps.maintenanceOperations).toContain("check");
     });
+
+    // The Create Table form writes SQLite's own grammar, read off the driver-free module (#1822):
+    // the measured reasons are in docs/providers/sqlite.md, "Create Table form".
+    test("declares the SQLite create-table grammar, the module's own object", () => {
+      expect(new SQLiteProvider(makeSQLiteConfig()).getCapabilities().createTable).toBe(SQLITE_CREATE_TABLE);
+    });
   });
 
   // --------------------------------------------------------------------------
   // Schema
   // --------------------------------------------------------------------------
-
-  describe("getSchema()", () => {
-    test("returns correct schema after CREATE TABLE", async () => {
-      provider = new SQLiteProvider(makeSQLiteConfig());
-      await provider.connect();
-
-      await provider.query(`
-        CREATE TABLE users (
-          id INTEGER PRIMARY KEY,
-          name TEXT NOT NULL,
-          email TEXT,
-          created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-      `);
-      await provider.query("CREATE INDEX idx_users_email ON users(email)");
-
-      const schema = await provider.getSchema();
-      expect(schema.length).toBe(1);
-
-      const table = schema[0];
-      expect(table.name).toBe("users");
-      expect(table.columns.length).toBe(4);
-
-      // Check column properties
-      const idCol = table.columns.find((c) => c.name === "id")!;
-      expect(idCol.type).toBe("INTEGER");
-      expect(idCol.isPrimary).toBe(true);
-
-      const nameCol = table.columns.find((c) => c.name === "name")!;
-      expect(nameCol.nullable).toBe(false);
-
-      const emailCol = table.columns.find((c) => c.name === "email")!;
-      expect(emailCol.nullable).toBe(true);
-
-      // Check indexes
-      expect(table.indexes.length).toBeGreaterThanOrEqual(1);
-      const emailIdx = table.indexes.find((i) => i.name === "idx_users_email");
-      expect(emailIdx).toBeDefined();
-      expect(emailIdx!.columns).toContain("email");
-    });
-
-    test("schema includes foreign keys", async () => {
-      provider = new SQLiteProvider(makeSQLiteConfig());
-      await provider.connect();
-
-      await provider.query("CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)");
-      await provider.query(`
-        CREATE TABLE books (
-          id INTEGER PRIMARY KEY,
-          title TEXT,
-          author_id INTEGER REFERENCES authors(id)
-        )
-      `);
-
-      const schema = await provider.getSchema();
-      const books = schema.find((t) => t.name === "books")!;
-      expect(books.foreignKeys).toBeDefined();
-      expect(books.foreignKeys!.length).toBe(1);
-      expect(books.foreignKeys![0].columnName).toBe("author_id");
-      expect(books.foreignKeys![0].referencedTable).toBe("authors");
-      expect(books.foreignKeys![0].referencedColumn).toBe("id");
-    });
-  });
 
   // --------------------------------------------------------------------------
   // Health
@@ -499,6 +780,19 @@ describe("SQLiteProvider", () => {
       expect(tables.rows.length).toBe(1);
     });
 
+    test("a container changes nothing here, because the file has no second namespace", async () => {
+      // #772: SQLite always resolves against the attached `main`, so the container is
+      // deliberately ignored rather than becoming a qualifier that cannot exist.
+      provider = new SQLiteProvider(makeSQLiteConfig());
+      await provider.connect();
+      await provider.query("CREATE TABLE mt (id INTEGER PRIMARY KEY, v TEXT)");
+
+      const result = await provider.runMaintenance("analyze", "mt", "main");
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain("ANALYZE");
+    });
+
     test("reindex does not execute a statement smuggled through the target identifier", async () => {
       provider = new SQLiteProvider(makeSQLiteConfig());
       await provider.connect();
@@ -534,6 +828,80 @@ describe("SQLiteProvider", () => {
       expect(typeof overview.databaseSizeBytes).toBe("number");
       expect(overview.activeConnections).toBe(1);
       expect(overview.maxConnections).toBe(1);
+    });
+
+    // Review on #1050: `result?.size || 0` cannot tell a measured zero apart from
+    // `sizeStmt.get()` answering no row, or a row whose `size` came back
+    // `undefined` - `as { size: number }` casts past both rather than ruling them
+    // out. `page_count * page_size` never actually produces either in real
+    // operation, so both are reproduced here by intercepting the statement.
+    describe("a :memory: size read that answers no measurement", () => {
+      test("no row at all leaves databaseSizeBytes absent, not 0", async () => {
+        provider = new SQLiteProvider(makeSQLiteConfig());
+        await provider.connect();
+        answerReadsMatching(provider, "page_count", []);
+
+        const overview = await provider.getOverview();
+        expect(overview.databaseSizeBytes).toBeUndefined();
+        expect("databaseSizeBytes" in overview).toBe(false);
+        expect(overview.databaseSize).toBe("N/A");
+      });
+
+      test("a row whose size is undefined leaves databaseSizeBytes absent, not 0", async () => {
+        provider = new SQLiteProvider(makeSQLiteConfig());
+        await provider.connect();
+        answerReadsMatching(provider, "page_count", [{ size: undefined }]);
+
+        const overview = await provider.getOverview();
+        expect(overview.databaseSizeBytes).toBeUndefined();
+        expect("databaseSizeBytes" in overview).toBe(false);
+        expect(overview.databaseSize).toBe("N/A");
+      });
+
+      // The control: a real zero (an edge case in principle, since page_count and
+      // page_size are never actually 0 on a real :memory: handle) is a
+      // measurement and must be kept, not folded into the same absence.
+      test("a row whose size really is 0 is kept as a measurement", async () => {
+        provider = new SQLiteProvider(makeSQLiteConfig());
+        await provider.connect();
+        answerReadsMatching(provider, "page_count", [{ size: 0 }]);
+
+        const overview = await provider.getOverview();
+        expect(overview.databaseSizeBytes).toBe(0);
+        expect(overview.databaseSize).not.toBe("N/A");
+      });
+
+      // `databaseSizeBytes` used to be initialised to 0 and left there by an empty
+      // catch, so a read that never answered published a measured-looking zero
+      // indistinguishable from a genuinely empty database (#546). Since #1449 a file
+      // database is sized by this same `page_count * page_size` read, so a refused
+      // read is the one failure left, for both kinds of database. Only the size read
+      // is intercepted: the table count below is the control that the failure stays
+      // contained to the one reading it belongs to.
+      test("a size read that fails leaves databaseSizeBytes absent, not 0", async () => {
+        provider = new SQLiteProvider(makeSQLiteConfig());
+        await provider.connect();
+        await provider.query("CREATE TABLE v (id INTEGER PRIMARY KEY)");
+        failReadsMatching(provider, "page_count", "disk I/O error");
+
+        const overview = await provider.getOverview();
+        expect(overview.databaseSizeBytes).toBeUndefined();
+        expect("databaseSizeBytes" in overview).toBe(false);
+        expect(overview.databaseSize).toBe("N/A");
+        expect(overview.tableCount).toBe(1);
+      });
+
+      // Review on #1050: `getHealth()` used to report a failed size read as
+      // "Unknown" while `getOverview()` reported the same failure as "N/A" - two
+      // different sentences for the same unmeasured database. Both read the same
+      // helper and say the same thing.
+      test("getHealth reads N/A, not Unknown, when the size read fails", async () => {
+        provider = new SQLiteProvider(makeSQLiteConfig());
+        await provider.connect();
+        failReadsMatching(provider, "page_count", "disk I/O error");
+
+        expect((await provider.getHealth()).databaseSize).toBe("N/A");
+      });
     });
   });
 
@@ -708,10 +1076,14 @@ describe("SQLiteProvider", () => {
       const fakeDb = {
         exec: () => {},
         close: () => {},
+        inTransaction: false,
         prepare: (sql: string) => ({
           all: () => (sql.includes("dbstat") ? dbstat : owners),
           get: () => null,
+          values: () => [],
           run: () => ({ changes: 0 }),
+          declaredColumns: () => [],
+          returnsRows: () => true,
         }),
       };
 
@@ -729,6 +1101,7 @@ describe("SQLiteProvider", () => {
       const fakeDb = {
         exec: () => {},
         close: () => {},
+        inTransaction: false,
         prepare: () => {
           throw new Error("no such table: dbstat");
         },
@@ -845,7 +1218,7 @@ describe("SQLiteProvider", () => {
     });
 
     afterAll(() => {
-      rmSync(fileTmpDir, { recursive: true, force: true });
+      rmSync(fileTmpDir, { recursive: true });
     });
 
     test("getHealth reports the on-disk file size and passes the integrity check", async () => {
@@ -892,6 +1265,167 @@ describe("SQLiteProvider", () => {
       const wal = stats.find((s) => s.name === "WAL")!;
       expect(wal.location).toBe("storage.db-wal");
       expect(typeof wal.walSizeBytes).toBe("number");
+    });
+
+    // #1449: in WAL journal mode a write lands in the `-wal` file and reaches the main
+    // file only at a checkpoint. The database size used to be the main file alone, while
+    // `dbstat` and `page_count` read through the WAL, so the Storage tab drew tables and
+    // indexes at several times the database they belong to (reported as 400% and 200%,
+    // reproduced as 1000% and 900% with 1,000 rows on SQLite 3.53.0).
+    test("getOverview counts data still in the WAL, so no table or index outgrows the database (#1449)", async () => {
+      const dbPath = join(fileTmpDir, "wal-size.db");
+      provider = new SQLiteProvider(makeSQLiteConfig({ database: dbPath }));
+      await provider.connect();
+      // No checkpoint until the connection closes: the rows below stay in the -wal.
+      await provider.query("PRAGMA wal_autocheckpoint = 0");
+      await provider.query("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, email TEXT)");
+      await provider.query("CREATE INDEX idx_customers_email ON customers (email)");
+      await provider.query(
+        `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000)
+         INSERT INTO customers (name, email) SELECT 'user' || i, 'user' || i || '@example.com' FROM n`,
+      );
+
+      // The precondition, so the test cannot pass for the wrong reason: the data is in
+      // the WAL, and the main file alone is smaller than what the database holds.
+      const walBytes = statSync(`${dbPath}-wal`).size;
+      expect(walBytes).toBeGreaterThan(0);
+      const pages = (
+        await provider.query("SELECT page_count * page_size AS bytes FROM pragma_page_count(), pragma_page_size()")
+      ).rows[0] as { bytes: number };
+      expect(statSync(dbPath).size).toBeLessThan(pages.bytes);
+
+      const overview = await provider.getOverview();
+      // The pages SQLite itself counts for this database, WAL included.
+      expect(overview.databaseSizeBytes).toBe(pages.bytes);
+      // getHealth() reads the same size, so it must agree.
+      expect((await provider.getHealth()).databaseSize).toBe(overview.databaseSize);
+
+      // The acceptance criterion itself, where this SQLite build can measure it:
+      // tables plus indexes never exceed 100% of the database.
+      if (await hasDbstat(provider)) {
+        const stats = await provider.getTableStats();
+        const customers = stats.find((s) => s.tableName === "customers")!;
+        expect(customers.tableSizeBytes! + customers.indexSizeBytes!).toBeLessThanOrEqual(overview.databaseSizeBytes!);
+      }
+
+      // The WAL keeps its own row in the Storage tab.
+      const storage = await provider.getStorageStats();
+      expect(storage.find((s) => s.name === "WAL")!.sizeBytes).toBe(walBytes);
+
+      // After a checkpoint the pages are in the main file too, and the -wal is NOT
+      // truncated: main file plus -wal would count them twice (review on #1449).
+      await provider.query("PRAGMA wal_checkpoint(PASSIVE)");
+      const checkpointed = (
+        await provider.query("SELECT page_count * page_size AS bytes FROM pragma_page_count(), pragma_page_size()")
+      ).rows[0] as { bytes: number };
+      expect(statSync(`${dbPath}-wal`).size).toBeGreaterThan(0);
+      expect(statSync(dbPath).size + statSync(`${dbPath}-wal`).size).toBeGreaterThan(checkpointed.bytes);
+      expect((await provider.getOverview()).databaseSizeBytes).toBe(checkpointed.bytes);
+    });
+
+    // ── disconnect() has to RELEASE the file, not schedule its release ────────
+    //
+    // bun:sqlite's `close()` is `sqlite3_close_v2`: the connection becomes a zombie
+    // and the operating-system handle is released only once the last statement
+    // prepared from it is finalized or garbage collected. The provider prepares a
+    // statement per query and drops the reference, so on a collector's schedule that
+    // is "eventually", and `disconnect()` used to resolve with the database, its WAL
+    // and its shared-memory file still open (measured on Linux through
+    // /proc/self/fd: three descriptors survived a disconnect that reported
+    // isConnected() === false).
+    //
+    // Nothing on POSIX notices, because POSIX unlinks a file that is still open. On
+    // Windows it is the whole difference: every one of these directories failed its
+    // own teardown with `EBUSY: resource busy or locked` on windows-latest
+    // (2026-09), and a user could not delete or move a database Studio had
+    // disconnected from.
+    //
+    // Each platform is asked the strongest question it can answer. The WAL sidecars
+    // are NOT that question, though they look like it: measured on 2026-09-15 with
+    // the same probe on all three runners, `close(true)` removes `-wal` and `-shm`
+    // on Linux and on Windows, and leaves both in place on macOS, where bun:sqlite
+    // links Apple's system libsqlite3. That is the library keeping the WAL, not a
+    // handle keeping the file: opening the same database with node:sqlite and
+    // closing it removed both sidecars on that same macOS run, and removing a WAL
+    // takes the exclusive lock a surviving handle would have denied.
+    test("disconnect releases the file rather than scheduling it", async () => {
+      const dbPath = join(fileTmpDir, "release.db");
+      provider = new SQLiteProvider(makeSQLiteConfig({ database: dbPath }));
+      await provider.connect();
+      await provider.query("CREATE TABLE r (id INTEGER PRIMARY KEY, v TEXT)");
+      await provider.query("INSERT INTO r VALUES (1, 'held')");
+      expect(existsSync(`${dbPath}-wal`)).toBe(true);
+
+      await provider.disconnect();
+
+      // Windows answers by refusing: a file with a live handle cannot be renamed,
+      // and renaming is exactly what a user does to a database they think they have
+      // closed. POSIX renames an open file, so this cannot fail there.
+      const moved = `${dbPath}.moved`;
+      renameSync(dbPath, moved);
+      renameSync(moved, dbPath);
+
+      // Linux answers precisely: this is the measurement the defect was found with.
+      // /proc/self/fd is the process's own open files, so a scheduled close shows up
+      // as a descriptor still pointing into this directory.
+      if (existsSync("/proc/self/fd")) {
+        const held = readdirSync("/proc/self/fd").flatMap((fd) => {
+          try {
+            return [readlinkSync(join("/proc/self/fd", fd))];
+          } catch {
+            // The descriptor closed between the listing and the read, which is this
+            // process's own bookkeeping rather than anything about the database.
+            return [];
+          }
+        });
+        expect(held.filter((target) => target.startsWith(fileTmpDir))).toEqual([]);
+      }
+
+      // And the data survived whatever the close had to checkpoint.
+      const reader = new SQLiteProvider(makeSQLiteConfig({ database: dbPath }));
+      await reader.connect();
+      try {
+        expect((await reader.query("SELECT v FROM r")).rows).toEqual([{ v: "held" }]);
+      } finally {
+        await reader.disconnect();
+      }
+    });
+
+    // The same claim on the path nobody plans for: the connection points at a file
+    // that is not a SQLite database, which is the ordinary "wrong file in the
+    // dialog" mistake. `connect()` opens the handle before it fails, so a catch that
+    // only records the error leaves the user's own file held open: on Windows they
+    // then cannot delete or move the file they just picked by accident. Measured
+    // 2026-09-15 through /proc/self/fd, before the fix: one descriptor on notes.txt
+    // survived a connect() that had already thrown and reported isConnected() false.
+    test("a connect that fails releases the file it had already opened", async () => {
+      const notADatabase = join(fileTmpDir, "notes.txt");
+      writeFileSync(notADatabase, "these are notes, not a database\n");
+      provider = new SQLiteProvider(makeSQLiteConfig({ database: notADatabase }));
+
+      await expect(provider.connect()).rejects.toThrow();
+      expect(provider.isConnected()).toBe(false);
+      // A retry has to ask the file again rather than answer from a handle that is
+      // not there: `connect()` returns early when it still holds one, so a catch that
+      // released the file but kept the reference would make this second call resolve,
+      // silently, on a provider that is not connected.
+      await expect(provider.connect()).rejects.toThrow();
+      expect(provider.isConnected()).toBe(false);
+
+      const moved = `${notADatabase}.moved`;
+      renameSync(notADatabase, moved);
+      renameSync(moved, notADatabase);
+
+      if (existsSync("/proc/self/fd")) {
+        const held = readdirSync("/proc/self/fd").flatMap((fd) => {
+          try {
+            return [readlinkSync(join("/proc/self/fd", fd))];
+          } catch {
+            return [];
+          }
+        });
+        expect(held.filter((target) => target === notADatabase)).toEqual([]);
+      }
     });
   });
 
@@ -1030,6 +1564,1531 @@ describe("SQLiteProvider", () => {
 });
 
 // ============================================================================
+// Object surface (#789)
+//
+// SQLite is the first ZERO-CONTAINER engine in this epic: `containerLevels` is
+// `[]`, `containerDepth()` answers 0, and `listContainers()` answers `[]`. The
+// fixture below is built by DDL against a real :memory: database, so every
+// assertion is measured against the engine rather than a mock.
+// ============================================================================
+
+/**
+ * One instance of every declared kind, plus every case the reads have to survive.
+ *
+ * Built to hold all four values of `PRAGMA table_list.type` - `table`, `view`,
+ * `shadow` and `virtual` - because the vocabulary is derived from SQLite's own
+ * documentation and a rule nothing exercises is a rule nobody measured (standing
+ * ruling 5a). The FTS5 table contributes the `virtual` row and five `shadow` rows,
+ * and a naive `sqlite_schema` scan types all six as `table`.
+ *
+ * The `temp` and `attached` objects deliberately SHADOW names in `main`: a listing
+ * that did not restrict itself to `main` would answer two objects with one path,
+ * which is the invariant the conformance helper checks and the tree relies on.
+ *
+ * THE DDL IS NOT HERE ANY MORE and that is standing ruling 5i (#789). It lives in
+ * `docker/sqlite-init/01-object-fixture.sql`, which this reads and which
+ * `bun docker/sqlite-init/build-fixture.ts` replays into a database FILE a person
+ * can open in Studio. A fixture only a test can apply is a measurement nobody else
+ * can re-run; every object asserted below is created by that file.
+ */
+const OBJECT_FIXTURE_DDL: readonly string[] = readFixtureStatements();
+
+/**
+ * What `sqlite_schema.sql` holds for every object of every source-bearing kind (#789).
+ *
+ * Keyed `"<kind>/<name>"`, because `audit_log` is BOTH a table and a trigger and a key of
+ * the name alone could not hold both. Every value is a statement of
+ * `docker/sqlite-init/01-object-fixture.sql`, resolved from the file rather than typed here:
+ * the engine stores the submitted text, so a literal that drifted from the file would be a
+ * definition nobody wrote.
+ *
+ * MEASURED on SQLite 3.53.2 through `bun:sqlite`, and it is why `origin` is `stored`: the
+ * newlines and the five-space indentation of the multi-line `orders` statement come back
+ * exactly as written. The engine does normalize the `CREATE TABLE <name>` prefix and drops
+ * anything after the closing parenthesis, including a trailing comment, which is recorded in
+ * docs/providers/sqlite.md and is why neither fixture writes one.
+ */
+const EXPECTED_DEFINITIONS: Readonly<Record<string, string>> = Object.fromEntries(
+  [
+    "table/customers",
+    "table/orders",
+    "table/archive",
+    "table/audit_log",
+    "table/sqliteXledger",
+    "table/notes",
+    "view/order_summary",
+    "index/idx_orders_customer",
+    "index/idx_orders_doubled",
+    "trigger/orders_stamp",
+    "trigger/order_summary_guard",
+    "trigger/audit_log",
+  ].map((key) => [key, definitionFor(key)]),
+);
+
+/**
+ * The fixture statement that created one object, or a throw naming the key that matched none.
+ *
+ * The match is on the object's NAME as a whole word after its own keyword, so
+ * `trigger/audit_log` cannot pick up `CREATE TABLE audit_log`. A key matching zero statements
+ * or more than one raises rather than answering, because either one would silently pin the
+ * wrong text and a test asserting the wrong value is worse than no test at all.
+ */
+function definitionFor(key: string): string {
+  const [kind, name] = key.split("/");
+  const keyword = kind === "table" ? "(?:VIRTUAL TABLE|TABLE)" : kind.toUpperCase();
+  const pattern = new RegExp(`^CREATE ${keyword} ${name}\\b`);
+  const matched = readFixtureStatements().filter((statement) => pattern.test(statement));
+  if (matched.length !== 1) {
+    throw new Error(`${key} matched ${matched.length} statements of 01-object-fixture.sql, expected exactly 1`);
+  }
+  return matched[0];
+}
+
+/** Every kind, and how many of it `main` holds. Derived nowhere: counted by hand off the DDL. */
+const EXPECTED_COUNTS = { table: 6, view: 1, index: 2, trigger: 3 } as const;
+
+/**
+ * Swaps the provider's own database handle for one that intercepts a named statement.
+ *
+ * Every other assertion in this block runs against the real engine, which is how a
+ * provider test should be written; these three cases cannot be. A build without
+ * `PRAGMA table_list` is a build, not a schema, and SQLite's catalog cannot be made to
+ * answer a row whose kind reads `toString`. The handle is the smallest seam that reaches
+ * them, and everything not matched still goes to the real database, so each test keeps a
+ * live control beside the intercepted read.
+ */
+function interceptReads(provider: SQLiteProvider, match: string, intercept: (sql: string) => SQLiteStatement): void {
+  const holder = provider as unknown as { db: SQLiteDatabase };
+  const real = holder.db;
+  holder.db = {
+    exec: (sql: string) => real.exec(sql),
+    close: (throwOnError?: boolean) => real.close(throwOnError),
+    get inTransaction() {
+      return real.inTransaction;
+    },
+    prepare: (sql: string) => (sql.includes(match) ? intercept(sql) : real.prepare(sql)),
+  };
+}
+
+/** The named statement fails the way a missing catalog does: at prepare, with a message. */
+function failReadsMatching(provider: SQLiteProvider, match: string, message: string): void {
+  interceptReads(provider, match, () => {
+    throw new Error(message);
+  });
+}
+
+/** The named statement throws something that is not an Error at all. */
+function throwFromReadsMatching(provider: SQLiteProvider, match: string, thrown: string): void {
+  interceptReads(provider, match, () => {
+    throw thrown;
+  });
+}
+
+/** The named statement answers rows of the test's choosing. */
+function answerReadsMatching(provider: SQLiteProvider, match: string, rows: readonly unknown[]): void {
+  interceptReads(provider, match, () => ({
+    all: () => [...rows],
+    get: () => rows[0] ?? null,
+    values: () => [],
+    run: () => ({ changes: 0 }),
+    declaredColumns: () => [],
+    returnsRows: () => true,
+  }));
+}
+
+/**
+ * Captures the parameters a named statement is prepared with, and answers rows of the
+ * test's choosing.
+ *
+ * The binds are what a derivation test has to reach: standing ruling 5g says a two-level
+ * test that stops at a refusal proves nothing, so the statement must run and its BOUND
+ * VALUES must be read. Everything not matched still goes to the real database.
+ */
+function captureReadsMatching(
+  provider: SQLiteProvider,
+  match: string,
+  rows: readonly unknown[],
+): { statements: string[]; params: unknown[][] } {
+  const captured = { statements: [] as string[], params: [] as unknown[][] };
+  interceptReads(provider, match, (sql) => {
+    captured.statements.push(sql);
+    return {
+      all: (...params: unknown[]) => {
+        captured.params.push(params);
+        return [...rows];
+      },
+      get: () => rows[0] ?? null,
+      values: () => [],
+      run: () => ({ changes: 0 }),
+      declaredColumns: () => [],
+      returnsRows: () => true,
+    };
+  });
+  return captured;
+}
+
+/** A connected provider holding the fixture above, in memory. */
+async function connectedWithObjects(): Promise<SQLiteProvider> {
+  const opened = new SQLiteProvider(makeSQLiteConfig());
+  await opened.connect();
+  for (const statement of OBJECT_FIXTURE_DDL) await opened.query(statement);
+  return opened;
+}
+
+describe("SQLiteProvider object surface (#789)", () => {
+  let objects: SQLiteProvider;
+
+  afterEach(async () => {
+    if (objects?.isConnected()) await objects.disconnect();
+  });
+
+  test("declares the four kinds SQLite has, at zero container levels", async () => {
+    objects = await connectedWithObjects();
+    const capabilities = objects.getCapabilities();
+    const kinds = capabilities.objectKinds ?? [];
+
+    expect(kinds.map((kind) => kind.id)).toEqual(["table", "view", "index", "trigger"]);
+    expect(kinds.find((kind) => kind.id === "table")?.role).toBe("relation");
+    expect(kinds.find((kind) => kind.id === "table")?.acceptsRowWrites).toBe(true);
+    // A view is not a row-write target: SQLite refuses a write to one outright unless
+    // an INSTEAD OF trigger carries it, which is a per-OBJECT fact this per-kind
+    // declaration cannot state.
+    expect(kinds.find((kind) => kind.id === "view")?.role).toBe("relation");
+    expect(kinds.find((kind) => kind.id === "view")?.acceptsRowWrites).toBeUndefined();
+    // Declared, unlike on postgres, mysql, mssql and oracle: `sqlite_schema` models an
+    // index as a first-class named row beside its tables (standing ruling 4).
+    expect(kinds.find((kind) => kind.id === "index")?.role).toBe("config");
+    expect(kinds.find((kind) => kind.id === "trigger")?.role).toBe("attached");
+    expect(kinds.find((kind) => kind.id === "trigger")?.attachedTo).toBe("table");
+    // No routine kind of any spelling. An application-defined SQLite function is
+    // registered by the HOST PROCESS and never stored in the file, so there is nothing
+    // to list, and a kind an engine does not have is ABSENT rather than counted zero.
+    for (const absent of ["procedure", "function", "routine", "sequence", "package", "event"]) {
+      expect(kinds.find((kind) => kind.id === absent)).toBeUndefined();
+    }
+    // The headline of this task: zero container levels, which `containerDepth()` reads.
+    expect(capabilities.containerLevels).toEqual([]);
+    expect(containerDepth(capabilities)).toBe(0);
+  });
+
+  test("satisfies the object-surface conformance contract", async () => {
+    objects = await connectedWithObjects();
+
+    await assertObjectSurface(objects, {
+      // No container level, so there is no container path to name. `[]` here is the
+      // engine answering "I have none", never a refusal.
+      containers: [],
+      kinds: { ...EXPECTED_COUNTS },
+      sampleObject: { path: ["orders"], kind: "table" },
+      // No container level, so the authored path is the bare name. `emptyKinds` is absent
+      // because every source-bearing kind this engine declares is counted above zero.
+      absentSource: { path: ["no_such_table"], kind: "table" },
+    });
+  });
+
+  test("the TREE draws the kind folders at the ROOT, which nothing before this task exercised", async () => {
+    // The headline risk of the first zero-container engine, and the reason a provider
+    // test asserts a UI derivation. `flatten.ts` originally read `containerLevels?.length
+    // ?? 1`, which rendered an engine with no container level as an EMPTY TREE with no
+    // error at all - a Critical in Task 5's review. Every engine landed since has had at
+    // least one container, so this is the first time the 0 arm is driven by a real
+    // provider rather than by a hand-written declaration.
+    //
+    // Everything below comes from the PROVIDER: the kinds are its declaration, the depth
+    // is `containerDepth()` over that declaration, and the counts and objects are its own
+    // reads. Nothing about the zero case is typed in here.
+    objects = await connectedWithObjects();
+    const capabilities = objects.getCapabilities();
+    const containers = await objects.listContainers();
+    const counts = await objects.countObjects([]);
+    const tables = await objects.listObjects([], "table");
+
+    const rows = flattenTree({
+      kinds: declaredKinds(capabilities),
+      containers,
+      // The folder row id at depth 0 is the bare kind id, because the container path it
+      // hangs under is empty.
+      expanded: new Set(["table"]),
+      // Keyed by the container path joined with "/", so the root container's key is "".
+      counts: { "": counts },
+      objects: { table: tables },
+      // Nothing is described here, and that is the point of naming both fields rather than
+      // letting a default answer for them. `readsColumns` is the STANDALONE shell's value,
+      // which is what SQLite really renders now that its `table` and `view` declare
+      // `hasColumns`; `details` is empty because `expanded` holds only the folder id, so no
+      // object row is open and no column row can be emitted. This assertion is about the
+      // zero-container arm and stays green either way, which is why both are spelled out
+      // instead of being tuned until it passes.
+      details: {},
+      readsColumns: true,
+      containerDepth: containerDepth(capabilities),
+    });
+
+    // No container row anywhere: the engine has no container level, so there is nothing
+    // above the folders. A tree that drew a synthetic "main" row would fail here.
+    expect(rows.filter((row) => row.kind === "container")).toEqual([]);
+
+    // The four folders ARE the top-level sibling group, in declaration order, each
+    // badged from `countObjects` rather than from a listing's length.
+    const folders = rows.filter((row) => row.kind === "folder");
+    expect(folders.map((row) => ({ id: row.id, label: row.label, depth: row.depth, badge: row.badge }))).toEqual([
+      { id: "table", label: "Tables", depth: 0, badge: "6" },
+      { id: "view", label: "Views", depth: 0, badge: "1" },
+      { id: "index", label: "Indexes", depth: 0, badge: "2" },
+      { id: "trigger", label: "Triggers", depth: 0, badge: "3" },
+    ]);
+    // ARIA position is computed per sibling group, and at depth 0 that group is the four
+    // folders and nothing else.
+    expect(folders.map((row) => `${row.posInSet}/${row.setSize}`)).toEqual(["1/4", "2/4", "3/4", "4/4"]);
+
+    // And the expanded folder really opens onto the provider's own objects, one level in.
+    const objectRows = rows.filter((row) => row.kind === "object");
+    expect(objectRows.map((row) => row.label)).toEqual([
+      "archive",
+      "audit_log",
+      "customers",
+      "notes",
+      "orders",
+      "sqliteXledger",
+    ]);
+    expect(objectRows.every((row) => row.depth === 1 && row.kindId === "table")).toBe(true);
+    expect(objectRows.map((row) => row.id)).toEqual([
+      "archive/table",
+      "audit_log/table",
+      "customers/table",
+      "notes/table",
+      "orders/table",
+      "sqliteXledger/table",
+    ]);
+  });
+
+  test("listContainers answers an empty array, which is an answer and not a refusal", async () => {
+    objects = await connectedWithObjects();
+
+    // `[]` is SQLite saying it has no container level. It must not raise, and it must not
+    // invent a `main` row to make the shape match the engines that do have a container
+    // level, such as PostgreSQL's schemas.
+    await expect(objects.listContainers()).resolves.toEqual([]);
+    // Still a catalog method: it is not answerable off a closed handle.
+    await expect(new SQLiteProvider(makeSQLiteConfig()).listContainers()).rejects.toThrow();
+  });
+
+  // --------------------------------------------------------------------------
+  // What the counts and the listings enumerate
+  // --------------------------------------------------------------------------
+
+  test("a shadow table is not an object, and a virtual table is", async () => {
+    // The whole reason `PRAGMA table_list` is read here rather than `sqlite_schema`. The
+    // FTS5 table `notes` contributes one `virtual` row and five `shadow` rows, and
+    // `sqlite_schema` types every one of the six `table`.
+    objects = await connectedWithObjects();
+
+    const naive = (await objects.query("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")).rows;
+    const listed = (await objects.listObjects([], "table")).map((object) => object.name);
+
+    // The control: the naive scan really does see the shadow tables, so the assertion
+    // below is a difference rather than an empty comparison.
+    expect(naive.map((row) => row.name)).toContain("notes_data");
+    expect(naive).toHaveLength(12);
+
+    expect(listed).toEqual(["archive", "audit_log", "customers", "notes", "orders", "sqliteXledger"]);
+    for (const shadow of ["notes_data", "notes_idx", "notes_content", "notes_docsize", "notes_config"]) {
+      expect(listed).not.toContain(shadow);
+    }
+    // `notes` itself IS listed: a user selects from a virtual table, and it accepts row
+    // writes, so dropping it with its shadows would lose a real object.
+    expect(listed).toContain("notes");
+  });
+
+  test("every value PRAGMA table_list can answer has a rule, checked against the engine", async () => {
+    // Standing ruling 5a: the vocabulary is derived from SQLite's documentation, not from
+    // a `SELECT DISTINCT` over whatever the fixture happens to hold. This guard is the
+    // other half - it fails the day the engine answers a fifth value, which would
+    // otherwise fall out of BOTH the count and the listing and be invisible in the tree.
+    //
+    // Non-vacuous by construction: the fixture is built to contain all four, and that is
+    // asserted first. A guard run against data that never holds the case it exists to
+    // catch is a guard that has never run.
+    objects = await connectedWithObjects();
+
+    const answered = (await objects.query("SELECT DISTINCT type FROM pragma_table_list ORDER BY type")).rows.map(
+      (row) => row.type,
+    );
+
+    expect(answered).toEqual(["shadow", "table", "view", "virtual"]);
+    // `shadow` is the one value with no kind, and it is dropped on purpose. The other
+    // three are covered by the two relation kinds.
+    expect(answered.filter((type) => type !== "shadow")).toEqual(["table", "view", "virtual"]);
+  });
+
+  test("the names SQLite reserves for itself are not objects", async () => {
+    objects = await connectedWithObjects();
+
+    const tables = (await objects.listObjects([], "table")).map((object) => object.name);
+    const indexes = (await objects.listObjects([], "index")).map((object) => object.name);
+
+    // Controls: each of these really is in the catalog this listing reads.
+    const raw = (await objects.query("SELECT name FROM pragma_table_list WHERE schema = 'main'")).rows.map(
+      (row) => row.name,
+    );
+    expect(raw).toContain("sqlite_schema");
+    expect(raw).toContain("sqlite_sequence");
+    const rawIndexes = (await objects.query("SELECT name FROM sqlite_schema WHERE type = 'index'")).rows.map(
+      (row) => row.name,
+    );
+    expect(rawIndexes).toContain("sqlite_autoindex_customers_1");
+
+    expect(tables).not.toContain("sqlite_schema");
+    // `sqlite_sequence` is the one an AUTOINCREMENT column adds without being asked for.
+    expect(tables).not.toContain("sqlite_sequence");
+    // And the other direction, which is what makes `ESCAPE` load-bearing rather than
+    // decoration: `sqliteXledger` is a name a user can really have, and the unescaped
+    // `LIKE 'sqlite_%'` excludes it too, because `_` matches any single character.
+    expect(tables).toContain("sqliteXledger");
+    expect(indexes).toEqual(["idx_orders_customer", "idx_orders_doubled"]);
+  });
+
+  test("temp and attached objects are not in this file, so they are not in the tree", async () => {
+    // `PRAGMA table_list` spans every attached schema AND `temp`, and the fixture puts an
+    // `orders` in all three. Without the schema restriction the table folder would answer
+    // three objects with ONE path, which is the uniqueness the tree addresses rows by.
+    objects = await connectedWithObjects();
+
+    const everywhere = (await objects.query("SELECT schema, name FROM pragma_table_list WHERE name = 'orders'")).rows;
+    // The control: all three really are visible on this handle.
+    expect(everywhere.map((row) => row.schema).sort()).toEqual(["attached", "main", "temp"]);
+
+    const counts = await objects.countObjects([]);
+    expect(counts).toEqual({
+      table: { count: EXPECTED_COUNTS.table },
+      view: { count: EXPECTED_COUNTS.view },
+      index: { count: EXPECTED_COUNTS.index },
+      trigger: { count: EXPECTED_COUNTS.trigger },
+    });
+    for (const kind of ["table", "view", "index", "trigger"]) {
+      const paths = (await objects.listObjects([], kind)).map((object) => object.path.join("/"));
+      expect(new Set(paths).size).toBe(paths.length);
+    }
+    // Named, so a regression says which schema leaked rather than only that a number moved.
+    expect((await objects.listObjects([], "index")).map((o) => o.name)).not.toContain("idx_orders_customer_temp");
+    expect((await objects.listObjects([], "trigger")).map((o) => o.name)).not.toContain("orders_stamp_attached");
+  });
+
+  test("the listing contains exactly what the count counted, for every declared kind", async () => {
+    // Standing ruling 5f from this provider's side: a badge that disagrees with its own
+    // folder is worse than either being wrong alone. The two reads go to different
+    // statements, so this is a real cross-check rather than a restatement.
+    objects = await connectedWithObjects();
+    const counts = await objects.countObjects([]);
+
+    for (const kind of declaredKinds(objects.getCapabilities())) {
+      const count = counts[kind.id];
+      expect(isCountUnavailable(count)).toBe(false);
+      const listed = await objects.listObjects([], kind.id);
+      expect({ kind: kind.id, n: listed.length }).toEqual({
+        kind: kind.id,
+        n: isCountUnavailable(count) ? -1 : count.count,
+      });
+    }
+  });
+
+  test("a trigger nests under the object it fires on, view or table", async () => {
+    objects = await connectedWithObjects();
+
+    const triggers = await objects.listObjects([], "trigger");
+
+    // Sorted by PATH, so a trigger sits under its parent's name. The INSTEAD OF trigger's
+    // parent is a VIEW, which the `attachedTo: "table"` declaration does not forbid and
+    // which the count includes, so the listing has to as well.
+    expect(triggers.map((trigger) => trigger.path)).toEqual([
+      // The name collision the source read needs: a trigger may share a name with the table
+      // it fires on, which SQLite accepts and which no other kind here can do.
+      ["audit_log", "audit_log"],
+      ["order_summary", "order_summary_guard"],
+      ["orders", "orders_stamp"],
+    ]);
+    expect(triggers.map((trigger) => trigger.name)).toEqual(["audit_log", "order_summary_guard", "orders_stamp"]);
+    expect(triggers.every((trigger) => trigger.kind === "trigger")).toBe(true);
+  });
+
+  test("a listing is sorted by path, and by segments rather than by one joined string", async () => {
+    objects = await connectedWithObjects();
+
+    const tables = await objects.listObjects([], "table");
+
+    // Neither catalog answers in name order: `PRAGMA table_list` walks its own hash.
+    const raw = (
+      await objects.query(
+        "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type IN ('table','virtual') AND name NOT LIKE 'sqlite@_%' ESCAPE '@'",
+      )
+    ).rows.map((row) => row.name);
+    expect(raw).not.toEqual([...raw].sort());
+
+    expect(tables.map((table) => table.name)).toEqual([
+      "archive",
+      "audit_log",
+      "customers",
+      "notes",
+      "orders",
+      "sqliteXledger",
+    ]);
+  });
+
+  // --------------------------------------------------------------------------
+  // describeObject
+  // --------------------------------------------------------------------------
+
+  test("describes a table from `main` even when temp holds a different table of that name", async () => {
+    // The measurement behind MAIN_SCHEMA. A one-argument `pragma_table_info('orders')`
+    // answers about the TEMP table, which has one column; the schema-bound read answers
+    // about the file, which has five. Both are non-empty, so a read that lost the schema
+    // would not raise - it would quietly describe a different object.
+    objects = await connectedWithObjects();
+
+    const shadow = (await objects.query("SELECT name FROM pragma_table_info('orders')")).rows.map((row) => row.name);
+    expect(shadow).toEqual(["id"]);
+
+    const described = await objects.describeObject(["orders"], "table");
+    expect(described.columns.map((column) => column.name)).toHaveLength(5);
+  });
+
+  test("describes a view, which has columns and neither indexes nor foreign keys", async () => {
+    objects = await connectedWithObjects();
+
+    const view = await objects.describeObject(["order_summary"], "view");
+
+    expect(view.columns.map((column) => column.name)).toEqual(["id", "total"]);
+    expect(view.indexes).toEqual([]);
+    expect(view.foreignKeys).toEqual([]);
+  });
+
+  test("a virtual table describes its declared columns and not the module's own", async () => {
+    // `table_xinfo` publishes an FTS5 table's interface columns `notes` and `rank` at
+    // hidden = 1. They are the module's handles rather than columns the table declares,
+    // and the `hidden <> 1` filter is what keeps them out while keeping generated
+    // columns in.
+    objects = await connectedWithObjects();
+
+    const raw = (await objects.query("SELECT name, hidden FROM pragma_table_xinfo('notes', 'main')")).rows;
+    expect(raw.map((row) => row.name)).toEqual(["body", "notes", "rank"]);
+
+    const notes = await objects.describeObject(["notes"], "table");
+    expect(notes.columns.map((column) => column.name)).toEqual(["body"]);
+  });
+
+  test("a table's indexes exclude the implicit ones, and an expression key has no column name", async () => {
+    objects = await connectedWithObjects();
+
+    const orders = await objects.describeObject(["orders"], "table");
+
+    // BY NAME, which is this read's own `ORDER BY` and not `pragma_index_list`'s: measured,
+    // that pragma answers in reverse creation order, so it would put `idx_orders_doubled`
+    // first. The bulk read has to order by the object to group its rows, and two different
+    // orders over one table's indexes is a disagreement between the two surfaces (#789).
+    expect(orders.indexes).toEqual([
+      { name: "idx_orders_customer", columns: ["customer_id"], unique: false },
+      // The expression index keys `total * 2`, which publishes a null column name, so it
+      // carries no columns rather than a fabricated label.
+      { name: "idx_orders_doubled", columns: [], unique: false },
+    ]);
+    // The control for the null filter: SQLite really does answer a null name here.
+    const keys = (await objects.query("SELECT name FROM pragma_index_info('idx_orders_doubled', 'main')")).rows;
+    expect(keys).toEqual([{ name: null }]);
+
+    // An implicit `sqlite_autoindex_*` serves a UNIQUE constraint, cannot be dropped, and
+    // is not in the Indexes folder either, so the two surfaces agree about what an index is.
+    const customers = await objects.describeObject(["customers"], "table");
+    expect(customers.indexes).toEqual([]);
+    const raw = (await objects.query("SELECT name FROM pragma_index_list('customers', 'main')")).rows;
+    expect(raw).toEqual([{ name: "sqlite_autoindex_customers_1" }]);
+  });
+
+  test("a foreign key that names no column resolves to the parent's primary key", async () => {
+    objects = await connectedWithObjects();
+
+    const orders = await objects.describeObject(["orders"], "table");
+
+    // The control: SQLite publishes a null for the implicit one, so this is a resolution
+    // rather than a pass-through.
+    const raw = (await objects.query("SELECT \"from\", \"to\" FROM pragma_foreign_key_list('orders', 'main')")).rows;
+    expect(raw).toContainEqual({ from: "customer_id", to: null });
+
+    expect(orders.foreignKeys).toEqual([
+      { columnName: "customer_email", referencedTable: "customers", referencedColumn: "email" },
+      { columnName: "customer_id", referencedTable: "customers", referencedColumn: "id" },
+    ]);
+  });
+
+  test("a foreign key whose parent has no primary key carries no referenced column", async () => {
+    // SQLite accepts this schema and rejects it only on INSERT ("foreign key mismatch"),
+    // so `pragma_table_info` answers no key column to resolve. `ForeignKeySchema` carries
+    // a string, and the empty one says there is nothing to name.
+    objects = new SQLiteProvider(makeSQLiteConfig());
+    await objects.connect();
+    await objects.query("CREATE TABLE no_pk (x INTEGER, y INTEGER)");
+    await objects.query("CREATE TABLE broken_ref (a INTEGER REFERENCES no_pk)");
+
+    const detail = await objects.describeObject(["broken_ref"], "table");
+
+    expect(detail.foreignKeys).toEqual([{ columnName: "a", referencedTable: "no_pk", referencedColumn: "" }]);
+  });
+
+  test("an index and a trigger describe as three empty arrays, without a round trip", async () => {
+    objects = await connectedWithObjects();
+
+    // A true fact about those kinds rather than a failed read: `pragma_table_xinfo`
+    // answers nothing for either name, which is the control below.
+    for (const name of ["idx_orders_customer", "orders_stamp"]) {
+      expect((await objects.query(`SELECT name FROM pragma_table_xinfo('${name}', 'main')`)).rows).toEqual([]);
+    }
+
+    expect(await objects.describeObject(["idx_orders_customer"], "index")).toEqual({
+      path: ["idx_orders_customer"],
+      columns: [],
+      indexes: [],
+      foreignKeys: [],
+    });
+    expect(await objects.describeObject(["orders", "orders_stamp"], "trigger")).toEqual({
+      path: ["orders", "orders_stamp"],
+      columns: [],
+      indexes: [],
+      foreignKeys: [],
+    });
+  });
+
+  test("declares hasColumns on the two relation kinds, and the engine answers both ways", async () => {
+    // The declaration the object tree draws a twisty from (#789), pinned against this
+    // engine's own answer rather than against the design's table. The two coincide with
+    // `role === "relation"` HERE and that is a coincidence, not the rule: `describeObject`
+    // gates on the role only because `pragma_table_xinfo` answers zero rows for an index
+    // and for a trigger name, measured in the test above.
+    objects = await connectedWithObjects();
+    const kinds = declaredKinds(objects.getCapabilities());
+
+    expect(kinds.filter((kind) => kindHasColumns(kind)).map((kind) => kind.id)).toEqual(["table", "view"]);
+    // Absent rather than `false`: an abstaining kind declares nothing at all, so a kind
+    // that later grows columns cannot be missed by a reader looking only for the field.
+    for (const abstainer of ["index", "trigger"]) {
+      expect(kinds.find((kind) => kind.id === abstainer)?.hasColumns).toBeUndefined();
+    }
+
+    for (const [path, kind] of [
+      [["orders"], "table"],
+      [["order_summary"], "view"],
+    ] as const) {
+      const detail = await objects.describeObject(path, kind);
+      expect(detail.columns.length).toBeGreaterThan(0);
+      // Both fields, and the name check is not cosmetic: the tree feeds `column.name` to
+      // `pathKey`, which calls `segment.replaceAll(...)`, so a non-string name throws
+      // inside the walk and unmounts the whole tree instead of failing one row.
+      for (const column of detail.columns) {
+        expect(typeof column.name).toBe("string");
+        expect(column.name.trim()).not.toBe("");
+        expect(typeof column.type).toBe("string");
+        expect(column.type.trim()).not.toBe("");
+      }
+    }
+
+    // The other direction, which is what keeps the declaration from being a one-way claim:
+    // a kind that declares nothing is a leaf in the tree, so it must answer no column.
+    expect((await objects.describeObject(["idx_orders_customer"], "index")).columns).toEqual([]);
+    expect((await objects.describeObject(["orders", "orders_stamp"], "trigger")).columns).toEqual([]);
+  });
+
+  test("an object that is not there is a failed read and says so", async () => {
+    objects = await connectedWithObjects();
+
+    // Zero columns cannot mean an empty table: SQLite refuses `CREATE TABLE t()`, so an
+    // empty answer means nothing of that name is in `main`. The temp and attached
+    // `orders` are reachable on this handle and deliberately do not rescue this.
+    await expect(objects.describeObject(["no_such_table"], "table")).rejects.toThrow(
+      /No SQLite table named no_such_table in main/,
+    );
+  });
+
+  // --------------------------------------------------------------------------
+  // Refusals and the declaration
+  // --------------------------------------------------------------------------
+
+  test("a kind the file holds none of still draws its folder, badged zero", async () => {
+    // The three states of `KindCount` are three different facts. Building the record from
+    // the GROUP BY rows alone would leave an empty kind OUT, and an absent kind already
+    // means something stronger: the engine has no such concept, so the tree draws no
+    // folder. Seeding is what keeps "SQLite has views and this file has none" renderable.
+    objects = new SQLiteProvider(makeSQLiteConfig());
+    await objects.connect();
+    await objects.query("CREATE TABLE only_a_table (id INTEGER PRIMARY KEY)");
+
+    const counts = await objects.countObjects([]);
+
+    expect(counts).toEqual({
+      table: { count: 1 },
+      view: { count: 0 },
+      index: { count: 0 },
+      trigger: { count: 0 },
+    });
+    // Every declared kind is present, which is what stops a folder vanishing from the tree.
+    expect(Object.keys(counts).sort()).toEqual(
+      declaredKinds(objects.getCapabilities())
+        .map((kind) => kind.id)
+        .sort(),
+    );
+  });
+
+  test("a kind SQLite does not declare is refused by name, in both methods", async () => {
+    objects = await connectedWithObjects();
+
+    await expect(objects.listObjects([], "procedure")).rejects.toThrow(/declares no object kind "procedure"/);
+    await expect(objects.describeObject(["x"], "sequence")).rejects.toThrow(/declares no object kind "sequence"/);
+  });
+
+  test("a kind that is declared but has no listing statement says so, not that it is undeclared", async () => {
+    // Two questions, and only the declaration answers the first. Deciding "declared" from
+    // whether a statement exists would report "declares no object kind" about a kind
+    // `objectKinds` does declare, which is a different defect with the same symptom.
+    objects = await connectedWithObjects();
+    const real = objects.getCapabilities();
+    spyOn(objects, "getCapabilities").mockReturnValue({
+      ...real,
+      objectKinds: [...(real.objectKinds ?? []), { id: "tablespace", role: "config", label: "T", labelPlural: "Ts" }],
+    });
+
+    await expect(objects.listObjects([], "tablespace")).rejects.toThrow(
+      /declares the kind "tablespace" but has no statement that lists it/,
+    );
+  });
+
+  test("a container path of another engine's shape is refused rather than read", async () => {
+    objects = await connectedWithObjects();
+
+    // The message names the shape the DECLARATION describes, which here is no shape at all.
+    for (const call of [objects.countObjects(["main"]), objects.listObjects(["main"], "table")]) {
+      await expect(call).rejects.toThrow(/A SQLite container path is empty, received \["main"\]/);
+    }
+    await expect(objects.describeObject(["main", "orders"], "table")).rejects.toThrow(
+      /A SQLite "table" path is \[name\], received \["main","orders"\]/,
+    );
+    await expect(objects.describeObject(["orders_stamp"], "trigger")).rejects.toThrow(
+      /A SQLite "trigger" path is \[table, name\], received \["orders_stamp"\]/,
+    );
+  });
+
+  test("the container depth, the object path and the name bind are DERIVED, which a two-level declaration shows", async () => {
+    // Standing ruling 5g, and on a ZERO-container engine this test is the only thing that
+    // can tell a derivation from a literal: `container.length !== 0` and `path[0]` for the
+    // object name are behaviour-identical to the derived forms at depth 0, which is
+    // exactly why the same defect has now shipped three times, each instance found one
+    // review later than the last. The declaration below is synthetic for SQLite; the
+    // derivations under test are the shared ones every provider copies.
+    //
+    // It is driven all the way to a BOUND VALUE and not to a refusal. A test that stops at
+    // the refusal is how the third instance survived two providers and a review round.
+    objects = await connectedWithObjects();
+    const real = objects.getCapabilities();
+    spyOn(objects, "getCapabilities").mockReturnValue({
+      ...real,
+      containerLevels: [
+        { id: "catalog", label: "Catalog", labelPlural: "Catalogs" },
+        { id: "schema", label: "Database", labelPlural: "Databases" },
+      ],
+    });
+
+    // The refusal half. The depth comes from `containerDepth()`, so the EMPTY container
+    // path - the only one this engine really accepts - is now wrong, and the message names
+    // both declared levels. A hardcoded `!== 0` would accept it.
+    await expect(objects.countObjects([])).rejects.toThrow(
+      /A SQLite container path is \[catalog, database\], received \[\]/,
+    );
+    await expect(objects.listObjects([], "table")).rejects.toThrow(
+      /A SQLite container path is \[catalog, database\], received \[\]/,
+    );
+    await expect(objects.describeObject(["orders"], "table")).rejects.toThrow(
+      /A SQLite "table" path is \[catalog, database, name\], received \["orders"\]/,
+    );
+    await expect(objects.describeObject(["cat", "sch", "orders", "orders_stamp"], "table")).rejects.toThrow(
+      /A SQLite "table" path is \[catalog, database, name\]/,
+    );
+
+    // The bound-value half, which a refusal-only test cannot see.
+    //
+    // A two-segment container is now the valid one, and the reads still answer.
+    expect(await objects.countObjects(["cat", "sch"])).toEqual({
+      table: { count: EXPECTED_COUNTS.table },
+      view: { count: EXPECTED_COUNTS.view },
+      index: { count: EXPECTED_COUNTS.index },
+      trigger: { count: EXPECTED_COUNTS.trigger },
+    });
+
+    // Every listed path starts with the container it was asked for, because `objectPath`
+    // prefixes the container rather than knowing this engine's depth. A `[row.name]`
+    // literal would answer `["orders"]` here and break the tree's addressing.
+    const tables = await objects.listObjects(["cat", "sch"], "table");
+    expect(tables.map((table) => table.path)).toContainEqual(["cat", "sch", "orders"]);
+    const triggers = await objects.listObjects(["cat", "sch"], "trigger");
+    expect(triggers.map((trigger) => trigger.path)).toEqual([
+      ["cat", "sch", "audit_log", "audit_log"],
+      ["cat", "sch", "order_summary", "order_summary_guard"],
+      ["cat", "sch", "orders", "orders_stamp"],
+    ]);
+
+    // AND THE BIND. `path[path.length - 1]` is `orders` at this depth and `path[0]` is the
+    // CATALOG, `path[1]` the schema. Both literals are depth-identical at 0, so only this
+    // declaration can tell them apart: binding either would ask `pragma_table_xinfo` for
+    // an object called `cat` or `sch`, which answers nothing and raises by name.
+    const detail = await objects.describeObject(["cat", "sch", "orders"], "table");
+    expect(detail.path).toEqual(["cat", "sch", "orders"]);
+    expect(detail.columns.map((column) => column.name)).toEqual([
+      "id",
+      "customer_id",
+      "customer_email",
+      "total",
+      "total_with_tax",
+    ]);
+    expect(detail.foreignKeys.map((fk) => fk.columnName).sort()).toEqual(["customer_email", "customer_id"]);
+    expect((Array.isArray(detail.indexes) ? detail.indexes : []).map((index) => index.name).sort()).toEqual([
+      "idx_orders_customer",
+      "idx_orders_doubled",
+    ]);
+  });
+
+  // --------------------------------------------------------------------------
+  // A read the engine refuses
+  // --------------------------------------------------------------------------
+
+  test("a refused count carries SQLite's own sentence, for every kind at once", async () => {
+    // `PRAGMA table_list` arrived in SQLite 3.37 and a build below it answers "no such
+    // table: pragma_table_list" for the whole statement, so one failure covers all four
+    // kinds. A refused read is never 0: the two are different facts and `KindCount` is the
+    // type that keeps them apart.
+    objects = await connectedWithObjects();
+    failReadsMatching(objects, "pragma_table_list", "no such table: pragma_table_list");
+
+    const counts = await objects.countObjects([]);
+
+    expect(counts).toEqual({
+      table: { unavailable: "no such table: pragma_table_list" },
+      view: { unavailable: "no such table: pragma_table_list" },
+      index: { unavailable: "no such table: pragma_table_list" },
+      trigger: { unavailable: "no such table: pragma_table_list" },
+    });
+    // Verbatim, with no product prefix in front of the engine's words.
+    for (const count of Object.values(counts)) {
+      expect(isCountUnavailable(count) ? count.unavailable : "").not.toContain("SQLite");
+    }
+  });
+
+  test("a thrown non-Error still reaches the folder as a sentence", async () => {
+    objects = await connectedWithObjects();
+    throwFromReadsMatching(objects, "pragma_table_list", "a driver that threw a string");
+
+    const counts = await objects.countObjects([]);
+
+    expect(counts.table).toEqual({ unavailable: "a driver that threw a string" });
+  });
+
+  test("a refused LISTING raises against the statement SQLite received", async () => {
+    // A listing has no third state to report: a folder the user opened has to say why it
+    // could not be filled, so this raises where `countObjects` degrades.
+    objects = await connectedWithObjects();
+    failReadsMatching(objects, "pragma_table_list", "no such table: pragma_table_list");
+
+    // Typed, and carrying THE STATEMENT SQLITE RECEIVED rather than a bare driver error:
+    // a raw rethrow arrives as a plain Error with no provider and no query, so whoever
+    // reads the message cannot tell which of the four listings failed.
+    const refusal = await objects.listObjects([], "table").then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(refusal).toBeInstanceOf(DatabaseError);
+    expect((refusal as DatabaseError).message).toContain("no such table: pragma_table_list");
+    expect((refusal as DatabaseError).provider).toBe("sqlite");
+    expect((refusal as DatabaseError).query).toContain("pragma_table_list");
+
+    // The kinds that read `sqlite_schema` are untouched, which is the control.
+    await expect(objects.listObjects([], "index")).resolves.toHaveLength(EXPECTED_COUNTS.index);
+  });
+
+  test("a catalog row whose kind names a prototype member draws no folder", async () => {
+    // `Object.hasOwn` and not `in`, which is what makes the declared-kind guard ABSOLUTE
+    // rather than nearly so. `"toString" in counts` is true on any object literal, so the
+    // `in` spelling would write a folder for a kind the provider never declared. SQLite's
+    // own catalog cannot produce such a row, which is exactly why it is handed one here:
+    // the guard's docblock claims the declaration decides, with no exceptions.
+    objects = await connectedWithObjects();
+    answerReadsMatching(objects, "pragma_table_list", [
+      { kind: "table", n: 3 },
+      { kind: "toString", n: 9 },
+      { kind: "constructor", n: 9 },
+      { kind: "__proto__", n: 9 },
+    ]);
+
+    const counts = await objects.countObjects([]);
+
+    // The control, so this is not a test of an empty read: the declared kind DID take its
+    // count from the same rows.
+    expect(counts.table).toEqual({ count: 3 });
+    expect(Object.keys(counts).sort()).toEqual(["index", "table", "trigger", "view"]);
+  });
+});
+
+/**
+ * The Source read, against the real engine plus one intercepted case (#789 Phase 2).
+ *
+ * Everything here runs against a live `:memory:` database built from
+ * `docker/sqlite-init/01-object-fixture.sql`. The single exception is the NULL-definition
+ * case, which is UNREACHABLE through this provider by construction and is driven through the
+ * statement seam for the reason section 6 of the recipe gives: on an engine whose read is
+ * supposed never to refuse, the thing worth knowing is what the suite would do if it started.
+ */
+describe("SQLiteProvider object source (#789)", () => {
+  let objects: SQLiteProvider;
+
+  afterEach(async () => {
+    if (objects?.isConnected()) await objects.disconnect();
+  });
+
+  test("declares source on exactly the kinds that have a definition text", async () => {
+    objects = await connectedWithObjects();
+    const kinds = objects.getCapabilities().objectKinds ?? [];
+    const declared = kinds
+      .filter((kind) => kind.hasSource === true)
+      .map((kind) => [kind.id, kind.sourceLanguage] as const)
+      .sort();
+
+    // All four, because `sqlite_schema.sql` holds the submitted text for every row it has.
+    expect(declared).toEqual([
+      ["index", "sql"],
+      ["table", "sql"],
+      ["trigger", "sql"],
+      ["view", "sql"],
+    ]);
+    // The other direction, so a kind added later cannot quietly gain a Source tab. SQLite is
+    // one of the engines where this list is EMPTY, and the assertion is still the one that
+    // fails the day a fifth kind is declared without a decision about its source.
+    expect(
+      kinds
+        .filter((kind) => kind.hasSource !== true)
+        .map((kind) => kind.id)
+        .sort(),
+    ).toEqual([]);
+  });
+
+  test("reads the definition of a table and says what the text is", async () => {
+    objects = await connectedWithObjects();
+
+    const document = await objects.readObjectSource!(["orders"], "table");
+
+    expect(document.path).toEqual(["orders"]);
+    expect(document.kind).toBe("table");
+    expect(document.parts).toHaveLength(1);
+    const [part] = document.parts;
+    expect(isSourcePartUnavailable(part)).toBe(false);
+    if (isSourcePartUnavailable(part)) throw new Error("narrowing");
+    expect(part.id).toBe("definition");
+    expect(part.label).toBe("Definition");
+    expect(part.text).toContain("total_with_tax INTEGER GENERATED ALWAYS AS (total * 2) VIRTUAL");
+    expect(part.language).toBe("sql");
+    // The caption's whole job: this is the author's own bytes, not a reconstruction. The
+    // newlines and the five-space indentation of the fixture statement survive, which is what
+    // separates SQLite from every engine that rebuilds a statement out of its catalog.
+    expect(part.form).toBe("complete");
+    expect(part.origin).toBe("stored");
+    expect(part.text).toContain("\n     id INTEGER PRIMARY KEY,");
+    expect(part.truncated).toBeUndefined();
+  });
+
+  /**
+   * The per-kind READ-THE-TEXT pin, whose population comes from the DECLARATION (#789).
+   *
+   * Recipe rule 6, measured by Task 8 one wave earlier: a whole-statement pin is necessary
+   * and NOT sufficient. A wrong reply column reads as `undefined`, the provider correctly
+   * turns that into a refusal, and a refusal passes the conformance walk, the statement pin
+   * and every count assertion. On THIS engine the same defect wears a worse disguise:
+   * `sqlite_schema` has four columns and reading `s.name` instead of `s.sql` answers a
+   * non-empty STRING, so the read would not even become a refusal - it would hand a reader
+   * the object's own name as its definition. Only comparing the TEXT can see either.
+   *
+   * Three guards, so no arm of this can go vacuous:
+   *   - a declared source-bearing kind with no expectation THROWS by name;
+   *   - a listed object with no expectation THROWS by name, so the expectation cannot name
+   *     one object of a kind and leave its siblings unread;
+   *   - every expected text is resolved from the fixture FILE, so nothing here can drift
+   *     away from the DDL that created the object.
+   */
+  test("every object of every source-bearing kind reads back the DDL the fixture file wrote", async () => {
+    objects = await connectedWithObjects();
+    const capabilities = objects.getCapabilities();
+    const sourceKinds = (capabilities.objectKinds ?? []).filter((kind) => kind.hasSource === true);
+    if (sourceKinds.length === 0) throw new Error("no kind declares hasSource, so this test reads nothing");
+
+    let read = 0;
+    for (const spec of sourceKinds) {
+      const listed = await objects.listObjects([], spec.id);
+      if (listed.length === 0) throw new Error(`the fixture holds no ${spec.id}, so its source read is unexercised`);
+      const named = Object.keys(EXPECTED_DEFINITIONS).filter((key) => key.startsWith(`${spec.id}/`));
+      if (named.length === 0) throw new Error(`EXPECTED_DEFINITIONS names no ${spec.id}, so that kind is unread`);
+      for (const object of listed) {
+        const key = `${spec.id}/${object.name}`;
+        if (!Object.hasOwn(EXPECTED_DEFINITIONS, key)) {
+          throw new Error(`the fixture holds ${key} and EXPECTED_DEFINITIONS carries no text for it`);
+        }
+        const document = await objects.readObjectSource!(object.path, spec.id);
+        const [part] = document.parts;
+        if (isSourcePartUnavailable(part)) {
+          throw new Error(`${key} answered the refusal "${part.unavailable}" on an engine that has none`);
+        }
+        expect(part.text).toBe(EXPECTED_DEFINITIONS[key]);
+        read += 1;
+      }
+    }
+    // Both sides come from the fixture: the left from the declaration and the listings, the
+    // right from the expectation map. Equal means every named object was reached.
+    expect(read).toBe(Object.keys(EXPECTED_DEFINITIONS).length);
+  });
+
+  test("the statement is one text, with the type BOUND and taken from the KIND", async () => {
+    objects = await connectedWithObjects();
+    const captured = captureReadsMatching(objects, "FROM sqlite_schema AS s", [{ sql: "CREATE TABLE x (a)" }]);
+
+    await objects.readObjectSource!(["orders"], "table");
+
+    // The whole statement as a LITERAL, never the provider's own constant: importing it
+    // would move both sides of the assertion together and pin nothing (recipe rule 6).
+    expect(captured.statements).toEqual([
+      `
+      SELECT s.sql AS sql
+        FROM sqlite_schema AS s
+       WHERE s.type = ?
+         AND s.name = ?
+    `,
+    ]);
+    expect(captured.params).toEqual([["table", "orders"]]);
+  });
+
+  /**
+   * The one object either fixture holds that can tell a KIND-derived type from a name match.
+   *
+   * `audit_log` is a table AND a trigger, which SQLite accepts while it refuses an index or a
+   * view under an existing table's name (measured on SQLite 3.53.2). `SELECT sql FROM
+   * sqlite_schema WHERE name = 'audit_log'` answers two rows and the table's comes first, so
+   * dropping `type = ?` hands a reader the table's DDL under the trigger's address - a defect
+   * no statement-shape assertion can see, which is standing ruling 5a's instruction to build
+   * the fixture that would disprove the claim.
+   */
+  test("a trigger sharing a name with a table reads the TRIGGER, not the table", async () => {
+    objects = await connectedWithObjects();
+
+    const trigger = await objects.readObjectSource!(["audit_log", "audit_log"], "trigger");
+    const table = await objects.readObjectSource!(["audit_log"], "table");
+    const [triggerPart] = trigger.parts;
+    const [tablePart] = table.parts;
+    if (isSourcePartUnavailable(triggerPart) || isSourcePartUnavailable(tablePart)) throw new Error("narrowing");
+
+    expect(triggerPart.text).toBe(EXPECTED_DEFINITIONS["trigger/audit_log"]);
+    expect(tablePart.text).toBe(EXPECTED_DEFINITIONS["table/audit_log"]);
+    expect(triggerPart.text).not.toBe(tablePart.text);
+  });
+
+  test("an object that is not there RAISES, naming the segment, and never answers a refusal", async () => {
+    objects = await connectedWithObjects();
+
+    await expect(objects.readObjectSource!(["no_such_table"], "table")).rejects.toThrow(
+      /No SQLite table named no_such_table/,
+    );
+    // The kind is what decides, so a name that exists under ANOTHER kind raises too rather
+    // than quietly resolving to the row that does exist.
+    await expect(objects.readObjectSource!(["orders", "orders"], "trigger")).rejects.toThrow(
+      /No SQLite trigger named orders/,
+    );
+  });
+
+  test("a kind this engine does not declare, and a path of the wrong shape, both raise", async () => {
+    objects = await connectedWithObjects();
+
+    await expect(objects.readObjectSource!(["x"], "procedure")).rejects.toThrow(
+      /SQLite declares no object kind "procedure"/,
+    );
+    await expect(objects.readObjectSource!(["orders_stamp"], "trigger")).rejects.toThrow(
+      /A SQLite "trigger" path is \[table, name\], received \["orders_stamp"\]/,
+    );
+  });
+
+  /**
+   * The refusal this engine CANNOT produce, driven anyway.
+   *
+   * `sqlite_schema.sql` is NULL for exactly one shape, an index the engine made for itself,
+   * and the provider's `name NOT LIKE 'sqlite\_%' ESCAPE '\'` filter keeps every one of those
+   * out of the listing, so no path the tree offers can reach it. That is why
+   * docs/providers/sqlite.md states the absence of a refusal as a CANNOT rather than leaving a
+   * reader to wonder. The arm still exists, because "unreachable today" is not "cannot be
+   * written", and this is what the suite would say if the read ever started producing one: a
+   * REFUSAL part carrying a sentence, never an empty editor over a definition.
+   */
+  test("a NULL definition becomes a refusal part rather than an empty text", async () => {
+    objects = await connectedWithObjects();
+    captureReadsMatching(objects, "FROM sqlite_schema AS s", [{ sql: null }]);
+
+    const document = await objects.readObjectSource!(["orders"], "table");
+    const [part] = document.parts;
+
+    expect(isSourcePartUnavailable(part)).toBe(true);
+    if (!isSourcePartUnavailable(part)) throw new Error("narrowing");
+    expect(part.id).toBe("definition");
+    expect(part.unavailable).toContain("sqlite_schema.sql is NULL");
+    // The CAUSE is asserted, and it is asserted HERE and nowhere else: NULL is the only one of
+    // the three blank shapes for which "an index SQLite created for itself" is a true reason.
+    expect(part.unavailable).toContain("an index it created for itself");
+    // Not an empty string and not whitespace: a refusal that says nothing is not a refusal.
+    expect(part.unavailable.trim().length).toBeGreaterThan(20);
+  });
+
+  test("a whitespace-only definition is refused too, and is NOT reported as the engine's NULL", async () => {
+    objects = await connectedWithObjects();
+    captureReadsMatching(objects, "FROM sqlite_schema AS s", [{ sql: "   \n  " }]);
+
+    const [part] = (await objects.readObjectSource!(["orders"], "table")).parts;
+
+    expect(isSourcePartUnavailable(part)).toBe(true);
+    if (!isSourcePartUnavailable(part)) throw new Error("narrowing");
+    expect(part.unavailable).toContain("no non-whitespace character");
+    // The sentence must not carry a cause that is false for this shape: the row is present and
+    // the column is present, so nothing here is an index the engine made for itself.
+    expect(part.unavailable).not.toContain("an index it created for itself");
+    expect(part.unavailable).not.toContain("is NULL");
+  });
+
+  /**
+   * The three guards a correct DECLARATION cannot reach, driven through the declaration.
+   *
+   * Each one is a different way the declaration and this method can disagree, and none is
+   * reachable with the four kinds SQLite really declares: a kind that is declared and not
+   * source-bearing, a kind that declares source and forgets the Monaco id that renders it,
+   * and a kind that declares source and has no catalog type behind it. A `spyOn` on
+   * `getCapabilities` is the only seam that reaches them, and reaching them is what says
+   * the guards are live rather than covered.
+   */
+  test("a declared kind that is not source-bearing, or is under-declared, raises by name", async () => {
+    objects = await connectedWithObjects();
+    const real = objects.getCapabilities();
+    const withKind = (extra: ObjectKindSpec) =>
+      spyOn(objects, "getCapabilities").mockReturnValue({ ...real, objectKinds: [...(real.objectKinds ?? []), extra] });
+
+    const noSource = withKind({ id: "synonym", role: "config", label: "Synonym", labelPlural: "Synonyms" });
+    try {
+      await expect(objects.readObjectSource!(["x"], "synonym")).rejects.toThrow(
+        /SQLite publishes no definition text for the kind "synonym"/,
+      );
+    } finally {
+      noSource.mockRestore();
+    }
+
+    const noLanguage = withKind({
+      id: "synonym",
+      role: "config",
+      label: "Synonym",
+      labelPlural: "Synonyms",
+      hasSource: true,
+    });
+    try {
+      await expect(objects.readObjectSource!(["x"], "synonym")).rejects.toThrow(
+        /declares readable source for the kind "synonym" and no sourceLanguage/,
+      );
+    } finally {
+      noLanguage.mockRestore();
+    }
+
+    const noStatement = withKind({
+      id: "synonym",
+      role: "config",
+      label: "Synonym",
+      labelPlural: "Synonyms",
+      hasSource: true,
+      sourceLanguage: "sql",
+    });
+    try {
+      await expect(objects.readObjectSource!(["x"], "synonym")).rejects.toThrow(
+        /declares readable source for the kind "synonym" but has no catalog type that reads it/,
+      );
+    } finally {
+      noStatement.mockRestore();
+    }
+  });
+
+  /**
+   * Recipe rule 6's own failure mode, driven on the engine that has no refusal.
+   *
+   * A reply whose definition COLUMN is spelled differently reads as `undefined` rather than
+   * as an error, and a document of one refusal part passes every count and length assertion
+   * there is. Here it becomes a refusal rather than an empty text, which is the only correct
+   * answer; the per-kind text pin above is what would notice that the live read had started
+   * doing it.
+   */
+  test("a reply carrying no sql column at all becomes a refusal that names the READ, not the object", async () => {
+    objects = await connectedWithObjects();
+    captureReadsMatching(objects, "FROM sqlite_schema AS s", [{}]);
+
+    const [part] = (await objects.readObjectSource!(["orders"], "table")).parts;
+
+    expect(isSourcePartUnavailable(part)).toBe(true);
+    if (!isSourcePartUnavailable(part)) throw new Error("narrowing");
+    // This arm is the defect recipe rule 6 exists for, so its sentence has to send a reader to
+    // the statement rather than to the object. A reason claiming the engine stored NULL for an
+    // index of its own would send them to the listing filter instead, and it would be false:
+    // the row is there and the column this provider asked for is not.
+    expect(part.unavailable).toContain("no sqlite_schema.sql column at all");
+    expect(part.unavailable).not.toContain("an index it created for itself");
+  });
+
+  test("the caller's bound cuts the text and says so, and an exact answer is never marked", async () => {
+    objects = await connectedWithObjects();
+    const [whole] = (await objects.readObjectSource!(["orders"], "table")).parts;
+    if (isSourcePartUnavailable(whole)) throw new Error("narrowing");
+
+    const [cut] = (await objects.readObjectSource!(["orders"], "table", 20)).parts;
+    if (isSourcePartUnavailable(cut)) throw new Error("narrowing");
+
+    expect(whole.text.length).toBeGreaterThan(20);
+    expect(cut.text).toBe(whole.text.slice(0, 20));
+    expect(cut.truncated).toEqual({ limit: 20, reason: sourceBoundTruncationReason(20) });
+
+    const [uncut] = (await objects.readObjectSource!(["orders"], "table", whole.text.length)).parts;
+    if (isSourcePartUnavailable(uncut)) throw new Error("narrowing");
+    expect(uncut.truncated).toBeUndefined();
+  });
+
+  /**
+   * Standing ruling 5g, on a zero-level engine, driven to the BOUND VALUE (#789).
+   *
+   * A zero-level engine's own fixture cannot tell a hardcoded depth from a derived one, so the
+   * declaration is swapped for a two-level one and a three-segment path is driven all the way
+   * to the binds. Two mutations die here and nowhere else in this suite: a shape check written
+   * `path.length !== 1` refuses this path, and a name bind written `path[0]` binds "cat"
+   * instead of "obj".
+   */
+  test("derives the object name and the path shape from the DECLARATION, not from a position", async () => {
+    objects = await connectedWithObjects();
+    const spy = spyOn(objects, "getCapabilities").mockReturnValue({
+      ...objects.getCapabilities(),
+      containerLevels: [
+        { id: "catalog", label: "Database", labelPlural: "Databases" },
+        { id: "schema", label: "Schema", labelPlural: "Schemas" },
+      ],
+    });
+    try {
+      const captured = captureReadsMatching(objects, "FROM sqlite_schema AS s", [{ sql: "CREATE TABLE obj (a)" }]);
+
+      const document = await objects.readObjectSource!(["cat", "sch", "obj"], "table");
+
+      expect(captured.params).toEqual([["table", "obj"]]);
+      expect(document.path).toEqual(["cat", "sch", "obj"]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("SQLiteProvider bulk column read (#789)", () => {
+  let objects: SQLiteProvider;
+
+  afterEach(async () => {
+    if (objects?.isConnected()) await objects.disconnect();
+  });
+
+  /**
+   * Every statement the provider prepared from here on, in order.
+   *
+   * The only way to assert "no round trip at all", which is the claim a kind with no
+   * columns makes, and the only way to assert that the round trips are CONSTANT in the
+   * number of objects rather than one per object - the property this method exists for.
+   * Everything still reaches the real database, so the assertions beside the count are
+   * live answers and not a double's.
+   */
+  function recordPrepares(provider: SQLiteProvider): string[] {
+    const holder = provider as unknown as { db: SQLiteDatabase };
+    const real = holder.db;
+    const seen: string[] = [];
+    holder.db = {
+      exec: (sql: string) => real.exec(sql),
+      close: (throwOnError?: boolean) => real.close(throwOnError),
+      get inTransaction() {
+        return real.inTransaction;
+      },
+      prepare: (sql: string) => {
+        seen.push(sql);
+        return real.prepare(sql);
+      },
+    };
+    return seen;
+  }
+
+  test("describes every table in the folder, and each detail is what describeObject answers for the same object", async () => {
+    objects = await connectedWithObjects();
+
+    const batch = await objects.describeObjects([], "table");
+
+    expect(batch.truncated).toBeUndefined();
+    expect(batch.details.map((detail) => detail.path)).toEqual([
+      ["archive"],
+      ["audit_log"],
+      ["customers"],
+      ["notes"],
+      ["orders"],
+      ["sqliteXledger"],
+    ]);
+    // The two readings of the same object, compared whole. One mapper serves both, so a
+    // divergence here is the bulk read spelling a column, an index or a foreign key
+    // differently from the single read of the same table - the defect two mappers cause.
+    for (const detail of batch.details) {
+      expect(detail).toEqual(await objects.describeObject(detail.path, "table"));
+    }
+  });
+
+  test("every described path is one listObjects produced", async () => {
+    objects = await connectedWithObjects();
+
+    const listed = await objects.listObjects([], "table");
+    const batch = await objects.describeObjects([], "table");
+
+    // Both sides come from the provider; nothing here is a path this test typed.
+    expect(batch.details.map((detail) => detail.path)).toEqual(listed.map((object) => object.path));
+  });
+
+  test("a view is described from the same statements a table is", async () => {
+    objects = await connectedWithObjects();
+
+    const batch = await objects.describeObjects([], "view");
+
+    expect(batch.details).toHaveLength(1);
+    expect(batch.details[0]!.path).toEqual(["order_summary"]);
+    expect(batch.details[0]!.columns.map((column) => column.name)).toEqual(["id", "total"]);
+    // Measured: `pragma_index_list` and `pragma_foreign_key_list` both answer zero rows
+    // for a view, so the two reads happen and find nothing rather than being skipped.
+    expect(batch.details[0]!.indexes).toEqual([]);
+    expect(batch.details[0]!.foreignKeys).toEqual([]);
+  });
+
+  test("an index and a trigger answer an empty batch with no round trip at all", async () => {
+    objects = await connectedWithObjects();
+    const prepared = recordPrepares(objects);
+
+    await expect(objects.describeObjects([], "index")).resolves.toEqual({ details: [] });
+    await expect(objects.describeObjects([], "trigger")).resolves.toEqual({ details: [] });
+
+    // Not "no rows came back": no statement was sent. Neither kind has columns on this
+    // engine - measured, `pragma_table_xinfo` answers zero rows for an index name and for
+    // a trigger name - and that is a fact about the KIND, so it is answered from the
+    // declaration and never from the catalog.
+    expect(prepared).toEqual([]);
+    // The control: a kind that DOES have columns still reaches the database.
+    await objects.describeObjects([], "view");
+    expect(prepared.length).toBeGreaterThan(0);
+  });
+
+  test("an undeclared kind raises, naming the engine and the kind", async () => {
+    objects = await connectedWithObjects();
+
+    // Never an empty batch. An undeclared kind is a fact about SQLite and an empty answer
+    // would be a claim about the file.
+    await expect(objects.describeObjects([], "sequence")).rejects.toThrow(/SQLite declares no object kind "sequence"/);
+  });
+
+  test("a container path of the wrong shape raises through the declaration, not a literal depth", async () => {
+    objects = await connectedWithObjects();
+
+    await expect(objects.describeObjects(["main"], "table")).rejects.toThrow(/A SQLite container path is empty/);
+  });
+
+  test("a two-level declaration is accepted and reaches the produced path", async () => {
+    // Standing ruling 5g, driven to a VALUE and not to a refusal. SQLite declares no
+    // container level, so the hardcoded spellings this rule forbids - `container.length
+    // !== 0` here, `[row.name]` in the path builder - are behaviour-identical on the real
+    // engine and only a differently shaped declaration can tell them apart.
+    objects = await connectedWithObjects();
+    spyOn(objects, "getCapabilities").mockReturnValue({
+      ...objects.getCapabilities(),
+      containerLevels: [
+        { id: "catalog", label: "Catalog", labelPlural: "Catalogs" },
+        { id: "schema", label: "Schema", labelPlural: "Schemas" },
+      ],
+    });
+
+    const batch = await objects.describeObjects(["warehouse", "app"], "table");
+
+    // Every path carries both container segments, so the prefix is derived from the
+    // declaration rather than assumed empty.
+    expect(batch.details.map((detail) => detail.path)).toEqual([
+      ["warehouse", "app", "archive"],
+      ["warehouse", "app", "audit_log"],
+      ["warehouse", "app", "customers"],
+      ["warehouse", "app", "notes"],
+      ["warehouse", "app", "orders"],
+      ["warehouse", "app", "sqliteXledger"],
+    ]);
+    // And the shape that WAS valid a moment ago is refused, with the declared level
+    // labels in the sentence.
+    await expect(objects.describeObjects([], "table")).rejects.toThrow(
+      /A SQLite container path is \[catalog, schema\]/,
+    );
+  });
+
+  test("a limit that is not a positive whole number raises rather than clamping", async () => {
+    objects = await connectedWithObjects();
+
+    for (const limit of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await expect(objects.describeObjects([], "table", limit)).rejects.toThrow(
+        /A SQLite bulk column read limit must be a positive whole number/,
+      );
+    }
+    // Not clamped and not ignored: a 0 would answer nothing while reporting a truncation
+    // the caller never asked for.
+    expect(true).toBe(true);
+  });
+
+  test("a bound that bites reports the caller's own limit, and one that does not never reports", async () => {
+    objects = await connectedWithObjects();
+
+    const bounded = await objects.describeObjects([], "table", 2);
+    expect(bounded.details).toHaveLength(2);
+    expect(bounded.truncated?.limit).toBe(2);
+    expect(bounded.truncated?.reason.length).toBeGreaterThan(0);
+
+    // Exactly as many as the folder holds. `limit + 1` is what the statement carries, so
+    // a saturated read is told from an exact one without a second count.
+    const exact = await objects.describeObjects([], "table", EXPECTED_COUNTS.table);
+    expect(exact.details).toHaveLength(EXPECTED_COUNTS.table);
+    expect(exact.truncated).toBeUndefined();
+
+    const unbounded = await objects.describeObjects([], "table");
+    expect(unbounded.details).toHaveLength(EXPECTED_COUNTS.table);
+    expect(unbounded.truncated).toBeUndefined();
+  });
+
+  test("the bound cuts the engine's own order, and the answer is sorted by path", async () => {
+    objects = await connectedWithObjects();
+
+    const bounded = await objects.describeObjects([], "table", 3);
+
+    // `ORDER BY t.name` in the target, which on SQLite runs under BINARY, the UTF-8 byte
+    // order: measured, `pragma_table_list` answers in no useful order at all without it,
+    // so the bound would otherwise keep an arbitrary three of the six.
+    expect(bounded.details.map((detail) => detail.path)).toEqual([["archive"], ["audit_log"], ["customers"]]);
+    expect(bounded.truncated).toEqual({ limit: 3, reason: bounded.truncated!.reason });
+  });
+
+  test("the engine cuts under BINARY and the answer is sorted by path, and those are two different orders", async () => {
+    // The one probe that can tell the two apart on this engine, and it is a real
+    // disagreement rather than a contrived one. SQLite's `ORDER BY name` runs under
+    // BINARY, the UTF-8 BYTE order, where U+E000 (EE 80 80) sorts below U+1F600
+    // (F0 9F 98 80); JavaScript compares UTF-16 CODE UNITS, where the surrogate 0xD83D
+    // sorts below 0xE000. So the engine's order and `comparePaths`' order are opposite
+    // here, which is why the membership of a bounded cut is the server's and the ORDER of
+    // the answer is ours.
+    const named = new SQLiteProvider(makeSQLiteConfig());
+    await named.connect();
+    try {
+      await named.query('CREATE TABLE "\u{1F600}" (x INTEGER)');
+      await named.query('CREATE TABLE "\uE000" (x INTEGER)');
+
+      const engineOrder = (
+        await named.query(
+          "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table'" +
+            " AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name",
+        )
+      ).rows as { name: string }[];
+      expect(engineOrder.map((row) => row.name)).toEqual(["\uE000", "\u{1F600}"]);
+
+      const batch = await named.describeObjects([], "table");
+      expect(batch.details.map((detail) => detail.path)).toEqual([["\u{1F600}"], ["\uE000"]]);
+
+      // And the cut keeps the engine's first, which is the other one.
+      const bounded = await named.describeObjects([], "table", 1);
+      expect(bounded.details.map((detail) => detail.path)).toEqual([["\uE000"]]);
+      expect(bounded.truncated?.limit).toBe(1);
+    } finally {
+      await named.disconnect();
+    }
+  });
+
+  test("the round trips are constant in the number of objects", async () => {
+    objects = await connectedWithObjects();
+    const prepared = recordPrepares(objects);
+
+    const batch = await objects.describeObjects([], "table");
+
+    // Six objects, five statements: the target plus the four detail reads. The whole
+    // reason this method exists is that the caller's alternative was one describeObject
+    // per object, which is 6 x (1 column read + 1 index list + N index reads + 1 foreign
+    // key list) here.
+    expect(batch.details).toHaveLength(6);
+    expect(prepared).toHaveLength(5);
+  });
+
+  test("a generated column survives the bulk read, as it does the single one", async () => {
+    objects = await connectedWithObjects();
+
+    const batch = await objects.describeObjects([], "table");
+    const orders = batch.details.find((detail) => detail.path[0] === "orders")!;
+
+    // `pragma_table_xinfo` and not `pragma_table_info`, which DROPS a generated column in
+    // both spellings. `getSchema()` still reads `table_info` and still loses it; the bulk
+    // read inherits the object model's catalog and not the flat surface's.
+    expect(orders.columns.map((column) => column.name)).toContain("total_with_tax");
+  });
+
+  test("an expression index publishes no fabricated column name", async () => {
+    objects = await connectedWithObjects();
+
+    const batch = await objects.describeObjects([], "table");
+    const orders = batch.details.find((detail) => detail.path[0] === "orders")!;
+
+    // `idx_orders_doubled` keys `total * 2`, whose `index_info` row carries a null name.
+    // A null there is not a column of this object, so it is left out rather than rendered
+    // as a label - and the index itself still appears, with an empty column list.
+    expect(orders.indexes).toEqual([
+      { name: "idx_orders_customer", columns: ["customer_id"], unique: false },
+      { name: "idx_orders_doubled", columns: [], unique: false },
+    ]);
+  });
+
+  test("a foreign key naming no column resolves the parent's primary key", async () => {
+    objects = await connectedWithObjects();
+
+    const batch = await objects.describeObjects([], "table");
+    const orders = batch.details.find((detail) => detail.path[0] === "orders")!;
+
+    // `REFERENCES customers` with no column list answers `to = NULL`, which SQLite reads
+    // as the parent's PRIMARY KEY. `ForeignKeySchema.referencedColumn` is a string, so
+    // the alternative to resolving it is a null in a typed string field.
+    // In `pragma_foreign_key_list`'s own order, which is by its `id` and is the reverse of
+    // the declaration order: both reads carry the same `ORDER BY id, seq`.
+    expect(orders.foreignKeys).toEqual([
+      { columnName: "customer_email", referencedTable: "customers", referencedColumn: "email" },
+      { columnName: "customer_id", referencedTable: "customers", referencedColumn: "id" },
+    ]);
+  });
+});
+
+describe("comparePaths", () => {
+  // Exported for the same reason `readDbstatSizes` is: the ordering rule is shared with
+  // every other provider in #789, and the cases that separate it from `JSON.stringify`
+  // cannot arise on an engine whose paths within one kind are all the same length.
+  test("orders by segments, so a prefix sorts above what nests under it", () => {
+    // The `JSON.stringify` spelling gets this backwards: `,` (0x2C) is below `]` (0x5D),
+    // so the deeper path would sort first and a trigger would sit above its own table.
+    expect(comparePaths(["orders"], ["orders", "orders_stamp"])).toBeLessThan(0);
+    expect(comparePaths(["orders", "orders_stamp"], ["orders"])).toBeGreaterThan(0);
+    expect(comparePaths(["orders"], ["orders"])).toBe(0);
+  });
+
+  test("orders by code point, so an escaped name is not reordered by its escape", () => {
+    // `JSON.stringify(["a\\"b"])` is `["a\\\\"b"]`, whose third character is a backslash
+    // (0x5C) rather than the quote (0x22) the name actually holds.
+    expect(comparePaths(['a"b'], ["a\\b"])).toBeLessThan(0);
+    expect(comparePaths(["a", "z"], ["b", "a"])).toBeLessThan(0);
+  });
+});
+
+// ============================================================================
 // Agent read-only execution profile (#328) — bun driver, in-process
 //
 // The security boundary asserted here is the DATABASE's own read-only open,
@@ -1057,7 +3116,7 @@ describe("SQLiteProvider agent read-only execution profile (#328)", () => {
   });
 
   afterAll(() => {
-    rmSync(agentTmpDir, { recursive: true, force: true });
+    rmSync(agentTmpDir, { recursive: true });
   });
 
   afterEach(async () => {
@@ -1115,7 +3174,7 @@ describe("SQLiteProvider agent read-only execution profile (#328)", () => {
     const dbPath = await seedDatabase();
     const profile = await openAgent(dbPath);
 
-    await expect(profile.queryReadOnly("INSERT INTO t (id, v) VALUES (2, 'agent')", AGENT_BUDGET)).rejects.toThrow();
+    await engineRefusal(profile.queryReadOnly("INSERT INTO t (id, v) VALUES (2, 'agent')", AGENT_BUDGET));
 
     expect(await readBack(dbPath)).toEqual([{ id: 1, v: "seeded" }]);
   });
@@ -1124,8 +3183,8 @@ describe("SQLiteProvider agent read-only execution profile (#328)", () => {
     const dbPath = await seedDatabase();
     const profile = await openAgent(dbPath);
 
-    await expect(profile.queryReadOnly("CREATE TABLE injected (id INTEGER)", AGENT_BUDGET)).rejects.toThrow();
-    await expect(profile.queryReadOnly("DROP TABLE t", AGENT_BUDGET)).rejects.toThrow();
+    await engineRefusal(profile.queryReadOnly("CREATE TABLE injected (id INTEGER)", AGENT_BUDGET));
+    await engineRefusal(profile.queryReadOnly("DROP TABLE t", AGENT_BUDGET));
 
     const tables = await profile.queryReadOnly("SELECT name FROM sqlite_master WHERE type = 'table'", AGENT_BUDGET);
     expect(tables.rows).toEqual([{ name: "t" }]);
@@ -1173,7 +3232,7 @@ describe("SQLiteProvider agent read-only execution profile (#328)", () => {
     await profile.queryReadOnly("PRAGMA query_only = false", AGENT_BUDGET);
 
     expect((await profile.queryReadOnly("PRAGMA query_only", AGENT_BUDGET)).rows).toEqual([{ query_only: 1 }]);
-    await expect(profile.queryReadOnly("INSERT INTO t (id, v) VALUES (2, 'bypass')", AGENT_BUDGET)).rejects.toThrow();
+    await engineRefusal(profile.queryReadOnly("INSERT INTO t (id, v) VALUES (2, 'bypass')", AGENT_BUDGET));
     expect(await readBack(dbPath)).toEqual([{ id: 1, v: "seeded" }]);
   });
 
@@ -1187,7 +3246,7 @@ describe("SQLiteProvider agent read-only execution profile (#328)", () => {
     // arbitrary server path on BOTH adapters (verified). query_only is what
     // refuses it, which is why it is re-asserted per statement.
     await profile.queryReadOnly("PRAGMA query_only = false", AGENT_BUDGET);
-    await expect(profile.queryReadOnly(`VACUUM INTO '${stolen}'`, AGENT_BUDGET)).rejects.toThrow();
+    await engineRefusal(profile.queryReadOnly(`VACUUM INTO '${stolen}'`, AGENT_BUDGET));
 
     // KNOWN LIMITATION: the engine creates the target file before refusing the
     // copy, so an empty file can still appear at an agent-chosen path. What
@@ -1263,12 +3322,16 @@ describe("SQLiteProvider agent read-only execution profile (#328)", () => {
     });
     expect(rows.rowCount).toBe(3);
 
-    await expect(
-      profile.queryReadOnly("SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3", {
+    const thrown = await profile
+      .queryReadOnly("SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3", {
         ...AGENT_BUDGET,
         maxResultRows: 2,
-      }),
-    ).rejects.toThrow(QueryError);
+      })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+    expect(thrown).toBeInstanceOf(QueryError);
   });
 
   test("the row budget refusal a grounding capture records is parsed out of THIS message (B54)", async () => {
@@ -1305,7 +3368,9 @@ describe("SQLiteProvider agent read-only execution profile (#328)", () => {
       live arm above — it proves the template still reads that way, not that a running
       engine produces it — and still red on a reword, which is the property that matters.
     */
-    const postgresSource = await Bun.file("src/lib/db/providers/sql/postgres.ts").text();
+    // Anchored to this file, like every other source read in the suite: a cwd-relative read
+    // would fail here naming a path rather than the rule it is checking.
+    const postgresSource = readFileSync(join(REPO_ROOT, "src/lib/db/providers/sql/postgres.ts"), "utf8");
     expect(postgresSource).toContain(
       "Read-only execution exceeded the row budget: ${result.rows.length} rows > ${budget.maxResultRows} allowed",
     );
@@ -1315,24 +3380,31 @@ describe("SQLiteProvider agent read-only execution profile (#328)", () => {
     const dbPath = await seedDatabase();
     const profile = await openAgent(dbPath);
 
-    await expect(
-      profile.queryReadOnly("SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' AS big", { ...AGENT_BUDGET, maxResultBytes: 8 }),
-    ).rejects.toThrow(QueryError);
+    const thrown = await profile
+      .queryReadOnly("SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' AS big", { ...AGENT_BUDGET, maxResultBytes: 8 })
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+    expect(thrown).toBeInstanceOf(QueryError);
   });
 
   test("rejects a statement that overruns the timeout budget", async () => {
     const dbPath = await seedDatabase();
     const profile = await openAgent(dbPath);
 
-    // Neither adapter exposes sqlite3_interrupt or a progress handler, so the
-    // timeout is a post-execution deadline: the statement is not preempted,
-    // but its result is refused. See docs/providers/sqlite.md section 12.
-    await expect(
-      profile.queryReadOnly(
+    // The deadline is preemptive in the worker: the child that runs the statement
+    // is killed at the timeout, so the statement never returns its result.
+    const thrown = await profile
+      .queryReadOnly(
         "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 400000) SELECT COUNT(*) AS n FROM c",
         { ...AGENT_BUDGET, statementTimeoutMs: 1 },
-      ),
-    ).rejects.toThrow(QueryError);
+      )
+      .then(
+        () => null,
+        (error: unknown) => error,
+      );
+    expect(thrown).toBeInstanceOf(QueryError);
   });
 
   test.each([
@@ -1356,13 +3428,13 @@ describe("SQLiteProvider agent read-only execution profile (#328)", () => {
 
     // A missing file is not created by ATTACH either — same no-create property
     // as the profile's own open.
-    await expect(profile.queryReadOnly(`ATTACH DATABASE '${absent}' AS absent`, AGENT_BUDGET)).rejects.toThrow();
+    await engineRefusal(profile.queryReadOnly(`ATTACH DATABASE '${absent}' AS absent`, AGENT_BUDGET));
     expect(existsSync(absent)).toBe(false);
 
     // An EXISTING file attaches successfully: the read-only mode is inherited,
     // so writes through it are refused...
     await profile.queryReadOnly(`ATTACH DATABASE '${otherPath}' AS other`, AGENT_BUDGET);
-    await expect(profile.queryReadOnly("INSERT INTO other.t (id, v) VALUES (2, 'x')", AGENT_BUDGET)).rejects.toThrow();
+    await engineRefusal(profile.queryReadOnly("INSERT INTO other.t (id, v) VALUES (2, 'x')", AGENT_BUDGET));
     expect(await readBack(otherPath)).toEqual([{ id: 1, v: "seeded" }]);
 
     // ...but its ROWS become readable, and neither adapter offers a
@@ -1376,7 +3448,7 @@ describe("SQLiteProvider agent read-only execution profile (#328)", () => {
     expect(leaked.rows).toEqual([{ v: "seeded" }]);
 
     await profile.queryReadOnly("DETACH DATABASE other", AGENT_BUDGET);
-    await expect(profile.queryReadOnly("DETACH DATABASE main", AGENT_BUDGET)).rejects.toThrow();
+    await engineRefusal(profile.queryReadOnly("DETACH DATABASE main", AGENT_BUDGET));
   });
 
   test("refuses a handle whose query_only pragma does not read back enabled", () => {
@@ -1385,6 +3457,172 @@ describe("SQLiteProvider agent read-only execution profile (#328)", () => {
     expect(() => assertQueryOnlyEnabled([{ query_only: 1 }])).not.toThrow();
     expect(() => assertQueryOnlyEnabled([{ query_only: 0 }])).toThrow(ConnectionError);
     expect(() => assertQueryOnlyEnabled([])).toThrow(ConnectionError);
+  });
+});
+
+// ============================================================================
+// 64-bit integers
+//
+// SQLite's INTEGER is signed 64-bit, so an id past 2^53 has no exact JavaScript
+// `number`. Measured on the two drivers with their defaults: bun:sqlite (the
+// Docker image) silently answered 9007199254740992 for 9007199254740993 - the
+// row NEXT to the one asked for, which the inline editor then used as its
+// UPDATE key and edited the neighbour; node:sqlite threw ERR_OUT_OF_RANGE.
+// Both drivers now read 64-bit integers as BigInt and the provider's driver seam
+// converts them back: exactly representable -> number, otherwise -> decimal
+// string, the same answer `supportBigNumbers` gives on MySQL.
+// ============================================================================
+
+describe("64-bit integers past 2^53", () => {
+  /** 2^53, the first integer a JS number cannot separate from its neighbour. */
+  const TWO_53 = "9007199254740992";
+  const TWO_53_PLUS_1 = "9007199254740993";
+
+  let provider: SQLiteProvider;
+
+  afterEach(async () => {
+    try {
+      if (provider?.isConnected()) {
+        await provider.disconnect();
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+  });
+
+  async function connectWithBigIds(): Promise<SQLiteProvider> {
+    const db = new SQLiteProvider(makeSQLiteConfig());
+    await db.connect();
+    await db.query("CREATE TABLE big (id INTEGER PRIMARY KEY, label TEXT)");
+    await db.query(`INSERT INTO big (id, label) VALUES (${TWO_53}, 'neighbour')`);
+    await db.query(`INSERT INTO big (id, label) VALUES (${TWO_53_PLUS_1}, 'target')`);
+    return db;
+  }
+
+  test("reads both ids back with every digit, and keeps them apart", async () => {
+    provider = await connectWithBigIds();
+
+    const rows = (await provider.query("SELECT id, label FROM big ORDER BY id")).rows as Record<string, unknown>[];
+
+    expect(rows.map((row) => String(row.id))).toEqual([TWO_53, TWO_53_PLUS_1]);
+    expect(String(rows[1].id)).not.toBe(TWO_53);
+    expect(rows[0].id).not.toEqual(rows[1].id);
+  });
+
+  // The damage the defect actually did: the id read back was the neighbour's, so the
+  // UPDATE the inline editor builds from it wrote to the wrong row.
+  test("an UPDATE keyed on the id that was read lands on that row, not the one next to it", async () => {
+    provider = await connectWithBigIds();
+
+    const read = (await provider.query("SELECT id, label FROM big ORDER BY id")).rows as Record<string, unknown>[];
+    const target = read.find((row) => row.label === "target")!;
+    await provider.query("UPDATE big SET label = 'edited' WHERE id = ?", [target.id]);
+
+    const after = (await provider.query("SELECT id, label FROM big ORDER BY id")).rows as Record<string, unknown>[];
+    expect(after.map((row) => [String(row.id), row.label])).toEqual([
+      [TWO_53, "neighbour"],
+      [TWO_53_PLUS_1, "edited"],
+    ]);
+  });
+
+  // Rows are serialized to the browser with JSON.stringify, which refuses BigInt
+  // outright, so "turn the driver flag on" without this conversion breaks the
+  // connection itself rather than fixing anything.
+  test("hands back no BigInt anywhere, so rows survive JSON.stringify", async () => {
+    provider = await connectWithBigIds();
+
+    const rows = (await provider.query("SELECT id, label FROM big ORDER BY id")).rows as Record<string, unknown>[];
+    for (const row of rows) {
+      for (const value of Object.values(row)) {
+        expect(typeof value).not.toBe("bigint");
+      }
+    }
+    expect(() => JSON.stringify(rows)).not.toThrow();
+    expect(JSON.parse(JSON.stringify(rows))[1].id).toBe(TWO_53_PLUS_1);
+  });
+
+  // The driver flag is all-or-nothing - `1` and COUNT(*) become BigInt too - so the
+  // conversion has to hand ordinary integers back as ordinary numbers.
+  test("leaves ordinary integers as numbers", async () => {
+    provider = await connectWithBigIds();
+
+    expect((await provider.query("SELECT 1 AS one")).rows).toEqual([{ one: 1 }]);
+    expect((await provider.query("SELECT COUNT(*) AS count FROM big")).rows).toEqual([{ count: 2 }]);
+    expect((await provider.query("SELECT -7 AS negative, 1.5 AS fraction, 'x' AS word, NULL AS nil")).rows).toEqual([
+      { negative: -7, fraction: 1.5, word: "x", nil: null },
+    ]);
+    // The exact edges of the safe range stay numbers; one past them becomes digits.
+    expect((await provider.query("SELECT 9007199254740991 AS max, -9007199254740991 AS min")).rows).toEqual([
+      { max: 9007199254740991, min: -9007199254740991 },
+    ]);
+    expect((await provider.query("SELECT -9007199254740993 AS below")).rows).toEqual([{ below: "-9007199254740993" }]);
+  });
+
+  test("leaves PRAGMA columns unchanged", async () => {
+    provider = await connectWithBigIds();
+
+    expect((await provider.query("PRAGMA journal_mode")).rows).toEqual([{ journal_mode: "memory" }]);
+    expect((await provider.query("PRAGMA foreign_keys")).rows).toEqual([{ foreign_keys: 1 }]);
+    const tableInfo = (await provider.query('PRAGMA table_info("big")')).rows as Record<string, unknown>[];
+    expect(tableInfo.map((column) => column.cid)).toEqual([0, 1]);
+    expect(tableInfo[0].pk).toBe(1);
+  });
+
+  // The agent read-only profile prepares its own statements and refuses an in-memory
+  // target, so it gets a file of its own rather than the shared :memory: handle.
+  test("reads the same digits back on the agent read-only path", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "libredb-sqlite-bigint-"));
+    const dbPath = join(dir, "big.db");
+    const writer = new SQLiteProvider(makeSQLiteConfig({ database: dbPath }));
+    await writer.connect();
+    await writer.query("CREATE TABLE big (id INTEGER PRIMARY KEY, label TEXT)");
+    await writer.query(`INSERT INTO big (id, label) VALUES (${TWO_53_PLUS_1}, 'target')`);
+    await writer.disconnect();
+
+    const agent = new SQLiteProvider(makeSQLiteConfig({ database: dbPath }), {}, { readOnly: true });
+    try {
+      await agent.connect();
+      const rows = (
+        await agent.queryReadOnly("SELECT id, label FROM big", {
+          statementTimeoutMs: 5_000,
+          maxResultRows: 100,
+          maxResultBytes: 64 * 1024,
+        })
+      ).rows as Record<string, unknown>[];
+      expect(String(rows[0].id)).toBe(TWO_53_PLUS_1);
+      expect(() => JSON.stringify(rows)).not.toThrow();
+    } finally {
+      await agent.disconnect();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Every other way a row can leave the provider. They all compile through the same
+  // `prepare()` seam, and this pins that rather than trusting it.
+  test("covers the parameterized, transaction, schema and stats paths alike", async () => {
+    provider = await connectWithBigIds();
+
+    // Parameterized statement, with the big id bound as the digits it was read as.
+    const bound = (await provider.query("SELECT label FROM big WHERE id = ?", [TWO_53_PLUS_1])).rows;
+    expect(bound).toEqual([{ label: "target" }]);
+
+    // Inside an open transaction.
+    await provider.query("BEGIN");
+    const inTx = (await provider.query("SELECT id FROM big ORDER BY id DESC LIMIT 1")).rows as Record<
+      string,
+      unknown
+    >[];
+    expect(String(inTx[0].id)).toBe(TWO_53_PLUS_1);
+    await provider.endOpenQueryTransaction();
+
+    // Schema reads (PRAGMA-backed) and the statistics reads still answer in numbers.
+    const detail = await provider.describeObject(["big"], "table");
+    expect(detail.columns.map((column) => column.name)).toEqual(["id", "label"]);
+    expect(detail.columns[0].isPrimary).toBe(true);
+    const stats = await provider.getTableStats();
+    expect(stats.find((table) => table.tableName === "big")!.rowCount).toBe(2);
+    const overview = await provider.getOverview();
+    expect(overview.tableCount).toBe(1);
   });
 });
 
@@ -1443,6 +3681,297 @@ describe("resolveSQLiteDriverName()", () => {
 });
 
 // ============================================================================
+// Statements that return rows without starting with SELECT
+// ============================================================================
+// The provider chose `all()` or `run()` from the leading keyword, and the keyword set
+// had no WITH, no VALUES and no way to see a RETURNING clause, so all three came back
+// as an empty "success" carrying the connection's previous change count. Measured
+// 2026-10-03 on node:sqlite (SQLite 3.50.4): the CTE answered `rows: [], rowCount: 3`,
+// and the RETURNING insert landed with its row dropped. Run on both drivers in-process
+// (Bun 1.4 ships node:sqlite), so the two answers are compared rather than assumed.
+
+describe.each(["bun", "node"] as const)("SQLiteProvider row-returning statements on the %s driver", (driver) => {
+  const originalDriverEnv = process.env.LIBREDB_SQLITE_DRIVER;
+  let rowsProvider: SQLiteProvider;
+
+  beforeEach(async () => {
+    process.env.LIBREDB_SQLITE_DRIVER = driver;
+    rowsProvider = new SQLiteProvider(makeSQLiteConfig({ id: `rows-${driver}` }));
+    await rowsProvider.connect();
+    await rowsProvider.query("CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT)");
+    // Three rows changed, so a statement that wrongly reports the connection's last
+    // change count is told apart from one that reports its own.
+    await rowsProvider.query("INSERT INTO dept VALUES (1, 'Ops'), (2, 'Eng'), (3, 'Sales')");
+  });
+
+  afterEach(async () => {
+    await rowsProvider.disconnect();
+    if (originalDriverEnv === undefined) delete process.env.LIBREDB_SQLITE_DRIVER;
+    else process.env.LIBREDB_SQLITE_DRIVER = originalDriverEnv;
+  });
+
+  test("a CTE returns its rows", async () => {
+    const result = await rowsProvider.query("WITH x AS (SELECT 1 AS a UNION ALL SELECT 2) SELECT a FROM x");
+
+    expect(result.rows).toEqual([{ a: 1 }, { a: 2 }]);
+    expect(result.fields).toEqual(["a"]);
+    expect(result.rowCount).toBe(2);
+  });
+
+  test("a recursive CTE returns its rows", async () => {
+    const result = await rowsProvider.query(
+      "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 4) SELECT n FROM c",
+    );
+
+    expect(result.rows).toEqual([{ n: 1 }, { n: 2 }, { n: 3 }, { n: 4 }]);
+  });
+
+  test("a bare VALUES list returns its rows", async () => {
+    const result = await rowsProvider.query("VALUES (1, 'a'), (2, 'b')");
+
+    expect(result.rows).toEqual([
+      { column1: 1, column2: "a" },
+      { column1: 2, column2: "b" },
+    ]);
+    expect(result.rowCount).toBe(2);
+  });
+
+  test("INSERT ... RETURNING writes the row and returns it", async () => {
+    const result = await rowsProvider.query("INSERT INTO dept VALUES (7, 'R&D') RETURNING id, name");
+
+    expect(result.rows).toEqual([{ id: 7, name: "R&D" }]);
+    expect(result.fields).toEqual(["id", "name"]);
+    expect(result.rowCount).toBe(1);
+    const stored = await rowsProvider.query("SELECT name FROM dept WHERE id = 7");
+    expect(stored.rows).toEqual([{ name: "R&D" }]);
+  });
+
+  test("UPDATE ... RETURNING and DELETE ... RETURNING return the rows they touched", async () => {
+    const updated = await rowsProvider.query("UPDATE dept SET name = upper(name) WHERE id <= 2 RETURNING id, name");
+    expect(updated.rows).toEqual([
+      { id: 1, name: "OPS" },
+      { id: 2, name: "ENG" },
+    ]);
+    expect(updated.rowCount).toBe(2);
+
+    const deleted = await rowsProvider.query("DELETE FROM dept WHERE id = 3 RETURNING *");
+    expect(deleted.rows).toEqual([{ id: 3, name: "Sales" }]);
+    expect((await rowsProvider.query("SELECT COUNT(*) AS n FROM dept")).rows).toEqual([{ n: 2 }]);
+  });
+
+  test("a RETURNING statement that matches nothing answers no rows and a zero count", async () => {
+    const result = await rowsProvider.query("DELETE FROM dept WHERE id = 99 RETURNING id");
+
+    expect(result.rows).toEqual([]);
+    expect(result.rowCount).toBe(0);
+  });
+
+  test("a parameterized RETURNING statement binds its parameters", async () => {
+    const result = await rowsProvider.query("INSERT INTO dept VALUES (?, ?) RETURNING name", [8, "Legal"]);
+
+    expect(result.rows).toEqual([{ name: "Legal" }]);
+  });
+
+  test("a plain INSERT, UPDATE and DELETE still report the rows they changed", async () => {
+    expect((await rowsProvider.query("INSERT INTO dept VALUES (4, 'HR'), (5, 'IT')")).rowCount).toBe(2);
+    const update = await rowsProvider.query("UPDATE dept SET name = 'x' WHERE id IN (1, 2, 4)");
+    expect(update.rows).toEqual([]);
+    expect(update.rowCount).toBe(3);
+    expect((await rowsProvider.query("DELETE FROM dept WHERE id = 5")).rowCount).toBe(1);
+  });
+
+  test("a value-setting PRAGMA answers no rows, and reading it back answers the value", async () => {
+    const set = await rowsProvider.query("PRAGMA user_version = 3");
+    expect(set.rows).toEqual([]);
+
+    const read = await rowsProvider.query("PRAGMA user_version");
+    expect(read.rows).toEqual([{ user_version: 3 }]);
+  });
+
+  test("a CTE-led DELETE without RETURNING is still a write", async () => {
+    const result = await rowsProvider.query(
+      "WITH d AS (SELECT 2 AS id) DELETE FROM dept WHERE id IN (SELECT id FROM d)",
+    );
+
+    expect(result.rows).toEqual([]);
+    expect(result.rowCount).toBe(1);
+  });
+});
+
+// ============================================================================
+// A statement that changes no row reports none
+//
+// `run().changes` is SQLite's `sqlite3_changes()`, which only an INSERT, UPDATE or DELETE
+// resets. Measured 2026-10-14: on node:sqlite a `CREATE TABLE` after a two-row `DELETE`
+// answered `rowCount: 2`, and so did every DDL, value-setting PRAGMA and COMMIT after it,
+// on `:memory:` (the in-process handle) and on a file (the worker) alike. bun:sqlite
+// answered 0. Run on both drivers and both handles.
+
+describe.each([
+  ["bun", "memory"],
+  ["bun", "file"],
+  ["node", "memory"],
+  ["node", "file"],
+] as const)("SQLiteProvider change count of a statement that changes no row (%s driver, %s)", (driver, location) => {
+  const originalDriverEnv = process.env.LIBREDB_SQLITE_DRIVER;
+  let changesTmpDir: string;
+  let changesProvider: SQLiteProvider;
+
+  beforeEach(async () => {
+    process.env.LIBREDB_SQLITE_DRIVER = driver;
+    changesTmpDir = mkdtempSync(join(tmpdir(), "libredb-sqlite-changes-"));
+    changesProvider = new SQLiteProvider(
+      makeSQLiteConfig({
+        id: `changes-${driver}-${location}`,
+        database: location === "memory" ? ":memory:" : join(changesTmpDir, "c.db"),
+      }),
+    );
+    await changesProvider.connect();
+    await changesProvider.query("CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT)");
+    await changesProvider.query("INSERT INTO dept VALUES (1, 'Ops'), (2, 'Eng'), (3, 'Sales')");
+  });
+
+  afterEach(async () => {
+    await changesProvider.disconnect();
+    // The node driver under Bun holds the file until its statements are collected (see
+    // the column-names suite above).
+    Bun.gc(true);
+    rmSync(changesTmpDir, { recursive: true });
+    if (originalDriverEnv === undefined) delete process.env.LIBREDB_SQLITE_DRIVER;
+    else process.env.LIBREDB_SQLITE_DRIVER = originalDriverEnv;
+  });
+
+  test("DDL, a value-setting PRAGMA and a transaction's ends after a DELETE report no changed rows", async () => {
+    expect((await changesProvider.query("DELETE FROM dept WHERE id <= 2")).rowCount).toBe(2);
+
+    for (const sql of [
+      "CREATE TABLE audit (id INTEGER)",
+      "CREATE INDEX dept_name ON dept(name)",
+      "ALTER TABLE audit ADD COLUMN note TEXT",
+      "PRAGMA user_version = 4",
+      "PRAGMA foreign_keys = ON",
+      "DROP TABLE audit",
+    ]) {
+      expect({ sql, rowCount: (await changesProvider.query(sql)).rowCount }).toEqual({ sql, rowCount: 0 });
+    }
+
+    expect((await changesProvider.query("BEGIN")).rowCount).toBe(0);
+    expect((await changesProvider.query("UPDATE dept SET name = 'x'")).rowCount).toBe(1);
+    expect((await changesProvider.query("COMMIT")).rowCount).toBe(0);
+  });
+
+  test("a parameterized write reports its own count, and a ROLLBACK after it none", async () => {
+    expect((await changesProvider.query("BEGIN")).rowCount).toBe(0);
+    expect((await changesProvider.query("INSERT INTO dept VALUES (?, ?), (?, ?)", [4, "HR", 5, "IT"])).rowCount).toBe(
+      2,
+    );
+    expect((await changesProvider.query("ROLLBACK")).rowCount).toBe(0);
+    expect((await changesProvider.query("CREATE TABLE audit (id INTEGER)")).rowCount).toBe(0);
+  });
+
+  // Passes without the guard too, since a write always resets `changes`: it pins that the
+  // guard does not swallow a write's count.
+  test("a write that matches nothing reports zero, and the next write its own count", async () => {
+    expect((await changesProvider.query("UPDATE dept SET name = 'x' WHERE id = 99")).rowCount).toBe(0);
+    expect((await changesProvider.query("UPDATE dept SET name = 'y' WHERE id >= 2")).rowCount).toBe(2);
+  });
+});
+
+// ============================================================================
+// Result column names: an unnamed or repeated column keeps its own value
+//
+// The rows were read keyed by name and `fields` was `Object.keys(rows[0])`, so
+// `SELECT 1 AS a, 2 AS a` answered one column holding 2, and `SELECT 1 AS ""` answered
+// `fields: [""]`, a column no grid can key. The rows are now read positionally on both
+// drivers and keyed by `uniqueFieldNames`.
+
+describe.each(["bun", "node"] as const)("SQLiteProvider result column names on the %s driver", (driver) => {
+  const originalDriverEnv = process.env.LIBREDB_SQLITE_DRIVER;
+  let namesTmpDir: string;
+  let namesProvider: SQLiteProvider;
+  let namesAgent: SQLiteProvider | null = null;
+
+  beforeEach(async () => {
+    process.env.LIBREDB_SQLITE_DRIVER = driver;
+    namesTmpDir = mkdtempSync(join(tmpdir(), "libredb-sqlite-names-"));
+    namesProvider = new SQLiteProvider(
+      makeSQLiteConfig({ id: `names-${driver}`, database: join(namesTmpDir, "n.db") }),
+    );
+    await namesProvider.connect();
+    await namesProvider.query("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, item TEXT)");
+    await namesProvider.query("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)");
+    await namesProvider.query("INSERT INTO orders VALUES (100, 1, 'book')");
+    await namesProvider.query("INSERT INTO customers VALUES (1, 'Ann')");
+  });
+
+  afterEach(async () => {
+    if (namesAgent?.isConnected()) await namesAgent.disconnect();
+    namesAgent = null;
+    await namesProvider.disconnect();
+    // Under Bun the `node` driver is Bun's own node:sqlite, whose `close()` leaves the
+    // statements it prepared holding the database, its WAL and its shared-memory file
+    // until they are collected: measured 2026-10-07 through /proc/self/fd, three
+    // descriptors after disconnect and none after a collection. Node's own `close()`
+    // releases them (the driver's `close` docblock; the under-Node test below), so this
+    // is the test runtime's behaviour, and on windows-latest it failed the removal
+    // below with EBUSY.
+    Bun.gc(true);
+    rmSync(namesTmpDir, { recursive: true });
+    if (originalDriverEnv === undefined) delete process.env.LIBREDB_SQLITE_DRIVER;
+    else process.env.LIBREDB_SQLITE_DRIVER = originalDriverEnv;
+  });
+
+  test("a repeated alias keeps both values under two names", async () => {
+    const result = await namesProvider.query("SELECT 1 AS a, 2 AS a");
+
+    expect(result.fields).toEqual(["a", "a (2)"]);
+    expect(result.rows).toEqual([{ a: 1, "a (2)": 2 }]);
+  });
+
+  test("a join that projects id from both tables keeps the order's id", async () => {
+    const result = await namesProvider.query("SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id");
+
+    expect(result.fields).toEqual(["id", "customer_id", "item", "id (2)", "name"]);
+    expect(result.rows).toEqual([{ id: 100, customer_id: 1, item: "book", "id (2)": 1, name: "Ann" }]);
+    expect(result.columnTypes).toEqual({
+      id: "INTEGER",
+      customer_id: "INTEGER",
+      item: "TEXT",
+      "id (2)": "INTEGER",
+      name: "TEXT",
+    });
+  });
+
+  test("an empty alias is named, and an unaliased expression keeps the name SQLite gives it", async () => {
+    const result = await namesProvider.query('SELECT 1 AS "", 4 + 5');
+
+    expect(result.fields).toEqual(["(No column name)", "4 + 5"]);
+    expect(result.rows).toEqual([{ "(No column name)": 1, "4 + 5": 9 }]);
+  });
+
+  test("an empty result still names its columns", async () => {
+    const result = await namesProvider.query("SELECT id, id FROM orders WHERE id = -1");
+
+    expect(result.rows).toEqual([]);
+    expect(result.fields).toEqual(["id", "id (2)"]);
+  });
+
+  test("the read-only profile keys a repeated column the same way", async () => {
+    namesAgent = new SQLiteProvider(
+      makeSQLiteConfig({ id: `names-agent-${driver}`, database: join(namesTmpDir, "n.db") }),
+      {},
+      { readOnly: true },
+    );
+    await namesAgent.connect();
+
+    const result = await namesAgent.queryReadOnly('SELECT 1 AS a, 2 AS a, 3 AS ""', AGENT_BUDGET);
+
+    expect(result.fields).toEqual(["a", "a (2)", "(No column name)"]);
+    expect(result.rows).toEqual([{ a: 1, "a (2)": 2, "(No column name)": 3 }]);
+  });
+});
+
+// ============================================================================
 // Node driver (LIBREDB_SQLITE_DRIVER=node -> node:sqlite)
 //
 // Bun refuses to load better-sqlite3 and does not implement node:sqlite, so
@@ -1471,7 +4000,7 @@ describe.skipIf(!nodeDriverTestable)("SQLiteProvider with LIBREDB_SQLITE_DRIVER=
   });
 
   afterAll(() => {
-    rmSync(tmpDir, { recursive: true, force: true });
+    rmSync(tmpDir, { recursive: true });
   });
 
   test("core CRUD, schema, maintenance, and error mapping work under Node", () => {
@@ -1485,8 +4014,17 @@ describe.skipIf(!nodeDriverTestable)("SQLiteProvider with LIBREDB_SQLITE_DRIVER=
       ["build", harnessEntry, "--target=node", "--format=esm", "--external", "bun:sqlite", "--outfile", bundlePath],
       { timeout: 60_000 },
     );
+    // `build.error` first: on a timeout spawnSync returns status null with error set, and
+    // `status !== 0` is true for null, so a status read on its own used to raise
+    // "bun build failed:" with an empty stderr, a message that names nothing. Under a concurrent
+    // runner a timeout is the likely failure, so it has to say so. `howItFailed` below now also
+    // names a signal, which is the other way a status arrives null; this branch stays because an
+    // error that stopped the spawn carries a message neither of those fields does.
+    if (build.error) {
+      throw new Error(`bun build could not run: ${build.error.message}`);
+    }
     if (build.status !== 0) {
-      throw new Error(`bun build failed: ${build.stderr?.toString()}`);
+      throw new Error(`bun build ${howItFailed(build)}: ${build.stderr?.toString()}`);
     }
 
     // Run it under real Node with the node driver forced.
@@ -1494,8 +4032,11 @@ describe.skipIf(!nodeDriverTestable)("SQLiteProvider with LIBREDB_SQLITE_DRIVER=
       env: { ...process.env, LIBREDB_SQLITE_DRIVER: "node" },
       timeout: 60_000,
     });
+    if (run.error) {
+      throw new Error(`node harness could not run: ${run.error.message}`);
+    }
     if (run.status !== 0) {
-      throw new Error(`node harness failed: ${run.stderr?.toString()}`);
+      throw new Error(`node harness ${howItFailed(run)}: ${run.stderr?.toString()}`);
     }
 
     const report = JSON.parse(run.stdout.toString()) as Record<string, unknown>;
@@ -1505,6 +4046,9 @@ describe.skipIf(!nodeDriverTestable)("SQLiteProvider with LIBREDB_SQLITE_DRIVER=
     expect(report.driverEnv).toBe("node");
     expect(report.connected).toBe(true);
     expect(report.disconnected).toBe(true);
+    // And the disconnect released the file, as the bun adapter's does: no WAL sidecar
+    // survived it. See "disconnect releases the file rather than scheduling it" above.
+    expect(report.sidecarsAfterDisconnect).toEqual([]);
     expect(existsSync(dbPath)).toBe(true); // real file-backed database
 
     // CRUD (same results as the bun driver)
@@ -1517,17 +4061,71 @@ describe.skipIf(!nodeDriverTestable)("SQLiteProvider with LIBREDB_SQLITE_DRIVER=
     expect(report.updateRowCount).toBe(1);
     expect(report.deleteRowCount).toBe(1);
 
+    // Row-returning statements that do not start with SELECT: the same answers the
+    // in-process runs of both drivers give above.
+    expect(report.rowReturning).toEqual({
+      cte: { rows: [{ a: 1 }, { a: 2 }], rowCount: 2 },
+      values: {
+        rows: [
+          { column1: 1, column2: "a" },
+          { column1: 2, column2: "b" },
+        ],
+        rowCount: 2,
+      },
+      insertReturning: { rows: [{ id: 3, name: "Cy" }], rowCount: 1 },
+      updateReturning: { rows: [{ name: "Cyd" }], rowCount: 1 },
+      deleteReturning: { rows: [{ id: 3 }], rowCount: 1 },
+    });
+
+    // 64-bit ids: the same answer the bun driver gives in-process above.
+    // Before the fix this run did not reach here at all - node:sqlite threw
+    // ERR_OUT_OF_RANGE on the first read of 9007199254740993.
+    expect(report.bigIds).toEqual(["9007199254740992", "9007199254740993"]);
+    expect(report.bigIdTypes).toEqual(["string", "string"]);
+    expect(report.bigRowsAfterUpdate).toEqual([
+      { id: "9007199254740992", label: "neighbour" },
+      { id: "9007199254740993", label: "edited" },
+    ]);
+    expect(report.bigSmallInteger).toEqual([{ one: 1 }]);
+    expect(report.bigCount).toEqual([{ count: 2 }]);
+
+    // A BLOB reaches the wire as the Buffer form `asBytes` reads, as under bun.
+    expect(report.blobWire).toEqual([
+      { bin: { type: "Buffer", data: [0xde, 0xad, 0xbe, 0xef, 0x00, 0xff] }, empty: { type: "Buffer", data: [] } },
+    ]);
+
+    // #42: on a column with NO affinity the same id used to match nothing at all, so the
+    // row was uneditable. One row changes, and it is the one that was read.
+    for (const key of ["none", "blob"]) {
+      expect((report.noAffinityRoundTrip as Record<string, unknown>)[key]).toEqual({
+        read: ["9007199254740992", "9007199254740993"],
+        rowCount: 1,
+        after: [
+          { id: "9007199254740992", label: "neighbour" },
+          { id: "9007199254740993", label: "edited" },
+        ],
+      });
+    }
+    // and a genuinely textual all-digit key is untouched by that, leading zero included
+    expect(report.textKeyKinds).toEqual([
+      { id: "007", kind: "text" },
+      { id: "9007199254740993", kind: "text" },
+    ]);
+    expect(report.textKeyMatches).toEqual([1, 1]);
+
     // Schema introspection
     const schema = report.schema as Array<{
       name: string;
-      rowCount: number;
       columns: Array<{ name: string; isPrimary: boolean; nullable: boolean }>;
       indexes: string[];
       foreignKeys: Array<{ columnName: string; referencedTable: string; referencedColumn: string }>;
     }>;
     const users = schema.find((t) => t.name === "users")!;
     expect(users).toBeDefined();
-    expect(users.rowCount).toBe(1);
+    // No row count here, and that is SQLite`s own answer rather than a gap in the harness:
+    // the object listing publishes none, because there is no catalog estimate on this
+    // engine and a COUNT(*) per object would be a full table scan per row of the tree.
+    // The counted figure has its own read, asserted below through `getTableStats`.
     expect(users.columns.find((c) => c.name === "id")!.isPrimary).toBe(true);
     expect(users.columns.find((c) => c.name === "name")!.nullable).toBe(false);
     expect(users.indexes).toContain("idx_users_email");
@@ -1569,9 +4167,57 @@ describe.skipIf(!nodeDriverTestable)("SQLiteProvider with LIBREDB_SQLITE_DRIVER=
     expect(report.tableCount).toBe(2);
     expect(report.integrity).toContain("OK");
 
-    // Error mapping (same mapDatabaseError path as the bun driver)
-    expect(report.queryErrorName).toBe("DatabaseError");
+    // Error mapping (same mapDatabaseError path as the bun driver). A missing table is the
+    // statement's own fault, read from node:sqlite's `errcode` 1 (SQLITE_ERROR) since #1427.
+    expect(report.queryErrorName).toBe("QueryError");
     expect(report.queryErrorMessage).toContain("no such table");
+
+    // ------------------------------------------------------------------
+    // The object surface (#789) on the node:sqlite adapter.
+    //
+    // node:sqlite is a DIFFERENT SQLite build behind the same adapter, and this surface
+    // needs `PRAGMA table_list` (3.37+) and a bound schema argument on the pragma
+    // table-valued functions. Neither is provable from the bun run: measured here,
+    // node:sqlite is 3.51.2 where bun:sqlite is 3.53.2.
+    // ------------------------------------------------------------------
+    expect(report.objectContainers).toEqual([]);
+    // `users`, `books` and the FTS5-free fixture's two tables, plus the view and the
+    // trigger this section adds. The TEMP `users` created beside them is excluded, which
+    // is the schema restriction working on this driver too.
+    expect(report.objectCounts).toEqual({
+      table: { count: 2 },
+      view: { count: 1 },
+      index: { count: 1 },
+      trigger: { count: 1 },
+    });
+    expect(report.objectList_table).toEqual([
+      { path: ["books"], name: "books", kind: "table" },
+      { path: ["users"], name: "users", kind: "table" },
+    ]);
+    expect(report.objectList_view).toEqual([{ path: ["user_names"], name: "user_names", kind: "view" }]);
+    expect(report.objectList_index).toEqual([{ path: ["idx_users_email"], name: "idx_users_email", kind: "index" }]);
+    expect(report.objectList_trigger).toEqual([
+      { path: ["users", "users_stamp"], name: "users_stamp", kind: "trigger" },
+    ]);
+    // The file's `users`, not the one-column TEMP table shadowing it: the schema is bound
+    // into `pragma_table_xinfo` on this adapter as well.
+    expect(report.objectDetail).toEqual({
+      path: ["users"],
+      columns: [
+        { name: "id", isPrimary: true },
+        { name: "name", isPrimary: false },
+        { name: "email", isPrimary: false },
+      ],
+      indexes: [{ name: "idx_users_email", columns: ["email"] }],
+    });
+    expect(report.objectDetailTrigger).toEqual({
+      path: ["users", "users_stamp"],
+      columns: [],
+      indexes: [],
+      foreignKeys: [],
+    });
+    expect(report.objectMissingRefused).toBe(true);
+    expect(report.objectBadContainerRefused).toBe(true);
 
     // ------------------------------------------------------------------
     // Agent read-only execution profile (#328) on the node:sqlite adapter.
@@ -1596,5 +4242,1177 @@ describe.skipIf(!nodeDriverTestable)("SQLiteProvider with LIBREDB_SQLITE_DRIVER=
     expect(report.agentMissingFileCreated).toBe(false);
     expect(report.agentMissingDirOpenRejected).toBe(true);
     expect(report.agentMissingDirCreated).toBe(false);
+  });
+});
+
+// ============================================================================
+// Independent verification of #39 (added by the verifying pass)
+//
+// Three questions the fix's own tests do not answer, measured through the real
+// provider on whichever driver this file's default resolves to:
+//
+// 1. WHICH shapes changed. The driver flag is all-or-nothing, so every narrow
+//    integer in the product crosses the same conversion. The table below is the
+//    measured before/after for each one: nothing narrow may have become a string.
+// 2. What an AGGREGATE over 64-bit values answers now, and what json_extract does.
+//    Before the fix bun:sqlite answered SUM(id) as 18014398509481984 - one short of
+//    the truth and indistinguishable from it.
+// 3. The residual: a string id read out only finds its row again when the column
+//    it is compared against has INTEGER (or NUMERIC/REAL) affinity. SQLite applies
+//    no conversion for a BLOB/NONE-affinity column, so there the round trip fails.
+// ============================================================================
+
+describe("64-bit integers past 2^53, independently verified", () => {
+  let provider: SQLiteProvider;
+  const originalDriverEnv = process.env.LIBREDB_SQLITE_DRIVER;
+
+  afterEach(async () => {
+    if (originalDriverEnv === undefined) {
+      delete process.env.LIBREDB_SQLITE_DRIVER;
+    } else {
+      process.env.LIBREDB_SQLITE_DRIVER = originalDriverEnv;
+    }
+    try {
+      if (provider?.isConnected()) {
+        await provider.disconnect();
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+  });
+
+  async function connect(setup: readonly string[] = []): Promise<SQLiteProvider> {
+    // Run on this file's default driver rather than whatever a sibling describe left
+    // behind, so the shapes below are the ones the Docker image actually produces.
+    delete process.env.LIBREDB_SQLITE_DRIVER;
+    const db = new SQLiteProvider(makeSQLiteConfig());
+    await db.connect();
+    for (const statement of setup) {
+      await db.query(statement);
+    }
+    return db;
+  }
+
+  const SMALL_TABLE = [
+    "CREATE TABLE small (id INTEGER PRIMARY KEY, g TEXT, v INTEGER, r REAL)",
+    "INSERT INTO small (g, v, r) VALUES ('a', 1, 1.5), ('a', 2, 2.5), ('b', 3, 3.5)",
+  ];
+
+  /**
+   * Every narrow shape the all-or-nothing driver flag passes through, with the type
+   * measured on the unfixed build for comparison. All nine were `number` before the
+   * fix on bun:sqlite (and on node:sqlite, which only threw past the safe range), and
+   * all nine must still be `number` after it.
+   */
+  test.each([
+    ["SELECT 1", "SELECT 1 AS x", "number", 1],
+    ["COUNT(*)", "SELECT COUNT(*) AS x FROM small", "number", 3],
+    ["SUM() over small values", "SELECT SUM(v) AS x FROM small", "number", 6],
+    ["AVG()", "SELECT AVG(v) AS x FROM small", "number", 2],
+    ["INTEGER PRIMARY KEY", "SELECT id AS x FROM small ORDER BY id LIMIT 1", "number", 1],
+    ["rowid", "SELECT rowid AS x FROM small ORDER BY rowid LIMIT 1", "number", 1],
+    ["length()", "SELECT length('abcd') AS x", "number", 4],
+    ["a REAL column", "SELECT r AS x FROM small ORDER BY id LIMIT 1", "number", 1.5],
+    ["CAST to INTEGER", "SELECT CAST('42' AS INTEGER) AS x", "number", 42],
+    ["GROUP BY count", "SELECT COUNT(*) AS x FROM small GROUP BY g ORDER BY g LIMIT 1", "number", 2],
+    ["julianday()", "SELECT julianday('2020-01-01') AS x", "number", 2458849.5],
+    // TEXT before and after — strftime has always answered text, typeof always a name.
+    ["strftime('%s')", "SELECT strftime('%s', '2020-01-01') AS x", "string", "1577836800"],
+    ["typeof()", "SELECT typeof(9007199254740993) AS x", "string", "integer"],
+  ] as const)("%s keeps its shape", async (_label, sql, expectedType, expectedValue) => {
+    provider = await connect(SMALL_TABLE);
+
+    const value = ((await provider.query(sql)).rows[0] as Record<string, unknown>).x;
+
+    expect(typeof value).toBe(expectedType);
+    expect(value).toEqual(expectedValue);
+  });
+
+  // last_insert_rowid() answers whatever was last written, so it is narrow or wide by
+  // the same rule as any other integer — asserted both ways rather than once.
+  test("last_insert_rowid() is a number for a small rowid and digits for a 64-bit one", async () => {
+    provider = await connect(["CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)"]);
+
+    await provider.query("INSERT INTO t (id, label) VALUES (7, 'small')");
+    expect((await provider.query("SELECT last_insert_rowid() AS x")).rows).toEqual([{ x: 7 }]);
+
+    await provider.query("INSERT INTO t (id, label) VALUES (9007199254740993, 'wide')");
+    expect((await provider.query("SELECT last_insert_rowid() AS x")).rows).toEqual([{ x: "9007199254740993" }]);
+  });
+
+  // The aggregate is the case that was wrong without ever looking wrong: bun:sqlite
+  // answered SUM(id) as 18014398509481984 where the truth is ...985.
+  test("an aggregate over 64-bit values answers every digit", async () => {
+    provider = await connect([
+      "CREATE TABLE big (id INTEGER PRIMARY KEY, doc TEXT)",
+      "INSERT INTO big VALUES (9007199254740992, '{\"k\":9007199254740993}')",
+      "INSERT INTO big VALUES (9007199254740993, '{\"k\":7}')",
+    ]);
+
+    expect((await provider.query("SELECT SUM(id) AS x FROM big")).rows).toEqual([{ x: "18014398509481985" }]);
+    expect((await provider.query("SELECT MAX(id) AS x FROM big")).rows).toEqual([{ x: "9007199254740993" }]);
+    expect((await provider.query("SELECT MIN(id) AS x FROM big")).rows).toEqual([{ x: "9007199254740992" }]);
+    // A 64-bit integer inside JSON comes out of json_extract on the same rule.
+    expect((await provider.query("SELECT json_extract(doc, '$.k') AS x FROM big ORDER BY id LIMIT 1")).rows).toEqual([
+      { x: "9007199254740993" },
+    ]);
+    // and a narrow one inside the same column is still a number
+    expect(
+      (await provider.query("SELECT json_extract(doc, '$.k') AS x FROM big ORDER BY id DESC LIMIT 1")).rows,
+    ).toEqual([{ x: 7 }]);
+    // INT64's own limits survive the trip.
+    expect((await provider.query("SELECT 9223372036854775807 AS hi, -9223372036854775807 - 1 AS lo")).rows).toEqual([
+      { hi: "9223372036854775807", lo: "-9223372036854775808" },
+    ]);
+  });
+
+  /**
+   * The other half of the round trip.
+   *
+   * SQLite settles `column = ?` by the COLUMN's affinity, and a column declared BLOB or
+   * declared NOTHING has none: it compares a text to an integer as they stand, they are
+   * never equal, and the id the grid just read could not find its own row again. The
+   * UPDATE reported 0 rows changed and the user was told nothing happened - better than
+   * the original defect, which wrote to the NEIGHBOUR, but still an uneditable row.
+   *
+   * The driver seam now reads the digits it printed back as the 64-bit integer they came
+   * from (`toSQLiteBindValue`), so the comparison is integer to integer and the row is
+   * found on every affinity.
+   */
+  test.each([
+    ["no declared type (NONE affinity)", "CREATE TABLE k (id, label TEXT)"],
+    ["a BLOB-affinity column", "CREATE TABLE k (id BLOB, label TEXT)"],
+  ] as const)("a 64-bit id read from %s finds its own row again when sent back", async (_label, ddl) => {
+    provider = await connect([
+      ddl,
+      "INSERT INTO k VALUES (9007199254740992, 'neighbour')",
+      "INSERT INTO k VALUES (9007199254740993, 'target')",
+    ]);
+
+    const rows = (await provider.query("SELECT id, label FROM k ORDER BY id")).rows as Record<string, unknown>[];
+    // The read is right: both ids come back whole and apart.
+    expect(rows.map((row) => row.id)).toEqual(["9007199254740992", "9007199254740993"]);
+
+    const target = rows.find((row) => row.label === "target")!;
+    const update = await provider.query("UPDATE k SET label = 'edited' WHERE id = ?", [target.id]);
+
+    // Exactly one row, and it is the one that was read.
+    expect(update.rowCount).toBe(1);
+    expect((await provider.query("SELECT label FROM k WHERE id = ?", [target.id])).rows).toEqual([{ label: "edited" }]);
+    expect((await provider.query("SELECT id, label FROM k ORDER BY id")).rows).toEqual([
+      { id: "9007199254740992", label: "neighbour" },
+      { id: "9007199254740993", label: "edited" },
+    ]);
+  });
+
+  /**
+   * Which strings the bind reads as a 64-bit integer, and which it leaves as text.
+   *
+   * The set is exactly what the READ can print for an out-of-range integer, so the two
+   * directions are inverses. Everything else is somebody's text and stays text -
+   * asserted here through `typeof(?)`, which is the one thing SQLite answers differently
+   * for the two storage classes.
+   */
+  test.each([
+    ["past 2^53, the shape the read prints", "9007199254740993", "integer"],
+    ["past 2^53 and negative", "-9007199254740993", "integer"],
+    ["INT64's own maximum", "9223372036854775807", "integer"],
+    ["INT64's own minimum", "-9223372036854775808", "integer"],
+    ["one past INT64, which no row can hold", "9223372036854775808", "text"],
+    ["far wider than 64 bits", "99999999999999999999999", "text"],
+    ["inside the safe range, where the read prints a number", "9007199254740991", "text"],
+    ["a small integer's digits", "7", "text"],
+    ["leading zeros", "0009007199254740993", "text"],
+    ["a single leading zero", "007", "text"],
+    ["a leading plus", "+9007199254740993", "text"],
+    ["a leading minus with a zero", "-0009007199254740993", "text"],
+    ["surrounding space", " 9007199254740993 ", "text"],
+    ["a decimal point", "9007199254740993.0", "text"],
+    ["exponent notation", "9.007199254740993e15", "text"],
+    ["the empty string", "", "text"],
+    ["digits with a tail", "9007199254740993x", "text"],
+  ] as const)("binds %s as %s", async (_label, value, expected) => {
+    provider = await connect(["CREATE TABLE k (id, label TEXT)"]);
+    expect((await provider.query("SELECT typeof(?) AS kind", [value])).rows).toEqual([{ kind: expected }]);
+  });
+
+  /**
+   * A genuinely textual key is still matched as text.
+   *
+   * On a TEXT-declared column this is unconditional and covers the whole shape: SQLite
+   * applies the column's TEXT affinity to the bind, so the integer is turned back into
+   * the same digits before the comparison. A leading zero is carried along because it is
+   * the case that would break if the conversion were written as "digits mean a number".
+   */
+  test("a genuinely textual all-digit key still stores and matches as text", async () => {
+    provider = await connect([
+      "CREATE TABLE t (id TEXT PRIMARY KEY, label TEXT)",
+      "INSERT INTO t VALUES ('9007199254740993', 'wide')",
+      "INSERT INTO t VALUES ('0009007199254740993', 'padded')",
+      "INSERT INTO t VALUES ('007', 'bond')",
+    ]);
+
+    // Stored as text, every one of them, including the one the bind would read as a number.
+    expect((await provider.query("SELECT id, typeof(id) AS kind FROM t ORDER BY label")).rows).toEqual([
+      { id: "007", kind: "text" },
+      { id: "0009007199254740993", kind: "text" },
+      { id: "9007199254740993", kind: "text" },
+    ]);
+
+    const stillMatchesAsText = async (id: string, label: string): Promise<void> => {
+      expect((await provider.query("SELECT label FROM t WHERE id = ?", [id])).rows).toEqual([{ label }]);
+      const update = await provider.query("UPDATE t SET label = ? WHERE id = ?", [`${label}-edited`, id]);
+      expect(update.rowCount).toBe(1);
+    };
+    await stillMatchesAsText("9007199254740993", "wide");
+    await stillMatchesAsText("0009007199254740993", "padded");
+    await stillMatchesAsText("007", "bond");
+    // And a value written through a bind is still the text that was written.
+    await provider.query("INSERT INTO t VALUES (?, 'written')", ["9007199254740994"]);
+    expect((await provider.query("SELECT typeof(id) AS kind FROM t WHERE label = 'written'")).rows).toEqual([
+      { kind: "text" },
+    ]);
+  });
+
+  /**
+   * The mistake the first half of this fix made, in the other direction: the bind creates
+   * a BigInt, and a BigInt that reached a row would break `JSON.stringify` and with it the
+   * whole connection. It exists only between this seam and the driver call, so everything
+   * that comes back is swept for one.
+   */
+  test("a converted bind never comes back as a BigInt", async () => {
+    provider = await connect(["CREATE TABLE k (id, label TEXT)", "INSERT INTO k VALUES (9007199254740993, 'target')"]);
+
+    const answers: unknown[] = [
+      (await provider.query("SELECT ? AS echo", ["9007199254740993"])).rows,
+      (await provider.query("SELECT id, label FROM k WHERE id = ?", ["9007199254740993"])).rows,
+      await provider.query("UPDATE k SET label = ? WHERE id = ?", ["9007199254740994", "9007199254740993"]),
+      (await provider.query("SELECT id, label, typeof(label) AS kind FROM k")).rows,
+    ];
+
+    const found: string[] = [];
+    const walk = (value: unknown, path: string): void => {
+      if (typeof value === "bigint") return void found.push(`${path} = ${value}`);
+      if (value === null || typeof value !== "object" || ArrayBuffer.isView(value)) return;
+      for (const [key, child] of Object.entries(value as Record<string, unknown>)) walk(child, `${path}.${key}`);
+    };
+    answers.forEach((answer, index) => walk(answer, `answer[${index}]`));
+
+    expect(found).toEqual([]);
+    expect(() => JSON.stringify(answers)).not.toThrow();
+    // The echo comes back as the digits it went in as, which is the round trip itself.
+    expect(answers[0]).toEqual([{ echo: "9007199254740993" }]);
+    // and a converted value WRITTEN into a TEXT-affinity column is still text
+    expect(answers[3]).toEqual([{ id: "9007199254740993", label: "9007199254740994", kind: "text" }]);
+  });
+
+  /**
+   * The residual, written down rather than left to be discovered.
+   *
+   * A column with NO affinity that genuinely stores these digits as TEXT is the one case
+   * the seam cannot serve, and it is the SAME ambiguity read from the other end: the read
+   * prints the integer 9007199254740993 and the text '9007199254740993' as one identical
+   * JavaScript string, so the bind has to pick, and it picks the integer those digits
+   * exist for. Reaching it takes a quoted SQL literal - a value written through a bind is
+   * stored as an integer here, so what this provider writes it can always read back.
+   */
+  test("a no-affinity column holding these digits as TEXT is the case the seam cannot serve", async () => {
+    provider = await connect([
+      "CREATE TABLE k (id, label TEXT)",
+      "INSERT INTO k VALUES ('9007199254740993', 'quoted-literal')",
+    ]);
+
+    expect((await provider.query("SELECT typeof(id) AS kind FROM k")).rows).toEqual([{ kind: "text" }]);
+    expect((await provider.query("UPDATE k SET label = 'edited' WHERE id = ?", ["9007199254740993"])).rowCount).toBe(0);
+    // It is reachable by its text, which is what the column actually holds.
+    expect((await provider.query("SELECT label FROM k WHERE CAST(id AS TEXT) = ?", ["9007199254740993"])).rows).toEqual(
+      [{ label: "quoted-literal" }],
+    );
+    // And a bind WRITES an integer there, so the provider's own round trip stays closed.
+    await provider.query("INSERT INTO k VALUES (?, 'through-a-bind')", ["9007199254740994"]);
+    expect((await provider.query("SELECT typeof(id) AS kind FROM k WHERE label = 'through-a-bind'")).rows).toEqual([
+      { kind: "integer" },
+    ]);
+    expect((await provider.query("UPDATE k SET label = 'edited' WHERE id = ?", ["9007199254740994"])).rowCount).toBe(1);
+  });
+
+  // The same id on an affinity that DOES convert, so the contrast is pinned rather than
+  // asserted in prose.
+  test.each([["INTEGER"], ["NUMERIC"]] as const)(
+    "a 64-bit id round-trips on a %s-affinity column",
+    async (declared) => {
+      provider = await connect([
+        `CREATE TABLE k (id ${declared}, label TEXT)`,
+        "INSERT INTO k VALUES (9007199254740992, 'neighbour')",
+        "INSERT INTO k VALUES (9007199254740993, 'target')",
+      ]);
+
+      const rows = (await provider.query("SELECT id, label FROM k ORDER BY id")).rows as Record<string, unknown>[];
+      const target = rows.find((row) => row.label === "target")!;
+      const update = await provider.query("UPDATE k SET label = 'edited' WHERE id = ?", [target.id]);
+
+      expect(update.rowCount).toBe(1);
+      expect((await provider.query("SELECT id, label FROM k ORDER BY id")).rows).toEqual([
+        { id: "9007199254740992", label: "neighbour" },
+        { id: "9007199254740993", label: "edited" },
+      ]);
+    },
+  );
+
+  /**
+   * A REAL-affinity column is lossy in SQLite ITSELF, before any driver sees it: the
+   * engine stores an INTEGER there as a double, so 9007199254740993 and its neighbour
+   * become the same value in the FILE. The provider then reads one number twice and an
+   * edit keyed on it hits BOTH rows. Nothing at the driver seam can recover this, and it
+   * is pinned here so the limit is written down rather than discovered later.
+   */
+  test("a REAL-affinity column collapses two 64-bit ids in the file, before the driver", async () => {
+    provider = await connect([
+      "CREATE TABLE k (id REAL, label TEXT)",
+      "INSERT INTO k VALUES (9007199254740992, 'neighbour')",
+      "INSERT INTO k VALUES (9007199254740993, 'target')",
+    ]);
+
+    const rows = (await provider.query("SELECT id, typeof(id) AS kind FROM k ORDER BY rowid")).rows as Record<
+      string,
+      unknown
+    >[];
+    expect(rows.map((row) => row.kind)).toEqual(["real", "real"]);
+    expect(rows[0].id).toEqual(rows[1].id);
+
+    const update = await provider.query("UPDATE k SET label = 'edited' WHERE id = ?", [rows[1].id]);
+    expect(update.rowCount).toBe(2);
+  });
+
+  /**
+   * The coverage claim, checked rather than argued: every public surface that can hand
+   * a row or a scalar back, driven over a database that holds INT64's own maximum, and
+   * swept for a BigInt at any depth. A BigInt reaching any of these is a connection the
+   * browser cannot serialize at all.
+   */
+  test("no public read path leaks a BigInt when the database holds a 64-bit value", async () => {
+    delete process.env.LIBREDB_SQLITE_DRIVER;
+    const dir = mkdtempSync(join(tmpdir(), "libredb-sqlite-bigint-sweep-"));
+    const db = new SQLiteProvider(makeSQLiteConfig({ database: join(dir, "sweep.db") }));
+    try {
+      await db.connect();
+      await db.query("CREATE TABLE big (id INTEGER PRIMARY KEY, n INTEGER DEFAULT 9223372036854775807)");
+      await db.query("INSERT INTO big (id, n) VALUES (9007199254740993, 9223372036854775807)");
+      await db.query("CREATE INDEX idx_big_n ON big(n)");
+      await db.query("CREATE VIEW v_big AS SELECT id, n FROM big");
+
+      const answers: unknown[] = [
+        (await db.query("SELECT * FROM big")).rows,
+        (await db.query('PRAGMA table_info("big")')).rows,
+        (await db.query('PRAGMA index_list("big")')).rows,
+        (await db.query("PRAGMA page_count")).rows,
+        (await db.query("EXPLAIN QUERY PLAN SELECT * FROM big WHERE n = 1")).rows,
+        await db.listContainers(),
+        await db.countObjects([]),
+        await db.listObjects([], "table"),
+        await db.listObjects([], "index"),
+        await db.describeObject(["big"], "table"),
+        await db.describeObjects([], "table"),
+        await db.readObjectSource(["v_big"], "view"),
+        await db.getHealth(),
+        await db.getOverview(),
+        await db.getPerformanceMetrics(),
+        await db.getSlowQueries(),
+        await db.getActiveSessions(),
+        await db.getTableStats(),
+        await db.getIndexStats(),
+        await db.getStorageStats(),
+        await db.runMaintenance("analyze"),
+      ];
+
+      const bigints: string[] = [];
+      const seen = new Set<unknown>();
+      const walk = (value: unknown, path: string): void => {
+        if (typeof value === "bigint") {
+          bigints.push(`${path} = ${value}`);
+          return;
+        }
+        if (value === null || typeof value !== "object" || ArrayBuffer.isView(value) || seen.has(value)) {
+          return;
+        }
+        seen.add(value);
+        for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+          walk(child, `${path}.${key}`);
+        }
+      };
+      answers.forEach((answer, index) => walk(answer, `answer[${index}]`));
+
+      expect(bigints).toEqual([]);
+      expect(() => JSON.stringify(answers)).not.toThrow();
+      // and the 64-bit column DEFAULT still reaches the schema reader with every digit
+      const detail = await db.describeObject(["big"], "table");
+      expect(detail.columns.find((column) => column.name === "n")!.defaultValue).toBe("9223372036854775807");
+      // a row count is a row count, not digits
+      expect((await db.getTableStats()).find((table) => table.tableName === "big")!.rowCount).toBe(1);
+    } finally {
+      try {
+        await db.disconnect();
+      } catch {
+        // Ignore cleanup errors
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ============================================================================
+// Declared column types (#273)
+// ============================================================================
+//
+// Every other provider family fills `QueryResult.columnTypes`; the local SQLite one
+// did not, and two things downstream read it and decide with it:
+//
+//  - `src/lib/export/result-export.ts` falls back to the JAVASCRIPT TYPE of a value
+//    when no declaration came with the result. Since the 64-bit seam hands a
+//    key past 2^53 over as its digits, a SQLite `INTEGER PRIMARY KEY` holding
+//    9007199254740993 was exported as `"id" TEXT` - measured below, by replaying the
+//    generated file into SQLite, where the column came back with the `text` storage
+//    class and the table was no longer keyed by an integer.
+//  - `src/hooks/use-inline-editing.ts` reads the declared type to decide whether a
+//    key can be sent back as the row that holds it, and with nothing declared it has
+//    to fail closed.
+//
+// The declarations themselves are SQLite's own `sqlite3_column_decltype`, bridged in
+// `sqlite-driver.ts` because the two drivers spell the question differently. What is
+// asserted HERE is the provider's half, on the bun driver these tests run under - the
+// split this file has kept since it was written. The OTHER driver's half is asserted
+// against the real node:sqlite module at the seam itself, in
+// tests/unit/db/sqlite-driver.test.ts, over the same nine shapes; it is not repeated
+// in-process here, because `loadSQLiteDriver` caches per driver NAME and the unit file
+// deliberately caches a FAILURE under "node", which a second file sharing one bun
+// process would then inherit.
+
+const DECLARATION_FIXTURE = [
+  "CREATE TABLE decl (id INTEGER PRIMARY KEY, price REAL, label TEXT, payload BLOB, flag BOOLEAN, bare)",
+  "INSERT INTO decl VALUES (1, 1.5, 'first', x'0011', 1, 'anything')",
+  "CREATE VIEW decl_view AS SELECT id, price, label FROM decl",
+];
+
+describe("declared column types (#273)", () => {
+  let declared: SQLiteProvider;
+
+  beforeAll(async () => {
+    declared = new SQLiteProvider(makeSQLiteConfig());
+    await declared.connect();
+    for (const statement of DECLARATION_FIXTURE) await declared.query(statement);
+  });
+
+  afterAll(async () => {
+    await declared.disconnect();
+  });
+
+  test("the driver under test is the bun one, as this file's design assumes", () => {
+    expect(resolveSQLiteDriverName()).toBe("bun");
+  });
+
+  /**
+   * What SQLite declares for each shape a result column can have.
+   *
+   * The `undefined` rows are the point of the table rather than gaps in it: SQLite
+   * declares a type for a column that came out of a TABLE and for nothing else, so a
+   * computed column, a literal, an aggregate, a function call, every PRAGMA column and
+   * a column created with no type at all have no declaration to carry, and the key is
+   * left OFF the result rather than filled with a guess.
+   */
+  test.each([
+    ["a plain column", "SELECT id, price, label FROM decl", { id: "INTEGER", price: "REAL", label: "TEXT" }],
+    ["an alias", "SELECT id AS ident, price AS ratio FROM decl", { ident: "INTEGER", ratio: "REAL" }],
+    ["a view column", "SELECT id, label FROM decl_view", { id: "INTEGER", label: "TEXT" }],
+    ["an expression", "SELECT id + 1 AS e, price * 2 AS e2 FROM decl", undefined],
+    ["a literal", "SELECT 1 AS one, 'x' AS ex", undefined],
+    ["an aggregate", "SELECT COUNT(*) AS c, SUM(id) AS s FROM decl", undefined],
+    ["a function call", "SELECT upper(label) AS u, sqlite_version() AS v FROM decl", undefined],
+    ["a PRAGMA column", "PRAGMA table_info(decl)", undefined],
+    ["an undeclared column", "SELECT bare FROM decl", undefined],
+  ])("%s", async (_shape, sql, expected) => {
+    const result = await declared.query(sql);
+
+    expect(result.columnTypes).toEqual(expected);
+    // ABSENT rather than `{}` when nothing was declared, which is the contract every
+    // other provider already answers to: a consumer decides from the field's presence.
+    expect(Object.hasOwn(result, "columnTypes")).toBe(expected !== undefined);
+    // and the names are the result's own, so every declared key is a field on the row
+    for (const name of Object.keys(result.columnTypes ?? {})) expect(result.fields).toContain(name);
+  });
+
+  test("a result mixing a table column with a computed one declares only the table column", async () => {
+    const result = await declared.query("SELECT id, COUNT(*) AS n FROM decl GROUP BY id");
+
+    // Not all-or-nothing: `n` has no declaration and `id` does, and dropping the map
+    // because one column was undeclared would lose the one type that exists.
+    expect(result.fields).toEqual(["id", "n"]);
+    expect(result.columnTypes).toEqual({ id: "INTEGER" });
+  });
+
+  test("a result that matched no rows is still described", async () => {
+    const result = await declared.query("SELECT id, price FROM decl WHERE id = -1");
+
+    // The names and the types both come from the statement, not from a row, so a result
+    // with no rows is named and described alike. A value-shaped guess could never answer
+    // this case at all.
+    expect(result.rows).toEqual([]);
+    expect(result.fields).toEqual(["id", "price"]);
+    expect(result.columnTypes).toEqual({ id: "INTEGER", price: "REAL" });
+  });
+
+  test("a write declares nothing, because it has no result columns", async () => {
+    const result = await declared.query("UPDATE decl SET label = 'first' WHERE id = 1");
+
+    expect(result.rowCount).toBe(1);
+    expect(Object.hasOwn(result, "columnTypes")).toBe(false);
+  });
+
+  test("two result columns of one name each keep their own value and type", async () => {
+    const result = await declared.query("SELECT label AS c, 1 AS c, id AS c FROM decl");
+
+    // SQLite really does answer three columns called `c`. Each is named apart and keyed
+    // by position, so each keeps its value, and its type is paired with it by position:
+    // the undeclared literal declares none, and the third column is not shown the first's.
+    expect(result.fields).toEqual(["c", "c (2)", "c (3)"]);
+    expect(result.rows).toEqual([{ c: "first", "c (2)": 1, "c (3)": 1 }]);
+    expect(result.columnTypes).toEqual({ c: "TEXT", "c (3)": "INTEGER" });
+  });
+
+  /**
+   * The spelling is the SCHEMA's, not the storage class of the row that was read.
+   *
+   * This is the whole reason bun:sqlite's `columnTypes` is not what the bridge reads.
+   * Measured 2026-09-18 on Bun 1.4.0, `columnTypes` for this very statement answers
+   * `["INTEGER", "FLOAT", "TEXT", "BLOB", "INTEGER", "TEXT"]`: the `REAL` column comes
+   * back as `FLOAT`, the `BOOLEAN` column as `INTEGER`, and the undeclared column as
+   * whatever that row happened to hold. Reading it would have renamed half the schema.
+   */
+  test("the types are the ones the schema declares, not the storage classes of the values", async () => {
+    const result = await declared.query("SELECT id, price, label, payload, flag, bare FROM decl");
+
+    expect(result.columnTypes).toEqual({
+      id: "INTEGER",
+      price: "REAL",
+      label: "TEXT",
+      payload: "BLOB",
+      flag: "BOOLEAN",
+    });
+    // `bare` was created with no type, so it is the one column of the six with no entry.
+    expect(Object.hasOwn(result.columnTypes!, "bare")).toBe(false);
+  });
+
+  test("a 64-bit id that left the provider as digits is still declared INTEGER", async () => {
+    await declared.query("CREATE TABLE IF NOT EXISTS big_decl (id INTEGER PRIMARY KEY, label TEXT)");
+    await declared.query("DELETE FROM big_decl");
+    await declared.query("INSERT INTO big_decl VALUES (9007199254740993, 'target')");
+
+    const result = await declared.query("SELECT id, label FROM big_decl");
+
+    // The value is a string by the time it leaves the 64-bit seam and the column
+    // is an INTEGER all the same. Anything inferring the type from the value answers
+    // TEXT here, which is exactly the export defect below.
+    expect(result.rows).toEqual([{ id: "9007199254740993", label: "target" }]);
+    expect(result.columnTypes).toEqual({ id: "INTEGER", label: "TEXT" });
+  });
+});
+
+describe("declared column types on the read-only profile (#273 + #328)", () => {
+  let profileDir: string;
+
+  beforeAll(() => {
+    profileDir = mkdtempSync(join(tmpdir(), "libredb-sqlite-decl-"));
+  });
+
+  afterAll(() => {
+    rmSync(profileDir, { recursive: true, force: true });
+  });
+
+  test("the agent's read-only path carries them exactly as the ordinary path does", async () => {
+    const dbPath = join(profileDir, "profile.db");
+    const seed = new SQLiteProvider(makeSQLiteConfig({ database: dbPath }));
+    await seed.connect();
+    await seed.query("CREATE TABLE t (id INTEGER PRIMARY KEY, price REAL, v TEXT)");
+    await seed.query("INSERT INTO t VALUES (1, 1.5, 'seeded')");
+    await seed.disconnect();
+
+    const profile = new SQLiteProvider(makeSQLiteConfig({ database: dbPath }), {}, { readOnly: true });
+    await profile.connect();
+    try {
+      // The agent reads the same result shape the user does; a snapshot that described
+      // its columns on one path and not the other would be two answers to one question.
+      const result = await profile.queryReadOnly("SELECT id, price, v FROM t", AGENT_BUDGET);
+      expect(result.rows).toEqual([{ id: 1, price: 1.5, v: "seeded" }]);
+      expect(result.columnTypes).toEqual({ id: "INTEGER", price: "REAL", v: "TEXT" });
+
+      // and the same absence, on the same path
+      const computed = await profile.queryReadOnly("SELECT COUNT(*) AS n FROM t", AGENT_BUDGET);
+      expect(Object.hasOwn(computed, "columnTypes")).toBe(false);
+    } finally {
+      await profile.disconnect();
+    }
+  });
+});
+
+/**
+ * The consequence the missing declarations had on the file a user keeps (#273).
+ *
+ * `result-export.ts` writes the declared type when the result carries one and falls
+ * back to the JavaScript type of a value when it does not. Nothing here edits that
+ * file - it was already right; it was being handed nothing to read.
+ */
+describe("SQL export of a SQLite result (#273)", () => {
+  let exportDir: string;
+
+  beforeAll(() => {
+    exportDir = mkdtempSync(join(tmpdir(), "libredb-sqlite-export-"));
+  });
+
+  afterAll(() => {
+    rmSync(exportDir, { recursive: true, force: true });
+  });
+
+  test("a 64-bit key is exported as the INTEGER column it is, and replays as one", async () => {
+    const db = new SQLiteProvider(makeSQLiteConfig());
+    await db.connect();
+    let file: string;
+    try {
+      await db.query("CREATE TABLE zz (id INTEGER PRIMARY KEY, price REAL, label TEXT)");
+      await db.query("INSERT INTO zz VALUES (9007199254740993, 1.5, 'target')");
+      const result = await db.query("SELECT id, price, label FROM zz");
+
+      // The value really is a string here - that is the 64-bit seam doing its job - so
+      // the declaration is the only thing standing between it and a TEXT column.
+      expect(typeof result.rows[0].id).toBe("string");
+
+      const source = {
+        rows: result.rows,
+        fields: result.fields,
+        tabName: "zz",
+        dialect: "sqlite" as const,
+        ...(result.columnTypes === undefined ? {} : { columnTypes: result.columnTypes }),
+      };
+      const ddl = buildResultExport("sql-ddl", source).content;
+      // MEASURED before this: `"id" TEXT` and `"price" DOUBLE PRECISION`, because
+      // `inferKind` saw a string and a fractional number. Both are now the schema's.
+      expect(ddl).toContain('"id" INTEGER');
+      expect(ddl).toContain('"price" REAL');
+      expect(ddl).not.toContain('"id" TEXT');
+
+      file = `${ddl}\n${buildResultExport("sql-insert", source).content}`;
+    } finally {
+      await db.disconnect();
+    }
+
+    // The file is meant to be RUN somewhere else, so it is run: replayed into a fresh
+    // database, the key has to come back as an integer holding every digit. Before
+    // this it came back with the `text` storage class, and the table a user moved to
+    // another engine was no longer keyed by a number.
+    const replayPath = join(exportDir, "replayed.db");
+    const replay = new SQLiteProvider(makeSQLiteConfig({ database: replayPath }));
+    await replay.connect();
+    try {
+      for (const statement of file.split(";\n").filter((part) => part.trim().length > 0)) {
+        await replay.query(statement);
+      }
+      expect(await replay.query("SELECT typeof(id) AS kind FROM zz")).toMatchObject({ rows: [{ kind: "integer" }] });
+      expect(await replay.query("SELECT id FROM zz")).toMatchObject({ rows: [{ id: "9007199254740993" }] });
+      // and the column the replayed schema declares is the one the source declared
+      expect((await replay.query("SELECT id, price FROM zz")).columnTypes).toEqual({ id: "INTEGER", price: "REAL" });
+    } finally {
+      await replay.disconnect();
+    }
+  });
+
+  test("a computed column still falls back to the value's shape, because nothing declared it", async () => {
+    const db = new SQLiteProvider(makeSQLiteConfig());
+    await db.connect();
+    try {
+      await db.query("CREATE TABLE zc (id INTEGER PRIMARY KEY)");
+      await db.query("INSERT INTO zc VALUES (1)");
+      const result = await db.query("SELECT COUNT(*) AS n FROM zc");
+
+      expect(Object.hasOwn(result, "columnTypes")).toBe(false);
+      // The fallback is the RIGHT answer here rather than a leftover: SQLite declares
+      // nothing for `COUNT(*)`, so the value is the only witness there has ever been.
+      const ddl = buildResultExport("sql-ddl", {
+        rows: result.rows,
+        fields: result.fields,
+        tabName: "zc",
+        dialect: "sqlite",
+      }).content;
+      expect(ddl).toContain('"n" BIGINT');
+    } finally {
+      await db.disconnect();
+    }
+  });
+});
+
+/**
+ * The consequence the missing declarations had on the row editor (#273).
+ *
+ * `src/hooks/use-inline-editing.ts` decides whether a key can be sent back as the row
+ * that holds it by reading `QueryResult.columnTypes`, and with nothing declared it has
+ * to fail closed - so on this provider it refused keys the engine answers about
+ * perfectly. What the provider owes that decision is the declaration itself, spelled
+ * the way SQLite spells it, which is what these pin. The rule that reads them lives in
+ * the hook and is tested there; neither file is touched here.
+ *
+ * MEASURED end to end on 2026-09-18, rendering that hook over rows read through this
+ * provider, before and after the declarations existed:
+ *
+ *   key column, holding 1.5  | before      | after
+ *   DOUBLE                   | refused     | 1 UPDATE accepted
+ *   REAL                     | refused     | refused  (see below)
+ *   TEXT holding an ISO-shaped string      | refused | 1 UPDATE accepted
+ *
+ * The REAL row was the one case that did NOT close on that date, and the reason was
+ * entirely inside the hook: the float64 set it read then omitted `real`, because
+ * PostgreSQL's and Trino's `real` is 32 bits wide even though SQLite's is 64. The table is
+ * that measurement and is not current for REAL: SQLite's own module
+ * (`src/lib/db/providers/sql/sqlite-sql-writing.ts`) now declares
+ * `inlineEdit.float64TypeNames: "all"`, measured there, so the hook reads a fractional
+ * value in any SQLite column as the 8-byte double the file holds.
+ */
+describe("what the row editor reads off a SQLite result (#273)", () => {
+  let editing: SQLiteProvider;
+
+  beforeAll(async () => {
+    editing = new SQLiteProvider(makeSQLiteConfig());
+    await editing.connect();
+    await editing.query("CREATE TABLE dbl (id DOUBLE, note TEXT)");
+    await editing.query("INSERT INTO dbl VALUES (1.5, 'first')");
+    await editing.query("CREATE TABLE rl (id REAL, note TEXT)");
+    await editing.query("INSERT INTO rl VALUES (1.5, 'first'), (2.5, 'second')");
+    await editing.query("CREATE TABLE txt (id TEXT, note TEXT)");
+    await editing.query("INSERT INTO txt VALUES ('2026-01-01T10:00:00.123Z', 'first')");
+  });
+
+  afterAll(async () => {
+    await editing.disconnect();
+  });
+
+  test("a 64-bit float key arrives declared, so the editor's float64 rule can see it", async () => {
+    const result = await editing.query("SELECT id, note FROM dbl");
+
+    // `double` is the first word of the type, which is what the hook matches on. With no
+    // declaration the same 1.5 was refused as "a fractional number", and the engine was
+    // never asked about a key it answers for exactly.
+    expect(result.rows).toEqual([{ id: 1.5, note: "first" }]);
+    expect(result.columnTypes).toEqual({ id: "DOUBLE", note: "TEXT" });
+  });
+
+  test("a text key that merely LOOKS like an instant arrives declared TEXT", async () => {
+    const result = await editing.query("SELECT id, note FROM txt");
+
+    // The hook reads a serialized-date SHAPE as a date only where nothing was declared,
+    // because a `Date` through JSON is exactly that string. SQLite has no date type, so
+    // this key is text and the declaration is what says so.
+    expect(result.rows).toEqual([{ id: "2026-01-01T10:00:00.123Z", note: "first" }]);
+    expect(result.columnTypes).toEqual({ id: "TEXT", note: "TEXT" });
+  });
+
+  test("a REAL key is declared REAL, and the engine really does answer for it", async () => {
+    const result = await editing.query("SELECT id, note FROM rl");
+    expect(result.columnTypes).toEqual({ id: "REAL", note: "TEXT" });
+
+    // The other half of the measurement, so the remaining refusal is recorded against a
+    // fact rather than an assumption: SQLite matches this key exactly, once.
+    const matched = await editing.query("SELECT note FROM rl WHERE id = ?", [1.5]);
+    expect(matched.rows).toEqual([{ note: "first" }]);
+  });
+});
+
+/**
+ * Column defaults as SQLite's catalog reports them (#1029).
+ *
+ * `PRAGMA table_info` publishes `dflt_value` as the expression AS WRITTEN, so a string
+ * default arrives quoted with SQL standard doubling while a number or an expression arrives
+ * bare. Measured on SQLite 3.53.2 through `bun:sqlite`:
+ *
+ *   DEFAULT 'NULL'            -> 'NULL'
+ *   DEFAULT 'abc'             -> 'abc'
+ *   DEFAULT ''                -> ''
+ *   DEFAULT 'it''s'           -> 'it''s'
+ *   DEFAULT 'a\b'             -> 'a\b'
+ *   DEFAULT 42                -> 42
+ *   DEFAULT CURRENT_TIMESTAMP -> CURRENT_TIMESTAMP
+ *
+ * `defaultValue` is the VALUE the column defaults to; `defaultExpression` keeps the text as
+ * the engine wrote it, which is what goes after the word DEFAULT.
+ */
+describe("SQLiteProvider column defaults (#1029)", () => {
+  const DDL = `CREATE TABLE column_defaults (
+    id INTEGER PRIMARY KEY,
+    def_null_string TEXT DEFAULT 'NULL',
+    def_text TEXT DEFAULT 'abc',
+    def_empty TEXT DEFAULT '',
+    def_quote TEXT DEFAULT 'it''s',
+    def_backslash TEXT DEFAULT 'a\\b',
+    def_number INTEGER DEFAULT 42,
+    def_expression TEXT DEFAULT CURRENT_TIMESTAMP
+  )`;
+
+  const EXPECTED: Record<string, { defaultValue?: string; defaultExpression?: string }> = {
+    id: {},
+    def_null_string: { defaultValue: "NULL", defaultExpression: "'NULL'" },
+    def_text: { defaultValue: "abc", defaultExpression: "'abc'" },
+    def_empty: { defaultValue: "", defaultExpression: "''" },
+    def_quote: { defaultValue: "it's", defaultExpression: "'it''s'" },
+    def_backslash: { defaultValue: "a\\b", defaultExpression: "'a\\b'" },
+    def_number: { defaultValue: "42", defaultExpression: "42" },
+    def_expression: { defaultValue: "CURRENT_TIMESTAMP", defaultExpression: "CURRENT_TIMESTAMP" },
+  };
+
+  const defaultsOf = (columns: readonly { name: string; defaultValue?: string; defaultExpression?: string }[]) =>
+    Object.fromEntries(
+      columns.map((column) => [
+        column.name,
+        {
+          ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
+          ...(column.defaultExpression === undefined ? {} : { defaultExpression: column.defaultExpression }),
+        },
+      ]),
+    );
+
+  test("a string default is reported as its value, with the catalog text kept alongside", async () => {
+    delete process.env.LIBREDB_SQLITE_DRIVER;
+    const dir = mkdtempSync(join(tmpdir(), "libredb-sqlite-defaults-"));
+    const db = new SQLiteProvider(makeSQLiteConfig({ database: join(dir, "defaults.db") }));
+    try {
+      await db.connect();
+      await db.query(DDL);
+
+      const single = await db.describeObject(["column_defaults"], "table");
+      expect(defaultsOf(single.columns)).toEqual(EXPECTED);
+
+      // The bulk read goes through the same mapper; asserting it too is what catches a fix
+      // applied to one read and not the other, the mistake #795 had to correct.
+      const batch = await db.describeObjects([], "table");
+      const bulk = batch.details.find((detail) => detail.path[0] === "column_defaults")!;
+      expect(defaultsOf(bulk.columns)).toEqual(EXPECTED);
+    } finally {
+      try {
+        await db.disconnect();
+      } catch {
+        // Ignore cleanup errors
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ============================================================================
+// A database file this process cannot write
+// ----------------------------------------------------------------------------
+// A read-only Docker mount, or a file owned by another user. The editor used to open
+// every file read-write with `create` and `PRAGMA journal_mode = WAL`, so such a file
+// could not be opened at all: health, inventory and counts all answered 503 with
+// "attempt to write a readonly database", while the agent's read-only handle read it
+// fine (reproduced 2026-09-26 in Docker as uid 1001 with the file mounted `:ro`).
+//
+// The mode bits are the fixture, so the test cannot run where they mean nothing: root
+// passes every permission check, and Windows enforces no directory mode. The Linux CI job
+// runs as an ordinary user, which is where these lines are covered.
+// ============================================================================
+
+const MISSING_UNWRITABLE_FILE: string | null =
+  MISSING_POSIX_FILE_MODES ??
+  (process.getuid?.() === 0 ? "running as root: file modes do not restrict root, so nothing is unwritable" : null);
+
+/**
+ * A database of three orders in `dir`, then made unwritable: 0444 on the file and 0555 on
+ * the directory. Written with the driver directly rather than through the provider, because
+ * the provider leaves a file in WAL mode, and that is its own fixture (see "a WAL-mode file"
+ * below).
+ *
+ * A WAL fixture is the file alone, with no `-wal` or `-shm` beside it, unless `keepWal`
+ * leaves its `-wal`. Closing removes both on Linux and Windows but not on macOS, where
+ * bun:sqlite links Apple's libsqlite3, which keeps them (docs/providers/sqlite.md §3.2);
+ * with them left in place the read-only open succeeded on the macos-latest runner
+ * (2026-09-26). So the checkpoint moves every row into the file, `PERSIST_WAL` makes every
+ * platform keep the `-wal` alike, and what is not kept goes by hand.
+ */
+function writeUnwritableFixture(dir: string, journalMode: "delete" | "wal", keepWal = false): string {
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, "shop.db");
+  const db = new BunDatabase(file, { create: true, readwrite: true });
+  db.exec(`PRAGMA journal_mode = ${journalMode}`);
+  db.exec("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer TEXT NOT NULL, total REAL)");
+  db.exec("INSERT INTO orders VALUES (1, 'ada', 10.5), (2, 'bob', 20), (3, 'cy', 30.25)");
+  if (journalMode === "wal") {
+    db.fileControl(sqliteConstants.SQLITE_FCNTL_PERSIST_WAL, 1);
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  }
+  db.close(true);
+  if (!keepWal) rmSync(`${file}-wal`, { force: true });
+  rmSync(`${file}-shm`, { force: true });
+  chmodSync(file, 0o444);
+  chmodSync(dir, 0o555);
+  return file;
+}
+
+/** Bundle sqlite-node-harness.ts for Node and run one scenario with the node driver forced. */
+function runNodeHarness(dbPath: string, scenario: string): Record<string, unknown> {
+  const bundleDir = mkdtempSync(join(tmpdir(), "libredb-sqlite-node-unwritable-"));
+  try {
+    const bundlePath = join(bundleDir, "sqlite-node-harness.mjs");
+    const build = spawnSync(
+      process.execPath,
+      [
+        "build",
+        join(import.meta.dir, "sqlite-node-harness.ts"),
+        "--target=node",
+        "--format=esm",
+        "--external",
+        "bun:sqlite",
+        "--outfile",
+        bundlePath,
+      ],
+      { timeout: 60_000 },
+    );
+    if (build.error) throw new Error(`bun build could not run: ${build.error.message}`);
+    if (build.status !== 0) throw new Error(`bun build ${howItFailed(build)}: ${build.stderr?.toString()}`);
+    const run = spawnSync("node", [bundlePath, dbPath, scenario], {
+      env: { ...process.env, LIBREDB_SQLITE_DRIVER: "node" },
+      timeout: 60_000,
+    });
+    if (run.error) throw new Error(`node harness could not run: ${run.error.message}`);
+    if (run.status !== 0) throw new Error(`node harness ${howItFailed(run)}: ${run.stderr?.toString()}`);
+    // The report is the last line; the logger writes to stdout too, and its lines come back
+    // beside the report as `logLines`.
+    const lines = run.stdout.toString().trim().split("\n");
+    const report = JSON.parse(lines.pop()!) as Record<string, unknown>;
+    return { ...report, logLines: lines };
+  } finally {
+    rmSync(bundleDir, { recursive: true, force: true });
+  }
+}
+
+/** The reason a refused WAL-mode file is given, before SQLite's own words. */
+const WAL_REFUSAL = (file: string) =>
+  `Failed to open SQLite database: ${file} is open read-only because this process cannot write the file or its directory, and a file in WAL journal mode cannot be read without a -shm file beside it; switch it to a rollback journal (PRAGMA journal_mode = DELETE) where it is writable, or make its directory writable: `;
+
+const READ_ONLY_INSERT_MESSAGE = (file: string) =>
+  `SQLite database ${file} is open read-only because this process cannot write the file or its directory: attempt to write a readonly database`;
+
+describe("SQLiteProvider on a database file this process cannot write", () => {
+  let root: string;
+  let infoSpy: { mockRestore(): void } | undefined;
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "libredb-sqlite-unwritable-"));
+  });
+
+  afterAll(() => {
+    // The fixtures took the write bit off their directories, and rmSync needs it back.
+    for (const entry of readdirSync(root)) chmodSync(join(root, entry), 0o755);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  afterEach(() => {
+    infoSpy?.mockRestore();
+    infoSpy = undefined;
+  });
+
+  /** The info lines that announced a read-only open. */
+  function readOnlyDecisions(spy: { mock: { calls: unknown[][] } }): string[] {
+    return spy.mock.calls.map(([message]) => String(message)).filter((message) => message.includes("read-only"));
+  }
+
+  describeIf(MISSING_UNWRITABLE_FILE, "with file mode 0444 in a directory with mode 0555", () => {
+    test("connects read-only, answers health, lists objects and runs a SELECT", async () => {
+      const dir = join(root, "readonly");
+      const file = writeUnwritableFixture(dir, "delete");
+      const spy = spyOn(logger, "info");
+      infoSpy = spy;
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      try {
+        await db.connect();
+        expect(db.isConnected()).toBe(true);
+
+        // The decision is logged once, with the path, at info.
+        const decisions = readOnlyDecisions(spy);
+        expect(decisions).toHaveLength(1);
+        expect(decisions[0]).toContain(file);
+
+        const health = await db.getHealth();
+        expect(health.slowQueries.find((sq) => sq.query.includes("Integrity"))!.query).toContain("OK");
+        // Still the file's own rollback journal: nothing tried to switch it to WAL.
+        expect((await db.query("PRAGMA journal_mode")).rows).toEqual([{ journal_mode: "delete" }]);
+
+        expect((await db.listObjects([], "table")).map((object) => object.name)).toEqual(["orders"]);
+        expect((await db.countObjects([])).table).toEqual({ count: 1 });
+
+        const select = await db.query("SELECT customer, total FROM orders ORDER BY id");
+        expect(select.rows).toEqual([
+          { customer: "ada", total: 10.5 },
+          { customer: "bob", total: 20 },
+          { customer: "cy", total: 30.25 },
+        ]);
+      } finally {
+        await db.disconnect();
+      }
+      // A read-only open leaves no sidecar behind, and could not create one anyway.
+      expect(readdirSync(dir)).toEqual(["shop.db"]);
+    });
+
+    test("an INSERT fails with SQLite's read-only error, named as such", async () => {
+      const file = join(root, "readonly", "shop.db");
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      try {
+        await db.connect();
+        const insert = db.query("INSERT INTO orders VALUES (4, 'dee', 1)");
+        await expect(insert).rejects.toBeInstanceOf(QueryError);
+        await expect(insert).rejects.toThrow(READ_ONLY_INSERT_MESSAGE(file));
+        expect((await db.query("SELECT COUNT(*) AS n FROM orders")).rows).toEqual([{ n: 3 }]);
+      } finally {
+        await db.disconnect();
+      }
+    });
+
+    // SQLite reads a WAL-mode file only with a `-shm` file beside it, and a directory it
+    // cannot write gives it nowhere to make one, so even a read-only handle is refused
+    // (measured on bun:sqlite and node:sqlite, 2026-09-26). The provider cannot change
+    // that, but it can say why instead of passing on SQLite's bare refusal. The child
+    // worker runs node:sqlite, whose bundled library answers this file alone with
+    // SQLITE_READONLY on every platform (bun:sqlite had worded it SQLITE_CANTOPEN on
+    // Apple), so the reason is read from the file's header and the engine's own words
+    // follow it unvaried.
+    test("a WAL-mode file is refused with the reason and the way out", async () => {
+      const file = writeUnwritableFixture(join(root, "wal"), "wal");
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      const connect = db.connect();
+      await expect(connect).rejects.toBeInstanceOf(ConnectionError);
+      await expect(connect).rejects.toThrow(WAL_REFUSAL(file) + "attempt to write a readonly database");
+      expect(db.isConnected()).toBe(false);
+    });
+
+    // A `-wal` left beside the file with no `-shm` is SQLITE_CANTOPEN on Linux too.
+    test("a WAL-mode file with its -wal left and no -shm is refused with the same reason", async () => {
+      const dir = join(root, "wal-left");
+      const file = writeUnwritableFixture(dir, "wal", true);
+      expect(readdirSync(dir).sort()).toEqual(["shop.db", "shop.db-wal"]);
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      const connect = db.connect();
+      await expect(connect).rejects.toBeInstanceOf(ConnectionError);
+      await expect(connect).rejects.toThrow(`${WAL_REFUSAL(file)}unable to open database file`);
+      expect(db.isConnected()).toBe(false);
+    });
+
+    // The control: a refusal that has nothing to do with WAL keeps SQLite's words alone.
+    test("a file this process cannot read is refused without the WAL reason", async () => {
+      const dir = join(root, "unreadable");
+      const file = writeUnwritableFixture(dir, "delete");
+      chmodSync(dir, 0o755);
+      chmodSync(file, 0o000);
+      chmodSync(dir, 0o555);
+      const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+      const connect = db.connect();
+      await expect(connect).rejects.toBeInstanceOf(ConnectionError);
+      await expect(connect).rejects.toThrow(
+        /^Failed to open SQLite database: (unable to open database file|EACCES: permission denied, lstat .*)$/,
+      );
+      expect(db.isConnected()).toBe(false);
+    });
+
+    testIf(
+      nodeDriverTestable ? null : "`node` with node:sqlite is not available on this machine",
+      "the same file under LIBREDB_SQLITE_DRIVER=node (node:sqlite)",
+      () => {
+        const dir = join(root, "readonly");
+        const file = join(dir, "shop.db");
+        const report = runNodeHarness(file, "unwritable");
+        expect(report.runtime).toBe("node");
+        expect(report.driverEnv).toBe("node");
+        expect(report.connected).toBe(true);
+        const decisions = (report.logLines as string[]).filter((line) => line.includes("read-only"));
+        expect(decisions).toHaveLength(1);
+        expect(decisions[0]).toContain(file);
+        expect(report.integrity).toContain("OK");
+        expect(report.journalMode).toEqual([{ journal_mode: "delete" }]);
+        expect(report.tables).toEqual(["orders"]);
+        expect(report.count).toEqual([{ n: 3 }]);
+        expect(report.insertError).toBe(`QueryError: ${READ_ONLY_INSERT_MESSAGE(file)}`);
+        expect(readdirSync(dir)).toEqual(["shop.db"]);
+      },
+    );
+  });
+
+  // The control: the write check must not turn an ordinary file read-only.
+  test("a writable file still opens read-write in WAL mode", async () => {
+    const dir = join(root, "writable");
+    mkdirSync(dir);
+    const spy = spyOn(logger, "info");
+    infoSpy = spy;
+    const db = new SQLiteProvider(makeSQLiteConfig({ database: join(dir, "shop.db") }));
+    try {
+      await db.connect();
+      expect((await db.query("PRAGMA journal_mode")).rows).toEqual([{ journal_mode: "wal" }]);
+      await db.query("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+      expect((await db.query("INSERT INTO t VALUES (1)")).rowCount).toBe(1);
+      expect(readOnlyDecisions(spy)).toEqual([]);
+    } finally {
+      await db.disconnect();
+    }
+  });
+
+  // The write check only turns "you may not write this" into a read-only open. Any other
+  // answer from the filesystem is a real failure and surfaces as one.
+  test("a write check that fails for another reason is raised, not read as read-only", async () => {
+    const dir = join(root, "eio");
+    mkdirSync(dir);
+    const file = join(dir, "shop.db");
+    writeFileSync(file, "");
+    const accessSpy = spyOn(fsNode, "accessSync").mockImplementation(() => {
+      throw Object.assign(new Error("EIO: i/o error, access"), { code: "EIO" });
+    });
+    const db = new SQLiteProvider(makeSQLiteConfig({ database: file }));
+    try {
+      await expect(db.connect()).rejects.toThrow("Failed to open SQLite database: EIO: i/o error, access");
+      expect(db.isConnected()).toBe(false);
+    } finally {
+      accessSpy.mockRestore();
+    }
+  });
+});
+
+// ============================================================================
+// A BLOB round trip: provider, wire, export, replay
+// ============================================================================
+// The whole path a BLOB takes to a user's file and back, on the real bun:sqlite driver.
+// The rows cross `JSON.stringify` and `JSON.parse` exactly as `POST /api/db/query` and
+// the browser do. Before the driver seam handed back a Buffer, the bytes arrived as
+// `{"0":222,...}`, the SQL export wrote that object as quoted text, and the replay
+// below stored a TEXT value in place of the six bytes.
+
+describe("a BLOB survives the wire, the export and a replay", () => {
+  test("the SQL INSERT export writes X'..' and replays to identical bytes", async () => {
+    const provider = new SQLiteProvider(makeSQLiteConfig());
+    await provider.connect();
+    await provider.query("CREATE TABLE src (id INTEGER PRIMARY KEY, bin BLOB)");
+    await provider.query("INSERT INTO src VALUES (1, x'DEADBEEF00FF'), (2, x'')");
+
+    const read = await provider.query("SELECT id, bin FROM src ORDER BY id");
+    const wire = JSON.parse(JSON.stringify(read.rows)) as Record<string, unknown>[];
+    expect(wire[0]?.bin).toEqual({ type: "Buffer", data: [0xde, 0xad, 0xbe, 0xef, 0x00, 0xff] });
+
+    const source = { rows: wire, fields: read.fields, tabName: "dst", dialect: "sqlite" as const };
+    expect(buildResultExport("csv", source).content).toContain("1,\\xdeadbeef00ff");
+    const insert = buildResultExport("sql-insert", source).content;
+    expect(insert.split("\n")).toEqual([
+      `INSERT INTO dst ("id", "bin") VALUES (1, X'deadbeef00ff');`,
+      `INSERT INTO dst ("id", "bin") VALUES (2, X'');`,
+    ]);
+
+    await provider.query("CREATE TABLE dst (id INTEGER PRIMARY KEY, bin BLOB)");
+    await Promise.all(insert.split("\n").map((statement) => provider.query(statement)));
+    const replayed = await provider.query(
+      "SELECT d.id, typeof(d.bin) AS kind, hex(d.bin) AS hex, d.bin = s.bin AS same FROM dst d JOIN src s USING (id) ORDER BY d.id",
+    );
+    expect(replayed.rows).toEqual([
+      { id: 1, kind: "blob", hex: "DEADBEEF00FF", same: 1 },
+      { id: 2, kind: "blob", hex: "", same: 1 },
+    ]);
+    await provider.disconnect();
   });
 });

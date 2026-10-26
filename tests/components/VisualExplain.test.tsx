@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { VisualExplain, type ExplainPlanResult } from "@/components/VisualExplain";
+import { schemaContextOf } from "@/lib/db/detailed-object";
+import { SAMPLED_MARKER, sampledSchema } from "../fixtures/sampled-schema";
 
 let originalFetch: typeof globalThis.fetch;
 
@@ -208,10 +210,188 @@ describe("VisualExplain", () => {
     expect(queryByText(/Statistics may be outdated/)).not.toBeNull();
   });
 
+  test("does not report a downward estimate mismatch for an index scan stopped by Limit", () => {
+    const plan: ExplainPlanResult[] = [
+      {
+        Plan: {
+          "Node Type": "Limit",
+          "Plan Rows": 10,
+          "Actual Rows": 10,
+          Plans: [{ "Node Type": "Index Scan", "Plan Rows": 25000, "Actual Rows": 10 }],
+        },
+      },
+    ];
+    const { queryByText } = render(<VisualExplain plan={plan} />);
+    expect(queryByText("Estimate Mismatch")).toBeNull();
+    expect(queryByText("Query looks good")).not.toBeNull();
+  });
+
+  test("reports a downward estimate mismatch for a scan below Limit and Sort", () => {
+    const plan: ExplainPlanResult[] = [
+      {
+        Plan: {
+          "Node Type": "Limit",
+          "Plan Rows": 10,
+          "Actual Rows": 10,
+          Plans: [
+            {
+              "Node Type": "Sort",
+              "Plan Rows": 10,
+              "Actual Rows": 10,
+              Plans: [{ "Node Type": "Seq Scan", "Plan Rows": 25000, "Actual Rows": 10 }],
+            },
+          ],
+        },
+      },
+    ];
+    const { queryByText } = render(<VisualExplain plan={plan} />);
+    expect(queryByText("Estimate Mismatch")).not.toBeNull();
+    expect(queryByText("Expected 25.0K rows, got 10. Statistics may be outdated.")).not.toBeNull();
+  });
+
+  test("reports a downward estimate mismatch for a scan below Limit and a Hashed SetOp", () => {
+    // The plan PostgreSQL 18.6 gives `SELECT x FROM a EXCEPT SELECT x FROM b LIMIT 5`
+    // with stale statistics on `a`: the Hashed SetOp read the whole scan before its first row.
+    const plan: ExplainPlanResult[] = [
+      {
+        Plan: {
+          "Node Type": "Limit",
+          "Plan Rows": 5,
+          "Actual Rows": 5,
+          Plans: [
+            {
+              "Node Type": "SetOp",
+              Strategy: "Hashed",
+              "Plan Rows": 50000,
+              "Actual Rows": 5,
+              Plans: [
+                { "Node Type": "Seq Scan", "Plan Rows": 50000, "Actual Rows": 300 },
+                { "Node Type": "Seq Scan", "Plan Rows": 100, "Actual Rows": 100 },
+              ],
+            },
+          ],
+        },
+      },
+    ];
+    const { queryByText } = render(<VisualExplain plan={plan} />);
+    expect(queryByText("Expected 50.0K rows, got 300. Statistics may be outdated.")).not.toBeNull();
+  });
+
+  test("reports an upward estimate mismatch for an index scan below Limit", () => {
+    const plan: ExplainPlanResult[] = [
+      {
+        Plan: {
+          "Node Type": "Limit",
+          "Plan Rows": 10,
+          "Actual Rows": 10,
+          Plans: [{ "Node Type": "Index Scan", "Plan Rows": 100, "Actual Rows": 5000 }],
+        },
+      },
+    ];
+    const { queryByText } = render(<VisualExplain plan={plan} />);
+    expect(queryByText("Estimate Mismatch")).not.toBeNull();
+    expect(queryByText("Expected 100 rows, got 5.0K. Statistics may be outdated.")).not.toBeNull();
+  });
+
+  test("reports a downward estimate mismatch when there is no Limit", () => {
+    const plan: ExplainPlanResult[] = [{ Plan: { "Node Type": "Index Scan", "Plan Rows": 25000, "Actual Rows": 10 } }];
+    const { queryByText } = render(<VisualExplain plan={plan} />);
+    expect(queryByText("Estimate Mismatch")).not.toBeNull();
+  });
+
+  test.each([
+    ["Hash", undefined],
+    ["Aggregate", "Plain"],
+    ["Aggregate", "Hashed"],
+  ])("reports a scan's mismatch below Limit and %s (%s)", (nodeType, strategy) => {
+    const plan: ExplainPlanResult[] = [
+      {
+        Plan: {
+          "Node Type": "Limit",
+          "Plan Rows": 10,
+          "Actual Rows": 10,
+          Plans: [
+            {
+              "Node Type": nodeType,
+              Strategy: strategy,
+              "Plan Rows": 50000,
+              "Actual Rows": 10,
+              Plans: [{ "Node Type": "Seq Scan", "Plan Rows": 25000, "Actual Rows": 10 }],
+            },
+          ],
+        },
+      },
+    ];
+    const { queryByText, getAllByText } = render(<VisualExplain plan={plan} />);
+    expect(getAllByText("Estimate Mismatch")).toHaveLength(1);
+    expect(queryByText("Expected 25.0K rows, got 10. Statistics may be outdated.")).not.toBeNull();
+  });
+
+  test.each([
+    ["Result", undefined],
+    ["Aggregate", "Sorted"],
+    ["Hash Join", undefined],
+  ])("carries Limit context through streaming %s (%s)", (nodeType, strategy) => {
+    const plan: ExplainPlanResult[] = [
+      {
+        Plan: {
+          "Node Type": "Limit",
+          "Plan Rows": 10,
+          "Actual Rows": 10,
+          Plans: [
+            {
+              "Node Type": nodeType,
+              Strategy: strategy,
+              "Plan Rows": 25000,
+              "Actual Rows": 10,
+              Plans: [{ "Node Type": "Index Scan", "Plan Rows": 25000, "Actual Rows": 10 }],
+            },
+          ],
+        },
+      },
+    ];
+    const { queryByText } = render(<VisualExplain plan={plan} />);
+    expect(queryByText("Estimate Mismatch")).toBeNull();
+  });
+
+  test("a nested Limit stops its scan even below a blocking Sort", () => {
+    const plan: ExplainPlanResult[] = [
+      {
+        Plan: {
+          "Node Type": "Sort",
+          "Plan Rows": 10,
+          "Actual Rows": 10,
+          Plans: [
+            {
+              "Node Type": "Limit",
+              "Plan Rows": 10,
+              "Actual Rows": 10,
+              Plans: [{ "Node Type": "Index Scan", "Plan Rows": 25000, "Actual Rows": 10 }],
+            },
+          ],
+        },
+      },
+    ];
+    const { queryByText } = render(<VisualExplain plan={plan} />);
+    expect(queryByText("Estimate Mismatch")).toBeNull();
+  });
+
   test('shows "Query looks good" for healthy plan', () => {
     const { queryByText } = render(<VisualExplain plan={healthyPlan} />);
     expect(queryByText("Query looks good")).not.toBeNull();
     expect(queryByText(/No obvious performance issues/)).not.toBeNull();
+  });
+
+  /**
+   * A plan with no node in it was read as a verdict (#1389): MySQL's rows cast to this model
+   * showed "Operations 0" under the green card. Nothing parsed is nothing judged.
+   */
+  test('a plan with no node it can read never says "Query looks good"', () => {
+    const { queryByText } = render(
+      <VisualExplain plan={[{ EXPLAIN: '{"query_block":{}}' } as unknown as ExplainPlanResult]} />,
+    );
+    expect(queryByText("Query looks good")).toBeNull();
+    expect(queryByText("Plan could not be read")).not.toBeNull();
   });
 
   test("shows Expensive Sort warning", () => {
@@ -482,13 +662,13 @@ describe("VisualExplain", () => {
       expect(queryByText("inline code")).not.toBeNull();
     });
 
-    // One SQL fenced block (blue styling) and one non-SQL "text" fenced block (zinc styling).
+    // One SQL fenced block (accent styling) and one non-SQL "text" fenced block (neutral fill styling).
     const pres = container.querySelectorAll("pre");
     expect(pres.length).toBe(2);
 
     const sqlPre = Array.from(pres).find((pre) => pre.textContent?.includes("SELECT * FROM users;"));
     expect(sqlPre).not.toBeUndefined();
-    expect(sqlPre!.className).toContain("bg-blue-500/5");
+    expect(sqlPre!.className).toContain("bg-brand-tint/5");
 
     const nonSqlPre = Array.from(pres).find((pre) => pre.textContent?.includes("plain block content"));
     expect(nonSqlPre).not.toBeUndefined();
@@ -708,17 +888,17 @@ describe("VisualExplain", () => {
       },
     ];
     const { container } = render(<VisualExplain plan={joinPlan} />);
-    // Layers icon for Join has text-purple-400 class
-    const purpleIcon = container.querySelector(".text-purple-400");
+    // Layers icon for Join carries the purple identity hue token
+    const purpleIcon = container.querySelector(".text-hue-purple");
     expect(purpleIcon).not.toBeNull();
   });
 
   test("NodeIcon renders ArrowDown icon for Sort type", () => {
     // sortPlan already has Node Type = 'Sort'
     const { container } = render(<VisualExplain plan={sortPlan} />);
-    // Sort nodes use ArrowDown icon with text-amber-400
-    // Seq Scan also uses amber-400, but sortPlan has 'Sort' not 'Seq Scan'
-    const amberIcon = container.querySelector(".text-amber-400");
+    // Sort nodes use ArrowDown icon with the amber identity hue token
+    // Seq Scan also uses text-hue-amber, but sortPlan has 'Sort' not 'Seq Scan'
+    const amberIcon = container.querySelector(".text-hue-amber");
     expect(amberIcon).not.toBeNull();
   });
 
@@ -737,8 +917,8 @@ describe("VisualExplain", () => {
       },
     ];
     const { container } = render(<VisualExplain plan={aggPlan} />);
-    // Aggregate uses Zap icon with text-pink-400
-    const pinkIcon = container.querySelector(".text-pink-400");
+    // Aggregate uses Zap icon with the pink identity hue token
+    const pinkIcon = container.querySelector(".text-hue-pink");
     expect(pinkIcon).not.toBeNull();
   });
 
@@ -757,8 +937,8 @@ describe("VisualExplain", () => {
       },
     ];
     const { container } = render(<VisualExplain plan={hashPlan} />);
-    // Hash uses HardDrive icon with text-cyan-400
-    const cyanIcon = container.querySelector(".text-cyan-400");
+    // Hash uses HardDrive icon with the cyan identity hue token
+    const cyanIcon = container.querySelector(".text-hue-cyan");
     expect(cyanIcon).not.toBeNull();
   });
 
@@ -866,6 +1046,63 @@ describe("VisualExplain", () => {
 });
 
 // ============================================================================
+// An estimated PostgreSQL plan (`EXPLAIN (FORMAT JSON)`, nothing executed)
+// ============================================================================
+
+/**
+ * The background plan beside every run is an estimate since #1311: the ANALYZE form
+ * ran the user's statement a second time. Such a plan carries `Plan Rows` and
+ * `Total Cost` and no `Actual *` field at all, so the panel must not read it as a run
+ * that returned zero rows in zero time.
+ */
+describe("VisualExplain with an estimated plan", () => {
+  // The shape `EXPLAIN (FORMAT JSON)` answers on PostgreSQL 18: no Actual fields, no
+  // Execution Time, no buffer counts.
+  const estimatedPlan: ExplainPlanResult[] = [
+    {
+      Plan: {
+        "Node Type": "Seq Scan",
+        "Relation Name": "events",
+        "Plan Rows": 250000,
+        "Total Cost": 4831.5,
+        Plans: [{ "Node Type": "Index Scan", "Relation Name": "users", "Plan Rows": 1, "Total Cost": 8.3 }],
+      },
+    },
+  ];
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  test("the header says the plan was not executed and shows the planned rows", () => {
+    const { queryByText, queryAllByText } = render(<VisualExplain plan={estimatedPlan} />);
+    expect(queryByText("not executed")).not.toBeNull();
+    expect(queryByText("execution")).toBeNull();
+    expect(queryAllByText("~250.0K").length).toBeGreaterThan(0);
+  });
+
+  test("plan nodes show planned rows and cost, never zero rows in zero time", () => {
+    const { queryByText, queryAllByText } = render(<VisualExplain plan={estimatedPlan} />);
+    fireEvent.click(queryByText("tree")!);
+    expect(queryAllByText("~250.0K rows").length).toBeGreaterThan(0);
+    expect(queryAllByText("cost 4.8K").length).toBeGreaterThan(0);
+    expect(queryAllByText("0 rows")).toHaveLength(0);
+    expect(queryAllByText("0μs")).toHaveLength(0);
+  });
+
+  test("a large planned sequential scan is still flagged, from the planner's row count", () => {
+    const { queryByText } = render(<VisualExplain plan={estimatedPlan} />);
+    expect(queryByText("Sequential Scan")).not.toBeNull();
+    expect(queryByText(/Full table scan on "events" \(250\.0K rows\)/)).not.toBeNull();
+  });
+
+  test("the Execution insight says the plan was not executed", () => {
+    const { queryAllByText } = render(<VisualExplain plan={estimatedPlan} />);
+    expect(queryAllByText("Not executed").length).toBeGreaterThan(0);
+  });
+});
+
+// ============================================================================
 // Tree render model (sqlite-queryplan and other tagged-tree strategies)
 // ============================================================================
 
@@ -909,6 +1146,39 @@ describe("tree render model (sqlite-queryplan)", () => {
     );
     fireEvent.click(queryByText("raw")!);
     expect(getByText(/"detail": "SCAN employee"/)).toBeTruthy();
+  });
+
+  test("a tree node's detail is shown, so a text plan's attributes are not dropped", () => {
+    // CockroachDB v26.2.5 prints a plan node's attributes on their own lines under it
+    // (`table: orders@orders_pkey`, `spans: FULL SCAN`), and `postgres-text` folds them
+    // into the node they describe rather than nesting an operator under one of them.
+    // A renderer that shows only the label would throw away most of that plan - and
+    // TiDB's extra EXPLAIN columns with it, which is the same field (#597).
+    const withDetail = {
+      kind: "tree" as const,
+      root: {
+        label: "EXPLAIN",
+        children: [{ label: "\u2022 scan", detail: "table: orders@orders_pkey, spans: FULL SCAN", children: [] }],
+      },
+      raw: "\u2022 scan",
+    };
+    const { getByText } = render(<VisualExplain plan={withDetail} query="SELECT 1" databaseType="postgres" />);
+    expect(getByText("table: orders@orders_pkey, spans: FULL SCAN")).toBeTruthy();
+  });
+
+  test("raw tab prints a string raw plan verbatim (mysql-text)", () => {
+    // mysql-text stores the plan as the engine printed it, not as JSON: measured
+    // 2026-09-06, `EXPLAIN SELECT 1` on StarRocks 3.3.22 answers one column of plain
+    // text. JSON.stringify would show it wrapped in quotes with escaped newlines.
+    const textPlan = {
+      kind: "tree" as const,
+      root: { label: "EXPLAIN", children: [{ label: "PLAN FRAGMENT 0", children: [] }] },
+      raw: "PLAN FRAGMENT 0\n  RESULT SINK",
+    };
+    const { getByText, queryByText } = render(<VisualExplain plan={textPlan} query="SELECT 1" databaseType="mysql" />);
+    fireEvent.click(queryByText("raw")!);
+    const pre = getByText(/PLAN FRAGMENT 0/);
+    expect(pre.textContent).toBe("PLAN FRAGMENT 0\n  RESULT SINK");
   });
 
   test("legacy array prop still renders the postgres pipeline", () => {
@@ -1034,8 +1304,13 @@ describe("tree render model (sqlite-queryplan)", () => {
       rerender(<VisualExplain plan={TREE_INPUT} query="SELECT 1" databaseType="sqlite" />);
 
       await waitFor(() => {
-        // the previous plan's response is gone and the tab is back to its initial state
-        expect(queryByText("Old Analysis")).toBeNull();
+        // the previous plan's response is gone and the tab is back to its initial state.
+        // `=== null` and not `toBeNull()` on the node, in this poll and in the one the next test
+        // runs: a FAILING poll would make bun pretty-print the element, which walks the whole
+        // happy-dom node's object graph. 301 ms for a 260-node subtree, measured, so a few polls
+        // eat waitFor's 5 s budget and a briefly busy machine reds a healthy test. The boolean is
+        // 0 ms and asserts the same absence.
+        expect(queryByText("Old Analysis") === null).toBe(true);
         expect(queryByText("AI Query Analysis")).not.toBeNull();
         // the previous request's controller was aborted
         expect(abortSpy).toHaveBeenCalled();
@@ -1066,7 +1341,7 @@ describe("tree render model (sqlite-queryplan)", () => {
     rerender(<VisualExplain plan={samplePlan} query="SELECT id FROM users" databaseType="postgres" />);
 
     await waitFor(() => {
-      expect(queryByText("Old Analysis")).toBeNull();
+      expect(queryByText("Old Analysis") === null).toBe(true);
       expect(queryByText("AI Query Analysis")).not.toBeNull();
     });
   });
@@ -1088,5 +1363,41 @@ describe("tree render model (sqlite-queryplan)", () => {
   test("tagged postgres-json input with an empty plan falls back to the empty state", () => {
     const { getByText } = render(<VisualExplain plan={{ kind: "postgres-json", plan: [] }} />);
     expect(getByText("No execution plan")).toBeTruthy();
+  });
+});
+
+describe("VisualExplain and a column the engine only inferred from sampled data", () => {
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    cleanup();
+  });
+
+  test("the AI explanation request carries no byte of it", async () => {
+    const user = userEvent.setup();
+    globalThis.fetch = mockFetchStream("## Analysis") as unknown as typeof fetch;
+    const { queryByText } = render(
+      <VisualExplain
+        plan={samplePlan}
+        query="SELECT * FROM articles"
+        databaseType="postgres"
+        schemaContext={schemaContextOf(sampledSchema)}
+      />,
+    );
+    fireEvent.click(queryByText("AI Explain")!);
+    await user.click(queryByText("Analyze with AI")!);
+    await waitFor(() => {
+      expect(globalThis.fetch).toHaveBeenCalled();
+    });
+    const [url, init] = (globalThis.fetch as unknown as ReturnType<typeof mock>).mock.calls[0] as unknown as [
+      string,
+      RequestInit,
+    ];
+    expect(url).toBe("/api/ai/explain");
+    expect(String(init.body)).toContain("category");
+    expect(String(init.body)).not.toContain(SAMPLED_MARKER);
   });
 });

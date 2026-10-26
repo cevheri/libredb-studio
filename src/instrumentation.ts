@@ -20,6 +20,24 @@ export async function register(): Promise<void> {
   const { verifyAuthEnvAtBoot } = await import("@/lib/config/auth-preflight");
   if (!verifyAuthEnvAtBoot()) return;
 
+  // Governance preflight (docs/GOVERNANCE.md#boot-checks): with
+  // GOVERNANCE_SOURCE set, refuse an environment that contradicts governance
+  // mode, such as a password, a seed file or a missing governance URL, before
+  // anything acts on it. It checks nothing while governance is off.
+  const { verifyGovernanceEnvAtBoot } = await import("@/lib/governance/preflight");
+  if (!verifyGovernanceEnvAtBoot()) return;
+
+  // Governance snapshot (docs/GOVERNANCE.md#operating-notes): load the
+  // governance source in the background and keep it current. Not awaited, so
+  // the server serves at once and data routes answer 503 until the first load
+  // succeeds; a database outage never stops it. Imported only under governance,
+  // so a Studio without GOVERNANCE_SOURCE never loads the governance pool.
+  const { governanceEnabled } = await import("@/lib/governance/config");
+  if (governanceEnabled()) {
+    const { startGovernance } = await import("@/lib/governance/start");
+    startGovernance();
+  }
+
   const { logger } = await import("@/lib/logger");
 
   // LibreDB sample: programmatic and fast — seeded synchronously as before.
@@ -52,6 +70,12 @@ export async function register(): Promise<void> {
   // refuses to boot never prints a welcome. Never throws.
   const { printStartupBanner } = await import("@/lib/startup-banner");
   printStartupBanner();
+
+  // Agent resume sweep (#329 B9): pick up runs a dead process left `running`.
+  // The sweep itself checks whether the agent runtime is enabled, so wiring it
+  // here costs nothing when AI is off. Never throws, and never blocks boot.
+  const { startAgentResumeSweep } = await import("@/lib/agent/resume-sweep");
+  startAgentResumeSweep();
 
   if (!isSqliteSampleEnabled()) return;
 

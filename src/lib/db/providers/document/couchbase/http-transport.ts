@@ -21,8 +21,13 @@
 import { promises as dns, type SrvRecord } from "node:dns";
 import { request as httpRequest, type RequestOptions as HttpRequestOptions } from "node:http";
 import { request as httpsRequest, type RequestOptions as HttpsRequestOptions } from "node:https";
+import { endpointUrl, httpOrigin, rejectRedirect } from "@/lib/db/http/endpoint";
+import { DatabaseConfigError } from "@/lib/db/errors";
+import { guardedNodeOptions, httpTransportFetch } from "@/lib/db/http/egress-policy";
+import { describeFetchFailure } from "@/lib/db/http/fetch-failure";
 import type { DatabaseConnection } from "@/lib/db/types";
 import type { SSLConfig } from "@/lib/types";
+import { quoteUnsafeIntegers } from "@/lib/db/utils/json-integers";
 import { quoteIdentifier } from "./keyspace";
 import {
   CouchbaseError,
@@ -144,9 +149,20 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+/**
+ * The body as JSON, or null when it is not JSON at all.
+ *
+ * `quoteUnsafeIntegers` runs first because a document's number reaches this
+ * process as the UNQUOTED literal it was stored as: measured on 8.0.2 CE, a
+ * document holding 9007199254740993 came back from a plain JSON.parse as
+ * 9007199254740992, in the grid and in every export, with no error. Quoted, it
+ * arrives as its exact digits, the way Druid's transport hands one over. Every
+ * other body passes through untouched, since the counts and sizes this provider
+ * reads from the REST API all sit far inside the safe range.
+ */
 function parseJsonBody(text: string): unknown {
   try {
-    return JSON.parse(text) as unknown;
+    return JSON.parse(quoteUnsafeIntegers(text)) as unknown;
   } catch {
     return null;
   }
@@ -156,11 +172,6 @@ function readMessage(record: Record<string, unknown>, fallback: string): string 
   if (typeof record.msg === "string") return record.msg;
   if (typeof record.message === "string") return record.message;
   return fallback;
-}
-
-/** Bracket a bare IPv6 literal so it can be used in a URL authority. */
-function formatHost(host: string): string {
-  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 }
 
 /**
@@ -250,9 +261,8 @@ function httpError(httpCode: number): CouchbaseError {
   );
 }
 
-function networkError(error: unknown): CouchbaseError {
-  const message = error instanceof Error ? error.message : String(error);
-  return new CouchbaseError(`Couchbase request failed: ${message}`, 0, true);
+function networkError(error: unknown, url: string): CouchbaseError {
+  return new CouchbaseError(`Couchbase request failed: ${describeFetchFailure(error, url)}`, 0, true);
 }
 
 function throwIfFailed(response: JsonResponse): void {
@@ -287,11 +297,20 @@ function buildTlsMaterial(ssl: SSLConfig | undefined): CouchbaseTlsMaterial | nu
 async function fetchJson(url: string, init: JsonRequestInit): Promise<JsonResponse> {
   let response: Response;
   try {
-    response = await fetch(url, { method: init.method, headers: init.headers, body: init.body });
+    // A followed redirect would carry the credential to wherever it points.
+    response = await httpTransportFetch(url, {
+      method: init.method,
+      headers: init.headers,
+      body: init.body,
+      redirect: "manual",
+    });
   } catch (error) {
-    throw networkError(error);
+    if (error instanceof DatabaseConfigError) throw error;
+    throw networkError(error, url);
   }
-  return { httpCode: response.status, payload: parseJsonBody(await response.text()) };
+  const text = await response.text();
+  rejectRedirect(response, url);
+  return { httpCode: response.status, payload: parseJsonBody(text) };
 }
 
 /**
@@ -303,6 +322,7 @@ export function nodeRequestJson(url: string, init: JsonRequestInit, tls: Couchba
   const options: HttpsRequestOptions = {
     protocol: target.protocol,
     hostname: target.hostname,
+    ...guardedNodeOptions(target.hostname),
     port: target.port,
     path: `${target.pathname}${target.search}`,
     method: init.method,
@@ -330,7 +350,9 @@ export function nodeRequestJson(url: string, init: JsonRequestInit, tls: Couchba
         ? httpsRequest(options, onResponse)
         : httpRequest(options as HttpRequestOptions, onResponse);
 
-    clientRequest.on("error", (error: Error) => reject(networkError(error)));
+    clientRequest.on("error", (error: Error) =>
+      reject(error instanceof DatabaseConfigError ? error : networkError(error, target.href)),
+    );
     if (init.body !== undefined) clientRequest.write(init.body);
     clientRequest.end();
   });
@@ -365,6 +387,10 @@ export class CouchbaseHttpTransport implements CouchbaseTransport {
     this.tls = buildTlsMaterial(config.ssl);
     this.scheme = this.tls ? "https" : "http";
     this.managementPort = config.port ?? (this.tls ? DEFAULT_MANAGEMENT_TLS_PORT : DEFAULT_MANAGEMENT_PORT);
+    // Validated now so a bad host or port is refused before any lookup or request.
+    // Every URL is built through the same check again, because the host that is
+    // finally used may come from an SRV record or from the cluster itself.
+    httpOrigin(this.scheme, this.host, this.managementPort);
     this.authorization = `Basic ${Buffer.from(`${config.user ?? ""}:${config.password ?? ""}`).toString("base64")}`;
     this.resolveSrv = deps.resolveSrv ?? dns.resolveSrv.bind(dns);
     this.requestJson = deps.requestJson ?? nodeRequestJson;
@@ -402,7 +428,7 @@ export class CouchbaseHttpTransport implements CouchbaseTransport {
 
   public async manage<T>(path: string): Promise<T> {
     const host = await this.getHost();
-    const response = await this.send(`${this.scheme}://${formatHost(host)}:${this.managementPort}${path}`, {
+    const response = await this.send(endpointUrl(httpOrigin(this.scheme, host, this.managementPort), path), {
       method: "GET",
       headers: this.baseHeaders(),
     });
@@ -485,6 +511,6 @@ export class CouchbaseHttpTransport implements CouchbaseTransport {
   }
 
   private queryUrl(host: string, port: number): string {
-    return `${this.scheme}://${formatHost(host)}:${port}${QUERY_PATH}`;
+    return endpointUrl(httpOrigin(this.scheme, host, port), QUERY_PATH);
   }
 }

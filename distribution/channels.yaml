@@ -42,13 +42,32 @@
 #   update.method             ci_publish | commit | upstream_pr | manual_ui
 #   update.sla                every_release | minor_plus | major_only | on_demand
 #   update.ci_enabled         REQUIRED on, and allowed ONLY on, the switchable
-#                             channels (docker-hub-mirror, homebrew, snap,
-#                             winget, chocolatey): may release CI publish this
-#                             channel? The release workflow reads it, so turning
-#                             a channel off here is the whole switch - no secret
-#                             to delete, no workflow edit. The core release path
-#                             (github-release, docker-ghcr, npm, helm) and the
-#                             required release assets have no flag on purpose.
+#                             channels (SWITCHABLE_CHANNEL_IDS in
+#                             scripts/distribution-check.mjs): may release CI
+#                             publish this channel? The release workflow reads
+#                             it, so turning a channel off here is the whole
+#                             switch - no secret to delete, no workflow edit.
+#                             CI publishes only a live channel, so a pending
+#                             one stays off whatever its flag says. The core
+#                             release path (github-release, docker-ghcr, npm,
+#                             helm) and the required release assets have no
+#                             flag on purpose.
+#   update.fork               REQUIRED on, and allowed ONLY on, the channels a
+#                             release workflow stages on a LibreDB fork of the
+#                             upstream catalog (FORK_STAGED_CHANNEL_IDS in
+#                             scripts/distribution-check.mjs). The workflow
+#                             never opens the pull request: a member tests the
+#                             staged branch and opens it by hand. Two settings:
+#     mode                    update - the fork must already exist; its default
+#                               branch is fast-forwarded to upstream before the
+#                               release branch is staged, and a fork carrying
+#                               commits upstream lacks stops the run.
+#                             create_or_update - a missing fork is created in
+#                               the libredb org first, then updated the same way.
+#     push                    auto - the release run pushes the staged branch.
+#                             manual - the release run only validates it; a
+#                               member pushes by running the workflow by hand on
+#                               the release tag.
 #   links                     tracking_issue / first_pr / last_bump_pr (nullable
 #                             until the first post-listing bump) / catalog /
 #                             upstream_repo / docs / get (user-facing "where do I
@@ -183,7 +202,7 @@ channels:
       strategy: local_file
       files:
         - charts/libredb-studio/Chart.yaml
-      extract: 'appVersion: "(\d+\.\d+\.\d+)"'
+      extract: "appVersion:\\s*[\"']?(\\d+\\.\\d+\\.\\d+)"
       note: Enforcement lives in the required chart:check CI gate (#138); this row is visibility.
 
   - id: homebrew
@@ -206,7 +225,7 @@ channels:
     pin:
       strategy: remote_file
       url: https://raw.githubusercontent.com/libredb/homebrew-tap/main/Formula/libredb-studio.rb
-      extract: 'version "(\d+\.\d+\.\d+)"'
+      extract: "version\\s+[\"'](\\d+\\.\\d+\\.\\d+)"
       note: Confirms the release-CI tap push actually landed.
 
   - id: snap
@@ -283,6 +302,63 @@ channels:
         manifest repacks in flatpak-smoke.yml (packaging/flatpak, dormant - see the flathub
         channel); the GUI .deb (libredb-studio-desktop_<version>_<arch>.deb, distinct from the
         headless server package) is what FlatPark pins as extra-data.
+
+  - id: vscode-marketplace
+    name: VS Code extension (Visual Studio Marketplace)
+    short_name: VS Code extension
+    status: live
+    category: os-desktop
+    platforms: [linux, macos, windows]
+    # VS Code's own binary runs the providers in Node mode (ELECTRON_RUN_AS_NODE),
+    # so the editor supplies the runtime, not the user.
+    runtime: channel_supplied
+    tier: 2
+    kind: marketplace
+    update:
+      # The VSIX that vscode-extension.yml tested is uploaded by hand on the
+      # publisher's management page; the release workflow publishes nothing yet.
+      method: manual_ui
+      sla: on_demand
+    links:
+      catalog: https://marketplace.visualstudio.com/items?itemName=libredb.libredb-studio
+      docs: docs/DISTRIBUTION.md
+    pin:
+      strategy: none
+      note: Published 21 Oct 2026 as the 0.1.0 pre-release, under the publisher libredb; 0.2.0 is its first
+        release. The extension has
+        a version line of its own in vscode-extension/package.json, which the drift check's comparison
+        with the root package.json cannot read, so the listed version is checked by hand against the
+        listing.
+
+  - id: aur
+    name: Arch User Repository (libredb-studio-bin)
+    short_name: AUR
+    status: pending
+    category: package-managers
+    platforms: [linux]
+    runtime: channel_supplied
+    tier: 1
+    kind: package-manager
+    update:
+      method: ci_publish
+      sla: every_release
+      ci_enabled: true
+    links:
+      tracking_issue: https://github.com/libredb/libredb-studio/issues/971
+      catalog: https://aur.archlinux.org/packages/libredb-studio-bin
+      upstream_repo: https://aur.archlinux.org/libredb-studio-bin.git
+      docs: packaging/aur/README.md
+    pin:
+      strategy: remote_file
+      url: https://aur.archlinux.org/rpc/v5/info/libredb-studio-bin
+      extract: "\"Version\":\"(\\d+\\.\\d+\\.\\d+)-\\d+\""
+      note: Pending until the AUR account exists and the first push lands (#971). The package is
+        staged in packaging/aur and repackages the standalone linux tarball. Release CI renders the
+        PKGBUILD for each tag and pushes it (the aur job in release-artifacts.yml), and it does so
+        only once this channel is live - ci_enabled alone does not start it. The AUR RPC answers
+        with one document whose Version is "<pkgver>-<pkgrel>"; the pattern keeps the pkgver, so a
+        pkgrel-only rebuild is not drift. Node is the distribution's (depends=nodejs-lts-krypton,
+        the 24.x line, for the same reason Homebrew pins node@24).
 
   # ---- Tier 2: LibreDB-owned copies and listings, bumped by hand ----------
 
@@ -402,6 +478,33 @@ channels:
         The `container` platform is deliberate and not a stand-in for cloud - the user installs a Docker
         container on their own Unraid server.
 
+  - id: dokku-plugin
+    name: Dokku community plugin (libredb/dokku-libredb-studio)
+    short_name: Dokku plugin
+    status: live
+    category: paas-catalogs
+    platforms: [cloud]
+    runtime: channel_supplied
+    tier: 2
+    kind: one-click-template
+    update:
+      method: commit
+      sla: on_demand
+    links:
+      first_pr: https://github.com/dokku/dokku/pull/9116
+      catalog: https://dokku.com/docs/community/plugins/
+      upstream_repo: https://github.com/libredb/dokku-libredb-studio
+      docs: docs/DISTRIBUTION.md
+    pin:
+      strategy: remote_file
+      url: https://raw.githubusercontent.com/libredb/dokku-libredb-studio/main/config
+      extract: 'libredb-studio:(\d+\.\d+\.\d+)'
+      note: The plugin is LibreDB-owned, so a version bump is a commit (and a plugin release) in THAT
+        repo, as with unraid-ca. Dokku has no application catalog; its community plugins page is the
+        listing users find it from, added by dokku/dokku#9116 (merged 2026-10-08). The pinned value is
+        LIBREDB_STUDIO_DEFAULT_IMAGE in the plugin's config file, the image `libredb-studio:install`
+        deploys when no --image flag is given.
+
   # ---- Tier 3: upstream community catalogs, bumped via PR -----------------
 
   - id: caprover-official
@@ -416,22 +519,54 @@ channels:
     update:
       method: upstream_pr
       sla: on_demand
+      # .github/workflows/caprover-fork.yml stages both CapRover templates on
+      # libredb/caprover-one-click-apps for each release; a member opens the PR.
+      fork:
+        mode: update
+        push: auto
     links:
       tracking_issue: https://github.com/libredb/libredb-studio/issues/56
       first_pr: https://github.com/caprover/one-click-apps/pull/1303
+      last_bump_pr: https://github.com/caprover/one-click-apps/pull/1315
       upstream_repo: https://github.com/caprover/one-click-apps
       docs: deploy/caprover/README.md
     pin:
       strategy: remote_file
       url: https://raw.githubusercontent.com/caprover/one-click-apps/master/public/v4/apps/libredb-studio.yml
-      extract: "defaultValue: '(\\d+\\.\\d+\\.\\d+)'"
-      note: The single CapRover row. A LibreDB-owned 3rd-party repo
-        (libredb/caprover-one-click-apps) served the app while this submission was in review and was
-        retired once it merged; it had its own inventory entry until that duplicated CapRover in the
-        coverage matrix as one live and one dead route to the same platform, with the dead one's URL
-        no longer published. Its record lives in deploy/caprover/README.md, which is where a
-        maintainer bumping the template already looks. Users install from the official catalog only -
-        no third-party repo to add.
+      extract: "defaultValue:\\s*[\"']?(\\d+\\.\\d+\\.\\d+)"
+      note: The plain CapRover entry; caprover-autoconnect below is the second. A LibreDB-owned
+        3rd-party repo served the app while this submission was in review and was retired once it
+        merged; it had its own inventory entry until that duplicated CapRover in the coverage matrix
+        as one live and one dead route to the same platform. Its address no longer serves a list,
+        and the repo is archived as libredb/caprover-one-click-apps-legacy. Its record lives in
+        deploy/caprover/README.md, which is where a maintainer bumping the template already looks.
+        Users install from the official catalog only - no third-party repo to add.
+
+  - id: caprover-autoconnect
+    name: CapRover official one-click apps (auto-connect)
+    short_name: CapRover auto-connect
+    status: live
+    category: paas-catalogs
+    platforms: [cloud]
+    runtime: channel_supplied
+    tier: 3
+    kind: one-click-template
+    update:
+      method: upstream_pr
+      sla: on_demand
+    links:
+      first_pr: https://github.com/caprover/one-click-apps/pull/1346
+      last_bump_pr: null
+      upstream_repo: https://github.com/caprover/one-click-apps
+      docs: deploy/caprover/README.md
+    pin:
+      strategy: remote_file
+      url: https://raw.githubusercontent.com/caprover/one-click-apps/master/public/v4/apps/libredb-studio-autoconnect.yml
+      extract: "defaultValue:\\s*[\"']?(\\d+\\.\\d+\\.\\d+)"
+      note: The opt-in second CapRover entry. It installs Studio with a discovery companion that reads
+        the Docker socket and connects Studio to the databases CapRover runs, so the libredb-studio entry
+        stays socket-free. Its template lives in deploy/caprover/libredb-studio-autoconnect.yml and is
+        bumped together with the caprover-official row.
 
   - id: dokploy
     name: Dokploy template catalog
@@ -447,14 +582,47 @@ channels:
     links:
       tracking_issue: https://github.com/libredb/libredb-studio/issues/171
       first_pr: https://github.com/Dokploy/templates/pull/931
+      last_bump_pr: https://github.com/Dokploy/templates/pull/1039
       catalog: https://templates.dokploy.com
       upstream_repo: https://github.com/Dokploy/templates
       docs: deploy/dokploy/README.md
     pin:
       strategy: remote_file
-      url: https://raw.githubusercontent.com/Dokploy/templates/main/blueprints/libredb-studio/docker-compose.yml
+      url: https://raw.githubusercontent.com/Dokploy/templates/canary/blueprints/libredb-studio/docker-compose.yml
       extract: 'libredb-studio:(\d+\.\d+\.\d+)'
-      note: Bump from 0.9.27 to the current release is tracked in issue 175.
+      note: The blueprint serves 0.9.59, bumped there by Dokploy/templates#1039 (merged 2026-08-03).
+        Every bump is an upstream pull request a maintainer has to merge, so this pin drifts behind
+        the release by design and the drift row is the reminder to open the next one. That repo's
+        default branch is `canary`, not main, and both of the pull requests merged there for this
+        app (931 and 1039) targeted it, so the pin URL and any bump PR must use `canary`. This URL
+        read `main` until now, which happened to report the same version and so hid the mistake.
+
+  - id: pethost
+    name: Pethost template catalog
+    short_name: Pethost
+    status: live
+    category: paas-catalogs
+    platforms: [cloud]
+    runtime: channel_supplied
+    tier: 3
+    kind: paas-template
+    update:
+      method: upstream_pr
+      sla: on_demand
+    links:
+      catalog: https://pethost.dev/templates/libredb-studio/
+      upstream_repo: https://github.com/pethost-dev/templates
+      docs: README.md
+    pin:
+      strategy: remote_file
+      url: https://raw.githubusercontent.com/pethost-dev/templates/main/libredb-studio/compose.yaml
+      extract: 'libredb-studio:(\d+\.\d+\.\d+)'
+      note: Pethost wrote the template and committed it to pethost-dev/templates directly (c1a6ce95,
+        15 Oct 2026), so there is no first_pr. It pins an exact release because this project
+        publishes no minor-line image tag, and that repo's README takes a line tag only where one
+        exists. A bump is a pull request there that changes the tag in compose.yaml. The README
+        button opens https://console.pethost.dev/?template=libredb-studio, the same deploy link the
+        catalog page uses.
 
   - id: cosmos
     name: Cosmos servapp marketplace
@@ -473,9 +641,13 @@ channels:
       upstream_repo: https://github.com/azukaar/cosmos-servapps-official
       docs: deploy/cosmos/README.md
     pin:
-      strategy: remote_file
-      url: https://raw.githubusercontent.com/azukaar/cosmos-servapps-official/master/servapps/LibreDB-Studio/cosmos-compose.json
-      extract: 'libredb-studio:(\d+\.\d+\.\d+)'
+      strategy: none
+      note: The servapp pins ghcr.io/libredb/libredb-studio:latest, so there is no version to
+        measure - the same shape as the Koyeb deploy button. It carried a semver until
+        azukaar/cosmos-servapps-official#305 (merged 2026-09-21) moved it to the floating tag, and
+        a remote_file pin left behind after that reports UNKNOWN on every run rather than drift,
+        because the extract pattern can never match. Cosmos installs whatever :latest resolves to
+        at install time, which is why this row went from a drift reminder to nothing to check.
 
   - id: kubero
     name: Kubero template catalog
@@ -497,7 +669,7 @@ channels:
     pin:
       strategy: remote_file
       url: https://raw.githubusercontent.com/kubero-dev/kubero/main/services/libredb-studio/app.yaml
-      extract: 'ghcr\.io/libredb/libredb-studio\s+tag:\s*(\d+\.\d+\.\d+)'
+      extract: "ghcr\\.io/libredb/libredb-studio\\s+tag:\\s*[\"']?(\\d+\\.\\d+\\.\\d+)"
 
   - id: sealos
     name: Sealos App Store template
@@ -550,7 +722,7 @@ channels:
     pin:
       strategy: remote_file
       url: https://raw.githubusercontent.com/truenas/apps/master/ix-dev/community/libredb-studio/ix_values.yaml
-      extract: 'ghcr\.io/libredb/libredb-studio\s+tag:\s*(\d+\.\d+\.\d+)'
+      extract: "ghcr\\.io/libredb/libredb-studio\\s+tag:\\s*[\"']?(\\d+\\.\\d+\\.\\d+)"
       note: Merged in truenas/apps#5501 (14 Aug 2026); live in the TrueNAS SCALE community catalog. The pin
         reads the ghcr repo and tag in ix-dev/community/libredb-studio/ix_values.yaml (the maintainer-edited
         source a bump PR touches) - the container_utils_image tag is a different repository and must not be
@@ -559,7 +731,7 @@ channels:
 
   - id: casaos
     name: CasaOS App Store
-    status: pending
+    status: live
     category: paas-catalogs
     platforms: [container]
     runtime: channel_supplied
@@ -574,12 +746,43 @@ channels:
       upstream_repo: https://github.com/IceWhaleTech/CasaOS-AppStore
       docs: docs/DISTRIBUTION.md
     pin:
-      strategy: none
-      note: PR IceWhaleTech/CasaOS-AppStore#992 is open, so nothing is listed yet. On merge, flip to live
-        and add a remote_file pin on
-        https://raw.githubusercontent.com/IceWhaleTech/CasaOS-AppStore/main/Apps/LibreDBStudio/docker-compose.yml
-        with extract 'libredb-studio:(\d+\.\d+\.\d+)'. Installs a Docker container on the user's own device,
-        so the platform is container.
+      strategy: remote_file
+      url: https://raw.githubusercontent.com/IceWhaleTech/CasaOS-AppStore/main/Apps/LibreDBStudio/docker-compose.yml
+      extract: 'libredb-studio:(\d+\.\d+\.\d+)'
+      note: Merged in IceWhaleTech/CasaOS-AppStore#992 (7 Sep 2026); live in the CasaOS App Store. The pin
+        reads the image tag in Apps/LibreDBStudio/docker-compose.yml, the file a bump PR touches. Installs a
+        Docker container on the user's own device, so the platform is container.
+
+  - id: okxlin-appstore
+    name: 1Panel community app store (okxlin/appstore)
+    short_name: 1Panel community store
+    status: live
+    category: paas-catalogs
+    platforms: [container]
+    runtime: channel_supplied
+    tier: 3
+    kind: one-click-template
+    update:
+      method: upstream_pr
+      sla: on_demand
+    links:
+      first_pr: https://github.com/okxlin/appstore/pull/6552
+      last_bump_pr: https://github.com/okxlin/appstore/pull/6938
+      catalog: https://github.com/okxlin/appstore/tree/localApps/apps/libredb-studio
+      upstream_repo: https://github.com/okxlin/appstore
+      docs: docs/DISTRIBUTION.md
+    pin:
+      strategy: probe
+      probe: github-dir-max-version
+      urls:
+        catalog: https://api.github.com/repos/okxlin/appstore/contents/apps/libredb-studio
+      note: The community-maintained app store for 1Panel, merged in okxlin/appstore#6552 (normalized by
+        okxlin/appstore#6591) and bumped by the store's own Renovate, which carried it to 0.16.0 in
+        okxlin/appstore#6938. The OFFICIAL 1Panel store declined us in 1Panel-dev/appstore#9398 - the
+        maintainer keeps that catalog to projects above 10,000 stars and pointed at this one - so this row
+        is the whole 1Panel presence, not a staging step. Measured as a directory listing rather than as a
+        file, because the store publishes one directory per version under apps/libredb-studio and a fixed
+        file URL would keep reporting a superseded version forever.
 
   - id: umbrel
     name: Umbrel App Store
@@ -656,10 +859,42 @@ channels:
         'libredb-studio:(\d+\.\d+\.\d+)'; both the pin URL and any bump PR must target v3. Deploys a
         container to the user's Docker host, so the platform is container.
 
+  - id: portainer-templates-as93
+    name: Portainer templates (lissy93 aggregator)
+    short_name: Portainer templates (as93)
+    status: live
+    category: paas-catalogs
+    platforms: [container]
+    runtime: channel_supplied
+    tier: 3
+    kind: one-click-template
+    update:
+      method: commit
+      sla: on_demand
+    links:
+      first_pr: https://github.com/lissy93/portainer-templates/pull/140
+      upstream_repo: https://github.com/lissy93/portainer-templates
+      get: https://portainer-templates.as93.net
+      docs: docs/DISTRIBUTION.md
+    pin:
+      strategy: none
+      note: A third-party aggregator, and a different row from `portainer` above, which is the official
+        portainer/templates repo. It served a copy of our template inside its own
+        sources/local/development_templates.json, added by lissy93/portainer-templates#140, which said
+        "sixteen database engines" and set no STORAGE_PROVIDER, so the volume it declared held none of
+        the user's saved connections. Its documented model runs the other way round, with the app
+        keeping portainer-template.json on its own default branch while the project pulls it daily, so
+        the copy at this repository's root is now the source and the local copy goes in the same
+        upstream PR. There is no version to pin, by design, because the template names
+        ghcr.io/libredb/libredb-studio:latest, which their guide allows for a tag we keep publishing,
+        so it needs no release-time bump. What can go stale instead is the copy, which is why
+        portainer-template.json is listed in COPY_FILES of
+        tests/unit/lib/catalog-copy-engine-count.test.ts, where the engine numerals are gated.
+
   - id: operatorhub-community
     name: OperatorHub / OpenShift community operator catalogs
     short_name: OperatorHub / OpenShift
-    status: pending
+    status: live
     category: kubernetes-operators
     platforms: [kubernetes]
     runtime: channel_supplied
@@ -668,17 +903,95 @@ channels:
     update:
       method: upstream_pr
       sla: every_release
+      # Submission is automated from operator-release.yml (#656). The switch is
+      # here because the submission can be legitimately impossible: the first
+      # listing in a catalog is manual, an earlier submission may still be
+      # unmerged, and OPERATOR_CATALOG_TOKEN may be absent - none of which is a
+      # broken release.
+      ci_enabled: true
     links:
       tracking_issue: https://github.com/libredb/libredb-studio/issues/152
       first_pr: https://github.com/redhat-openshift-ecosystem/community-operators-prod/pull/10497
+      catalog: https://operatorhub.io/operator/libredb-studio-operator
       upstream_repo: https://github.com/redhat-openshift-ecosystem/community-operators-prod
       docs: docs/DISTRIBUTION.md
     pin:
-      strategy: local_file
-      files:
-        - operator/bundle/manifests/libredb-studio-operator.clusterserviceversion.yaml
-      extract: 'libredb-studio-operator:(\d+\.\d+\.\d+)'
-      note: The OpenShift console catalog is live at 0.9.59 (community-operators-prod#10497 merged 2026-07-27, FBC catalogs in community-operators-prod#10581); the OperatorHub.io listing (k8s-operatorhub/community-operators#8794) is still in review, so this channel stays pending until both are listed. Catalog submissions (k8s-operatorhub + community-operators-prod) start after the operator PR lands; the committed bundle is the source for both, with community-operators-prod contributed in FBC mode (fbc.enabled plus per-OCP-version catalog_mapping in ci.yaml). FBC releases in two upstream PRs - bundle first, then the rendered catalogs - and that second PR is only bot-created when the bundle directory ships a release-config.yaml, so every release must include one.
+      strategy: probe
+      probe: github-dir-max-version
+      urls:
+        operatorhub-io: https://api.github.com/repos/k8s-operatorhub/community-operators/contents/operators/libredb-studio-operator
+        openshift-console: https://api.github.com/repos/redhat-openshift-ecosystem/community-operators-prod/contents/operators/libredb-studio-operator
+      note: Submitted automatically by the submit-catalogs job in operator-release.yml (#656); ci_enabled above is its switch. Both catalogs are listed - OpenShift console since 0.9.59 (bundle community-operators-prod#10497
+        merged 2026-07-27, FBC catalogs community-operators-prod#10581), operatorhub.io since
+        k8s-operatorhub/community-operators#8794 merged 2026-09-08. These are the COMMUNITY catalogs, not the
+        Red Hat certified one, so the OpenShift console lists the operator under Community with its
+        unsupported-operator warning. Measured as two directory listings rather than one local file, because
+        the committed bundle is only the submission source - a local pin would have read 0.14.1 while both
+        catalogs still served 0.9.59. Each catalog is bumped by its own upstream PR and the two merge on
+        different days, so a lagging one has to surface as its own disagreeing source. Catalog submissions
+        start once the operator controller image is public on GHCR; community-operators-prod is contributed in
+        FBC mode (fbc.enabled plus per-OCP-version catalog_mapping in ci.yaml). An FBC release is two upstream
+        PRs - bundle first, then the rendered catalogs - and that second PR is only bot-created when the
+        bundle version directory ships a release-config.yaml, which submit-catalogs writes.
+
+  - id: zopdev-helm-charts
+    name: ZopDev Helm Charts (helm.zop.dev, ZopDay)
+    short_name: ZopDev Helm Charts
+    status: live
+    category: kubernetes-operators
+    platforms: [kubernetes]
+    runtime: channel_supplied
+    tier: 3
+    kind: helm-chart
+    update:
+      method: upstream_pr
+      sla: on_demand
+    links:
+      first_pr: https://github.com/zopdev/helm-charts/pull/322
+      catalog: https://helm.zop.dev
+      upstream_repo: https://github.com/zopdev/helm-charts
+    pin:
+      strategy: remote_file
+      url: https://raw.githubusercontent.com/zopdev/helm-charts/main/charts/libredb-studio/Chart.yaml
+      extract: 'appVersion:\s*"(\d+\.\d+\.\d+)"'
+      note: Merged in zopdev/helm-charts#322 (6 Oct 2026); chart v0.0.1 is served from
+        https://helm.zop.dev. It is a chart of its own in their repo, not a copy of ours, suggested by the
+        ZopDay team (#1183). The image tag comes from the top-level `version` value, which falls back to
+        appVersion, so a bump PR changes appVersion, `version` in values.yaml, values.schema.json and the
+        chart README, plus the chart version, then a Helm 3 package into docs/ and a regenerated
+        docs/index.yaml.
+
+  - id: yunohost
+    name: YunoHost app catalog
+    short_name: YunoHost
+    status: live
+    category: paas-catalogs
+    platforms: [linux]
+    runtime: channel_supplied
+    tier: 3
+    kind: one-click-template
+    update:
+      method: upstream_pr
+      sla: on_demand
+    links:
+      first_pr: https://github.com/YunoHost/apps/pull/3618
+      catalog: https://apps.yunohost.org/app/libredb_studio
+      upstream_repo: https://github.com/YunoHost-Apps/libredb_studio_ynh
+      docs: docs/DISTRIBUTION.md
+    pin:
+      strategy: remote_file
+      url: https://raw.githubusercontent.com/YunoHost-Apps/libredb_studio_ynh/master/manifest.toml
+      extract: "version\\s*=\\s*[\"']?(\\d+\\.\\d+\\.\\d+)"
+      note: Listed by YunoHost/apps#3618, merged 2026-09-20. Unlike the other self-hosting catalogs here, the
+        package installs no container; it unpacks the standalone Linux tarball under systemd and fetches its
+        own Node 24 through YunoHost's `n`, which is why platforms is linux and the runtime is
+        channel_supplied. The catalog entry points at a repository in the YunoHost-Apps organization - the
+        package was written for this release, opened under libredb, and transferred on the maintainer's
+        invitation, which is the route that repository's CI and packagers come with. A bump is therefore a
+        pull request against THAT repository, and their autoupdate cron opens one when a release asset
+        matching the manifest pattern appears. The pin reads past the `~ynh` packaging suffix and captures
+        the application version, so a packaging-only change does not read as drift. apps.yunohost.org serves
+        what its own periodic catalog build picked up, so the catalog link lags a merge by up to one build.
 
   # ---- Tier 4: partner and curated catalogs (not self-serve) --------------
 
@@ -700,11 +1013,14 @@ channels:
       upstream_repo: https://github.com/rancher/partner-charts
     pin:
       strategy: none
-      note: Merged in rancher/partner-charts#1158 (17 Aug 2026); live in Rancher Partner Charts (the repo
-        index.yaml carries libredb-studio at appVersion 0.12.0) and listed in the SUSE Solutions Catalog.
-        Partner catalog, not self-serve - the chart is regenerated on Rancher's cadence and index.yaml
-        accumulates every chart version, so an image-tag extract there would be ambiguous; strategy stays
-        none like the other tier-4 partner/curated catalogs.
+      note: Merged in rancher/partner-charts#1158 (17 Aug 2026); live in Rancher Partner Charts and listed
+        in the SUSE Solutions Catalog. Chart versions need no submission of ours - partner-charts runs
+        partner-charts-ci update nightly against https://libredb.org/libredb-studio/ and has carried our
+        releases since the listing without a pull request, taking the newest chart version at each run.
+        So upstream_pr here is a copy change to the app-readme overlay (rancher/partner-charts#1168), not
+        a version bump. Strategy stays none because the catalog names one directory per CHART version and
+        the app version each ships is only inside its Chart.yaml, so a directory listing cannot measure it
+        - unlike the two operator catalogs, whose directories are named for the app version.
 
   - id: koyeb-catalog
     name: Koyeb One-Click Apps catalog (curated by Koyeb)
@@ -724,6 +1040,33 @@ channels:
     pin:
       strategy: none
 
+  - id: railyard
+    name: Railyard template catalog
+    status: live
+    category: paas-catalogs
+    platforms: [cloud]
+    runtime: channel_supplied
+    tier: 4
+    kind: paas-template
+    update:
+      method: manual_ui
+      sla: on_demand
+    links:
+      tracking_issue: https://github.com/libredb/libredb-studio/pull/1546
+      catalog: https://railyard.run/templates/libredb-studio
+      docs: docs/DISTRIBUTION.md
+    pin:
+      strategy: none
+      note: Listed on 2026-10-06 by Railyard, which added the template at the maintainer's request (#1546)
+        and keeps it on its own side. There is no upstream repository or pull request, and the template's
+        settings are not public, so they can only be checked on a deploy. Railyard says it builds this
+        repo's Dockerfile from main at deploy time, so there is no image tag or template version to pin,
+        and a deploy can carry commits no release has shipped yet, the same as the Render Blueprint.
+        Railyard offered to pin it to release tags instead; that change is theirs to make, not ours. On
+        2026-10-06 the reference deploy at libredb-studio.apps.railyard.run answered /api/storage/config
+        with provider local, so it did not use the Postgres the template provisions; check storage on a
+        fresh deploy.
+
   - id: digitalocean
     name: DigitalOcean Marketplace
     status: live
@@ -741,7 +1084,107 @@ channels:
       catalog: https://marketplace.digitalocean.com/apps/libredb-studio
       docs: deploy/digitalocean/README.md
     pin:
+      strategy: remote_file
+      url: https://marketplace.digitalocean.com/apps/libredb-studio
+      # The listing's custom_data.version is serialized with escaped quotes in
+      # Next.js flight data; also accept unescaped JSON, never generic page versions.
+      extract: 'custom_data(?:\\)?"\s*:\s*\{\s*(?:\\)?"version(?:\\)?"\s*:\s*(?:\\)?"(\d+\.\d+\.\d+)(?:\\)?"'
+      note: Measures the published Marketplace image, not the local Packer input. Builds and Vendor
+        Portal submissions remain manual; each release summary carries the handoff checklist.
+
+  - id: gcp-marketplace
+    name: Google Cloud Marketplace
+    short_name: Google Cloud Marketplace
+    status: live
+    category: cloud-marketplaces
+    platforms: [kubernetes, cloud]
+    runtime: channel_supplied
+    tier: 4
+    kind: marketplace
+    update:
+      # Producer Portal, not a pull request: the listing, its version and its
+      # Terraform module are submitted through Google's console and each change
+      # goes through Google's own review, so nothing here can be CI-driven.
+      method: manual_ui
+      sla: on_demand
+    links:
+      catalog: https://console.cloud.google.com/marketplace/product/libredb-public/libredb-studio
+      docs: docs/DISTRIBUTION.md
+    pin:
+      # The listed version is held in Google's Producer Portal and the artifacts
+      # live in a private Artifact Registry, so there is no public file to read a
+      # version out of. It is checked by hand against the portal.
       strategy: none
+
+  - id: azure-marketplace
+    name: Microsoft Azure Marketplace
+    short_name: Azure Marketplace
+    status: live
+    category: cloud-marketplaces
+    platforms: [cloud]
+    runtime: channel_supplied
+    tier: 4
+    kind: marketplace
+    update:
+      method: manual_ui
+      sla: on_demand
+    links:
+      catalog: https://marketplace.microsoft.com/en-us/product/libredb.libredb-studio
+      docs: deploy/azure/README.md
+    pin:
+      strategy: none
+      note: Published 7 Sep 2026 as a free ("Get It Now") Azure Application solution template.
+        The package version is recorded once, in deploy/azure/package-version.txt; naming it
+        here as well is what let the two drift apart. There is no pin to add, because the
+        listed version lives in Partner Center the way Google's lives in the Producer Portal.
+
+  - id: aws-marketplace
+    name: AWS Marketplace (free AMI product)
+    short_name: AWS Marketplace
+    status: live
+    category: cloud-marketplaces
+    platforms: [cloud]
+    runtime: channel_supplied
+    tier: 4
+    kind: marketplace
+    update:
+      # The AMI and every listing field are submitted through the AWS Marketplace
+      # Management Portal, and a visibility change is reviewed by hand by Seller
+      # Operations, so nothing here can be CI-driven.
+      method: manual_ui
+      sla: on_demand
+    links:
+      catalog: https://aws.amazon.com/marketplace/pp/prodview-tsahkrgdqpnws
+      docs: deploy/aws/README.md
+    pin:
+      strategy: none
+      note: Published 7 Sep 2026 as a free AMI product (0.14.1, ami-08263251d25dc8ced). This status
+        is load-bearing rather than documentation - .github/workflows/aws-ami-build.yml reads it and
+        stands down on every machine-triggered path while it is not live. Live opens that workflow's
+        own release trigger, which fires only for a draft published by hand; no other workflow
+        dispatches it, so an ordinary release still builds no AMI.
+        There is no pin to read, because the listed version lives in the AWS Marketplace Management
+        Portal the way Azure's lives in Partner Center; it is checked by hand against the portal.
+
+  - id: civo-marketplace
+    name: Civo Kubernetes Marketplace
+    status: pending
+    category: cloud-marketplaces
+    platforms: [kubernetes]
+    runtime: channel_supplied
+    tier: 3
+    kind: marketplace
+    update:
+      method: upstream_pr
+      sla: on_demand
+    links:
+      tracking_issue: https://github.com/libredb/libredb-studio/issues/975
+      first_pr: https://github.com/civo/kubernetes-marketplace/pull/1076
+      upstream_repo: https://github.com/civo/kubernetes-marketplace
+    pin:
+      strategy: none
+      note: The version lives in `libredb-studio/manifest.yaml` in the upstream repository, so there
+        is nothing to pin here. The row flips to `live` when civo/kubernetes-marketplace#1076 merges.
 
   - id: winget
     name: winget community repository (LibreDB.Studio)
@@ -766,9 +1209,9 @@ channels:
       docs: docs/DISTRIBUTION.md
     pin:
       strategy: probe
-      probe: winget-max-version
+      probe: github-dir-max-version
       urls:
-        versions: https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/l/LibreDB/Studio
+        catalog: https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/l/LibreDB/Studio
       note: Listed since 0.9.59 (winget install LibreDB.Studio). winget publishes no floating "latest"
         document - the contents listing enumerates every published version - so the highest version it
         enumerates is the served state. A regex pin cannot express that (all matches in a source must
@@ -805,12 +1248,41 @@ channels:
       extract: '<d:Version>(\d+\.\d+\.\d+)</d:Version>'
       note: Listed since 0.9.59 (choco install libredb-studio), approved 2026-08-24. The community
         feed publishes no floating "latest" document, so the pin filters the OData package list to
-        IsLatestVersion - one document, one match, whatever the published version count. It reads
-        0.9.59 until the next release publishes through the now-enabled job, which is real lag and
-        not a broken pin. The feed lists APPROVED versions only, so a drift row here means the
+        IsLatestVersion - one document, one match, whatever the published version count. It sat at
+        0.9.59 while the job was disabled and has moved with every release since; it reads 0.13.6
+        today, one behind, which is moderation lag and not a broken pin. The feed lists APPROVED
+        versions only, so a drift row here means the
         version is waiting on human moderation rather than that the push failed; the release run's
         job summary reports the push outcome and that version's PackageStatus. Trusted status is
         what removes the wait - docs/BACKLOG.md REL3.
+  
+  - id: scoop
+    name: Scoop Extras bucket (extras/libredb-studio)
+    short_name: Scoop
+    status: live
+    category: package-managers
+    platforms: [windows]
+    runtime: channel_supplied
+    tier: 4
+    kind: package-manager
+    update:
+      method: upstream_pr
+      sla: every_release
+    links:
+      first_pr: https://github.com/ScoopInstaller/Extras/pull/18786
+      catalog: https://github.com/ScoopInstaller/Extras/blob/master/bucket/libredb-studio.json
+      upstream_repo: https://github.com/ScoopInstaller/Extras
+      docs: docs/DISTRIBUTION.md
+    pin:
+      strategy: remote_file
+      url: https://raw.githubusercontent.com/ScoopInstaller/Extras/master/bucket/libredb-studio.json
+      extract: '"version"\s*:\s*"(\d+\.\d+\.\d+)"'
+      note: Listed since 0.16.2 (scoop install extras/libredb-studio), merged in ScoopInstaller/Extras#18786.
+        Our release CI does not publish it. The bucket's own Excavator workflow runs every four hours,
+        reads our releases.atom through the manifest's checkver regex and rewrites version, url and hash
+        itself, taking the hash from the release SHA256SUMS. A drift row for a few hours after a release
+        is that schedule. A longer one means the bump failed, most likely because a release tag or asset
+        name changed shape.
 
   - id: flathub
     name: Flathub community catalog (org.libredb.Studio)

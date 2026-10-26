@@ -1,10 +1,18 @@
 import * as client from "openid-client";
 import { SignJWT, jwtVerify } from "jose";
 import { logger } from "@/lib/logger";
-import { getJwtSecret } from "@/lib/config/auth-env";
+import { derivedSigningKey } from "@/lib/config/auth-env";
 import { AuthConfigError } from "@/lib/auth-errors";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
+
+/**
+ * The `prompt` sent on the authorization request (OIDC_PROMPT). `omit` sends none, so a live
+ * identity provider session signs the user in without asking again (single sign-on).
+ */
+export type OIDCPrompt = "login" | "consent" | "select_account" | "omit";
+
+const OIDC_PROMPTS: readonly OIDCPrompt[] = ["login", "consent", "select_account", "omit"];
 
 export interface OIDCConfig {
   issuer: string;
@@ -12,13 +20,22 @@ export interface OIDCConfig {
   clientSecret: string;
   scope: string;
   roleClaim: string;
+  rolePrefix?: string;
   adminRoles: string[];
+  /**
+   * OIDC_USER_ROLES. Empty (the default): an account that matches no admin role is a user. Non-empty: an account must
+   * match an admin or a user role, and any other is refused at sign-in.
+   */
+  userRoles: string[];
+  prompt: OIDCPrompt;
 }
 
 export interface OIDCState {
   code_verifier: string;
   state: string;
   nonce: string;
+  /** The app-relative page to land on after sign-in (#1420); absent for the default landing page. */
+  return_to?: string;
 }
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -27,6 +44,26 @@ export interface OIDCState {
 // src/lib/config/auth-env.ts (bun coverage under-counts multi-line string continuations).
 const OIDC_CONFIG_MISSING_MESSAGE =
   "OIDC_ISSUER, OIDC_CLIENT_ID, and OIDC_CLIENT_SECRET are required when using OIDC authentication";
+const OIDC_ISSUER_NOT_HTTPS_MESSAGE =
+  "OIDC_ISSUER must be an https:// URL; openid-client refuses plain http, localhost included";
+const OIDC_PROMPT_INVALID_MESSAGE = "OIDC_PROMPT must be one of login, consent, select_account, omit; got ";
+const OIDC_USER_ROLES_WITHOUT_CLAIM_MESSAGE =
+  "OIDC_USER_ROLES is set but OIDC_ROLE_CLAIM is empty: with no claim to read roles from, every sign-in would be refused";
+const OIDC_ROLE_PREFIX_WITHOUT_CLAIM_MESSAGE =
+  "OIDC_ROLE_PREFIX is set but OIDC_ROLE_CLAIM is empty: with no claim to read roles from, no claim role could ever be extracted";
+
+/**
+ * Unset or empty keeps `login`, the value Studio always sent before OIDC_PROMPT existed. `none` is
+ * refused with the other unknown values: it fails with login_required whenever the provider has no
+ * session, which leaves the user on an error page instead of a sign-in form.
+ */
+function readOIDCPrompt(): OIDCPrompt {
+  const value = (process.env.OIDC_PROMPT ?? "").trim().toLowerCase() || "login";
+  if (!(OIDC_PROMPTS as readonly string[]).includes(value)) {
+    throw new AuthConfigError(OIDC_PROMPT_INVALID_MESSAGE + value);
+  }
+  return value as OIDCPrompt;
+}
 
 export function getOIDCConfig(): OIDCConfig {
   const issuer = process.env.OIDC_ISSUER;
@@ -44,16 +81,46 @@ export function getOIDCConfig(): OIDCConfig {
     throw new AuthConfigError(OIDC_CONFIG_MISSING_MESSAGE);
   }
 
+  // openid-client v6 refuses a non-https issuer before it sends anything. Checked on the parsed
+  // URL rather than the raw string, the way openid-client does: `HTTPS://host` is https, and a
+  // scheme-less value either fails to parse or parses with a bogus scheme (`localhost:8080/...`
+  // becomes protocol `localhost:`). Either way it is the operator's .env, not the network, so it
+  // is named here as configuration rather than surfacing as a discovery failure that "try again
+  // later" cannot fix.
+  if (URL.parse(issuer)?.protocol !== "https:") {
+    throw new AuthConfigError(OIDC_ISSUER_NOT_HTTPS_MESSAGE);
+  }
+
+  const roleClaim = process.env.OIDC_ROLE_CLAIM || "";
+  const rolePrefix = process.env.OIDC_ROLE_PREFIX || "";
+  const userRoles = (process.env.OIDC_USER_ROLES || "")
+    .split(",")
+    .map((r) => r.trim())
+    .filter(Boolean);
+
+  // User roles are read from the role claim, so without one every account would be refused, one sign-in at a time, as
+  // oidc_no_role. Named once as configuration instead, which the login route reports as oidc_config.
+  if (userRoles.length > 0 && !roleClaim) {
+    throw new AuthConfigError(OIDC_USER_ROLES_WITHOUT_CLAIM_MESSAGE);
+  }
+
+  if (rolePrefix && !roleClaim) {
+    throw new AuthConfigError(OIDC_ROLE_PREFIX_WITHOUT_CLAIM_MESSAGE);
+  }
+
   return {
     issuer,
     clientId,
     clientSecret,
     scope: process.env.OIDC_SCOPE || "openid profile email",
-    roleClaim: process.env.OIDC_ROLE_CLAIM || "",
+    roleClaim,
+    rolePrefix: rolePrefix || undefined,
     adminRoles: (process.env.OIDC_ADMIN_ROLES || "admin")
       .split(",")
       .map((r) => r.trim())
       .filter(Boolean),
+    userRoles,
+    prompt: readOIDCPrompt(),
   };
 }
 
@@ -94,6 +161,7 @@ export async function generateAuthUrl(
   config: client.Configuration,
   redirectUri: string,
   scope: string,
+  prompt: OIDCPrompt = "login",
 ): Promise<{ url: URL; state: OIDCState }> {
   const code_verifier = client.randomPKCECodeVerifier();
   const code_challenge = await client.calculatePKCECodeChallenge(code_verifier);
@@ -107,8 +175,10 @@ export async function generateAuthUrl(
     code_challenge_method: "S256",
     state,
     nonce,
-    prompt: "login",
   };
+  if (prompt !== "omit") {
+    parameters.prompt = prompt;
+  }
 
   const url = client.buildAuthorizationUrl(config, parameters);
 
@@ -122,9 +192,17 @@ export async function generateAuthUrl(
 
 export interface OIDCClaims {
   sub: string;
+  /** openid-client has checked it against the issuer discovered at OIDC_ISSUER. */
+  iss: string;
   email?: string;
   preferred_username?: string;
   [claim: string]: unknown;
+}
+
+/** The ID token's claims and the raw token, which the logout hint cookie carries (OIDC_LOGOUT_HINT). */
+export interface OIDCExchange {
+  claims: OIDCClaims;
+  idToken: string;
 }
 
 export async function exchangeCode(
@@ -133,7 +211,7 @@ export async function exchangeCode(
   codeVerifier: string,
   expectedState: string,
   expectedNonce: string,
-): Promise<OIDCClaims | null> {
+): Promise<OIDCExchange | null> {
   const tokens = await client.authorizationCodeGrant(config, callbackUrl, {
     pkceCodeVerifier: codeVerifier,
     expectedState,
@@ -142,45 +220,113 @@ export async function exchangeCode(
   });
 
   const claims = tokens.claims();
-  if (!claims) {
-    logger.warn("OIDC token exchange succeeded but claims are empty", { route: "oidc" });
+  if (!claims || !tokens.id_token) {
+    logger.warn("OIDC token exchange succeeded but the ID token or its claims are missing", { route: "oidc" });
     return null;
   }
 
-  return claims as unknown as OIDCClaims;
+  return { claims: claims as unknown as OIDCClaims, idToken: tokens.id_token };
 }
 
-// ─── Role Mapping ──────────────────────────────────────────────────────────
+const OIDC_MAX_CLAIM_ROLES = 20;
+const OIDC_MAX_CLAIM_ROLE_BYTES = 64;
+
+const RESERVED_ROLES = new Set(["*", "admin", "user"]);
+
+export interface OIDCClaimRolesResult {
+  roles: string[];
+  overflow: boolean;
+}
+
+/**
+ * Extract normalized string values from an OIDC claim path.
+ * Supports dot-notation for nested claims (e.g. "realm_access.roles"); a top-level claim named exactly `roleClaim` is
+ * read whole first, because a namespaced claim such as Auth0's "https://libredb.org/roles" holds dots of its own.
+ * An object claim yields its keys, as Zitadel's "urn:zitadel:iam:org:project:roles" maps each role name to its orgs.
+ */
+export function readRoleClaimValues(claims: Record<string, unknown>, roleClaim: string): string[] {
+  if (!roleClaim) return [];
+
+  let value: unknown = claims;
+  if (Object.hasOwn(claims, roleClaim)) {
+    value = claims[roleClaim];
+  } else {
+    for (const part of roleClaim.split(".")) {
+      if (value == null || typeof value !== "object") return [];
+      value = (value as Record<string, unknown>)[part];
+    }
+  }
+
+  if (value == null) return [];
+
+  if (Array.isArray(value)) return value.map(String);
+  return typeof value === "object" ? Object.keys(value) : [String(value)];
+}
 
 /**
  * Extract role from OIDC claims using configured claim path.
  * Supports dot-notation for nested claims (e.g. "realm_access.roles").
- * Returns 'admin' if any claim value matches OIDC_ADMIN_ROLES, otherwise 'user'.
+ * Returns 'admin' if any claim value matches OIDC_ADMIN_ROLES, which wins when the claim also holds a user role.
+ * Otherwise, with `userRoles` (OIDC_USER_ROLES) empty, returns 'user'; with it set, returns 'user' only when a claim
+ * value matches one of them, and null for an account that holds neither role.
  */
 export function mapOIDCRole(
   claims: Record<string, unknown>,
   roleClaim: string,
   adminRoles: string[],
-): "admin" | "user" {
-  if (!roleClaim) return "user";
-
-  // Navigate dot-notation path
-  const parts = roleClaim.split(".");
-  let value: unknown = claims;
-  for (const part of parts) {
-    if (value == null || typeof value !== "object") return "user";
-    value = (value as Record<string, unknown>)[part];
-  }
-
-  if (value == null) return "user";
-
-  // Normalize to array of strings
-  const values: string[] = Array.isArray(value) ? value.map(String) : [String(value)];
+  userRoles: string[] = [],
+): "admin" | "user" | null {
+  // What an account that matches no role gets: everyone is at least a user until OIDC_USER_ROLES says otherwise.
+  const unmatched = userRoles.length === 0 ? "user" : null;
+  const values = readRoleClaimValues(claims, roleClaim);
+  if (values.length === 0) return unmatched;
 
   // Check if any value matches admin roles
   const isAdmin = values.some((v) => adminRoles.some((ar) => v.toLowerCase() === ar.toLowerCase()));
+  if (isAdmin) return "admin";
 
-  return isAdmin ? "admin" : "user";
+  const isUser = values.some((v) => userRoles.some((ur) => v.toLowerCase() === ur.toLowerCase()));
+  return isUser ? "user" : unmatched;
+}
+
+/**
+ * Extract custom claim roles that start with the configured prefix.
+ * Keeps values exactly as the IdP sent them (prefix included), deduplicated and sorted.
+ * Reserved names ('*', 'admin', 'user') never become claim roles under any casing.
+ * Limits: at most 20 claim roles, each at most 64 bytes (UTF-8); exceeding either marks overflow: true.
+ */
+export function mapOIDCClaimRoles(
+  valuesOrClaims: readonly string[] | Record<string, unknown>,
+  prefix: string,
+  roleClaim?: string,
+): OIDCClaimRolesResult {
+  if (!prefix) return { roles: [], overflow: false };
+
+  const values = Array.isArray(valuesOrClaims)
+    ? (valuesOrClaims as readonly string[])
+    : readRoleClaimValues(valuesOrClaims as Record<string, unknown>, roleClaim || "");
+
+  const matching: string[] = [];
+  let overflow = false;
+
+  for (const val of values) {
+    if (val.startsWith(prefix)) {
+      if (RESERVED_ROLES.has(val.toLowerCase())) {
+        continue;
+      }
+      if (Buffer.byteLength(val, "utf8") > OIDC_MAX_CLAIM_ROLE_BYTES) {
+        overflow = true;
+      }
+      matching.push(val);
+    }
+  }
+
+  const deduped = Array.from(new Set(matching)).sort();
+  if (deduped.length > OIDC_MAX_CLAIM_ROLES) {
+    overflow = true;
+  }
+
+  return { roles: overflow ? [] : deduped, overflow };
 }
 
 // ─── State Cookie Encryption ───────────────────────────────────────────────
@@ -188,27 +334,43 @@ export function mapOIDCRole(
 // Hoisted single-line message (SonarCloud/bun coverage: keep throw messages on one line).
 const OIDC_STATE_SECRET_MISSING_MESSAGE = "JWT_SECRET is required for OIDC state encryption";
 
-function getStateSecret(): Uint8Array {
-  // No dev fallback here: OIDC state must never be signed with a well-known
-  // secret, so a missing JWT_SECRET throws in every environment. Read fresh on
-  // every call (not memoized), matching the pre-consolidation behavior.
-  return getJwtSecret({ allowDevFallback: false, missingMessage: OIDC_STATE_SECRET_MISSING_MESSAGE });
+/**
+ * The label the state signing key is derived with, and the typ its header pins: the state token follows the
+ * purpose-derived key convention of the other non-session tokens (agent drive, MCP, object-edit plan, passkey
+ * ceremony). Changing either makes outstanding state cookies fail their check, which is harmless: they live five
+ * minutes and the user simply signs in again.
+ */
+const OIDC_STATE_KEY_LABEL = "libredb.oidc.state.v1";
+const OIDC_STATE_TOKEN_TYPE = "libredb-oidc-state+jwt";
+
+function stateSigningKey(): Promise<Uint8Array> {
+  // No dev fallback here: OIDC state must never be signed with a key derived from a
+  // well-known secret, so a missing JWT_SECRET throws in every environment. Derived
+  // on every call (not memoized), so a rotated secret takes effect at once.
+  return derivedSigningKey(OIDC_STATE_KEY_LABEL, {
+    allowDevFallback: false,
+    missingMessage: OIDC_STATE_SECRET_MISSING_MESSAGE,
+  });
 }
 
 export async function encryptState(data: OIDCState): Promise<string> {
   return await new SignJWT({ ...data })
-    .setProtectedHeader({ alg: "HS256" })
+    .setProtectedHeader({ alg: "HS256", typ: OIDC_STATE_TOKEN_TYPE })
     .setIssuedAt()
     .setExpirationTime("5m")
-    .sign(getStateSecret());
+    .sign(await stateSigningKey());
 }
 
 export async function decryptState(token: string): Promise<OIDCState> {
-  const { payload } = await jwtVerify(token, getStateSecret());
+  const { payload } = await jwtVerify(token, await stateSigningKey(), {
+    algorithms: ["HS256"],
+    typ: OIDC_STATE_TOKEN_TYPE,
+  });
   return {
     code_verifier: payload.code_verifier as string,
     state: payload.state as string,
     nonce: payload.nonce as string,
+    ...(typeof payload.return_to === "string" ? { return_to: payload.return_to } : {}),
   };
 }
 
@@ -235,8 +397,10 @@ export function getPublicOrigin(request: Request): string {
  * Build the OIDC provider's logout URL.
  * Auth0: /v2/logout?client_id=...&returnTo=...
  * Generic: use the discovered end_session_endpoint.
+ * `idTokenHint` is added as `id_token_hint` on the Zitadel and generic end-session paths; Auth0's /v2/logout takes
+ * no such parameter, so its URL stays the same.
  */
-export async function buildLogoutUrl(returnTo: string): Promise<string | null> {
+export async function buildLogoutUrl(returnTo: string, idTokenHint?: string): Promise<string | null> {
   try {
     const config = getOIDCConfig();
     const issuerUrl = new URL(config.issuer);
@@ -255,6 +419,7 @@ export async function buildLogoutUrl(returnTo: string): Promise<string | null> {
       const logoutUrl = new URL("/oidc/v1/end_session", config.issuer);
       logoutUrl.searchParams.set("client_id", config.clientId);
       logoutUrl.searchParams.set("post_logout_redirect_uri", returnTo);
+      if (idTokenHint !== undefined) logoutUrl.searchParams.set("id_token_hint", idTokenHint);
       return logoutUrl.toString();
     }
 
@@ -262,6 +427,7 @@ export async function buildLogoutUrl(returnTo: string): Promise<string | null> {
     const discovered = await discoverProvider(config);
     const logoutUrl = client.buildEndSessionUrl(discovered, {
       post_logout_redirect_uri: returnTo,
+      ...(idTokenHint === undefined ? {} : { id_token_hint: idTokenHint }),
     });
     return logoutUrl.toString();
   } catch (error) {

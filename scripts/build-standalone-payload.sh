@@ -18,6 +18,14 @@
 #                                      duckdb.node + libduckdb.so
 #   - node_modules/detect-libc      -> what the DuckDB binding loader uses to
 #                                      pick between a glibc and a musl package
+#   - node_modules/oracledb         -> the Oracle driver, whole: Thick mode
+#                                      (ORACLE_CLIENT_LIB_DIR) loads a native
+#                                      addon from build/Release, which file
+#                                      tracing never sees (#538)
+#   - node_modules/db2-node         -> the Db2 driver: traced (no copy),
+#                                      pruned to the addons this target loads
+#   - THIRD_PARTY_NOTICES.txt       -> notices for the crates compiled into
+#                                      db2-node's addons
 #   - seed-assets/                  -> vendored sample DB templates (fs-read
 #                                      at runtime, not seen by file tracing)
 #   - data/                         -> default SQLite storage directory
@@ -119,7 +127,11 @@ export JWT_SECRET="${JWT_SECRET:-build-time-placeholder-secret-32ch}"
 export ADMIN_PASSWORD="${ADMIN_PASSWORD:-build}"
 export USER_PASSWORD="${USER_PASSWORD:-build}"
 echo "==> Building standalone server (version ${VERSION}, ${OS}-${ARCH})"
-NEXT_TELEMETRY_DISABLED=1 DOCKER_BUILD=true bun run build
+# next build type-checks the whole tree, and on a fresh checkout that outgrows the default heap of
+# the smaller release runners: the 0.18.0 tag stopped on macos-14 and macos-15-intel with "JavaScript
+# heap out of memory" at about 2 GB. Raised for the build only; the smoke test below starts the server
+# with the defaults a user gets.
+NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=6144" NEXT_TELEMETRY_DISABLED=1 DOCKER_BUILD=true bun run build
 
 if [ ! -f .next/standalone/server.js ]; then
   echo "Standalone output missing (.next/standalone/server.js) - is DOCKER_BUILD=true wired in next.config.ts?" >&2
@@ -223,6 +235,48 @@ cp -R node_modules/@duckdb "$PAYLOAD_DIR/node_modules/@duckdb"
 rm -rf "${PAYLOAD_DIR:?}/node_modules/detect-libc"
 cp -R node_modules/detect-libc "$PAYLOAD_DIR/node_modules/detect-libc"
 
+# The Oracle driver (#538). Thin mode is pure JavaScript, so this package looked
+# like an ordinary traced dependency for a long time. Thick mode is not: setting
+# ORACLE_CLIENT_LIB_DIR makes node-oracledb load build/Release/oracledb-<ver>-
+# <platform>-<arch>.node, reached through a computed require(path) that output
+# file tracing cannot follow, so the standalone tree got the JavaScript and none
+# of the binaries. Copy the whole package: build/ carries one binary per
+# platform and arch (~3 MB), which is what keeps this arch-agnostic.
+if [ ! -d node_modules/oracledb ]; then
+  echo "node_modules/oracledb not found - run 'bun install --frozen-lockfile' first" >&2
+  exit 1
+fi
+rm -rf "${PAYLOAD_DIR:?}/node_modules/oracledb"
+cp -R node_modules/oracledb "$PAYLOAD_DIR/node_modules/oracledb"
+# Unlike the two probes above, this one cannot `require` its way to proof: the
+# addon only loads under initOracleClient(), which needs an Oracle Instant
+# Client that no build runner has. What IS checkable is the failure the copy
+# exists to prevent - the addon for THIS target missing from the payload.
+if ! ls "$PAYLOAD_DIR"/node_modules/oracledb/build/Release/oracledb-*-"${OS}"-"${ARCH}".node >/dev/null 2>&1; then
+  echo "node_modules/oracledb has no Thick-mode addon for ${OS}-${ARCH} in build/Release." >&2
+  echo "The published package ships one per platform, so this normally means an incomplete" >&2
+  echo "node_modules - reinstall with 'bun install --frozen-lockfile'." >&2
+  exit 1
+fi
+
+# The Db2 driver (#786). No copy here, unlike the three above: db2-node's
+# index.js reaches its eight prebuilt addons through static require literals,
+# so file tracing already put the whole package into the payload at the
+# `cp -R .next/standalone/.` step. The work is the reverse, keeping only what
+# this target can load (both libcs on Linux, because npx serves Alpine from the
+# same tarball); the script fails when the package, a kept addon or the addon
+# count is wrong. Then prove the survivor loads under this host's node.
+"$ROOT_DIR/scripts/lib/prune-db2-node.sh" "$PAYLOAD_DIR" "$OS" "$ARCH"
+if ! (cd "$PAYLOAD_DIR" && node -e "require('db2-node')") 2>/dev/null; then
+  echo "db2-node does not load for ${OS}-${ARCH} under $(node --version)." >&2
+  exit 1
+fi
+
+# The npm tarball of db2-node ships no LICENSE and no notices for the Rust
+# crates linked into its addons, so the generated notices travel at the payload
+# root, next to LICENSE (prune-standalone-payload.sh keeps both).
+cp THIRD_PARTY_NOTICES.txt "$PAYLOAD_DIR/THIRD_PARTY_NOTICES.txt"
+
 # Vendored sample database templates (seed-assets/): read at runtime relative
 # to the payload root, so output file tracing never includes them — copy
 # explicitly (mirrors the Dockerfile runner stage COPY).
@@ -276,6 +330,12 @@ if [ "$RUN_SMOKE" = "true" ]; then
   # until a user opens a DuckDB connection.
   echo "==> Smoke: @duckdb/node-api native binding loads"
   (cd "$SMOKE_DIR" && node -e "const { DuckDBInstance } = require('@duckdb/node-api'); DuckDBInstance.create(':memory:').then((i) => i.connect()).then((c) => c.runAndReadAll('SELECT 42 AS a')).then((r) => { if (r.getRowObjectsJson()[0].a !== 42) { throw new Error('unexpected DuckDB result'); } });")
+
+  # The third native module. A bare require is a complete probe: index.js
+  # throws at load when the addon for this platform is not on disk.
+  echo "==> Smoke: db2-node native binding loads"
+  (cd "$SMOKE_DIR" && node -e "const m = require('db2-node'); if (typeof m.Client !== 'function') { throw new Error('db2-node loaded without Client'); }")
+  test -f "$SMOKE_DIR/THIRD_PARTY_NOTICES.txt"
 
   PORT=$(( (RANDOM % 20000) + 20001 ))
   echo "==> Smoke: booting node server.js on port $PORT"

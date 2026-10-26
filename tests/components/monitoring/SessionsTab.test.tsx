@@ -6,7 +6,12 @@ import { mock, describe, test, expect, afterEach } from "bun:test";
 import React from "react";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { SessionsTab } from "@/components/monitoring/tabs/SessionsTab";
-import type { MonitoringData, ProviderLabels } from "@/lib/db/types";
+import type { MonitoringData, ProviderCapabilities, ProviderLabels } from "@/lib/db/types";
+import { PostgresProvider } from "@/lib/db/providers/sql/postgres";
+import { SQLiteProvider } from "@/lib/db/providers/sql/sqlite";
+import { RedisProvider } from "@/lib/db/providers/keyvalue/redis";
+import { CassandraProvider } from "@/lib/db/providers/sql/cassandra/index";
+import { DruidProvider } from "@/lib/db/providers/sql/druid/index";
 
 mock.module("@/components/ui/tooltip", () => ({
   TooltipProvider: ({ children }: { children: React.ReactNode }) => React.createElement("div", {}, children),
@@ -15,19 +20,24 @@ mock.module("@/components/ui/tooltip", () => ({
   TooltipContent: ({ children }: { children: React.ReactNode }) => React.createElement("div", {}, children),
 }));
 
-mock.module("@/components/ui/alert-dialog", () => ({
-  AlertDialog: ({ children, open }: { children: React.ReactNode; open?: boolean }) =>
-    open ? React.createElement("div", { "data-testid": "alert-dialog" }, children) : null,
-  AlertDialogContent: ({ children }: { children: React.ReactNode }) => React.createElement("div", {}, children),
-  AlertDialogHeader: ({ children }: { children: React.ReactNode }) => React.createElement("div", {}, children),
-  AlertDialogTitle: ({ children }: { children: React.ReactNode }) => React.createElement("h2", {}, children),
-  AlertDialogDescription: ({ children }: { children: React.ReactNode }) => React.createElement("p", {}, children),
-  AlertDialogFooter: ({ children }: { children: React.ReactNode }) => React.createElement("div", {}, children),
-  AlertDialogCancel: ({ children }: { children: React.ReactNode }) =>
-    React.createElement("button", { type: "button" }, children),
-  AlertDialogAction: ({ children, onClick }: { children: React.ReactNode; onClick?: () => void }) =>
-    React.createElement("button", { type: "button", onClick }, children),
-}));
+// Each engine's own declaration, read from the provider rather than written here (#1424).
+const config = { name: "t", host: "localhost", port: 1, database: "app", createdAt: new Date(0) };
+const postgresCaps = new PostgresProvider({ ...config, id: "pg", type: "postgres" }).getCapabilities();
+const sqliteCaps = new SQLiteProvider({
+  ...config,
+  id: "sqlite",
+  type: "sqlite",
+  database: ":memory:",
+}).getCapabilities();
+const enginesWithoutKill: [string, ProviderCapabilities][] = [
+  ["SQLite", sqliteCaps],
+  ["Redis", new RedisProvider({ ...config, id: "redis", type: "redis" }).getCapabilities()],
+  [
+    "Cassandra",
+    new CassandraProvider({ ...config, id: "cassandra", type: "cassandra", localDataCenter: "dc1" }).getCapabilities(),
+  ],
+  ["Druid", new DruidProvider({ ...config, id: "druid", type: "druid" }).getCapabilities()],
+];
 
 function makeData(): MonitoringData {
   return {
@@ -151,15 +161,17 @@ describe("SessionsTab", () => {
 
   test("calls onKillSession after confirming terminate action", async () => {
     const onKillSession = mock(async () => true);
-    const { container, queryByText } = render(
-      <SessionsTab data={makeData()} loading={false} onKillSession={onKillSession} isAdmin />,
+    const { getByRole, queryByText } = render(
+      <SessionsTab
+        data={makeData()}
+        loading={false}
+        onKillSession={onKillSession}
+        isAdmin
+        capabilities={postgresCaps}
+      />,
     );
 
-    const killButtons = Array.from(container.querySelectorAll("button")).filter((btn) =>
-      btn.className.includes("text-destructive"),
-    );
-    expect(killButtons.length).toBeGreaterThan(0);
-    fireEvent.click(killButtons[0]!);
+    fireEvent.click(getByRole("button", { name: "Terminate session 101" }));
 
     expect(queryByText("Terminate Session?")).not.toBeNull();
     const terminateButton = queryByText("Terminate");
@@ -171,11 +183,100 @@ describe("SessionsTab", () => {
     });
   });
 
-  test("hides admin actions when isAdmin is false", () => {
-    const { queryAllByText } = render(
-      <SessionsTab data={makeData()} loading={false} onKillSession={mock(async () => true)} isAdmin={false} />,
+  // The dialog opens from state, with no AlertDialogTrigger for Radix to return to (#1198).
+  test("cancelling the terminate dialog puts focus back on the row's kill button", async () => {
+    const onKillSession = mock(async () => true);
+    const { getByRole, queryByText } = render(
+      <SessionsTab
+        data={makeData()}
+        loading={false}
+        onKillSession={onKillSession}
+        isAdmin
+        capabilities={postgresCaps}
+      />,
     );
-    expect(queryAllByText("-").length).toBeGreaterThan(0);
+
+    const killButton = getByRole("button", { name: "Terminate session 101" });
+    killButton.focus();
+    fireEvent.click(killButton);
+    await waitFor(() => expect(queryByText("Terminate Session?")).not.toBeNull());
+
+    fireEvent.click(getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => expect(queryByText("Terminate Session?")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(killButton));
+    expect(onKillSession).not.toHaveBeenCalled();
+  });
+
+  test("hides admin actions when isAdmin is false", () => {
+    const { queryAllByRole } = render(
+      <SessionsTab
+        data={makeData()}
+        loading={false}
+        onKillSession={mock(async () => true)}
+        isAdmin={false}
+        capabilities={postgresCaps}
+      />,
+    );
+    expect(queryAllByRole("button", { name: /^Terminate session/ })).toHaveLength(0);
+  });
+});
+
+// The route refuses `kill` wherever the provider does not declare it, so the button is drawn only where it can
+// work: for an admin, on an engine that declares `kill`, on a row the engine can end (#1424).
+describe("Terminate is offered only where the server accepts it", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  const terminateLabels = (capabilities: ProviderCapabilities | undefined, data: MonitoringData = makeData()) =>
+    render(
+      <SessionsTab
+        data={data}
+        loading={false}
+        onKillSession={mock(async () => true)}
+        isAdmin
+        capabilities={capabilities}
+      />,
+    )
+      .queryAllByRole("button", { name: /^Terminate session/ })
+      .map((button) => button.getAttribute("aria-label"));
+
+  test("an admin on PostgreSQL gets one per row", () => {
+    expect(terminateLabels(postgresCaps)).toEqual(["Terminate session 101", "Terminate session 202"]);
+  });
+
+  for (const [engine, capabilities] of enginesWithoutKill) {
+    test(`${engine} declares no kill, so no row gets one`, () => {
+      expect(capabilities.maintenanceOperations).not.toContain("kill");
+      expect(terminateLabels(capabilities)).toEqual([]);
+    });
+  }
+
+  test("the Studio process SQLite lists as its one session gets none", () => {
+    const data = {
+      ...makeData(),
+      activeSessions: [
+        { pid: 4242, user: "sqlite", database: "app.db", state: "active", query: "", duration: "N/A", durationMs: 0 },
+      ],
+    } as MonitoringData;
+    expect(terminateLabels(sqliteCaps, data)).toEqual([]);
+  });
+
+  test("capabilities that have not arrived offer none", () => {
+    expect(terminateLabels(undefined)).toEqual([]);
+  });
+
+  test("a list naming kill offers none while maintenance is off, as the route refuses it first", () => {
+    const capabilities = { ...postgresCaps, supportsMaintenance: false };
+    expect(capabilities.maintenanceOperations).toContain("kill");
+    expect(terminateLabels(capabilities)).toEqual([]);
+  });
+
+  test("a row the engine says it cannot end gets none, and the others keep theirs", () => {
+    const data = makeData();
+    data.activeSessions![1] = { ...data.activeSessions![1], terminable: false };
+    expect(terminateLabels(postgresCaps, data)).toEqual(["Terminate session 101"]);
   });
 });
 

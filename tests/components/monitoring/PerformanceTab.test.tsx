@@ -6,6 +6,7 @@ import React from "react";
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, render } from "@testing-library/react";
 import { PerformanceTab } from "@/components/monitoring/tabs/PerformanceTab";
+import { storage } from "@/lib/storage";
 import type { MonitoringData } from "@/lib/db/types";
 import type { TimeSeriesPoint } from "@/lib/time-series-buffer";
 
@@ -51,6 +52,40 @@ function makeHistory(): TimeSeriesPoint<MonitoringData>[] {
 describe("PerformanceTab", () => {
   afterEach(() => {
     cleanup();
+    localStorage.removeItem("libredb_threshold_config");
+  });
+
+  test("uses saved monitoring thresholds and falls back for missing metrics", () => {
+    const data = makeData({ deadlocks: 6 });
+    const { getAllByText, rerender } = render(<PerformanceTab data={data} loading={false} />);
+    const card = (title: string) => getAllByText(title)[0].closest('[data-slot="card"]')!;
+    expect(card("Cache Hit").className).toContain("border-hue-green");
+    expect(card("Buffer").className).toContain("border-hue-green");
+    expect(card("Deadlocks").className).toContain("border-hue-red");
+
+    storage.saveThresholdConfig([
+      { metric: "cacheHitRatio", warning: 100, critical: 99, direction: "below", label: "Cache" },
+      { metric: "bufferPoolUsage", warning: 60, critical: 64, direction: "above", label: "Buffer" },
+      { metric: "deadlocks", warning: 10, critical: 20, direction: "above", label: "Deadlocks" },
+    ]);
+    rerender(<PerformanceTab data={data} loading={false} />);
+    expect(card("Cache Hit").className).toContain("border-hue-red");
+    expect(card("Buffer").className).toContain("border-hue-red");
+    expect(card("Deadlocks").className).toContain("border-hue-green");
+
+    storage.saveThresholdConfig([]);
+    rerender(<PerformanceTab data={data} loading={false} />);
+    expect(card("Cache Hit").className).toContain("border-hue-green");
+    expect(card("Buffer").className).toContain("border-hue-green");
+    expect(card("Deadlocks").className).toContain("border-hue-red");
+  });
+
+  test("does not grade missing readings at saved boundaries", () => {
+    storage.saveThresholdConfig([
+      { metric: "cacheHitRatio", warning: 100, critical: 100, direction: "below", label: "Cache" },
+    ]);
+    const { getByText } = render(<PerformanceTab data={makeData({ cacheHitRatio: undefined })} loading={false} />);
+    expect(getByText("Cache Hit").closest('[data-slot="card"]')!.className).toContain("border-hue-green");
   });
 
   test("renders skeleton while loading without data", () => {
@@ -75,6 +110,32 @@ describe("PerformanceTab", () => {
     expect(queryByText("Attention")).not.toBeNull();
   });
 
+  test("names a setting only where the provider declares one", () => {
+    const pg = render(
+      <PerformanceTab
+        data={makeData({ cacheHitRatio: 80, cacheHitAdvice: "Increase shared_buffers" })}
+        loading={false}
+      />,
+    );
+    expect(pg.queryByText("Increase shared_buffers")).not.toBeNull();
+    cleanup();
+
+    const ch = render(<PerformanceTab data={makeData({ cacheHitRatio: 80 })} loading={false} />);
+    expect(ch.queryByText("Low Cache Hit")).not.toBeNull();
+    expect(ch.container.textContent).not.toContain("shared_buffers");
+    expect(ch.queryByText("The working set does not fit in the engine's cache")).not.toBeNull();
+    cleanup();
+
+    const healthy = render(
+      <PerformanceTab
+        data={makeData({ cacheHitRatio: 95, cacheHitAdvice: "Increase shared_buffers" })}
+        loading={false}
+      />,
+    );
+    expect(healthy.queryByText("Low Cache Hit")).toBeNull();
+    expect(healthy.container.textContent).not.toContain("shared_buffers");
+  });
+
   test("renders the measured cache hit ratio with a bar and a rating", () => {
     const { queryByText } = render(<PerformanceTab data={makeData()} loading={false} />);
     const card = queryByText("Cache Hit")!.closest('[data-slot="card"]')!;
@@ -82,7 +143,7 @@ describe("PerformanceTab", () => {
     expect(card.textContent).toContain("%");
     expect(card.querySelectorAll('[data-slot="progress"]').length).toBe(1);
     expect(card.textContent).toContain("Excellent");
-    expect(card.querySelector("svg")?.getAttribute("class")).toContain("text-green-500");
+    expect(card.querySelector("svg")?.getAttribute("class")).toContain("text-hue-green");
   });
 
   test("reports an unmeasured cache hit ratio as unavailable instead of 0%", () => {
@@ -105,10 +166,10 @@ describe("PerformanceTab", () => {
     for (const rating of ["Excellent", "Good", "Fair", "Poor"]) {
       expect(card.textContent).not.toContain(rating);
     }
-    // Absence is not a fault: no red icon, no red or yellow border, no advice.
+    // Absence is not a fault: no danger icon, no danger or warning border, no advice.
     expect(card.querySelector("svg")?.getAttribute("class")).toContain("text-muted-foreground");
-    expect(card.className).not.toContain("red");
-    expect(card.className).not.toContain("yellow");
+    expect(card.className).not.toContain("danger");
+    expect(card.className).not.toContain("warning");
     expect(queryByText("Low Cache Hit")).toBeNull();
     expect(queryByText("Performing well!")).toBeNull();
   });
@@ -159,7 +220,7 @@ describe("PerformanceTab", () => {
 
   // Trino "holds no buffer pool" and "takes no locks, so there are no deadlocks to
   // count" (providers/sql/trino/introspect.ts:622-639), Cassandra and Druid omit the
-  // same two fields, and sqlite.ts:729 sets bufferPoolUsage undefined outright. The
+  // same two fields, and sqlite.ts:715 sets bufferPoolUsage undefined outright. The
   // panel used to answer those absences with "0 %"/"Poor" and "0"/"None
   // detected"/"Healthy" - a rating and a clean bill of health for measurements nobody
   // made. Same rule as the cache hit ratio card three lines above it.
@@ -176,10 +237,10 @@ describe("PerformanceTab", () => {
     for (const rating of ["Excellent", "Good", "Fair", "Poor"]) {
       expect(card.textContent).not.toContain(rating);
     }
-    // Absence is not a fault: no red icon, no red or yellow border.
+    // Absence is not a fault: no danger icon, no danger or warning border.
     expect(card.querySelector("svg")?.getAttribute("class")).toContain("text-muted-foreground");
-    expect(card.className).not.toContain("red");
-    expect(card.className).not.toContain("yellow");
+    expect(card.className).not.toContain("danger");
+    expect(card.className).not.toContain("warning");
   });
 
   test("reports unmeasured deadlocks as unavailable instead of a healthy zero", () => {
@@ -193,15 +254,15 @@ describe("PerformanceTab", () => {
     expect(card.textContent).not.toContain("None detected");
     expect(card.textContent).not.toContain("Healthy");
     expect(card.textContent).not.toContain("Attention");
-    // A green icon is a verdict too.
+    // A success-coloured icon is a verdict too.
     expect(card.querySelector("svg")?.getAttribute("class")).toContain("text-muted-foreground");
-    expect(card.className).not.toContain("red");
-    expect(card.className).not.toContain("yellow");
+    expect(card.className).not.toContain("danger");
+    expect(card.className).not.toContain("warning");
   });
 
-  // The pin that keeps absence and zero from being collapsed back together: mongodb.ts:856,
-  // mysql.ts:855 and sqlite.ts:729 report a real measured 0, and that measurement must keep
-  // exactly the rendering it has today.
+  // The pin that keeps absence and zero from being collapsed back together: `getPerformanceMetrics`
+  // in `mongodb/index.ts`, `mysql.ts` and `sqlite.ts` reports a real measured 0, and that measurement
+  // must keep exactly the rendering it has today.
   test("keeps a measured zero rendering as a measured zero", () => {
     const { queryByText } = render(
       <PerformanceTab data={makeData({ bufferPoolUsage: 0, deadlocks: 0 })} loading={false} />,
@@ -219,7 +280,7 @@ describe("PerformanceTab", () => {
     expect(deadlocks.textContent).toContain("None detected");
     expect(deadlocks.textContent).toContain("Healthy");
     expect(deadlocks.textContent).not.toContain("N/A");
-    expect(deadlocks.querySelector("svg")?.getAttribute("class")).toContain("text-green-500");
+    expect(deadlocks.querySelector("svg")?.getAttribute("class")).toContain("text-hue-green");
   });
 
   test("renders the buffer and deadlock trends as not measured when no sample carries them", () => {

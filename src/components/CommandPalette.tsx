@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useState, useMemo } from "react";
+import { SHORTCUTS, matchesShortcut, shortcutLabel } from "@/lib/keyboard-shortcuts";
 import {
   CommandDialog,
   CommandInput,
@@ -23,18 +24,35 @@ import {
   Bot,
   TextAlignStart,
   Save,
+  Keyboard,
 } from "lucide-react";
-import { DatabaseConnection, TableSchema, SavedQuery, QueryHistoryItem } from "@/lib/types";
+import { DatabaseConnection, SavedQuery, QueryHistoryItem } from "@/lib/types";
+import { relationObjects, type DetailedObject } from "@/lib/db/detailed-object";
+import { pathKey } from "@/lib/db/object-path";
+import { offersSchemaDiagram, type ProviderCapabilities } from "@/lib/db/types";
 import { storage } from "@/lib/storage";
 import { getDBIcon } from "@/lib/db-ui-config";
 
 interface CommandPaletteProps {
   connections: DatabaseConnection[];
   activeConnection: DatabaseConnection | null;
-  schema: TableSchema[];
+  schema: readonly DetailedObject[];
+  /**
+   * The provider's own declaration, used for one thing: which of `schema`'s entries this
+   * palette may offer. Selecting an item EXECUTES a generated query through
+   * `onTableClick`, so a routine or a trigger here is a statement that fails as soon as it
+   * is clicked. Optional because the metadata read is asynchronous and a palette that hid
+   * every object until it answered would look like an empty database (#789).
+   */
+  capabilities?: ProviderCapabilities;
   onSelectConnection: (conn: DatabaseConnection) => void;
-  onTableClick: (tableName: string) => void;
-  onAddConnection: () => void;
+  onTableClick: (path: readonly string[]) => void;
+  /**
+   * Opens the connection dialog. Optional, and the item is not rendered without it: the
+   * standalone shell withholds it while the server refuses custom connections
+   * (`ALLOW_CUSTOM_CONNECTIONS`), the same rule `onAskAgent` below follows.
+   */
+  onAddConnection?: () => void;
   onExecuteQuery: () => void;
   onLoadSavedQuery: (query: string) => void;
   onLoadHistoryQuery: (query: string) => void;
@@ -52,6 +70,8 @@ interface CommandPaletteProps {
    * shell declines to offer elsewhere too (`MobileNav.onOpenAgent`).
    */
   onAskAgent?: () => void;
+  /** Opens the standalone shell's `ShortcutsDialog` instance (#746). */
+  onShowShortcuts: () => void;
   onLogout: () => void;
 }
 
@@ -59,6 +79,7 @@ export function CommandPalette({
   connections,
   activeConnection,
   schema,
+  capabilities,
   onSelectConnection,
   onTableClick,
   onAddConnection,
@@ -71,14 +92,19 @@ export function CommandPalette({
   onFormatQuery,
   onSaveQuery,
   onAskAgent,
+  onShowShortcuts,
   onLogout,
 }: CommandPaletteProps) {
   const [open, setOpen] = useState(false);
 
+  // Relations only, by the kind's declared ROLE and never by its id: an item here runs a
+  // generated query the moment it is selected (#789).
+  const tables = useMemo(() => relationObjects(schema, capabilities), [schema, capabilities]);
+
   // Register Cmd+K / Ctrl+K keyboard shortcut
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+      if (matchesShortcut(e, SHORTCUTS.commandPalette)) {
         e.preventDefault();
         setOpen((prev) => !prev);
       }
@@ -113,17 +139,25 @@ export function CommandPalette({
         {/* Quick Actions */}
         <CommandGroup heading="Actions">
           <CommandItem onSelect={() => runAction(onExecuteQuery)}>
-            <Play strokeWidth={1.5} className="w-3.5 h-3.5 text-blue-400" />
+            <Play strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-blue" />
             <span>Run Query</span>
-            <CommandShortcut>Ctrl+Enter</CommandShortcut>
+            <CommandShortcut>{shortcutLabel(SHORTCUTS.executeQuery)}</CommandShortcut>
           </CommandItem>
-          <CommandItem onSelect={() => runAction(onFormatQuery)}>
-            <TextAlignStart strokeWidth={1.5} className="w-3.5 h-3.5 text-fg-tertiary" />
-            <span>Format Query</span>
-          </CommandItem>
+          {/* Not where the provider withholds the SQL formatter: the editor's own Format reads the same capability. */}
+          {capabilities?.supportsSqlFormat !== false && (
+            <CommandItem onSelect={() => runAction(onFormatQuery)}>
+              <TextAlignStart strokeWidth={1.5} className="w-3.5 h-3.5 text-fg-tertiary" />
+              <span>Format Query</span>
+            </CommandItem>
+          )}
           <CommandItem onSelect={() => runAction(onSaveQuery)}>
             <Save strokeWidth={1.5} className="w-3.5 h-3.5 text-fg-tertiary" />
             <span>Save Current Query</span>
+          </CommandItem>
+          <CommandItem onSelect={() => runAction(onShowShortcuts)}>
+            <Keyboard strokeWidth={1.5} className="w-3.5 h-3.5 text-fg-tertiary" />
+            <span>Keyboard Shortcuts</span>
+            <CommandShortcut>?</CommandShortcut>
           </CommandItem>
           {onAskAgent && (
             /*
@@ -132,30 +166,33 @@ export function CommandPalette({
               carries the editor's statement in with it (review of #331 T3).
             */
             <CommandItem onSelect={() => runAction(onAskAgent)}>
-              <Bot strokeWidth={1.5} className="w-3.5 h-3.5 text-blue-400" />
+              <Bot strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-blue" />
               <span>Ask the agent about this query</span>
             </CommandItem>
           )}
-          <CommandItem onSelect={() => runAction(onAddConnection)}>
-            <Plus strokeWidth={1.5} className="w-3.5 h-3.5 text-emerald-400" />
-            <span>New Connection</span>
-          </CommandItem>
+          {onAddConnection && (
+            <CommandItem onSelect={() => runAction(onAddConnection)}>
+              <Plus strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-emerald" />
+              <span>New Connection</span>
+            </CommandItem>
+          )}
           <CommandItem onSelect={() => runAction(onNavigateHealth)}>
-            <Activity strokeWidth={1.5} className="w-3.5 h-3.5 text-emerald-400" />
+            <Activity strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-emerald" />
             <span>Health Dashboard</span>
           </CommandItem>
           <CommandItem onSelect={() => runAction(onNavigateMonitoring)}>
-            <Gauge strokeWidth={1.5} className="w-3.5 h-3.5 text-purple-400" />
+            <Gauge strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-purple" />
             <span>Monitoring</span>
           </CommandItem>
-          {activeConnection && (
+          {/* Not on a Cypher connection: its relationship types are no tables (SR20). */}
+          {activeConnection && offersSchemaDiagram(capabilities) && (
             <CommandItem onSelect={() => runAction(onShowDiagram)}>
-              <Layers strokeWidth={1.5} className="w-3.5 h-3.5 text-cyan-400" />
+              <Layers strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-cyan" />
               <span>Schema Diagram (ERD)</span>
             </CommandItem>
           )}
           <CommandItem onSelect={() => runAction(onLogout)}>
-            <LogOut strokeWidth={1.5} className="w-3.5 h-3.5 text-red-400" />
+            <LogOut strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-red" />
             <span>Logout</span>
           </CommandItem>
         </CommandGroup>
@@ -170,7 +207,7 @@ export function CommandPalette({
                   <Icon className="w-3.5 h-3.5" />
                   <span>{conn.name}</span>
                   {activeConnection?.id === conn.id && (
-                    <span className="ml-auto text-xs text-emerald-500 font-medium">Active</span>
+                    <span className="ml-auto text-xs text-success font-medium">Active</span>
                   )}
                 </CommandItem>
               );
@@ -179,10 +216,10 @@ export function CommandPalette({
         )}
 
         {/* Tables */}
-        {schema.length > 0 && (
+        {tables.length > 0 && (
           <CommandGroup heading="Tables">
-            {schema.map((table) => (
-              <CommandItem key={table.name} onSelect={() => runAction(() => onTableClick(table.name))}>
+            {tables.map((table) => (
+              <CommandItem key={pathKey(table.path)} onSelect={() => runAction(() => onTableClick(table.path))}>
                 <Table2 strokeWidth={1.5} className="w-3.5 h-3.5 text-fg-muted" />
                 <span>{table.name}</span>
                 <span className="ml-auto text-xs text-fg-subtle">
@@ -199,10 +236,10 @@ export function CommandPalette({
           <CommandGroup heading="Saved Queries">
             {savedQueries.map((sq: SavedQuery) => (
               <CommandItem key={sq.id} onSelect={() => runAction(() => onLoadSavedQuery(sq.query))}>
-                <Bookmark strokeWidth={1.5} className="w-3.5 h-3.5 text-purple-400" />
+                <Bookmark strokeWidth={1.5} className="w-3.5 h-3.5 text-hue-purple" />
                 <span>{sq.name}</span>
                 <span className="ml-auto text-xs text-fg-subtle truncate max-w-[150px]">
-                  {sq.query.substring(0, 40)}...
+                  {sq.query.length > 40 ? sq.query.substring(0, 40) + "..." : sq.query}
                 </span>
               </CommandItem>
             ))}

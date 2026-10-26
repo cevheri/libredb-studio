@@ -4,6 +4,31 @@ import { hasUnterminatedSpan, readSqlSpan } from "@/lib/sql/spans";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+/**
+ * Run a bounded-time probe ten times and report its cheapest run, in milliseconds.
+ *
+ * The guards below are about algorithmic SHAPE, not about the machine: what they pin is that a
+ * character scanner cannot backtrack, and the linear scanner costs hundredths of a millisecond
+ * on these 20k inputs against a ceiling of 200. A single sample measures the machine as well,
+ * though, and one bun process per CPU makes a scheduler stall inside the measured region
+ * ordinary - so a stall reports a performance regression that did not happen, and it gets
+ * blamed on the scanner. Being preempted only ever ADDS time, so the cheapest of several runs
+ * is the sample least polluted by the other test processes, and it leaves the ceiling exactly
+ * where it was rather than widening it until it stops catching anything. Measured on this tree:
+ * the slowest of these inputs is 1.7ms idle and 5.5ms with forty bun processes on twenty cores.
+ */
+function bestOfTen<T>(probe: () => T): { readonly result: T; readonly elapsed: number } {
+  // The first run is outside the measurement on purpose: it is the cold one.
+  let result = probe();
+  let elapsed = Infinity;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const started = performance.now();
+    result = probe();
+    elapsed = Math.min(elapsed, performance.now() - started);
+  }
+  return { result, elapsed };
+}
+
 /** The span at index 0, as `kind|text` (or `null`), which is what most cases assert. */
 function spanOf(sql: string, index = 0, grammar?: SqlGrammar): string | null {
   const span = readSqlSpan(sql, index, grammar);
@@ -377,6 +402,45 @@ describe("readSqlSpan", () => {
     });
   });
 
+  // A dialect whose only dollar-quoted form is the untagged `$$` (`dollarTags: false`, Snowflake's row) reads the
+  // `$` that would open a tagged run as code, and keeps every other dollar reading.
+  describe("dollar-quoted strings without the tagged form", () => {
+    const UNTAGGED: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, dollarTags: false };
+
+    test("no `$` of a tagged run opens a span", () => {
+      const sql = "$t$x$t$";
+
+      for (let index = 0; index < sql.length; index++) {
+        if (sql[index] === "$") expect(readSqlSpan(sql, index, UNTAGGED)).toBeNull();
+      }
+    });
+
+    test("an untagged $$ body is still a dollar string", () => {
+      expect(readSqlSpan("$$x$$", 0, UNTAGGED)).toEqual({ kind: "dollar-string", end: 5, terminated: true });
+    });
+
+    test("an unterminated untagged body still reports terminated: false", () => {
+      expect(readSqlSpan("$$ body", 0, UNTAGGED)).toEqual({ kind: "dollar-string", end: 7, terminated: false });
+    });
+
+    test.each<string>(["$1", "$", "$1$"])("%s is code, as before", (sql) => {
+      expect(readSqlSpan(sql, 0, UNTAGGED)).toBeNull();
+      expect(readSqlSpan(sql, 0)).toBeNull();
+    });
+
+    test("a tagged run inside an untagged body is part of the body", () => {
+      expect(spanOf("$$ $t$ $$ x", 0, UNTAGGED)).toBe("dollar-string|$$ $t$ $$");
+    });
+
+    test.each<[string, SqlGrammar]>([
+      ["the default grammar", DEFAULT_SQL_GRAMMAR],
+      ["the postgres row", resolveSqlGrammar("postgres")],
+    ])("%s still reads the tagged run as a dollar string", (_label, grammar) => {
+      expect(readSqlSpan("$t$x$t$", 0, grammar)).toEqual({ kind: "dollar-string", end: 7, terminated: true });
+      expect(readSqlSpan("$t$ body", 0, grammar)).toEqual({ kind: "dollar-string", end: 8, terminated: false });
+    });
+  });
+
   // ── Alternate quoting (Oracle's `q'…'`) ─────────────────────────────────
   //
   // The form exists so that a literal can carry apostrophes without doubling
@@ -457,9 +521,7 @@ describe("readSqlSpan", () => {
     test("answers in bounded time on a long body that never closes", () => {
       const sql = `q'{${"a".repeat(20000)}`;
 
-      const started = performance.now();
-      const span = readSqlSpan(sql, 0, ORACLE);
-      const elapsed = performance.now() - started;
+      const { result: span, elapsed } = bestOfTen(() => readSqlSpan(sql, 0, ORACLE));
 
       expect(span).toEqual({ kind: "string", end: sql.length, terminated: false });
       expect(elapsed, `took ${elapsed.toFixed(1)}ms`).toBeLessThan(200);
@@ -506,9 +568,7 @@ describe("readSqlSpan", () => {
     ];
 
     for (const [label, sql, expectSpan] of adversarial) {
-      const started = performance.now();
-      const span = readSqlSpan(sql, 0);
-      const elapsed = performance.now() - started;
+      const { result: span, elapsed } = bestOfTen(() => readSqlSpan(sql, 0));
 
       // A correct answer AND a bounded one: a fast wrong answer is not a pass.
       expect(span === null, label).toBe(!expectSpan);
@@ -688,9 +748,7 @@ describe("hasUnterminatedSpan", () => {
     // Unbalanced on purpose: the answer has to be reached by scanning to the end.
     const deep = `${"/*".repeat(20000)} SELECT 1`;
 
-    const started = performance.now();
-    const unresolved = hasUnterminatedSpan(deep, resolveSqlGrammar("postgres"));
-    const elapsed = performance.now() - started;
+    const { result: unresolved, elapsed } = bestOfTen(() => hasUnterminatedSpan(deep, resolveSqlGrammar("postgres")));
 
     expect(unresolved).toBe(true);
     expect(elapsed, `took ${elapsed.toFixed(1)}ms`).toBeLessThan(200);
@@ -711,9 +769,7 @@ describe("hasUnterminatedSpan", () => {
     // time cannot backtrack - the property this asserts is kept, not assumed.
     const many = `SELECT ${"'lit' /* note */ -- line\n".repeat(20000)}1`;
 
-    const started = performance.now();
-    const unresolved = hasUnterminatedSpan(many);
-    const elapsed = performance.now() - started;
+    const { result: unresolved, elapsed } = bestOfTen(() => hasUnterminatedSpan(many));
 
     expect(unresolved).toBe(false);
     expect(elapsed, `took ${elapsed.toFixed(1)}ms`).toBeLessThan(200);
@@ -813,5 +869,335 @@ describe("hasUnterminatedSpan: `//`", () => {
 
     expect(hasUnterminatedSpan(sql, resolveSqlGrammar("cassandra"))).toBe(false);
     expect(hasUnterminatedSpan(sql, DEFAULT_SQL_GRAMMAR)).toBe(true);
+  });
+});
+
+// ─── A dialect where a backslash always escapes ─────────────────────────────
+//
+// Where the dialect states that `\` escapes inside every `'…'` and `"…"`, there is
+// no second reading left to disagree with, so a quote behind an odd backslash run
+// is an escaped quote rather than an undeterminable end. No shipped row declares
+// the fact yet (MySQL's reading turns on `NO_BACKSLASH_ESCAPES` in `sql_mode`), so
+// these cases run on a synthetic grammar.
+
+describe("readSqlSpan: a dialect where a backslash always escapes", () => {
+  const ESCAPES: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, backslashAlwaysEscapes: true };
+
+  test("an escaped apostrophe does not end the string", () => {
+    expect(readSqlSpan("'it\\'s' x", 0, ESCAPES)).toEqual({ kind: "string", end: 7, terminated: true });
+  });
+
+  test("a doubled backslash is one escaped pair, so the quote after it closes", () => {
+    expect(spanOf("'a\\\\' x", 0, ESCAPES)).toBe("string|'a\\\\'");
+  });
+
+  test("an odd run of backslashes escapes the quote after it", () => {
+    expect(spanOf("'a\\\\\\' b' x", 0, ESCAPES)).toBe("string|'a\\\\\\' b'");
+  });
+
+  test("an escaped double quote does not end a double-quoted run", () => {
+    expect(spanOf('"a\\"b" x', 0, ESCAPES)).toBe('quoted-identifier|"a\\"b"');
+  });
+
+  test("a doubled quote is still an escape", () => {
+    expect(spanOf("'it''s' x", 0, ESCAPES)).toBe("string|'it''s'");
+  });
+
+  test("a trailing lone backslash leaves the string unterminated", () => {
+    expect(readSqlSpan("'a\\", 0, ESCAPES)).toEqual({ kind: "string", end: 3, terminated: false });
+    expect(readSqlSpan("'a\\'", 0, ESCAPES)).toEqual({ kind: "string", end: 4, terminated: false });
+  });
+
+  // Databend's string token is `'([^'\\]|\\.|'')*'`, and `.` there excludes a line
+  // feed, so a backslash before one is a lexer error rather than an escaped pair.
+  test("a backslash before a line feed leaves the string unterminated", () => {
+    const sql = "'a\\\nb'; x";
+
+    expect(readSqlSpan(sql, 0, ESCAPES)).toEqual({ kind: "string", end: sql.length, terminated: false });
+  });
+
+  test("a backslash before a carriage return is still an escaped pair", () => {
+    expect(readSqlSpan("'a\\\r\nb' x", 0, ESCAPES)).toEqual({ kind: "string", end: 7, terminated: true });
+  });
+
+  test("with the fact false, a backslash before a line ending reads as on main", () => {
+    expect(readSqlSpan("'a\\\nb'; x", 0, DEFAULT_SQL_GRAMMAR)).toEqual({ kind: "string", end: 6, terminated: true });
+    expect(readSqlSpan("'a\\\r\nb' x", 0, DEFAULT_SQL_GRAMMAR)).toEqual({
+      kind: "string",
+      end: 7,
+      terminated: true,
+    });
+  });
+
+  test("a backtick-quoted name is unchanged: a backslash there is part of the name", () => {
+    expect(spanOf("`a\\` x", 0, ESCAPES)).toBe("quoted-identifier|`a\\`");
+  });
+
+  // The fact at `false` is today's reading: every answer that was undeterminable
+  // stays undeterminable, which is what keeps every shipped row where it was.
+  test.each<string>(["'a\\' , x", "'a\\'' x'", "'\\' , x", "'it\\'s' x"])(
+    "with the fact false, %s stays undeterminable",
+    (sql) => {
+      const grammar: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, backslashAlwaysEscapes: false };
+
+      expect(readSqlSpan(sql, 0, grammar)?.terminated).toBe(false);
+      expect(readSqlSpan(sql, 0)?.terminated).toBe(false);
+    },
+  );
+
+  test("with the fact false, a double quote behind an odd backslash run stays undeterminable", () => {
+    expect(readSqlSpan('"a\\" x', 0, DEFAULT_SQL_GRAMMAR)?.terminated).toBe(false);
+  });
+});
+
+// `doubleQuoteBackslashEscapes` overrides `backslashAlwaysEscapes` inside `"…"` alone: false makes a backslash there
+// an ordinary character (Snowflake's row), true makes it an escape, and absent keeps the reading both quotes share.
+describe("readSqlSpan: a dialect that says what a backslash means inside double quotes", () => {
+  test("false: the run closes at its second quote, even where a backslash escapes inside strings", () => {
+    const grammar: SqlGrammar = {
+      ...DEFAULT_SQL_GRAMMAR,
+      backslashAlwaysEscapes: true,
+      doubleQuoteBackslashEscapes: false,
+    };
+
+    expect(spanOf('"a\\" x', 0, grammar)).toBe('quoted-identifier|"a\\"');
+    expect(readSqlSpan("'it\\'s' x", 0, grammar)).toEqual({ kind: "string", end: 7, terminated: true });
+  });
+
+  test("false: a doubled quote is still an escape", () => {
+    const grammar: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, doubleQuoteBackslashEscapes: false };
+
+    expect(spanOf('"a\\""b" x', 0, grammar)).toBe('quoted-identifier|"a\\""b"');
+  });
+
+  test("absent, with backslashAlwaysEscapes true: the backslash escapes the quote and the run does not close", () => {
+    const grammar: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, backslashAlwaysEscapes: true };
+
+    expect(readSqlSpan('"a\\"', 0, grammar)).toEqual({ kind: "quoted-identifier", end: 4, terminated: false });
+  });
+
+  test("true: the backslash escapes the quote, even where strings leave it undeterminable", () => {
+    const grammar: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, doubleQuoteBackslashEscapes: true };
+
+    expect(spanOf('"a\\"b" x', 0, grammar)).toBe('quoted-identifier|"a\\"b"');
+    expect(readSqlSpan("'a\\' , x", 0, grammar)?.terminated).toBe(false);
+  });
+});
+
+describe("hasUnterminatedSpan: a dialect where a backslash always escapes", () => {
+  test("an escaped apostrophe is resolvable only where the dialect declares the fact", () => {
+    const sql = "SELECT * FROM t WHERE name = 'O\\'Brien'";
+
+    expect(hasUnterminatedSpan(sql, { ...DEFAULT_SQL_GRAMMAR, backslashAlwaysEscapes: true })).toBe(false);
+    expect(hasUnterminatedSpan(sql, DEFAULT_SQL_GRAMMAR)).toBe(true);
+  });
+});
+
+// `rawStrings` (Spark's row): `r'…'`, `R'…'`, `r"…"` and `R"…"` are string literals that take no escapes and end at
+// the first quote of their own kind, line feeds included, wherever the `r` does not continue a word.
+describe("readSqlSpan: raw strings", () => {
+  const RAW: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, backslashAlwaysEscapes: true, rawStrings: true };
+  const ESCAPING: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, backslashAlwaysEscapes: true };
+
+  test.each<[string, string]>([
+    ["r'C:\\' AS a", "string|r'C:\\'"],
+    ["R'a\\nb' x", "string|R'a\\nb'"],
+    ['r"x\\" y', 'string|r"x\\"'],
+    ['R"it\'s" z', 'string|R"it\'s"'],
+  ])("%j opens a raw string that ends at the first quote of its own kind", (sql, expected) => {
+    expect(spanOf(sql, 0, RAW)).toBe(expected);
+  });
+
+  test("a line feed inside a raw string is text, so the literal runs past it", () => {
+    expect(readSqlSpan("r'a\nb' x", 0, RAW)).toEqual({ kind: "string", end: 6, terminated: true });
+  });
+
+  test("a doubled quote is no escape: the first quote closes the literal", () => {
+    expect(spanOf("r'a''b'", 0, RAW)).toBe("string|r'a'");
+  });
+
+  test("a raw string with no closing quote is unterminated", () => {
+    expect(readSqlSpan("r'abc", 0, RAW)).toEqual({ kind: "string", end: 5, terminated: false });
+  });
+
+  test("an `r` that continues a word opens nothing, and the quote after it is an ordinary escaping string", () => {
+    expect(readSqlSpan("abr'x'", 2, RAW)).toBeNull();
+    expect(readSqlSpan("a1r'x'", 2, RAW)).toBeNull();
+    expect(readSqlSpan("a$r'x'", 2, RAW)).toBeNull();
+    expect(spanOf("abr'x\\'y'", 3, RAW)).toBe("string|'x\\'y'");
+  });
+
+  test("the code point before the `r` is read whole: a letter outside the Basic Multilingual Plane continues the word", () => {
+    // U+1D465 is a letter in two UTF-16 units; U+1D100 is two units and no letter, so the `r` after it starts a token.
+    expect(readSqlSpan("\u{1D465}r'x\\'y'", 2, RAW)).toBeNull();
+    expect(spanOf("\u{1D465}r'x\\'y'", 3, RAW)).toBe("string|'x\\'y'");
+    expect(spanOf("\u{1D100}r'C:\\' x", 2, RAW)).toBe("string|r'C:\\'");
+  });
+
+  test("an `r` that no quote follows is code", () => {
+    expect(readSqlSpan("rx'a'", 0, RAW)).toBeNull();
+    expect(readSqlSpan("r", 0, RAW)).toBeNull();
+  });
+
+  test("absent: the `r` is code and the quote after it opens an escaping literal that never closes", () => {
+    expect(readSqlSpan("r'C:\\' AS a", 0, ESCAPING)).toBeNull();
+    expect(readSqlSpan("r'C:\\' AS a", 1, ESCAPING)).toMatchObject({ kind: "string", terminated: false });
+  });
+
+  test("hasUnterminatedSpan resolves the text only where the dialect declares the fact", () => {
+    expect(hasUnterminatedSpan("SELECT r'C:\\' AS a", RAW)).toBe(false);
+    expect(hasUnterminatedSpan("SELECT r'C:\\' AS a", ESCAPING)).toBe(true);
+  });
+});
+
+// `hintsAreCode` (Spark's row): `/*+` opens an optimizer hint the engine lexes as code, not a block comment. Measured
+// on Spark 4.2.0: a `/*+` inside a comment opens no level, so the first `*/` after it ends the outer comment, and
+// inside a hint a plain comment nests and the hint ends at the next `*/`.
+describe("readSqlSpan: optimizer hints read as code", () => {
+  const HINTS: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, blockComment: "nesting", hintsAreCode: true };
+  const NESTING: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, blockComment: "nesting" };
+
+  test("`/*+` at a code position opens no span", () => {
+    const sql = "SELECT /*+ BROADCAST(u) */ * FROM t";
+    expect(readSqlSpan(sql, 7, HINTS)).toBeNull();
+    expect(spanOf(sql, 7, NESTING)).toBe("block-comment|/*+ BROADCAST(u) */");
+  });
+
+  test("a plain `/*` still opens a comment where hints are code", () => {
+    expect(spanOf("/* note */ SELECT 1", 0, HINTS)).toBe("block-comment|/* note */");
+  });
+
+  test("inside a comment, `/*+` opens no nested level, so the first `*/` ends the comment", () => {
+    const sql = "/* a /*+ b */ SELECT 1";
+    expect(spanOf(sql, 0, HINTS)).toBe("block-comment|/* a /*+ b */");
+    // A nesting reader that counts the `/*+` reads the rest as comment text with no end.
+    expect(readSqlSpan(sql, 0, NESTING)).toEqual({ kind: "block-comment", end: sql.length, terminated: false });
+  });
+
+  test("inside a nested comment, `/*+` opens no level either", () => {
+    expect(spanOf("/* a /* b /*+ c */ d */ SELECT 1", 0, HINTS)).toBe("block-comment|/* a /* b /*+ c */ d */");
+  });
+
+  test("a plain comment inside a hint nests, and the hint's own `*/` is code", () => {
+    const sql = "SELECT /*+ COALESCE(3) /* x /* y */ z */ */ 1";
+    expect(readSqlSpan(sql, 7, HINTS)).toBeNull();
+    expect(spanOf(sql, 23, HINTS)).toBe("block-comment|/* x /* y */ z */");
+    expect(readSqlSpan(sql, 41, HINTS)).toBeNull();
+    expect(hasUnterminatedSpan(sql, HINTS)).toBe(false);
+  });
+
+  test("a string inside a hint is a string, so a `*/` written in it ends nothing", () => {
+    const sql = "SELECT /*+ REPARTITION(3, '*/') */ 1";
+    expect(spanOf(sql, 26, HINTS)).toBe("string|'*/'");
+    expect(hasUnterminatedSpan(sql, HINTS)).toBe(false);
+    // Read as a comment, the hint ends inside the string, and the quote after it never closes.
+    expect(hasUnterminatedSpan(sql, NESTING)).toBe(true);
+  });
+
+  // Spark lexes every `*/` in code as one token, the hint's closer (`HENT_END`, SqlBaseLexer v4.1.0 and v4.2.0), so it
+  // reads `*/*` as the hint's end followed by `*`, and the `/` opens no comment. Read as an opener, a later `*/`, here
+  // inside a line comment, would close it, and the reader would take the DELETE that Spark runs for comment text.
+  test("a hint closed right before `*` opens no comment: the `/` belongs to the hint's closer", () => {
+    expect(readSqlSpan("SELECT /*+ X */* FROM t", 14, HINTS)).toBeNull();
+    expect(hasUnterminatedSpan("SELECT /*+ X */* FROM t", HINTS)).toBe(false);
+
+    const sql = "WITH c AS (SELECT /*+ H */* FROM t) DELETE FROM u -- */";
+    expect(readSqlSpan(sql, 25, HINTS)).toBeNull();
+    expect(spanOf(sql, 50, HINTS)).toBe("line-comment|-- */");
+    expect(hasUnterminatedSpan(sql, HINTS)).toBe(false);
+    // Without the fact the same `/` opens a comment, the reading every other row keeps.
+    expect(spanOf(sql, 25, NESTING)).toBe("block-comment|/* FROM t) DELETE FROM u -- */");
+  });
+
+  test("after a hint closed right before `*`, a `*/` written in a string ends nothing", () => {
+    const sql = "WITH c AS (SELECT /*+ H */* FROM t WHERE x = '*/') DELETE FROM u";
+    expect(readSqlSpan(sql, 25, HINTS)).toBeNull();
+    expect(spanOf(sql, 45, HINTS)).toBe("string|'*/'");
+    expect(hasUnterminatedSpan(sql, HINTS)).toBe(false);
+  });
+
+  // The lexer has no hint context: a `*/` outside any hint is the same token, so its `/` opens nothing there either.
+  test("a `/` after a code `*` opens no comment outside a hint either", () => {
+    expect(readSqlSpan("SELECT 2 */* c */ 3", 10, HINTS)).toBeNull();
+    expect(spanOf("SELECT 2 */* c */ 3", 10, NESTING)).toBe("block-comment|/* c */");
+  });
+
+  test("a flat grammar with the fact also reads `/*+` as code", () => {
+    expect(readSqlSpan("/*+ x */", 0, { ...DEFAULT_SQL_GRAMMAR, hintsAreCode: true })).toBeNull();
+  });
+
+  test("absent: `/*+` opens an ordinary block comment, as before", () => {
+    expect(spanOf("/*+ x */ SELECT 1", 0, NESTING)).toBe("block-comment|/*+ x */");
+    expect(spanOf("/*+ x */ SELECT 1", 0, DEFAULT_SQL_GRAMMAR)).toBe("block-comment|/*+ x */");
+  });
+});
+
+// `lineCommentBackslashContinues` (Spark's row): a backslash immediately before the line feed continues a `--` comment
+// onto the next line, and one before a carriage return and line feed does not (`SIMPLE_COMMENT`,
+// `SqlBaseLexer.g4:687-689` at v4.2.0). The rule pairs a backslash with nothing else, so the second of two continues it.
+describe("readSqlSpan: line comments a backslash continues", () => {
+  const CONTINUES: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, lineCommentBackslashContinues: true };
+
+  test("a backslash right before the line feed continues the comment onto the next line", () => {
+    expect(spanOf("-- a \\\nb\nSELECT 1", 0, CONTINUES)).toBe("line-comment|-- a \\\nb\n");
+  });
+
+  test("it continues as often as the lines end so", () => {
+    expect(spanOf("-- a \\\nb \\\nc\nSELECT 1", 0, CONTINUES)).toBe("line-comment|-- a \\\nb \\\nc\n");
+  });
+
+  test("a backslash before a carriage return and line feed does not continue it", () => {
+    expect(spanOf("-- a \\\r\nb\r\nSELECT 1", 0, CONTINUES)).toBe("line-comment|-- a \\\r\n");
+  });
+
+  test("a backslash earlier in the line does not continue it", () => {
+    expect(spanOf("-- a \\ b\nSELECT 1", 0, CONTINUES)).toBe("line-comment|-- a \\ b\n");
+  });
+
+  test("the second of two backslashes continues it: a comment takes no escapes", () => {
+    expect(spanOf("-- a \\\\\nb\nSELECT 1", 0, CONTINUES)).toBe("line-comment|-- a \\\\\nb\n");
+  });
+
+  test("a comment continued past its last line feed, or ending in a backslash, runs to the end of the text", () => {
+    for (const sql of ["SELECT 1 -- a \\\nb", "SELECT 1 -- a \\\n", "SELECT 1 -- a \\"]) {
+      expect(readSqlSpan(sql, 9, CONTINUES)).toEqual({ kind: "line-comment", end: sql.length, terminated: true });
+    }
+  });
+
+  test("absent: the comment ends at the first line feed", () => {
+    expect(spanOf("-- a \\\nb\nSELECT 1", 0)).toBe("line-comment|-- a \\\n");
+    expect(spanOf("-- a \\\nb\nSELECT 1", 0, resolveSqlGrammar("postgres"))).toBe("line-comment|-- a \\\n");
+  });
+});
+
+// `lineCommentEndsAtCarriageReturn` (Spark's row): a carriage return ends a `--` comment as a line feed does, a line
+// feed right after it ends the comment with it, and a backslash before it continues nothing (`SIMPLE_COMMENT`,
+// `SqlBaseLexer.g4:687-689` at v4.2.0: the body takes neither `\r` nor `\n`, and `'\r'? '\n'?` closes it).
+describe("readSqlSpan: line comments a carriage return ends", () => {
+  const SPARK = resolveSqlGrammar("spark");
+
+  test("a lone carriage return ends the comment, under the fact and under Spark's row", () => {
+    const CR_ENDS: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, lineCommentEndsAtCarriageReturn: true };
+    expect(spanOf("-- a\rSELECT 1", 0, CR_ENDS)).toBe("line-comment|-- a\r");
+    expect(spanOf("-- a\rSELECT 1", 0, SPARK)).toBe("line-comment|-- a\r");
+    expect(spanOf("-- a\r\r\nSELECT 1", 0, SPARK)).toBe("line-comment|-- a\r");
+  });
+
+  test("a carriage return and line feed end it once, after the line feed", () => {
+    expect(spanOf("-- a\r\nSELECT 1", 0, SPARK)).toBe("line-comment|-- a\r\n");
+  });
+
+  test("a backslash before a lone carriage return does not continue it", () => {
+    expect(spanOf("-- a \\\rb\nSELECT 1", 0, SPARK)).toBe("line-comment|-- a \\\r");
+  });
+
+  test("a comment a backslash continued past a line feed ends at the next lone carriage return", () => {
+    expect(spanOf("-- a \\\nb\rSELECT 1", 0, SPARK)).toBe("line-comment|-- a \\\nb\r");
+  });
+
+  test("absent: a lone carriage return is comment text, so the comment runs to the line feed or the end of the text", () => {
+    expect(spanOf("-- a\rb\nSELECT 1", 0)).toBe("line-comment|-- a\rb\n");
+    const sql = "SELECT 1 -- a\rDROP TABLE t";
+    expect(readSqlSpan(sql, 9)).toEqual({ kind: "line-comment", end: sql.length, terminated: true });
   });
 });

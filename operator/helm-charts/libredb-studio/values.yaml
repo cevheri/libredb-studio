@@ -56,10 +56,14 @@ secrets:
     adminPassword: admin-password
     userEmail: user-email
     userPassword: user-password
+    adminTotpSecret: admin-totp-secret
+    userTotpSecret: user-totp-secret
     llmApiKey: llm-api-key
     oidcClientId: oidc-client-id
     oidcClientSecret: oidc-client-secret
     storagePostgresUrl: storage-postgres-url
+    governancePostgresUrl: governance-postgres-url
+    governancePrivateKeys: governance-private-keys
   # -- JWT signing secret (min 32 chars). Required in strict mode (config.authBootstrap=off);
   # otherwise generated on first start.
   jwtSecret: ""
@@ -75,6 +79,17 @@ secrets:
   # -- Regular user account password. Optional: the non-admin account exists only when set;
   # it is never generated.
   userPassword: ""
+  # -- Base32 TOTP secret for the admin account (RFC 4648: A-Z and 2-7), at least 26 characters
+  # so the decoded secret carries the 128 bits RFC 4226 requires. Optional and
+  # local-provider only: when set, admin login requires a 6-digit authenticator code after the
+  # password. A value that is not base32 stops login with a clear 503 rather than silently
+  # dropping the second factor. Under config.authProvider=oidc the login page shows no password
+  # form and MFA belongs to the identity provider, but this still guards POST /api/auth/login
+  # whenever a password is also set. Generate one with: openssl rand 20 | base32 | tr -d '='
+  adminTotpSecret: ""
+  # -- Base32 TOTP secret for the regular user account. Same rules as adminTotpSecret; inert
+  # unless userPassword is also set, since without it there is no user account to protect.
+  userTotpSecret: ""
   # -- LLM API key (optional, for AI features)
   llmApiKey: ""
   # -- OIDC client ID (required when authProvider=oidc)
@@ -83,6 +98,15 @@ secrets:
   oidcClientSecret: ""
   # -- PostgreSQL connection URL for storage (required when storageProvider=postgres and postgresql.enabled=false)
   storagePostgresUrl: ""
+  # -- The governance source for Studio's own role, as a postgresql:// URL that reaches the
+  # primary (required when governance.enabled=true, unless existingSecret carries it).
+  # Rendered as GOVERNANCE_POSTGRES_URL from the Secret, never into the ConfigMap.
+  governancePostgresUrl: ""
+  # -- The keyring document that opens sealed credentials:
+  # {"version":1,"keys":["<base64url raw 32-byte X25519 private key>", ...]} (required when
+  # governance.enabled=true, unless existingSecret carries it). Mounted read-only as a file at
+  # /etc/libredb/governance/keyring.json, never an environment variable.
+  governancePrivateKeys: ""
 
 # =============================================================================
 # Config — non-sensitive values stored in a ConfigMap
@@ -92,6 +116,9 @@ secrets:
 authProvider: "local"
 
 config:
+  # -- Must match BASE_PATH baked into a custom image. Prefixes default health probes;
+  # this value cannot change the routes in a prebuilt image. Empty means root.
+  basePath: ""
   # -- Log level
   logLevel: "info"
   # -- Address the container listens on, written to HOSTNAME. Empty is the
@@ -132,11 +159,32 @@ config:
   # `false` means session cookies travel in cleartext - keep it to trusted
   # networks. `true` is accepted and explicit, and forces the flag on.
   #
+  # The flag covers the session cookie and the two passkey ceremony cookies,
+  # passkey-registration and passkey-sign-in, alike.
+  #
   # A YAML boolean (or `--set config.authCookieSecure=false`), not a string: the
   # value is rendered as a quoted string for the ConfigMap, so no --set-string is
   # needed, and the app's other spellings ("on"/"off"/"0"/"1") are rejected here
   # by values.schema.json rather than silently mis-read.
   authCookieSecure: null
+  # -- The public address people open Studio at, written to PASSKEY_ORIGIN when
+  # set: scheme, host and port only, with no path, so no config.basePath either,
+  # such as https://studio.example.com. Empty (the default) writes nothing and
+  # passkey sign-in stays off.
+  #
+  # Passkeys also need config.storageProvider sqlite or postgres (a browser-local
+  # store has no account registry to keep them in) and authProvider local (an
+  # identity provider manages its own passkeys); NOTES.txt warns when either is
+  # missing. Browsers offer passkeys only over https, or on http://localhost.
+  # The app validates the value at startup and says what is wrong with it.
+  # Passkeys belong to the host name, so changing it means every user registers
+  # their passkeys again.
+  #
+  # This needs an application image that includes passkey sign-in (#785):
+  # appVersion 0.17.0, which this chart version pins, does not read
+  # PASSKEY_ORIGIN, so the value acts only once an application release moves
+  # appVersion or image.tag names such an image. Guide: docs/PASSKEYS.md.
+  passkeyOrigin: ""
   # -- Storage provider: "local" (browser), "sqlite" (file), or "postgres" (database)
   storageProvider: "local"
   # -- SQLite database file path (when storageProvider=sqlite)
@@ -147,14 +195,81 @@ config:
   llmModel: ""
   # -- LLM API URL for ollama/custom providers (optional)
   llmApiUrl: ""
+  # -- LLM_MODEL_EFFORT, the reasoning effort for llmProvider openai only (optional):
+  # none, minimal, low, medium, high, xhigh or max. Empty writes nothing and the model keeps its
+  # own default. Which values a model takes is the model's own (GPT-6.1 Sol has no none), and the
+  # app refuses the variable with any other provider. Needs an application image after 1.0.0.
+  llmModelEffort: ""
   # -- OIDC issuer URL (required when authProvider=oidc)
   oidcIssuer: ""
   # -- OIDC scopes (space-separated)
   oidcScope: "openid profile email"
   # -- OIDC claim path for role extraction
   oidcRoleClaim: ""
+  # -- Case-sensitive prefix filter for custom seed roles from the OIDC role claim (optional)
+  oidcRolePrefix: ""
   # -- OIDC admin role values (comma-separated)
   oidcAdminRoles: "admin"
+  # -- OIDC user role values (comma-separated). Empty writes nothing, and any signed-in user
+  # without an admin role is a user. Set, a user with neither an admin nor a user role is
+  # refused. Required when governance.enabled=true, which installs use "user".
+  oidcUserRoles: ""
+  # -- The prompt sent to the identity provider on sign-in: empty writes nothing (the app's
+  # default, login), "omit" sends none so a provider session signs in silently, "consent" and
+  # "select_account" are passed through.
+  oidcPrompt: ""
+  # -- Send a signed-out visitor of /login straight to the identity provider. false (the
+  # default) writes nothing; true writes OIDC_AUTO_REDIRECT=true.
+  oidcAutoRedirect: false
+  # -- Send id_token_hint with the provider's end-session request on logout. false (the
+  # default) writes nothing; true writes OIDC_LOGOUT_HINT=true. Turn it on only after
+  # verifying it against the identity provider.
+  oidcLogoutHint: false
+  # -- Session lifetime in seconds, from 300 to 86400. null (the default) writes nothing and
+  # the app keeps 86400; governance installs use 28800.
+  sessionTtlSeconds: null
+  # -- Schema of the PostgreSQL storage tables (storageProvider=postgres). Empty writes
+  # nothing and the tables stay unqualified. Studio never creates the schema: create it
+  # first, owned by the storage role. Required when governance.enabled=true.
+  storagePostgresSchema: ""
+
+# =============================================================================
+# Governance (docs/GOVERNANCE.md)
+# =============================================================================
+# Runs Studio under a control plane: the governance source it reads in PostgreSQL
+# becomes the only catalog of connections and grants, and the identity provider the
+# only way to sign in. Until governance.enabled is true, nothing below is written.
+#
+# Enabled, the chart writes GOVERNANCE_SOURCE=postgres and the values below, takes
+# GOVERNANCE_POSTGRES_URL from secrets.governancePostgresUrl (or the existingSecret
+# key governance-postgres-url), mounts the keyring from secrets.governancePrivateKeys
+# (or the existingSecret key governance-private-keys) read-only at
+# /etc/libredb/governance/keyring.json, and moves the readiness probe to /api/ready.
+# The render fails, naming the value, for any combination Studio would refuse to
+# start with: authProvider other than oidc, an empty config.oidcRoleClaim,
+# config.oidcUserRoles or config.storagePostgresSchema, a missing URL or keyring,
+# seedConnections, mcp or agent enabled, secrets.adminPassword or userPassword set,
+# an extraEnv entry named GOVERNANCE_*, or more than one replica without
+# stickySessions.enabled.
+governance:
+  # -- Run Studio under governance (GOVERNANCE_SOURCE=postgres).
+  enabled: false
+  # -- The schema the governance source lives in.
+  postgresSchema: "bridge"
+  # -- This instance's id in its heartbeat. Empty uses the chart's fullname, which stays
+  # the same across rollouts, so a new pod updates the same heartbeat row. With more than
+  # one replica each pod reports its own name instead, and a set value fails the render.
+  instanceId: ""
+  # -- Reload interval in milliseconds without a change notification, from 1000 to 600000.
+  # null (the default) writes nothing and the app keeps 30000.
+  refreshMs: null
+  # -- How old the snapshot may grow while reloads fail before data routes answer 503, in
+  # milliseconds, from refreshMs to 3600000. null (the default) writes nothing and the app
+  # keeps 120000.
+  maxStalenessMs: null
+  # -- The engine type ids Studio admits, separated by commas. Empty (the default) writes
+  # nothing and the app keeps postgres,mysql,mssql,oracle,mongodb,redis.
+  allowedEngines: ""
 
 # =============================================================================
 # Agent Runtime
@@ -228,6 +343,33 @@ agent:
     configMapKey: "model-tuning.json"
 
 # =============================================================================
+# MCP server (#246)
+# =============================================================================
+# An AI client of the user's own (Claude Code, Codex, Cursor, VS Code, Gemini CLI)
+# reads schemas and runs bounded read-only SQL at /api/mcp, with a token each user
+# mints on the settings screen. The endpoint stays disabled, and nothing below is
+# written, until enabled is true. An image built before the MCP server shipped
+# ignores all four variables. Guide, client configuration and limits: docs/MCP.md.
+mcp:
+  # -- Serve /api/mcp. false (the default) writes no LIBREDB_MCP_* variable, and the
+  # endpoint answers an authenticated request with 404. true writes all four
+  # variables below as strings and requires url and tokenLabel: the render fails
+  # without them.
+  enabled: false
+  # -- The address MCP clients use, which every token is bound to: an absolute
+  # http(s) URL ending in /api/mcp, with config.basePath when one is set, and no
+  # user name, password, query or fragment, such as
+  # https://studio.example.com/api/mcp
+  url: ""
+  # -- Any non-empty value. The token signing key is derived from the JWT secret
+  # under it, so changing it revokes every MCP token at once, which is the only
+  # revocation there is. To offboard a person, stop them signing in, then change
+  # it once ten minutes have passed, since minting needs a sign-in that recent.
+  tokenLabel: ""
+  # -- How many days a minted token stays valid, from 1 to 365.
+  tokenTtlDays: 30
+
+# =============================================================================
 # Persistence — PVC for SQLite storage mode
 # =============================================================================
 persistence:
@@ -267,7 +409,9 @@ serviceAccount:
   annotations: {}
   # -- ServiceAccount name (auto-generated if empty)
   name: ""
-  # -- Automount API credentials
+  # -- Mount an API token into the pod; set on the pod spec and on the created ServiceAccount,
+  # so it also holds with create=false. Only true mounts one. Studio reads the pod's token only
+  # for Vault Kubernetes auth (VAULT_ROLE); see docs/SEED_CONNECTIONS.md.
   automountServiceAccountToken: false
 
 podSecurityContext:
@@ -456,6 +600,14 @@ autoscaling:
   # -- Target memory utilization percentage
   targetMemoryUtilizationPercentage: 80
 
+# -- Records that the operator configured cookie affinity at the ingress or load balancer,
+# so that each browser stays on one pod. Studio keeps interactive transactions, rate limits
+# and per-user providers in process memory, so under governance.enabled more than one
+# replica (or autoscaling) renders only with this set. The chart renders no affinity
+# annotation and has no cookie name value: the affinity belongs to the ingress controller.
+stickySessions:
+  enabled: false
+
 podDisruptionBudget:
   # -- Enable PodDisruptionBudget
   enabled: false
@@ -521,6 +673,30 @@ extraEnv: []
 extraEnvFrom: []
 #  - configMapRef:
 #      name: my-config
+
+# -- Additional volumes for the pod, e.g. a private CA from a ConfigMap or Secret
+extraVolumes: []
+#  - name: internal-ca
+#    configMap:
+#      name: internal-ca
+
+# -- Additional volume mounts for the app container. With the volume above, point
+# NODE_EXTRA_CA_CERTS (extraEnv) at the file so the OIDC issuer or Vault is trusted.
+extraVolumeMounts: []
+#  - name: internal-ca
+#    mountPath: /etc/ssl/internal
+#    readOnly: true
+
+# -- Additional Kubernetes objects deployed with the release, each rendered
+# through tpl. A string item is taken as a template as it is. Write a literal
+# {{ as {{ "{{" }}, or the install fails.
+extraObjects: []
+#  - apiVersion: v1
+#    kind: ConfigMap
+#    metadata:
+#      name: my-config
+#    data:
+#      key: value
 
 # -- Seed connections: pre-configured database connections
 seedConnections:

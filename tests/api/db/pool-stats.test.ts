@@ -14,6 +14,10 @@ const mockGetSession = mock(
 // ─── Mock auth + seed resolution BEFORE importing the route ─────────────────
 mock.module("@/lib/auth", () => ({
   getSession: mockGetSession,
+  readSession: mock(async () => {
+    const s = await mockGetSession();
+    return s ? { kind: "authenticated", session: s } : { kind: "anonymous" };
+  }),
   signJWT: mock(async () => "mock-token"),
   verifyJWT: mock(async () => null),
   login: mock(async () => {}),
@@ -45,6 +49,8 @@ mock.module("@/lib/seed/resolve-connection", () => {
 mock.module("@/lib/db/factory", () => ({
   getOrCreateProvider: mockGetOrCreateProvider,
   createDatabaseProvider: mock(async () => mockProvider),
+  // src/lib/api/editor-provider.ts imports it, and the route loads that module.
+  findCachedProvider: mock(() => null),
 }));
 
 // ─── Import route handler AFTER mocking ─────────────────────────────────────
@@ -114,6 +120,22 @@ describe("POST /api/db/pool-stats", () => {
     expect(data.waiting).toBe(2);
   });
 
+  test("passes the configured maximum through when the provider reports one", async () => {
+    const providerWithMax = {
+      ...createMockProvider(),
+      getPoolStats: mock(() => ({ total: 2, max: 10, idle: 0, active: 2, waiting: 0 })),
+    };
+    mockGetOrCreateProvider.mockResolvedValueOnce(providerWithMax);
+
+    const res = await POST(
+      createMockRequest("/api/db/pool-stats", { method: "POST", body: { connection: validConnection } }) as never,
+    );
+    const data = await parseResponseJSON<{ total: number; max: number }>(res);
+
+    expect(data.total).toBe(2);
+    expect(data.max).toBe(10);
+  });
+
   test("returns fallback stats when provider lacks getPoolStats", async () => {
     // Default mockProvider does not have getPoolStats
     const req = createMockRequest("/api/db/pool-stats", {
@@ -164,5 +186,30 @@ describe("POST /api/db/pool-stats", () => {
 
     expect(res.status).toBe(500);
     expect(data.error).toBe("Provider creation failed");
+  });
+});
+
+// A JSON `null` body or one that is not JSON at all answered 500 INTERNAL_ERROR with the runtime's own text ("Cannot destructure property 'connection' ...").
+// Any body that is not a JSON object is the caller's malformed request, answered before any connection resolves.
+describe("POST /api/db/pool-stats: a body that is not a JSON object", () => {
+  test.each<[string, string]>([
+    ["null", "null"],
+    ["an array", "[]"],
+    ["a number", "7"],
+    ["a string", '"x"'],
+    ["text that is not JSON", "{not json"],
+  ])("a body that is %s answers 400 and opens no provider", async (_label, raw) => {
+    mockGetOrCreateProvider.mockClear();
+    const res = await POST(
+      new Request("http://localhost:3000/api/db/pool-stats", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: raw,
+      }) as never,
+    );
+
+    expect(res.status).toBe(400);
+    expect(await parseResponseJSON(res)).toEqual({ error: "Invalid request body" });
+    expect(mockGetOrCreateProvider).not.toHaveBeenCalled();
   });
 });

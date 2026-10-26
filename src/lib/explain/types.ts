@@ -5,6 +5,7 @@ export type ExplainMode = "estimate" | "analyze";
 export type ExplainPlanNode = {
   Plan?: ExplainPlanNode;
   "Node Type"?: string;
+  Strategy?: string;
   "Actual Rows"?: number;
   "Plan Rows"?: number;
   "Actual Total Time"?: number;
@@ -47,8 +48,22 @@ export interface StoredExplainPlan {
  */
 export interface ExplainStrategy {
   readonly format: ExplainFormat;
+  /**
+   * `false` where the editor sends no plan beside an ordinary run, because the engine bills every plan request. Absent
+   * means the editor asks for an estimate plan in the background beside every run of a statement the strategy explains.
+   */
+  readonly backgroundPlan?: false;
   /** Dialect EXPLAIN SQL for a SELECT statement, or null when not explainable. */
   buildSql(sql: string, mode: ExplainMode): string | null;
+  /**
+   * Why `buildSql` declines this statement in this mode, as the sentence a person reads, or null when it does not
+   * decline it, or declines it only for not being a SELECT, which the caller says in its own words.
+   *
+   * Optional: a strategy that declines by the statement's kind alone has nothing to add, and the caller's sentence
+   * stands. One that declines a SELECT-shaped statement too implements it, or the person is told that a SELECT is not
+   * one.
+   */
+  declineReason?(sql: string, mode: ExplainMode): string | null;
   /** Maps a raw /api/db/query result to the value stored on QueryTab.explainPlan. Never throws. */
   extractPlan(result: { rows?: Array<Record<string, unknown>> }): unknown;
   /** Maps the stored raw value to the VisualExplain render model. Never throws; null on foreign shapes. */

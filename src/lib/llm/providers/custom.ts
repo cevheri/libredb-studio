@@ -4,6 +4,7 @@
  */
 
 import { BaseLLMProvider } from "../base-provider";
+import type { RetryOptions } from "../utils/retry";
 import {
   type LLMConfig,
   type LLMStreamOptions,
@@ -13,6 +14,7 @@ import {
   LLMConfigError,
 } from "../types";
 import { createStreamFromSSEResponse } from "../utils/streaming";
+import { validModelEffort } from "../utils/config";
 import { logger } from "@/lib/logger";
 
 // ============================================================================
@@ -22,8 +24,8 @@ import { logger } from "@/lib/logger";
 export class CustomProvider extends BaseLLMProvider {
   private baseUrl: string;
 
-  constructor(config: LLMConfig) {
-    super(config);
+  constructor(config: LLMConfig, retryOptions?: RetryOptions) {
+    super(config, retryOptions);
     this.validate();
     this.baseUrl = this.ensureApiUrl();
   }
@@ -39,28 +41,33 @@ export class CustomProvider extends BaseLLMProvider {
     if (!this.config.model || this.config.model.trim() === "") {
       throw new LLMConfigError("Model name is required for Custom provider.", "custom");
     }
+
+    validModelEffort(this.config);
   }
 
   /**
    * Stream completion from custom endpoint
    */
   public async stream(options: LLMStreamOptions): Promise<ReadableStream<Uint8Array>> {
-    return this.streamWithRetry(async () => {
-      const model = this.getModel(options);
-      const messages = this.buildMessages(options);
+    return this.streamWithRetry(
+      async () => {
+        const model = this.getModel(options);
+        const messages = this.buildMessages(options);
 
-      try {
-        const response = await this.fetchStream(model, messages, options);
-        await this.validateResponse(response);
+        try {
+          const response = await this.fetchStream(model, messages, options);
+          await this.validateResponse(response);
 
-        return createStreamFromSSEResponse(response, "custom");
-      } catch (error) {
-        if (error instanceof LLMAuthError || error instanceof LLMRateLimitError || error instanceof LLMConfigError) {
-          throw error;
+          return createStreamFromSSEResponse(response, "custom");
+        } catch (error) {
+          if (error instanceof LLMAuthError || error instanceof LLMRateLimitError || error instanceof LLMConfigError) {
+            throw error;
+          }
+          throw this.mapError(error);
         }
-        throw this.mapError(error);
-      }
-    });
+      },
+      { signal: options.signal },
+    );
   }
 
   /**
@@ -100,6 +107,7 @@ export class CustomProvider extends BaseLLMProvider {
         ...(options.temperature !== undefined && { temperature: options.temperature }),
         ...(options.maxTokens !== undefined && { max_tokens: options.maxTokens }),
       }),
+      signal: options.signal,
     });
 
     return response;

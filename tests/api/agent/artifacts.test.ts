@@ -68,7 +68,14 @@ const mockStatus = mock(async (runId: string) => {
 const mockReadAgentArtifact = mock((correlationId: string) => held.get(correlationId));
 
 function installMocks(): void {
-  mock.module("@/lib/auth", () => ({ ...realAuth, getSession: mockGetSession }));
+  mock.module("@/lib/auth", () => ({
+    ...realAuth,
+    getSession: mockGetSession,
+    readSession: mock(async () => {
+      const s = await mockGetSession();
+      return s ? { kind: "authenticated", session: s } : { kind: "anonymous" };
+    }),
+  }));
   mock.module("@/lib/agent/runtime", () => ({
     getAgentRunService: mock(async () => ({ status: mockStatus })),
     driveAgentRun: mock(async () => ({ runId: "arun_1", status: "succeeded" })),
@@ -120,6 +127,23 @@ describe("GET /api/agent/runs/[runId]/artifacts/[correlationId]", () => {
     // from the in-memory copy the rows came from.
     expect(body.operationId).toBe("sql.query.read");
     expect((body.result as typeof RESULT).rows).toEqual(RESULT.rows);
+  });
+
+  // The grid this feeds would otherwise show NULL where the model's text said NaN.
+  test("hands back NaN and the infinities as words, not as null", async () => {
+    held.set("corr_9", {
+      ...READ_ARTIFACT,
+      value: {
+        ...RESULT,
+        rows: [{ f: Number.NaN, r: Number.POSITIVE_INFINITY, n: Number.NEGATIVE_INFINITY, z: null }],
+      },
+    });
+
+    const res = await GET(request(), params("arun_1", "corr_9"));
+    const body = await parseResponseJSON<{ result: { rows: unknown[] } }>(res);
+
+    expect(res.status).toBe(200);
+    expect(body.result.rows).toEqual([{ f: "NaN", r: "Infinity", n: "-Infinity", z: null }]);
   });
 
   test("the operation reported is the ledger's, not the in-memory copy's", async () => {

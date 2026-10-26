@@ -11,6 +11,9 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  FORK_MODES,
+  FORK_PUSH_MODES,
+  FORK_STAGED_CHANNEL_IDS,
   SWITCHABLE_CHANNEL_IDS,
   applyMatrixMarkers,
   buildChannelsDoc,
@@ -20,6 +23,7 @@ import {
   docsHref,
   evaluateChannel,
   extractPin,
+  forkOutputs,
   githubAuthHeaders,
   guideLabel,
   humanizeSla,
@@ -425,6 +429,18 @@ describe("extractPin", () => {
       "0.9.27",
     );
   });
+
+  // TrueNAS started quoting and digest-pinning the same field, and the pattern
+  // then matched nothing, so the channel reported UNKNOWN on every run for weeks
+  // and nobody saw it. This is that exact shape, so the quote cannot go
+  // unreadable again without a red test.
+  test("extracts a quoted, digest-pinned tag (truenas style)", () => {
+    const content =
+      '    repository: ghcr.io/libredb/libredb-studio\n    tag: "0.17.0@sha256:ce4d58724e2507a4467bcce6702d00760475e0f339071d878fce83e90c99718f"\n';
+    expect(
+      extractPin(content, 'ghcr\\.io/libredb/libredb-studio\\s+tag:\\s*"?(\\d+\\.\\d+\\.\\d+)', "truenas-scale"),
+    ).toBe("0.17.0");
+  });
 });
 
 function helmChannel() {
@@ -642,9 +658,11 @@ describe("update.ci_enabled", () => {
     // required release assets are deliberately absent: a flag there would be a
     // way to publish a release with no npm package or no image.
     expect([...SWITCHABLE_CHANNEL_IDS].sort()).toEqual([
+      "aur",
       "chocolatey",
       "docker-hub-mirror",
       "homebrew",
+      "operatorhub-community",
       "snap",
       "winget",
     ]);
@@ -680,10 +698,164 @@ describe("update.ci_enabled", () => {
     expect(ciEnabledOutputs(channels)).toEqual(["snap=true", "docker_hub_mirror=false"]);
   });
 
+  // The AUR channel is staged before the account that pushes it exists (#971).
+  // Its publish job has to stay off until the channel is live, and flipping the
+  // status is what turns it on: no second switch to forget.
+  test("ciEnabledOutputs emits false for a channel that is not live", () => {
+    const pending = switchableRow("aur", true).replace("status: live", "status: pending");
+    const deprecated = switchableRow("snap", true).replace("status: live", "status: deprecated");
+    const channels = parseChannels(channelsYaml(pending + deprecated + switchableRow("winget", true)));
+    expect(ciEnabledOutputs(channels)).toEqual(["aur=false", "snap=false", "winget=true"]);
+  });
+
   test("the real inventory declares the flag for every switchable channel", () => {
     const channels = parseChannels(readFileSync(join(import.meta.dir, "../../distribution/channels.yaml"), "utf8"));
     const declared = channels.filter((c: { update: { ci_enabled?: boolean } }) => c.update.ci_enabled !== undefined);
     expect(declared.map((c: { id: string }) => c.id).sort()).toEqual([...SWITCHABLE_CHANNEL_IDS].sort());
+  });
+
+  // TrueNAS quoted and digest-pinned a tag it had always written bare, the
+  // pattern stopped matching, and the channel reported UNKNOWN on every run for
+  // weeks with nobody noticing: strictFailures only covers local_file channels
+  // on every_release, so a remote pin that measures nothing never fails anything.
+  // Every pin below reads a field whose quoting the upstream owner can change
+  // without telling us, so each is asserted against all three legal spellings.
+  test("every quote-sensitive pin reads the value bare, single- and double-quoted", () => {
+    const channels = parseChannels(readFileSync(join(import.meta.dir, "../../distribution/channels.yaml"), "utf8"));
+    const shapes: Record<string, (v: string) => string> = {
+      "truenas-scale": (v) => `    repository: ghcr.io/libredb/libredb-studio\n    tag: ${v}\n`,
+      kubero: (v) => `    repository: ghcr.io/libredb/libredb-studio\n    tag: ${v}\n`,
+      helm: (v) => `appVersion: ${v}\n`,
+      homebrew: (v) => `  version ${v}\n`,
+      "caprover-official": (v) => `          defaultValue: ${v}\n`,
+      "caprover-autoconnect": (v) => `          defaultValue: ${v}\n`,
+      yunohost: (v) => `version = ${v}\n`,
+    };
+    // A formatter run upstream can turn one space into two, or into a tab, as
+    // easily as it can change a quote. Homebrew's pattern used to spell the gap
+    // as a single literal space while every other one used \\s.
+    const gaps: Record<string, string[]> = { homebrew: ["  version ", "  version  ", "  version\t"] };
+    for (const [id, shape] of Object.entries(shapes)) {
+      const channel = channels.find((c: { id: string }) => c.id === id);
+      expect(channel, `${id} is missing from the inventory`).toBeDefined();
+      const pattern = channel.pin.extract as string;
+      // Homebrew writes a Ruby string literal, so bare is not a spelling there:
+      // `version 0.17.0` is not valid Ruby, and accepting it would only widen the
+      // pattern towards matching something that is not the version.
+      const spellings = id === "homebrew" ? ['"9.9.9"', "'9.9.9'"] : ["9.9.9", '"9.9.9"', "'9.9.9'"];
+      for (const spelling of spellings) {
+        expect(extractPin(shape(spelling), pattern, id), `${id} cannot read ${spelling}`).toBe("9.9.9");
+      }
+      for (const gap of gaps[id] ?? []) {
+        expect(extractPin(`${gap}"9.9.9"\n`, pattern, id), `${id} cannot read the gap ${JSON.stringify(gap)}`).toBe(
+          "9.9.9",
+        );
+      }
+    }
+  });
+
+  // The digest is part of the tag TrueNAS publishes, and the capture has to stop
+  // before it or the channel reads a version no release ever carried.
+  test("a digest-pinned tag captures the version and stops at the digest", () => {
+    const channels = parseChannels(readFileSync(join(import.meta.dir, "../../distribution/channels.yaml"), "utf8"));
+    const truenas = channels.find((c: { id: string }) => c.id === "truenas-scale");
+    const body =
+      '  image:\n    repository: ghcr.io/libredb/libredb-studio\n    tag: "0.17.0@sha256:ce4d58724e2507a4467bcce6702d00760475e0f339071d878fce83e90c99718f"\n  container_utils_image:\n    repository: ixsystems/container-utils\n    tag: "1.0.2@sha256:46eba20714c1cc6784f60e245c32c33a2d9f616e47d804694a9854248c89a992"\n';
+    expect(extractPin(body, truenas.pin.extract, "truenas-scale")).toBe("0.17.0");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// update.fork - what the release workflow may do to a LibreDB fork of an
+// upstream catalog. It stages the change there and stops: a person tests it
+// and opens the pull request, so nothing here ever opens one.
+// ---------------------------------------------------------------------------
+
+const FORK_SETTINGS = "      fork:\n        mode: update\n        push: auto\n";
+
+function forkRow(fork = FORK_SETTINGS, method = "upstream_pr"): string {
+  return `  - id: caprover-official
+    name: CapRover official one-click apps
+    status: live
+    category: paas-catalogs
+    platforms: [cloud]
+    runtime: channel_supplied
+    tier: 3
+    kind: one-click-template
+    update:
+      method: ${method}
+      sla: on_demand
+${fork}    pin:
+      strategy: none
+      note: Staged on the libredb fork by CI; a person opens the pull request.
+`;
+}
+
+describe("update.fork", () => {
+  test("the fork-staged set is exactly the CapRover catalog", () => {
+    expect([...FORK_STAGED_CHANNEL_IDS]).toEqual(["caprover-official"]);
+    expect(FORK_MODES).toEqual(["update", "create_or_update"]);
+    expect(FORK_PUSH_MODES).toEqual(["auto", "manual"]);
+  });
+
+  test("accepts every mode with every push setting", () => {
+    for (const mode of FORK_MODES) {
+      for (const push of FORK_PUSH_MODES) {
+        const row = forkRow(`      fork:\n        mode: ${mode}\n        push: ${push}\n`);
+        expect(parseChannels(channelsYaml(row))[0].update.fork).toEqual({ mode, push });
+      }
+    }
+  });
+
+  // Required, never defaulted, like ci_enabled: what the workflow may do to a
+  // fork has to be a stated decision in the inventory.
+  test("throws when a fork-staged channel omits the settings", () => {
+    expect(() => parseChannels(channelsYaml(forkRow("")))).toThrow(/caprover-official.*update\.fork must be a mapping/);
+  });
+
+  test("throws when the settings are not a mapping", () => {
+    expect(() => parseChannels(channelsYaml(forkRow("      fork: auto\n")))).toThrow(/update\.fork must be a mapping/);
+  });
+
+  test("throws on a mode outside the list", () => {
+    const row = forkRow(FORK_SETTINGS.replace("mode: update", "mode: create"));
+    expect(() => parseChannels(channelsYaml(row))).toThrow(
+      /update\.fork\.mode must be one of update\|create_or_update/,
+    );
+  });
+
+  test("throws on a push setting outside the list", () => {
+    const row = forkRow(FORK_SETTINGS.replace("push: auto", "push: true"));
+    expect(() => parseChannels(channelsYaml(row))).toThrow(/update\.fork\.push must be one of auto\|manual/);
+  });
+
+  test("throws on a key it does not know, so a misspelt setting is never ignored", () => {
+    const row = forkRow(`${FORK_SETTINGS}        open_pr: true\n`);
+    expect(() => parseChannels(channelsYaml(row))).toThrow(/update\.fork has unknown keys: open_pr/);
+  });
+
+  test("throws when the channel does not reach its catalog through a pull request", () => {
+    expect(() => parseChannels(channelsYaml(forkRow(FORK_SETTINGS, "commit")))).toThrow(
+      /update\.fork needs update\.method upstream_pr/,
+    );
+  });
+
+  test("throws when the settings appear on a channel the workflow does not stage", () => {
+    const row = NONE_ROW.replace("      sla: every_release\n", `      sla: every_release\n${FORK_SETTINGS}`);
+    expect(() => parseChannels(channelsYaml(row))).toThrow(/npm.*update\.fork is only allowed on caprover-official/);
+  });
+
+  test("forkOutputs emits the settings and whether the channel is live", () => {
+    const [live] = parseChannels(channelsYaml(forkRow()));
+    expect(forkOutputs(live)).toEqual(["mode=update", "push=auto", "live=true"]);
+    const [pending] = parseChannels(channelsYaml(forkRow().replace("status: live", "status: pending")));
+    expect(forkOutputs(pending)).toEqual(["mode=update", "push=auto", "live=false"]);
+  });
+
+  test("the real inventory declares the settings for every fork-staged channel", () => {
+    const channels = parseChannels(readFileSync(join(import.meta.dir, "../../distribution/channels.yaml"), "utf8"));
+    const declared = channels.filter((c: { update: { fork?: unknown } }) => c.update.fork !== undefined);
+    expect(declared.map((c: { id: string }) => c.id).sort()).toEqual([...FORK_STAGED_CHANNEL_IDS].sort());
   });
 });
 
@@ -824,6 +996,14 @@ describe("CLI (subprocess against temp fixtures)", () => {
     expect(result.stdout.toString().trim()).toBe("false");
   });
 
+  test("--ci-enabled answers false for a switchable channel that is not live", () => {
+    const pending = switchableRow("aur", true).replace("status: live", "status: pending");
+    const root = makeFixture("0.9.61", channelsYaml(pending));
+    const result = runCheck(root, ["--ci-enabled", "aur"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString().trim()).toBe("false");
+  });
+
   test("--ci-enabled rejects a channel that is not switchable", () => {
     const root = makeFixture("0.9.61", channelsYaml(NONE_ROW));
     const result = runCheck(root, ["--ci-enabled", "npm"]);
@@ -836,7 +1016,50 @@ describe("CLI (subprocess against temp fixtures)", () => {
     expect(result.exitCode).toBe(2);
     expect(result.stderr.toString()).toContain("--ci-enabled requires");
   });
+
+  // The caprover-fork workflow reads these lines into $GITHUB_OUTPUT.
+  test("--fork-outputs <id> prints the fork settings", () => {
+    const settings = "      fork:\n        mode: create_or_update\n        push: manual\n";
+    const root = makeFixture("0.18.0", channelsYaml(forkRow(settings)));
+    const result = runCheck(root, ["--fork-outputs", "caprover-official"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString().trim().split("\n")).toEqual(["mode=create_or_update", "push=manual", "live=true"]);
+  });
+
+  test("--fork-outputs rejects a channel the workflow does not stage", () => {
+    const root = makeFixture("0.18.0", channelsYaml(NONE_ROW));
+    const result = runCheck(root, ["--fork-outputs", "npm"]);
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr.toString()).toContain("'npm' is not a fork-staged channel");
+  });
+
+  test("--fork-outputs fails when the channel is not in the inventory", () => {
+    const root = makeFixture("0.18.0", channelsYaml(NONE_ROW));
+    const result = runCheck(root, ["--fork-outputs", "caprover-official"]);
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr.toString()).toContain("channel 'caprover-official' is not in");
+  });
+
+  test("--fork-outputs with no value exits 2 with usage", () => {
+    const result = Bun.spawnSync(["node", SCRIPT, "--fork-outputs"], { stdout: "pipe", stderr: "pipe" });
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr.toString()).toContain("--fork-outputs requires");
+  });
 });
+
+/**
+ * A case that starts a node process and makes an HTTP round trip to a server in this
+ * process, which bun's 5000 ms per-test default is not sized for. Measured on
+ * windows-latest on 2026-09-15, with the suite running four files at once: "a reachable
+ * remote pin is compared like a local one" took 4480 ms end to end and failed, most of
+ * that spent inside a 3000 ms fetch budget the test itself had set.
+ *
+ * That fetch budget is gone rather than raised. No case here needs a fetch to time out:
+ * every failure it exercises answers at once, with a refused connection or a status
+ * code, so a short budget could only ever fail the SUCCESS path on a slow machine. The
+ * script's own default applies instead, which is also what a real run gets.
+ */
+const spawnTest = (name: string, body: () => Promise<void>) => test(name, body, 30_000);
 
 describe("CLI (remote pins against a local server)", () => {
   const fixtureRoots: string[] = [];
@@ -883,7 +1106,7 @@ describe("CLI (remote pins against a local server)", () => {
   // in-process Bun.serve fixture, so the remote tests spawn asynchronously.
   async function runCheckAsync(root: string) {
     const proc = Bun.spawn(["node", SCRIPT, "--root", root], {
-      env: { ...process.env, GITHUB_STEP_SUMMARY: "", DISTRIBUTION_CHECK_TIMEOUT_MS: "3000" },
+      env: { ...process.env, GITHUB_STEP_SUMMARY: "" },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -895,7 +1118,7 @@ describe("CLI (remote pins against a local server)", () => {
     return { stdout, stderr, exitCode };
   }
 
-  test("a reachable remote pin is compared like a local one", async () => {
+  spawnTest("a reachable remote pin is compared like a local one", async () => {
     const url = serve(() => new Response("image: ghcr.io/libredb/libredb-studio:0.9.27\n"));
     const result = await runCheckAsync(remoteFixture(url));
     expect(result.exitCode).toBe(0);
@@ -903,14 +1126,14 @@ describe("CLI (remote pins against a local server)", () => {
     expect(result.stdout).toContain("0.9.27");
   });
 
-  test("a failing remote fetch degrades to UNKNOWN and still exits 0", async () => {
+  spawnTest("a failing remote fetch degrades to UNKNOWN and still exits 0", async () => {
     const url = serve(() => new Response("boom", { status: 500 }));
     const result = await runCheckAsync(remoteFixture(url));
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("UNKNOWN");
   });
 
-  test("an unreachable host degrades to UNKNOWN and still exits 0", async () => {
+  spawnTest("an unreachable host degrades to UNKNOWN and still exits 0", async () => {
     // Port 1 is reserved and closed: connection refused, no timeout wait.
     const result = await runCheckAsync(remoteFixture("http://127.0.0.1:1/pin.yml"));
     expect(result.exitCode).toBe(0);
@@ -945,7 +1168,7 @@ describe("CLI (probes against a local registry/store/catalog)", () => {
 
   async function runCheckAsync(root: string) {
     const proc = Bun.spawn(["node", SCRIPT, "--root", root], {
-      env: { ...process.env, GITHUB_STEP_SUMMARY: "", DISTRIBUTION_CHECK_TIMEOUT_MS: "3000" },
+      env: { ...process.env, GITHUB_STEP_SUMMARY: "" },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -994,7 +1217,7 @@ describe("CLI (probes against a local registry/store/catalog)", () => {
     });
   }
 
-  test("GHCR latest pointing at the released version is OK", async () => {
+  spawnTest("GHCR latest pointing at the released version is OK", async () => {
     const base = registry({ latest: "sha256:same", "0.9.53": "sha256:same" });
     const result = await runCheckAsync(probeFixture(ghcrRow(base)));
     expect(result.exitCode).toBe(0);
@@ -1002,7 +1225,7 @@ describe("CLI (probes against a local registry/store/catalog)", () => {
     expect(result.stdout).toContain("0.9.53");
   });
 
-  test("GHCR latest still pointing at the previous image is DRIFT with both digests", async () => {
+  spawnTest("GHCR latest still pointing at the previous image is DRIFT with both digests", async () => {
     const base = registry({ latest: "sha256:previous", "0.9.53": "sha256:current" });
     const result = await runCheckAsync(probeFixture(ghcrRow(base)));
     expect(result.stdout).toContain("| DRIFT | docker-ghcr |");
@@ -1010,20 +1233,20 @@ describe("CLI (probes against a local registry/store/catalog)", () => {
     expect(result.stdout).toContain("sha256:current");
   });
 
-  test("a GHCR token exchange that fails degrades to UNKNOWN", async () => {
+  spawnTest("a GHCR token exchange that fails degrades to UNKNOWN", async () => {
     const base = serveBase(() => new Response("no token for you", { status: 403 }));
     const result = await runCheckAsync(probeFixture(ghcrRow(base)));
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("| UNKNOWN | docker-ghcr |");
   });
 
-  test("an unreachable registry degrades to UNKNOWN, never drift", async () => {
+  spawnTest("an unreachable registry degrades to UNKNOWN, never drift", async () => {
     const result = await runCheckAsync(probeFixture(ghcrRow("http://127.0.0.1:1")));
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("| UNKNOWN | docker-ghcr |");
   });
 
-  test("a Docker Hub mirror missing the released tag is DRIFT - the silently skipped push", async () => {
+  spawnTest("a Docker Hub mirror missing the released tag is DRIFT - the silently skipped push", async () => {
     const base = serveBase((req) => {
       const ref = new URL(req.url).pathname.split("/").pop();
       return ref === "latest" ? Response.json({ digest: "sha256:stale" }) : new Response("not found", { status: 404 });
@@ -1075,24 +1298,27 @@ describe("CLI (probes against a local registry/store/catalog)", () => {
 `;
   }
 
-  test("the Snap Store stable channel is measured per architecture and the device-series header is sent", async () => {
-    const seenHeaders: Array<string | null> = [];
-    const base = serveBase((req) => {
-      seenHeaders.push(req.headers.get("snap-device-series"));
-      return Response.json({
-        "channel-map": [
-          { channel: { track: "latest", risk: "stable", architecture: "amd64" }, version: "0.9.53" },
-          { channel: { track: "latest", risk: "stable", architecture: "arm64" }, version: "0.9.53" },
-          { channel: { track: "latest", risk: "edge", architecture: "amd64" }, version: "0.9.40" },
-        ],
+  spawnTest(
+    "the Snap Store stable channel is measured per architecture and the device-series header is sent",
+    async () => {
+      const seenHeaders: Array<string | null> = [];
+      const base = serveBase((req) => {
+        seenHeaders.push(req.headers.get("snap-device-series"));
+        return Response.json({
+          "channel-map": [
+            { channel: { track: "latest", risk: "stable", architecture: "amd64" }, version: "0.9.53" },
+            { channel: { track: "latest", risk: "stable", architecture: "arm64" }, version: "0.9.53" },
+            { channel: { track: "latest", risk: "edge", architecture: "amd64" }, version: "0.9.40" },
+          ],
+        });
       });
-    });
-    const result = await runCheckAsync(probeFixture(snapRow(base)));
-    expect(seenHeaders).toEqual(["16"]);
-    expect(result.stdout).toContain("| OK | snap |");
-  });
+      const result = await runCheckAsync(probeFixture(snapRow(base)));
+      expect(seenHeaders).toEqual(["16"]);
+      expect(result.stdout).toContain("| OK | snap |");
+    },
+  );
 
-  test("one lagging Snap architecture is DRIFT even though the other is current", async () => {
+  spawnTest("one lagging Snap architecture is DRIFT even though the other is current", async () => {
     const base = serveBase(() =>
       Response.json({
         "channel-map": [
@@ -1106,7 +1332,7 @@ describe("CLI (probes against a local registry/store/catalog)", () => {
     expect(result.stdout).toContain("arm64=0.9.40");
   });
 
-  test("a Snap Store error degrades to UNKNOWN", async () => {
+  spawnTest("a Snap Store error degrades to UNKNOWN", async () => {
     const base = serveBase(() => new Response("maintenance", { status: 503 }));
     const result = await runCheckAsync(probeFixture(snapRow(base)));
     expect(result.exitCode).toBe(0);
@@ -1128,30 +1354,98 @@ describe("CLI (probes against a local registry/store/catalog)", () => {
       ci_enabled: true
     pin:
       strategy: probe
-      probe: winget-max-version
+      probe: github-dir-max-version
       urls:
-        versions: ${base}/repos/microsoft/winget-pkgs/contents/manifests/l/LibreDB/Studio
+        catalog: ${base}/repos/microsoft/winget-pkgs/contents/manifests/l/LibreDB/Studio
 `;
   }
 
-  test("winget is measured by the highest version its catalog enumerates", async () => {
+  /**
+   * Two directory listings under one channel - the operator catalogs' real
+   * shape, where operatorhub.io and the OpenShift console publish the same
+   * bundle independently and either one can lag behind the other.
+   */
+  function twoCatalogRow(base: string): string {
+    return `  - id: operatorhub-community
+    name: OperatorHub community catalogs
+    status: live
+    category: kubernetes-operators
+    platforms: [kubernetes]
+    runtime: channel_supplied
+    tier: 3
+    kind: operator-catalog
+    update:
+      method: upstream_pr
+      sla: every_release
+      ci_enabled: true
+    pin:
+      strategy: probe
+      probe: github-dir-max-version
+      urls:
+        operatorhub-io: ${base}/hub
+        openshift-console: ${base}/prod
+`;
+  }
+
+  spawnTest("winget is measured by the highest version its catalog enumerates", async () => {
     const base = serveBase(() => Response.json([{ name: ".validation" }, { name: "0.9.40" }, { name: "0.9.53" }]));
     const result = await runCheckAsync(probeFixture(wingetRow(base)));
     expect(result.stdout).toContain("| OK | winget |");
   });
 
-  test("a winget catalog stuck on an older version is DRIFT", async () => {
+  spawnTest("a winget catalog stuck on an older version is DRIFT", async () => {
     const base = serveBase(() => Response.json([{ name: "0.9.40" }]));
     const result = await runCheckAsync(probeFixture(wingetRow(base)));
     expect(result.stdout).toContain("| DRIFT | winget |");
     expect(result.stdout).toContain("0.9.40");
   });
 
-  test("a winget catalog listing that cannot be read degrades to UNKNOWN", async () => {
+  spawnTest("a winget catalog listing that cannot be read degrades to UNKNOWN", async () => {
     const base = serveBase(() => new Response("rate limited", { status: 429 }));
     const result = await runCheckAsync(probeFixture(wingetRow(base)));
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("| UNKNOWN | winget |");
+  });
+
+  spawnTest("two catalog listings that agree are one OK row", async () => {
+    const base = serveBase(() => Response.json([{ name: "ci.yaml" }, { name: "0.9.53" }]));
+    const result = await runCheckAsync(probeFixture(twoCatalogRow(base)));
+    expect(result.stdout).toContain("| OK | operatorhub-community |");
+  });
+
+  spawnTest("one lagging catalog is DRIFT naming both listings", async () => {
+    const base = serveBase((req) =>
+      Response.json(new URL(req.url).pathname === "/hub" ? [{ name: "0.9.40" }] : [{ name: "0.9.53" }]),
+    );
+    const result = await runCheckAsync(probeFixture(twoCatalogRow(base)));
+    expect(result.stdout).toContain("| DRIFT | operatorhub-community |");
+    expect(result.stdout).toContain("operatorhub-io=0.9.40");
+    expect(result.stdout).toContain("openshift-console=0.9.53");
+  });
+
+  spawnTest("an unreadable listing names which catalog failed", async () => {
+    const base = serveBase((req) =>
+      new URL(req.url).pathname === "/hub"
+        ? new Response("rate limited", { status: 429 })
+        : Response.json([{ name: "0.9.53" }]),
+    );
+    const result = await runCheckAsync(probeFixture(twoCatalogRow(base)));
+    expect(result.stdout).toContain("| UNKNOWN | operatorhub-community |");
+    expect(result.stdout).toContain("operatorhub-io: catalog listing unavailable");
+  });
+
+  spawnTest("a listing with no published version names which catalog is empty", async () => {
+    const base = serveBase((req) =>
+      Response.json(new URL(req.url).pathname === "/hub" ? [{ name: "ci.yaml" }] : [{ name: "0.9.53" }]),
+    );
+    const result = await runCheckAsync(probeFixture(twoCatalogRow(base)));
+    expect(result.stdout).toContain("| UNKNOWN | operatorhub-community |");
+    expect(result.stdout).toContain("operatorhub-io: no published version");
+  });
+
+  test("throws when a directory probe declares no listing url at all", () => {
+    const row = twoCatalogRow("http://127.0.0.1:1").replace(/      urls:\n(        [^\n]+\n)+/, "      urls: {}\n");
+    expect(() => parseChannels(channelsYaml(row))).toThrow(/github-dir-max-version.*at least one/);
   });
 });
 
@@ -1255,6 +1549,20 @@ describe("matrix cell helpers", () => {
       "Manual, minor+",
     );
     expect(updateSummary({ status: "deprecated", update: { method: "upstream_pr", sla: "on_demand" } })).toBe("—");
+  });
+
+  test("updateSummary calls an automated upstream PR what it is", () => {
+    // The submission is opened by CI (#656) but merged by the upstream
+    // maintainers, so neither "Automated" nor "Manual" is true on its own.
+    expect(
+      updateSummary({ status: "live", update: { method: "upstream_pr", sla: "every_release", ci_enabled: true } }),
+    ).toBe("Automated PR, every release");
+  });
+
+  test("updateSummary marks a switched-off upstream PR channel as paused too", () => {
+    expect(
+      updateSummary({ status: "live", update: { method: "upstream_pr", sla: "every_release", ci_enabled: false } }),
+    ).toBe("Automated PR (paused), every release");
   });
 
   test("updateSummary marks a switched-off channel as paused", () => {

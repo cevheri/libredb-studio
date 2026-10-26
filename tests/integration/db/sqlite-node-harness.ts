@@ -37,6 +37,12 @@ async function main(): Promise<void> {
     driverEnv: process.env.LIBREDB_SQLITE_DRIVER ?? null,
   };
 
+  if (process.argv[3] === "unwritable") {
+    await unwritableFileScenario(config, report);
+    console.log(JSON.stringify(report));
+    return;
+  }
+
   const provider = new SQLiteProvider(config);
 
   // Connect
@@ -67,15 +73,92 @@ async function main(): Promise<void> {
   const del = await provider.query("DELETE FROM users WHERE id = ?", [2]);
   report.deleteRowCount = del.rowCount;
 
-  // Schema introspection
-  const schema = await provider.getSchema();
-  report.schema = schema.map((table) => ({
-    name: table.name,
-    rowCount: table.rowCount,
-    columns: table.columns.map((c) => ({ name: c.name, isPrimary: c.isPrimary, nullable: c.nullable })),
-    indexes: table.indexes.map((i) => i.name),
-    foreignKeys: table.foreignKeys,
-  }));
+  // Statements that return rows without starting with SELECT. The provider routes on the
+  // driver's own column count, so this is node:sqlite's answer on the Node runtime the
+  // npx / brew / deb installs run, beside the in-process run of both drivers.
+  const rowsOf = async (sql: string) => {
+    const result = await provider.query(sql);
+    return { rows: result.rows, rowCount: result.rowCount };
+  };
+  report.rowReturning = {
+    cte: await rowsOf("WITH x AS (SELECT 1 AS a UNION ALL SELECT 2) SELECT a FROM x"),
+    values: await rowsOf("VALUES (1, 'a'), (2, 'b')"),
+    insertReturning: await rowsOf("INSERT INTO users (id, name) VALUES (3, 'Cy') RETURNING id, name"),
+    updateReturning: await rowsOf("UPDATE users SET name = 'Cyd' WHERE id = 3 RETURNING name"),
+    deleteReturning: await rowsOf("DELETE FROM users WHERE id = 3 RETURNING id"),
+  };
+
+  // 64-bit ids. With node:sqlite's defaults this read threw ERR_OUT_OF_RANGE
+  // outright, where bun:sqlite silently answered the NEIGHBOURING row's id; both
+  // drivers now read them as BigInt and the driver seam converts them back the same
+  // way. Read here against the real node:sqlite build, because an in-process bun run
+  // can prove nothing about it.
+  await provider.query("CREATE TABLE big (id INTEGER PRIMARY KEY, label TEXT)");
+  await provider.query("INSERT INTO big (id, label) VALUES (9007199254740992, 'neighbour')");
+  await provider.query("INSERT INTO big (id, label) VALUES (9007199254740993, 'target')");
+  const bigRows = (await provider.query("SELECT id, label FROM big ORDER BY id")).rows as Record<string, unknown>[];
+  report.bigIds = bigRows.map((row) => String(row.id));
+  report.bigIdTypes = bigRows.map((row) => typeof row.id);
+  // The inline editor's round trip: the id that was read is the UPDATE key.
+  const bigTarget = bigRows.find((row) => row.label === "target")!;
+  await provider.query("UPDATE big SET label = 'edited' WHERE id = ?", [bigTarget.id]);
+  report.bigRowsAfterUpdate = (await provider.query("SELECT id, label FROM big ORDER BY id")).rows;
+  // Ordinary integers must stay ordinary numbers despite the all-or-nothing driver flag.
+  report.bigSmallInteger = (await provider.query("SELECT 1 AS one")).rows;
+  report.bigCount = (await provider.query("SELECT COUNT(*) AS count FROM big")).rows;
+
+  // A BLOB as the route serializes it: node:sqlite reads it as a plain Uint8Array, which
+  // JSON writes as an object keyed by index unless the seam hands back a Buffer.
+  report.blobWire = JSON.parse(
+    JSON.stringify((await provider.query("SELECT x'DEADBEEF00FF' AS bin, x'' AS empty")).rows),
+  );
+  await provider.query("DROP TABLE big");
+
+  // The same round trip on a column with NO affinity and on a BLOB one. SQLite
+  // compares those operands as they stand, so the decimal string the read prints used to
+  // match NOTHING and the row could not be edited at all. Read here against the real
+  // node:sqlite build, because the bind is the driver's own call and an in-process bun
+  // run can prove nothing about it.
+  const roundTripOn = async (ddl: string): Promise<Record<string, unknown>> => {
+    await provider.query(ddl);
+    await provider.query("INSERT INTO na VALUES (9007199254740992, 'neighbour')");
+    await provider.query("INSERT INTO na VALUES (9007199254740993, 'target')");
+    const read = (await provider.query("SELECT id, label FROM na ORDER BY id")).rows as Record<string, unknown>[];
+    const target = read.find((row) => row.label === "target")!;
+    const edit = await provider.query("UPDATE na SET label = 'edited' WHERE id = ?", [target.id]);
+    const after = (await provider.query("SELECT id, label FROM na ORDER BY id")).rows;
+    await provider.query("DROP TABLE na");
+    return { read: read.map((row) => String(row.id)), rowCount: edit.rowCount, after };
+  };
+  report.noAffinityRoundTrip = {
+    none: await roundTripOn("CREATE TABLE na (id, label TEXT)"),
+    blob: await roundTripOn("CREATE TABLE na (id BLOB, label TEXT)"),
+  };
+
+  // A genuinely textual all-digit key, including one with a leading zero, is still text.
+  await provider.query("CREATE TABLE tk (id TEXT PRIMARY KEY, label TEXT)");
+  await provider.query("INSERT INTO tk VALUES ('9007199254740993', 'wide')");
+  await provider.query("INSERT INTO tk VALUES ('007', 'bond')");
+  report.textKeyKinds = (await provider.query("SELECT id, typeof(id) AS kind FROM tk ORDER BY id")).rows;
+  report.textKeyMatches = [
+    (await provider.query("UPDATE tk SET label = 'edited' WHERE id = ?", ["9007199254740993"])).rowCount,
+    (await provider.query("UPDATE tk SET label = 'edited' WHERE id = ?", ["007"])).rowCount,
+  ];
+  await provider.query("DROP TABLE tk");
+
+  // Object introspection, through the one surface that reads a SQLite file's objects.
+  const listed = await provider.listObjects([], "table");
+  const { details } = await provider.describeObjects([], "table");
+  const detailOf = (name: string) => details.find((detail) => detail.path[detail.path.length - 1] === name);
+  report.schema = listed.map((object) => {
+    const detail = detailOf(object.path[object.path.length - 1]);
+    return {
+      name: object.name,
+      columns: (detail?.columns ?? []).map((c) => ({ name: c.name, isPrimary: c.isPrimary, nullable: c.nullable })),
+      indexes: (Array.isArray(detail?.indexes) ? detail.indexes : []).map((i) => i.name),
+      foreignKeys: detail?.foreignKeys ?? [],
+    };
+  });
 
   // Maintenance
   const check = await provider.runMaintenance("check");
@@ -112,12 +195,60 @@ async function main(): Promise<void> {
     report.queryErrorMessage = error instanceof Error ? error.message : String(error);
   }
 
+  await runObjectSurface(provider, report);
+
   await provider.disconnect();
   report.disconnected = !provider.isConnected();
+  // disconnect() has to RELEASE the file on this adapter too, and the sidecars are the
+  // portable reading of it: SQLite checkpoints the WAL and removes `-wal` and `-shm` when
+  // the connection really closes, and leaves both when the close was only scheduled. The
+  // flag the bun adapter needs for that is meaningless to node:sqlite, which is exactly
+  // the kind of claim an adapter test cannot make for the real driver.
+  report.sidecarsAfterDisconnect = [`${dbPath}-wal`, `${dbPath}-shm`].filter((sidecar) => existsSync(sidecar));
 
   await runAgentReadOnlyProfile(dbPath, report);
 
   console.log(JSON.stringify(report));
+}
+
+/**
+ * The object surface (#789) on the node:sqlite adapter.
+ *
+ * The four methods are read here as well as in-process under bun for the same reason the
+ * agent profile is: the two drivers are different SQLite builds behind a shared adapter,
+ * and this surface leans on catalogs that arrived at different versions -
+ * `PRAGMA table_list` in 3.37 and `pragma_table_xinfo`'s bound schema argument, neither
+ * of which the bun run can prove for node. bun:sqlite here is 3.53.2 and node:sqlite is
+ * 3.51.2.
+ */
+async function runObjectSurface(provider: SQLiteProvider, report: Record<string, unknown>): Promise<void> {
+  await provider.query("CREATE VIEW user_names AS SELECT id, name FROM users");
+  await provider.query("CREATE TRIGGER users_stamp AFTER INSERT ON users BEGIN SELECT 1; END");
+  await provider.query("CREATE TEMP TABLE users (id INTEGER)");
+
+  report.objectContainers = await provider.listContainers!();
+  report.objectCounts = await provider.countObjects!([]);
+  for (const kind of ["table", "view", "index", "trigger"]) {
+    report[`objectList_${kind}`] = (await provider.listObjects!([], kind)).map((object) => ({
+      path: object.path,
+      name: object.name,
+      kind: object.kind,
+    }));
+  }
+  const detail = await provider.describeObject!(["users"], "table");
+  report.objectDetail = {
+    path: detail.path,
+    columns: detail.columns.map((column) => ({ name: column.name, isPrimary: column.isPrimary })),
+    indexes: (Array.isArray(detail.indexes) ? detail.indexes : []).map((index) => ({
+      name: index.name,
+      columns: index.columns,
+    })),
+  };
+  report.objectDetailTrigger = await provider.describeObject!(["users", "users_stamp"], "trigger");
+  report.objectMissingRefused = await rejects(() => provider.describeObject!(["not_here"], "table"));
+  report.objectBadContainerRefused = await rejects(() => provider.countObjects!(["main"]));
+
+  await provider.query("DROP TABLE temp.users");
 }
 
 /**
@@ -212,6 +343,32 @@ async function runAgentReadOnlyProfile(dbPath: string, report: Record<string, un
   );
   report.agentMissingDirOpenRejected = await rejects(() => missingDirProvider.connect());
   report.agentMissingDirCreated = existsSync(missingDir);
+}
+
+/**
+ * The editor path against a file this process cannot write (mode 0444 in a 0555 directory,
+ * prepared by the test): it opens read-only, reads, and a write fails with the provider's
+ * read-only message.
+ */
+async function unwritableFileScenario(config: DatabaseConnection, report: Record<string, unknown>): Promise<void> {
+  const provider = new SQLiteProvider(config);
+  await provider.connect();
+  try {
+    report.connected = provider.isConnected();
+    const health = await provider.getHealth();
+    report.integrity = health.slowQueries.find((sq) => sq.query.includes("Integrity"))?.query;
+    report.journalMode = (await provider.query("PRAGMA journal_mode")).rows;
+    report.tables = (await provider.listObjects([], "table")).map((object) => object.name);
+    report.count = (await provider.query("SELECT COUNT(*) AS n FROM orders")).rows;
+    try {
+      await provider.query("INSERT INTO orders VALUES (4, 'dee', 1)");
+      report.insertError = null;
+    } catch (error) {
+      report.insertError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    }
+  } finally {
+    await provider.disconnect();
+  }
 }
 
 /** True when the thunk rejects; false when it resolves. */

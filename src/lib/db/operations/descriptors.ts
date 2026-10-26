@@ -2,12 +2,16 @@
  * Canonical Phase 1 operation descriptors (#328, epic #325; extended by #330 T3,
  * B27 and #414).
  *
- * Six operations exist: bounded read, plan inspection, plan execution, table
- * profiling, the curated operational reading and the provider's schema read. The set
- * was pinned at THREE by epic #325 and reopened by #330 T3, which is why the fourth
- * carries that reversal in its own comment rather than arriving as though the number
- * had never been a decision; the fifth and sixth carry their own reasons for the same
- * reason. The last two are the ones that name no statement at all.
+ * Every operation is a read: the bounded read, plan inspection, plan execution and
+ * table profiling on SQL; the curated operational reading and the provider's schema
+ * read, which name no statement at all; the kubectl read and the two curated
+ * cluster readings on Kubernetes; and the command read, the scoped catalog, the
+ * estimating plan and the composed profile on MongoDB. The set was pinned at THREE
+ * by epic #325 and reopened by #330 T3, which is why the profile carries that
+ * reversal in its own comment rather than arriving as though the number had never
+ * been a decision, and every operation added since carries its own reason the same
+ * way. A language's statement read has an id of its own, so the SQL contract stays
+ * what it was.
  *
  * Plan inspection and plan execution are DISTINCT descriptors whose
  * ids are derived from the explain seam's modes (`ExplainMode`,
@@ -18,7 +22,10 @@
 
 import { z } from "zod";
 import type { ExplainMode } from "@/lib/explain";
+import { readMongoCommand } from "@/lib/db/providers/document/mongodb/envelope";
 import { OperationRegistry } from "./registry";
+import { kubectlAgentReadInput } from "./kubectl-admission";
+import { mongoAgentReadInput } from "./mongo-admission";
 import { agentPlanExecutionSqlInput, agentReadSqlInput } from "./statement-guard";
 import type { RegistrableOperationDescriptor } from "./types";
 
@@ -46,6 +53,7 @@ export const sqlQueryReadDescriptor: RegistrableOperationDescriptor = {
   resourceCost: "heavy",
   supportsDryRun: false,
   requiresApproval: false,
+  modelStatement: true,
   inputSchema: agentReadSqlInput,
   verification: {
     reviewedBy: "issue #328 acceptance bar (epic #325 product decisions)",
@@ -54,11 +62,37 @@ export const sqlQueryReadDescriptor: RegistrableOperationDescriptor = {
   },
 };
 
+/**
+ * Estimating plan inspection.
+ *
+ * It requires NO provider capability, and that is a correction rather than a
+ * relaxation. `supportsExplain` is the EDITOR's capability: it is what decides
+ * whether the Explain button and tab are rendered and which strategy module in
+ * `src/lib/explain` reads the result. The agent's plan path does not go through
+ * any of that. `composed-sql.ts` says so in its own header: the editor's PostgreSQL
+ * strategy is deliberately not reused here, because it is chosen by a capability the
+ * editor's provider measures and can emit the EXECUTING form. The agent composes its
+ * own estimating form per dialect, and
+ * `composeEstimatingExplain` REFUSES a dialect it has not verified
+ * (`UNSUPPORTED_DIALECT`) before this descriptor is ever resolved, so the real gate
+ * was never this line.
+ *
+ * Keeping it here denied the one engine where the two facts differ: SQL Server has a
+ * verified estimating plan for the agent (`SET SHOWPLAN_ALL`, which the read-only
+ * profile already compiles for every statement it admits) and no editor Explain, so
+ * `supportsExplain` is honestly false while `inspect_plan` is honestly available.
+ * Measured before the change: a `query-optimization` run on SQL Server had
+ * `inspect_plan` denied `CAPABILITY_UNSUPPORTED` and finished `unanswered` with
+ * `no-plan-evidence`: the workflow could not complete on that engine at all.
+ *
+ * `sqlExplainAnalyzeDescriptor` below keeps the requirement, and the asymmetry is the
+ * point: the executing form is the editor's own statement, run on the editor's terms.
+ */
 export const sqlExplainEstimateDescriptor: RegistrableOperationDescriptor = {
   id: PLAN_INSPECTION_ID,
   riskClass: 0,
   accessLevel: "metadata-read",
-  requiredCapabilities: ["supportsExplain"],
+  requiredCapabilities: [],
   resourceCost: "light",
   supportsDryRun: false,
   requiresApproval: false,
@@ -175,13 +209,14 @@ const CURATED_OPERATION_READ_ID = "db.operations.read";
  * no statement at all.
  *
  * **R0/`metadata-read`, and that is a claim rather than a convenience.** R1 requires
- * a `RiskVerification` naming the database-native mechanism that bounds the
- * operation, and a curated provider method has none to name — there is no statement
- * for a read-only transaction to bound. What bounds it instead is the SHAPE of the
- * call: the model supplies a kind out of a closed enum and two scalars, the server
- * chooses the method, and no model-authored text reaches an engine on this path. The
- * six readings are the engine's own operational views, which is metadata about the
- * server rather than the contents of user tables.
+ * a `RiskVerification` naming the mechanism that bounds the operation (the engine's
+ * own read-only mechanism, or a Studio-enforced allowlist on the final request where
+ * the engine has none), and a curated provider method has none to name: there is no
+ * statement for a read-only transaction to bound. What bounds it instead is the
+ * SHAPE of the call: the model supplies a kind out of a closed enum and two scalars,
+ * the server chooses the method, and no model-authored text reaches an engine on this
+ * path. The six readings are the engine's own operational views, which is metadata
+ * about the server rather than the contents of user tables.
  *
  * The honest edge, stated rather than glossed: two of the readings carry TEXT that a
  * user wrote. `SlowQueryStats.query` and `ActiveSessionDetails.query` are statements,
@@ -213,23 +248,29 @@ export const dbOperationsReadDescriptor: RegistrableOperationDescriptor = {
  * no catalog statement is composed (#414). Until then a run's inventory came only
  * from `sql.query.read` statements the server wrote per dialect, which is why the set
  * served two engines. This one names the other way the product already reads a
- * schema — `provider.getSchema()` — so that reading can be audited, budgeted and
- * cited exactly like a statement instead of happening beside the pipeline.
+ * schema — the provider's OBJECT SURFACE, walked by `readObjectInventoryForGrounding`
+ * — so that reading can be audited, budgeted and cited exactly like a statement instead
+ * of happening beside the pipeline. It named `provider.getSchema()` until #789 deleted
+ * that method, and the descriptor did not move: what it governs is "the product reads
+ * this database's schema without composing a statement", which is the same operation an
+ * operator means to allow or deny.
  *
  * **R0/`metadata-read`, on `db.operations.read`'s own argument.** R1 requires a
- * `RiskVerification` naming the database-native mechanism that bounds the operation,
- * and a provider call has no statement for a read-only transaction to bound. What
- * bounds this one is the SHAPE of the call, and here that shape is as narrow as it
- * gets: the input is EMPTY, the server chooses the method, and no model-authored text
- * reaches an engine on this path at all.
+ * `RiskVerification` naming the mechanism that bounds the operation (see
+ * `RiskVerification.boundary`), and a provider call has no statement for a read-only
+ * transaction to bound. What bounds this one is the SHAPE of the call, and here that
+ * shape is as narrow as it gets: the input is EMPTY, the server chooses the method,
+ * and no model-authored text reaches an engine on this path at all.
  *
  * **`heavy`, unlike the curated reading it is modelled on**, and that is a cost claim
- * rather than caution. A provider schema read is N+1 round trips on most engines —
- * MySQL spends three per table, SQLite counts every row of every table — and on
- * MongoDB and Couchbase it reads a sample of documents. A few engines answer it in one
- * or two catalog queries, PostgreSQL among them, but the cost is declared for the
- * expensive shape rather than the cheapest one: calling it `light` would tell the
- * budget that the single call this path makes is always the cheap kind.
+ * rather than caution. One charge buys a WALK, not a call: a `listContainers` per
+ * container level, a `countObjects` per container, then a `listObjects` and a
+ * `describeObjects` per container-and-kind pair, up to the pair bound. On a many-schema
+ * database that is tens of round trips for one budgeted statement, and on the document
+ * engines `describeObjects` reads a sample of documents. A one-container engine answers
+ * it in a handful of catalog queries, but the cost is declared for the expensive shape
+ * rather than the cheapest one: calling it `light` would tell the budget that the single
+ * charge this path makes is always the cheap kind.
  *
  * The honest edge, stated rather than glossed, as `db.operations.read` states its
  * own: on the document engines the FIELD NAMES in the resulting inventory are
@@ -245,26 +286,308 @@ export const dbSchemaReadDescriptor: RegistrableOperationDescriptor = {
   id: "db.schema.read",
   riskClass: 0,
   accessLevel: "metadata-read",
-  // None: `getSchema()` is declared on the `DatabaseProvider` interface for every
-  // engine, so there is no capability whose absence would make this call impossible.
+  // None: `listContainers`, `countObjects`, `listObjects` and `describeObjects` are all
+  // declared on the `DatabaseProvider` interface for every engine, so there is no
+  // capability whose absence would make this call impossible. The one absence that does
+  // exist is a DECLARATION rather than a capability - an engine declaring no
+  // `objectKinds` has nothing to answer - and `readObjectInventoryForGrounding` answers
+  // that before anything is acquired, charged or audited.
   requiredCapabilities: [],
   resourceCost: "heavy",
   supportsDryRun: false,
   requiresApproval: false,
-  // Empty, and strict: `getSchema()` takes no argument, so there is no selector to
-  // validate. `z.strictObject({})` refuses every key rather than ignoring unknown
+  // Empty, and strict: the server chooses the containers and the kinds from the
+  // provider's own declaration, so there is no selector to validate.
+  // `z.strictObject({})` refuses every key rather than ignoring unknown
   // ones, so a caller that believes it can narrow this reading is told it cannot
   // instead of being handed the whole schema silently.
   inputSchema: z.strictObject({}),
 };
 
+const KUBECTL_READ_BOUNDARY =
+  "Kubernetes: Studio's request allowlist (request-policy.ts) admits GET on discovery, on collections and objects " +
+  "whose verbs discovery lists and on pod logs, and POST to the three self reviews, checked on the final method and " +
+  "path before any socket; aggregated groups are read with GET semantics; the identity's RBAC decides what is " +
+  "visible. The kubectl reader is not this boundary: it refuses writes, exec and tunnels so a model reads why.";
+
+/**
+ * One kubectl read the model wrote, on a `kubernetes` connection.
+ *
+ * R1 on a boundary the ENGINE does not provide: Kubernetes has no read-only transaction, so what bounds the read is
+ * Studio's request allowlist on the final request and the identity's RBAC. The R1 contract admits that shape where
+ * the engine has none (see `RiskVerification.boundary`). Its own id, and not a widened `sql.query.read`, so the SQL
+ * contract and its audit action stay exactly what they were.
+ */
+export const kubectlQueryReadDescriptor: RegistrableOperationDescriptor = {
+  id: "kubectl.query.read",
+  riskClass: 1,
+  accessLevel: "data-read",
+  requiredCapabilities: [],
+  resourceCost: "heavy",
+  supportsDryRun: false,
+  requiresApproval: false,
+  modelStatement: true,
+  inputSchema: kubectlAgentReadInput,
+  verification: {
+    reviewedBy: "Kubernetes agent execution design review",
+    boundary: KUBECTL_READ_BOUNDARY,
+    verifiedOn: "2026-10-14",
+  },
+};
+
+const MONGO_READ_BOUNDARY =
+  "MongoDB: the profiled connection opens only after the server identifies itself as the measured engine " +
+  "(buildInfo, fail-closed past FerretDB and the other wire relatives), after the session's own privileges read as " +
+  "reads on the connection's database alone against a fail-closed action allowlist, and after the server refuses a " +
+  "delete that matches nothing, which changes nothing either way; a server that accepts it enforces no authorization " +
+  "and is refused. The command reader (envelope.ts) admits the five reads of the editor's command envelope with read " +
+  "pipeline stages only and refuses server-side JavaScript; a command naming a database other than the connection's " +
+  "is refused; every command carries maxTimeMS, and Studio kills the session when the server overruns it; find and " +
+  "aggregate are capped one document past the row budget server-side; a cursor's documents are counted in BSON " +
+  "bytes before they are decoded, while a distinct's one reply, which the server holds to 16 MiB, is decoded whole " +
+  "before its values are counted; and a result past either budget is refused, never truncated.";
+
+/**
+ * One MongoDB command the model wrote, on a `mongodb` connection (issue #1614).
+ *
+ * R1 on a boundary the ENGINE provides in the direction that matters: MongoDB has no read-only transaction, so the
+ * boundary is the principal's own inability to write, proven at the profiled connection's open by its privileges,
+ * read against a read-only allowlist, and by the server's refusal of a probe - which is why an auth-off server, where
+ * role restrictions are not enforced at all (measured 2026-09-27), is refused outright rather than served. Its own
+ * id, and not a widened `sql.query.read`, so the SQL contract and its audit action stay exactly what they were.
+ */
+export const mongoQueryReadDescriptor: RegistrableOperationDescriptor = {
+  id: "mongo.query.read",
+  riskClass: 1,
+  accessLevel: "data-read",
+  requiredCapabilities: [],
+  resourceCost: "heavy",
+  supportsDryRun: false,
+  requiresApproval: false,
+  modelStatement: true,
+  inputSchema: mongoAgentReadInput,
+  verification: {
+    reviewedBy: "MongoDB agent execution design review",
+    boundary: MONGO_READ_BOUNDARY,
+    verifiedOn: "2026-10-17",
+  },
+};
+
+/** The selector of a scoped MongoDB catalog read: a kind, a database and a collection, any of them narrowed. */
+const mongoCatalogSelectorInput = z.strictObject({
+  kind: z.enum(["columns", "indexes"]).default("columns"),
+  schema: z.string().min(1).optional(),
+  table: z.string().min(1).optional(),
+});
+
+/**
+ * A scoped MongoDB catalog read, on a `mongodb` connection: the provider's own catalog, narrowed by the selector the
+ * model supplied.
+ *
+ * R0 `metadata-read`: the shape of the call bounds it. The selector reaches the provider's catalog read for the agent
+ * (`readCatalogReadOnly`) - a collection listing, or one collection's fields and indexes - and no value out of any
+ * document is returned, which is the same claim `db.schema.read` makes for the unscoped walk. Its own id so an
+ * operator can deny the scoped catalog read without denying either the unscoped walk or the model's command reads.
+ * No `RiskVerification`, like `db.schema.read`: R0 has no boundary to name beyond the shape of the call itself.
+ */
+export const mongoSchemaReadDescriptor: RegistrableOperationDescriptor = {
+  id: "mongo.schema.read",
+  riskClass: 0,
+  accessLevel: "metadata-read",
+  requiredCapabilities: [],
+  resourceCost: "moderate",
+  supportsDryRun: false,
+  requiresApproval: false,
+  inputSchema: mongoCatalogSelectorInput,
+};
+
+const MONGO_PLAN_BOUNDARY =
+  "MongoDB: the estimating plan runs under the same profiled connection, reader and bound database as " +
+  "mongo.query.read, built by the same builder: the command wrapped in explain at queryPlanner verbosity, which " +
+  "answers with the plan and none of the command's documents; with several candidate plans the server runs each for " +
+  "a bounded trial, under the same maxTimeMS and kill.";
+
+/**
+ * The estimating plan of one MongoDB command: `explain` at `queryPlanner` verbosity, which answers with the plan and
+ * none of the command's documents.
+ *
+ * R1 `data-read`, where the SQL estimate is R0: with several candidate plans the server runs each for a bounded trial,
+ * so the documents are read even though none is returned, and the command text is model-written and reaches the
+ * engine. Not a statement read (`modelStatement` unset), because the command is planned rather than run: a plan is
+ * evidence a run may cite, never an answer it may present. Its own id rather than a widened `sql.explain.estimate`,
+ * so the SQL contract and its audit action stay exactly what they were, and so the plan-reading surfaces can name the
+ * estimating-plan operations of BOTH languages without a dialect comparison.
+ */
+export const mongoPlanEstimateDescriptor: RegistrableOperationDescriptor = {
+  id: "mongo.plan.estimate",
+  riskClass: 1,
+  accessLevel: "data-read",
+  requiredCapabilities: [],
+  resourceCost: "moderate",
+  supportsDryRun: false,
+  requiresApproval: false,
+  inputSchema: mongoAgentReadInput,
+  verification: {
+    reviewedBy: "MongoDB agent execution design review",
+    boundary: MONGO_PLAN_BOUNDARY,
+    verifiedOn: "2026-10-17",
+  },
+};
+
+/**
+ * The longest command Studio composes for a run, the collection profile's (`agent/languages/mongo/tools.ts`): room
+ * for a batch of `MAX_PROFILE_COLUMNS` fields with long nested paths, since a field name has no length bound of its
+ * own.
+ */
+const MONGO_COMPOSED_MAX_STATEMENT_CHARS = 65_536;
+
+/**
+ * The input of a command the SERVER composes: one command, read by the reader every command meets
+ * (`readMongoCommand`), up to `MONGO_COMPOSED_MAX_STATEMENT_CHARS`.
+ *
+ * Its own input because the 4,096 characters of `mongoAgentReadInput` bound text a MODEL writes, and a composition is
+ * not that: a profile of sixteen fields with long nested paths runs past it, and held to it the profile would be
+ * refused by its own descriptor. The SQL profile meets no such cap: its input is the bounded read's, which has none.
+ */
+const mongoComposedReadInput = z
+  .strictObject({ command: z.string().min(1).max(MONGO_COMPOSED_MAX_STATEMENT_CHARS) })
+  .superRefine((value, context) => {
+    const read = readMongoCommand(value.command);
+    if (!read.ok) context.addIssue({ code: "custom", path: ["command"], message: read.message });
+  });
+
+const MONGO_PROFILE_BOUNDARY =
+  "MongoDB: the profile's aggregation is composed by the SERVER from the run's own captured inventory - the model " +
+  "supplies only the collection, the depth and where in its fields to start - and it runs under the same profiled " +
+  "connection, reader, bound database, deadline and budgets as mongo.query.read. Only counts come back: no value is " +
+  "read out of any field, which is what makes pointing a profile at a collection of personal data acceptable at all.";
+
+/**
+ * One MongoDB collection profile, composed as an aggregation and run under the profile's bounds.
+ *
+ * R1 `data-read` on the same boundary the model's own command reads take. The composition is server-authored from the
+ * captured inventory (`agent/languages/mongo/tools.ts`), so what the pipeline validates and the engine runs is the
+ * COMPOSED COMMAND - read by the same reader every model command meets, under a length bound of its own
+ * (`mongoComposedReadInput`) - and never a word the model wrote: the selector it named was resolved against the run's
+ * own inventory before this descriptor saw anything. Not a statement read (`modelStatement` unset), for the reason
+ * `sql.table.profile` is not one: its statement is the server's. Its own id for the reason that one has its own: the
+ * counts are the one reading an operator may want to deny without denying the reads the model itself writes.
+ */
+export const mongoTableProfileDescriptor: RegistrableOperationDescriptor = {
+  id: "mongo.table.profile",
+  riskClass: 1,
+  accessLevel: "data-read",
+  requiredCapabilities: [],
+  resourceCost: "heavy",
+  supportsDryRun: false,
+  requiresApproval: false,
+  inputSchema: mongoComposedReadInput,
+  verification: {
+    reviewedBy: "MongoDB agent execution design review",
+    boundary: MONGO_PROFILE_BOUNDARY,
+    verifiedOn: "2026-10-17",
+  },
+};
+
+/** One namespace (a DNS-1123 label, as the API server names one) and an optional label selector over its pods. */
+export const clusterUsageReadInput = z.strictObject({
+  namespace: z.string().regex(/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/),
+  selector: z
+    .string()
+    .min(1)
+    .max(1024)
+    .refine((text) => text.trim() !== "", "a label selector may not be blank")
+    .optional(),
+});
+
+/**
+ * Container usage against requests and limits in one namespace, on a `kubernetes` connection: a curated reading the
+ * agent takes instead of composing `kubectl top` and `kubectl get pods`.
+ *
+ * R1 `data-read`, not metadata: the selector is model-written and reaches the API server, and the answer is the
+ * cluster's own usage data, so it sits under the same boundary as `kubectl.query.read`. `heavy` on the
+ * `db.schema.read` precedent: one charge buys a reading of several lists (PodMetrics, pods, ReplicaSets, Jobs). It has
+ * its own ceiling of 500 rows, and a reading past it is refused rather than truncated.
+ */
+export const clusterUsageReadDescriptor: RegistrableOperationDescriptor = {
+  id: "cluster.usage.read",
+  riskClass: 1,
+  accessLevel: "data-read",
+  requiredCapabilities: [],
+  resourceCost: "heavy",
+  supportsDryRun: false,
+  requiresApproval: false,
+  inputSchema: clusterUsageReadInput,
+  verification: {
+    reviewedBy: "Kubernetes agent execution design review",
+    boundary: KUBECTL_READ_BOUNDARY,
+    verifiedOn: "2026-10-14",
+  },
+};
+
+/** One namespace (a DNS-1123 label, as the API server names one) and nothing to narrow it: a profile is all of it. */
+export const clusterWorkloadsReadInput = z.strictObject({
+  namespace: z.string().regex(/^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/),
+});
+
+/**
+ * The workload profile of one namespace, on a `kubernetes` connection: a curated reading the agent's cluster health
+ * workflow takes instead of composing `kubectl get` over each controller kind, the pods and the Warning events.
+ *
+ * R1 `data-read` under the same boundary as `kubectl.query.read`, for the reason `cluster.usage.read` is: the
+ * namespace is model-written and reaches the API server, and the answer is the cluster's own state. `heavy` because
+ * one charge buys eight lists. Its own ceiling of 500 workloads, and a reading past it is refused rather than
+ * truncated.
+ */
+export const clusterWorkloadsReadDescriptor: RegistrableOperationDescriptor = {
+  id: "cluster.workloads.read",
+  riskClass: 1,
+  accessLevel: "data-read",
+  requiredCapabilities: [],
+  resourceCost: "heavy",
+  supportsDryRun: false,
+  requiresApproval: false,
+  inputSchema: clusterWorkloadsReadInput,
+  verification: {
+    reviewedBy: "Kubernetes agent execution design review",
+    boundary: KUBECTL_READ_BOUNDARY,
+    verifiedOn: "2026-10-14",
+  },
+};
+
+const CANONICAL_DESCRIPTORS: readonly RegistrableOperationDescriptor[] = Object.freeze([
+  sqlQueryReadDescriptor,
+  sqlExplainEstimateDescriptor,
+  sqlExplainAnalyzeDescriptor,
+  sqlTableProfileDescriptor,
+  dbOperationsReadDescriptor,
+  dbSchemaReadDescriptor,
+  kubectlQueryReadDescriptor,
+  clusterUsageReadDescriptor,
+  clusterWorkloadsReadDescriptor,
+  mongoQueryReadDescriptor,
+  mongoSchemaReadDescriptor,
+  mongoPlanEstimateDescriptor,
+  mongoTableProfileDescriptor,
+]);
+
+/**
+ * Whether an operation is a bounded read of a statement the model wrote: data-read, carrying a model statement, and
+ * never approval-gated. Derived from the registered descriptors rather than a list of ids, so a later language's
+ * read is one by declaring it.
+ */
+export function isStatementReadOperation(id: string): boolean {
+  return CANONICAL_DESCRIPTORS.some(
+    (descriptor) =>
+      descriptor.id === id &&
+      descriptor.accessLevel === "data-read" &&
+      descriptor.modelStatement === true &&
+      !descriptor.requiresApproval,
+  );
+}
+
 export function createCanonicalOperationRegistry(): OperationRegistry {
   const registry = new OperationRegistry();
-  registry.register(sqlQueryReadDescriptor);
-  registry.register(sqlExplainEstimateDescriptor);
-  registry.register(sqlExplainAnalyzeDescriptor);
-  registry.register(sqlTableProfileDescriptor);
-  registry.register(dbOperationsReadDescriptor);
-  registry.register(dbSchemaReadDescriptor);
+  for (const descriptor of CANONICAL_DESCRIPTORS) registry.register(descriptor);
   return registry;
 }

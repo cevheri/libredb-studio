@@ -54,8 +54,8 @@ mock.module("@/lib/db-ui-config", () => ({
     MockDBIcon.displayName = "MockDBIcon";
     return MockDBIcon;
   },
-  getDBConfig: () => ({ icon: () => null, color: "text-blue-400", label: "PostgreSQL", defaultPort: "5432" }),
-  getDBColor: () => "text-blue-400",
+  getDBConfig: () => ({ icon: () => null, color: "text-hue-blue", label: "PostgreSQL", defaultPort: "5432" }),
+  getDBColor: () => "text-hue-blue",
 }));
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
@@ -95,6 +95,49 @@ describe("ConnectionItem", () => {
     );
 
     expect(queryByText("Test PostgreSQL")).not.toBeNull();
+  });
+
+  test("activating the row with Enter or Space selects the connection", () => {
+    const { container } = render(
+      <ConnectionItem
+        connection={mockPostgresConnection}
+        isActive={false}
+        onSelect={defaultOnSelect}
+        onDelete={defaultOnDelete}
+      />,
+    );
+
+    const row = container.querySelector('[role="button"]');
+    expect(row).not.toBeNull();
+
+    fireEvent.keyDown(row as HTMLElement, { key: "Enter" });
+    expect(defaultOnSelect).toHaveBeenCalledWith(mockPostgresConnection);
+
+    fireEvent.keyDown(row as HTMLElement, { key: " " });
+    expect(defaultOnSelect).toHaveBeenCalledTimes(2);
+
+    // Any other key does not select, so the keyboard handler is not a catch-all.
+    fireEvent.keyDown(row as HTMLElement, { key: "a" });
+    expect(defaultOnSelect).toHaveBeenCalledTimes(2);
+  });
+
+  // The row's buttons sit inside it, so their keydowns bubble to the row. Handling those
+  // cancelled the button's own activation: Enter on Edit selected the connection instead.
+  test.each(["Enter", " "])("%p on a button inside the row is left to that button", (key) => {
+    const { getByRole } = render(
+      <ConnectionItem
+        connection={mockPostgresConnection}
+        isActive={false}
+        onSelect={defaultOnSelect}
+        onDelete={defaultOnDelete}
+        onEdit={defaultOnEdit}
+      />,
+    );
+
+    // `fireEvent` answers false when a handler called preventDefault.
+    expect(fireEvent.keyDown(getByRole("button", { name: "Edit connection" }), { key })).toBe(true);
+    expect(fireEvent.keyDown(getByRole("button", { name: "Delete connection" }), { key })).toBe(true);
+    expect(defaultOnSelect).not.toHaveBeenCalled();
   });
 
   test("shows environment badge for non-other environments", () => {
@@ -143,7 +186,7 @@ describe("ConnectionItem", () => {
     const connectionDiv = container.firstElementChild;
     expect(connectionDiv).not.toBeNull();
     const className = connectionDiv?.className || "";
-    expect(className.includes("bg-blue-600/10")).toBe(true);
+    expect(className.includes("bg-brand-solid/10")).toBe(true);
   });
 
   test("onSelect fires on click", () => {
@@ -188,6 +231,39 @@ describe("ConnectionItem", () => {
     expect(defaultOnSelect).toHaveBeenCalledTimes(0);
   });
 
+  test("duplicate requests an independent connection without selecting or deleting the source", () => {
+    const onDuplicate = mock(() => {});
+    const view = render(
+      <ConnectionItem
+        connection={mockPostgresConnection}
+        isActive={false}
+        onSelect={defaultOnSelect}
+        onDelete={defaultOnDelete}
+        onEdit={defaultOnEdit}
+        onDuplicate={onDuplicate}
+      />,
+    );
+    fireEvent.click(view.getByRole("button", { name: "Duplicate connection" }));
+    expect(onDuplicate).toHaveBeenCalledWith(mockPostgresConnection);
+    expect(defaultOnSelect).not.toHaveBeenCalled();
+    expect(defaultOnDelete).not.toHaveBeenCalled();
+    expect(defaultOnEdit).not.toHaveBeenCalled();
+  });
+
+  test("duplicate is absent for managed connections and hosts without a duplication handler", () => {
+    const props = {
+      connection: { ...mockPostgresConnection, managed: true },
+      isActive: false,
+      onSelect: defaultOnSelect,
+      onDelete: defaultOnDelete,
+      onDuplicate: mock(() => {}),
+    };
+    const view = render(<ConnectionItem {...props} />);
+    expect(view.queryByRole("button", { name: "Duplicate connection" })).toBeNull();
+    view.rerender(<ConnectionItem {...props} connection={mockPostgresConnection} onDuplicate={undefined} />);
+    expect(view.queryByRole("button", { name: "Duplicate connection" })).toBeNull();
+  });
+
   test("onDelete fires on delete button click with stopPropagation", () => {
     const { container } = render(
       <ConnectionItem
@@ -209,5 +285,268 @@ describe("ConnectionItem", () => {
     expect(defaultOnDelete).toHaveBeenCalledWith(mockPostgresConnection.id);
     // onSelect should NOT have been called (stopPropagation)
     expect(defaultOnSelect).toHaveBeenCalledTimes(0);
+  });
+
+  describe("favorite toggle", () => {
+    test("no star button when onToggleFavorite is not passed", () => {
+      const { queryByLabelText } = render(
+        <ConnectionItem
+          connection={mockPostgresConnection}
+          isActive={false}
+          onSelect={defaultOnSelect}
+          onDelete={defaultOnDelete}
+        />,
+      );
+
+      expect(queryByLabelText("Add to favorites")).toBeNull();
+      expect(queryByLabelText("Remove from favorites")).toBeNull();
+    });
+
+    test("shows an unfavorited star labeled to add, and toggles it with stopPropagation", () => {
+      const onToggleFavorite = mock(() => {});
+      const { getByLabelText } = render(
+        <ConnectionItem
+          connection={mockPostgresConnection}
+          isActive={false}
+          onSelect={defaultOnSelect}
+          onDelete={defaultOnDelete}
+          isFavorite={false}
+          onToggleFavorite={onToggleFavorite}
+        />,
+      );
+
+      const star = getByLabelText("Add to favorites");
+      expect(star.getAttribute("aria-pressed")).toBe("false");
+
+      fireEvent.click(star);
+
+      expect(onToggleFavorite).toHaveBeenCalledTimes(1);
+      expect(onToggleFavorite).toHaveBeenCalledWith(mockPostgresConnection.id);
+      expect(defaultOnSelect).not.toHaveBeenCalled();
+    });
+
+    test("a favorited connection shows a filled star labeled to remove", () => {
+      const onToggleFavorite = mock(() => {});
+      const { getByLabelText } = render(
+        <ConnectionItem
+          connection={mockPostgresConnection}
+          isActive={false}
+          onSelect={defaultOnSelect}
+          onDelete={defaultOnDelete}
+          isFavorite={true}
+          onToggleFavorite={onToggleFavorite}
+        />,
+      );
+
+      const star = getByLabelText("Remove from favorites");
+      expect(star.getAttribute("aria-pressed")).toBe("true");
+
+      fireEvent.click(star);
+
+      expect(onToggleFavorite).toHaveBeenCalledWith(mockPostgresConnection.id);
+    });
+
+    test("star toggle is available for managed connections", () => {
+      const onToggleFavorite = mock(() => {});
+      const { getByLabelText } = render(
+        <ConnectionItem
+          connection={{ ...mockPostgresConnection, managed: true }}
+          isActive={false}
+          onSelect={defaultOnSelect}
+          onDelete={defaultOnDelete}
+          onToggleFavorite={onToggleFavorite}
+        />,
+      );
+
+      fireEvent.click(getByLabelText("Add to favorites"));
+      expect(onToggleFavorite).toHaveBeenCalledWith(mockPostgresConnection.id);
+    });
+  });
+
+  describe("drag reordering (#748)", () => {
+    test("not draggable and no drag handle when draggable is not passed", () => {
+      const { container, queryByTestId } = render(
+        <ConnectionItem
+          connection={mockPostgresConnection}
+          isActive={false}
+          onSelect={defaultOnSelect}
+          onDelete={defaultOnDelete}
+        />,
+      );
+
+      expect(queryByTestId(`drag-handle-${mockPostgresConnection.id}`)).toBeNull();
+      expect(container.querySelector('[class*="cursor-pointer"]')?.getAttribute("draggable")).toBe("false");
+    });
+
+    test("draggable renders a drag handle and fires the drag callbacks", () => {
+      const onDragStart = mock(() => {});
+      const onDragEnter = mock(() => {});
+      const onDragEnd = mock(() => {});
+      const onDrop = mock(() => {});
+      const { container, getByTestId } = render(
+        <ConnectionItem
+          connection={mockPostgresConnection}
+          isActive={false}
+          onSelect={defaultOnSelect}
+          onDelete={defaultOnDelete}
+          draggable
+          onDragStart={onDragStart}
+          onDragEnter={onDragEnter}
+          onDragEnd={onDragEnd}
+          onDrop={onDrop}
+        />,
+      );
+
+      expect(getByTestId(`drag-handle-${mockPostgresConnection.id}`)).not.toBeNull();
+      const item = container.querySelector('[class*="cursor-pointer"]')!;
+      expect(item.getAttribute("draggable")).toBe("true");
+
+      fireEvent.dragStart(item);
+      fireEvent.dragEnter(item);
+      fireEvent.dragOver(item);
+      fireEvent.drop(item);
+      fireEvent.dragEnd(item);
+
+      expect(onDragStart).toHaveBeenCalledTimes(1);
+      expect(onDragEnter).toHaveBeenCalledTimes(1);
+      expect(onDrop).toHaveBeenCalledTimes(1);
+      expect(onDragEnd).toHaveBeenCalledTimes(1);
+    });
+
+    test("isDragging dims the row and isDragOver highlights it", () => {
+      const { container, rerender } = render(
+        <ConnectionItem
+          connection={mockPostgresConnection}
+          isActive={false}
+          onSelect={defaultOnSelect}
+          onDelete={defaultOnDelete}
+          draggable
+        />,
+      );
+      const item = () => container.querySelector('[class*="cursor-pointer"]')!;
+      expect(item().className).not.toContain("opacity-40");
+      expect(item().className).not.toContain("ring-brand-solid");
+
+      rerender(
+        <ConnectionItem
+          connection={mockPostgresConnection}
+          isActive={false}
+          onSelect={defaultOnSelect}
+          onDelete={defaultOnDelete}
+          draggable
+          isDragging
+        />,
+      );
+      expect(item().className).toContain("opacity-40");
+
+      rerender(
+        <ConnectionItem
+          connection={mockPostgresConnection}
+          isActive={false}
+          onSelect={defaultOnSelect}
+          onDelete={defaultOnDelete}
+          draggable
+          isDragOver
+        />,
+      );
+      expect(item().className).toContain("ring-brand-solid");
+    });
+  });
+
+  // ── Icon-only controls announce their name (#919) ──────────────────────────
+  //
+  // The edit and delete controls sat beside a Duplicate control that already carried its
+  // name, so a screen reader read one of the three and announced the other two as
+  // "button".
+
+  describe("accessible names", () => {
+    test("the edit control has a name, not just a pencil", () => {
+      const onEdit = mock(() => {});
+      const { getByRole } = render(
+        <ConnectionItem
+          connection={mockPostgresConnection}
+          isActive={false}
+          onSelect={defaultOnSelect}
+          onDelete={defaultOnDelete}
+          onEdit={onEdit}
+        />,
+      );
+
+      fireEvent.click(getByRole("button", { name: "Edit connection" }));
+      expect(onEdit).toHaveBeenCalledTimes(1);
+    });
+
+    test("the delete control has a name, not just a bin", () => {
+      const onDelete = mock(() => {});
+      const { getByRole } = render(
+        <ConnectionItem
+          connection={mockPostgresConnection}
+          isActive={false}
+          onSelect={defaultOnSelect}
+          onDelete={onDelete}
+        />,
+      );
+
+      fireEvent.click(getByRole("button", { name: "Delete connection" }));
+      expect(onDelete).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("the read-only marker (#1089)", () => {
+    const title = "Writes, value edits and maintenance are refused on this connection";
+
+    test("keeps name space with compact read-only and environment badges (#1430)", () => {
+      const { getByText } = render(
+        <ConnectionItem
+          connection={{ ...mockPostgresConnection, name: "E2E Milvus RO", environment: "local", readOnly: true }}
+          isActive={false}
+          onSelect={defaultOnSelect}
+          onDelete={defaultOnDelete}
+          onEdit={defaultOnEdit}
+        />,
+      );
+      expect(getByText("E2E Milvus RO").classList.contains("truncate")).toBe(true);
+      expect(getByText("E2E Milvus RO").classList.contains("min-w-[4ch]")).toBe(true);
+      expect(getByText("Read-only").classList.contains("sr-only")).toBe(true);
+      expect(getByText("Read-only").parentElement?.querySelector("svg")).not.toBeNull();
+      expect(getByText("LOCAL").classList.contains("truncate")).toBe(true);
+    });
+
+    test("a read-only connection carries the marker, titled with what it refuses", () => {
+      const { getByText } = render(
+        <ConnectionItem
+          connection={{ ...mockPostgresConnection, readOnly: true }}
+          isActive={false}
+          onSelect={defaultOnSelect}
+          onDelete={defaultOnDelete}
+        />,
+      );
+
+      expect(getByText("Read-only").closest("[title]")?.getAttribute("title")).toBe(title);
+    });
+
+    test("a managed read-only seed shows it beside the managed lock", () => {
+      const { getByText, getByTestId } = render(
+        <ConnectionItem
+          connection={{ ...mockPostgresConnection, managed: true, seedId: "prod", readOnly: true }}
+          isActive={false}
+          onSelect={defaultOnSelect}
+          onDelete={defaultOnDelete}
+        />,
+      );
+
+      expect(getByText("Read-only").closest("[title]")?.parentElement).toBe(
+        getByTestId("managed-lock-prod").parentElement,
+      );
+    });
+
+    test("a connection that is not read-only carries none", () => {
+      const props = { isActive: false, onSelect: defaultOnSelect, onDelete: defaultOnDelete };
+      const view = render(<ConnectionItem connection={mockPostgresConnection} {...props} />);
+      expect(view.queryByText("Read-only")).toBeNull();
+
+      view.rerender(<ConnectionItem connection={{ ...mockPostgresConnection, readOnly: false }} {...props} />);
+      expect(view.queryByText("Read-only")).toBeNull();
+    });
   });
 });

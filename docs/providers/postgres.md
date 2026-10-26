@@ -16,7 +16,8 @@
 | **Connection pooling** | Yes — `pg.Pool` (min 2 / max 10 by default) |
 | **Connection string** | Supported (`postgres://` / `postgresql://`) |
 | **Transactions** | Yes — explicit `BEGIN`/`COMMIT`/`ROLLBACK` with auto-rollback timeout |
-| **Query cancellation** | Yes — PID tracking + `pg_cancel_backend` |
+| **Query cancellation** | Yes: PID tracking + `pg_cancel_backend`, then the wire-protocol CancelRequest where that is refused ([§5.3](#53-query-cancellation)) |
+| **Identifier length** | 63 bytes, declared as `maxIdentifierBytes` ([§3.4.2](#342-identifier-length-63-bytes-1435)) |
 | **Agent read-only profile** | Yes — `BEGIN READ ONLY` + extended-protocol single statement (#328, §12) |
 | **Source** | [`src/lib/db/providers/sql/postgres.ts`](../../src/lib/db/providers/sql/postgres.ts) |
 | **Base** | [`src/lib/db/providers/sql/sql-base.ts`](../../src/lib/db/providers/sql/sql-base.ts) |
@@ -39,7 +40,7 @@ introspection and monitoring fast, safely, and resiliently**:
   (`pg_stat_statements`) or superuser-only views (WAL) are unavailable.
 
 PostgreSQL is also the **canonical SQL provider**: the shared SQL mechanics (identifier quoting,
-`LIMIT` injection, dialect placeholders, SSL auto-detection) live in `SQLBaseProvider`, and the
+`LIMIT` injection, SSL auto-detection) live in `SQLBaseProvider`, and the
 other SQL providers (MySQL, SQLite, Oracle, SQL Server) follow the patterns established here.
 
 ---
@@ -79,16 +80,24 @@ rather than reimplementing them:
 
 | Member | Purpose |
 |--------|---------|
-| `escapeIdentifier()` ([sql-base.ts:33](../../src/lib/db/providers/sql/sql-base.ts)) | Dialect-aware quoting — `"ident"` for Postgres, `` `ident` `` for MySQL, `[ident]` for MSSQL; doubles embedded quote chars |
+| `escapeIdentifier()` ([`sql-base.ts`](../../src/lib/db/providers/sql/sql-base.ts)) | Dialect-aware quoting — `"ident"` for Postgres, `` `ident` `` for MySQL, `[ident]` for MSSQL; doubles embedded quote chars |
+| `shouldEnableSSL()` ([`sql-base.ts`](../../src/lib/db/providers/sql/sql-base.ts)) | Auto-enables SSL for known cloud hosts (supabase, neon, render, planetscale, aws, azure, gcp, …) |
+| `getDefaultSchema()` ([`sql-base.ts`](../../src/lib/db/providers/sql/sql-base.ts)) | `public` for Postgres |
+| `prepareQuery()` ([`sql-base.ts`](../../src/lib/db/providers/sql/sql-base.ts)) | Injects `LIMIT` into bare `SELECT`s — see [§5.2](#52-automatic-limit-injection) |
+
+`SQLBaseProvider` no longer has a placeholder helper (#304 removed it).
+
+### 2.2.1 Positional placeholders (shared module, not inherited)
+
+| Function | Purpose |
+|----------|---------|
 | `positionalPlaceholder()` ([values.ts](../../src/lib/sql/values.ts), shared rather than inherited) | `$1`-style placeholders for Postgres (`?` for MySQL/SQLite/Druid, `:n` Oracle, `@pn` MSSQL, `$n` Couchbase) |
-| `shouldEnableSSL()` ([sql-base.ts:75](../../src/lib/db/providers/sql/sql-base.ts)) | Auto-enables SSL for known cloud hosts (supabase, neon, render, planetscale, aws, azure, gcp, …) |
-| `getDefaultSchema()` ([sql-base.ts:91](../../src/lib/db/providers/sql/sql-base.ts)) | `public` for Postgres |
-| `prepareQuery()` ([sql-base.ts:137](../../src/lib/db/providers/sql/sql-base.ts)) | Injects `LIMIT` into bare `SELECT`s — see [§5.2](#52-automatic-limit-injection) |
 
 ### 2.3 Registration & lifecycle
 
 The factory loads the provider via dynamic import so the `pg` driver is only pulled in when a
-PostgreSQL connection is opened ([`factory.ts:62`](../../src/lib/db/factory.ts)):
+PostgreSQL connection is opened by `createDatabaseProvider()`
+([`factory.ts`](../../src/lib/db/factory.ts)):
 
 ```ts
 case 'postgres': {
@@ -110,7 +119,8 @@ These are the non-obvious choices. Read this section before changing the provide
 ### 3.1 `MATERIALIZED` CTEs for schema introspection
 
 This is the single most important detail in the file. All schema-introspection CTEs are declared
-`AS MATERIALIZED` ([postgres.ts:86–177](../../src/lib/db/providers/sql/postgres.ts)). PostgreSQL 12+
+`AS MATERIALIZED` (the `CTE_*_INFO` consts in
+[`postgres.ts`](../../src/lib/db/providers/sql/postgres.ts)). PostgreSQL 12+
 *inlines* single-reference CTEs by default, which lets the planner re-execute these
 `information_schema`-based CTEs inside nested-loop joins (it estimates `rows=1` for them). On a
 large schema (100+ tables/constraints/indexes) that explodes into minutes of planning/execution.
@@ -120,10 +130,1080 @@ large schema (100+ tables/constraints/indexes) that explodes into minutes of pla
 
 If you edit these queries, keep `MATERIALIZED` or you reintroduce the timeout.
 
+**Fallback chain for engines that reject part of this query (#38680).** The object surface's
+container and detail reads all route their query through `queryWithMaterializedFallback()` ([postgres.ts](../../src/lib/db/providers/sql/postgres.ts)), which
+recovers real object-browser data on independent gaps instead of failing outright:
+
+1. **`pg_total_relation_size()`.** CockroachDB has no such builtin at all, and neither has
+   Materialize. `withoutTotalRelationSizeFn()` replaces the call with a literal `0`, trading
+   per-table size for real column/PK data instead of nothing.
+2. **`pg_constraint`.** The keys and the EXCLUDE constraints all read it, so `withoutConstraintCatalog()` empties `pk_info`, `fk_info` and `exclude_info` together, which keeps the columns and the indexes and leaves the keys and the EXCLUDE list empty.
+   It empties each CTE rather than dropping it, which keeps the outer `LEFT JOIN` valid.
+   It matches the closing parenthesis by depth, not by text, because another fallback may already have rewritten part of the statement by the time it runs.
+   Every engine measured has the catalog, PostgreSQL 17.6, CockroachDB v26.2.5, YugabyteDB 2026.1.2.0, RisingWave 3.1.0 and Materialize v26.44.1 on 2026-10-24, so this repair is for a fork nobody here has run.
+   A missing `pg_get_constraintdef()` alone empties only `exclude_info`.
+
+Another repair used to empty `fk_info` when `information_schema.constraint_column_usage` was refused.
+Materialize does not implement that view and RisingWave refuses it, so each paid a retry on every object read and lost its foreign keys for it.
+The keys are read from `pg_constraint` now ([§3.4.0](#340-how-keys-are-read-and-why-a-select-only-role-sees-them)), no statement names the view, and the repair is removed.
+Materialize has no primary or foreign keys at all, `CREATE TABLE` refuses both, so its `pg_constraint` holds no row for a user table; RisingWave has primary keys and no foreign keys.
+
+Two gaps that used to be repaired here no longer reach the chain at all (#1075).
+
+The `MATERIALIZED` keyword: Materialize and RisingWave reserve it for their own `CREATE MATERIALIZED VIEW` grammar and refuse the CTE modifier, Materialize with *Expected left parenthesis, found MATERIALIZED* and RisingWave 3.0.4 with *Expected 'changelog' but found 'MATERIALIZED'*.
+Both object reads strip the hints where they are defined, for the measured reason under [§3.1.4](#314-what-the-object-surface-declares-and-which-catalog-answers-for-it), so no statement that reaches the chain carries one.
+The matcher that sat first in the chain was therefore dead, and worse than dead: it accepted any message that named the word, and RisingWave's `constraint_column_usage` refusal recommends `SHOW MATERIALIZED VIEWS`, so it spent a retry resending an identical statement.
+It is removed.
+
+`json_agg()` / `json_build_object()` and the `json` type: the rows are built with `jsonb_agg()`, `jsonb_build_object()` and `'[]'::jsonb` from the start.
+RisingWave 3.0.4 has no `json` type at all and refuses `json_agg()`, `json_build_object()`, `'[]'::json` and `CAST(NULL AS json)` alike, while it answers every `jsonb` form; Materialize 26.40.0 has no `json_agg()` either.
+A swap applied after the first refusal could not work on RisingWave: the `constraint_column_usage` repair, since removed, inserted a `NULL::json` of its own after the swap had already been spent, and the read failed on that.
+PostgreSQL and every relative in the registry answer both forms, and `pg` parses the two OIDs into the same plain value.
+`jsonb` reorders an object's keys and drops duplicate ones, which changes nothing here: every object these statements build has a fixed set of distinct keys, and every consumer reads it parsed, never as text.
+It keeps an array's order, and `ORDER BY a.attnum` inside the aggregate is what hands back the table's own column order.
+
+Each fallback is matched against whichever error actually comes back, not tried in a fixed order.
+Real PostgreSQL never takes any retry path; it accepts every construct above and the first attempt succeeds.
+An error no fallback recognizes, or one that survives every applicable fallback, is mapped through `mapDatabaseError()` and rethrown rather than left raw.
+
+**What still doesn't work.** On Materialize, keys come back empty because the engine has none; sizes are unmeasured (gap #1).
+
+RisingWave's object browser was unavailable until 2026-09-19 and this paragraph named the wrong
+cause, which is worth keeping rather than quietly replacing. It said the binder fails on the
+`LEFT JOIN pg_class ON (...)::regclass` pattern itself. Measured against a live 3.0.4, that pattern
+is fine: `LEFT JOIN pg_class ON c.relnamespace = n.oid` binds, a bare `::regclass` cast evaluates,
+and joining two `information_schema` relations binds. The one thing that does not bind is
+`c.reltuples`, because RisingWave's `pg_class` has no such column - it carries oid, relname,
+relnamespace, relowner, relpersistence, relkind, relpages, relam, reltablespace, reloptions,
+relispartition and relpartbound. The engine reports an unbindable column on its first line and
+`missing FROM-clause entry for table "c"` on its second, and reading the second line first is what
+produced the wrong diagnosis. The repair is in the object listing rather than in this chain: see
+`withoutRowCountColumn()`.
+
+A statement that never joined the catalog a fallback repairs is *not* retried blind:
+`withoutConstraintCatalog()` returns the SQL untouched when there is no key or EXCLUDE CTE to empty
+(`CONTAINERS_SQL` has none), so the rejection is mapped and rethrown on the next attempt instead of
+looping on a statement nothing changed.
+
+### 3.0.1 Resolving a name that may vanish mid-read
+
+`tables_info` lists relations from `information_schema` and then resolves each name to a
+`pg_class` row. A bare `::regclass` cast **raises** when the name no longer resolves, so a
+table dropped between those two steps failed the entire read. Reproduced on PostgreSQL
+18.4 with concurrent `CREATE`/`DROP` alongside: **102 of 400 runs** died with
+`relation "public.materialized_daily_totals_396" does not exist`. `to_regclass()` answers
+`NULL` instead, the row survives with no `pg_class` match, and its count reads as absent —
+which it is. Same harness after the change: **400 of 400 succeeded**.
+
+Materialize has no `to_regclass`, so it retries with the cast through
+`withoutToRegclass()` and behaves as it did before. PostgreSQL, TimescaleDB, YugabyteDB,
+Cloudberry, AlloyDB Omni and CockroachDB were each asked on a live instance and all have it.
+
+**What this costs, measured** on 2026-09-24 through `describeObject()` and `describeObjects()` (#1075):
+a PostgreSQL object read is **one** round trip, and so is a CockroachDB one.
+A Materialize one was **two**, and so was a RisingWave one: each refused `constraint_column_usage` once and the retry ran.
+Since the keys moved to `pg_constraint` both are **one**, measured on Materialize v26.44.1 and RisingWave 3.1.0 on 2026-10-24.
+Materialize took three before the rows were built with `jsonb`, the extra one for `json_agg()`; RisingWave took four and still failed.
+Each failed attempt is a parse or plan error rather than work, and the chain is error-driven so it cannot be pre-sorted, but on a remote instance those round trips are latency the object browser pays on every refresh.
+
+### 3.1.0 A row count nobody counted
+
+`tables_info` reads `pg_class.reltuples`, which is an **estimate**, and PostgreSQL 14+ writes
+**-1** there for a relation nothing has vacuumed or analysed yet. That is "I have not counted
+this", not "this has no rows". `estimatedRowCount()` maps it — and a NULL from a pg_class join
+that matched nothing — to `undefined`; the row count is optional on an object and both
+[TableItem.tsx](../../src/components/schema-explorer/TableItem.tsx) and `DatabaseDocs.tsx`
+already gate on that, so no badge is drawn rather than a number nobody produced.
+
+A genuine `0` is kept, because an empty table is a real measurement. On a server old enough to
+write `0` instead of `-1` the two cannot be told apart, the same limit
+[languages/sql/engines/postgres.ts](../../src/lib/agent/languages/sql/engines/postgres.ts) documents for the agent's grounding read.
+
+This mattered more than it looks. Measured on stock PostgreSQL 18.4, two tables holding 5000 and
+1200 rows both answered -1 until `ANALYZE` ran, and the browser showed **0 rows** for both — a
+freshly restored dump is exactly that state, so the first thing a new user saw was every table
+claiming to be empty. Materialize answers -1 for every relation always. The clamp that produced
+this was `Math.max(0, ...)`, and a test asserted it: "negative reltuples row_count is clamped to
+zero". Its stated concern was right, the UI must never show -1; its conclusion swapped one wrong
+number for a more convincing one.
+
+### 3.1.1 What counts as a table
+
+`CTE_TABLES_INFO` filters `table_type IN ('BASE TABLE', 'MATERIALIZED VIEW')` — a positive list,
+not "anything that is not a view", so a `FOREIGN` or `SYSTEM VIEW` row still stays out.
+`MATERIALIZED VIEW` is on it for Materialize, which reports its materialized views through
+`information_schema.tables` under that type and whose users work with them rather than with base
+tables: listing only `BASE TABLE` hid the engine's central object while showing its plain tables.
+
+**The Overview's table count does not follow the listing here (#1439).** The object tree lists
+materialized views in a folder of their own — a kind it resolves from `pg_class.relkind = 'm'`, not
+from `information_schema` — so `OVERVIEW_COUNTS_SQL` counts `table_type = 'BASE TABLE'` alone.
+Counting `MATERIALIZED VIEW` there made Overview's "Tables" tile read 5 for a schema with 3 tables
+and 2 materialized views on RisingWave 3.1.0 and Materialize v26.44.1, where the tree's Tables
+folder said 3. Two facts wear the word "table": what the tree groups under Tables, and what the
+listing's positive list admits so Materialize's central object is browsable at all. The count is the
+first.
+
+Including `MATERIALIZED VIEW` in the listing is a measured no-op everywhere else. PostgreSQL leaves
+materialized views out of `information_schema.tables` altogether — its `table_type` is only
+`BASE TABLE`, `VIEW`, `FOREIGN` or `LOCAL TEMPORARY` — and TimescaleDB, YugabyteDB, Cloudberry,
+AlloyDB Omni and CockroachDB were each asked on a live instance and emit no such row (CockroachDB's
+third value is `SYSTEM VIEW`), so the Overview's count is unchanged on every one of them.
+
+### 3.1.2 Two kinds of absence, and why neither is an empty array
+
+`getTableStats()`, `getIndexStats()` and `getStorageStats()`'s tablespace read **reject**
+when the engine says the object is not there. They do not answer `[]`. The `MonitoringData`
+contract ([types.ts](../../src/lib/db/types.ts)) is explicit that these are different facts:
+a rejected read leaves its panel absent and records the engine's own sentence under
+`errors`, while an empty array claims the engine answered "nothing" — a measurement it
+never made, and one that throws away the sentence saying why.
+
+A refused **size builtin** is not one of those cases, and since #1436 does not reject.
+`pg_table_size()`, `pg_indexes_size()` and `pg_total_relation_size()` are three columns of a
+read whose other columns the engine answers, so each is dropped on its own
+(`queryTableStats()`) and the rows arrive with that size absent — never as a `0`, which
+would be a measurement nobody made ([D105](../BACKLOG.md)). Measured on RisingWave 3.1.0,
+which binds neither `pg_size_pretty()` nor `pg_total_relation_size()` but answers
+`pg_table_size(relid)` and `pg_indexes_size(relid)`: the panel now lists the tables with
+their sizes, where the whole read used to fail.
+
+**The total is the one size that can be derived rather than dropped**, and
+`totalSizeBytes()` does. PostgreSQL defines `pg_total_relation_size()` as `pg_table_size()`
+plus `pg_indexes_size()`, so adding the two measured parts is the engine's own arithmetic and
+not this provider's guess. It has to be derived rather than left absent because
+`totalSizeBytes` is a **required** field: an absent total still has to carry a number, and the
+`N/A`-beside-`0` spelling the other providers use is only safe where nothing else on the row
+claims a size. The Tables tab's Size card and the Storage tab's share both gate on
+`tableSizeBytes` alone — until #1436 a measured table size always arrived with a measured
+total — so a row carrying one part and the placeholder got that `0` summed and drawn as a
+reading. Measured on RisingWave 3.1.0 on 2026-10-08, one table of two rows:
+`pg_table_size` 89, `pg_indexes_size` 0, `pg_total_relation_size` *function
+pg_total_relation_size(integer) does not exist*. The card read **0 B** over a table with
+bytes in it; it now reads **89 B**. Where a part is refused as well there is nothing to add
+up, and the row publishes no sizes at all, so those gates read the absence and answer `N/A`
+instead of summing the placeholder. No engine measured here does that — RisingWave refuses
+the total alone, CockroachDB answers NULL for all three — so that arm closes the shape rather
+than one seen.
+
+Materialize's outcome is unchanged, because its refusal is not the size call alone: it has
+no `pg_stat_user_tables` either, so the statement still has nothing to read FROM and the
+panel still carries that sentence.
+
+The distinction a reader needs is then drawn where the sentence is rendered.
+`describesAbsentObject()` ([monitoring-absence.ts](../../src/lib/monitoring-absence.ts))
+asks whether the message names a `pg_`-prefixed object that is not there, and
+`PanelUnavailable` picks its headline from the answer:
+
+- **"This engine does not publish this."** — Materialize has no `pg_table_size()`, no
+  `pg_stat_user_tables` and no `pg_tablespace_size()`. Nothing is wrong and nothing the
+  user does will change it. Three of its panels land here.
+- **"This database could not answer this panel."** — Apache Cloudberry answers
+  `query plan with multiple segworker groups is not supported` for the same queries while
+  `pg_stat_user_tables` exists there and is readable. Its MPP planner is refusing this
+  query's *shape*, so a different statement could still succeed; that is worth attention
+  in a way the first is not. Two of its panels land here.
+
+The engine's sentence is shown verbatim under either headline, so no reason is lost.
+Both halves of the predicate are load-bearing: without the phrase any message naming a
+catalog would qualify, and without the `pg_` name Cloudberry's restriction would be
+flattened into a settled fact the next time its wording contains "does not exist".
+Verified in the browser in both directions on live instances.
+
+### 3.1.3 The system-schema exclusion set
+
+`SYSTEM_SCHEMAS` ([postgres.ts](../../src/lib/db/providers/sql/postgres.ts)) is single-sourced and
+interpolated into every `NOT IN (...)` clause in the file, so a query added later cannot filter on a
+shorter list than the rest. Every name was read off that engine's own documentation and then
+confirmed against a live instance; stock PostgreSQL creates none of them, so excluding them there is
+a no-op — measured, not assumed: PostgreSQL 18.4 and YugabyteDB 2.25.2 both answer `public` and
+nothing else.
+
+Two separate defects made this load-bearing rather than cosmetic, and they pull in opposite
+directions because the two readers use different catalogs:
+
+- **The object browser** reads `information_schema.tables` with `table_type = 'BASE TABLE'`. That
+  filter hides an engine's *views* but not its internal *tables*, so it listed 61 objects on
+  TimescaleDB where 2 were the user's (34 hypertable chunks in `_timescaledb_internal`, 22 in
+  `_timescaledb_catalog`, 3 in `_timescaledb_cache`), 10 on AlloyDB Omni (`google_ml`) and 4 on
+  Apache Cloudberry (`pg_ext_aux`).
+- **`OVERVIEW_COUNTS_SQL`** counted `pg_tables` directly, which has no `table_type` column to
+  filter on. On CockroachDB that answered 98 for the same 2 tables — 93 `crdb_internal`, 3
+  `pg_extension` — so the Monitoring overview and the Explorer badge disagreed inside one app.
+  It now counts `information_schema.tables` through the same `schemaExclusion()` clause the rest
+  of the file uses, so an engine-internal schema is left out of the count exactly as it is left
+  out of the object tree. The count takes `table_type = 'BASE TABLE'` alone (#1439) — a
+  materialized view is its own folder in the tree — and the index count still reads `pg_indexes`,
+  which has no equivalent second reader.
+
+Every CTE in the schema queries carries the filter, not just some: `pk_info` and `fk_info` were
+missing it while `tables_info`, `columns_info` and `index_info` had it, which let the deleted
+relations read keep listing `_timescaledb_catalog` and `google_ml` relations through the FK side of
+its `FULL OUTER JOIN` after the browser had stopped showing them.
+
+Extension-created schemas are excluded by **ownership**, not by name. A hardcoded
+`google_ml` would have hidden a real schema from anyone who happened to name one that -
+it is the only entry of this kind a user could plausibly choose - so `pg_depend` is asked
+the question the name was standing in for. It answers better too: on a live AlloyDB Omni
+it returns `google_ml` **and** `ai`, which the name list had missed, and a user's own
+schema is never extension-owned so it always survives. Measured accepted on all seven
+engines, PostgreSQL included, where it correctly returns nothing; the driver serves
+engines nobody here has run, so an engine without `pg_depend` or `pg_extension` drops the
+clause through `withoutExtensionOwnershipTest()` and keeps the fixed list.
+
+The object browser asks the same question one level down, per object (#1429). An extension
+can put its routines and relations into a user's own schema, where no schema filter reaches
+them: `CREATE EXTENSION pgcrypto` and `hstore` add 97 functions to `public`, and
+`pg_stat_statements` adds three functions and two views. `extensionMemberExclusion()` drops every routine
+(`pg_proc`) and relation (`pg_class`) with a `pg_depend` row of `deptype = 'e'` from the
+folder counts, the listings and `describeObjects()`, which is the same relation test the
+agent's catalog read carries, so the two agree. A user's own object never has such a row.
+Measured 2026-10-08 with user objects seeded next to the extensions:
+
+| Engine | Catalog in `public` | Object browser |
+|---|---|---|
+| PostgreSQL 18.6, pgcrypto + hstore + pg_stat_statements | 102 functions, 3 views | 2 functions, 1 view |
+| TimescaleDB on PG 18.6 | 90 functions, 13 procedures | 2 functions, 0 procedures |
+| OrioleDB beta 19 on PG 18.6 | 80 functions, 5 views | 2 functions, 1 view |
+| Percona PostgreSQL 18.6.1, pg_stat_monitor | 15 functions, 2 views | 2 functions, 1 view |
+| AlloyDB Omni 17.9, as the image ships | 150 functions, 50 views | 2 functions, 1 view |
+| YugabyteDB 2026.1.2 (PG 15.12), pgcrypto + hstore | 98 functions | 1 function |
+| CockroachDB 26.3.2 | 1 function, 1 view, 1 table | the same; `pg_depend` answers nothing |
+| Materialize 26.45.1 | 1 view, 1 table | the same; `pg_depend` answers nothing |
+| RisingWave 3.1.0 | 1 view, 1 table | the same; `pg_depend` answers nothing |
+
+All nine accept the clause. The listings and counts retry without it on an engine that
+refuses `pg_depend` or `pg_extension`, through `queryListing()` and `queryCounts()`, and
+`describeObjects()` already runs through the fallback chain that drops it.
+
+Three places read other catalogs and needed the same test on their own (#1599). The
+Overview's table and index counts read `information_schema.tables` and `pg_indexes`, which
+name a table instead of carrying its oid, so `extensionMemberTableExclusion()` asks by
+schema and name; an index is left out by asking about the table it sits on. The Triggers
+folder's count, listing and source read leave out a trigger whose table an extension created,
+since that table is already hidden. Measured 2026-10-08 on the `postgis/postgis:17-3.5`
+image as it ships (PostgreSQL 17.5, PostGIS 3.5.2, with topology and the tiger geocoder),
+plus `orders` with one trigger and a second trigger added to `spatial_ref_sys`: the Overview
+went from 38 tables and 76 indexes to 1 and 1, and the Triggers folder from 2 triggers to
+one. CockroachDB 26.3.2 answers the new statements with the same counts as before.
+
+The fixed list stays for schemas the *engine itself* builds in, which are not
+extension-owned: measured, CockroachDB's `crdb_internal` and Cloudberry's `pg_ext_aux`
+return nothing from `pg_depend`.
+
+Citations, by engine: Materialize's
+[system catalog](https://materialize.com/docs/sql/system-catalog/) (`mz_catalog`, `mz_internal`,
+`mz_introspection`). `mz_unsafe` and `mz_catalog_unstable` are not on that page; Materialize
+v26.44.1 listed both beside a user's own schemas, so they are excluded on that measurement.
+RisingWave's [`rw_catalog`](https://docs.risingwave.com/sql/system-catalogs/rw-catalog) holds its
+system tables; RisingWave 3.1.0 listed 74 of them as user objects. CockroachDB's
+[system catalogs](https://www.cockroachlabs.com/docs/stable/system-catalogs), which enumerates
+exactly four (`crdb_internal` and `pg_extension` are the two stock PostgreSQL lacks); TimescaleDB's
+own `sql/pre_install/schemas.sql`, which creates all seven; Cloudberry's
+[schema documentation](https://cloudberry.apache.org/docs/operate-with-data/operate-with-db-objects/create-and-manage-schemas/)
+for `gp_toolkit`, `pg_aoseg` and `pg_bitmapindex`. Entries that rest on measurement rather than a
+document are marked as such in the code: Cloudberry's `pg_ext_aux` (the PAX auxiliary tables),
+which its schema page does not list; Materialize's `mz_unsafe` and `mz_catalog_unstable`; and
+AlloyDB's `google_ml`, which Google's docs never name — traced through `pg_depend` to the
+`google_ml_integration` extension the Omni image enables by default.
+
+### 3.1.4 What the object surface declares, and which catalog answers for it
+
+[§3.1.1](#311-what-counts-as-a-table) is the flat model's answer to "what is a table", and it is a
+single yes/no over every relation the database holds.
+The object surface (#789) replaces it with seven named kinds, each declared in
+`getCapabilities().objectKinds` by the provider that has it, and each answered by the catalog that
+knows about it:
+
+| Kind | `role` | Catalog | Test |
+|---|---|---|---|
+| `table` | `relation` | `pg_class.relkind` in `'r'`, `'p'` | `acceptsRowWrites: true` |
+| `view` | `relation` | `pg_class.relkind = 'v'` | not a row-write target |
+| `materialized_view` | `relation` | `pg_class.relkind = 'm'` | not a row-write target |
+| `sequence` | `config` | `pg_class.relkind = 'S'` | |
+| `function` | `routine` | `pg_proc.prokind = 'f'` | |
+| `procedure` | `routine` | `pg_proc.prokind = 'p'` | |
+| `trigger` | `attached` | `pg_trigger` where `NOT tgisinternal` | `attachedTo: 'table'` |
+
+Five of the seven also declare `hasSource` and a `sourceLanguage`, which is what gives a row a Source tab; [§3.1.5](#315-object-source-789) says which, what each definition text IS, and why `table` and `sequence` declare nothing.
+
+`containerLevels` is one level, `schema`, on a connection that names a database: a `pg` pool is
+opened against one database and cannot switch it. A **server-level connection**
+([§4.1.1](#411-server-level-connections-an-empty-database-1530)) declares `catalog` (Database) above
+`schema` and `catalogSessions: true`, so an object's path is `[database, schema, name]`
+(`containerPathShapes` stays `exact`). Its `listContainers()` answers the databases, then one
+database's schemas; every other object method strips the database segment, asks that database's
+session, and puts the segment back on every path it returns. `buildObjectEdit` re-seals the plan
+with the connection's own fingerprint, which is what the edit routes recompute.
+
+**No `index` kind**, deliberately, and this is the line the other providers are read
+against. PostgreSQL's own catalog models an index as a property of the relation it is on:
+`pg_index` is keyed by `indrelid` and an index cannot exist apart from one. So it stays where it
+already is, in `describeObject()`'s output beside that object's columns, rather than becoming a
+container-level folder. An `index` kind belongs only where the engine's catalog names indexes as
+first-class objects at container level.
+
+**A view declares no `acceptsRowWrites`.** PostgreSQL does accept an `UPDATE` against a simple
+updatable view, and against any view carrying an `INSTEAD OF` trigger. The declaration is still
+absent, because it is per KIND and that fact is per OBJECT: claiming it would offer an import
+target that fails on most views in most schemas. `kindAcceptsRowWrites()`
+([object-kinds.ts](../../src/lib/db/object-kinds.ts)) reads an absent flag as false, so nothing has
+to be written for that to hold.
+
+**`prokind` costs the routine folders, never the container.** `pg_proc.prokind` arrived in
+PostgreSQL 11, and the wire-compatible forks do not all have it. When the counting statement is
+refused with a sentence that names `prokind`, `countObjects()` re-runs it with the routine arm
+removed, so the relations and the triggers still carry their counts and only `function` and
+`procedure` carry `{ unavailable }` with the server's own sentence. Losing two folders to a missing
+column is the right cost; losing the whole schema to it is not.
+
+The retry is keyed on the column name, under ANY SQLSTATE, the way every other fallback in
+[postgres.ts](../../src/lib/db/providers/sql/postgres.ts) is keyed on the identifier it repairs.
+Only the routine arm names `prokind`, so a refusal that names it is a refusal of that arm. Any
+other refusal (a missing column in an arm the retry keeps, a statement timeout, a cancel, a
+serialization failure, a lost connection) is not retried: every folder carries that sentence from
+the first read, so a timeout is not waited out twice and is never filed under the routine pair. If
+the retry is refused too, the routine pair keeps the first sentence and the rest carry the retry's.
+
+The retry used to be keyed on `42703` as well, and that lost the whole tree on Materialize.
+Measured on Materialize v26.44.1 on 2026-10-04 with `\set VERBOSITY verbose`: the routine arm
+answers `ERROR: XX000: column "p.prokind" does not exist`, so the retry never ran and all seven
+folders, in every schema, showed that sentence and could not be opened. `XX000` is Materialize's
+generic internal error, so keying on it instead would read every internal failure as a missing
+column. On the same server the routine-free statement answers the tables, views and materialized
+views, so those three folders count and list, and only Functions and Procedures stay closed:
+`listObjects()` for them runs the same `prokind` filter and is refused the same way. PostgreSQL 18.6, which has the column, and RisingWave 3.1.0, whose `pg_proc`
+has it too, answer the full statement on the first read and draw all seven folders, measured the
+same day.
+
+**Three facts, not two.** `KindCount` is `{ count }` or `{ unavailable }`, and every declared kind
+is seeded at `{ count: 0 }` before the read. So a folder the engine has and this schema holds none
+of renders a zero badge; a folder whose read was refused renders the reason; and a kind this engine
+does not have at all is simply not in `objectKinds`, so no folder is drawn. The flat model
+collapsed all three into an empty array, which is the same failure
+[§3.1.2](#312-two-kinds-of-absence-and-why-neither-is-an-empty-array) records on the monitoring
+side. The `unavailable` sentence is the server's own, not passed through `mapDatabaseError()`:
+nothing here throws, and the mapper's prefix would put this product's words in front of the
+server's.
+
+**`describeObject()` reads columns from `pg_attribute`, not from `CTE_COLUMNS_INFO`.** This is the
+one place the object surface does not reuse the schema query's CTEs, and the reason is measured.
+`information_schema.columns` is defined over relkinds `'r'`, `'v'`, `'f'` and `'p'` only, so it has
+no row at all for a materialized view or a sequence. On the seeded `postgres:18` fixture it answered
+**0 columns** for `app.revenue_by_month` (relkind `'m'`) and **0** for `app.invoice_number_seq`
+(`'S'`), while `pg_attribute` answered 2 and 3. Reusing it would have shipped the browser's headline
+new folder, the materialized view #710 is about, with an empty column list. The primary key, foreign
+key and index CTEs *are* reused, so a fork that needs `withoutConstraintCatalog()` gets the same
+repair here that the container read gets.
+
+**A column's default is read only where `pg_attrdef` has one.** The column read hands
+`pg_get_expr()` an expression only through `CASE WHEN ad.adbin IS NOT NULL`. PostgreSQL answers NULL
+for a NULL expression anyway, but RisingWave 3.0.4 answers `''`, and its `pg_attrdef` is always empty,
+so an unguarded call gave every column there an empty default, which the schema diagram prints as
+*Default: '' (empty string)* (#1075).
+
+**An index's column list is a `LATERAL` join, not a subquery inside the aggregate.** RisingWave 3.0.4
+refuses any subquery among an aggregate call's arguments, *subquery inside aggregation calls*, and the
+index CTE used to build each index's column list that way. The `LATERAL` form is the same per-index
+read, and an index over expressions alone still answers NULL, which the provider reads as `[]` (#1075).
+
+**A column carries two type strings.** `type` is `format_type(a.atttypid, NULL)`, the unqualified
+base name: `character varying`, `numeric`, `vector`, `text`, `integer`, `text[]`. `declaredType` is
+`format_type(a.atttypid, a.atttypmod)`, the declaration PostgreSQL itself prints:
+`character varying(50)`, `numeric(12,2)`, `vector(1536)`. `describeObject()` and `describeObjects()`
+select both, from the same `pg_attribute` row, so the two object-model reads agree.
+
+`type` used to be the only string, and NULL was passed on purpose so this surface would match
+`information_schema.columns.data_type`, which is what the deleted flat schema tree showed. That
+reading is gone (#789): the provider no longer implements `getSchema`, and this file does not read
+`information_schema.columns`. The modifier is recorded beside the base name rather than inside it
+(#1860). The diagram, completions and migration DDL read `type` and are unchanged. The agent's
+grounding capture reads `information_schema.columns.data_type`, the same base name, and is unchanged.
+The column tooltip and the object detail show `declaredType`. A column with no modifier is given the
+same string in both fields, so `text`, `integer` and `text[]` render as they did.
+
+One measurement is kept from the deleted flat reading. `app.products.tags` is `text[]`:
+`format_type` answers `text[]` in both fields, while `information_schema.columns.data_type` answered
+the bare word `ARRAY` and put the element type in `information_schema.element_types`. That second
+answer has no reader left.
+
+`OBJECT_DETAIL_SQL` also strips the `AS MATERIALIZED` hints, which is the opposite of what
+[§3.1](#31-materialized-ctes-for-schema-introspection) wants and for the opposite reason. There the
+CTEs are read by several joins over every relation in the database, and materializing once is
+cheap. Here there is one target object, and the hint forbids the planner from pushing `$1`/`$2` into
+the CTEs, so it computes every constraint and every index in the database to answer for one name.
+Measured on the 10-table seed fixture with `EXPLAIN`: total plan cost **3416.66** with the hints
+against **122.99** without, and the gap grows with the database rather than with the object.
+
+**A size nobody could read is dropped, not zeroed.** `listObjects()` selects
+`pg_total_relation_size(c.oid)` without the `COALESCE(..., 0)` the schema query wraps the same call
+in, and does not go through `queryWithMaterializedFallback()`. CockroachDB and Materialize have no
+such builtin and both are reached under the `postgres` type id, so the listing retries with the
+size column REMOVED: the row then carries no `size_bytes` and `DatabaseObject.sizeBytes` is absent,
+which draws no badge. The shared `withoutTotalRelationSizeFn()` would have answered a literal `0`
+instead, and "0 bytes" is a claim about every relation on those servers that nobody measured, which
+is the distinction [§3.1.0](#310-a-row-count-nobody-counted) draws for row counts. Nothing else in
+the listing statement is repairable by that chain anyway: it has no `to_regclass` and no
+`pg_depend`. `listContainers()` does go through the chain,
+because `schemaExclusion()` carries the `pg_depend` ownership test and
+`withoutExtensionOwnershipTest()` drops only a filter.
+
+**A relation with no storage of its own carries no size.**
+The listing reads `pg_total_relation_size(c.oid)` only for a relkind PostgreSQL's `RELKIND_HAS_STORAGE()` names (`r`, `i`, `S`, `t`, `m`), and answers `NULL` for the rest.
+A plain view (`v`) and a partitioned table (`p`) have none: measured on postgres:17.6-alpine, the function answered `0` for a view over a 65536-byte table, and `0` for a partitioned table whose one partition held 65536 bytes.
+`0` is what an empty table measures, so those rows carry no `sizeBytes` and draw no badge, an empty table still carries `0`, and a materialized view keeps its real size (73728 bytes in the same run).
+A foreign table (`f`) has no storage either, and no kind here lists one.
+
+**`path` addresses, `name` labels, and the two are allowed to differ.** `DatabaseObject.path`'s
+last segment is the identifier that is unique WITHIN ITS PARENT, and two kinds here need more than a
+bare name for that:
+
+| Kind | Path | `name` |
+|---|---|---|
+| relation | `["app", "orders"]` | `orders` |
+| routine | `["app", "order_total(integer)"]` | `order_total` |
+| trigger | `["app", "orders", "orders_stamp_updated_at"]` | `orders_stamp_updated_at` |
+
+A routine's segment is the ARGUMENT TYPES and nothing else, because two overloads differ by types
+and never by parameter names: a name in the segment adds nothing to identity, and would change the
+identity when somebody renames a parameter. `pg_get_function_identity_arguments()` is the obvious
+candidate and is deliberately not used, measured on `postgres:18` for the reason above:
+
+| Routine | `pg_get_function_identity_arguments()` | What the path carries |
+|---|---|---|
+| `app.order_total` | `order_total(order_id integer)` | `order_total(integer)` |
+| `app.touch_order` | `touch_order(IN order_id integer)` | `touch_order(integer)` |
+| `app.stamp_updated_at` | `stamp_updated_at()` | `stamp_updated_at()` |
+
+The form used is `oid::regprocedure` minus the schema qualification, which is the point:
+`regprocedure` prepends the schema and the path already carries it, so using it directly would say
+`app` twice. Measured over all 3402 routines in `pg_catalog`, the two agree on 3315; the 87 that
+differ are every case where `regprocedure` double-quotes a RESERVED-WORD routine name
+(`"char"(integer)`, `"position"(text,text)`), and the argument list is identical in all 87. Quoting
+is a fact about SQL text and a path segment is data, so the bare `proname` is the right half of that
+disagreement. Uniqueness was checked rather than assumed: across every schema on that server, no two
+routines share a segment. The `COALESCE` in the expression is load-bearing, because
+`array_to_string` over an empty array answers NULL and a zero-argument routine would otherwise have
+no address at all.
+
+A trigger nests under its table because `attachedTo: 'table'` says it does, and because a trigger
+name is unique per table and not per schema: `[schema, trigger]` gives two triggers on two tables
+one address. The path builder reads this off the ROW - a `parent` column adds a segment, an
+`identity` column replaces the last one - so the three listings share one rule and no code branches
+on a kind id.
+
+**`EXCLUDE` constraints are listed beside the indexes (#1778).** The GiST index that backs an exclusion
+constraint was already listed, but the constraint itself, which is the rule a person is looking for, was
+not. `CTE_EXCLUDE_INFO` reads `pg_constraint` where `contype = 'x'` and takes the definition from
+`pg_get_constraintdef(oid)`, so the text is PostgreSQL's own rendering, `WHERE` predicate included. It is
+joined into both `describeObject()` and `describeObjects()` and surfaces as the optional
+`exclusionConstraints` (`{ name, definition }`) on `ObjectDetail` and `DetailedObject`; a table with none
+carries no key. The desktop tree draws it as a row under the table's columns, marked `EXCLUDE`, and the mobile
+schema list as an "Exclusion constraints" group; both show the definition as text under the name, and as its tooltip. An engine that refuses `pg_constraint` or `pg_get_constraintdef()` is retried with
+the CTE emptied, like `fk_info`, so the list is absent there and every other column still arrives.
+Verified against PostgreSQL through PGlite, and against a PostgreSQL 18.6 server in the explorer, with `EXCLUDE USING gist (table_id WITH =, tsrange(starts_at,
+ends_at, '[)') WITH &&) WHERE (...)`: both reads return the constraint, and a table without one returns none.
+
+**`describeObject()` takes the kind, and branches on it rather than on the name.** Only the kinds
+resolved in `pg_class` have columns, indexes or foreign keys, so a routine and a trigger answer three
+empty lists with no round trip. That was already the OUTPUT before the kind was passed, but by
+accident: the detail statement keys the last path segment against `pg_class.relname`, so
+`order_total(integer)` answered nothing only because no relation is called that, and a trigger named
+`orders` on table `customers` would have been handed `app.orders`'s 23 columns as its own. Path depth
+is derived from the declaration in the same way, two segments plus one where the kind declares
+`attachedTo`. That depth is `containerLevels.length + 1`, read off the declaration rather than
+written as a literal: `2` and `3` are right for a one-level engine and wrong for the five two-level
+ones in this epic, and the segment names in the refusal message come from the same array as the
+depth, so the message and the check cannot disagree.
+
+**`hasColumns` is declared on `table`, `view`, `materialized_view` and `sequence`, and on nothing
+else (#789).** The declaration is not transcribed: it reads `RELKIND_BY_KIND`, the same map
+`describeObject()` gates on, so the twisty the object tree draws and the read that fills it are one
+fact. `function`, `procedure` and `trigger` declare nothing and answer `columns: []` with no round
+trip, which is why they are leaves in the tree. `sequence` is the kind that shows this cannot be read
+off `role`: it is `role: "config"` and it answers `last_value`, `log_cnt` and `is_called` out of
+`pg_attribute`, where Oracle's kind of the same id answers none. An object dropped between the
+listing and the expand does NOT reach the reader as an empty answer here: the detail statement's
+aggregate has no `GROUP BY`, so zero rows means the statement that ran was not the one we wrote, and
+the provider raises `No detail row for <schema>.<name>`.
+
+**Listing order is applied in TypeScript, not with an `ORDER BY`, and sorts by PATH.** Three
+different catalogs answer the three listings, so three `ORDER BY` clauses would be three chances to
+disagree; and a SQL sort runs under the database's own collation, which is `C` on the seeded fixture
+and `en_US.UTF-8` on plenty of real servers, so one schema would come back in two orders on two
+servers. Sorting by path rather than by name matters for the same reason the path exists: two
+overloads share a name, so a name sort leaves their order to whatever the catalog happened to
+answer, and sorting by address also groups one table's triggers together.
+
+**Verified against the seed.** `docker/postgres-init/02-sample-data.sql` creates one instance of
+every declared kind in schema `app`, and the provider was run against it end to end:
+
+```
+containers: [{"path":["app"],...},{"path":["public"],...}]
+counts(app): {"table":{"count":10},"view":{"count":4},"materialized_view":{"count":1},
+              "sequence":{"count":11},"function":{"count":2},"procedure":{"count":1},
+              "trigger":{"count":1}}
+function: 2 -> [[["app","order_total(order_id integer)"],"order_total"],
+               [["app","stamp_updated_at()"],"stamp_updated_at"]]
+trigger: 1 -> [[["app","orders","orders_stamp_updated_at"],"orders_stamp_updated_at"]]
+describe revenue_by_month: cols=2 idx=0 fk=0 first=month:timestamp with time zone
+```
+
+The four views are `customer_lifetime_value`, `daily_sales`, `order_summary` and
+`product_sales_summary`, which are the ones #710 reported the app never showed.
+
+**`describeObjects()` is the bulk column read, and it is `describeObject()` with the target chosen by
+RELKIND instead of by name (#789).** One statement answers every relation of one kind in one schema,
+with its columns, primary key, foreign keys and indexes. The lineage is `SCHEMA_FULL_SQL` ->
+`OBJECT_DETAIL_SQL` -> `bulkDetailSql()`, and it is a reshaping rather than a new statement on
+purpose: those bodies carry which catalog answers which fact and which schemas are excluded, all of
+it measured, and the shared PK, FK and index CTEs bring their fallback repairs with them.
+
+Why it exists at all: `src/lib/agent/tools.ts` read the agent's whole column, index and foreign-key
+grounding through the flat schema reading, and the four methods above cannot answer that. The inventory route
+tried, as one `describeObject` per object, and removed it as an N+1 of up to 5000 sequential round
+trips. Measured here on a 200-table schema: **33 ms for one `describeObjects()` against 4,135 ms for
+200 `describeObject()` calls**, both answering the same 600 columns, 200 indexes and 200 foreign keys.
+
+| Argument | Meaning |
+|----------|---------|
+| `container` | the schema, exactly as `listObjects` takes it |
+| `kind` | the declared kind; a kind with no relation behind it answers `{ details: [] }` with no round trip |
+| `limit` | optional; bounds ONE read, which nothing else in the object surface can do |
+
+Three properties it holds to:
+
+1. **One round trip per container and kind, never per object.** The arguments are a container and a
+   kind, the same pair `listObjects` takes, so a caller's fan-out is bounded by the container-and-kind
+   product it already bounds for listing rather than by a second, differently shaped budget. A list of
+   paths was the alternative and was rejected: it reaches a two-level engine as an IN list over
+   tuples, needs a second one for a kind with mixed path depth, and leaves a caller holding 5000 paths
+   to chunk them itself.
+2. **Keyed by `path`.** Every `ObjectDetail.path` is built by `objectPath()`, the same function
+   `listObjects` builds its paths with, because every caller joins the two answers on path. Never a
+   joined name: `"app.orders"` is what `query-generators.ts` used to split back on `.`.
+3. **It reports its own truncation.** `limit + 1` rows are asked for, so a saturated read is
+   distinguishable from an exact one without a second count; the extra row is dropped and
+   `truncated` carries the caller's own limit with the one sentence every provider reports a
+   caller's bound with, `callerBoundTruncationReason()` in `src/lib/db/object-kinds.ts`. An
+   unbounded call runs without a `LIMIT` clause and can never report truncation. The deleted flat
+   reading's `FILTER (WHERE c.ordinal_position <= 100)` column cap is deliberately NOT carried over,
+   because an unreported bound is the defect this field exists to prevent.
+
+**The `AS MATERIALIZED` hints are stripped here too, and the measurement is the other way round from
+the plan estimate.** `EXPLAIN (ANALYZE)` on `postgres:18` against the seeded `app` schema, ten
+tables: **6.5 ms** stripped against **20.2 ms** with the hints. The plan COST estimate disagrees,
+1301.35 stripped against 1287.54 with them, which is why the decision is recorded from ANALYZE. The
+gap grows with the schema rather than closing, because the hint forbids the planner from pushing
+`$1` into the shared CTEs and it then computes every constraint and index in the database: on a
+200-table schema, **29 ms against 730 ms**. Rebuild that schema with
+
+```sql
+CREATE SCHEMA bulkprobe;
+DO $$ BEGIN FOR i IN 1..200 LOOP EXECUTE format(
+  'CREATE TABLE bulkprobe.t%s (id serial primary key, a text, b int references bulkprobe.t%s(id))',
+  i, greatest(i-1,1)); END LOOP; END $$;
+```
+
+`ORDER BY c.relname` inside the target CTE is what makes a bounded read deterministic, and it is the
+one sort in this file that runs under the SERVER's collation. It decides WHICH objects a bound keeps
+and nothing else: the result is re-sorted by path in TypeScript, segment by segment, and a caller
+joins on path rather than on position.
+
+**Verified against the seed**, `docker/postgres-init/02-sample-data.sql`, on `postgres:18`:
+
+```
+describeObjects(app, table):             10 details, 1 round trip, truncated=undefined
+describeObjects(app, view):              4 details      materialized_view: 1     sequence: 11
+describeObjects(app, function|trigger):  0 details, 0 round trips
+describeObjects(app, table, limit 3):    3 details, truncated={"limit":3,
+                                         "reason":"the bulk column read was bounded at 3 objects by its caller"}
+describeObjects(app, table, limit 10):   10 details, truncated=undefined
+```
+
+Every detail path was found in that kind's own `listObjects()` answer, and every column list matched
+`describeObject()` for the same table column for column.
+
+**The bound is written into the statement, not bound to it.**
+`LIMIT 3`, never `LIMIT $2`, and that is a relative's constraint rather than a style choice.
+Measured 2026-09-22 through `pg` with the same statement three ways: no bound, a literal bound and a
+parameterised one.
+Stock PostgreSQL 17.11 answers all three.
+**RisingWave 3.0.4** answers the first two and refuses the third with *Failed to prepare the statement ...
+expects an integer or expression*, which is the same trait
+[`compatibility.ts`](../../src/lib/db/compatibility.ts) already records for its monitoring reads, where a
+parameterised `LIMIT` is why the slow-query and active-session panels stay empty.
+What is spelled in is the caller's `limit + 1`, which `describeObjects()` has already rejected unless it is a
+positive whole number, so the rendered statement can carry nothing but digits.
+
+That change did not make RisingWave's object browser work on its own, and this paragraph used to name the wrong reason, which is worth keeping rather than quietly replacing.
+Measured against RisingWave 3.0.4 on 2026-09-22, `describeObject()`, `describeObjects()` and `describeObjects(..., 1)` all failed alike with *Failed to bind expression: CAST(NULL AS json)* / *Feature is not yet implemented: unsupported data type: json*, and the paragraph concluded that the gap was the engine's missing `json` type rather than anything this statement chose.
+That was wrong: the engine has every form the statement needs under the `jsonb` name, and the statement chose `json`.
+Two more constraints of the statement's own sat behind it: an index's column list built by a subquery inside an aggregate, which RisingWave refuses, and a default read through `pg_get_expr()` over a missing `pg_attrdef` row, which RisingWave answers with `''`.
+All three are repaired (#1075), and measured again on 2026-09-24 against a live 3.0.4 with tables, a secondary index, a view and a materialized view present: all four reads answer, each with the object's columns and types in the table's own order.
+The bound was never what decided it.
+
+The same four reads were run on the same day against PostgreSQL and every relative in the registry, before and after the change, over one fixture of two tables with a primary key, a foreign key, a unique index, a two-column index, an expression index, a view and a materialized view.
+Each engine answered byte-identically before and after, with key order set aside: PostgreSQL 18.4, TimescaleDB 2.30.1 on PostgreSQL 17.11, OrioleDB beta 16 on PostgreSQL 18.4 (nightly of 2026-08-24), CockroachDB v26.2.5, YugabyteDB 2.25.2.0-b0, Citus 14.1-1 on PostgreSQL 18.4, Apache Cloudberry 2.1.0-incubating, AlloyDB Omni 17.9.0, ParadeDB 0.25.4, Percona Server for PostgreSQL 18.6.1 and Materialize 26.40.0.
+Foreign keys and indexes read as they did wherever the engine has them, and nowhere lost one.
+
+### 3.1.5 Object source (#789)
+
+`readObjectSource(path, kind, limit?)` answers one object's definition text.
+Five of the seven declared kinds have one, and each declares `hasSource: true` with `sourceLanguage: "pgsql"`.
+
+| Kind | Statement | What the text is | `form` | `origin` |
+|---|---|---|---|---|
+| `view` | `pg_get_viewdef(c.oid, false)` over `pg_class` joined to `pg_namespace`, `relkind = 'v'` | the bare `SELECT`, with no `CREATE` around it | `partial` | `regenerated` |
+| `materialized_view` | the same statement with `relkind = 'm'` | the bare `SELECT` | `partial` | `regenerated` |
+| `function` | `pg_get_functiondef(p.oid)` over `pg_proc`, `prokind = 'f'` | a runnable `CREATE OR REPLACE FUNCTION` | `complete` | `regenerated` |
+| `procedure` | the same statement with `prokind = 'p'` | a runnable `CREATE OR REPLACE PROCEDURE` | `complete` | `regenerated` |
+| `trigger` | `pg_get_triggerdef(t.oid, false)` over `pg_trigger` joined to `pg_class` and `pg_namespace`, `NOT tgisinternal` | a runnable `CREATE TRIGGER` | `complete` | `regenerated` |
+
+**`table` and `sequence` declare nothing, and it is the first of the two absences: the engine publishes no such text at all.**
+There is no `pg_get_tabledef` and no `pg_get_sequencedef`, and `pg_catalog.pg_sequences` publishes a sequence's properties (`start_value`, `increment_by`, `cache_size`) rather than any statement.
+A kind an engine cannot answer for is absent from the declaration and is never declared and then refused, so those two rows offer no Source action at all.
+
+**`origin` is `regenerated` on all five, in PostgreSQL's own words.**
+The documentation calls this family's output "a decompiled reconstruction, not the original text of the command", so none of these five is the text anybody typed: a comment, the original whitespace and the original casing are all gone.
+`view` and `materialized_view` are additionally `partial` because `pg_get_viewdef` answers the `SELECT` and nothing else, which is what the reader is told rather than left to discover.
+
+**The pretty flag is `false` on every call.** PostgreSQL documents that "the default format is more likely to be interpreted the same way by future versions of PostgreSQL; so avoid using pretty-printed output for dump purposes", and this text may be submitted back.
+
+**PostgreSQL has NO privilege-driven refusal for object source. This is MEASURED and it is a CANNOT, not an omission.**
+On PostgreSQL 18.4 (Debian 18.4-1.pgdg13+1), a role holding no `USAGE` on schema `app`, no `EXECUTE` and no `SELECT` read the COMPLETE text of `app.order_total(integer)`, `app.order_summary` and `orders_stamp_updated_at`, in the same session where `SELECT app.order_total(1)` was refused with `permission denied for schema app`.
+The `pg_get_*` family applies no privilege check at all.
+That role is `src_probe` in `docker/postgres-init/03-object-fixture.sql` and it is there so the measurement can be re-run rather than believed.
+
+**The consequence is an implementation rule, and it is the reason these statements pass an oid.**
+The two failures that DO exist are name RESOLUTION and ABSENCE.
+`pg_get_viewdef('app.order_summary'::regclass, false)` raises `ERROR: 42501: permission denied for schema app` for that same role, because the `regclass` and `regprocedure` casts resolve the NAME and name resolution needs `USAGE` on the schema.
+So a provider that casts manufactures a refusal the engine never made, on an object the tree has already listed.
+Every statement above joins `pg_namespace` on the schema NAME, which any caller may read, and hands the catalog's own `oid` to the function.
+
+**Absence RAISES; it is never a refusal part.**
+No row, a NULL definition and a whitespace-only definition are one fact here: the catalog holds no such object at that address.
+Measured: `pg_get_viewdef` answers NULL for an oid that is not a view.
+PostgreSQL utters no sentence for that, so a refusal part would carry OUR silence dressed as the server's answer, and an empty part would put an empty editor over a definition nobody read.
+The raise is a `QueryError` naming the object's own segment.
+
+**Two refusal arms exist for a wire-compatible FORK missing a catalog surface, and NEITHER FORK REACHES THEM.**
+This was measured on both forks on 2026-09-13 and the earlier wording here, "so both arms are reachable", was wrong. The arms fire on SQLSTATE `42883` (the function is absent) and `42703` (`pg_proc.prokind` is absent), which are the codes PostgreSQL 18.4 answers and the shapes the suite pins.
+
+| Fork | `pg_get_viewdef` | `pg_get_functiondef` | `pg_proc.prokind` | `pg_get_triggerdef` | What the provider does |
+|---|---|---|---|---|---|
+| CockroachDB v26.2.5 | works | works | present | works | reads the source. Neither refusal arm is needed |
+| Materialize v26.40.0 | works on a plain view, **NULL on a materialized view** | `XX000` | `XX000` | `XX000` | RAISES on all four, because `XX000` is neither of the two codes and a NULL definition is read as an absence |
+
+Re-run it, one container at a time, with the exact statements this file ships:
+
+```
+docker run -d --name <yours> -p <yours>:26257 cockroachdb/cockroach:v26.2.5 start-single-node --insecure --accept-sql-without-tls
+docker run -d --name <yours> -p <yours>:6875 materialize/materialized:v26.40.0
+psql "postgresql://root@127.0.0.1:<yours>/defaultdb?sslmode=disable"     # CockroachDB
+psql "postgresql://materialize@127.0.0.1:<yours>/materialize?sslmode=disable"   # Materialize
+```
+
+then `\set VERBOSITY verbose` and run each statement from `viewSourceSql()`, `SOURCE_ROUTINE_SQL` and `SOURCE_TRIGGER_SQL`.
+
+CockroachDB v26.2.5 answers every one of them, including `pg_get_functiondef` on a `CREATE FUNCTION` and `p.prokind = 'f'`, so nothing there is refused and nothing there is missing.
+
+Materialize v26.40.0 answers `XX000` for each absent surface, verbatim
+`function "pg_catalog.pg_get_functiondef" does not exist` and `column "p.prokind" does not exist`. `XX000` is `internal_error`, not `undefined_function` or `undefined_column`, so `isMissingCatalogSurface()` does not match and the read RAISES rather than answering a refusal part. The SQLSTATE is the server's and not the harness's: in the same session `SELECT 1/0` answers `22012` and `SELEC 1` answers `42601`, while an unknown table answers `XX000` too.
+
+A third Materialize fact, and it is the sharper one: `pg_get_viewdef` returns **NULL** for a `MATERIALIZED VIEW` (`relkind = 'm'`) while returning the definition for a plain view in the same schema. A NULL definition is read here as an absence, so a materialized view that exists is reported as an object the catalog does not hold.
+
+Widening the arms to `XX000` is NOT an obvious fix and is deliberately not done here: `XX000` is Materialize's generic internal error, so keying on it would turn a real internal failure into this object's refusal, which is the exact confusion the refusal-versus-absence rule exists to prevent. That is a code decision, recorded here rather than taken, and this section is the record: the measurement above is the whole of it, re-runnable with the commands beside it.
+Each is reported as the part's `unavailable`, the server's own sentence unprefixed and NOT passed through `mapDatabaseError()`, for the reason the count refusal gives one section up: the mapper's prefix would put this product's words in front of the server's.
+Measured, and it is why the plain spelling is load-bearing rather than cosmetic: `mapDatabaseError()` returns both sentences above unchanged, and puts `Permission denied: ` in front of a refused privilege (`42501`).
+Everything else RAISES, including a transport failure, because nobody answering is not the server answering "no", and "Connection terminated unexpectedly" rendered as this object's own refusal is a symptom presented as a fact about the object.
+
+**No identifier escaper, and that is a property of the statements rather than a decision.**
+All five are fully parameterised: the schema, the object's own segment and, for a trigger, its table are binds, and `prokind` is a bind too.
+No caller-supplied name ever reaches statement text on this engine, which is the reason these are preferred over any `SHOW`-shaped alternative.
+
+**Verified end to end against the seeded `postgres:18`**, through the provider itself, connected as `src_probe`, which holds nothing:
+
+```
+view              app.order_summary                   1 part  partial   regenerated  pgsql  606 chars
+materialized_view app.revenue_by_month                1 part  partial   regenerated  pgsql  161 chars
+function          app.order_total(integer)            1 part  complete  regenerated  pgsql  228 chars
+procedure         app.touch_order(integer)            1 part  complete  regenerated  pgsql  185 chars
+trigger           app.orders.orders_stamp_updated_at  1 part  complete  regenerated  pgsql  119 chars
+limit 30 on the function:  30 chars, truncated={"limit":30,
+                           "reason":"the source read was bounded at 30 characters by its caller"}
+app.no_such_view (view):            raises  PostgreSQL holds no view called "no_such_view" in schema "app"
+app.invoice_number_seq (sequence):  raises  PostgreSQL publishes no definition text for the kind "sequence"
+```
+
+Every object `listObjects()` named under each of the five kinds was then read: 4/4 views, 1/1 materialized view, 2/2 functions, 1/1 procedure, 1/1 trigger, nine of nine, all readable text and no refusal.
+A role holding no privilege of any kind read all nine.
+
+**A routine is read by the identity its own listing wrote.**
+The last path segment of a routine is `proname` plus the argument TYPE list, and the source statement compares the SAME expression, `ROUTINE_IDENTITY_EXPR`, which the listing builds the segment with.
+One writer for both, because two copies are two chances for the read to answer "no such routine" for an object the tree had just listed.
+`pg_get_function_identity_arguments()` is not used, for the reason [§3.1.4](#314-what-the-object-surface-declares-and-which-catalog-answers-for-it) gives: it renders parameter names.
+
+**`pgsql` is a real Monaco language id and is no compromise here.**
+It is among the ids the installed `monaco-editor` 0.57.0 registers, unlike `plsql` and `tsql`, which Oracle and SQL Server have to render under `sql`.
+A PL/pgSQL body inside a `$function$` dollar-quoted string is highlighted as PostgreSQL SQL rather than as a procedural language, which is the closest this bundle can come.
+
+### 3.1.6 Object edit (#789)
+
+Two kinds accept an edited definition back, `function` and `procedure`, and both declare `acceptsSourceEdits: true` on a server that runs the apply's guard.
+That is measured at connect (#1437), because the guard's two `DO` blocks need `PERFORM` and `pg_proc.xmin` and not every server on this type id has them: `probeRoutineGuard` sends `DO $probe$BEGIN PERFORM p.xmin FROM pg_catalog.pg_proc p WHERE false; END$probe$`, reads success or failure only, and is skipped under the read-only profile like the EXPLAIN probe.
+Measured 2026-10-08: PostgreSQL 18.6 answers `DO`; CockroachDB v26.3.2 runs an empty `DO $$ BEGIN END $$` but answers `0A000 at or near ";": syntax error: unimplemented: this syntax` for the probe and `42703 column "p.xmin" does not exist` for the column, so there neither kind declares the field, the Source read carries no `edit`, and a build is refused before anything is sent.
+Before this, CockroachDB was offered Edit and every apply answered that same `0A000` refusal.
+Everything below was measured on PostgreSQL 18.4 (Debian 18.4-1.pgdg13+1) through `pg`, against a container brought up on `docker/postgres-init/`.
+
+**The three kinds that are REFUSED, each with the engine fact behind it, and one that is deferred.**
+A refusal here is a decision with a reason, not a gap somebody has not got to yet.
+
+| Kind | Why it is not editable |
+| --- | --- |
+| `view` | `pg_get_viewdef` returns the bare `SELECT` and NOTHING else: no column alias list, no `WITH CHECK OPTION`, no `security_barrier`. A `CREATE OR REPLACE VIEW` header assembled from it would silently remove a write constraint and a row-security control. |
+| `materialized_view` | The same missing header, and there is no statement to put it in: `CREATE OR REPLACE MATERIALIZED VIEW` is `42601 syntax error at or near "MATERIALIZED"`. Replacing one means `DROP` plus `CREATE`, which ruling 1b forbids on every engine at every scope. |
+| `trigger` | DEFERRED and cheap. `CREATE OR REPLACE TRIGGER` does exist on 18.4, so this is the first kind a later phase adds. The listing join it depends on is unpinned (D64), and that pin is owed with the kind. |
+| `table`, `sequence` | No definition text at all, so there is nothing to edit. PostgreSQL publishes no `pg_get_tabledef` and no `pg_get_sequencedef`, which is the same fact that keeps both out of the Source tab. |
+
+**Strategy: `guarded-atomic-batch`, and it is atomic because the engine makes it so.**
+The whole apply is ONE parameterless `client.query()` carrying four statements, and PostgreSQL wraps a multi-statement simple query in its own implicit transaction.
+Measured: a `DO` block raising `42P13` in front of the CREATE left `pg_proc` untouched, and a failing CREATE after a DROP left the same `oid` and the same `xmin`.
+This provider opens NO transaction of its own, deliberately: `txActive` is one flag per connection id (D72) and a dangling `BEGIN` poisons one pooled client for the whole process (D71), and the implicit transaction already gives this strategy every guarantee it claims.
+
+**The read, and why the oid is passed rather than cast.**
+The build re-reads the object through the same statement the Source tab uses, extended with five columns: `md5(pg_get_functiondef(p.oid))`, `pg_get_userbyid(p.proowner)`, `pg_has_role(current_user, p.proowner, 'USAGE')`, `current_setting('search_path')` and `current_setting('check_function_bodies')`.
+The oid is handed to `pg_get_functiondef` and no `::regprocedure` cast is used, for the reason [§3.1.5](#315-object-source-789) gives and measured again here: the cast resolves a NAME, name resolution needs `USAGE` on the schema, and a provider that casts manufactures a `42501` the engine never made.
+`pg_has_role(current_user, proowner, 'USAGE')` is ONE expression rather than an owner comparison plus a membership query, because a role is a member of itself, so it is true for the owner and for every member of the owning role, which is exactly the population `CREATE OR REPLACE` accepts.
+
+**The ownership pre-flight, answered on the READ.**
+`CREATE OR REPLACE` on somebody else's function is an OWNERSHIP check and not a privilege check.
+Measured with the `src_probe` role that `docker/postgres-init/03-object-fixture.sql` creates, holding `GRANT USAGE` and `GRANT CREATE` on the schema: the read carries `edit: { offered: false }` with the sentence naming the owner, and the build refuses `privilege` before the reader types anything.
+The CONTROL is in the same session: that same role creating a function OF ITS OWN in that same schema succeeds, so the refusal is about ownership and no grant can make the apply work.
+The engine's own sentence is `must be owner of function order_total`, SQLSTATE `42501`, and the shipped error mapper turns it into HTTP 500 because the message matches none of its substrings, which is why this answer is given before a statement is sent.
+
+**A kind that declares an edit with no routine statement is refused on the READ too.**
+The affordance is a routine fact: it reads `may_replace` and `owner`, which only the routine statement selects.
+So the source read raises the build's own sentence, `declares an editable kind "<kind>" but has no statement that reads it`, through the build's own address helper, rather than drawing `offered: false` with "owned by another role" over a declaration drift.
+No shipped declaration reaches it: only `function` and `procedure` declare `acceptsSourceEdits` and both have a routine statement.
+The refusal is raised before the round trip, so it costs no query.
+
+**The five build refusals, in the order they are answered.**
+
+| Class | When | The sentence, or its shape |
+| --- | --- | --- |
+| `guard` | The definition is longer than the Source pane's bound | "this definition is N characters and the Source pane is bounded at 1,000,000 characters, so the text you edited is a truncation of it and submitting it back would delete everything past the bound" |
+| `privilege` | This connection does not own the routine | "this connection's database account does not own \"app.order_total(integer)\", which is owned by \"postgres\", and PostgreSQL checks ownership rather than privilege for CREATE OR REPLACE" |
+| `guard` | `check_function_bodies` is not `on` | "this connection's session has check_function_bodies = off, and PostgreSQL then accepts a body it would otherwise reject, so an apply would report success and store a definition that cannot run" |
+| `definition` | The text is byte-identical to the server's | "this text is identical to the definition on the server" |
+| `identity` | The header changed | "this text declares \"...\" and the object being edited is \"...\", and LibreDB refuses an edited header rather than sending it. CREATE OR REPLACE with a different name or a different argument list creates a SECOND routine and leaves this one untouched, after which every call site fails 42725 is not unique. A changed parameter DEFAULT is rendered inside this same header and PostgreSQL replaces that one in place, so it is refused here as well: make it with a CREATE OR REPLACE of your own in the SQL editor" |
+
+The identity comparison is everything up to and including the parenthesis that CLOSES THE PARAMETER LIST, found by a left-to-right scan that counts nesting and skips single-quoted and double-quoted text, and the comparison itself needs no parser, because both sides are `pg_get_functiondef` output: the reader started from it and the build re-read it, so the question is whether they are the same bytes the engine wrote.
+It read the FIRST `)` until #789 task 31, and that ended the header early for every routine whose header carries a parenthesis before the parameter list closes, after which a change to a LATER parameter was never compared at all.
+SEVEN such shapes were measured on 18.4 by creating the object and reading `pg_get_functiondef` back, re-measured on 2026-09-15 on a `postgres:18` container answering `PostgreSQL 18.4 (Debian 18.4-1.pgdg13+1)` where every one of those renderings and their `md5(pg_get_functiondef(oid))` came back byte for byte, and all of them are ordinary PostgreSQL: a parameter `DEFAULT` holding a call, rendered `DEFAULT abs('-1'::integer)`; a `DEFAULT` holding a `)` and a `DEFAULT` holding a `(` inside a string literal; a quoted function NAME as in `app."we)ird"(a integer, b integer)`; a quoted PARAMETER name as in `app.pn("a)b" integer, c integer)`; and the two mixed-quote shapes `app.mix("a')b" integer, c integer)` and `app.mix2(a text DEFAULT '")'::text, b integer DEFAULT 1)`, which are why the scan tracks both quote kinds and has each ignore the other.
+That numeral is the only count of this population in this document and it is not maintained by hand: `PAREN_HEADER_FIXTURES` in `tests/integration/db/postgres-provider.test.ts` is the population, and a test in that file reads the sentence above out of this file and asserts the word against the array's length, so adding an eighth shape without correcting this paragraph is a RED and not a silent drift.
+One of those shapes is now BUILT by this repository rather than transcribed from a run (D77): `docker/postgres-init/03-object-fixture.sql` creates `app.dl(a text DEFAULT ')', b integer DEFAULT 1)`, and a test in the same file reads that `CREATE` out of the SQL and matches it against these constants, so the object cannot be deleted from the fixture without going red.
+Before it existed, every routine in that fixture had a header whose first `)` was also its last, so the whole scan was a guard over an empty LIVE population and only a driver double could reach the outcome it prevents.
+MEASURED against the rebuilt container on 2026-09-15, driving this provider: `md5(pg_get_functiondef(oid))` answered `0c7937f7060d7bc0c2a583af49227203`, which is the constant the suite carries; the same edit that changes the LATER parameter to `bigint` was refused `identity` with both whole headers in the sentence; and a plan built elsewhere and carrying that fork applied, raised `LB003` from the emitted unit's own post-condition, answered `applied-elsewhere` with `undone: true`, and left ONE `pg_proc` row with `oid` 16782 and `xmin` 837 unmoved, against the control of the same plan without the fork, which answered `applied`.
+A second test in that file refuses any numeral written directly in front of the word `shapes` in this document or in its own, which is the drift the paragraph below carried until 2026-09-15: it stated the count a second time in prose with nothing bound to it, so an eighth shape would have been caught here and left that sentence wrong.
+The shape a reader expects to be the dangerous one is NOT in that population and cannot be: `pg_get_functiondef` renders parameter types through `format_type(t, NULL)` and DROPS the type modifier, so a function declared `(a numeric(10,2), b varchar(9), c char(5), d time(3), e timestamp(3), f decimal(8,4), g interval hour to second(2), h bit(4))` is rendered `(a numeric, b character varying, c character, d time without time zone, e timestamp without time zone, f numeric, g interval, h bit)`, with every parenthesis gone.
+A typmod therefore only ever reaches this comparison from the text the READER submitted.
+It has a limit in EACH direction and both are stated rather than left to be found.
+
+In the FALSE-ACCEPT direction there is no case left on the server's side, and that sentence is an ARGUMENT and not a measurement, said so here because it is a universal claim over every rendering `pg_get_functiondef` can produce and no run enumerates those.
+The argument is that the CURRENT text is always the engine's own rendering and is cut at the right place, so an accept requires the submitted text to cut to exactly those bytes, and any mis-cut of the submitted text produces different bytes and refuses.
+Its one named exception is a shape `pg_get_functiondef` never renders, a dollar-quoted DEFAULT being the one to expect, which is therefore a possible false REFUSE and never a false accept.
+What WAS measured, on 2026-09-15 on the same 18.4 container, is an attack on it: seven renderings outside the measured population above were created and read back, `VARIADIC a integer[]`, a `DEFAULT` holding nested arithmetic parentheses, a `DEFAULT ARRAY[1, 2]`, a function name holding a DOUBLED double quote and a `)`, a `DEFAULT` holding a doubled single quote and a `)`, a pair of `OUT` parameters, and a `RETURNS TABLE(...)` whose parenthesis sits after the header, and the scan cut every one of them to exactly the parameter list's close.
+Seven that did not break it is evidence and not a proof, so the post-condition below is still the control on this one, and it is what caught the case this reading used to let through.
+
+In the FALSE-REFUSE direction: `pg_get_functiondef` renders parameter DEFAULTS inside the header, so a CHANGED DEFAULT is refused as an identity change although PostgreSQL would have replaced the routine in place.
+Measured: `CREATE OR REPLACE FUNCTION app.f_def(a integer DEFAULT 1)` re-created as `DEFAULT 2` left `count(*) = 1` and `oid = 16787` with `xmin` moving 857 to 858, and `pg_get_functiondef` then rendered `DEFAULT 2`.
+The refusal stays, because telling a changed DEFAULT from a changed argument list inside the rendered header needs a parser for the header and this design has none: to a byte comparison they are the same bytes.
+What the refusal does NOT do any more is claim the engine would fork the object, which is a fact that is false for this population.
+Change a default with a `CREATE OR REPLACE` of your own in the SQL editor.
+
+**What #789 task 31 NARROWED, which is a cost this fix accepted rather than a defect.**
+Reading the header to the parameter list's real end means a change to a LATER parameter's `DEFAULT` is now compared too, and it is refused.
+Until that fix it was accepted, and the two halves of that sentence rest on different evidence, so both are named.
+The BUILD accepting it is measured by re-running the replaced reading, `text.indexOf(")")` as `c2437ec1`'s own diff carries it, over the two texts: it cuts both to `CREATE OR REPLACE FUNCTION app.dc(a integer DEFAULT abs('-1'::integer)` and has nothing left to compare.
+The APPLY then performing it follows from the engine measurement below rather than from a run of the old code end to end: the addressed row is rewritten, so the post-condition's `xmin` comparison finds it moved and raises nothing.
+MEASURED on 2026-09-15 on PostgreSQL 18.4 (Debian 18.4-1.pgdg13+1), in ONE database on ONE container, with the shapes above created in the order `PAREN_HEADER_FIXTURES` in `tests/integration/db/postgres-provider.test.ts` holds them plus `app.np()`, then this edit, then the two below: `CREATE OR REPLACE FUNCTION app.dc(a integer DEFAULT abs(-1), b integer DEFAULT 3)` over the `DEFAULT 2` form of the same routine left ONE `pg_proc` row with its `oid` unmoved at 16392 and `xmin` moving 763 to 771, and `pg_get_functiondef` then rendered `b integer DEFAULT 3`, so this is an ordinary in-place replace the engine performs and the apply would have reported `applied`.
+An `oid` is allocated from a counter that is global to the cluster and an `xmin` from one global to the database, so neither numeral reproduces on a differently populated cluster and neither is the claim: the claim is ONE row, the `oid` unmoved and the `xmin` moved, and the numerals are here only so that this measurement and the two below can be read as the one session they are.
+It is refused for the reason above and no other: inside the rendered header a changed DEFAULT and a changed argument list are the same bytes to a byte comparison, and the one is a replace while the other is a silent fork.
+A type modifier the reader types onto a parameter the server renders without one is in that same class: MEASURED in that same database and session, `CREATE OR REPLACE FUNCTION app.tmn(a numeric(10,2), b integer)` over `app.tmn(a numeric, b integer)` left ONE row with its `oid` unmoved at 16400 and `xmin` moving 772 to 773, and `pg_get_functiondef` still rendered `a numeric`, so the engine performs the replace and the typmod never reaches the catalog.
+A parameter RENAME is NOT in that class, and an earlier revision of this paragraph said it was without ever running it.
+MEASURED in that same database and session: `CREATE OR REPLACE FUNCTION app.tmn(zzz numeric(10,2), b integer)` answers `ERROR: cannot change name of input parameter "a"`, SQLSTATE `42P13`, with `HINT: Use DROP FUNCTION app.tmn(numeric,integer) first.`, and leaves the row untouched, one row with its `oid` still 16400 and `xmin` still 773.
+So on a rename this build's refusal costs the reader nothing: PostgreSQL refuses it too, and `CREATE OR REPLACE` in the SQL editor is refused the same way, the engine's only route being `DROP FUNCTION` and a fresh `CREATE`, which drops the routine's grants and its dependents.
+The changed DEFAULT and the reader-typed typmod are refused with the same sentence, which names the SQL editor as the way to make the edit, and that way works for those two.
+For a rename it does not, and no change to this comparison can make it, because the engine and not the build is the one refusing.
+
+The byte-identical case is a refusal and not a no-op apply because an apply that cannot change anything spends a write path, an audit row and a lock on nothing.
+It was documented here as emptying the post-condition's false-positive population, and that claim was MEASURED FALSE and withdrawn: see the post-condition below.
+
+A sixth refusal, `unsupported`, exists for a server that answers no `md5(pg_get_functiondef(oid))` at all.
+A guarded batch with no token to guard on is not this strategy, so it is refused rather than downgraded in silence to an unguarded write.
+
+**The emitted unit, and its three private SQLSTATEs.**
+Four statements in one round trip:
+
+```
+SET LOCAL search_path = "app", pg_catalog;
+DO $lb...$ <the pre-condition block> $lb...$;
+<the reader's text>
+;
+DO $lb...$ <the post-condition block> $lb...$;
+```
+
+The terminator that ends the reader's text is on a LINE OF ITS OWN, and that is a repair rather than a style.
+Until this was fixed the terminator was the first character after the reader's last one, on the same line, and PostgreSQL discards a `--` comment to the end of the line: an edit ending in a line comment, which is how a person ends one, had its terminator swallowed, the post-condition `DO` became part of the CREATE, and the apply answered `syntax error at or near "DO"`, SQLSTATE `42601`, with the reported position inside the text LibreDB added, so the pane placed no marker and told the reader the error was in text they cannot see.
+Measured through this provider on 18.4 with ` -- edited by task 22` appended to `app.order_total(integer)`: `syntax error at or near "DO"` before, `applied` after, with the emitted bytes differing by exactly one newline.
+A trailing terminator of the reader's own is left alone rather than detected: a doubled semicolon is accepted, measured, `SELECT 1;;SELECT 2;` in one parameterless query answers both rows.
+A comment written after the body's closing `$function$` is not part of the definition, so the engine discards it and the next read of the Source tab does not show it; the apply itself succeeds, measured on 18.4 both with the comment on the `$function$` line and on a line of its own after it.
+
+Every interpolated value is dollar-quoted with a randomly tagged delimiter, and there is NO literal escaping anywhere in the apply.
+That is deliberate: a dollar-quoted string ignores every escape, so the statement does not depend on `standard_conforming_strings`, another session GUC a previous borrower of the pooled connection can change and which single-quote doubling would depend on.
+A value that happens to contain its own generated tag is refused rather than emitted.
+
+The pre-condition compares the routine's current `md5(pg_get_functiondef(oid))` against the token the plan carries and raises `LB001` if it moved, then compares `check_function_bodies` against the value read at build and raises `LB002` if that moved, then captures the addressed row's `pg_proc.xmin` into a transaction-local setting.
+The post-condition raises `LB003` when that row's `xmin` is UNCHANGED, which means the CREATE wrote some other row: a fork.
+
+**The post-condition asks whether the addressed ROW was rewritten, and never whether its rendering moved.**
+It compared the md5 until the difference was measured, on the premise that the byte-identical refusal left it no false positives.
+It had one: `pg_get_functiondef` is a CANONICAL rendering, so an edit that differs from the server's bytes and re-renders to the same bytes passes the build.
+Measured through this provider on 18.4, `app.order_total(integer)` re-indented with `sql` upper-cased answered `applied-elsewhere` and was rolled back, a legitimate edit reported as somebody else's object and taken back.
+`xmin` moves on EVERY rewrite of the row including a byte-identical one, which is the same property that makes it a bad revision TOKEN and the right post-condition.
+It is captured inside the apply rather than carried from the build, because a value read at build time is stale by any `GRANT EXECUTE` in between and that would make a real fork invisible.
+Measured after the repair: the same canonicalized edit answers `applied`, and a unit whose text creates a DIFFERENT routine answers `LB003` and leaves `count(*) = 0` for the forked name.
+The setting the capture travels in is transaction-local: a new session answers `unrecognized configuration parameter`, and the same pooled session keeps the name and reads it back as the empty string, so the captured value does not survive the round trip.
+
+Three private codes and not one, because they mean three different outcomes, a `conflict`, a `refused` and an `applied-elsewhere`, and one shared code would force the classifier back onto reading messages.
+All three are in the range PostgreSQL documents for user-defined conditions.
+The classifier maps SQLSTATE as DATA: `LB001` to `conflict`, `LB002` to a `guard` refusal, `LB003` to `applied-elsewhere`, `42501` to `privilege`, and `42601`, `42P13`, `42809` and `42P16` to `definition`.
+One message is read and only one: `tuple concurrently updated` arrives under `XX000`, the catch-all internal-error class, so the code cannot distinguish it from any other internal error and there is nothing else to read. It is consulted only for a code the table does not carry.
+
+**The pinned `search_path`, its cost and its repair.**
+The apply pins `search_path` to the object's own container schema plus `pg_catalog`, and the preview shows the pinned value as a line the reader sees before confirming.
+
+The `SET LOCAL` and the statement MUST travel in ONE round trip, and splitting them fails in silence.
+Measured: `SET LOCAL search_path = app, pg_catalog` sent as its own round trip answers `WARNING: SET LOCAL can only be used in transaction blocks` and the value does not take effect, `SHOW search_path` still reading `"$user", public`; the same `SET LOCAL` in one round trip with the CREATE answers `SET` then `CREATE FUNCTION` with no warning; and the CONTROL, the identical CREATE without the pin, answers `ERROR: relation "t" does not exist`.
+`pg` does not surface that warning as a rejection, so a split pin would leave the apply running under whatever the previous borrower of the pooled connection left, with nothing downstream able to see it.
+A new session reads the default, so the pin does not leak, and the explicit `BEGIN`/`COMMIT` form behaves identically.
+
+Why it is pinned at all: with `check_function_bodies` at its default `on`, a `LANGUAGE plpgsql` body creates under ANY path, while a `LANGUAGE sql` body and a `BEGIN ATOMIC` body are name-resolved at CREATE time and fail under the wrong one.
+A `SET` issued by one Studio user's request is read back by every later request on the same connection id, so without the pin the same edit would succeed or fail depending on who used the connection last.
+
+THE COST, accepted and stated rather than discovered: a previously-working body that reads ANOTHER schema unqualified IS refused by this pin.
+Measured, a function whose body read `other.u` rewritten to read `u` answers `relation "u" does not exist`, `42P01`, pointed at the reader's own line and column.
+`pg_proc.proconfig` is NULL for a function that does not declare its own `SET search_path`, so the value the object was created under is not recoverable from the catalog and there is nothing else to pin to.
+THE REPAIR is either of two things the reader can do: qualify the name, or give the function its own `SET search_path`, which `pg_get_functiondef` then emits and which round trips untouched.
+
+**`check_function_bodies` is asserted and never set.**
+Measured: with it `off`, `CREATE OR REPLACE FUNCTION` over a body naming a table that does not exist answers `CREATE FUNCTION` and a BROKEN FUNCTION IS CREATED AND SUCCESS IS REPORTED.
+`SET LOCAL check_function_bodies = on` in the apply's own round trip refuses the same statement with `ERROR: relation "totally_absent_table" does not exist`.
+It is session-scoped and session state is measured persisting across Studio users on the cached provider, so the population this assertion exists for is reachable by a previous borrower rather than hypothetical.
+The plan reads it at build and the pre-condition compares it at apply; the build refuses outright when it is anything but `on`.
+
+**The revision, and the four candidates that were measured and rejected.**
+The revision is `md5(pg_get_functiondef(oid))`, computed SERVER SIDE, with `check: "guarded"` and `scope: "server"`.
+
+| Candidate | Why not |
+| --- | --- |
+| `xmin` | Moves on a byte-identical replace and on a `GRANT EXECUTE`, so it produces FALSE conflicts. That same property is what makes it the POST-CONDITION above: a revision answers "is the text still the one I read", where a move that changed nothing is a false conflict, and the post-condition answers "was the row I addressed the row that got written", where it is the whole signal. |
+| `ctid` | Moves on a plain `VACUUM FULL` while `xmin` survives. |
+| A frozen row's `xmin` | Reports 1, which is not a version of anything. |
+| `proconfig` | Records nothing about the body at all. |
+
+The md5 of the engine's own rendering did not move on `COMMENT ON` or on `GRANT EXECUTE` and did move on a real body change, on all five measured rows.
+
+**The failure behaviour.**
+A raise anywhere in the round trip rolls the whole thing back.
+A failed apply leaves the routine with the same `oid` and the same `xmin`, so nothing that depends on it, no `GRANT` and no comment, is disturbed.
+That is also what lets `applied-elsewhere` report `undone: true` here: the post-condition detects the fork AND takes it back in the same round trip, which an engine without a transaction cannot do.
+An error carrying no SQLSTATE at all is not a verdict the engine reached: the statement was sent and its answer never arrived, so it is `interrupted` with `committed: "unknown"`, and a client that retried on it would apply twice.
+
+**The apply refuses a pooled client somebody else left in a transaction.**
+Before it sends anything, `applyObjectEdit` reads the borrowed client's ReadyForQuery transaction status, the same server-sent byte `endOpenQueryTransaction()` reads, and refuses with class `guard` when it is anything but `I`.
+No round trip is spent on the check and nothing is sent when it fires.
+Measured through this provider on 18.4: a lone `BEGIN` on the ordinary query path releases its pooled client in status `T`, `pg`'s idle list is LIFO so the next acquire hands back the same client, and before the guard the apply ran inside that foreign transaction and answered `applied` with a `guarded` revision token, while the write was uncommitted; a later `endOpenQueryTransaction()` on the same connection then rolled it away, `xmin` 856 back to 825 and the definition byte-identical to the pre-image.
+Two more measured consequences of that path: the revision handed back was whichever image the re-read's own borrowed client happened to see, and the `SET LOCAL search_path` pin survived into the rest of the foreign transaction, `SHOW search_path` reading `app, pg_catalog`.
+With the guard, the same sequence answers `refused` with class `guard`, `xmin` does not move and `SHOW search_path` reads `"$user", public`; the control, the identical apply on an idle client, still answers `applied` and its write survives the later rollback.
+Neither a rollback nor a retry: rolling the foreign transaction back destroys work this user was never shown, and `POSTGRES_POOL_MAX=1`, which a single-slot PgBouncer also produces, has no other client to retry on.
+
+**The apply re-resolves the editable kind before it sends anything.**
+`applyObjectEdit` calls `requireEditableKind` on the plan's kind against this connection's own capabilities and discards the return, exactly as Redis does, because the apply sends the plan's bytes verbatim and needs nothing off the spec.
+Neither shipped path can reach the refusal: `POST /api/db/objects/edit-apply` asks the same question on the connected provider, and the plan's statement was minted by a `buildObjectEdit` that asked it too.
+The population it closes is a `@libredb/studio` library consumer calling `applyObjectEdit` directly.
+Without it a plan carrying a kind this provider does not declare editable reached the round trip and was refused only afterwards, by the re-read's address derivation, with the wrong sentence and the DDL already sent.
+
+**A position is converted into the reader's own coordinates.**
+PostgreSQL's `position` is a 1-based CHARACTER offset into the text that was SENT, and it arrives from `pg` as a string although `QueryError.position` is typed `number`.
+The plan carries a segment map, so an offset inside the provider's guard block is reported as `outside` rather than as a number, and an offset in the reader's text is converted to the line and column of THEIR text.
+Measured end to end: a syntax error introduced into the body of `app.order_total` answered `position` in the assembled statement and landed on line 6, column 3 of the reader's own text.
+An uncorrected coordinate would not be caught anywhere downstream: Monaco silently CLAMPS an out-of-range marker rather than rejecting it.
+
+**The doubled semicolon.**
+`SELECT 1;;SELECT 2;` in one parameterless query is ACCEPTED and answers both rows, so the terminator after the reader's text is appended unconditionally rather than conditionally on their last character.
+
+**THE READER'S TEXT MUST BE ONE STATEMENT, AND POSTGRESQL IS WHAT COUNTS IT (D76).**
+The emitted unit is one parameterless simple query and PostgreSQL runs every statement in one of those, so a text carrying a second statement after its terminator used to run that statement too.
+The build now refuses such a text, and it does so WITHOUT a splitter of ours: a dollar-quoted body may carry any number of semicolons and a `BEGIN ATOMIC` body carries them by construction, and no reader in `src/lib/sql/` can tell a separator from a character of a definition.
+The question goes to the engine instead.
+The build opens a transaction on a pooled client, poisons it with `SELECT 1/0`, parses the reader's text alone as a NAMED prepared statement, and rolls the transaction back.
+For every text that reaches this check the server performs no parse analysis, no planning and no execution, and its multi-command check still runs because it precedes the aborted-block check in `exec_parse_message`, on the raw grammar parse.
+The probe therefore understands dollar quoting, `BEGIN ATOMIC`, comments and string literals exactly the way the engine does, because it IS the engine.
+
+The aborted block is NOT a universal brake, and the clause above is bounded by the population it was measured over rather than by caution.
+Measured on 18.4 on 2026-09-15, one `BEGIN` plus `SELECT 1/0` plus a named Parse per row, with `pg_prepared_statements` counted after the `ROLLBACK`: `COMMIT`, `ROLLBACK`, `END` and `ABORT` answer no error at all, run, END the block this check opened, and leave one prepared statement behind, because `exec_parse_message` exempts a transaction-exit statement from the aborted-block check.
+An empty, whitespace-only or comment-only text answers `25P02` from Bind rather than from Parse, because the server takes its empty-parse-list branch, so the named statement IS created and survives the `ROLLBACK` on a client that then goes back to the pool.
+Neither class can reach this check, and what keeps them away is the ORDER of the build's refusals rather than the block: `routineIdentityHeader` answers the WHOLE text when it finds no closing parenthesis, so both render a header that is not the addressed routine's and are refused two refusals earlier with no round trip at all.
+So the order is load-bearing and not only the saved round trip the code comment used to give as its whole reason, and the provider's own suite asserts it.
+
+Three things are load-bearing and each one alone would turn the check into an execution: the poison, the NAME on the prepared statement, since `query({ text, values: [] })` with no name takes node-postgres's simple-query path and measured running a rider, and the rollback.
+The probe reads the borrowed client's ReadyForQuery byte first and refuses `guard` when it is anything but `I`, because opening and rolling back a transaction on a client somebody else left inside one destroys work this user was never shown.
+It asks about the SUBMITTED text alone and never about the assembled unit, which is multi-statement by construction.
+It runs at build time only, and the reason is what the apply HOLDS rather than an empty population.
+The plan is sealed and `applyObjectEdit` never sees the reader's text again: what it holds is the assembled unit, which is multi-statement by construction, so this check cannot be run on it at all without refusing every legitimate apply.
+The population that survives is real and it is the same one the entry guard above names, a `@libredb/studio` consumer that builds its own plan: `applyObjectEdit` sends `plan.unit.steps[0].text` verbatim, so a consumer-built plan carrying a rider still RUNS.
+What answers it is the result count below, which REPORTS such a round trip and does not prevent it.
+
+| What the Parse answered | What the build does |
+| --- | --- |
+| `25P02`, the aborted block | the text is one statement, or none, and the build proceeds |
+| `42601` whose message contains `multiple commands` | refused `definition`, naming the addressed routine and pointing the reader at the SQL editor |
+| `42601` with any other message | refused `definition` with the engine's own sentence, its SQLSTATE, and the position converted into the reader's own line and column |
+| anything else, including no error at all | refused `unsupported`, because the count was never established and reading silence as "one statement" is what lets a rider through |
+
+Measured on 18.4 in a container built from this repository's `docker/postgres-init/` on 2026-09-15, with a `pg_proc` count for the probe's own objects answering 0 after every row, so nothing executed in any of them.
+`pg_get_functiondef` output verbatim, the same with a trailing newline or a trailing line comment or a trailing block comment, the same with its trailing `;` removed, a `BEGIN ATOMIC` body of two `SELECT`s, a procedure, and a whitespace-only or comment-only text all answer `25P02`.
+The D76 reproduction, the same rider with no final semicolon, a comment between the `;` and the rider, `; SELECT 1;` and `; COMMIT;` riders, and the rider placed FIRST all answer `42601 cannot insert multiple commands into a prepared statement`.
+`CREATE OR REPLACE FUNCTIN app.x()` answers `42601 syntax error at or near "FUNCTIN"`.
+
+Driven end to end through this provider against the same server on 2026-09-15, which is the control the table needs.
+The D76 reproduction is refused `definition` at build and `count(*)` for the victim routine reads 1 before and 1 after, where the shipped code took it to 0.
+The legitimate edit of `app.order_total(integer)`, whose body carries a semicolon inside `$function$`, builds and applies `applied`.
+A `BEGIN ATOMIC` function whose body is `SELECT 1; SELECT a;` builds and applies `applied`, which is the case a splitter would refuse.
+`RETURNZ numeric` in place of `RETURNS numeric` is refused at build with `syntax error at or near "RETURNZ"`, `42601`, at line 2 column 2 of the reader's own text, which the apply used to be the first thing to report.
+
+**THE APPLY COUNTS WHAT THE ROUND TRIP CARRIED (D76).**
+A simple query answers one result per statement with the engine's own command tag, so the reply already says how many statements ran and no parser is needed to read it.
+Measured on 18.4 through `pg`: the emitted unit answers four results, `[SET, DO, CREATE, DO]`, and the same unit with a rider spliced into the reader's segment answers five, `[SET, DO, CREATE, DROP, DO]`.
+Four held for a reader's text ending in `;`, in a `--` line comment, in a newline and in `$$`, so the doubled semicolon above costs no result of its own.
+An apply that answers anything but four is NOT reported `applied`: it answers `interrupted` with `committed: "unknown"` and a sentence carrying both numbers, because statements ran, this provider cannot say which, and a retry would apply it again.
+That is what makes the `object_edit` audit event's claim as wide as the round trip rather than as wide as the plan.
+Its population is not the rider a reader types, which the build now refuses.
+It is three other things: this provider's own composition, anything between it and the server that rewrites a round trip, and the consumer-built plan the entry guard above names, since `applyObjectEdit` sends `plan.unit.steps[0].text` verbatim and a `@libredb/studio` consumer can put a rider there.
+
+The arm it reports on is `interrupted` with `committed: "unknown"`, and that is a DEVIATION from what `src/lib/db/types.ts` documents that arm as, recorded here rather than left for a reader to hit.
+That arm is written for "the statement was SENT and the engine's answer never arrived", and for a count mismatch the answer DID arrive and the engine DID speak.
+It is used anyway because it is the only arm in the union whose disposition is right: statements ran, this provider cannot say which, the write is not established, and a retry would apply twice.
+`ApplyPreviewDialog` says the same thing on its own second line, "Whether it was applied is unknown: LibreDB has no answer that says whether it landed", which is true of this member; its FIRST line still reads "Whether it reached the server is unknown", which is not.
+Closing that means either a seventh outcome arm or a narrowed sentence in `src/lib/db/types.ts` and in the dialog, and both of those files sit outside this provider, so the residual is filed as D89 in `docs/BACKLOG.md` with the cost of each way out.
+
+**The limit every claim on this page carries (D62).**
+Every PostgreSQL row above is a claim about 18.4.
+This type id also serves CockroachDB and Materialize, and neither was probed for any of it.
+The one exception is whether the guard runs at all, which every server is now asked at connect (#1437, at the top of this section); CockroachDB v26.3.2 answers no, so none of these rows is reached there.
+That is why the classifier answers `definition` with THE ENGINE'S OWN SENTENCE for a code it does not recognise, rather than guessing at a class, and why a server answering no md5 gets an `unsupported` refusal rather than an unguarded write.
+
+**Reproducing all of it.**
+`docker/postgres-init/03-object-fixture.sql` creates the population every claim here needs: `app.over_limit_fn(integer)`, whose definition measured 1,215,122 characters and which the read bound refuses; `app.huge_fn(integer)`, its control at 945,116 characters, which builds; and the two grants that make the ownership refusal non-vacuous.
+
+#### 3.1.6.1 The measured acceptance run (#789)
+
+Everything in this subsection was driven through `POST /api/db/objects/source`, `POST /api/db/objects/edit-plan` and `POST /api/db/objects/edit-apply` against a running Studio, on a container created for the run from `docker/postgres-init/` through the mount.
+The server named itself `PostgreSQL 18.4 (Debian 18.4-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit`.
+The fixture's own numbers on that server: `app.over_limit_fn(integer)` renders 1,215,122 characters, `app.huge_fn(integer)` renders 945,116, and every routine in `app` is owned by `postgres`, so the ownership refusal names `postgres`.
+
+**A FAILED APPLY LEAVES THE ROUTINE BYTE IDENTICAL, and `oid` and `xmin` say so.**
+Byte equality alone cannot tell a rollback from a write that happened to store the same bytes, so `oid`, `xmin` and `md5(pg_get_functiondef(oid))` were read out of band before and after each one.
+FOUR of the five failures below were driven against `app.order_total(integer)`, whose row is `oid = 16763` on a container built from this fixture, and none of the four moved that `oid` or that `xmin` across the apply.
+Read each row for what it actually compares, because two of the five are not "unmoved since the case began":
+
+- In the second-writer case the `xmin` DID move, and a second writer is what moved it: `16763|888` before the case and `16763|889` after the second writer's own `CREATE OR REPLACE`, with the md5 moving with it. What is unmoved there is the state ACROSS THE APPLY, so the comparison is against the row the second writer left and never against the pre-case row. The apply wrote nothing, which is the claim.
+- The last case was driven against a DIFFERENT object at a different row, `app.r19f1_paren(text,integer)`, because the fixture holds nothing that can reach the post-condition. It read `16793|879` before the apply and `16793|879` after it. That `oid` is not stable: the object is created by the probe rather than by the fixture, and two re-runs on the same image read `16789` and then `16793`.
+
+`oid = 16763` for `app.order_total(integer)` is what a container built from this fixture assigns, and it held across every run. The `xmin` counters are not: they advance with every write the container has seen, so read the pairs above as before-and-after of one run rather than as constants.
+
+| What was sent | What the apply answered | The object afterwards |
+| --- | --- | --- |
+| A syntax error in the body | `refused`, `definition`, `syntax error at or near "SELEKT"`, `42601`, at line 6 column 3 of the reader's own text | unchanged |
+| `RETURNS integer` in place of `RETURNS numeric` | `refused`, `definition`, `cannot change return type of existing function`, `42P13`, with the engine's own hint | unchanged |
+| A relation that does not exist under the pinned path | `refused`, `definition`, `relation "no_such_table_t19" does not exist`, `42P01`, at line 6 column 55 | unchanged |
+| A second writer changed the routine between the build and the apply | `conflict`, `object-changed`, carrying the server's CURRENT text for the diff | left as the second writer wrote it, and the apply wrote nothing |
+| A changed argument list past a parameter `DEFAULT` holding a `)` | `applied-elsewhere` with `undone: true` | unchanged, and the second `pg_proc` row the CREATE had made was gone |
+
+The last row is the only case here where the engine ACCEPTED the statement.
+`CREATE OR REPLACE` created a second row, the post-condition saw that the addressed row's `xmin` had not moved, raised `LB003`, and the implicit transaction took the fork back inside the same round trip.
+That object is NOT in the committed fixture: at the time of the run the identity check cut the rendered header at the first `)`, so only a parameter `DEFAULT` holding a `)` inside a string literal let a changed argument list past it, and the fixture has no such object.
+It was created for the run as `CREATE FUNCTION app.<name>(a text DEFAULT 'x)y', b integer DEFAULT 1) RETURNS text LANGUAGE sql AS $b$ SELECT a $b$` and the edit changed `b integer` to `b bigint`.
+Re-measured under the name `app.r19f1_paren` on the same 18.4 image: `edit-plan` built, `edit-apply` answered `applied-elsewhere` with `undone: true`, and `oid|xmin|argument types` read `16793|879|text,integer` both before and after with one row left, so the fork was made and taken back inside the round trip.
+
+THAT PATH IS CLOSED since #789 task 31, and the row above stays because it is what the acceptance run measured rather than what a reader can reproduce today.
+The same edit is now refused at build time as `identity`, with both whole headers in the sentence, so the `applied-elsewhere` outcome recorded here is an outcome the build no longer lets a reader reach through a changed argument list.
+Whether ANY text that passes the identity comparison can still fork the routine was not measured, so the post-condition stays as the second line and `applied-elsewhere` stays in this provider's outcome set: a guard is not removed because nobody could name a case for it.
+What is measured is that the byte-identical re-render, which used to trip this post-condition and is recorded above, no longer does, because the guard compares `xmin` and not the rendering.
+
+**A SUCCESSFUL APPLY COULD DESTROY AN OBJECT THE PLAN NEVER NAMED, and the build now refuses that text (D76).**
+This is what the acceptance run measured against the code as it shipped, and the repair is the single-statement check in 3.1.6 above.
+The reader's text is spliced into the emitted unit as a whole segment of one parameterless simple query, and PostgreSQL runs every statement in such a query, so a text that carried a second statement after its terminator ran that statement too.
+Nothing above the wire looked at the statement count: the build's identity comparison reads the rendered HEADER, and the post-condition asks whether the addressed row was rewritten, which a `CREATE OR REPLACE` followed by a rider answers yes to.
+MEASURED end to end through the two routes on the same 18.4 image: `app.order_total(integer)`'s own definition followed by `;` and `DROP FUNCTION app.r19f1_victim();` built with `consequences: []`, applied at HTTP 200 with a plain `"outcome": "applied"`, and `count(*)` for `app.r19f1_victim` went 1 to 0.
+The bytes ARE in the sealed preview, so the seal held and the user was shown them: in that re-run the step measured 2,473 characters, the reader's own 268-character segment ran from 1,506 to 1,774, and the rider sat at offset 1,741, between a 1,506-character provider prefix and a 699-character provider suffix.
+Those three offsets move with the reader's own text and the prefix's random dollar-quote tags; the prefix and suffix lengths are what the reader has to scroll past either way.
+What was missing was everything above the bytes.
+The plan's consequence model reported nothing lost, no acknowledgement was asked for, and the two `object_edit` audit events named `target: "function:app/order_total(integer):definition"` and carried the string `r19f1_victim` nowhere at all.
+
+WHAT CHANGED, measured on the same engine on 2026-09-15 through this provider.
+The same rider text is now refused at build with class `definition` and SQLSTATE `42601`, no plan is minted, nothing is sent, and the victim routine's `count(*)` reads 1 before the build and 1 after it.
+The control in the same run, the legitimate edit whose body carries a semicolon inside `$function$`, still builds and still applies `applied`, and so does a `BEGIN ATOMIC` routine whose body is two semicolon-separated `SELECT`s.
+The apply additionally asserts that the round trip answered exactly the four results the emitted unit is made of, so an apply that carried more or fewer statements is reported `interrupted` with `committed: "unknown"` rather than `applied`.
+
+WHAT IS STILL NOT GUARDED, stated rather than implied.
+The check is PostgreSQL's own parser reached through the extended query protocol, so it is exactly as good as that server's `exec_parse_message`: this type id also serves CockroachDB and Materialize and neither was probed, and a fork that does not refuse a Parse inside an aborted block is refused `unsupported` rather than trusted.
+The result count says how MANY statements ran, never which, so it detects a round trip that did not match the plan and cannot name what it carried.
+Neither half makes the plan's consequence model wider: a single statement whose own effects reach beyond the addressed routine is still described only by the `consequences: []` the strategy carries.
+
+**A TRUNCATED PART CANNOT BE EDITED, and the two bounds are two different refusals.**
+The read of `app.over_limit_fn(integer)` carries `truncated: { limit: 1000000, ... }` and carries NO `edit` key at all, and 1,000,000 characters of text.
+An edit that grows that text past the bound never reaches the provider: the route answers HTTP 413, `this edit is 1000012 characters and this route carries at most 1000000`.
+An edit that stays inside the route's bound reaches the build, which answers `built: false` with the `guard` class naming the server's own 1,215,122 characters.
+The CONTROL in the same run, `app.huge_fn(integer)`, carries no `truncated`, carries `edit: { offered: true }`, and builds a plan for both texts.
+
+**THE OWNERSHIP PRE-FLIGHT, PRODUCED BY THE ENGINE, in all three of the places it is read.**
+Driven on a second seed connection identical to the first except `user: src_probe`.
+
+- The read answers `edit: { offered: false, reason: "this connection's database account does not own \"app.order_total(integer)\", which is owned by \"postgres\", and PostgreSQL checks ownership rather than privilege for CREATE OR REPLACE" }`, against `edit: { offered: true }` on the owning connection.
+- The Source pane renders that same sentence verbatim and unprefixed, under the `provider-refused` arm and not `not-offered`, and draws no Edit control. The owning connection draws the Edit control and no refusal.
+- The build answers HTTP 200 with `{ built: false, refusal: { refusal: "privilege", ... } }` carrying the same sentence, against `built: true` on the owning connection.
+
+No HTTP 401 and no `Authentication failed` appears anywhere in those transcripts, which is the shipped defect this pre-flight replaces.
+The sentence is LibreDB's and not the engine's, and that is the point of a pre-flight: nothing is sent, so `42501` is never produced.
+The engine's own `must be owner of function order_total` is not reachable through these routes at all, because the plan seal frames `connection.user` into the fingerprint: a plan built on the owning connection and applied on the `src_probe` connection is refused `this preview was built against a different connection` at HTTP 400, before any provider is called.
+
+**THE APPLY LEAVES THE SESSION UNCHANGED, on the same pooled backend.**
+`current_setting('search_path')` read through `POST /api/db/query` answered `"$user", public` on backend pid 957 before a successful apply and `"$user", public` on backend pid 957 after it, and `check_function_bodies` answered `on` both times.
+The transaction-local GUC the pre block writes reads back as the empty string on that same session and its captured value does not survive, so no later apply can read a stale row version.
+
+**THE ONE ROUND TRIP IS LOAD-BEARING, and both halves of that were measured by mutation.**
+The probe edits `app.order_total(integer)` to name `order_items` UNQUALIFIED, so the body resolves only under the pinned `search_path = "app", pg_catalog`.
+At the shipped code that apply answers `applied` and the object is rewritten.
+With the `SET LOCAL` sent as its OWN `client.query()` and the rest as a second one, the same apply answers `refused`, `definition`, `relation "order_items" does not exist`, `42P01`, the object is unchanged, and the server log carries `WARNING: SET LOCAL can only be used in transaction blocks`.
+Nothing in the product's own answer says the pin evaporated: the refusal reads as an ordinary bad edit, which is why splitting them is the failure mode that produces no error at all.
+With `SET LOCAL search_path` changed to a plain `SET search_path`, the apply succeeds and every subsequent read on the same connection id answers `app, pg_catalog` on the apply's own backend, so the next Studio user to borrow that pooled client inherits the pinned path.
+That is D73's leak, and it is why the pin is `SET LOCAL` and why it travels with the statement.
+
+**`check_function_bodies = off` IS A REACHABLE POPULATION and not a hypothetical.**
+Measured on the same server through `pg`: with the GUC at `off`, `CREATE OR REPLACE FUNCTION` over a body naming a table that does not exist answers `CREATE` and A BROKEN FUNCTION IS CREATED WITH SUCCESS REPORTED.
+`SET LOCAL check_function_bodies = on` in the apply's own round trip refuses the same body with `ERROR: relation "totally_absent_table" does not exist`, and the session is still `off` afterwards, so the pin is local and a previous borrower's plain `SET` survives it.
+
+**THE AUDIT, read out of the ring and off stdout.**
+One successful apply added exactly two `object_edit` events under one `correlationId`, the plan's own id: an `action: "PLAN"` decision event with `result: "success"`, and an `action: "guarded-atomic-batch"` outcome event with `result: "success"` and a duration.
+A sentinel planted in the submitted body appears in neither event, in no field, and nowhere in the process's stdout.
+
 ### 3.2 Schema SQL hoisted to module scope
 
-`SCHEMA_FULL_SQL`, `SCHEMA_LIST_SQL`, and `SCHEMA_RELATIONS_SQL` are module-level `const`s, not
-inline template literals inside the methods ([postgres.ts:86–226](../../src/lib/db/providers/sql/postgres.ts)).
+The object surface's statements are module-level `const`s, not inline template literals inside the
+methods ([`postgres.ts`](../../src/lib/db/providers/sql/postgres.ts)).
 This is a **coverage** workaround: `bun`'s coverage instruments the interior lines of a multi-line
 template literal *in a function body* as 0-hit in any test process that imports the file but does
 not exercise that method, and the merged lcov then reports those SQL lines as uncovered. Evaluated
@@ -131,29 +1211,84 @@ once at module load, these consts are reported as covered everywhere. The CTE fr
 (`CTE_TABLES_INFO`, `CTE_COLUMNS_INFO`, …) are also single-sourced and composed into the three
 queries so the shared CTEs aren't duplicated (which would otherwise trip the duplication gate).
 
-### 3.3 Two-phase schema loading
+### 3.3 The two-phase schema load, and why it is gone
 
-The schema tree is loaded in two independent calls so a slow or failing relationship query never
-blocks the table list:
-
-- **`getSchemaList()`** — tables + columns + primary keys + row counts/sizes. Renders the tree
-  immediately. Excludes the expensive FK/index joins; returns `indexes: []`, `foreignKeys: []`.
-- **`getSchemaRelations()`** — foreign keys + indexes only, keyed by table display name, merged
-  into the tree asynchronously by the client.
-
-`getSchema()` remains available as the single-round-trip "everything" query (it replaced an old
-N+1 pattern of `1 + N*4` queries). The two-phase split is the path the UI actually uses (via
-`/api/db/schema/list` and `/api/db/schema/relations`).
+The schema tree used to be loaded in two independent calls, the deleted flat list read for tables, columns and
+primary keys and the deleted flat relations read for foreign keys and indexes, so a slow relationship query
+could not block the table list. Both are deleted with the flat reading (#789). The object browser
+reads counts before names and names before columns, so the cost the split was managing is now bounded
+by what the reader actually opened rather than by a second query.
 
 ### 3.4 Cross-schema display names & FK references
 
 Tables in the `public` schema are shown by bare name; tables in any other schema are prefixed
 (`reporting.invoices`). The same rule is applied to **foreign-key referenced tables**, so a FK that
-points across schemas renders correctly. The FK introspection CTE joins
-`constraint_column_usage` on **both** `constraint_name` and `constraint_schema`
-([postgres.ts:148–150](../../src/lib/db/providers/sql/postgres.ts)) — joining on name alone
-mis-resolves same-named constraints in different schemas (this was a real bug; there is a
-regression test for it).
+points across schemas renders correctly.
+
+### 3.4.0 How keys are read, and why a SELECT-only role sees them
+
+The primary-key and foreign-key CTEs (`CTE_PK_INFO`, `CTE_FK_INFO`, [`postgres.ts`](../../src/lib/db/providers/sql/postgres.ts)) read `pg_constraint` with `pg_attribute`, `contype = 'p'` and `contype = 'f'`, the way `CTE_INDEX_INFO` already reads `pg_index`.
+They used to read `information_schema.table_constraints`, `key_column_usage` and `constraint_column_usage`, and PostgreSQL shows a constraint in the first only to a role that owns the table or holds a privilege on it other than `SELECT`, and in the last only to the owner.
+So a read-only role, the setup this product recommends, saw `isPrimary: false` on every column and `foreignKeys: []`.
+`pg_constraint` answers every role that can see the table, so a `SELECT`-only role now sees the same keys the owner sees.
+
+`conkey` is unnested `WITH ORDINALITY`, which keeps the key in its declared order, and the referenced column is read as `confkey[k.ord::int]`, the referenced column at the same position.
+So each column of a multi-column foreign key names its own referenced column.
+The `constraint_column_usage` join this replaced paired every column of a two-column key with both referenced columns, four entries for two.
+A constraint is reached through `conrelid` and `confrelid`, which are oids, so two same-named constraints in different schemas cannot cross-match either.
+A partition copies its parent's foreign key under the same name, and the name join multiplied those rows too: measured, a foreign key on a partitioned table came back four times, on the parent and on each partition, and now comes back once.
+A role refused `pg_constraint` itself gets that refusal as the error, not a table that seems to have no keys.
+`pk_columns` stays `text[]` through an `attname::text` cast: `array_agg(a.attname)` is `name[]`, OID 1003, which node-postgres does not parse and hands back as the text `{order_id,line_no}` (#1394).
+
+Measured on 2026-10-24 through `describeObject()` and `describeObjects()`, over one fixture: `ref.countries (code)`, `app.customers (id)` with a foreign key into `ref`, `app.order_lines (order_id, line_no)`, and `app.shipments` with a foreign key on `(s_line, s_order)` referencing `app.order_lines (line_no, order_id)`.
+The second role holds `USAGE` on both schemas and `SELECT` on their tables and owns nothing.
+
+| Engine | Role | Keys before | Keys after |
+|---|---|---|---|
+| PostgreSQL 17.6 | owner | every key, the two-column key as four entries | every key, the two-column key as two entries |
+| PostgreSQL 17.6 | `SELECT` only | none | the same as the owner |
+| CockroachDB v26.2.5 | owner | every key, the two-column key as four entries | every key, the two-column key as two entries |
+| CockroachDB v26.2.5 | `SELECT` only | the same as the owner | the same as the owner |
+| YugabyteDB 2026.1.2.0 (PostgreSQL 15.12) | owner | every key, the two-column key as four entries | every key, the two-column key as two entries |
+| YugabyteDB 2026.1.2.0 (PostgreSQL 15.12) | `SELECT` only | none | the same as the owner |
+| RisingWave 3.1.0 | owner | every primary key, after one refused attempt | every primary key, first attempt |
+| RisingWave 3.1.0 | `SELECT` only | none, after one refused attempt | every primary key, first attempt |
+| Materialize v26.44.1 | either | none, after one refused attempt | none, first attempt |
+
+CockroachDB does not apply PostgreSQL's visibility rule to those views, so it was never affected.
+RisingWave refuses foreign keys (`column constraints "REFERENCES ..."` is not yet implemented) and Materialize refuses both kinds, so the fixture there has only what the engine accepts.
+The form of the two reads is what RisingWave 3.1.0 binds: `LATERAL unnest(...)` is refused there with *expected subquery after LATERAL*, so the unnest is written without the keyword PostgreSQL implies anyway, and the ordinal is cast to `int` because *array_access(smallint[], bigint)* does not exist there.
+
+### 3.4.1 The session default container, and why a bare name needs one
+
+`listContainers()` marks `isSessionDefault` from `current_schema()`, which standing ruling 5a2 of
+issue #789 requires of every provider with container levels and this one answered for none.
+
+It is the SERVER'S answer and not the literal `public` written down. Measured on a `postgres:18`
+seeded from `docker/postgres-init/`: a fresh connection reports `search_path` as `"$user", public`
+and `current_schema()` as `public`, and a connection that sets `search_path` moves it.
+
+Without the mark the object browser's flat join had no tie-breaker. §3.4 above drops the `public`
+qualifier and keeps every other one, so the deleted flat reading answered `app.orders` for one table
+and a bare `orders` for another; a bare name is a valid suffix of BOTH addresses, and with no container marked
+as the session's own the shared address rule refused it as ambiguous rather than reading it as the
+schema the connection is actually in. `docker/postgres-init/03-object-fixture.sql` creates
+`public.orders` beside the seeded `app.orders` so that case exists in the fixture rather than in a
+paragraph: it is the only shape that can tell an address that RESOLVES from a name that merely
+happens to be a suffix.
+
+One thing this pairing does NOT yet handle, and it is recorded here rather than fixed: the display
+rule strips `public` unconditionally while the tie-breaker follows `current_schema()`. A connection
+whose `search_path` puts another schema first therefore spells `public.orders` qualified while the
+join prefers that other schema, and a bare name would then be read in the wrong place. Nothing in
+the fixture reaches it, because the seeded connection's default IS `public`.
+
+### 3.4.2 Identifier length: 63 bytes (#1435)
+
+PostgreSQL keeps NAMEDATALEN-1 bytes of an identifier, 63 at the default build, and truncates a longer one with only a NOTICE.
+A Create Table name one byte longer would land under a name nobody typed, so the capabilities declare `maxIdentifierBytes: 63` and the Create Table form refuses a longer table or column name under its field, counting UTF-8 bytes rather than characters.
+It is declared rather than probed at connect: `/api/db/provider-meta` reads capabilities off a provider it never connects, so a measured value would never reach the form.
+The `postgres` type-id is the only one built on `PostgresProvider`, but a wire-compatible relative connected under it (CockroachDB, for one) gets the same limit: where that engine keeps longer names, the form refuses one it would have taken, and never lets one be shortened.
 
 ### 3.5 Resilient monitoring
 
@@ -162,21 +1297,46 @@ Monitoring never hard-fails on a missing optional feature:
   *differently*: `getSlowQueries()` falls back to a `pg_stat_activity` snapshot of
   currently-running queries when the extension isn't installed, whereas `getHealth()`'s lighter
   slow-query block returns a single placeholder row (`pg_stat_statements extension not enabled`).
-- WAL size (`getStorageStats`) and `pg_stat_bgwriter` checkpoint times are superuser/version-gated;
-  failures are swallowed and the field is simply omitted or reported as `N/A`. PostgreSQL 17 moved
-  `checkpoint_write_time`/`checkpoint_sync_time` from `pg_stat_bgwriter` to `pg_stat_checkpointer`,
-  so on 17+ the query throws and `checkpointWriteTime` is `"N/A"` — measured 2026-08-23 through this
-  provider against `postgres:18`. It is never `"0.0s"` for an unread counter.
+- WAL size (`getStorageStats`) is superuser-gated; a failure is swallowed and the field is simply omitted.
+- Checkpoint times come from whichever view carries them.
+  PostgreSQL 17 moved `checkpoint_write_time`/`checkpoint_sync_time` from `pg_stat_bgwriter` to `pg_stat_checkpointer` as `write_time`/`sync_time`, so `getPerformanceMetrics()` first asks `to_regclass('pg_catalog.pg_stat_checkpointer')` and reads that view when it exists, `pg_stat_bgwriter` otherwise.
+  It asks for the view rather than the version number because a wire-compatible fork need not report one in step with the other.
+  Before #825 the provider always read the old columns, so every 17+ server answered `"N/A"` and logged `column "checkpoint_write_time" does not exist` on each monitoring refresh.
+  Measured 2026-09-14 through this provider against `postgres` 14.24, 15.19, 16.15, 17.11 and 18.4: all five report a reading, and none logs an error.
+  A server with no `to_regclass()` (Materialize), or a view the role cannot read, reports `"N/A"`, never `"0.0s"` for an unread counter.
 - A metric the statistics views did not publish is **omitted rather than defaulted**
   ([§7.1](#71-when-the-cache-hit-ratio-is-not-measurable)); `deadlocks` is absent when
   `pg_stat_database` has no row for the database, rather than reported as zero deadlocks.
+- `getHealth()` isolates each of its five queries in its own try/catch
+  ([postgres.ts](../../src/lib/db/providers/sql/postgres.ts)). This matters beyond the
+  `pg_stat_statements` case above: an engine with no pg statistics catalog at all (Materialize,
+  RisingWave, #38680) rejects `pg_stat_activity` and `pg_statio_user_tables` outright, not just the
+  one optional extension. `activeConnections` is omitted (`undefined`), `databaseSize` and
+  `cacheHitRatio` report `"N/A"`/`CACHE_HIT_RATIO_UNAVAILABLE`, and `activeSessions` is `[]` — the
+  dashboard degrades panel-by-panel instead of the whole health check throwing.
+- The same isolation extends to `getOverview()`, `getPerformanceMetrics()`, `getSlowQueries()` and
+  `getActiveSessions()` (#38680) — these are the four "core" reads `getMonitoringData()`
+  (`base-provider.ts`) requires at least one of to succeed before it renders a dashboard at all; on
+  an engine with no statistics catalog every one of them used to reject in full (each ran several
+  unguarded queries in sequence), so the **entire Monitoring page** showed a connection-error
+  screen even though `getHealth()`'s own badge degraded fine. `getOverview()`'s single `version() +
+  pg_postmaster_start_time()` query is now two queries (`OVERVIEW_VERSION_SQL` /
+  `OVERVIEW_UPTIME_SQL`), because a single `SELECT` fails whole-row if any one column's function is
+  missing — version() alone still answers on Materialize even though uptime does not.
+  `getSlowQueries()`'s existing `pg_stat_statements` → `pg_stat_activity` fallback now has a second
+  layer: if `pg_stat_activity` is *also* absent, it returns `[]` instead of propagating that second
+  rejection.
 
 ### 3.6 Safe maintenance targets
 
-`qualifyMaintenanceTarget()` ([postgres.ts:751](../../src/lib/db/providers/sql/postgres.ts)) quotes
-maintenance targets through `escapeIdentifier()`: a bare name defaults to the `public` schema; a
-`schema.table` target is quoted per-part. This prevents identifier injection in `VACUUM`/`ANALYZE`/
-`REINDEX` statements (which cannot use bind parameters for object names).
+`qualifyMaintenanceTarget(target, container)` ([`postgres.ts`](../../src/lib/db/providers/sql/postgres.ts))
+quotes maintenance targets through `escapeIdentifier()`. A caller that passes a `container` (the
+`schemaName` the table row already carries) gets that schema, quoted whole, prefixed to the quoted
+table name: the schema is never recovered by splitting the name, because a schema is allowed to
+contain a dot and the split would land on the wrong side. Without a container the older readings
+stay, so a bare name defaults to the `public` schema and a `schema.table` target is quoted per-part.
+This prevents identifier injection in `VACUUM`/`ANALYZE`/`REINDEX` statements (which cannot use
+bind parameters for object names).
 
 ---
 
@@ -184,12 +1344,14 @@ maintenance targets through `escapeIdentifier()`: a bare name defaults to the `p
 
 ### 4.1 Configuration
 
-Two forms are accepted (`validate()`, [postgres.ts:264](../../src/lib/db/providers/sql/postgres.ts)).
-`validate()` requires `host` **and** `database` only when no `connectionString` is given — it does
-**not** reject supplying both. If both are present the **connection string wins**: `buildPoolConfig()`
-uses it and ignores the discrete fields.
+Two forms are accepted (`validate()`, [`postgres.ts`](../../src/lib/db/providers/sql/postgres.ts)).
+`validate()` requires `host` only when no `connectionString` is given — it does **not** reject
+supplying both. If both are present the **connection string wins**: `buildPoolConfig()` uses it and
+ignores the discrete fields. `database` is optional: a discrete-field connection without one is a
+server-level connection ([§4.1.1](#411-server-level-connections-an-empty-database-1530)).
 
-**Discrete fields** — `host` and `database` are both required (when no connection string):
+**Discrete fields** — `host` is required (when no connection string), and `database` pins the
+connection to one database:
 
 ```ts
 const connection = {
@@ -200,7 +1362,9 @@ const connection = {
 };
 ```
 
-**Connection string** — bypasses the host/database requirement:
+**Connection string** — bypasses the host requirement. A string naming no database lands where
+libpq puts it (the database named after the user), exactly as before; it never turns on
+server-level mode:
 
 ```ts
 const connection = {
@@ -209,6 +1373,36 @@ const connection = {
   createdAt: new Date(),
 };
 ```
+
+### 4.1.1 Server-level connections: an empty `database` (#1530)
+
+A discrete-field connection with an empty `database` reaches the whole server; a connection that
+names one, and every connection string, behaves exactly as before.
+
+- **Its own session** opens `postgres`, or `template1` when the first answers `3D000`, `42501` or
+  `28000` (`connectTemplate1()`). It lists the databases and runs nothing else.
+- **Only databases the role can CONNECT to are listed**: `datallowconn AND NOT datistemplate AND
+  has_database_privilege(oid, 'CONNECT')`. A requested name is checked with the same filter before a
+  session opens, and refused with `DatabaseConfigError` (400) otherwise.
+- **Each database is reached through `forCatalog(name)`**: an ordinary single-database provider,
+  opened on first use, inheriting everything but the database (tunnel, credentials, SSL, statement
+  timeout, read-only profile), owned and closed by this provider.
+- **At most 5 sessions, each with a `{ min: 0, max: 3 }` pool.** A sixth closes the idle one used
+  least recently; one holding a transaction, a statement or a borrowed client, or handed out in the
+  last 30 s, is never closed. All five busy answers `PoolExhaustedError` (503).
+- **The connection itself refuses** `query()`, `queryReadOnly()`, `beginTransaction()` and every
+  maintenance operation but `kill` until a database is named; the API names it in a `catalog`
+  field ([`API_DOCS.md`](../API_DOCS.md)), which every route resolves through `editorProvider()`
+  ([`editor-provider.ts`](../../src/lib/api/editor-provider.ts)). `cancelQuery()` finds the statement in whichever session
+  runs it.
+- **The object tree chooses the database** in the workspace: activating a database, a schema, a folder
+  or an object inside one makes that database the active one, and its row is drawn in bold
+  (`aria-current`).
+  The editor, transactions and the agent run there.
+  While a transaction is open it stays put, and activating another database says so instead of switching.
+  There is no separate database select beside the tree.
+  The monitoring page and the operations panel have no tree, so they offer a Database select that reads
+  and writes the same remembered choice; a refused or empty database list is shown there as an error.
 
 #### `sslmode` in a pasted URL
 
@@ -245,7 +1439,7 @@ server. Paste the certificate content instead.
 
 ### 4.2 Connection pooling
 
-`connect()` builds a `pg.Pool` ([postgres.ts:281](../../src/lib/db/providers/sql/postgres.ts)) and
+`connect()` builds a `pg.Pool` ([`postgres.ts`](../../src/lib/db/providers/sql/postgres.ts)) and
 validates it by acquiring and releasing one client. Pool **sizing** comes from `ProviderOptions.pool`
 merged over `DEFAULT_POOL_CONFIG`:
 
@@ -259,8 +1453,11 @@ merged over `DEFAULT_POOL_CONFIG`:
 The statement timeout is **separate** from pool config: `ProviderOptions.queryTimeout` (default
 `DEFAULT_QUERY_TIMEOUT` = 60000 ms) is applied as the pool's `statement_timeout`.
 
+On a server-level connection that pool is the maintenance database's, and each database it reads
+has a small pool of its own ([§4.1.1](#411-server-level-connections-an-empty-database-1530)).
+
 `connect()` is idempotent (a second call while a pool exists is a no-op). `getPoolStats()` exposes
-live `{ total, idle, active, waiting }` counts. Every query acquires a client from the pool and
+live `{ total, max, idle, active, waiting }` counts: `total` is the clients open right now and `max` is the configured pool ceiling, which the Monitoring > Pool tab shows as its own number and uses as the utilization denominator. Every query acquires a client from the pool and
 releases it in a `finally` block.
 
 #### Idle-client failures are handled, not fatal
@@ -284,7 +1481,7 @@ oracledb expose no pool-level `error` event at all, which is recorded at each pr
 
 ### 4.3 SSL
 
-`buildSSLConfig()` ([postgres.ts:342](../../src/lib/db/providers/sql/postgres.ts)) resolves SSL with
+`buildSSLConfig()` ([`postgres.ts`](../../src/lib/db/providers/sql/postgres.ts)) resolves SSL with
 this precedence:
 
 1. **Explicit `connection.ssl`** (`SSLConfig`, mode = `disable` | `require` | `verify-system` |
@@ -302,28 +1499,112 @@ this precedence:
 3. **`options.ssl === false`** → no SSL.
 4. Otherwise `undefined` (driver default).
 
+### Connection string
+
+The scheme shown for PostgreSQL is `postgres://`, and the parser also accepts `postgresql://`.
+Its row in `CONNECTION_STRING` is declared in [`postgres-connection-string.ts`](../../src/lib/db/providers/sql/postgres-connection-string.ts).
+Its `readTls` reads `sslmode` first, and the boolean `ssl` only when no `sslmode` is present: a string carrying both said the specific thing on purpose.
+`sslmode` maps libpq's `disable`, `require`, `verify-ca` and `verify-full`, and leaves `prefer` and `allow` unmapped: they mean "encrypt if the server offers it", which no SSL mode describes.
+`verify-system` is not in that table either, since it is this form's own mode name and not a libpq one.
+`ssl=true` maps to `verify-system` and `ssl=false` to `disable`, by the boolean rule (D26) in `src/lib/db/connection-string/shared.ts`.
+`sslrootcert`, `sslcert` and `sslkey` are read by nobody on purpose: they name files on the machine that wrote the string, and the server that opens the connection cannot read that path.
+It runs no seed load check.
+
+### Execution UI
+
+The rolled-back notice names `COMMIT` as the keyword that keeps an open transaction, and `postgres` has no consent deadline, so the agent's consent card shows no deadline chip or sentence for it.
+Its row in `EXECUTION_UI` is declared in [`postgres-execution-ui.ts`](../../src/lib/db/providers/sql/postgres-execution-ui.ts).
+
 ---
 
 ## 5. Query interface
 
 ### 5.1 Execution
 
-`query(sql, params?, queryId?)` ([postgres.ts:378](../../src/lib/db/providers/sql/postgres.ts))
+`query(sql, params?, queryId?)` ([`postgres.ts`](../../src/lib/db/providers/sql/postgres.ts))
 acquires a pooled client, optionally records its backend PID for cancellation, runs the
 (optionally parameterized — `$1`, `$2`, …) statement, and returns the standard envelope:
 
 ```ts
-{ rows, fields: string[], rowCount, executionTime, columnTypes? }
+{ rows, fields: string[], rowCount, executionTime, columnTypes?, warnings?, resultSets? }
 ```
 
+#### Result columns: every column keeps its own value
+
+`query()`, `queryInTransaction()` and `queryReadOnly()` ask `pg` for array rows (`rowMode: "array"`), name the columns with `uniqueFieldNames` ([result-fields.ts](../../src/lib/db/utils/result-fields.ts)) and key each row by those names by position.
+`pg`'s object rows key a value by its column's name and keep the last of two columns that share one, so before this a repeated name lost a value with no error.
+`rowMode` changes the row's shape and nothing else: the pool's type parsers (§5.5) read every value as before.
+`columnTypes` is keyed by the same names.
+A row whose value count is not the column count raises a `QueryError` rather than being read.
+
+Measured on PostgreSQL 16 through `pg` 8.23.1 on 2026-10-07, before and after:
+
+| Statement | Before | After |
+|---|---|---|
+| `SELECT 1 AS a, 2 AS a` | fields `["a","a"]`, row `{"a":2}` | fields `["a","a (2)"]`, row `{"a":1,"a (2)":2}` |
+| `SELECT 1, 2` (unnamed columns, which PostgreSQL calls `?column?`) | fields `["?column?","?column?"]`, row `{"?column?":2}` | fields `["?column?","?column? (2)"]`, row `{"?column?":1,"?column? (2)":2}` |
+| `SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id` | fields `["id","customer_id","item","id","name"]`, the customer's id under both `id` headers, the order's id gone | fields `["id","customer_id","item","id (2)","name"]`, the order's id under `id` and the customer's under `id (2)` |
+
+PostgreSQL never answers an empty column name: an unaliased expression is named by the server (`?column?`, `count`, `now`), so an unnamed column is only ever a repeated one here.
+
+A text of several statements sent as one simple query (`SELECT 1 AS a; SELECT 2 AS b, 3 AS b`) answers one result per statement.
+`rows`, `fields` and `columnTypes` are the first result set's, `rowCount` is the count of the statement that produced it (or of the first statement when none produced one), and `resultSets` lists every set when there are several; a statement that answers no column (an INSERT, a COMMIT, or a `SELECT` of no columns) is not a set.
+Measured the same day, that text answers `rows` `[{"a":1}]` and two `resultSets`, the second with fields `["b","b (2)"]`.
+Before, such a text answered no `rows` at all, because the list of answers was read as one answer.
+
+A statement whose command tag carries no count (an `EXPLAIN`, a `SHOW`) has its `rowCount` answered from the rows it returned, because `pg` reads the count from the tag alone and leaves it null while `rows` holds the answer; a count the driver did read, including a real 0, keeps its own value (#1839).
+
+#### Server notices (#1401)
+
+The NOTICE and WARNING messages the server sends while a statement that SUCCEEDS runs come back in
+`warnings`, one entry per notice: `message` is the server's primary message line, `code` its
+SQLSTATE and `severity` its level as the server spells it (`NOTICE`, `WARNING`, `INFO`), which may
+be localized by the server's `lc_messages`. A notice's DETAIL and HINT fields are not carried. The
+results panel shows them beside the result, `NOTICE: ...` the way `psql` prints it; a statement the
+server sent none for has no `warnings` key at all. `queryInTransaction()` reports them the same way.
+
+A statement that FAILS reports only its error: notices it raised before the error are dropped.
+
+At most 100 notices are kept per statement. A `RAISE NOTICE` in a loop can send millions, and each
+kept one is held in memory and drawn as a line of the results panel, so the rest are only counted and
+the list ends with one entry saying how many were not shown (`5 more notices not shown`).
+
+`pg` only emits a notice as an event on the client that received it, so the pool builds its clients
+from a subclass that keeps each client's notices, and a statement takes what arrived on its own
+client between its start and its answer. What a client held before the statement (its startup
+greeting, the cancel-PID read) is dropped first, and a client returned to the pool drops what it
+held, so one statement's notice never surfaces on another's result.
+
+On the PostgreSQL-wire relatives these are often the only sign a statement did not do what it
+looks like. Measured on 2026-10-04:
+
+| Engine | Statement | Notice |
+| --- | --- | --- |
+| PostgreSQL 18 | `DO $$BEGIN RAISE NOTICE 'n'; RAISE WARNING 'w'; END$$` | `NOTICE 00000 n`, `WARNING 01000 w` |
+| PostgreSQL 18 | `DROP TABLE IF EXISTS nope` | `NOTICE 00000 table "nope" does not exist, skipping` |
+| Apache Cloudberry 2.1.0 | `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ...` | `WARNING referential integrity (FOREIGN KEY) constraints are not supported in Apache Cloudberry, will not be enforced` |
+| RisingWave | `BEGIN` (typed in the editor) | `NOTICE 00000 ... no transaction is actually started` |
+
+Notices the server sends while a connection OPENS are read once, by `connect()`, and returned by
+`connectWarnings()`; Test Connection shows them as a caution instead of "Connected successfully",
+and the first save asks for a second click, as a degraded connection does. Materialize is the case:
+it opens a session on a database that does not exist and reports only `NOTICE MZ004 session
+database "nosuchdb" does not exist`. Startup notices of SQLSTATE class `00` (successful completion)
+are left out, because Materialize greets every session with one (`connected to Materialize ...`).
+
+The agent's read-only path (`queryReadOnly()`, section 12) and the internal catalog and monitoring
+reads do not report notices.
+
 Native `pg` errors are normalised through `mapDatabaseError()` into the shared
-[`errors.ts`](../../src/lib/db/errors.ts) classes (syntax → `QueryError`, auth → `AuthenticationError`,
-timeout → `TimeoutError`, etc.).
+[`errors.ts`](../../src/lib/db/errors.ts) classes (syntax → `QueryError`, a missing privilege → `PermissionDeniedError`,
+a refused credential → `AuthenticationError`, timeout → `TimeoutError`, etc.). A PostgreSQL `statement_timeout` or `lock_timeout` is a timeout even
+though the engine reports it as `canceling statement due to …`, so since #1145 it maps to `TimeoutError`;
+only an operator cancel (`pg_cancel_backend`, `due to user request`) stays a `QueryCancelledError`.
 
 ### 5.2 Automatic `LIMIT` injection
 
 `prepareQuery()` (inherited from `SQLBaseProvider`) protects the UI from runaway result sets. It
-runs the query through `analyzeQuery()` ([query-limiter.ts:88](../../src/lib/db/utils/query-limiter.ts))
+runs the query through `analyzeQuery()` ([`query-limiter.ts`](../../src/lib/db/utils/query-limiter.ts))
 and, **only for `SELECT`/CTE-`SELECT` queries that don't already have a `LIMIT`**, appends one via
 `applyQueryLimit()`:
 
@@ -331,6 +1612,12 @@ and, **only for `SELECT`/CTE-`SELECT` queries that don't already have a `LIMIT`*
 - "Unlimited" mode caps at `MAX_UNLIMITED_ROWS = 100000`.
 - Existing `LIMIT` / `FETCH FIRST … ROWS ONLY` / `TOP n` / `ROWNUM` is detected and respected
   (not double-limited).
+- **`LIMIT ALL` — PostgreSQL's own "no limit" spelling — is the statement's own bound**: the
+  SELECT page documents `LIMIT { count | ALL }`, so nothing is appended over it (#1926). The
+  word is declared on this dialect's grammar (`nonNumericRowBounds`), the same route
+  Snowflake's `NULL` took (SF-021); the parser takes `ALL` for the `LIMIT` count only, and a
+  `FETCH FIRST ALL ROWS ONLY` stays PostgreSQL's own refusal, just no longer a second
+  `LIMIT`'s.
 - Non-`SELECT` statements (INSERT/UPDATE/DELETE/DDL) are returned unchanged.
 - The statement type is read from its first keyword that is neither whitespace nor a **comment**
   ([`leading-keyword.ts`](../../src/lib/sql/leading-keyword.ts)), so `-- note`, `/* note */` and
@@ -339,7 +1626,7 @@ and, **only for `SELECT`/CTE-`SELECT` queries that don't already have a `LIMIT`*
   annotated `SELECT` classified as an unknown statement type and returned **every** row while the
   UI badge reported it as not limited (#275).
 - The statement's characters are read under **PostgreSQL's** grammar, which the provider passes down
-  from its own `type` ([`grammar.ts`](../../src/lib/sql/grammar.ts)). PostgreSQL has exactly two
+  from its own `type` ([`postgres-sql-grammar.ts`](../../src/lib/db/providers/sql/postgres-sql-grammar.ts)). PostgreSQL has exactly two
   comment forms, `--` and `/* … */`; `#` is an operator character (`#>` and `#>>` walk a jsonb path,
   `#-` deletes one, `##` is geometric, `#` is integer XOR). The shared reader used to approximate
   that with "a comment unless the next character makes an operator", which kept everyday jsonb queries
@@ -382,6 +1669,11 @@ and, **only for `SELECT`/CTE-`SELECT` queries that don't already have a `LIMIT`*
   set (#287). Undeterminable CTE shapes are likewise not bounded — an over-large read can be re-run,
   a partly committed write cannot. Asserted at the shared seam in `tests/unit/db/sql-base.test.ts`,
   since the behaviour is `SQLBaseProvider`'s for every SQL provider.
+- A `SELECT` over a data-modifying CTE body (`WITH d AS (DELETE … RETURNING *) SELECT * FROM d`) is not bounded either, so no next page is offered.
+  The body runs exactly once and always to completion whatever the outer `SELECT` reads (manual 7.8.4); bounded, the statement was pageable and every next page re-ran the `DELETE`, measured on PostgreSQL 17.6 as 1000 more rows gone per page.
+  CockroachDB documents the same, and its `UPSERT … RETURNING` body is not bounded either.
+  A read-only body over a table named like a write (`delete_queue`) keeps its bound.
+  Pinned in `tests/integration/db/postgres-provider.test.ts`.
 - The clause is inserted at the end of the **statement** as
   [`statement-end.ts`](../../src/lib/sql/statement-end.ts) delimits it — before any trailing comment
   and before the terminating `;`, both re-attached verbatim — and the already-limited probes read the
@@ -413,17 +1705,50 @@ comment-led final `SELECT`; it now reads `isSelectQuery()` from the same classif
 
 ### 5.3 Query cancellation
 
-A query issued with a `queryId` records its backend PID in a `Map`. `cancelQuery(queryId)`
-([postgres.ts:412](../../src/lib/db/providers/sql/postgres.ts)) looks the PID up and calls
-`pg_cancel_backend(pid)` on a fresh pooled client, returning whether the cancel signalled. Exposed
-via `POST /api/db/cancel`.
+A query issued with a `queryId` records its backend PID and its pooled client in a `Map`.
+`cancelQuery(queryId)` ([`postgres.ts`](../../src/lib/db/providers/sql/postgres.ts)) looks the run up
+and calls `pg_cancel_backend(pid)` on a fresh pooled client, returning true when the cancel
+signalled. Exposed via `POST /api/db/cancel`.
+
+Three engines this provider connects to do not honour `pg_cancel_backend`, measured on 2026-10-03
+and 2026-10-04: CockroachDB v26.3.2 answers `unknown function: pg_cancel_backend()`, Materialize
+26.44.1 refuses it with a bound parameter (`pg_cancel_backend in this position not yet supported`),
+and RisingWave 3.1.0 answers `f`. Each kept running the statement, and before #1364 that was the end
+of the cancel. Where `pg_cancel_backend` is refused or answers false, `cancelQuery` now sends the
+wire protocol's own CancelRequest for the run's session
+([`pg-wire-cancel.ts`](../../src/lib/db/providers/sql/pg-wire-cancel.ts)): a fresh connection to the
+address the client connected to (a tunnel's local end when there is one), carrying the process id and
+secret key the server handed that session at startup. CockroachDB v26.3.2 ended `SELECT
+pg_sleep(20)` on it within a second, and RisingWave's wire-protocol cancel was seen to work in the
+same test pass; Materialize was not measured with it.
+
+The server never answers a CancelRequest, so `cancelQuery` answers true only once the run has ended,
+within 3 s of sending it; a run still going after that is false, and the editor says the cancel was
+not confirmed.
+
+**Encrypted wherever the session is.** When the connection uses TLS (any SSL mode but `disable`), the
+cancel connection sends an SSLRequest first, upgrades with the same TLS options and server name the
+session itself used, and only then sends the CancelRequest, as `pg`'s own cancel and libpq since
+PostgreSQL 17 do. A server that answers the SSLRequest with `N` gets nothing, since the session was
+configured to require TLS, and a certificate the session's settings do not trust gets nothing either;
+both are reported as not confirmed. A connection without TLS sends the request in plaintext, as the
+session itself goes. Behind an SNI-routing proxy (a managed service that routes on the TLS server
+name), only the encrypted request can reach the session at all, which is one more reason it is not
+sent in clear. Measured 2026-10-04: over TLS the request stopped `SELECT pg_sleep(20)` about 1.5 s
+into the run on PostgreSQL 18.6 (`ssl=on`) and on CockroachDB v26.3.2 in secure mode alike.
+
+**A window of one round trip remains.** The request is sent only while the run still holds its
+session, checked once the cancel socket is open, because a released session can already be running
+another request's statement. The check narrows the race to the request's own flight time and cannot
+close it: a statement that ends while the 16 bytes travel leaves the key on a session the pool may
+have handed on. That window is inherent to the protocol's cancel, the same one `psql`'s Ctrl+C has.
 
 ### 5.4 Declared column types
 
 `pg` says exactly one thing about a column's type: `field.dataTypeID`, a `pg_type` OID. There is no
 name on the wire, and no value-shaped guess can supply one — `numeric` arrives as the **string**
 `"4.99"` so that its precision survives, `bigint` arrives as a string for the same reason, and a
-`timestamp` is a string by the time the browser has read the JSON. Measured against the local
+`timestamp` arrives as the engine's own text (§5.5). Measured against the local
 dvdrental before this existed, `SELECT rental_rate, last_update, film_id FROM film` exported as
 `("rental_rate" TEXT, "last_update" TIMESTAMP, "film_id" BIGINT)`: a `numeric` typed as text, and an
 `integer` widened. Guessing from the string's SHAPE is not the answer either — it would type a text
@@ -464,30 +1789,151 @@ paths do it: `query()`, `queryInTransaction()` and the agent's `queryReadOnly()`
 | >= 16384 | *absent* |
 
 The names are the base type's, without the type modifier: `character varying`, not
-`character varying(40)`. That is what `information_schema.columns.data_type` — the same source the
-schema tree shows — answers for the same column, and the modifier is not on the wire in a form worth
-reconstructing. `columnTypes` is consumed by the results grid's column labels, by the SQL-DDL export
-(which prefers a declared type over its value-shaped guess) and by the agent's state summary.
+`character varying(40)`. The modifier is not on the wire in a form worth reconstructing. This is
+`QueryResult.columnTypes`, the result grid's column labels. The schema tree's `type` is the same
+base name, and the modifier a person needs there is `declaredType` on the object detail
+([§3.1.4](#314-what-the-object-surface-declares-and-which-catalog-answers-for-it)). `columnTypes` is
+consumed by the results grid's column labels, by the SQL-DDL export (which prefers a declared type
+over its value-shaped guess) and by the agent's state summary.
+
+### 5.5 The types read as the engine's text
+
+The pool carries its own type parsers (`POOL_TYPE_PARSERS` in [`postgres.ts`](../../src/lib/db/providers/sql/postgres.ts)), passed as the `types` option in `buildPoolConfig()`, so the structured form and a pasted connection string both get them.
+These types arrive as the engine's own text, which is the form PostgreSQL's own input function reads back:
+
+| Type | Arrives as | Why not `pg-types`' form |
+|---|---|---|
+| `date`, `timestamp`, and their arrays | `'2026-09-01'`, `'2026-09-01 10:30:00'` | a `Date` at the Node process's local midnight, which moved the value with the TZ (below) |
+| `timestamptz`, `timestamptz[]` — the two infinities only | `'infinity'`, `'-infinity'` | the number `Infinity`, which no `Date` holds and `JSON.stringify` writes as `null` |
+| `interval`, `interval[]` | `'1 day 02:00:00'`, `'-3 years'` | `{days: 1, hours: 2}` (`postgres-interval`, zero parts dropped) |
+| `point`, `point[]`, `circle` | `'(1,2)'`, `'<(1,2),3>'` | `{x, y}` and `{x, y, radius}` |
+| `json`, `jsonb` — the top-level `null` document only | `'null'` | JavaScript `null`, which nothing can tell from a SQL NULL |
+
+`lseg`, `box`, `path`, `polygon`, `line`, and every geometric array but `point[]`, have no `pg-types` parser at all, so they were already the engine's text and are delegated to it untouched.
+`time` and `timetz` were already its text too, and are unchanged.
+Every other type is what `pg-types` makes of it.
+
+`date`, `date[]`, `timestamp` (without time zone) and `timestamp[]` arrive as the engine's own text, `'2026-09-01'` and `'2026-09-01 10:30:00'`, whatever the TZ of the Node process.
+`timestamptz` and `timestamptz[]` still arrive as a JavaScript `Date`, which is an instant, so the JSON the routes answer with carries its ISO UTC form, `'2026-09-01T10:30:00.000Z'`, in every TZ.
+Their two infinities are the exception and arrive as the engine's text, `'infinity'` and `'-infinity'`, alone and as array elements: `pg-types` reads them as the number `Infinity`, which no `Date` holds and `JSON.stringify` writes as `null`, so measured 2026-10-04 on PostgreSQL 18.6 a stored `'-infinity'::timestamptz` reached the grid as NULL.
+`time` and `timetz` were already the engine's text and are unchanged.
+Every other type is what `pg-types` makes of it.
+
+The text is the server's rendering, so it follows the session's `DateStyle`; the default `ISO, MDY` gives the forms above, and `'infinity'` and `'0044-03-15 BC'` come through as written.
+
+Before this, `pg-types` built a `date` as a `Date` at local midnight of the Node process and read a `timestamp` as local wall-clock time, and the row was then serialised as ISO UTC.
+The published image runs in UTC, which hid it; `npx @libredb/studio` on a machine east or west of UTC did not.
+Measured 2026-09-27 on `postgres:18-alpine` through `PostgresProvider`, for `DATE '2026-09-01'` and `TIMESTAMP '2026-09-01 10:30:00'`:
+
+| process TZ | `date` before | `timestamp` before | `date` after | `timestamp` after |
+|---|---|---|---|---|
+| UTC | `2026-09-01T00:00:00.000Z` | `2026-09-01T10:30:00.000Z` | `2026-09-01` | `2026-09-01 10:30:00` |
+| Europe/Istanbul | `2026-08-31T21:00:00.000Z` | `2026-09-01T07:30:00.000Z` | `2026-09-01` | `2026-09-01 10:30:00` |
+| America/Los_Angeles | `2026-09-01T07:00:00.000Z` | `2026-09-01T17:30:00.000Z` | `2026-09-01` | `2026-09-01 10:30:00` |
+
+Under Europe/Istanbul the SQL INSERT export of that row, replayed into a copy of the table, stored `2026-08-31` and `07:30:00` before and the original values after.
+`'infinity'::date` used to arrive as `Infinity` and leave as `null`, and `DATE '0044-03-15 BC'` moved by the zone's local mean time offset.
+`timestamptz` answered `2026-09-01T10:30:00.000Z` under all three zones, before and after.
+
+`interval`, `point` and `circle` were objects for the same reason: `pg-types` parses each into one, and the grid, Copy and every export then carried that shape, so a replayed export did not store the same interval.
+Measured 2026-10-04 on PostgreSQL 18.6 through this provider:
+
+| Value | psql | grid before | grid after |
+|---|---|---|---|
+| `'1 day 2 hours'::interval` | `1 day 02:00:00` | `{"days":1,"hours":2}` | `1 day 02:00:00` |
+| `'-3 years'::interval` | `-3 years` | `{"years":-3}` | `-3 years` |
+| `point(1,2)` | `(1,2)` | `{"x":1,"y":2}` | `(1,2)` |
+| `'<(1,2),3>'::circle` | `<(1,2),3>` | `{"x":1,"y":2,"radius":3}` | `<(1,2),3>` |
+| `ARRAY['1 day'::interval, NULL]` | `{1 day,NULL}` | `[{"days":1},null]` | `["1 day",null]` |
+
+A `json`/`jsonb` document keeps the parse `pg-types` gives it, with the top-level `null` as the one exception: its parse is JavaScript `null`, so the grid drew it as the same italic NULL a SQL NULL gets and the export wrote it as `NULL`, which made the document into a SQL NULL on replay.
+Measured on the same server, `SELECT 'null'::json, NULL::json` showed two identical italic NULL cells before and `null` beside an italic NULL after, which is what psql shows.
+A `json[]`/`jsonb[]` element is unaffected: `pg` parses each one, a `null` element included.
+The document `"null"` — the JSON *string* — reaches a row as the same four characters, because `pg-types` already parsed it to the JavaScript string `null` before this change; the two are told apart by the column's declared type, not by the value.
+
+A round trip over a table of `interval`, `point`, `circle`, `interval[]`, `point[]`, `json` and `jsonb`, exported as SQL INSERT and replayed into a `CREATE TABLE … (LIKE src)` copy, measured `SELECT src::text FROM src EXCEPT SELECT copy::text FROM copy` at **zero** rows, the `null` document included — the one cell [§5.7](#57-what-the-sql-insert-and-ddl-exports-write) used to record as unable to survive the export.
+
+The parsers are per pool on purpose: `pg.types.setTypeParser` is process-wide, and a host that embeds `@libredb/studio` has its own `pg` users.
+Only the text format is intercepted, since the binary one has no text to return.
+An in-process consumer of the library surface now receives strings, not `Date`, `postgres-interval` or `{x, y}` objects, for the types in the table above.
+Every relative that goes through `PostgresProvider` (the `via: "postgres"` entries in [`compatibility.ts`](../../src/lib/db/compatibility.ts)) shares the change, so RisingWave intervals are text too.
+
+### 5.6 NaN and the float infinities
+
+`real` and `double precision` (and their arrays) are still whatever `pg-types` makes of them, a JavaScript number, so `'NaN'`, `'Infinity'` and `'-Infinity'` arrive as `NaN`, `Infinity` and `-Infinity`.
+JSON has no form for those three, and the routes, the agent's row rendering, the MCP serializer and the exports write each as the string `"NaN"`, `"Infinity"` or `"-Infinity"` rather than the `null` `JSON.stringify` would make of it ([`src/lib/non-finite.ts`](../../src/lib/non-finite.ts), [`API_DOCS.md`](../API_DOCS.md#post-apidbquery)).
+`numeric` was already the engine's text, `'NaN'` and `'Infinity'` included.
+
+Measured 2026-10-04 on PostgreSQL 18.6, `SELECT 'NaN'::float8, 'Infinity'::real, '-Infinity'::float8` answered `null` in all three cells of `POST /api/db/query` before and `"NaN"`, `"Infinity"`, `"-Infinity"` after, while psql shows `NaN | Infinity | -Infinity`.
+The SQL INSERT export writes them as quoted literals, `'NaN'`, which PostgreSQL reads back into a `real`, `double precision` or `timestamptz` column, so a replayed file stores the same values where it used to store NULL.
+
+### 5.7 What the SQL INSERT and DDL exports write
+
+The result export reads each cell's declared type ([§5.4](#54-declared-column-types)) for the values whose generic form PostgreSQL refuses (#1386, [`postgres-typed-literals.ts`](../../src/lib/db/providers/sql/postgres-typed-literals.ts)):
+
+| Declared | Arrives as | Written as |
+|---|---|---|
+| any `…[]` | a JS array, nested per dimension | `'{"1","2",NULL}'`, every element double-quoted and backslash-escaped; a `json`/`jsonb` element is written as JSON, so an array stays one document and a string keeps its quotes (`pg` `JSON.parse`s each element, so the document `"hello"` arrives as `hello`) |
+| `interval`, `point`, `circle` | the engine's text ([§5.5](#55-the-types-read-as-the-engines-text)) | that text, quoted, by the generic writer |
+
+An `interval` or a geometric value that reaches the export as an object — `{days: 1, hours: 2}`, `{x, y}`, `{x, y, radius}` — is still written as `'1 days 2 hours'`, `'(1,2)'` and `'<(1,2),3>'` (`{}` is `'0 seconds'`), which is the form a host that embeds the library surface with its own `pg` pool and `pg-types`' defaults hands over.
+
+An array or an object in a `json`/`jsonb` column, or in a result with no declared type, is still the quoted JSON text.
+The DDL keeps an array type (`integer[]`) instead of writing `TEXT`, and writes a bare `bit` as `bit varying` (and `bit[]` as `bit varying[]`), because `pg` returns a bit string such as `1010` that `bit(1)` refuses.
+
+Measured 2026-10-04 on PostgreSQL 18.6: a `SELECT *` over a table with `integer[]`, two-dimensional `integer[]`, `text[]` holding quotes, commas, braces, backslashes and the word `NULL`, `boolean[]`, `jsonb[]`, `timestamptz[]`, `interval`, `point`, `bit(4)`, `varbit`, `money`, `inet`, `int4range` and the scalar types was exported and replayed with `psql`, once into a `CREATE TABLE … (LIKE src)` copy and once into the exported DDL's own table, and `SELECT s::text FROM src s EXCEPT SELECT c::text FROM copy c` answered one row.
+That row differed in one cell that never reached the export as itself, the JSON document `null` in a `json` column; it now arrives as its text and replays as the document, so the same comparison answers no rows ([§5.5](#55-the-types-read-as-the-engines-text)).
+Before this, the same file stopped at its first row with `ERROR: malformed array literal: "[1,2,3]"`.
+
+### 5.8 The confirmation gate
+
+The editor's confirmation gate asks before the shared destructive keywords, `MERGE` among them ([query-optimization.md](../editor/query-optimization.md#destructive-statement-confirmation)).
+On this dialect it also asks before a `DO` block, whatever the block does: the block's code is a literal, `$$ ... $$` or `'...'`, which the gate does not read.
+The grammar row's `confirmCodeForms` names `DO` followed by a body and `DO LANGUAGE` ([`postgres-sql-grammar.ts`](../../src/lib/db/providers/sql/postgres-sql-grammar.ts)), so the `DO` of `INSERT ... ON CONFLICT DO NOTHING` and of `CREATE RULE ... DO INSTEAD`, which a word follows, does not ask.
+`explainExecutesWithAnalyze` is set, because `EXPLAIN ANALYZE` (and `EXPLAIN (ANALYZE, …)`) runs the explained statement: the gate strips the option and asks about what remains when `ANALYZE` is on. A plain `EXPLAIN` only plans, and so does `ANALYZE` set to a boolean false (`false`, `off`, `no`, `0` and their accepted prefixes) or to an integer literal of value 0 (`0x0`, `0b0`, `0o0`, `0_0`). A nonzero literal (`0x1`, `0b1`, `0o1`, `0_1`) executes, so it asks.
+CockroachDB shares this type id and this grammar.
 
 ---
 
+### 5.9 SQL grammar
+
+How this engine's statement text is read is declared once, in [`src/lib/db/providers/sql/postgres-sql-grammar.ts`](../../src/lib/db/providers/sql/postgres-sql-grammar.ts), the `postgres` row of the SQL grammar registry in `src/lib/db/sql-grammar/`.
+Its grammar is `POSTGRES_GRAMMAR`, the one reading the statement splitter, the row limiter, the confirmation gate and query-event redaction share, so they cannot disagree about where a literal or a comment ends.
+`#` is an operator character (`#>`, `#>>` and `#-` walk or delete a jsonb path), and the only comment forms are `--` and the block form.
+Block comments nest, per the PostgreSQL manual (4.1.5 Comments, checked 2026-08-05).
+`[...]` is a subscript and array constructors nest (manual 4.2.3 and 4.2.12), established from the manual because the undeterminable reading prompted on `ARRAY[[1,2],[3,4]]` and `j['a]b']`, everyday reads in this dialect.
+`//` is code on 18, and the most explicit of the refusals: `SELECT 1 // 2` is "operator does not exist: integer // integer", so `//` is an operator name here.
+The row bound goes before Materialize's `AS OF [AT LEAST] <t>`, which shares this type id (E2E pass of 2026-10-03/04, #1398): `SELECT * FROM ui_mv AS OF AT LEAST 0` with the bound appended is `Expected end of statement, found LIMIT`, and with the bound before the clause it returns rows.
+Completion quotes a catalog name by PostgreSQL's `quote_ident` rule, with the keyword set taken from PostgreSQL 18's `kwlist.h`: a name stays bare only when it is lower case and not a keyword other than an unreserved one, and a qualifier written in double quotes before the dot is read back with its doubled quotes undone.
+Only PostgreSQL completions introduce quoted table names; every other dialect quotes through the connection's capabilities.
+`explainExecutesWithAnalyze` is `true`: `EXPLAIN ANALYZE` executes, and the confirmation gate reads the explained statement ([§5.8](#58-the-confirmation-gate)).
+`readsSqlText` is `true`: the editor text is SQL, and the provider extends `SQLBaseProvider`.
+Redaction is `sql` with `"` as its name quote: a redacted statement keeps its words and every name in that quote, and every literal becomes `?`.
+
 ## 6. Schema introspection
 
-Three queries, one set of shared `MATERIALIZED` CTEs:
-
-| Method | SQL const | Returns | Used by |
-|--------|-----------|---------|---------|
-| `getSchema()` | `SCHEMA_FULL_SQL` | tables + columns + PKs + FKs + indexes (one round-trip) | direct/full loads |
-| `getSchemaList()` | `SCHEMA_LIST_SQL` | tables + columns + PKs (fast, no FK/index) | `/api/db/schema/list` |
-| `getSchemaRelations()` | `SCHEMA_RELATIONS_SQL` | FKs + indexes keyed by table | `/api/db/schema/relations` |
+One surface, the object surface ([§3.1.4](#314-what-the-object-surface-declares-and-which-catalog-answers-for-it)): `listContainers()`,
+`countObjects()`, `listObjects()`, `describeObject()` and `describeObjects()`, over one set of shared
+`MATERIALIZED` CTEs.
 
 Common behaviour:
-- System schemas (`pg_catalog`, `information_schema`, `pg_toast`) are excluded; only `BASE TABLE`s.
-- Row counts come from `pg_class.reltuples` (planner estimate, fast) and are clamped to ≥ 0
-  (`reltuples` is `-1` on never-analyzed tables).
-- Column lists are capped at the first 100 columns (`ordinal_position <= 100`).
+- System schemas (`pg_catalog`, `information_schema`, `pg_toast`) are excluded, by ownership rather
+  than by name where an extension owns the schema.
+- Row counts come from `pg_class.reltuples` (planner estimate, fast); `-1` means never analysed and
+  is reported as no count rather than as zero.
+- Column lists are NOT capped, and a bulk read that a caller bounded says so in `truncated`.
 - Sizes use `pg_total_relation_size` formatted by `formatBytes()`.
 - Display names follow the public/qualified rule from [§3.4](#34-cross-schema-display-names--fk-references).
+
+Five more methods answer the container-aware object model (#789) and are documented in [§3.1.4](#314-what-the-object-surface-declares-and-which-catalog-answers-for-it):
+
+| Method | SQL const | Returns |
+|--------|-----------|---------|
+| `listContainers()` | `CONTAINERS_SQL` | the schemas, through the same exclusion set as the three above, with the session's own marked from `current_schema()`; on a server-level connection the databases first, then one database's schemas ([§3.1.4](#314-what-the-object-surface-declares-and-which-catalog-answers-for-it)) |
+| `countObjects(container)` | `COUNTS_SQL` | one `KindCount` per declared kind, seeded at `{ count: 0 }` |
+| `listObjects(container, kind)` | `LIST_RELATIONS_SQL[kind]`, `LIST_ROUTINES_SQL`, `LIST_TRIGGERS_SQL` | names, plus `reltuples` and size for relations |
+| `describeObject(path, kind)` | `OBJECT_DETAIL_SQL` | columns, indexes, foreign keys and `EXCLUDE` constraints for one object; the KIND decides whether there is a relation to read, so nothing infers it from the name |
+| `describeObjects(container, kind, limit?)` | `BULK_DETAIL_SQL[kind]`, `BULK_DETAIL_SQL_BOUNDED[kind]` | the same five aggregates for EVERY object of that kind in that container, in one round trip, keyed by path, with `truncated` when the caller's `limit` bit |
 
 ---
 
@@ -499,17 +1945,71 @@ base) fans these out in parallel.
 | Method | Primary source | Notes |
 |--------|----------------|-------|
 | `getHealth()` | `pg_stat_activity`, `pg_database_size`, `pg_statio_user_tables`, `pg_stat_statements` | connections, size, cache-hit % (`N/A` when unmeasurable — [§7.1](#71-when-the-cache-hit-ratio-is-not-measurable)), top-5 slow queries (single placeholder row if the extension is absent), 10 sessions |
-| `getOverview()` | `version()`, `pg_postmaster_start_time()`, `pg_settings`, `pg_database_size`, `pg_tables`/`pg_indexes` | version, uptime, conns, max_conns, size, table/index counts |
-| `getPerformanceMetrics()` | `pg_statio_user_tables`, `pg_stat_database`, `pg_stat_bgwriter` | cache-hit % (omitted when unmeasurable), deadlocks, checkpoint write time (gated, `N/A`); **no buffer-pool %** — see [§7.1](#71-when-the-cache-hit-ratio-is-not-measurable) |
+| `getOverview()` | `version()`, `pg_postmaster_start_time()`, `pg_settings`, `pg_database_size`, `information_schema.tables`/`pg_indexes` | version, uptime, conns, max_conns, size, table/index counts |
+| `getPerformanceMetrics()` | `pg_statio_user_tables`, `pg_stat_database`, `pg_stat_checkpointer` (17+) or `pg_stat_bgwriter` | cache-hit % (omitted when unmeasurable), deadlocks, checkpoint write time (`N/A` when unreadable); **no buffer-pool %** — see [§7.1](#71-when-the-cache-hit-ratio-is-not-measurable) |
 | `getSlowQueries()` | `pg_stat_statements` → fallback `pg_stat_activity` | detailed per-statement stats; fallback shows live active queries |
 | `getActiveSessions()` | `pg_stat_activity` | pid, user, state, query, wait events, duration; excludes own backend |
-| `getTableStats()` | `pg_stat_user_tables` + size functions | live/dead tuples, sizes, last (auto)vacuum/analyze, bloat ratio |
+| `getTableStats()` | `pg_stat_user_tables` + `pg_table_size`/`pg_indexes_size`/`pg_total_relation_size`, each on `relid`; `pg_class` when that view answers no rows (#1540) | live/dead tuples, sizes (absent per function the engine refuses, [§3.1.2](#312-two-kinds-of-absence-and-why-neither-is-an-empty-array)), last (auto)vacuum/analyze, bloat ratio |
 | `getIndexStats()` | `pg_stat_user_indexes`, `pg_index`, `pg_am` | type, columns, unique/primary, size, scan count, usage ratio |
 | `getStorageStats()` | `pg_tablespace`, WAL functions | per-tablespace size; WAL size (superuser-gated, swallowed if denied) |
 | `getPgStatActivity()` | `pg_stat_activity` | raw passthrough for advanced views |
 
 `getTableStats()` / `getIndexStats()` accept an optional `{ schema }` filter; with none they cover
 all user schemas.
+
+**On a server-level connection every panel is one database's**: the monitoring routes take a
+`catalog` and read through that database's session. Read on the connection itself, as Test
+Connection does, they name its own database (`monitoredDatabase()`), never the empty string.
+
+**Every catalog name list is read as `text[]` (#1394).** node-postgres parses no array of
+`information_schema.sql_identifier` or of `name`, so `array_agg(kcu.column_name)` and
+`array_agg(a.attname)` reached the provider as the text `{id}`. On the key read that turned
+`includes()` into a substring test: measured on PostgreSQL 18.6, a table keyed on `id` showed its
+columns `i` and `d` as keys too in the tree, the ERD and Docs. On the index statistics read the
+array guard turned every index's column list into `[]`. Both aggregates now cast each name to
+`text`, the key list in `ordinal_position` order, and a key list that still arrives as anything
+but an array marks no column. The index lists inside the `jsonb` object reads were never
+affected: `jsonb_build_object` serialises the array itself.
+
+**Database size is absent, never zeroed, when it is not measured.** `getOverview()` sizes the
+database with `pg_database_size($1)` and reads the byte figure only, the shape `mssql.ts` uses:
+`databaseSize` is `formatBytes()` over that number, so no `pg_size_pretty()` column is selected. A
+missing result row, or a row without `database_size_bytes`, is no measurement at all, so
+`databaseSizeBytes` is omitted and `databaseSize` stays `"N/A"`. A returned SQL `NULL` is a measured
+zero and is still published as `0`/`"0 B"`, which is the shared helper's contract rather than a
+state this engine produces: `pg_database_size()` is a function, not an aggregate, and measured on
+PostgreSQL 18 a freshly created database answers 7774735 bytes, never `NULL` and never zero. MySQL's
+`SUM()` over an empty schema is where that null row is real.
+
+**The table rows come from whichever catalog on this server has them (#1540).** `getTableStats()`
+reads `pg_stat_user_tables` first, the one catalog that can answer every column, and falls back to
+`pg_class` only when that view answers **no rows**. That is CockroachDB's shape: measured
+2026-10-05 on v26.3.2, `pg_stat_user_tables` and `pg_stat_all_tables` both carry zero rows while
+`pg_class` holds the user's tables, so Monitoring > Tables and Storage listed nothing and the
+Admin > Operations table list went with them, which put every per-table maintenance action out of
+reach — the supported `ANALYZE <table>` of #1387 among them. The fallback answers three rows there
+now, with the names and nothing else: `reltuples`, `pg_table_size()`, `pg_indexes_size()` and
+`pg_total_relation_size()` all answer `NULL` for a table CockroachDB has, so every figure is
+absent rather than zero. `pg_class` publishes no tuple counts at all, so `liveRowCount`,
+`deadRowCount` and `bloatRatio` are omitted rather than reported as 0, and `rowCount` goes with
+them. It is `reltuples`, which CockroachDB answers `NULL` and PostgreSQL itself answers **-1** for
+a table nothing has analysed yet, and `estimatedRowCount()` reads both as no estimate — the same
+distinction [§3.1.0](#310-a-row-count-nobody-counted) draws on the object surface, now on the
+statistics path too. A genuine `0` is still kept, because an empty table is a measurement. Until
+`TableStats.rowCount` became optional a `?? 0` filled it, and Monitoring > Tables summed those
+zeros into a "0 rows" total while Admin > Operations printed "0 rows" against every table.
+
+The order is what makes this safe without asking which engine answered: an engine that fills the
+view never reaches the second read. On PostgreSQL the fallback is reached only by a schema that
+really has no tables, where it answers nothing either and costs one round trip.
+
+**The table sizes are read the same way (#1436).** `getTableStats()` selects the three byte figures
+only and spells each with `formatBytes()`, so it selects no `pg_size_pretty()` column either — the
+shape `getOverview()` above and the object surface already use. That makes one spelling of a byte
+count across the provider instead of two, and it is visible: a 16384-byte table reads `16 KB` where
+`pg_size_pretty()` wrote `16 kB`. The bytes are unchanged, and it removes a builtin RisingWave does
+not bind. Each size is absent, never `0`, where its builtin is refused or answers `NULL` — which is
+what CockroachDB v26.3.2 does for a table it has.
 
 ### 7.1 When the cache hit ratio is not measurable
 
@@ -530,7 +2030,7 @@ has nothing to divide:
 
 In both cases **`getHealth().cacheHitRatio` is `"N/A"` and `getPerformanceMetrics().cacheHitRatio`
 is absent from the object**, and the Overview and Performance tabs render "Not measured" rather
-than a figure. A ratio that *is* measured as `0` is kept and shown as `0.0%`: a cold cache is a real
+than a figure. When a ratio is measured, `getPerformanceMetrics().cacheHitAdvice` carries the PostgreSQL-specific tip ("Increase shared_buffers") that the Performance tab shows under a ratio below 90%; engines that declare none get a generic line naming no setting. The advice appears only where the PostgreSQL heap counters move: engines that speak the PostgreSQL wire protocol with their own storage report no ratio ("Not measured") and so get no tip. A ratio that *is* measured as `0` is kept and shown as `0.0%`: a cold cache is a real
 reading, and the one the panel most needs to show.
 
 Both SQL statements used to wrap the `NULL` in `COALESCE(..., 100)`, so an unmeasured database
@@ -553,8 +2053,8 @@ the client is not returned to the pool until commit/rollback. Surfaced via `POST
 
 | Method | Behaviour |
 |--------|-----------|
-| `beginTransaction()` | Acquires a client, runs `BEGIN`, arms a **5-minute auto-rollback** timer ([postgres.ts:461](../../src/lib/db/providers/sql/postgres.ts), duration set by `TX_TIMEOUT_MS`). Throws if one is already active. |
-| `queryInTransaction(sql, params?)` | Runs on the transaction's client. Throws if none active. |
+| `beginTransaction()` | Acquires a client, runs `BEGIN`, arms a **5-minute auto-rollback** timer ([`postgres.ts`](../../src/lib/db/providers/sql/postgres.ts), duration set by `TX_TIMEOUT_MS`). Throws if one is already active, and refuses a `BEGIN` that opened nothing ([§8.0](#80-a-begin-that-opens-nothing-and-a-statement-that-ends-the-transaction)). |
+| `queryInTransaction(sql, params?)` | Runs on the transaction's client. Throws if none active. Ends the session when the statement ended the transaction itself ([§8.0](#80-a-begin-that-opens-nothing-and-a-statement-that-ends-the-transaction)). |
 | `commitTransaction()` / `rollbackTransaction()` | Ends the transaction, clears the timer, releases the client. Throws if none active. |
 | `expireTransaction()` | The timeout callback — auto-`ROLLBACK` to prevent leaked locks if a transaction is abandoned. |
 | `isInTransaction()` | Current state. |
@@ -562,17 +2062,131 @@ the client is not returned to the pool until commit/rollback. Surfaced via `POST
 The auto-rollback timer is the key safety mechanism: a client that opens a transaction and
 disconnects without committing would otherwise hold locks indefinitely.
 
+**On a server-level connection a transaction belongs to one database**: each database's session
+holds its own, and the route records the owner per connection and database. The editor runs in the
+active database, which is locked while a transaction is open.
+
 `supportsTransactions: true` ([§10](#10-capabilities--labels)) is what tells the editor toolbar to
 offer BEGIN/COMMIT/ROLLBACK and the auto-rolled-back SANDBOX toggle at all. It is declared rather
 than inferred because the route's own gate is `isTransactionProvider(provider)`, a runtime shape
 check no client can read, so before #464 those controls rendered on every
 connection — including the ten providers that answer HTTP 400.
 
+### 8.0 A `BEGIN` that opens nothing, and a statement that ends the transaction
+
+Both are read off the server's own ReadyForQuery status byte (`getTransactionStatus()`, the same
+reading §8.1 uses), never off the statement text and never off the connection's type id.
+
+- **`beginTransaction()` refuses a `BEGIN` the server answered with status `I`.** Measured
+  2026-10-04 on RisingWave 3.1.0: `BEGIN` succeeds with the NOTICE "Read-write transaction is not
+  supported yet. Please specify `READ ONLY` to start a read-only transaction. For compatibility,
+  this statement will still succeed but no transaction is actually started." and the byte stays
+  `I`. Before this check, SANDBOX ran an `INSERT` and a `DELETE` there with no transaction under
+  them, its `ROLLBACK` answered "there is no transaction in progress" as a NOTICE, and the UI said
+  "Changes auto-rolled back. No data was modified." while both changes stayed. The client goes
+  back to the pool and the error is `NO_TRANSACTION_OPENED` ([`errors.ts`](../../src/lib/db/errors.ts)),
+  a `QueryError`, so `POST /api/db/transaction` answers 400 with that sentence and the editor runs
+  nothing. The same byte reads `T` after `BEGIN` on PostgreSQL 18, so nothing changes there.
+- **`queryInTransaction()` ends the session when the byte reads `I` after the statement.**
+  PostgreSQL's DDL is transactional, so this is not about DDL: it is a text that ends the
+  transaction itself: a typed `COMMIT`, `END`, `ROLLBACK` or `ABORT` in a manual transaction, or
+  DDL on a relative that commits it (CockroachDB 25.1 and later commit before DDL by default,
+  `autocommit_before_ddl`). The byte cannot say WHICH of those happened, so the editor claims no
+  outcome: the route answers `inTransaction: false`, and the editor shows "Not Rolled Back"
+  (SANDBOX) or "Transaction Ended", each asking the user to check what was kept. A best-effort
+  `ROLLBACK` goes out before the client is released (a no-op answered with a WARNING where the
+  transaction really is gone), so a relative that ever reported `I` with a transaction still open
+  could not hand that transaction to the pool. A failed statement leaves the byte at `E`, so the
+  session stays for the `ROLLBACK` it needs. Measured 2026-10-04 on PostgreSQL 18.6 and
+  Materialize 26.44.1: `T` after `BEGIN` and after a read inside it, `I` after `COMMIT`.
+
+The declared half of the same guard, `implicitCommitStatements`, holds `END` and `PREPARE
+TRANSACTION`. PostgreSQL's DDL rolls back, so no DDL is in it; those two end the transaction
+anyway (`END` is the COMMIT synonym, `PREPARE TRANSACTION` detaches it from the session), and
+SANDBOX refuses them before sending, together with the `COMMIT`, `ROLLBACK` and `ABORT` it
+refuses on every engine ([`sandbox-refusal.ts`](../../src/lib/editor/sandbox-refusal.ts)). A
+`PREPARE name AS ...` statement is not matched: the sequence is two words.
+
+### 8.0.1 A write the next read cannot see, and the session setting that shows it (#1399)
+
+RisingWave makes a DML statement's effect visible to later batch reads only after a `FLUSH`, or at once in a session whose `rw_implicit_flush` is on.
+So an inline edit ran its `UPDATE`, re-ran the result's query at once, and drew the old row under a toast that said "The results are up to date".
+
+Measured on RisingWave 3.1.0 (`risingwavelabs/risingwave:latest`, single_node) on 2026-10-09:
+
+| What was run | Read back |
+|---|---|
+| `UPDATE` then `SELECT` in one default session | the old row |
+| the same pair after `SET rw_implicit_flush = true` | the new row |
+| `SHOW rw_implicit_flush` in a new session afterwards | `false`: the setting is the session's own |
+| a write under the setting, read by a second session without it | the new row |
+| a write without the setting, read by a second session | the old row |
+
+`connect()` therefore asks whether the server has the setting and has it off, and where it does, every session the pool opens is turned on: the one connect borrowed directly, and each later one from the pool's `connect` event, where `pg` runs the statement before the session is handed to whoever asked for it.
+A write made in such a session is visible to every session once it returns, so the grid's refresh reads it whichever pooled session it runs on.
+
+Two statements ask, because no single one is answered without an error by both ends of the family:
+
+| Statement | RisingWave 3.1.0 | PostgreSQL 18.6 |
+|---|---|---|
+| `SELECT current_setting('rw_implicit_flush', true)` | refused, *Failed to bind expression* | one row, NULL |
+| `SHOW rw_implicit_flush` | one row, `false` | refused, `42704` *unrecognized configuration parameter* |
+| the setting in `pg_settings` | no row | no row |
+
+The quiet form goes first.
+PostgreSQL answers it with NULL and is asked nothing more, so its server log gains no `unrecognized configuration parameter` line at every connect, which asking with `SHOW` first would write; measured on 18.6, the connect adds no line that names the setting.
+Only a server that refuses the quiet form is asked with `SHOW`, and one that refuses both has no such setting.
+The probe reads the answer and never a message and names no engine, as the EXPLAIN probe does ([10.1](#101-the-explain-grammar-is-measured-at-connect-597)).
+
+Measured through the provider against the same server, three writes each followed at once by a read of the same row: the read answered the previous value all three times before this change and the new value all three times after it.
+
+A server that already has the setting on is left alone.
+The read-only profile ([12](#12-agent-read-only-execution-profile-328)) asks nothing: it writes nothing, and a probe at connect would be a statement outside its `BEGIN READ ONLY` envelope.
+A session that refuses the `SET` is reported on the server console and stays in the pool, where its writes behave as they did before.
+
+### 8.1 `endOpenQueryTransaction()` — a transaction left open on a pooled client
+
+The lifecycle above is not the only way a transaction starts here.
+A `BEGIN` sent through `query()` opens one on the pooled client that call borrowed, and `query()` releases that client back to the pool without ending it.
+The pool does not make that benign, it widens it: the client is one of up to ten, it is handed out again at random, and the provider itself is cached per `connection.id` for the whole process.
+
+Measured 2026-09-13 on PostgreSQL 17 through the product's own routes.
+`POST /api/db/multi-query` with `BEGIN; CREATE TABLE d71_pg(id int); SELECT * FROM no_such_table` stopped on the third statement and released the client in status `E`.
+Every later request that drew that client answered HTTP 500 "current transaction is aborted, commands ignored until end of transaction block": a different user on `POST /api/db/query`, twelve retries over 60 seconds, 40 seconds of idleness, and `POST /api/db/maintenance` eight minutes later.
+`pg_stat_activity` showed the backend as `idle in transaction (aborted)` throughout.
+
+`endOpenQueryTransaction()` ends it and reports `"none"` or `"rolled-back"`.
+It reads the server's own answer rather than inferring one: `pg` records the ReadyForQuery status byte of every statement — `I` idle, `T` in a transaction, `E` in a failed one — and publishes it as `getTransactionStatus()` (pg 8.23).
+It targets the exact clients the CALLER'S OWN scope left a transaction open on, because a rollback issued through a fresh `pool.connect()` is not guaranteed to reach the client the statement ran on, and rolling back somebody else's transaction is worse than leaving this one open.
+A caller passes one `scope` string to every `query()` it makes and the same one to `endOpenQueryTransaction(scope)`; a client is recorded under that scope only when the server's status byte says `T` or `E` at the moment the call releases it, so a statement that left nothing open puts nothing within any ender's reach.
+
+An earlier form targeted one `lastQueryClient` field and said the interactive session above "is never touched", because its client is checked out for the session's whole life.
+Both were false, measured 2026-09-15 on 18.4 (D87).
+`query()` overwrote that one field for every concurrent caller of the per-`connection.id` cached provider, so a plain read's ender rolled a concurrent `/api/db/multi-query` script's transaction back mid-script while the script was told all four of its statements had succeeded, its `COMMIT` included, and its `CREATE TABLE` was gone.
+And `beginTransaction()` calls `pool.connect()` on a LIFO idle list, so it is handed the very object a previous `query()` recorded: the ender rolled the interactive session's committed `CREATE TABLE` away while the status route still read `inTransaction` and `commit` answered "Transaction committed".
+Both controls, run without the ender, kept the table.
+
+`POST /api/db/multi-query` and `POST /api/db/query` each call this in a `finally` under a scope of their own and report the outcome.
+What it still cannot undo: a client this scope released in `T` is back in the idle list, and the pool may hand it to another request in the moment before the ender runs, whose statement then joins this transaction and is discarded with it.
+That is the leak ending it promptly is for, not a second defect.
+
+THE OTHER REQUEST CAN BE THE INTERACTIVE SESSION, and then its `commit` lies, which is sharper than the sentence above and is said here rather than left to be met.
+MEASURED at provider level on 2026-09-15: with `query("BEGIN", scope)` having recorded a client in `T`, `beginTransaction()` was handed that same client off the LIFO idle list, its `CREATE TABLE` was destroyed by the ender, and `commit` still answered "Transaction committed".
+The window is only open when an EARLIER statement left something open, which is what makes it the leak above rather than the aliasing D87 closed: 46 attempts through the shipped routes lost nothing, because each route ends its own scope inside the same request.
+Ten apparent losses in the first run of that probe were `HTTP 429` from the route's own rate limiter and not losses at all, which is recorded because the first reading of it looked like the defect.
+
+**A ROLLBACK THIS PROVIDER COULD NOT ISSUE RAISES, and the raise takes the response with it.**
+Every client the scope recorded is attempted inside its own `try`, so one dead socket cannot strand the clients behind it in the loop, and the held failures are raised together once the loop is done: `Could not roll back the transaction this request left open on N of M pooled clients: ...`, where `M` counts the clients ASKED and not the clients recorded, because a client a later statement of the same scope already returned to `I` was never sent anything.
+Neither arm of the outcome type is true of a client still sitting in `T`: `"none"` denies the transaction and `"rolled-back"` certifies a rollback that did not happen.
+The class raised is the base `DatabaseError` with `code: "DATABASE_ERROR"` and NOT the `QueryError` the rest of this provider raises, because `databaseErrorBody` in [`error-body.ts`](../../src/lib/api/error-body.ts), reached through `createErrorResponse`, maps `QueryError` to HTTP 400 `QUERY_ERROR`, which would report a rollback this server could not issue on a client of its own pool as a fault in the SQL the caller sent; the `DatabaseError` arm answers HTTP 500 `DATABASE_ERROR`, which is what it is.
+The cost is two losses and both are deliberate: the throw is inside the route's `finally`, so it replaces the response the request had already produced, a script's per-statement results included, and a `finally` that throws also DISCARDS the exception the body was leaving with, so a dead socket that killed the statement AND the ROLLBACK costs the engine's own message with its `position` and `detail`.
+A pooled client left `idle in transaction` poisons every later user of that stored connection, which is the failure this whole surface exists for, so it is raised rather than reported quietly.
+
 ---
 
 ## 9. Maintenance
 
-`runMaintenance(type, target?)` ([postgres.ts:762](../../src/lib/db/providers/sql/postgres.ts)),
+`runMaintenance(type, target?, container?)` ([`postgres.ts`](../../src/lib/db/providers/sql/postgres.ts)),
 with targets quoted via [§3.6](#36-safe-maintenance-targets):
 
 | Type | With target | Without target |
@@ -582,8 +2196,94 @@ with targets quoted via [§3.6](#36-safe-maintenance-targets):
 | `reindex` | `REINDEX TABLE <target>` | `REINDEX DATABASE <db>` |
 | `kill` | `pg_terminate_backend(<pid>)` | throws (PID required) |
 
-`getCapabilities().maintenanceOperations = ['vacuum', 'analyze', 'reindex', 'kill']`. `kill`
-validates that the target parses as an integer PID.
+`getCapabilities().maintenanceOperations` is `['vacuum', 'analyze', 'reindex', 'kill']` before
+connect and on PostgreSQL itself; a connected relative keeps only what its server accepts
+([§9.1](#91-what-the-connected-server-accepts-measured-at-connect)). `kill` validates that the
+target parses as an integer PID.
+
+A statement that succeeds can still have done nothing, and the server says so in a notice:
+PostgreSQL skips a table the role does not own with the `WARNING` `permission denied to vacuum "t",
+skipping it`, and YugabyteDB 2026.1.2.0 answers every `VACUUM` with the `NOTICE` *VACUUM is a no-op
+statement since YugabyteDB performs garbage collection of dead tuples automatically* (measured
+2026-10-04). `runMaintenance` listens for the server's notices while its statement runs, and when a
+`NOTICE` or `WARNING` arrived the result reads `VACUUM completed, and the server said: <first
+three>; ... (and N more)` instead of `VACUUM completed successfully` (#1387). `INFO`, `LOG` and
+`DEBUG` are not quoted.
+
+A statement the server refuses is thrown as the driver raised it, and `POST /api/db/maintenance`
+types it through `mapDatabaseError`: a SQLSTATE of class `42`, `0A`, `22`, `23`, `21` or `44` is the
+statement's own fault and answers `400 QUERY_ERROR` with the server's sentence; anything else keeps a
+5xx (#1387, #1427).
+The exception is a privilege the connection's role lacks, `42501`, which answers `403 PERMISSION_DENIED`.
+
+### 9.1 What the connected server accepts, measured at connect
+
+The `postgres` type id reaches wire-compatible engines that refuse part of PostgreSQL's
+maintenance, and each refuses it in its own words, so the set is measured per server the way the
+EXPLAIN grammar is ([§10.1](#101-the-explain-grammar-is-measured-at-connect-597)): `probeMaintenance()`
+asks once per `connect()`, on the client connect already borrowed, about five of the six statements
+the table above sends (the per-row ones carry the table name `libredb_maintenance_probe`, the global
+ones are the exact whole-database statements). Skipped under the agent's read-only profile, which
+keeps the declaration.
+
+**The bare `ANALYZE` is never sent.** It is the one whole-database statement a transaction block
+does not stop (`VACUUM` and `REINDEX DATABASE` refuse inside one with `25001`, `ANALYZE` runs
+there), so behind a statement-routing proxy such as Pgpool-II with load balancing, where the
+probe's block cannot be shown to reach the backend the next statement reaches, it could really run
+over a whole database. Its placement is inferred instead: offered where `ANALYZE <table>` and the
+bare `VACUUM ANALYZE` both parse. That is the measured answer on every server below; CockroachDB
+has the first and not the second, and refuses the bare `ANALYZE` too.
+
+**Nothing is run.** The probe opens a block, aborts it with `SELECT 1/0`, and sends each statement
+inside it. PostgreSQL parses a simple query before it checks the block, so a statement in its
+grammar answers `25P02` without parse analysis, planning or execution, and one it does not have
+answers its own grammar or feature error. The verdict is the SQLSTATE, never the message: `25P02`
+keeps the placement, anything else drops it. The block is rolled back before the client goes back
+to the pool.
+
+**A server whose `BEGIN` opens nothing is not asked**, because there the statements would run. The
+probe sends `SELECT 1` after the poison and stops unless it answers `25P02`; such a server is
+offered none of `vacuum`, `analyze` and `reindex`. The status `getTransactionStatus()` reports is
+not used for this: a rejected query settles before `pg` reads the ReadyForQuery that follows the
+error, and under bun 1.4.2 it still read `T` there on PostgreSQL 18.6 while node read `E`.
+
+**Only the server's answer narrows anything.** `25P02` keeps a placement and `42601` or `0A000`
+drops it. Any other code is followed by `SELECT 1` again: if the block still answers `25P02`,
+nothing ran and the statement counts as refused (an engine that reports a grammar refusal as
+`XX000`); if it does not, or if a statement RESOLVED, the probe stops at once and the declared set
+stands, because the next statement could run. A failure that is not an answer at all (a reset
+connection, a pooler in statement mode that refuses `BEGIN`) also leaves the declared set, so a
+cached provider never loses its maintenance to a transient fault. Only the measured "`BEGIN`
+opened nothing" offers none of the three. The probe never fails the connection, and a `ROLLBACK`
+that fails releases the connect client with that error, so `pg` destroys it instead of pooling a
+client still inside the probe's block.
+
+`REINDEX DATABASE` names the configured database, or for a connection string that names none,
+the one `SELECT current_database()` reports (asked only for that statement), so the probe and the
+run never send `REINDEX DATABASE ""`.
+
+Measured 2026-10-04 through `pg`:
+
+| Server | `VACUUM ANALYZE <t>` / bare | `ANALYZE <t>` / bare | `REINDEX TABLE <t>` / `DATABASE` | Offered |
+|--------|-----------------------------|----------------------|----------------------------------|---------|
+| PostgreSQL 18.6 (`postgres:latest`) | `25P02` / `25P02` | `25P02` / inferred | `25P02` / `25P02` | everything |
+| CockroachDB v26.3.2 (`cockroachdb/cockroach:latest`) | `42601` / `42601` | `25P02` / inferred (`42601` when sent by hand) | `42601` (`unimplemented: this syntax`) / `42601` | per-row Analyze only |
+| RisingWave 3.1.0 (`risingwavelabs/risingwave:latest`) | not asked | not asked | not asked | none: `BEGIN` opens nothing (ReadyForQuery `I`) |
+| YugabyteDB 2026.1.2.0 (`yugabytedb/yugabyte:latest`) | `25P02` / `25P02` | `25P02` / inferred | `0A000 REINDEX not supported yet` / `0A000 REINDEX SCHEMA/DATABASE/SYSTEM not supported yet` | Vacuum and Analyze |
+
+YugabyteDB raises its `REINDEX` refusals in its grammar, so they reach the probe as `0A000` and drop
+both placements. Its `VACUUM` is in the grammar and stays offered, and the run then quotes the
+server's no-op `NOTICE` as described above.
+
+The two maintenance surfaces read capabilities from `POST /api/db/provider-meta`, which never
+connects (#457) and so can only answer this declaration. `POST /api/db/monitoring` connects, and
+its payload carries the connected provider's `maintenanceOperations` and `maintenanceOperationSpecs`
+as `maintenance`; the admin Operations tab and the monitoring Tables tab lay that over the declared
+capabilities (`withConnectedMaintenance` in `src/lib/db/types.ts`), so a refused operation has no
+control there. The route refuses it too, from the same connected provider, with its existing 400.
+
+Every whole-database card on the admin Operations tab asks before it sends (#1438): a dialog names
+the run, the connection and its database, and nothing is sent until it is confirmed.
 
 ### Where each operation may be offered (`maintenanceOperationSpecs`)
 
@@ -609,32 +2309,120 @@ placements or neither.
 
 PostgreSQL is the engine both surfaces were already right about - every statement here has
 a one-table form and a whole-database form - so these declarations record the baseline the
-other providers are measured against rather than a change in behaviour. `vacuumAction`
+other providers are measured against rather than a change in behaviour. On a connected relative
+they are what [§9.1](#91-what-the-connected-server-accepts-measured-at-connect) narrows: a
+placement the server refused is `false` there, and an operation with neither is left out. `vacuumAction`
 really means `vacuum` here, so `vacuumActionOperation` stays absent.
 
 ---
 
 ## 10. Capabilities & labels
 
-### `getCapabilities()` ([postgres.ts:250](../../src/lib/db/providers/sql/postgres.ts))
+### `getCapabilities()` ([`postgres.ts`](../../src/lib/db/providers/sql/postgres.ts))
 
 Overrides the SQL base defaults:
 
 | Capability | Value |
 |------------|-------|
 | `queryLanguage` | `sql` |
-| `supportsExplain` | `true` |
-| `explainFormat` | `postgres-json` |
+| `supportsExplain` | `true` when the server accepts one of the grammars below, measured at connect |
+| `explainFormat` | `postgres-json`, `postgres-text-analyze` or `postgres-text` — **measured, not declared** (see §10.1) |
 | `supportsExternalQueryLimiting` | `true` |
-| `supportsCreateTable` | `true` |
+| `createTable` | declared, see [Create Table form](#create-table-form) |
 | `supportsInlineRowEdit` | `true` — `UPDATE t SET c = v WHERE pk = v` is core PostgreSQL DML |
-| `supportsTransactions` | `true` — `beginTransaction()` holds one pool client and runs `BEGIN` / `COMMIT` / `ROLLBACK` on it, so the editor's transaction trio and the auto-rolled-back SANDBOX toggle are offered here (#464) |
+| `supportsTestDataGeneration` | `true` - the row menus offer Generate Test Data on tables, which writes one multi-row `INSERT INTO ... VALUES` |
+| `supportsResultPagination` | `true` — `LIMIT n OFFSET m` from the shared limiter (#816) |
+| `supportsTransactions` | `true`: `beginTransaction()` holds one pool client and runs `BEGIN` / `COMMIT` / `ROLLBACK` on it, so the editor's transaction trio and the auto-rolled-back SANDBOX toggle are offered here (#464). A relative whose `BEGIN` opens nothing (RisingWave) is refused at `beginTransaction()` rather than declared per type id ([§8.0](#80-a-begin-that-opens-nothing-and-a-statement-that-ends-the-transaction)) |
+| `implicitCommitStatements` | `END`, `PREPARE TRANSACTION`: the two statements besides COMMIT and ROLLBACK that end the transaction. No DDL is listed, because PostgreSQL's DDL is transactional; a relative that commits DDL anyway (CockroachDB's `autocommit_before_ddl`) is caught after the statement instead ([§8.0](#80-a-begin-that-opens-nothing-and-a-statement-that-ends-the-transaction)) |
 | `declaresForeignKeys` | `true` — inherited from the base capabilities; an empty `foreignKeys` list is then a fact about the schema or the reading role, never about the engine |
 | `supportsMaintenance` | `true` |
-| `maintenanceOperations` | `['vacuum', 'analyze', 'reindex', 'kill']` |
+| `maintenanceOperations` | `['vacuum', 'analyze', 'reindex', 'kill']` before connect; after it, the operations the server accepted plus `kill`: **measured, not declared** (see [§9.1](#91-what-the-connected-server-accepts-measured-at-connect)) |
 | `supportsConnectionString` | `true` |
 | `defaultPort` | `5432` |
+| `containerLevels` | one level, `schema`, on a connection that names a database: it pins that database and nothing can switch it; two, `catalog` (Database) above `schema`, on a server-level connection ([§3.1.4](#314-what-the-object-surface-declares-and-which-catalog-answers-for-it)) |
+| `containerPathShapes` | `exact`: only `[schema]` addresses a container (`[database, schema]` on a server-level connection), so a shorter or a longer path is refused, by the object routes over HTTP and by this provider for a caller that reaches it directly (#1147) |
+| `catalogSessions` | `true` on a server-level connection only, absent otherwise: requests run in the database the caller names through `forCatalog` ([§4.1.1](#411-server-level-connections-an-empty-database-1530)) |
+| `objectKinds` | `table`, `view`, `materialized_view`, `sequence`, `function`, `procedure`, `trigger`. No `index` kind: `pg_index` is keyed by `indrelid`, so an index is a property of a relation and stays in `describeObject()` ([§3.1.4](#314-what-the-object-surface-declares-and-which-catalog-answers-for-it)) |
 | `schemaRefreshPattern` | `(CREATE\|DROP\|ALTER\|TRUNCATE)\b` (from base) |
+
+
+### 10.1 The EXPLAIN grammar is measured at connect (#597)
+
+`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` is PostgreSQL's own grammar and the wire family does not
+share it, so the provider asks the server which grammar it accepts instead of declaring one per type
+id. `probeExplainFormat()` runs on the client `connect()` already borrowed, tries each statement in
+turn and keeps the first that is accepted:
+
+| Probe | Format | Accepted by (measured 2026-09-06, through `pg`) |
+|---|---|---|
+| `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT 1` | `postgres-json` | PostgreSQL 18, TimescaleDB (PG 17.11), YugabyteDB 2.25.2, Apache Cloudberry 2.1.0, AlloyDB Omni (PG 17.9) |
+| `EXPLAIN ANALYZE SELECT 1` | `postgres-text-analyze` | CockroachDB v26.2.5 |
+| `EXPLAIN SELECT 1` | `postgres-text` | Materialize v26.40.0 |
+
+Each probe is the statement its strategy really sends, so a grammar that answers here is one the
+panel can use.
+
+**Only the Explain button executes.** The probe's `postgres-json` statement is the `analyze` form,
+the one the Explain button sends. The background plan the editor requests beside every run of a
+SELECT is the `estimate`, and for `postgres-json` that is `EXPLAIN (FORMAT JSON)`, which plans without
+running anything. A server that accepts the parenthesised ANALYZE form accepts that one too. Until
+#1311 the strategy ignored the mode and built the ANALYZE form for the estimate as well, so every
+SELECT ran twice: on PostgreSQL 18.6 one RUN of `SELECT nextval('my_seq')` advanced the sequence by
+two, on YugabyteDB 2026.1.2.0 the first `nextval` answered 101 (the plan's backend took the first
+cached block), and on Citus 14.2.0 and TimescaleDB 2.30.2 `create_distributed_table` and
+`create_hypertable` did their work in the hidden request first. `postgres-text-analyze` (CockroachDB)
+already honoured the mode, and `postgres-text` (Materialize) has no executing form. The probe reads success or failure and never the message: the family shares no code or
+wording for a grammar refusal, and keying on one would have to enumerate engines. A server that
+refuses all three declares `supportsExplain: false` and no format, and the connection still succeeds
+— a missing grammar is a fact about the Explain panel, not about the connection.
+
+**What the two refusals actually were.** Materialize answers `Expected SELECT, VALUES, or a subquery
+in the query body, found ANALYZE`, and answers the same way to a bare `(FORMAT JSON)` naming
+`FORMAT`: the PARENTHESES are what its grammar has no rule for, so dropping `ANALYZE` alone changes
+nothing — the error text names only the first token inside them, which is what made this look like a
+smaller problem than it was. It has no `EXPLAIN ANALYZE` either (`Expected one of CPU or MEMORY,
+found SELECT`). CockroachDB answers `at or near "analyze": syntax error`, and `at or near "json":
+syntax error` for `(FORMAT JSON)` — its parenthesised options are its own vocabulary, and `JSON` is
+legal there only beside `DISTSQL`, where it answers a processor diagram rather than a plan.
+
+Until this was measured, both engines rendered the Explain panel's "no execution plan" empty state:
+the plan request failed with an HTTP 500 that only the server log saw, so the panel read as *this
+query has no plan* rather than as an error.
+
+**The read-only agent profile does not probe.** That connection's invariant is that every statement
+it runs arrives inside a `BEGIN READ ONLY` envelope, and a bare probe at connect would be the first
+statement to leave it. It would also buy nothing: the agent path composes its own EXPLAIN from
+the `planEstimate` of [`languages/sql/engines/postgres.ts`](../../src/lib/agent/languages/sql/engines/postgres.ts) keyed on the type id, and `summarisePlan`
+reads a plan only when that composed `EXPLAIN (FORMAT JSON)` succeeded — the case where the probe
+would have answered `postgres-json` anyway. So a profiled provider keeps the static default.
+
+**Reading a text plan.** `postgres-text` and `postgres-text-analyze` differ only in the statement
+they build; both read the answer through the same shape-driven reader in
+[`postgres-text.ts`](../../src/lib/explain/postgres-text.ts). CockroachDB returns one row per plan
+line in a column called `info`; Materialize returns a single row whose one cell holds the whole plan
+with newlines in it. The cell is split, blank padding is dropped, and the leading run of whitespace
+and box glyphs is the nesting. Where a plan marks its nodes — CockroachDB prefixes every operator
+with `•` — the marker is the structure and the lines between two markers become the detail of the
+one above them; read by indentation alone, `└── • hash join` would land underneath its own parent's
+`│ group by: name` attribute. Materialize marks nothing that way and indents correctly, so the rule
+is applied only to a plan that uses it.
+
+### Create Table form
+
+`createTable` is `POSTGRES_CREATE_TABLE` in [`postgres-create-table.ts`](../../src/lib/db/providers/sql/postgres-create-table.ts), a module with no driver import so a test reads the spec without loading `pg` (#1822).
+It is the grammar the Create Table form writes for this engine:
+
+| Field | Value |
+| --- | --- |
+| Auto-increment key | `INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY`, not sequence-backed |
+| `PRIMARY KEY` and `UNIQUE` checkboxes | Yes |
+| Key type when not auto-increment | `INTEGER` |
+| Type list, in dropdown order | `VARCHAR(255)`, `TEXT`, `INTEGER`, `BIGINT`, `BOOLEAN`, `TIMESTAMP`, `DATE`, `JSONB`, `UUID`, `DECIMAL(10,2)` |
+
+The key is an identity column rather than `SERIAL`, because PostgreSQL's own documentation calls `SERIAL` historical and points at identity columns.
+Until #648 the form wrote `id SERIAL PRIMARY KEY` here, so this engine changed too rather than keeping the text it already emitted.
+The type list is the one the form offered every engine before #648; a row that reads like that old shared list is this engine agreeing with it, not a row nobody looked at.
+A table or column name longer than 63 bytes is refused under its field, from `maxIdentifierBytes` ([§3.4.2](#342-identifier-length-63-bytes-1435)).
 
 ### Labels
 
@@ -646,14 +2434,33 @@ already fits.
 was hardcoded to *"Run Reindex"* / *"Rebuild Indexes"* / *"Reconstructs all indexes in the database."*
 for every engine (#464). That wording was written for this engine — the global card
 sends no target, so `runMaintenance('reindex')` here runs `REINDEX DATABASE`
-([§9](#9-maintenance)) — so declaring it changes nothing on PostgreSQL and lets the two
-other providers that offer `reindex` (SQLite, Couchbase) say what theirs does instead:
+([§9](#9-maintenance)) — so declaring it changes nothing on PostgreSQL and lets the
+other providers that offer `reindex`, such as SQLite, libSQL and Couchbase, say what theirs does instead:
 
 | Field | Value |
 | --- | --- |
 | `reindexGlobalLabel` | *Run Reindex* |
 | `reindexGlobalTitle` | *Rebuild Indexes* |
 | `reindexGlobalDesc` | *Runs REINDEX DATABASE, reconstructing every index in the database.* |
+
+### SQL writing
+
+[`sql/postgres-sql-writing.ts`](../../src/lib/db/providers/sql/postgres-sql-writing.ts) declares how a generated statement spells a literal, a name and a bind for this engine, and it is this engine's row of `SQL_WRITING` ([`src/lib/db/sql-writing/index.ts`](../../src/lib/db/sql-writing/index.ts)), which the readers in [`src/lib/sql/values.ts`](../../src/lib/sql/values.ts) and [`src/lib/sql/identifier.ts`](../../src/lib/sql/identifier.ts) look up.
+A literal is written by `literalStandard` and read back by `unquoteStandard`: the quote is doubled and a backslash is data.
+A name is quoted by `identifierDoubleQuoted`, the SQL standard form: a double-quoted name with an inner double quote doubled.
+A bind is spelled by `placeholderDollar`, as `$1`, `$2`.
+`standard_conforming_strings` has been on by default since PostgreSQL 9.1, so a backslash in a plain literal is data.
+`pg` takes `$n`.
+Inline row editing reads a key column's kind through the shared `INSTANT_TYPE_NAMES`, `FLOAT64_TYPE_NAMES` and `EXACT_DECIMAL_TYPE_NAMES` of the module's `inlineEdit`, and binds every edit as typed.
+
+The module's `export` field spells a result export's column types through `ddlTypes`, the standard spelling with `BYTEA` for a binary column, and writes a binary cell with `binaryPgBytea`, `'\x0102'::bytea`.
+PostgreSQL's `X'…'` is a bit string, not `bytea`, and there is no cast between the two: measured on 18.4, `SELECT pg_typeof(X'0102')` answers `bit` and `SELECT X'0102'::bytea` is `ERROR: cannot cast type bit to bytea`.
+The hex-input form is written as a plain literal rather than `E'\\x…'` because it survives `standard_conforming_strings` in both positions: with the setting `off`, `SELECT length('\x0102deadbeef'::bytea)` still answers 6.
+Each name in `standsAlone` was measured, one `CREATE TABLE probe (c <name>)` per name on PostgreSQL 18.4, read back out of `format_type`, and is listed only because PostgreSQL both accepted it and stored it unnarrowed.
+`character varying` is unbounded there.
+`bareSpelling` writes a bare `bit` as `bit varying`: `pg` hands a bit string back as text such as `1010`, which a bare `bit` (`bit(1)`) refuses with `bit string length 4 does not match type bit(1)`, and `bit varying` takes at any length (#1386).
+`nonFinite` is `QUOTED_WORD_NON_FINITE`, which writes NaN and the infinities as the quoted words `'NaN'`, `'Infinity'` and `'-Infinity'`: replayed into PostgreSQL 18.6 (2026-10-04), they read back into `real`, `double precision` and `timestamptz`.
+`typedLiteral` writes the cells whose generic form PostgreSQL refuses, arrays and intervals among them, from the engine's own [`postgres-typed-literals.ts`](../../src/lib/db/providers/sql/postgres-typed-literals.ts).
 
 ---
 
@@ -668,12 +2475,17 @@ the shared hierarchy:
 | Operation before `connect()` | `DatabaseConfigError` (via `ensureConnected()`) |
 | `connect()` fails | `ConnectionError` (carries host/port) |
 | SQL syntax / bad column / relation | `QueryError` (with position when available) |
-| `statement_timeout` exceeded, or user cancel via `pg_cancel_backend` | `QueryCancelledError` — both emit *"canceling statement due to …"*, which `mapDatabaseError()` matches **before** its timeout check |
-| Generic timeout / connection-acquire timeout (message contains "timeout"/"timed out", not "canceling statement") | `TimeoutError` |
-| Bad password / authentication | `AuthenticationError` |
+| `statement_timeout` or `lock_timeout` exceeded (`canceling statement due to statement timeout` / `due to lock timeout`) | `TimeoutError` — a time budget elapsed, so since #1145 `mapDatabaseError()` recognises these **before** its cancellation branch and keeps the engine's text |
+| User cancel via `pg_cancel_backend` (`canceling statement due to user request`) | `QueryCancelledError` |
+| Generic timeout / connection-acquire timeout (message contains "timeout"/"timed out") | `TimeoutError` |
+| A privilege the role lacks (SQLSTATE `42501`: `permission denied for table orders`, `must be owner of table orders`) | `PermissionDeniedError`, answered `403 PERMISSION_DENIED` with `Permission denied: ` before the server's sentence |
+| A refused credential (SQLSTATE class `28`: `28P01` a wrong password, `28000` a `pg_hba.conf` refusal or an unknown role) | `AuthenticationError`, answered `401 AUTH_ERROR` |
 | Pool exhausted / too many connections | `PoolExhaustedError` |
 
-`isRetryableError()` treats connection/timeout errors as retryable, but not auth, config, or
+The two refusals are read from the SQLSTATE and never from the words, so `column "password" does not exist` (`42703`) is a `QueryError`.
+Only an error `pg` raises itself, which carries no SQLSTATE, is read by its words, such as `SASL: SCRAM-SERVER-FIRST-MESSAGE: client password must be a string`.
+
+`isRetryableError()` treats connection/timeout errors as retryable, but not auth, privilege, config, or
 syntax errors.
 
 ---
@@ -689,7 +2501,7 @@ through `queryReadOnly()`, where the DATABASE — not a SQL parser — is the bo
 - The profiled cache is physically separate from `getOrCreateProvider`'s cache: an agent
   acquisition never returns, inserts, or touches a shared writable entry (unit-tested in both
   directions), so an agent execution can never be handed the editor's pool — and vice versa.
-- Provider types without a database-native read-only wrapper are refused with
+- Provider types without a read-only statement path (`queryReadOnly`) are refused with
   `PROFILE_UNSUPPORTED_BY_PROVIDER`; there is no fallback to `query()`. A provider that supports the
   profile but cannot apply it to *this* target refuses with `PROFILE_UNSUPPORTED_TARGET` (SQLite
   does this for `:memory:` — see [sqlite.md §12.3](./sqlite.md#123-per-statement-execution-queryreadonly)).
@@ -713,6 +2525,9 @@ through `queryReadOnly()`, where the DATABASE — not a SQL parser — is the bo
 - Lifecycle: profiled providers idle out on the same 30-minute sweep, are removed alongside
   `removeProvider(connectionId)`, and share the connection's SSH tunnel (closed only once nothing
   serves the connection anymore).
+- **On a server-level connection a run reads one database** (#1530): `POST /api/agent/runs` takes a
+  required `catalog`, records it, and the run, its drives and its hand-over use the connection naming
+  that database.
 
 ### 12.2 Per-statement execution (`queryReadOnly`, [postgres.ts](../../src/lib/db/providers/sql/postgres.ts))
 
@@ -828,12 +2643,20 @@ path is reachable from server code and not from a request.
 Four things about the PostgreSQL side of that layer are worth knowing here:
 
 - **The catalog read is a composed bounded read**, not a new operation. `inspect_schema` takes a
-  schema/table selector and the server writes
-  `SELECT … FROM information_schema.columns WHERE table_schema NOT IN ('pg_catalog', …)`, executed as
-  `sql.query.read` like any other statement. The model never supplies that SQL. Selectors are quoted
-  with `quoteLiteral` because `queryReadOnly` binds no parameters, and a selector carrying a
-  backslash is refused outright rather than quoted — the dialect-less span reader treats it as an
-  escape, so `'a\'` would read as an unterminated literal.
+  schema/table selector and the server writes the `columns` statement itself, executed as
+  `sql.query.read` like any other statement. The model never supplies that SQL. The statement's
+  `WHERE` excludes the engine's own objects three ways: the full engine-builtin schema list (not
+  only `pg_catalog` / `information_schema`) and every schema an extension created (`pg_depend` on
+  `pg_namespace`, `deptype = 'e'`) — both copied from this provider's object browser — plus every
+  relation an extension created (`pg_depend` on `pg_class`, `deptype = 'e'`), which is new on the
+  agent path and carried by all four catalog reads, not only the column one. The relation test is
+  the one that reaches AlloyDB Omni's extension views, 49 of which sit in `public` itself where no
+  schema filter can reach them; a user's own views are never extension-owned, so they stay in the
+  inventory. Measured live on 2026-09-07 with two user tables seeded: 46 → 2 object rows on
+  TimescaleDB, 67 → 2 on Cloudberry and 70 → 2 on AlloyDB Omni.
+  Selectors are quoted with `quoteLiteral` because `queryReadOnly` binds no parameters, and a selector
+  carrying a backslash is refused outright rather than quoted — the dialect-less span reader treats it
+  as an escape, so `'a\'` would read as an unterminated literal.
 - **A run reads three catalog inventories at its start (#329 T8), not one.** `inspect_schema` takes
   a `kind` — `columns` (the default), `relations` (foreign keys, from `pg_constraint` with
   `unnest(conkey, confkey) WITH ORDINALITY` pairing the two sides) and `indexes` (from `pg_index`
@@ -860,20 +2683,41 @@ Four things about the PostgreSQL side of that layer are worth knowing here:
 - **Plan inspection uses `EXPLAIN (FORMAT JSON)`, never `EXPLAIN (ANALYZE, …)`.** The editor's
   Explain button emits the ANALYZE form deliberately (a user asked for real timings) and that form
   EXECUTES the statement, which on this engine performs a data-modifying CTE. The agent path is
-  served by [`composed-sql.ts`](../../src/lib/agent/composed-sql.ts) instead, and the executing
+  served by [`composed-sql.ts`](../../src/lib/agent/composed-sql.ts) and the `planEstimate` of
+  [`languages/sql/engines/postgres.ts`](../../src/lib/agent/languages/sql/engines/postgres.ts) instead, and the executing
   variant stays behind the approval-gated `sql.explain.analyze` descriptor that no tool reaches.
 - **The statement timeout is clamped to the run's remaining wall clock** before it reaches
   `SET LOCAL statement_timeout`, so a statement cannot outlive the run that asked for it. Here that
   clamp really preempts; on SQLite it does not — see
   [sqlite.md §12](./sqlite.md#12-agent-read-only-execution-profile-328).
 
-  Worth knowing what the preemption looks like coming back, because it is not what the name suggests:
-  PostgreSQL reports it as `canceling statement due to statement timeout`, and `mapDatabaseError`
-  matches `canceling statement` before its timeout branch, so it arrives as a `QueryCancelledError` and
-  never as a `TimeoutError` on this engine. The agent tool layer treats it as a repairable statement
-  failure — narrowing the read is the repair that helps — and the mapper discards the wording that
-  would separate it from an operator cancel ([BACKLOG](../BACKLOG.md) B4), which is why a run
-  cancellation is enforced by the run loop's own state rather than by that exception.
+  Worth knowing what the preemption looks like coming back: PostgreSQL reports it as
+  `canceling statement due to statement timeout`, sharing the `canceling statement` prefix an operator
+  cancel uses. Since #1145 `mapDatabaseError` recognises that phrasing (and `due to lock timeout`)
+  **before** its cancellation branch and returns a `TimeoutError` carrying the engine's own text, so a
+  budget timeout arrives as a `TimeoutError` on this engine like everywhere else — only
+  `pg_cancel_backend`'s `due to user request` stays a `QueryCancelledError`. The agent tool layer
+  treats the timeout as a repairable statement failure — narrowing the read is the repair that helps.
+  A run cancellation is still enforced by the run loop's own state rather than by that exception,
+  because an operator cancel arriving mid-statement is repairable too (see [BACKLOG](../BACKLOG.md) B4
+  for the residual: classification reads the message text rather than the `57014`/`55P03` SQLSTATE).
+
+### 12.5 Agent language pack
+
+Statement-language family: `sql`.
+Overlay: [`src/lib/agent/languages/sql/engines/postgres.ts`](../../src/lib/agent/languages/sql/engines/postgres.ts), with its client row in [`src/lib/agent/languages/sql/engines/client.ts`](../../src/lib/agent/languages/sql/engines/client.ts).
+The agent reads it through `runServerPack` and `agentEnginePack`, and the dialect through `engineServerDialect`.
+
+| Member | Kind | Value |
+| --- | --- | --- |
+| `catalogRead` | Dialect-bound | Supplied |
+| `planEstimate` | Dialect-bound | Supplied |
+| `profileComposition` | Dialect-bound | Supplied |
+| `statistics` | Dialect-bound | Supplied |
+| `catalogCapture` | Dialect-bound | Supplied |
+
+This overlay overrides no Shared member, so every Shared member is the `sql` statement-language family's own.
+A pack does not open agent mode: execution is gated by `AGENT_EXECUTION_ENGINES` and the execution-profile check.
 
 ---
 
@@ -889,12 +2733,10 @@ canned result sets keyed by query shape, which exercises the same provider code 
 server.
 
 > **Mock isolation:** `bun`'s `mock.module()` is process-wide, so test files that mock different
-> drivers (here `pg`, elsewhere `ioredis`, etc.) cross-contaminate when they share a process. Running
-> a **single file** is safe (one file = one process). The full `bun run test` script runs the core
-> group (`tests/unit tests/api tests/integration`) in **one process** and is therefore load-order
-> flaky — so **CI does not use it**. The deterministic runner is **`bun run test:ci`** (per-file
-> process isolation via `tests/run-core.sh`); the coverage workflow uses `bun run test:coverage`
-> (also per-file). See [`CLAUDE.md`](../../CLAUDE.md).
+> drivers (here `pg`, elsewhere `ioredis`, etc.) would cross-contaminate if they shared a process.
+> They never do: `bun run test` gives every test file its own bun process, so a single file is safe
+> and so is the whole suite, which is the same command CI runs. `bun run test:coverage` is that
+> runner with coverage on. See [`CLAUDE.md`](../../CLAUDE.md).
 
 ### 13.2 Coverage
 
@@ -906,14 +2748,16 @@ tables, cross-schema FK joins, null-column coercion), health (incl. the `pg_stat
 placeholder path), maintenance (all types, identifier quoting, kill validation), overview/uptime
 formatting, performance (incl. checkpoint fallback), slow queries (extension + `pg_stat_activity`
 fallback), active sessions,
-table/index/storage stats, pool stats, capabilities, and `pg_stat_activity` passthrough.
+table/index/storage stats, pool stats, capabilities, and `pg_stat_activity` passthrough, and the
+server-level connection (#1530), whose bounded session set is also unit-tested in
+`tests/unit/db/catalog-sessions.test.ts`.
 
 ### 13.3 Run it
 
 ```bash
 bun test tests/integration/db/postgres-provider.test.ts   # just this file (single process — safe)
-bun run test:ci                                            # CI publish gate — per-file isolation (tests/run-core.sh)
-bun run test:coverage                                      # CI coverage workflow — per-file core + components
+bun run test                                               # the whole suite, one process per file, what CI runs
+bun run test:coverage                                      # CI coverage workflow: the same runner, with coverage
 ```
 
 ### 13.4 Optional: verifying against a live PostgreSQL
@@ -921,9 +2765,19 @@ bun run test:coverage                                      # CI coverage workflo
 The committed tests are mock-based by design. To smoke-test against a real server:
 
 ```bash
-docker run --rm -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:18
-# then point a connection at localhost:5432 (db=postgres, user=postgres) in the Studio UI
+docker compose -f database-compose.yml up -d postgres
+# then point a connection at localhost:5432 (db=libredb_dev, user=postgres, password=postgres)
 ```
+
+That service mounts `docker/postgres-init/`, which creates `libredb_dev`, the `app` schema and one
+instance of every object kind the provider declares, plus `public.orders`
+(`03-object-fixture.sql`), which exists to make one name live in two schemas
+([§3.4.1](#341-the-session-default-container-and-why-a-bare-name-needs-one))
+([§3.1.4](#314-what-the-object-surface-declares-and-which-catalog-answers-for-it)). The init scripts
+run **only on a fresh data directory**, so a container that already exists has to be recreated
+before a change to them takes effect. Nothing in this repo recreates a container for you, and
+nothing should: a `libredb-postgres` already running on a machine may hold somebody's own
+databases.
 
 The E2E suite (`e2e/`) has been verified against PostgreSQL 18.x.
 
@@ -944,18 +2798,32 @@ const provider = await createDatabaseProvider({
 
 await provider.connect();
 const res = await provider.query('SELECT id, email FROM users WHERE active = $1', [true]);
-const tree = await provider.getSchemaList();          // fast structural tree
-const rels = await provider.getSchemaRelations();      // FKs + indexes to merge in
+const schemas = await provider.listContainers();                        // the schemas
+const tables = await provider.listObjects(['app'], 'table');            // names only
+const { details } = await provider.describeObjects(['app'], 'table');   // columns, one round trip
 await provider.disconnect();
+```
+
+A server-level connection names no database, and requests that run somewhere say where:
+
+```ts
+const server = await createDatabaseProvider({ id: 'pg-dev', name: 'Dev', type: 'postgres',
+  host: 'postgres.dev.internal', database: '', user: 'libredb', password: 'secret', createdAt: new Date() });
+await server.connect();                                    // opens `postgres` (or `template1`)
+const databases = await server.listContainers();           // [{ path: ['analytics'] }, { path: ['shop'] }, …]
+const res = await (await server.forCatalog('shop')).query('SELECT current_database()');
+await server.disconnect();                                 // closes every database's session too
 ```
 
 ### 14.2 Over the API
 
 - `POST /api/db/query` — run SQL (see [`API_DOCS.md`](../API_DOCS.md#post-apidbquery)).
-- `POST /api/db/schema/list` and `POST /api/db/schema/relations` — two-phase schema.
+- `POST /api/db/objects/inventory` — objects, and their columns with `includeColumns`.
 - `POST /api/db/transaction` — begin/commit/rollback/query-in-tx.
 - `POST /api/db/cancel` — cancel a running query by id.
 - `POST /api/db/maintenance` — vacuum/analyze/reindex/kill (admin only).
+- On a server-level connection each of these takes a `catalog` naming the database, and the
+  inventory reads the `containers` of one database.
 
 ---
 
@@ -969,8 +2837,14 @@ await provider.disconnect();
   active queries is available.
 - **WAL size and checkpoint times require elevated privileges** and are silently omitted otherwise.
 - **Column introspection is capped at 100 columns** per table.
+- **`describeObject()` reports nothing for a routine beyond its emptiness.** A routine's parameters
+  and return type are not columns and are not listed here; that is Phase 2's Source tab. The method
+  answers three empty lists for every kind that is not resolved in `pg_class`.
 - **`blocked` on active sessions is always `false`** — lock-wait detection (`pg_locks`) is not yet
   wired in.
+- **Server-level connections are not measured on the PostgreSQL-wire relatives**, and each one can
+  hold its own pool plus 5 × 3 connections (size PgBouncer for that). The embedded shell does not
+  choose a database from its tree, so there it runs nothing until a host names a database.
 - **Cloud SSL auto-detect does not verify the server certificate.** When SSL is enabled by host
   heuristic (`shouldEnableSSL()`), it uses `rejectUnauthorized: false` — the connection is encrypted
   but **not authenticated**, so it is exposed to man-in-the-middle attacks. For verified TLS, set an
@@ -978,6 +2852,16 @@ await provider.disconnect();
   checks the chain, which is what a managed provider's certificate needs) or `verify-ca`/`verify-full`
   with a `caCert`. *Future:* prefer verifying modes by default and treat the heuristic as
   encryption-only opportunistic TLS.
+
+---
+
+## Migration DDL
+
+[`POSTGRES_MIGRATION_DDL`](../../src/lib/db/providers/sql/postgres-migration-ddl.ts) is what the schema-diff migration generator writes for `postgres`, read through `migrationDdlFor` in `src/lib/db/migration-ddl/`.
+PostgreSQL is the shape the shared building blocks were written from, so every statement is the shared one and the migration is wrapped in `BEGIN;` and `COMMIT;`.
+The fields it takes unchanged from `src/lib/db/migration-ddl/shared.ts` are `BEGIN_COMMIT`, `standardAddColumn`, `standardAddForeignKey`, `standardColumnDef`, `standardCreateIndex`, `standardCreateTableForeignKey`, `standardDropColumn`, `standardDropForeignKey`, `standardDropIndex`, `standardDropTable`, `standardModifyColumn` and `standardPrimaryKey`.
+
+It prints no refusal reason.
 
 ---
 
@@ -992,4 +2876,4 @@ await provider.disconnect();
 - Errors: [`src/lib/db/errors.ts`](../../src/lib/db/errors.ts)
 - Tests: [`tests/integration/db/postgres-provider.test.ts`](../../tests/integration/db/postgres-provider.test.ts)
 - API contract: [`docs/API_DOCS.md`](../API_DOCS.md)
-- Sibling provider docs: [Apache Trino](./trino.md) · [Redis](./redis.md)
+- Sibling provider docs: [Trino](./trino.md) · [Redis](./redis.md)

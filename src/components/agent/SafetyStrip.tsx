@@ -21,7 +21,7 @@ import { cn } from "@/lib/utils";
  * Three properties are load-bearing, and each is one edit away from being lost:
  *
  *  - **The qualifier sits BESIDE the pill, never behind the ⓘ.** A bare "Executes nothing
- *    it drafts" overclaims: on the dialects `CATALOG_PLANS` serves, plan mode's grounding
+ *    it drafts" overclaims: on the dialects that supply a `catalogCapture`, plan mode's grounding
  *    capture IS a catalog read, and `engine-support.ts` says in its own header that copy
  *    compressing these facts overclaims. Both halves are on one line, and the row
  *    flex-WRAPS rather than truncating, because a qualifier cut off mid-clause is the same
@@ -50,6 +50,8 @@ export interface SafetyStripProps {
   readonly engineLabel: string;
   /** Whether the editor hand-over is consented for the run this strip describes. */
   readonly handover: boolean;
+  /** The refusal the last run on this connection met for the connection itself (`connectionRefusalSentence`). */
+  readonly refusedHere?: string | null;
 }
 
 /**
@@ -68,14 +70,14 @@ export interface SafetyStripProps {
  * scans every rendered `class` attribute to keep it that way.
  */
 const TONE_PILL: Readonly<Record<AgentPostureTone, string>> = Object.freeze({
-  safe: "text-emerald-400/90 bg-emerald-500/10",
-  reads: "text-blue-300 bg-blue-500/10",
-  widened: "text-amber-400 bg-amber-500/10",
+  safe: "text-success/90 bg-success-tint/10",
+  reads: "text-brand-bright bg-brand-tint/10",
+  widened: "text-warning bg-warning-tint/10",
   blocked: "text-fg-muted bg-fill",
 } satisfies Record<AgentPostureTone, string>);
 
-export function SafetyStrip({ mode, engine, engineLabel, handover }: SafetyStripProps) {
-  const posture = agentPosture({ mode, engine, engineLabel, handover });
+export function SafetyStrip({ mode, engine, engineLabel, handover, refusedHere = null }: SafetyStripProps) {
+  const posture = agentPosture({ mode, engine, engineLabel, handover, refusedHere });
   const [open, setOpen] = useState(false);
   /*
     The description's id, and the ⓘ's `aria-controls` target. From `useId` rather than a

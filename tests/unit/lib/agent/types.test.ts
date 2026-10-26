@@ -25,7 +25,7 @@ const SNAPSHOT: AgentContextSnapshot = {
   connectionId: "conn_1",
   fingerprint: "sha256-2f0a",
   capturedAtMs: 1_700_000_000_000,
-  tables: [
+  objects: [
     {
       name: "orders",
       columns: [
@@ -76,6 +76,8 @@ const DATABASE_ERROR: AgentToolRefusal = {
  */
 const EVENTS: Record<AgentRunEvent["kind"], AgentRunEvent> = {
   "run-started": { kind: "run-started", atMs: 1, mode: "agent" },
+  "run-paused": { kind: "run-paused", atMs: 1 },
+  "run-resumed": { kind: "run-resumed", atMs: 1 },
   // What drove a stretch of the run. The `operator` provenance is the fixture rather than
   // `bundled` because it is the shape with fields to get wrong, and the one an operator's
   // deployment actually writes.
@@ -124,7 +126,7 @@ const EVENTS: Record<AgentRunEvent["kind"], AgentRunEvent> = {
     kind: "context-captured",
     atMs: 2,
     fingerprint: SNAPSHOT.fingerprint,
-    tableCount: SNAPSHOT.tables.length,
+    tableCount: SNAPSHOT.objects.length,
     snapshot: SNAPSHOT,
     // And the word the engine used for those rows (#414), which is two strings and
     // therefore as inert as the rest of the entry.
@@ -143,14 +145,15 @@ const EVENTS: Record<AgentRunEvent["kind"], AgentRunEvent> = {
     kind: "context-reused",
     atMs: 2,
     fingerprint: SNAPSHOT.fingerprint,
-    tableCount: SNAPSHOT.tables.length,
+    tableCount: SNAPSHOT.objects.length,
     ageMs: 3_600_000,
     noun: { singular: "key pattern", plural: "key patterns" },
   },
   // The capture that was REFUSED (B54). Its own kind rather than the entry above
   // carrying an absence, and the fixture is the row-budget case because that is the
   // shape with fields to get wrong — and because it is the one an operator has to
-  // diagnose: B52's 536 rows against a 200-row bound. No `tableCount` and no
+  // diagnose: 536 rows against a 200-row bound (the B52 measurement, now fixed). No
+  // `tableCount` and no
   // `fingerprint` exist on it at all, which is the absence rule in the type system
   // rather than in a convention (#477).
   "context-unavailable": {
@@ -228,6 +231,25 @@ const EVENTS: Record<AgentRunEvent["kind"], AgentRunEvent> = {
         },
       ],
     },
+  },
+  // A cluster usage reading, the resource-efficiency evidence, and the cluster's own fact that it has no metrics.
+  "usage-read": {
+    kind: "usage-read",
+    atMs: 8,
+    artifact: { ...ARTIFACT, operationId: "cluster.usage.read" },
+    namespace: "shop",
+    selector: "app=web",
+  },
+  "usage-unavailable": {
+    kind: "usage-unavailable",
+    atMs: 8,
+    namespace: "shop",
+  },
+  "workloads-profiled": {
+    kind: "workloads-profiled",
+    atMs: 8,
+    artifact: { ...ARTIFACT, operationId: "cluster.workloads.read" },
+    namespace: "shop",
   },
   // The data-analysis face's own artifact: which result IS the answer, and how it
   // is to be shown. The spec names columns of THAT result and carries no colours,

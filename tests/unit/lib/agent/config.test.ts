@@ -10,6 +10,7 @@ import {
   AgentConfigError,
   isThreadContextEnabled,
   getAgentRuntimeConfig,
+  isAgentHeldByGovernance,
   isAgentRuntimeEnabled,
   LEDGER_PROBE_TTL_MS,
   resolveAgentAvailability,
@@ -17,6 +18,10 @@ import {
   resolveAgentLedgerDirectory,
   SANCTIONED_WORLD_TARGETS,
 } from "@/lib/agent/config";
+import * as runtimeSettings from "@/lib/governance/settings";
+import { validateSettings } from "@/lib/governance/settings";
+import { recordGovernanceSnapshot, resetGovernanceState } from "@/lib/governance/state";
+import { grantedSnapshot } from "../../../helpers/governance/granted-snapshot";
 
 /**
  * The LLM keys are in this list because availability is DERIVED from them since
@@ -34,7 +39,9 @@ const ENV_KEYS = [
   "LLM_API_KEY",
   "LLM_MODEL",
   "LLM_API_URL",
+  "LLM_MODEL_EFFORT",
   AGENT_THREAD_CONTEXT_ENV,
+  "GOVERNANCE_SOURCE",
 ] as const;
 
 let originalEnv: Record<string, string | undefined>;
@@ -292,6 +299,134 @@ describe("resolveAgentAvailability", () => {
   });
 });
 
+// ─── governance mode ────────────────────────────────────────────────────────
+
+/**
+ * Governance mode holds the agent off in this version (docs/GOVERNANCE.md), whatever the off-switch and the AI
+ * configuration say. The boot preflight refuses LIBREDB_AGENT_ENABLED switched on; these hold for an environment
+ * changed after boot, and the answer names the hold rather than an off-switch nobody set.
+ */
+describe("the governance hold", () => {
+  test("is not in force without governance, so the derived answer stands", () => {
+    configureModel();
+    expect(isAgentHeldByGovernance()).toBe(false);
+    process.env.GOVERNANCE_SOURCE = "";
+    expect(isAgentHeldByGovernance()).toBe(false);
+    expect(isAgentRuntimeEnabled()).toBe(true);
+  });
+
+  test.each(["postgres", "postgress"])(
+    "GOVERNANCE_SOURCE=%p holds the agent off, an unknown value included",
+    (value) => {
+      process.env.GOVERNANCE_SOURCE = value;
+      expect(isAgentHeldByGovernance()).toBe(true);
+    },
+  );
+
+  test("under governance the agent answers off although an LLM is configured", async () => {
+    configureModel();
+    process.env[AGENT_ENABLED_ENV] = "true";
+    process.env.GOVERNANCE_SOURCE = "postgres";
+    const dataDir = path.join(freshLedgerDir(), "never-created");
+    process.env.WORKFLOW_LOCAL_DATA_DIR = dataDir;
+
+    expect(isAgentRuntimeEnabled()).toBe(false);
+    expect(getAgentRuntimeConfig()).toEqual({ enabled: false });
+    const availability = await resolveAgentAvailability();
+    expect(availability).toEqual({
+      available: false,
+      reason: "GOVERNANCE_HOLD",
+      detail:
+        "GOVERNANCE_SOURCE is set: this version of Studio does not run the agent under governance, so this server runs no agent whatever else is configured",
+    });
+    // Nothing else is asked once the hold answers: no ledger is probed for an agent that cannot run.
+    expect(fs.existsSync(dataDir)).toBe(false);
+  });
+
+  test("the hold answers before the off-switch is read, so a negative or unrecognised value changes nothing", async () => {
+    process.env.GOVERNANCE_SOURCE = "postgres";
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const value of ["false", "yes-please"]) {
+        process.env[AGENT_ENABLED_ENV] = value;
+        expect(await resolveAgentAvailability(), value).toMatchObject({ available: false, reason: "GOVERNANCE_HOLD" });
+      }
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+// ─── the runtime setting agent.enabled ──────────────────────────────────────
+
+/**
+ * Under governance a control plane may set `agent.enabled` (docs/GOVERNANCE.md#runtime-settings). It feeds the
+ * off-switch, after the v1 hold, so in this version it has no effect; the hold-free cases below stand in for the
+ * release that lifts the hold, by answering the setting the store would answer then.
+ */
+describe("the runtime setting agent.enabled", () => {
+  afterEach(() => {
+    resetGovernanceState();
+  });
+
+  /** The settings store answering `value` for `agent.enabled` and nothing for any other key. */
+  function runtimeAgentEnabled(value: boolean) {
+    return spyOn(runtimeSettings, "runtimeSetting").mockImplementation(((key: string) =>
+      key === "agent.enabled" ? value : undefined) as typeof runtimeSettings.runtimeSetting);
+  }
+
+  test("governance: agent.enabled=true in the snapshot leaves the agent off while the v1 hold stands", async () => {
+    configureModel();
+    process.env.GOVERNANCE_SOURCE = "postgres";
+    recordGovernanceSnapshot({
+      ...grantedSnapshot([], []),
+      settings: validateSettings([{ key: "agent.enabled", value: true, updated_at: new Date() }], 1),
+    });
+
+    expect(runtimeSettings.runtimeSetting("agent.enabled")).toBe(true);
+    expect(isAgentRuntimeEnabled()).toBe(false);
+    expect(await resolveAgentAvailability()).toMatchObject({ available: false, reason: "GOVERNANCE_HOLD" });
+  });
+
+  test("without a hold, a runtime false switches the agent off although a model is configured and the flag is on", () => {
+    configureModel();
+    process.env[AGENT_ENABLED_ENV] = "true";
+    const spy = runtimeAgentEnabled(false);
+    try {
+      expect(isAgentRuntimeEnabled()).toBe(false);
+      expect(getAgentRuntimeConfig()).toEqual({ enabled: false });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("without a hold, a runtime false is reported as the operator's switch and names the setting", async () => {
+    const spy = runtimeAgentEnabled(false);
+    try {
+      expect(await resolveAgentAvailability()).toEqual({
+        available: false,
+        reason: "OPERATOR_DISABLED",
+        detail: "the runtime setting agent.enabled is false, so this server runs no agent whatever else is configured",
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("without a hold, a runtime true wins over a negative flag and still needs a configured model", () => {
+    process.env[AGENT_ENABLED_ENV] = "false";
+    const spy = runtimeAgentEnabled(true);
+    try {
+      expect(isAgentRuntimeEnabled()).toBe(false);
+      configureModel();
+      expect(isAgentRuntimeEnabled()).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
 // ─── the ledger's own version file (B30) ────────────────────────────────────
 
 /**
@@ -432,7 +567,11 @@ describe("resolveAgentAvailability under concurrency", () => {
     // re-pointing WORKFLOW_LOCAL_DATA_DIR while a probe is in flight — neither of
     // which the memo can de-duplicate.
     const alias = path.join(freshLedgerDir(), "alias");
-    fs.symlinkSync(dataDir, alias);
+    // "junction", not the default: fs.symlinkSync with no type creates a FILE symlink on Windows
+    // even when the target is a directory, and any symlink there needs a privilege a normal shell
+    // does not hold. A junction is a directory link that needs none and reaches the same inode,
+    // which is the whole point of the alias here. Ignored on POSIX, where the type is not used.
+    fs.symlinkSync(dataDir, alias, "junction");
 
     // Hold both probes at the point where each has written its file and neither has
     // removed it. A probe filename that is constant for the process lifetime cannot
@@ -740,7 +879,8 @@ describe("getAgentRuntimeConfig", () => {
 // ─── operator documentation ─────────────────────────────────────────────────
 
 describe(".env.example", () => {
-  const envExample = fs.readFileSync(path.join(process.cwd(), ".env.example"), "utf8");
+  // Anchored to this file rather than to process.cwd(), so the read is correct whoever launches it.
+  const envExample = fs.readFileSync(path.resolve(import.meta.dir, "../../../..", ".env.example"), "utf8");
 
   test.each([AGENT_ENABLED_ENV, AGENT_WORLD_TARGET_ENV])("documents %s", (key) => {
     expect(envExample).toContain(key);

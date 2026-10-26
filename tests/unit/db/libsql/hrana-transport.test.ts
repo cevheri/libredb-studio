@@ -20,6 +20,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { LibSQLHranaTransport } from "@/lib/db/providers/sql/libsql/hrana-transport";
 import { LibSQLTransportError } from "@/lib/db/providers/sql/libsql/transport";
+import { ConnectionError, DatabaseConfigError } from "@/lib/db/errors";
 import type { DatabaseConnection, DatabaseType } from "@/lib/db/types";
 
 // ============================================================================
@@ -144,7 +145,8 @@ describe("LibSQLHranaTransport endpoint", () => {
       ssl: { mode: "require" },
     }).execute("SELECT 1");
 
-    expect(calls[0]?.url).toBe("https://libredb-probe-424-cevheri.aws-eu-west-1.turso.io:443/v2/pipeline");
+    // The URL leaves the scheme's own default port out of its serialization.
+    expect(calls[0]?.url).toBe("https://libredb-probe-424-cevheri.aws-eu-west-1.turso.io/v2/pipeline");
   });
 
   test("brackets an IPv6 literal so the URL stays parseable", async () => {
@@ -165,6 +167,95 @@ describe("LibSQLHranaTransport endpoint", () => {
 
     const headers = new Headers(calls[0]?.init?.headers);
     expect(headers.has("authorization")).toBe(false);
+  });
+
+  // sqld started with SQLD_HTTP_AUTH="basic:<base64(user:password)>" checks a user AND a password, so a
+  // connection that names a user sends the pair as Basic. The encodings are spelled out rather than computed,
+  // so the tests do not share the code they check.
+  test("sends a user and password as HTTP Basic", async () => {
+    await transport({ user: "libsql", password: "libsql-pass" }).execute("SELECT 1");
+
+    const headers = new Headers(calls[0]?.init?.headers);
+    expect(headers.get("authorization")).toBe("Basic bGlic3FsOmxpYnNxbC1wYXNz");
+  });
+
+  test("keeps the bearer token when the user is empty, because an empty user is no user", async () => {
+    await transport({ user: "", password: "tok-123" }).execute("SELECT 1");
+
+    const headers = new Headers(calls[0]?.init?.headers);
+    expect(headers.get("authorization")).toBe("Bearer tok-123");
+  });
+
+  test("sends Basic with an empty password when the user has none, rather than no header", async () => {
+    await transport({ user: "libsql", password: "" }).execute("SELECT 1");
+
+    const headers = new Headers(calls[0]?.init?.headers);
+    expect(headers.get("authorization")).toBe("Basic bGlic3FsOg==");
+  });
+
+  test("encodes a user and password outside ASCII as UTF-8 before base64", async () => {
+    await transport({ user: "kullanıcı", password: "şifre" }).execute("SELECT 1");
+
+    const headers = new Headers(calls[0]?.init?.headers);
+    expect(headers.get("authorization")).toBe("Basic a3VsbGFuxLFjxLE6xZ9pZnJl");
+  });
+
+  // A host is spliced into nothing: one that would rewrite the URL around it is
+  // refused before the transport exists, so no request can carry the token.
+  test.each(["evil.example/steal?", "user@evil.example", "db#x", "db\\evil", "db%2f", "db evil"])(
+    "refuses the host %p before any request is sent",
+    (host) => {
+      expect(() => transport({ host })).toThrow(DatabaseConfigError);
+      expect(calls).toHaveLength(0);
+    },
+  );
+
+  test.each([0, 65536, 1.5, "8080abc"])("refuses the port %p before any request is sent", (port) => {
+    expect(() => transport({ port: port as number })).toThrow(DatabaseConfigError);
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("LibSQLHranaTransport redirects", () => {
+  // Drained like any other answer, so the socket goes back to the pool instead of
+  // being held by a body nobody reads.
+  test("reads the redirect's body before refusing it", async () => {
+    const redirect = new Response("moved", { status: 302, headers: { location: "https://evil.example/" } });
+    handler = () => redirect;
+
+    await expect(transport().execute("SELECT 1")).rejects.toBeInstanceOf(ConnectionError);
+    expect(redirect.bodyUsed).toBe(true);
+  });
+
+  test("asks fetch not to follow a redirect on a pipeline", async () => {
+    await transport().execute("SELECT 1");
+
+    expect(calls[0]?.init?.redirect).toBe("manual");
+  });
+
+  test("refuses a 3xx pipeline response with a ConnectionError naming only the target origin", async () => {
+    handler = () =>
+      new Response("", { status: 308, headers: { location: "https://evil.example:9443/steal?token=SECRET" } });
+
+    const error = await transport()
+      .execute("SELECT 1")
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ConnectionError);
+    expect((error as Error).message).toContain("HTTP 308");
+    expect((error as Error).message).toContain("https://evil.example:9443");
+    expect((error as Error).message).not.toContain("SECRET");
+    expect(calls).toHaveLength(1);
+  });
+
+  // serverVersion answers null for every failure by contract, so a redirect is one
+  // more "no version to show" - but it is still not followed.
+  test("does not follow a redirect from the version route", async () => {
+    handler = () => new Response("", { status: 302, headers: { location: "https://evil.example/version" } });
+
+    expect(await transport().serverVersion()).toBeNull();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.init?.redirect).toBe("manual");
   });
 });
 
@@ -285,6 +376,21 @@ describe("LibSQLHranaTransport value decoding", () => {
     expect(Array.from(decoded as Uint8Array)).toEqual([1, 2, 3]);
   });
 
+  test("decodes a blob as a Buffer, so the JSON that carries it to the browser still holds bytes", async () => {
+    // A plain Uint8Array serialises to `{"0":222,"1":173,...}`, an object no reader can
+    // tell from a document; a Buffer serialises to the form `asBytes` reads.
+    const decoded = await scalar({
+      type: "blob",
+      base64: Buffer.from([0xde, 0xad, 0xbe, 0xef, 0, 0xff]).toString("base64"),
+    });
+    expect(JSON.parse(JSON.stringify({ bin: decoded }))).toEqual({
+      bin: { type: "Buffer", data: [0xde, 0xad, 0xbe, 0xef, 0, 0xff] },
+    });
+    expect(JSON.parse(JSON.stringify({ bin: await scalar({ type: "blob", base64: "" }) }))).toEqual({
+      bin: { type: "Buffer", data: [] },
+    });
+  });
+
   test("passes an unrecognised value type through as null rather than inventing a reading", async () => {
     expect(await scalar({ type: "future-type", value: "x" })).toBeNull();
   });
@@ -334,6 +440,132 @@ describe("LibSQLHranaTransport parameter encoding", () => {
     await transport().execute("SELECT ?", { params: [new Date("2026-08-27T00:00:00.000Z")] });
 
     expect(sentArgs()).toEqual([{ type: "text", value: "2026-08-27T00:00:00.000Z" }]);
+  });
+
+  // --------------------------------------------------------------------------
+  // Sending one back
+  // --------------------------------------------------------------------------
+  //
+  // `decodeInteger` hands a past-2^53 integer back as its decimal STRING, so the
+  // grid's next `UPDATE ... WHERE id = ?` binds that string. Measured 2026-09-18
+  // against sqld 0.24.33 (`ghcr.io/tursodatabase/libsql-server:v0.24.33`), against
+  // a row whose key is 9007199254740993:
+  //
+  //   column declared   | bound as text | bound as an integer
+  //   INTEGER / TEXT    |       matches |             matches
+  //   BLOB / undeclared |   NO MATCH    |             matches
+  //
+  // A column declared BLOB or declared NOTHING has no affinity, so SQLite compares
+  // the operands as they stand and a text never equals an integer - the row the
+  // grid just read reports 0 rows changed. The encoder therefore accepts back
+  // precisely the shape the decoder emits, and nothing else.
+
+  test("encodes the digits of a past-2^53 integer as an integer, the shape the decoder handed out", async () => {
+    await transport().execute("UPDATE t SET a = 1 WHERE id = ?", { params: ["9007199254740993"] });
+
+    expect(sentArgs()).toEqual([{ type: "integer", value: "9007199254740993" }]);
+  });
+
+  test("encodes the digits of a negative past-2^53 integer as an integer too", async () => {
+    await transport().execute("UPDATE t SET a = 1 WHERE id = ?", { params: ["-9007199254740993"] });
+
+    expect(sentArgs()).toEqual([{ type: "integer", value: "-9007199254740993" }]);
+  });
+
+  test("encodes INT64's own limits as integers, the widest row value SQLite can hold", async () => {
+    await transport().execute("SELECT ?, ?", {
+      params: ["9223372036854775807", "-9223372036854775808"],
+    });
+
+    expect(sentArgs()).toEqual([
+      { type: "integer", value: "9223372036854775807" },
+      { type: "integer", value: "-9223372036854775808" },
+    ]);
+  });
+
+  test("leaves a string inside the safe range as text, because the decoder hands those out as numbers", async () => {
+    await transport().execute("SELECT ?, ?", { params: ["7", "9007199254740991"] });
+
+    expect(sentArgs()).toEqual([
+      { type: "text", value: "7" },
+      { type: "text", value: "9007199254740991" },
+    ]);
+  });
+
+  test("leaves leading zeros as text, a shape the decoder cannot emit", async () => {
+    await transport().execute("SELECT ?, ?", { params: ["007", "09007199254740993"] });
+
+    expect(sentArgs()).toEqual([
+      { type: "text", value: "007" },
+      { type: "text", value: "09007199254740993" },
+    ]);
+  });
+
+  test("leaves a leading plus, surrounding space and a trailing .0 as text", async () => {
+    await transport().execute("SELECT ?, ?, ?", {
+      params: ["+9007199254740993", " 9007199254740993", "9007199254740993.0"],
+    });
+
+    expect(sentArgs()).toEqual([
+      { type: "text", value: "+9007199254740993" },
+      { type: "text", value: " 9007199254740993" },
+      { type: "text", value: "9007199254740993.0" },
+    ]);
+  });
+
+  test("leaves exponent form and the empty string as text", async () => {
+    await transport().execute("SELECT ?, ?", { params: ["9e15", ""] });
+
+    expect(sentArgs()).toEqual([
+      { type: "text", value: "9e15" },
+      { type: "text", value: "" },
+    ]);
+  });
+
+  test("leaves digits wider than 64 bits as text, since no row value could match them as a number", async () => {
+    await transport().execute("SELECT ?, ?", {
+      params: ["99999999999999999999", "9223372036854775808"],
+    });
+
+    expect(sentArgs()).toEqual([
+      { type: "text", value: "99999999999999999999" },
+      { type: "text", value: "9223372036854775808" },
+    ]);
+  });
+
+  test("leaves an ordinary textual key alone even when every character is a digit", async () => {
+    await transport().execute("SELECT ?, ?", { params: ["42", "0"] });
+
+    expect(sentArgs()).toEqual([
+      { type: "text", value: "42" },
+      { type: "text", value: "0" },
+    ]);
+  });
+
+  test("is the exact inverse of the decoder: what it reads back is what it sends", async () => {
+    // The one round trip the grid performs, both halves in a single test: read the
+    // key out of a row, then bind that very value back in the WHERE clause.
+    handler = () =>
+      respond(
+        pipeline(
+          okStep({
+            cols: [{ name: "id", decltype: null }],
+            rows: [[{ type: "integer", value: "9007199254740993" }]],
+            affected_row_count: 0,
+            last_insert_rowid: null,
+            rows_read: 1,
+            rows_written: 0,
+            query_duration_ms: 0.01,
+          }),
+        ),
+      );
+
+    const read = await transport().execute("SELECT id FROM t");
+    const key = read.rows[0]?.id;
+    expect(key).toBe("9007199254740993");
+
+    await transport().execute("UPDATE t SET a = 1 WHERE id = ?", { params: [key] });
+    expect(sentArgs(1)).toEqual([{ type: "integer", value: "9007199254740993" }]);
   });
 
   test("sends no args member when the statement has no parameters", async () => {
@@ -440,6 +672,25 @@ describe("LibSQLHranaTransport failures", () => {
     await expect(failure).rejects.toMatchObject({ status: 0 });
     await expect(failure).rejects.toThrow(/connect ECONNREFUSED/);
   });
+
+  // #1431: the reason Node keeps in `cause`, and Bun on the error itself, reaches the message.
+  test("a refused connection names the refusal and the address, on Node and on Bun", async () => {
+    globalThis.fetch = (() =>
+      Promise.reject(
+        new TypeError("fetch failed", { cause: { code: "ECONNREFUSED", address: "127.0.0.1", port: 18081 } }),
+      )) as unknown as typeof fetch;
+    await expect(transport().execute("SELECT 1")).rejects.toThrow(
+      "libSQL request failed: connection refused at 127.0.0.1:18081",
+    );
+
+    globalThis.fetch = (() =>
+      Promise.reject(
+        Object.assign(new TypeError("Unable to connect."), { code: "ConnectionRefused" }),
+      )) as unknown as typeof fetch;
+    await expect(transport().execute("SELECT 1")).rejects.toThrow(
+      "libSQL request failed: connection refused at 127.0.0.1:18081",
+    );
+  });
 });
 
 // ============================================================================
@@ -516,13 +767,14 @@ describe("LibSQLHranaTransport tolerances", () => {
     await transport().execute("SELECT 1", { timeoutMs: 250 });
   });
 
-  test("names a column the engine left unnamed by its position rather than dropping it", async () => {
+  test("names a column the engine left unnamed rather than dropping it", async () => {
     withResult({
-      cols: [{ decltype: null }, { name: "", decltype: "TEXT" }],
+      cols: [{ decltype: null }, { name: "", decltype: "TEXT" }, { name: "column_1", decltype: "INTEGER" }],
       rows: [
         [
           { type: "integer", value: "1" },
           { type: "text", value: "x" },
+          { type: "integer", value: "3" },
         ],
       ],
       affected_row_count: 0,
@@ -530,13 +782,52 @@ describe("LibSQLHranaTransport tolerances", () => {
       query_duration_ms: 0.01,
     });
 
-    const result = await transport().execute("SELECT 1, 'x'");
+    const result = await transport().execute("SELECT 1, 'x' AS \"\", 3 AS column_1");
 
-    expect(result.fieldNames).toEqual(["column_1", "column_2"]);
-    expect(result.rows).toEqual([{ column_1: 1, column_2: "x" }]);
-    // The empty name is not a declared type either: the second column's TEXT
-    // lands under the positional name, never under "".
-    expect(result.columnTypes).toEqual({ column_2: "TEXT" });
+    // A positional `column_1` collided with a column the statement itself named so, and the
+    // later value replaced the earlier one. The unnamed columns are named apart instead.
+    expect(result.fieldNames).toEqual(["(No column name)", "(No column name) (2)", "column_1"]);
+    expect(result.rows).toEqual([{ "(No column name)": 1, "(No column name) (2)": "x", column_1: 3 }]);
+    // The empty name is not a declared type either: the second column's TEXT lands under
+    // its own name, never under "".
+    expect(result.columnTypes).toEqual({ "(No column name) (2)": "TEXT", column_1: "INTEGER" });
+  });
+
+  test("a repeated column name keeps both values and both types", async () => {
+    withResult({
+      cols: [
+        { name: "id", decltype: "INTEGER" },
+        { name: "id", decltype: "TEXT" },
+      ],
+      rows: [
+        [
+          { type: "integer", value: "100" },
+          { type: "text", value: "c1" },
+        ],
+      ],
+      affected_row_count: 0,
+      query_duration_ms: 0,
+    });
+
+    const result = await transport().execute("SELECT o.id, c.id FROM o JOIN c");
+
+    expect(result.fieldNames).toEqual(["id", "id (2)"]);
+    expect(result.rows).toEqual([{ id: 100, "id (2)": "c1" }]);
+    expect(result.columnTypes).toEqual({ id: "INTEGER", "id (2)": "TEXT" });
+  });
+
+  test("a column named __proto__ keeps its declared type as a column of its own", async () => {
+    withResult({
+      cols: [{ name: "__proto__", decltype: "TEXT" }],
+      rows: [[{ type: "text", value: "x" }]],
+      affected_row_count: 0,
+      query_duration_ms: 0,
+    });
+
+    const result = await transport().execute('SELECT v AS "__proto__" FROM t');
+
+    expect(Object.hasOwn(result.columnTypes, "__proto__")).toBe(true);
+    expect(result.columnTypes.__proto__).toBe("TEXT");
   });
 
   test("reads a column declaration that is not a list as no columns at all", async () => {
@@ -547,7 +838,26 @@ describe("LibSQLHranaTransport tolerances", () => {
     expect(result).toMatchObject({ fieldNames: [], rows: [], affectedRowCount: 0, executionTimeMs: 0 });
   });
 
-  test("reads a row that is not a list as a row of nulls, keeping the column count", async () => {
+  test("refuses a row whose value count is not the column count, rather than padding it", async () => {
+    withResult({
+      cols: [{ name: "a" }, { name: "b" }],
+      rows: [
+        [
+          { type: "integer", value: "1" },
+          { type: "integer", value: "2" },
+        ],
+        [{ type: "integer", value: "3" }],
+      ],
+      affected_row_count: 0,
+      query_duration_ms: 0,
+    });
+
+    await expect(transport().execute("SELECT a, b FROM t")).rejects.toThrow(
+      "Row 2 carries 1 values for 2 result columns",
+    );
+  });
+
+  test("refuses a row that is not a list at all", async () => {
     withResult({
       cols: [{ name: "a" }, { name: "b" }],
       rows: [null],
@@ -555,7 +865,9 @@ describe("LibSQLHranaTransport tolerances", () => {
       query_duration_ms: 0,
     });
 
-    expect((await transport().execute("SELECT a, b FROM t")).rows).toEqual([{ a: null, b: null }]);
+    await expect(transport().execute("SELECT a, b FROM t")).rejects.toThrow(
+      "Row 1 carries 0 values for 2 result columns",
+    );
   });
 
   test("decodes a float the protocol quoted, and a text value it did not", async () => {
@@ -682,6 +994,15 @@ describe("LibSQLHranaTransport tolerances", () => {
 
     const headers = new Headers(calls[0]?.init?.headers);
     expect(headers.get("authorization")).toBe("Bearer tok-123");
+  });
+
+  test("sends the Basic credential on the version route as well", async () => {
+    handler = (url) => (url.endsWith("/version") ? new Response("sqld 0.24.33", { status: 200 }) : respond(pipeline()));
+
+    await transport({ user: "libsql", password: "libsql-pass" }).serverVersion();
+
+    const headers = new Headers(calls[0]?.init?.headers);
+    expect(headers.get("authorization")).toBe("Basic bGlic3FsOmxpYnNxbC1wYXNz");
   });
 });
 

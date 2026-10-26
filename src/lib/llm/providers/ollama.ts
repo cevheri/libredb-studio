@@ -4,9 +4,10 @@
  */
 
 import { BaseLLMProvider } from "../base-provider";
+import type { RetryOptions } from "../utils/retry";
 import { type LLMConfig, type LLMStreamOptions, LLMStreamError, LLMConfigError } from "../types";
 import { createStreamFromSSEResponse } from "../utils/streaming";
-import { DEFAULT_API_URLS } from "../utils/config";
+import { DEFAULT_API_URLS, validModelEffort } from "../utils/config";
 import { logger } from "@/lib/logger";
 
 // ============================================================================
@@ -16,9 +17,12 @@ import { logger } from "@/lib/logger";
 export class OllamaProvider extends BaseLLMProvider {
   private baseUrl: string;
 
-  constructor(config: LLMConfig) {
-    super(config);
+  constructor(config: LLMConfig, retryOptions?: RetryOptions) {
+    super(config, retryOptions);
     this.baseUrl = config.apiUrl ?? DEFAULT_API_URLS.ollama;
+    // Here as well as in validate(), because nothing on the chat surface calls validate() for this
+    // provider: a reasoning effort it never sends must not be accepted in silence.
+    validModelEffort(config);
   }
 
   /**
@@ -28,25 +32,29 @@ export class OllamaProvider extends BaseLLMProvider {
     if (!this.config.model || this.config.model.trim() === "") {
       throw new LLMConfigError("Model name is required for Ollama provider.", "ollama");
     }
+    validModelEffort(this.config);
   }
 
   /**
    * Stream completion from Ollama
    */
   public async stream(options: LLMStreamOptions): Promise<ReadableStream<Uint8Array>> {
-    return this.streamWithRetry(async () => {
-      const model = this.getModel(options);
-      const messages = this.buildMessages(options);
+    return this.streamWithRetry(
+      async () => {
+        const model = this.getModel(options);
+        const messages = this.buildMessages(options);
 
-      try {
-        const response = await this.fetchStream(model, messages, options);
-        await this.validateResponse(response);
+        try {
+          const response = await this.fetchStream(model, messages, options);
+          await this.validateResponse(response);
 
-        return createStreamFromSSEResponse(response, "ollama");
-      } catch (error) {
-        throw this.mapError(error);
-      }
-    });
+          return createStreamFromSSEResponse(response, "ollama");
+        } catch (error) {
+          throw this.mapError(error);
+        }
+      },
+      { signal: options.signal },
+    );
   }
 
   /**
@@ -81,6 +89,7 @@ export class OllamaProvider extends BaseLLMProvider {
         ...(options.temperature !== undefined && { temperature: options.temperature }),
         ...(options.maxTokens !== undefined && { max_tokens: options.maxTokens }),
       }),
+      signal: options.signal,
     });
 
     return response;

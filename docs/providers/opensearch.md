@@ -8,6 +8,8 @@
 > implementation serves both type-ids**, and the two documents deliberately disagree wherever the two
 > products do.
 
+`DB_HTTP_BLOCK_PRIVATE_HOSTS=true` blocks loopback, private, link-local and other non-public HTTP destinations; it is off by default so local connections work.
+
 | | |
 |---|---|
 | **Status** | Implemented & shipped |
@@ -58,7 +60,7 @@ Three things are OpenSearch-shaped:
 
 | `DatabaseProvider` slot | OpenSearch realisation | Mechanism |
 |---|---|---|
-| "Table" (`TableSchema`) | An **index**, displayed by its bare name | `GET /_cat/indices?format=json&bytes=b` |
+| "Table" (the relation kind) | An **index**, displayed by its bare name | `GET /_cat/indices?format=json&bytes=b` |
 | "Row" | A **document** | One positional array element in `datarows` |
 | Columns | The index's **mapped fields**, flattened to dotted paths, mapping types verbatim | `GET /<index>/_mapping` |
 | Primary key | none — nothing a mapping declares is unique. `_id` *is* selectable here (measured, unlike upstream) but it is metadata rather than a mapped field | `isPrimary: false` on every column |
@@ -78,9 +80,9 @@ Three things are OpenSearch-shaped:
 
 One directory serves **two type-ids**. Everything the two products disagree about on the wire is a row
 in the transport's dialect table
-([http-transport.ts:357-409](../../src/lib/db/providers/sql/search/http-transport.ts)) and everything
+(`DIALECTS`, [http-transport.ts](../../src/lib/db/providers/sql/search/http-transport.ts)) and everything
 they disagree about above it is one field of `SearchProduct`
-([index.ts:211](../../src/lib/db/providers/sql/search/index.ts)):
+([index.ts](../../src/lib/db/providers/sql/search/index.ts)):
 
 ```
 src/lib/db/providers/sql/
@@ -110,13 +112,13 @@ BaseDatabaseProvider (abstract, base-provider.ts)
         ^
 SQLBaseProvider (abstract, sql-base.ts)
         ^
-SearchProvider (abstract, search/index.ts:367)   <- not exported
+SearchProvider (abstract, search/index.ts)   <- not exported
         ^
-OpenSearchProvider (search/index.ts:967)         ElasticsearchProvider (search/index.ts:953)
+OpenSearchProvider (search/index.ts)            ElasticsearchProvider (search/index.ts)
 ```
 
 `OpenSearchProvider` is thin by construction — it names its product and nothing else
-([index.ts:959-971](../../src/lib/db/providers/sql/search/index.ts)) — and the one behaviour it does
+([index.ts](../../src/lib/db/providers/sql/search/index.ts)) — and the one behaviour it does
 **not** share with upstream is that its grammar accepts `OFFSET`, which is declared as a trait
 (`acceptsOffsetClause: true`) rather than branched on
 ([§5.5](#55-offset-works-here-which-is-why-paging-does)).
@@ -127,15 +129,18 @@ OpenSearchProvider (search/index.ts:967)         ElasticsearchProvider (search/i
 |---|---|
 | `buildLimitClause()` | **Both** forms are correct here: `LIMIT n` and `LIMIT n OFFSET m` (measured, HTTP 200). So the shared limiter is right unmodified and `prepareQuery()` never refuses anything on this product ([§5.5](#55-offset-works-here-which-is-why-paging-does)) |
 | `prepareQuery()` (base) | The shared query limiter, used as inherited |
-| `escapeIdentifier()` | Inherited and **never called** — this provider builds no SQL of its own, because the schema comes from the mapping rather than from a statement. Worth knowing that its default branch would double-quote, which is **wrong for this product** ([§5.4](#54-dialect-traps-a-user-will-hit)); the codebase's own quoter gets it right instead ([`identifier.ts:36`](../../src/lib/sql/identifier.ts)) |
-| `getPlaceholder()` | Inherited and never reached: positional parameters are refused outright ([§3.11](#311-positional-parameters-are-refused-not-emulated)) |
+| `escapeIdentifier()` | Inherited and **never called** — this provider builds no SQL of its own, because the schema comes from the mapping rather than from a statement. Worth knowing that its default branch would double-quote, which is **wrong for this product** ([§5.4](#54-dialect-traps-a-user-will-hit)); the codebase's own quoter gets it right instead ([`quoteIdentifier()`](../../src/lib/sql/identifier.ts)) |
 | `measureExecution()` / `trackQuery()` | The measured duration is the only timing in existence — neither the body nor the headers carry one |
 | `shouldEnableSSL()` | Inherited but **never called**. TLS comes from the connection's own `ssl` config only ([§4.3](#43-tls)) |
 
+Not in the list: a placeholder helper. `SQLBaseProvider` no longer has one (#304 removed it).
+Positional parameters are refused outright
+([§3.11](#311-positional-parameters-are-refused-not-emulated)).
+
 ### 2.4 Registration & lifecycle
 
-The factory wires the type-id in via a dynamic import
-([factory.ts:123](../../src/lib/db/factory.ts)):
+The factory wires the type-id in via a dynamic import inside `createDatabaseProvider()`
+([`factory.ts`](../../src/lib/db/factory.ts)):
 
 ```ts
 case "opensearch": {
@@ -144,7 +149,7 @@ case "opensearch": {
 }
 ```
 
-`connect()` ([index.ts:536](../../src/lib/db/providers/sql/search/index.ts)) proves the cluster with
+`connect()` ([index.ts](../../src/lib/db/providers/sql/search/index.ts)) proves the cluster with
 one `SELECT 1` — measured HTTP 200, one column named `1` of type `integer`. It needs no index, so it
 also succeeds on a cluster holding nothing yet. It proves the **product** as well as the port: pointing
 an `opensearch` connection at an upstream node fails at the connection form, because
@@ -182,7 +187,7 @@ dependency ([§4.3](#43-tls)).
 ### 3.2 The transport seam: one interface, one implementation, two dialects
 
 Provider logic never calls `fetch`. It goes through `SearchTransport`
-([transport.ts:230](../../src/lib/db/providers/sql/search/transport.ts)) — five calls, each answering
+([transport.ts](../../src/lib/db/providers/sql/search/transport.ts)) — five calls, each answering
 one question:
 
 ```ts
@@ -197,7 +202,7 @@ interface SearchTransport {
 ```
 
 `dialect` is the **only** product distinction that crosses it, and
-[transport.ts:46-55](../../src/lib/db/providers/sql/search/transport.ts) is explicit that it may pick a
+the docblock on `SearchDialectId` ([transport.ts](../../src/lib/db/providers/sql/search/transport.ts)) is explicit that it may pick a
 word and never a behaviour. `http-transport.ts` holds itself to the stronger rule that no method
 branches on `this.dialect` at all — it reads `this.spec`, one row of the dialect table — so the whole
 product difference is data:
@@ -221,7 +226,7 @@ product difference is data:
 > every source in the directory with the TypeScript compiler API — not a grep — and fails the build the
 > moment any of it appears elsewhere. This fork forces the guard to be narrower than Couchbase's or
 > Druid's, because its envelope keys are ordinary English that the **neutral** seam legitimately uses:
-> `schema` and `size` are simultaneously wire keys here and `options.schema` / `TableSchema.size`
+> `schema` and `size` are simultaneously wire keys here and `options.schema` / `DatabaseObject.sizeBytes`
 > everywhere else, so those words are matched only as exact **string literals** — the spelling envelope
 > *parsing* produces — and a bare property access is left alone.
 
@@ -249,16 +254,18 @@ Four properties the code depends on:
 - **The alias is a separate member.** Upstream declares `{"name":"who"}` for the same statement — the
   alias *is* the name there — so reading `name` alone would label this column `customer`, which is a
   **wrong** label rather than a missing one. `describeColumns()`
-  ([http-transport.ts:509](../../src/lib/db/providers/sql/search/http-transport.ts)) prefers the alias
+  ([http-transport.ts](../../src/lib/db/providers/sql/search/http-transport.ts)) prefers the alias
   when the dialect declares an `aliasKey`, and the alias is what the user typed, so it is what the grid
   must show.
+  An alias that is present but not text (an object, a number) is refused with an engine error, as a name that is not text is, rather than passed over for the name the user aliased away; a `null` alias is no alias, and the name stands.
 - **Rows are positional**, so each row is rebuilt against the declared column list rather than read as
-  an object; the declared **order** is authoritative in a way object keys never are.
-- **A duplicate output name is REFUSED, not disambiguated.** Measured, `SELECT 1 AS c, 2 AS c` answers
+  an object; the declared **order** is authoritative in a way object keys never are, and a row whose
+  value count differs from the declaration is refused rather than padded with nulls or cut.
+- **A duplicate output name is REFUSED, not numbered.** Measured, `SELECT 1 AS c, 2 AS c` answers
   HTTP 400, `IllegalArgumentException`, "Multiple entries with same key: c=2 and c=1" — where upstream
   answers 200 with two columns named `c`. So the seam's uniqueness invariant is load-bearing on exactly
-  one of the two products, and `disambiguate()`
-  ([http-transport.ts:489](../../src/lib/db/providers/sql/search/http-transport.ts)) can never fire
+  one of the two products, and the numbering in `uniqueFieldNames()`
+  ([result-fields.ts](../../src/lib/db/utils/result-fields.ts)) can never fire
   here. That is a fact about this engine, not dead code.
 - **`total` and `size` accompany every answer**, so `SearchQueryResult.totalHits` is a real number here
   and `null` upstream. It is deliberately **not used** by the provider
@@ -271,7 +278,7 @@ classifies a failure here either ([§3.6](#36-two-fault-vocabularies-in-one-clus
 
 Both products spell the paging token `cursor`, and the transport follows it until the engine stops
 sending one, bounded by `MAX_PAGES = 1000`
-([http-transport.ts:151](../../src/lib/db/providers/sql/search/http-transport.ts)). The measurement
+([http-transport.ts](../../src/lib/db/providers/sql/search/http-transport.ts)). The measurement
 that made this necessary came from upstream — an aggregation over 1500 distinct values answered 1000
 rows plus a cursor with no page size ever requested, and page two carried **no column declaration** —
 so the loop carries page one's declaration forward and rebuilds later pages against it
@@ -304,14 +311,14 @@ Three consequences, all deliberate:
 
 - **A missing index is 404 here and 400 upstream** — the same typo, two statuses — while a user's own
   arithmetic answers 500 upstream. So categorisation is **body-driven** everywhere in this provider
-  ([transport.ts:26-32](../../src/lib/db/providers/sql/search/transport.ts)), the
+  (the file docblock in [transport.ts](../../src/lib/db/providers/sql/search/transport.ts)), the
   ClickHouse lesson from #264 arriving again.
 - **A mistyped leading keyword is `unsupported` here and `syntax` upstream**, because that is what each
   engine claims about it. The asymmetry is not papered over: `unsupported` is mapped to `QueryError`
   rather than to a configuration error for exactly this reason — it describes a statement problem, not
   a deployment one ([§10](#10-error-handling)).
-- **`ParserException` is matched by SHAPE**, not by name (`syntaxTypePattern: /ParserException$/`,
-  [http-transport.ts:408](../../src/lib/db/providers/sql/search/http-transport.ts)). Two members of
+- **`ParserException` is matched by SHAPE**, not by name (`syntaxTypePattern: /ParserException$/` in
+  `DIALECTS`, [http-transport.ts](../../src/lib/db/providers/sql/search/http-transport.ts)). Two members of
   that family were measured and the grammar has several, so matching the suffix means a third is
   classified correctly the first time a user hits it rather than reported as an engine fault. Anything
   the table has never seen becomes `engine` — "reached, understood, and refused" — rather than a guess.
@@ -319,7 +326,7 @@ Three consequences, all deliberate:
 **The useful text is in `details`, not in `reason`.** Measured, `reason` is the literal constant
 `"Invalid SQL query"` for a mistyped keyword, an unknown column and an unparseable LIMIT alike, while
 `details` holds the sentence that names the fault. So `faultMessage()`
-([http-transport.ts:600](../../src/lib/db/providers/sql/search/http-transport.ts)) prefers `details`
+([http-transport.ts](../../src/lib/db/providers/sql/search/http-transport.ts)) prefers `details`
 here and falls back to `reason`, and it strips one trailing sentence:
 
 ```json
@@ -331,7 +338,7 @@ here and falls back to `reason`, and it strips one trailing sentence:
 
 That footer instructs the reader to re-send the request in another format to see the raw engine
 response — advice about this product's REST API, not about the statement the user just wrote — so it is
-removed ([`OPENSEARCH_DETAILS_FOOTER`, http-transport.ts:246](../../src/lib/db/providers/sql/search/http-transport.ts)).
+removed (`OPENSEARCH_DETAILS_FOOTER`, [http-transport.ts](../../src/lib/db/providers/sql/search/http-transport.ts)).
 Everything else is carried through **verbatim**, because the engine's own wording is the only text that
 tells a user which part of their statement is wrong.
 
@@ -353,11 +360,16 @@ rather than later on a query.
 security plugin disabled and a bogus `Basic` header is *ignored* there (HTTP 200, measured), so no
 401/403 body could be captured — and rather than invent one, the code uses the one signal whose
 meaning HTTP itself fixes
-([http-transport.ts:64-68](../../src/lib/db/providers/sql/search/http-transport.ts)).
+(the file docblock in [http-transport.ts](../../src/lib/db/providers/sql/search/http-transport.ts)).
+The transport is shared with Elasticsearch, which reuses 403 for a closed index
+(`cluster_block_exception`, #1413), so a 401/403 whose body is an `error` object naming a type that
+is not a security one is classified by that type instead, with the engine's reason. A test pass on
+2026-10-03/04 found OpenSearch already reporting the same closed-index read with its own
+`IndexClosedException` text, so nothing changes for it.
 
 ### 3.8 The deadline is the client's, and only the client's
 
-`deadline()` ([index.ts:609](../../src/lib/db/providers/sql/search/index.ts)) is one
+`deadline()` ([index.ts](../../src/lib/db/providers/sql/search/index.ts)) is one
 `AbortSignal.timeout(this.queryTimeout)` **per operation**, not per request — the monitoring reads
 below fan out several requests for one panel, and a panel that renders half its numbers after a stall
 is not a better answer than one that reports the stall.
@@ -371,7 +383,7 @@ deliberately not implemented.
 which is the one signal that tells a deadline apart from a user's cancellation — measured on Node 24
 and Bun, the thrown value cannot: `controller.abort(new Error("x"))` throws that Error verbatim, with
 nothing abort-shaped about it. `requestFailure()`
-([http-transport.ts:707](../../src/lib/db/providers/sql/search/http-transport.ts)) therefore consults
+([http-transport.ts](../../src/lib/db/providers/sql/search/http-transport.ts)) therefore consults
 `signal.aborted` **before** the thrown value.
 
 ### 3.9 Columns are labelled with mapping types, not SQL types
@@ -379,7 +391,7 @@ nothing abort-shaped about it. `requestFailure()`
 Measured: `SELECT customer, total FROM probe_orders` declares `keyword` and `double` — not `VARCHAR`
 and `DOUBLE`. That is the vocabulary a user wrote in their own index mapping, and it is the **same**
 vocabulary `mapping()` reports, which keeps the result grid and the schema tree speaking one language
-([transport.ts:92-104](../../src/lib/db/providers/sql/search/transport.ts)). A column whose declaration
+(`SearchQueryResult.columnTypes`, [transport.ts](../../src/lib/db/providers/sql/search/transport.ts)). A column whose declaration
 carried no type name is **left out** of `columnTypes` rather than given a placeholder.
 
 ### 3.10 No EXPLAIN: the statement form is refused
@@ -404,7 +416,7 @@ The endpoint really does bind them — measured,
 upstream spells the same request differently (a bare `params` array), the seam carries the **statement
 alone**, and inlining the values here to work around that would be building a SQL-injection site
 inside a provider. `query()` therefore throws a `QueryError` when `params` is non-empty
-([index.ts:625](../../src/lib/db/providers/sql/search/index.ts)), the same call
+([index.ts](../../src/lib/db/providers/sql/search/index.ts)), the same call
 `clickhouse/index.ts` makes for the same reason (#264). `positionalPlaceholder()` in
 [`src/lib/sql/values.ts`](../../src/lib/sql/values.ts) returns `null` for this dialect to match, so no
 shared generator emits a `?` this provider would then decline to fill.
@@ -416,13 +428,14 @@ shared generator emits a `?` this provider would then decline to fill.
 ### 4.1 Configuration fields
 
 The form offers exactly four fields
-([`db-ui-config.ts:162`](../../src/lib/db-ui-config.ts)): `host`, `port`, `user`, `password`.
+(the `opensearch` entry in [`connection-form.ts`](../../src/lib/db/connection-form.ts)): `host`, `port`, `user`, `password`.
 
 | Field | Required | Notes |
 |---|---|---|
-| `host` | **Yes** | `validate()` ([index.ts:529](../../src/lib/db/providers/sql/search/index.ts)) throws `DatabaseConfigError` — "OpenSearch requires a host" |
-| `port` | No | Defaults to `9200` ([index.ts:151](../../src/lib/db/providers/sql/search/index.ts)); the fork kept the upstream port. The container fixture publishes **9201** on the host, which is a collision on that machine rather than a fact about the product |
+| `host` | **Yes** | `validate()` ([index.ts](../../src/lib/db/providers/sql/search/index.ts)) throws `DatabaseConfigError` — "OpenSearch requires a host" |
+| `port` | No | Defaults to `9200` (`SEARCH_DEFAULT_PORT`, [index.ts](../../src/lib/db/providers/sql/search/index.ts)); the fork kept the upstream port. The container fixture publishes **9201** on the host, which is a collision on that machine rather than a fact about the product |
 | `user` / `password` | No | Sent as HTTP Basic **only when `user` is set**, for the security plugin. Measured with the plugin disabled: a bogus `Basic` header is *ignored* (HTTP 200), so credentials are genuinely optional. Note that a **default** distribution enables the plugin, serves HTTPS with a self-signed certificate and requires an admin password — see [§4.3](#43-tls) |
+| `apiKeyId` / `apiKeySecret` | — | **Not offered, and refused if set.** Elasticsearch's `Authorization: ApiKey` scheme ([elasticsearch.md §3.7a](./elasticsearch.md#37a-api-key-auth-708)). Nothing here has measured whether this product's security plugin accepts it, so a seed or stored connection that carries the pair is refused (`DatabaseConfigError`) rather than sent as Basic or as a guessed header. The seed schema and the seed projection refuse it the same way, so it cannot list as a connection that silently falls back. |
 | `ssl` | No | Any mode but `disable` switches the transport to `https` ([§4.3](#43-tls)) |
 | `database` | — | **Not offered, and ignored if set** — see below |
 
@@ -430,7 +443,7 @@ The form offers exactly four fields
 this product's own SQL says so: `SHOW TABLES LIKE %` answers `TABLE_CAT` `docker-cluster` with
 `TABLE_SCHEM` **null** (measured). So a database selector would be a control with no effect, and worse,
 one implying a scoping decision the user does not have. The monitoring rows carry an **empty** schema
-name for the same reason ([index.ts:167](../../src/lib/db/providers/sql/search/index.ts)), which
+name for the same reason (`SEARCH_SCHEMA_NAME`, [index.ts](../../src/lib/db/providers/sql/search/index.ts)), which
 renders as no prefix at all — and doubles as the only value the schema filter can match, so a caller
 asking for `public` gets no rows rather than every row.
 
@@ -456,12 +469,12 @@ shared parser could round-trip), and **`http://` / `https://` are already claime
 `connection-string-parser.ts` is therefore **not touched** by this provider. The consequence is
 recorded rather than hidden — pasting `http://localhost:9201` selects ClickHouse — and the
 connection-form hook's unparseable-string message deliberately omits both search ids
-([`use-connection-form.ts:376`](../../src/hooks/use-connection-form.ts)).
+(`handlePasteConnectionString` in [`use-connection-form.ts`](../../src/hooks/use-connection-form.ts)).
 
 ### 4.3 TLS
 
 `config.ssl` with any `mode` but `disable` switches the transport from `http` to `https`
-([http-transport.ts:819](../../src/lib/db/providers/sql/search/http-transport.ts)). `ssl` is a
+(`SearchHttpTransport`'s constructor, [http-transport.ts](../../src/lib/db/providers/sql/search/http-transport.ts)). `ssl` is a
 first-class `DatabaseConnection` field and independent of the form's `connectionFields`, so it applies
 even though this form shows no TLS row of its own, and an explicit `disable` turns TLS **off** as
 firmly as an explicit mode turns it on (the #264 lesson).
@@ -487,7 +500,33 @@ switch, not the upstream key: the plugin is *installed* rather than a licensed f
 disabled by name.
 
 An IPv6 literal host is bracketed before it becomes a URL authority
-([http-transport.ts:431](../../src/lib/db/providers/sql/search/http-transport.ts)).
+([`validateHost()`](../../src/lib/db/http/endpoint.ts), which the transport's constructor reaches
+through `httpOrigin()`).
+
+
+### 4.4 Endpoint validation and redirects
+
+`host` and `port` are validated when the transport is constructed, which happens in `connect()`, so
+a bad value fails Test Connection and never a capability read. A host must be a hostname, an IPv4
+address or an IPv6 address (bracketed or not), and a port must be an integer from 1 to 65535.
+Anything else is a `DatabaseConfigError` that names the field and does not repeat the value.
+Every request URL is built by the shared [`endpoint.ts`](../../src/lib/db/http/endpoint.ts) with
+`URL` and `URLSearchParams` and checked against the intended hostname, port and path before it is
+sent, so no value can move a request to another path or another server. A scheme's default port
+(80 for `http`, 443 for `https`) is left out of the URL the way `URL` serializes it.
+
+Redirects are not followed. Every request sets `redirect: "manual"`, and a 3xx answer becomes a
+`ConnectionError` naming the status and only the origin of its `Location`, since a followed
+redirect would take the Basic credential and the statement to wherever the server pointed.
+
+### Connection string
+
+`opensearch` has no connection string scheme, no `readTls` and no seed load check: every field of its row in `CONNECTION_STRING` is `null` ([`opensearch-connection-string.ts`](../../src/lib/db/providers/sql/search/opensearch-connection-string.ts)).
+
+### Execution UI
+
+The rolled-back notice names `COMMIT` as the keyword that keeps an open transaction, and `opensearch` has no consent deadline, so the agent's consent card shows no deadline chip or sentence for it.
+Its row in `EXECUTION_UI` is declared in [`opensearch-execution-ui.ts`](../../src/lib/db/providers/sql/search/opensearch-execution-ui.ts).
 
 ---
 
@@ -495,7 +534,7 @@ An IPv6 literal host is bracketed before it becomes a URL authority
 
 ### 5.1 Execution
 
-`query(sql, params?)` ([index.ts:625](../../src/lib/db/providers/sql/search/index.ts)) sends one
+`query(sql, params?)` ([index.ts](../../src/lib/db/providers/sql/search/index.ts)) sends one
 statement under the client deadline from [§3.8](#38-the-deadline-is-the-clients-and-only-the-clients):
 
 ```ts
@@ -509,11 +548,11 @@ error message, which is more useful than anything substituted here
 
 ### 5.2 Result shaping
 
-`toQueryResult()` ([index.ts:275](../../src/lib/db/providers/sql/search/index.ts)):
+`toQueryResult()` ([index.ts](../../src/lib/db/providers/sql/search/index.ts)):
 
 | Source | `QueryResult` field | Notes |
 |---|---|---|
-| `datarows` | `rows` | Rebuilt from the positional arrays, keyed by the declared names |
+| `datarows` | `rows` | Rebuilt from the positional arrays, keyed by the declared names; an integer past 2^53 arrives as its exact digits (see below) |
 | `schema[].alias ?? schema[].name` | `fields` | Declared order; the **alias wins** ([§3.4](#34-the-success-envelope-schemadatarows-a-separate-alias-and-a-count)) |
 | — | `rowCount` | `rows.length`. There is no second number: no statement here reaches a document, so a mutation count could only ever be zero |
 | the measured exchange | `executionTime` | Rounded milliseconds, **measured by this process**. Neither the body nor the headers carry any timing |
@@ -527,7 +566,7 @@ on the other for identical statements — and it would restate what the route's 
 tells the UI (`hasMore`, `limit`, `offset`). A caveat attached to every ordinary query is the fastest
 way to train a user to ignore the ones that matter, which is the argument [druid.md](./druid.md) makes
 about its own warnings. The count is dropped knowingly; `docs/BACKLOG.md` is where it belongs if a
-surface for it ever exists ([index.ts:260-269](../../src/lib/db/providers/sql/search/index.ts)).
+surface for it ever exists (the docblock on `toQueryResult()`, [index.ts](../../src/lib/db/providers/sql/search/index.ts)).
 
 ### 5.3 A container field comes back as its sub-document
 
@@ -546,7 +585,7 @@ container named **explicitly** there is a hard `verification_exception` ("Cannot
 type [object] only its subfields"). On an index whose mapping is *only* container and unsupported types
 that expansion leaves nothing at all — `{"columns":[],"rows":[[]]}`, which is one of the two reasons
 the schema never comes from a statement
-([introspect.ts:9-16](../../src/lib/db/providers/sql/search/introspect.ts)).
+(the file docblock in [introspect.ts](../../src/lib/db/providers/sql/search/introspect.ts)).
 
 This provider does **not** exploit the permissiveness: containers are excluded from the schema tree on
 both products, because a starter query that works on one and fails on the other is worse than one that
@@ -554,7 +593,18 @@ works on both ([§6](#6-schema-introspection)). A statement the user types thems
 exactly as this engine serves it — an object cell simply arrives as a JSON object in the grid, with the
 mapping type (`object`, `nested`) as its label.
 
-No value rewriting happens anywhere in this provider.
+One value rewrite happens in this provider, and only for row values. A `long` arrives in `datarows`
+as an **unquoted** JSON number, and `JSON.parse` rounds one past 2^53 with no error: measured on
+3.9.0 on 2026-10-04, `9223372036854775807` and `9007199254740993` were shown as
+`9223372036854776000` and `9007199254740992` in the grid, the API and every export. The SQL answer and
+each cursor page therefore go through
+[`quoteUnsafeIntegers`](../../src/lib/db/utils/json-integers.ts) before they are parsed
+(`parseRowsJson` in
+[`http-transport.ts`](../../src/lib/db/providers/sql/search/http-transport.ts)), so such a value
+reaches the grid as its exact digits, a string, the way Druid's and Trino's transports hand one over.
+An integer inside the safe range, and every float, stays a number. The REST reads (mappings,
+listings, object definitions) are parsed as before, which is why the object source still re-spells a
+long past 2^53 (D61).
 
 ### 5.4 Dialect traps a user will hit
 
@@ -576,14 +626,14 @@ The second is worse than an error: it returns the **literal string** `customer` 
 predicate written that way (`WHERE "customer" = 'acme'`) compares two literals and answers 0 rows with
 no failure at all. Backticks are the identifier form here — `` SELECT customer FROM `probe_orders` ``
 is HTTP 200 — which is why `opensearch` shares MySQL's branch in
-[`src/lib/sql/identifier.ts:36`](../../src/lib/sql/identifier.ts) while `elasticsearch` sits in the
+[`quoteIdentifier()`](../../src/lib/sql/identifier.ts) while `elasticsearch` sits in the
 double-quote default (it answers a backtick with *"backquoted identifiers not supported; please use
 double quotes instead"*). The two search ids genuinely cannot share a quoting branch.
 
 **`[…]` is also an identifier quote**, MySQL/SQL-Server style: `SELECT [customer] FROM probe_orders`
 answers the field's value, while `SELECT [1, 2]` is refused with "All items between Brackets should be
 identifiers, got:LITERAL_INT". So `OPENSEARCH_GRAMMAR.bracket` is `"quoted-identifier"`
-([`grammar.ts:199`](../../src/lib/sql/grammar.ts)) — where `elasticsearch` leaves it at the default,
+([`opensearch-sql-grammar.ts`](../../src/lib/db/providers/sql/search/opensearch-sql-grammar.ts)), where `elasticsearch` leaves it at the default,
 because `[` has no meaning in that grammar at all.
 
 **`#` really is a line comment**, and this is where the fork's SQL plugin parts company with upstream.
@@ -600,7 +650,8 @@ confirmation gate reads a statement's spans to decide whether a write is hiding 
 an unreadable span is a **prompt** rather than silence.
 
 **A trailing semicolon is accepted.** `SELECT 1;` is HTTP 200 here and a `parsing_exception` upstream —
-so the generated statement (`SELECT * FROM probe_orders LIMIT 50;`) ran on this product and failed on
+so the generated statement, which at the time of that measurement was
+`SELECT * FROM probe_orders LIMIT 50;`, ran on this product and failed on
 the other ([elasticsearch.md §5.4](./elasticsearch.md#54-dialect-traps-a-user-will-hit)). This product
 nevertheless declares `statementTerminator: "none"` along with the upstream one, because the absence of
 the terminator is accepted **here too** (measured) and one answer that runs on both beats a branch on
@@ -610,13 +661,17 @@ the terminator is accepted **here too** (measured) and one answer that runs on b
 `SELECT 'a\'b'` → `a'b` too, so a backslash escapes the quote; `SELECT 'a\\b'` → one backslash, so it
 escapes itself; and `SELECT 'a\'` is a `ParserException`, because the trailing backslash escaped the
 closing quote and left the literal open — which is exactly the defect #290 is about. Hence
-`opensearch: "double-and-backslash"` in [`src/lib/sql/values.ts:55`](../../src/lib/sql/values.ts),
-where `elasticsearch` is `"standard"` (a backslash there is data).
+`escapeLiteral: literalDoubleAndBackslash` in `OPENSEARCH_SQL_WRITING` ([`opensearch-sql-writing.ts`](../../src/lib/db/providers/sql/search/opensearch-sql-writing.ts)),
+where `elasticsearch` takes `literalStandard` (a backslash there is data).
 
 **`_id` is selectable here.** `SELECT _id FROM probe_orders` returns the document id; upstream answers
 "Unknown column [_id]". It is still not reported as a column or as a key, because it is metadata rather
 than a mapped field and because the same statement is not portable to the sibling type-id
 ([§6](#6-schema-introspection)).
+
+**Multi-valued fields stay multi-valued.** Measured on 3.8.0: `SELECT tags FROM arrprobe`
+returns the complete array in the result cell with an ordinary SQL request. No additional query option
+is required.
 
 **Block comments do not nest**, same as upstream: `SELECT /* a /* b */ 1 AS a` is HTTP 200, so the
 first `*/` closed the run.
@@ -629,8 +684,8 @@ asks for. Upstream refuses it outright (`parsing_exception`, "mismatched input '
 type-ids.
 
 It is declared as a trait, `acceptsOffsetClause: true`
-([index.ts:239-243](../../src/lib/db/providers/sql/search/index.ts)), and read by `prepareQuery()`
-alone ([index.ts:505](../../src/lib/db/providers/sql/search/index.ts)) — which therefore **never
+(`acceptsOffsetClause` on `OPENSEARCH_PRODUCT`, [index.ts](../../src/lib/db/providers/sql/search/index.ts)), and read by `prepareQuery()`
+alone ([index.ts](../../src/lib/db/providers/sql/search/index.ts)) — which therefore **never
 refuses anything on this product** and returns exactly what the inherited limiter produced. A method
 that asked `this.dialect === "opensearch"` would be the thing both the seam's rule and `CLAUDE.md`
 exist to prevent; a method that reads `this.product.acceptsOffsetClause` states which capability it
@@ -659,16 +714,16 @@ statement form exists and the setting does not permit it.
 
 Consequences elsewhere in the product:
 
-- `supportsCreateTable: false` and `supportsInlineRowEdit: false` are facts about the grammar, not
+- Declaring no `createTable` and `supportsInlineRowEdit: false` are facts about the grammar, not
   unimplemented features, so the EDIT toggle and the editable cell are not offered (#269).
 - The schema-diff migration generator emits, in place of a column change: *"OpenSearch SQL reads only;
   change a field by reindexing into an index whose mapping declares it."*
-  (the `NO_COLUMN_MODIFICATION` table in
-  [`migration-generator.ts`](../../src/lib/schema-diff/migration-generator.ts)). It says *reindex*
+  (the `OPENSEARCH_MIGRATION_DDL` refusal in
+  [`opensearch-migration-ddl.ts`](../../src/lib/db/providers/sql/search/opensearch-migration-ddl.ts)). It says *reindex*
   rather than "use the mapping API" because an existing field's type cannot be changed in place at
   all, even outside SQL.
 - `schemaRefreshPattern` is `\b(DELETE)\b`
-  ([index.ts:193](../../src/lib/db/providers/sql/search/index.ts)) and **this is the product it exists
+  (`SEARCH_SCHEMA_REFRESH_PATTERN`, [index.ts](../../src/lib/db/providers/sql/search/index.ts)) and **this is the product it exists
   for**: a cluster that switches DELETE on really does change the per-index document counts this
   provider reports, so a statement matching it refreshes the schema. Upstream has no DELETE in its
   grammar at all, so there the pattern never fires — exactly as Druid's `INSERT|REPLACE` never fires
@@ -677,16 +732,51 @@ Consequences elsewhere in the product:
 Documents otherwise change through the document APIs (`_doc`, `_bulk`, `_delete_by_query`), which this
 seam does not expose.
 
+### 5.7 `endOpenQueryTransaction()` is absent, and which absence it is (D75)
+
+The optional provider surface that ends a transaction a statement left open on the session
+`query()` runs on ([`types.ts`](../../src/lib/db/types.ts), implemented on `postgres`, `sqlite`,
+`duckdb` and `redis`) is **not implemented here, because the engine has no transaction to leave open.**
+
+What was read, and measured verbatim on OpenSearch 3.8.0 through this provider:
+
+- The grammar has no transaction verb. `BEGIN`, `START TRANSACTION`, `COMMIT` and `ROLLBACK` are each
+  refused with "Query must start with SELECT, DELETE, SHOW or DESCRIBE: `<verb>`"
+  (`SQLFeatureNotSupportedException`, HTTP 400), and a `SELECT 1` on the same provider straight
+  afterwards still answers.
+- There is no session for one to live on either. The transport is one stateless
+  `POST /_plugins/_sql` per statement
+  ([`http-transport.ts`](../../src/lib/db/providers/sql/search/http-transport.ts)); the only
+  server-side state it ever holds is a paging cursor, which it closes on the way out.
+
+`DELETE` being in this grammar (§5.6) does not change the answer: the fork's `DELETE` is a
+`_delete_by_query` in SQL clothing, not a statement inside a transaction.
+
+So there is nothing for the route to end, and the absence is a declared boundary rather than a
+fallback: the caller shape-checks for the method and this provider does not answer it.
+
 ---
+
+### 5.8 SQL grammar
+
+How this engine's statement text is read is declared once, in [`src/lib/db/providers/sql/search/opensearch-sql-grammar.ts`](../../src/lib/db/providers/sql/search/opensearch-sql-grammar.ts), the `opensearch` row of the SQL grammar registry in `src/lib/db/sql-grammar/`.
+Its grammar is `OPENSEARCH_GRAMMAR`, the one reading the statement splitter, the row limiter, the confirmation gate and query-event redaction share, so they cannot disagree about where a literal or a comment ends.
+Every fact was established by live probe on 2026-08-19 against OpenSearch 3.8.0; it disagrees with Elasticsearch about `#` and about `[...]`.
+`#` is a line comment: `SELECT 1 AS a # , 2 AS b` answers one column, the same with a newline before `, 2 AS b` answers two, and `SELECT customer # FROM probe_orders` is a `SemanticCheckException` because the `FROM` was hidden.
+`[...]` is a name quote: `SELECT [customer] FROM probe_orders` answers the field's value, `SELECT [1, 2]` is refused with "All items between Brackets should be identifiers, got:LITERAL_INT", and `[customer]]` and `[a[b]]` are both refused, so it has no escape and does not nest.
+Block comments are flat, by the same probe and answer as Elasticsearch, and `SELECT q'{it's}'` is refused, "Illegal SQL expression".
+`//` is not established, for the reason and at the cost the Elasticsearch row states.
+`readsSqlText` is `true`, deliberately: both search engines answer `POST`ed statements with columns and rows, and both providers extend `SQLBaseProvider` and call `prepareQuery`, so reading the text as not SQL would switch the SQL checks off for text that is SQL.
+Redaction is `sql` with no name quote: a redacted statement keeps its words, and every literal and quoted run becomes `?`.
 
 ## 6. Schema introspection
 
-`getSchema()` ([introspect.ts:355](../../src/lib/db/providers/sql/search/introspect.ts)) makes one
-index listing plus **one mapping read per index**, at most
-`SEARCH_MAPPING_CONCURRENCY = 4` at a time
-([introspect.ts:102](../../src/lib/db/providers/sql/search/introspect.ts)) — the number Couchbase's
-per-collection inference settled on for the same trade-off, and `_mapping` is a cluster-state read
-rather than a search.
+Everything this provider knows about an index's contents is read through the OBJECT SURFACE, and this
+section describes the MAPPING decisions behind it; the surface itself is described below. The flat
+two-phase reading that used to open this section was deleted with `getSchema` (#789), and so was its
+cost model: a folder of indices is described in ONE `_mapping` request over a comma-joined list, split
+only on the cluster's own request-line limit, rather than one request per index at a fixed
+concurrency.
 
 | Data | Source |
 |---|---|
@@ -717,22 +807,28 @@ top_queries-2026.08.18-74305    (engine bookkeeping, NO leading dot)
 
 On an *empty* cluster two of three indices are the engine's. The dot convention catches the first and
 **not** the second, so the transport carries a second rule for the date-suffixed query-insights shape
-(`/^top_queries-\d{4}\.\d{2}\.\d{2}-\d+$/`,
-[http-transport.ts:264](../../src/lib/db/providers/sql/search/http-transport.ts)) — which makes this a
-judgement rather than a rule, and is why the seam exposes a **flag** the provider decides about
-(`isSystemIndex()`, [introspect.ts:156](../../src/lib/db/providers/sql/search/introspect.ts)) rather
-than a filter applied on the wire. Hiding them is the default; `SearchSchemaOptions.includeSystemIndices`
-exists because both answers are legitimate and the caller knows which — an operator debugging ML
-inference wants `.plugins-ml-config` in the tree, and a developer writing a query does not want two
-thirds of the sidebar to be indices they have never heard of.
+(`/^top_queries-\d{4}\.\d{2}\.\d{2}-\d+$/`). A third shape is the security plugin's audit index.
+[Audit logs](https://docs.opensearch.org/latest/security/audit-logs/index/) default to the rolling name
+`security-auditlog-YYYY.MM.dd`, and OpenSearch 3.9.0 listed `security-auditlog-2026.10.04` as a table
+(and as the largest one). The transport flags `/^security-auditlog-/`, which also covers the weekly
+and other date patterns that setting accepts. A user index that does not start with that prefix stays
+listed. Both rules live in
+[http-transport.ts](../../src/lib/db/providers/sql/search/http-transport.ts) (`OPENSEARCH_QUERY_INSIGHTS`,
+`OPENSEARCH_SECURITY_AUDITLOG`), which makes this a judgement rather than a rule, and is why the seam
+exposes a **flag** the provider decides about (`isSystemIndex()`,
+[introspect.ts](../../src/lib/db/providers/sql/search/introspect.ts)) rather than a filter applied on
+the wire. Hiding them is what the object surface does: `isSystemIndex()` is consulted for every listing
+and count, so a folder's badge and its rows agree about what is shown. An operator debugging ML
+inference would want `.plugins-ml-config` in the tree and a developer writing a query would not, and
+nothing in the surface expresses that choice today; the flag is where it would be made.
 
 Note also that `top_queries-2026.08.18-74305` carries hyphens and dots, so it is a name SQL needs
-quoted. `TableSchema.name` is the index name **verbatim** — quoting belongs to whoever builds a
-statement, not to the inventory ([introspect.ts:324-336](../../src/lib/db/providers/sql/search/introspect.ts)) —
+quoted. `DatabaseObject.name` is the index name **verbatim** — quoting belongs to whoever builds a
+statement, not to the inventory (`listObjects()`, [index.ts](../../src/lib/db/providers/sql/search/index.ts)) —
 and on this product the quote character is a **backtick** ([§5.4](#54-dialect-traps-a-user-will-hit)).
 
 **The flattening.** `flattenProperties()`
-([http-transport.ts:776](../../src/lib/db/providers/sql/search/http-transport.ts)) descends both
+([http-transport.ts](../../src/lib/db/providers/sql/search/http-transport.ts)) descends both
 `properties` (objects) and `fields` (multi-fields), emitting containers, leaves and dotted children:
 for `probe_shapes` that is `address`/object, `address.city`/keyword, `items`/nested, `items.sku`/keyword,
 `note`/text, `note.keyword`/keyword. The output set is specified by the upstream product's own
@@ -742,7 +838,7 @@ is the stricter of the two surfaces and a column list valid there is valid here.
 `_meta` object at the same level, which is metadata about the mapping rather than a field in it.
 
 **Containers are not columns; a multi-field parent is.** `SEARCH_CONTAINER_TYPES = ["object",
-"nested"]` ([introspect.ts:90](../../src/lib/db/providers/sql/search/introspect.ts)) are dropped, and
+"nested"]` ([introspect.ts](../../src/lib/db/providers/sql/search/introspect.ts)) are dropped, and
 this is the one place the provider is deliberately **stricter than this engine allows**: upstream
 refuses `SELECT address` outright, this product answers it with the sub-document, and
 `query-generators.ts` builds its starter query by enumerating every declared column. Projecting the
@@ -751,7 +847,7 @@ all. A `text` field with a `keyword` sub-field is **kept** as a column, because 
 container type and both `note` and `note.keyword` are separately queryable.
 
 **Every column is nullable and none is primary**
-([introspect.ts:195](../../src/lib/db/providers/sql/search/introspect.ts)):
+(`toColumn()`, [introspect.ts](../../src/lib/db/providers/sql/search/introspect.ts)):
 
 - `nullable: true` is a measurement. A mapping declares how a field is indexed *if* a document carries
   it; there is no `NOT NULL` in the model, and a document indexed without a field comes back as `null`.
@@ -768,33 +864,365 @@ container type and both `note` and `note.keyword` are separately queryable.
   value any document carries.
 
 **Column order is sorted by path**, by code unit, not by the server's order and not by locale
-([introspect.ts:244](../../src/lib/db/providers/sql/search/introspect.ts)): a mapping has no
+(`toColumns()`, [introspect.ts](../../src/lib/db/providers/sql/search/introspect.ts)): a mapping has no
 declaration order to preserve, because documents are unordered JSON. Sorting by path also keeps
 `address.city` and `items.sku` next to their siblings once the containers are dropped.
 
 **A closed index is kept, and reads honestly**: its `_cat` row reports the status word **`close`** (not
 "closed") with `docs.count` and `pri.store.size` as JSON `null`, while `_mapping` still answers in
 full. So it is described completely with `rowCount` and `size` **omitted** rather than zeroed —
-`TableSchema` makes both optional, which is what preserves the distinction.
+The object shape makes both optional, which is what preserves the distinction.
 
-**A per-index failure costs one index's columns, not the tree.** Only `auth` and `unknown-object`
-degrade to an empty column list
-([`DEGRADABLE_MAPPING_FAILURES`, introspect.ts:119](../../src/lib/db/providers/sql/search/introspect.ts)):
-the security plugin grants index privileges *per index*, so a role that lists twenty indices and may
-describe nineteen is an ordinary configuration; and an index deleted between the listing and its
-mapping read is a race, not a fault. **This is where the two fault vocabularies matter most**: a
-missing index reported by `_mapping` is snake_case `index_not_found_exception` while the SQL endpoint
-says `IndexNotFoundException`, and both are in the fault table
-([http-transport.ts:395-401](../../src/lib/db/providers/sql/search/http-transport.ts)). A live probe of
-`mapping()` is what caught that — the SQL fixtures alone would have left a missing index reported as an
-engine fault by introspection, i.e. propagating and blanking the whole tree instead of degrading one
-index.
+**A mapping the cluster did not answer for is REPORTED, not degraded to an empty column list**, and
+that is a change from the deleted reading (#789). A concrete `_mapping` request answers for every name
+it was given, a CLOSED index included, and refuses the whole request for a name that does not exist, so
+a name missing from a present answer cannot have come from the engine and `describeObjects` throws
+naming the index. **This is where the two fault vocabularies still matter**: a missing index reported
+by `_mapping` is snake_case `index_not_found_exception` while the SQL endpoint says
+`IndexNotFoundException`, and both are in the transport's fault table
+([http-transport.ts](../../src/lib/db/providers/sql/search/http-transport.ts)). A live probe of
+`mapping()` is what caught that; the SQL fixtures alone would have left a missing index reported as an
+engine fault.
 
-`getSchemaList()` and `getSchemaRelations()` are deliberately **not implemented**: both are optional
-and the client falls back to `getSchema()`; here both halves are empty by construction, so a list would
-be byte-identical and a relations pass would re-read every mapping to return the same empty arrays.
+### The object surface (#789)
+
+The schema reader above describes **indices and nothing else**. The object browser's four methods -
+`listContainers`, `countObjects`, `listObjects`, `describeObject` - read four further REST endpoints,
+and **none of these objects is reachable from the SQL endpoint at all**: neither product's grammar has
+a `CREATE` statement for any of them, and OpenSearch's has none of any kind. This is the first
+provider in #789 whose objects come from REST rather than from a catalog query.
+
+**Zero container levels.** An index is not inside anything, and both products' own SQL surfaces say
+so: OpenSearch answers `TABLE_SCHEM` **null** and Elasticsearch reports only a `catalog` that is the
+cluster name and is not addressable in a statement (both measured, [§3](#3-design-decisions)). So
+`listContainers()` answers `[]` without a round trip and the tree opens straight onto the kind
+folders; first paint costs one `countObjects` and no container walk.
+
+| Kind | Role | Source | Filter |
+|---|---|---|---|
+| `index` | relation, accepts row writes | `GET /_cat/indices?format=json&bytes=b` | dot prefix, OpenSearch's date-suffixed `top_queries-*`, and the security plugin's `security-auditlog-*` |
+| `alias` | relation | `GET /_alias`, flattened and deduplicated | dot prefix or `_meta.managed` |
+| `stream` | relation | `GET /_data_stream` | dot prefix or `_meta.managed` |
+| `pipeline` | config | `GET /_ingest/pipeline` | dot prefix or `_meta.managed` |
+| `template` | config | `GET /_index_template` | dot prefix or `_meta.managed` |
+
+The last four all run the same predicate, `isEngineOwned()` in
+[`http-transport.ts`](../../src/lib/db/providers/sql/search/http-transport.ts): a dot prefix **or**
+`_meta.managed`, on every one of them. Only the `index` row is different, and only because `_cat`
+publishes no `_meta` at all, so a name shape is the only signal there is. An alias and a data stream
+carry no `_meta` on either product today, which makes the second half of the rule inert for those two
+rather than absent - and writing "dot prefix" for them would describe a filter the code does not run.
+
+**An alias and a data stream are RELATIONS, not config objects, and that is measured.** Both answer
+rows through the SQL endpoint on both products: `SELECT customer FROM probe_orders_alias` returns the
+row and `SELECT * FROM probe_stream` returns the column list (2026-09-11). Neither declares
+`acceptsRowWrites`: an alias may span several indices and has no single write target, a data stream is
+append-only through its own API, and in any case no statement this provider can send writes anything.
+
+**A data stream is a kind rather than a property of an index, and the reason is that the alternative
+hides it completely.** Its backing indices are `.ds-`-prefixed, which the index listing's own system
+rule already removes, so without this kind a data stream's data is reachable through nothing in the
+tree at all - and, the other half of the same fact, declaring both kinds counts nothing twice. Both
+`_cat/indices` fixtures carry a `.ds-` backing-index row so that premise is asserted rather than
+argued: the `index` folder does not list it and the `stream` folder holds one object.
+
+**The count and the listing are the same call.** Standing ruling 5f says the listing must contain
+exactly what the count counted; on a SQL engine those drift apart in a second `WHERE` clause, and here
+there is no `WHERE` clause, so the place they could stop being the same call is **the HTTP request
+itself**. `readKind()` in [`search/index.ts`](../../src/lib/db/providers/sql/search/index.ts) is the
+only place a REST listing becomes objects: `countObjects` is its length per kind and `listObjects` is
+its result for one kind, through the same read, the same system filter, the same path construction and
+the same sort. A refusal is **per kind**, not per cluster - these are four separate endpoints and a
+security plugin grants privileges per endpoint - so one refused folder carries the engine's own
+sentence and the other four still count.
+
+**An alias listing is keyed by INDEX and has to be flattened and deduplicated.** The payload is
+`{"<index>":{"aliases":{"<alias>":{}}}}`, an index with no alias is still listed with an empty map,
+and one alias over several indices is named once per index (measured: adding `shared_alias` to two
+indices lists it twice). The tree addresses an alias by name, so without the dedupe that folder holds
+two rows at one path. An alias can never collide with an index or a data stream: `POST /_aliases`
+adding an alias called `probe_orders` while that index exists is refused with *"an index or data
+stream exists with the same name as the alias"* on both products.
+
+**The engine's own objects are filtered on two signals, because neither is sufficient.** Measured on a
+stock Elasticsearch 9.1.4 node on 2026-09-11: 21 ingest pipelines, all `_meta.managed: true` and
+**none** dot-prefixed; 61 composable index templates, 57 managed and the remaining four
+(`.monitoring-*-mb`) dotted and unmanaged. A dot-only rule leaves every pipeline in, a managed-only
+rule leaves four templates in. The cost is the one the index listing already pays and it is stated
+rather than hidden: a user **can** create a dot-prefixed alias or template (measured, acknowledged),
+and this hides it. Elasticsearch's data streams also carry a `system` boolean and OpenSearch's carry
+none; it is deliberately **not** read, because every engine-owned data stream that could be measured
+is dot-prefixed and a second rule no fixture can distinguish from the first is a line nothing proves.
+
+**`GET /_ingest/pipeline` answers HTTP 404 with `{}` when the cluster holds no pipeline**, and the
+transport reads that as an empty set rather than a failure. It is the one status outside the 401/403
+pair that decides anything here, and it is not generalised: `_alias`, `_index_template` and
+`_data_stream` all answer HTTP 200 with an empty collection when they hold nothing, so a 404 from
+those really would be something else.
+
+Measured on **both** products on 2026-09-11, and upstream the state had to be made rather than found.
+A stock Elasticsearch node ships 21 managed ingest pipelines, so `DELETE /_ingest/pipeline/*` was sent
+first (HTTP 200, `{"acknowledged":true}`); `GET /_ingest/pipeline` then answered HTTP 404 with `{}` on
+Elasticsearch 9.1.4 exactly as it does on a stock OpenSearch 3.8.0 node, which ships none and reaches
+the state on its first run. Elasticsearch re-registers its built-ins within about twenty seconds, so
+the state is transient there and ordinary on the fork - but it is reachable on both, which is what
+licenses one rule for one implementation serving two type-ids.
+
+**A status alone cannot tell an empty set from a refusal, so the body decides.** A missing plugin, an
+endpoint a security role may not read and an index-shaped 404 all answer 404 too, and each of those
+would badge the folder **0** where the truth is a refusal - the exact confusion `KindCount` carries
+both a `count` and an `unavailable` state to prevent. The distinguishing signal is already on the wire:
+an empty set carries `{}` and nothing else, while a genuine failure carries the error envelope the
+transport categorises everywhere else (measured on both, `GET /_data_stream/nope` answers HTTP 404
+with `index_not_found_exception`, *"no such index [nope]"*). So the request helper reads the body
+before it trusts the status, and a 404 carrying that envelope reaches the folder as the engine's own
+sentence rather than as a zero.
+
+**A listing entry this client cannot read is refused, never dropped.** An entry that is not an object,
+an entry naming itself in no member, and an alias payload member with no alias map all raise rather
+than being skipped. A drop would remove the object from the count and from the listing together, so
+the two would still agree (ruling 5f) while the badge is short by exactly the objects nobody can see.
+The measured licence to refuse is that both products always send the list key (`{"index_templates":[]}`
+and `{"data_streams":[]}` on an empty cluster) and always name every entry, and that an index carrying
+no alias is listed with a **present**, empty map.
+
+**What is absent, and why each absence is a fact rather than a gap.**
+
+- **No view, function, procedure or trigger.** Neither product's SQL surface has `CREATE VIEW`, and
+  OpenSearch's grammar contains no `CREATE` statement of any kind (`CREATE TABLE t (id BIGINT)`
+  answers `SQLFeatureNotSupportedException`, *"Query must start with SELECT, DELETE, SHOW or
+  DESCRIBE"*). Elasticsearch 9.4 adds an **ES|QL views API as a technical preview**, and #789 Phase 2
+  answered the question it left open by leaving it out: a preview surface gets no folder, so there is
+  no kind and nothing for the source read to read. It would also be a kind only ONE of the two
+  products this implementation serves could ever hold, and this one is the other.
+- **No stored script.** Both products have them and neither has a list-all API: `GET /_scripts` is
+  refused outright (*"Invalid index name [_scripts]"*), only get-by-id exists. An object that cannot be
+  enumerated cannot be a tree node - the same call Redis's `EVAL` scripts got.
+- **No legacy index template.** `_template` is a separate namespace whose names may **collide** with
+  the composable ones: measured on both products, `PUT _template/probe_template` succeeds while a
+  composable `probe_template` already exists, so one kind fed by both endpoints would hold two
+  different objects at one path.
+- **No secondary-index kind** in the relational sense. Every mapped field is inverted-indexed as a
+  property of being mapped, so there is nothing a user declared and nothing to name; `index` here is
+  the engine's own word for what a table is.
+
+`describeObject(path, kind)` answers the **mapping** for an `index`, an `alias` and a `stream` - an
+alias resolves to the index behind it and a data stream to its current backing index, both keyed by
+the concrete index name - and **no columns** for a `pipeline` or a `template`, which is the right
+answer rather than a gap: they are JSON documents with no field list, exactly as a routine, a trigger
+and a sequence have no columns on the SQL engines. `indexes` and `foreignKeys` are always empty, for
+the reasons in the table above.
+
+Those same three kinds declare `hasColumns: true` (#789), which is what gives an object row a twisty
+in the object tree; a `pipeline` and a `template` declare nothing and stay leaves, so no column read
+is ever issued for them. An `alias` row and a `data stream` row show the mapping of **one** backing
+index: the transport takes the first entry of a `_mapping` payload keyed by concrete index name
+(`mapping()` in `src/lib/db/providers/sql/search/http-transport.ts`), so an alias spanning two indices shows
+whichever the cluster answered first, with nothing on screen to say the other is missing.
+
+#### `describeObjects`, the bulk column read (#789)
+
+`describeObjects(container, kind, limit?)` answers columns for every object of one kind, and **which
+call it uses depends on the kind**, measured on OpenSearch 3.8.0 on 2026-09-12 rather than assumed:
+
+- An **index** is concrete, so `_mapping` over a comma-joined list comes back keyed by the name that
+  was asked for. One request serves a whole folder.
+- An **alias** and a **data stream** resolve to the index behind them and come back keyed by **that**
+  index. Measured: `GET /probe_orders_alias,alias_two/_mapping`, two aliases on one index, answers a
+  single `probe_orders` key, and the fixture's alias answers under the same key as the index itself.
+  Nothing in that payload attributes a mapping back to the alias it was asked for, so those stay one
+  request per object, issued in parallel and cut by the caller's `limit` first.
+- A **pipeline** and a **template** answer `{ details: [] }` with no round trip at all, the same
+  fact `describeObject` states by answering three empty arrays.
+
+**The bulk request is chunked, and the bound is the cluster's own.** Measured on OpenSearch 3.8.0: a `_mapping`
+request whose index list is 3,999 characters answers HTTP 200 and one of 4,499 answers HTTP 400,
+`too_long_http_line_exception`, "An HTTP line is larger than 4096 bytes." The limit is on the whole
+request line, so the transport splits the names into request-line-sized chunks by BYTES rather than
+by a count - an index name may be up to 255 bytes - and issues as many requests as that needs.
+Splitting drops nothing, so it is **not** reported as truncation.
+
+| Shape | Requests | Time |
+| --- | --- | --- |
+| One `describeObjects` over the fixture's 2 indices | 2 | 4 ms |
+| The 2 `describeObject` calls it replaces | 4 | 8 ms |
+
+**One mapper, shared with the single read.** `searchObjectDetail()` builds both, so a batch cannot
+spell an object differently from `describeObject` on the same name. Verified live on both products:
+for every index, alias and data stream, the batch's detail is identical to the single read's.
+
+**A name the cluster answered nothing for is named, never described as empty.** A concrete `_mapping`
+request answers for every name it was given - a closed index included, measured - and refuses the
+whole request for one that does not exist, so a name missing from a present answer cannot come from
+the engine. Reporting it as a mapping-less index would spell it exactly like an index that really has
+no mapping, which is an ordinary state.
+
+**The bound is the caller's, and there is no `limit + 1`.** Every listing is one REST call answering
+the cluster's whole set, so the target set is complete before anything is cut and the comparison is
+exact. The cut is applied in code after the shared `comparePaths` sort, which makes a bounded read's
+membership this provider's rather than the server's: no listing endpoint here takes an order or a
+limit at all.
+
+**The fixture is `docker/search-init/01-object-fixture.sh` and it applies unchanged to both
+products.** Neither image has an init-script directory, so it is a script rather than a file the
+entrypoint runs. `database-compose.yml` mounts the directory read-only into both services at
+`/opt/search-init`, so it is applied either from the repo or from inside the container:
+
+```bash
+SEARCH_URL=http://localhost:9200 bash docker/search-init/01-object-fixture.sh
+docker exec libredb-elasticsearch bash /opt/search-init/01-object-fixture.sh
+docker exec libredb-opensearch    bash /opt/search-init/01-object-fixture.sh
+```
+
+It creates one instance of every declared kind: the index `probe_orders`, the alias
+`probe_orders_alias`, the ingest pipeline `probe_pipeline`, the composable index templates
+`probe_template` and `probe_stream_template`, and the data stream `probe_stream`. It creates two more
+ingest pipelines for the source read (#789), each carrying a claim this doc makes: `probe_json_edges`
+holds the values a JSON re-serialisation changes, and `probe pipe/slash` is named so that the
+percent-encoding is exercised by an object rather than by an argument. The script's own header says
+what each object is for.
+
+**The one measured difference between the two products, and it is not in the declaration.** The
+object surface's five kinds, their roles, their paths and their columns were driven against a live
+OpenSearch 3.8.0 node and a live Elasticsearch 9.1.4 node on 2026-09-11 with the same fixture applied,
+and the output was identical kind for kind, path for path and column for column. What differs is what
+a **stock** cluster already holds: this product ships **no** ingest pipeline and **no** composable
+index template at all, so a fresh cluster's `GET /_ingest/pipeline` really does answer HTTP 404 - that
+is the ordinary first-run state here, while upstream, where 21 managed pipelines ship, the same state
+has to be MADE by deleting them and lasts only the twenty seconds or so before Elasticsearch
+re-registers its own. A transport that classified on the status would put the engine's own refusal
+sentence on the Ingest Pipelines folder of every fresh OpenSearch cluster, where the truth is zero. The index filter
+also has more to do here for a second measured reason: a stock node ships `.plugins-ml-config`,
+`.opensearch-sap-log-types-config` and `top_queries-<date>-<n>`, and the last carries no dot at all.
+See [elasticsearch.md](elasticsearch.md) for the other half of that sentence.
+
+#### Object source (#789)
+
+`readObjectSource(path, kind, limit?)` answers **one part** holding one object's definition, and two
+of the five kinds declare it: `pipeline` and `template`, both `sourceLanguage: "json"`. ONE
+declaration constant, `SEARCH_OBJECT_KINDS`, serves both type-ids, so this section and
+[elasticsearch.md](elasticsearch.md) describe the same code - and every claim below was measured on
+**this** product, on OpenSearch 3.8.0 on 2026-09-13, rather than carried over.
+
+| Kind | Request | The text | `form` | `origin` |
+|---|---|---|---|---|
+| `pipeline` | `GET /_ingest/pipeline/<name>` | the value under the `<name>` key | `complete` | `rendered` |
+| `template` | `GET /_index_template/<name>` | the `index_template` of the entry whose `name` matches | `complete` | `rendered` |
+
+**Why `index`, `alias` and `stream` declare nothing.**
+
+- **`index`.** `GET /<index>` answers settings the **server** wrote - `index.uuid`, `creation_date`,
+  `version.created`, `provided_name` - so what a Source tab would show is not a definition anybody
+  could re-apply, and the round trip from that answer back to a `PUT` that recreates the index could
+  not be established.
+- **`alias`.** One alias over N indices has **one definition per index** and a different create shape
+  (`POST /_aliases` with an actions array), while the tree deliberately deduplicates those N rows to
+  one object. There is no single text belonging to the row that exists.
+- **`stream`.** A data stream's definition **is** the matching index template, which is a different
+  object in a different folder of the same tree. Showing it here would present another object's
+  definition as this one's.
+
+**The definition is unwrapped, and the key is matched EXACTLY.** A pipeline arrives as
+`{"<name>": {...}}` and a template as `{"index_templates":[{"name":..., "index_template":{...}}]}`, so
+rendering the answer would show a reader a wrapper around the thing they opened. Taking "the only
+key" or entry zero instead is worse, and the reason is measured on this product: a `*` in the name is
+a **wildcard** on both endpoints, `GET /_ingest/pipeline/probe*` answers HTTP 200 carrying
+`probe_pipeline`, `GET /_index_template/probe*` answers **two** entries, and `%2A` is decoded before
+the match so encoding does not help. The read therefore takes the value under the exact name asked
+for, and a name the answer does not carry is an **absence**.
+
+**Absence RAISES, and the two endpoints spell it differently.** `GET /_ingest/pipeline/no_such`
+answers HTTP **404** with the body `{}` and `GET /_index_template/no_such` answers HTTP **404** with
+the **full error envelope** (`resource_not_found_exception`, *"index template matching [no_such] not
+found"*, in the core REST layer's snake_case rather than the SQL plugin's Java class names). Both mean
+the object is not there, so absence is decided on the **status** for a named object and the read
+raises a `QueryError` naming it. That is deliberately not the rule the listings follow: a listing's
+404 has a second meaning here more than anywhere, because a stock node with no pipeline answers it,
+so a listing may read a 404 as empty only while the body is a payload.
+
+**Only an answer from the cluster is a refusal.** A denied endpoint, a fault the cluster named, or a
+body this client could not read becomes a refusal part carrying the cluster's own sentence,
+unprefixed - with one exception, the **denial**, whose sentence the transport composes from the
+status because no 401 or 403 body could be captured (see CANNOT below). A dropped socket, an expired
+client deadline and a cancellation **raise** instead: nobody answered, and *"connect ECONNREFUSED"*
+printed in the Source pane as this object's own refusal has no raise, nothing to retry and nothing
+distinguishing it from a real denial. All eight arms of that split are driven in the two integration
+suites, and `unsupported` is driven from THIS suite because it is this product's fault table that
+carries a name mapping to it (`SQLFeatureNotSupportedException`).
+
+**An unreadable body is a refusal and never an absence.** Where the answer is HTTP 200 and is not the
+shape this client parses - the wrapper is not an object, the value under the name is not an object,
+`index_templates` is not an array, an entry carries no `name` - the read reports *"OpenSearch answered
+an ingest pipeline definition the client could not read"* (or *"an index template definition"*).
+Skipping the entry or reading it as nothing would say *"No OpenSearch template named X"* about a row
+the tree is currently showing, which is a claim about the cluster where the truth is a claim about
+this client.
+
+**An EMPTY definition cannot arrive, measured rather than assumed.** Design guarantee 2 asks for a
+refusal part where an engine answers empty or whitespace-only text, and neither endpoint here can
+produce one: `PUT /_ingest/pipeline/<id>` with `{}` is HTTP **400** (`parse_exception`, *"[processors]
+required property is missing"*) and `PUT /_index_template/<name>` with `{}` is HTTP **400**
+(`illegal_argument_exception`, *"Required [index_patterns]"*). The smallest definitions either
+endpoint stores are `{"processors":[]}` and `{"index_patterns":["..."]}`, both `PUT` 200 and both read
+back with those members - and this product answers the minimal template back verbatim where
+Elasticsearch adds `"composed_of": []` to it. So the rendered text is always a JSON object with at
+least one member. Measured on 3.8.0 on 2026-09-13 and re-runnable with those `PUT`s.
+
+**A refusal is per ENDPOINT.** These are two separate endpoints and the security plugin grants
+privileges per endpoint, so a pipeline read can be denied while a template read answers.
+
+**Neither refusal can be produced on the compose service: CANNOT.** `DISABLE_SECURITY_PLUGIN` is
+`true` there, a bogus `Basic` header is IGNORED and the cluster answers HTTP 200 (measured
+2026-09-13), so no 401 or 403 body exists to capture from this container, and enabling the plugin
+would change the image configuration every other measurement here rests on. The suite drives the
+refusal shape instead, and a denied read carries `"OpenSearch refused the credentials (HTTP 403)"`.
+
+**The name is percent-encoded.** A pipeline name may hold a space **and** a slash on this product too
+(both `PUT` 200), and `GET /_ingest/pipeline/probe%20pipe%2Fslash` answers the object. The escaper is
+`encodeURIComponent`, and `docker/search-init/01-object-fixture.sh` creates `probe pipe/slash` so the
+escaping is exercised by an object rather than by an argument. A template name may **not** hold a
+space, so the pipeline endpoint is the only place such an object can exist.
+
+**What the renderer does to the cluster's bytes, measured, because `origin: "rendered"` is a promise
+about exactly this.** There is no extended-JSON writer for a REST payload, and the definition is a
+sub-document of the answer rather than the answer, so the text cannot be the bytes the cluster sent.
+It is `JSON.parse` followed by `JSON.stringify` with a two-space indent, and three things change.
+Measured on 3.8.0 on 2026-09-13 against the fixture's `probe_json_edges` pipeline:
+
+| The cluster answered | This product renders |
+|---|---|
+| `9223372036854775807` | `9223372036854776000` |
+| `1.0E30` | `1e+30` |
+| a map keyed `zz, 10, 2, aa` | the same map keyed `2, 10, zz, aa` |
+
+Nothing is **dropped** - every value is present, which is what keeps `form: "complete"` true - but a
+long past 2^53 loses precision, an exponent is re-spelled, and integer-like keys are hoisted ahead of
+the others by JavaScript's own property order. A definition holding such a value must not be copied
+out of the Source pane and `PUT` back unread.
+
+**One fixture line, two different definitions, and this is the product difference the source read
+adds.** `docker/search-init/01-object-fixture.sh` writes `"data_stream": {}` into
+`probe_stream_template` on both products, and each expands it its own way: this one answers
+`"data_stream":{"timestamp_field":{"name":"@timestamp"}}` and Elasticsearch answers
+`"data_stream":{"hidden":false,"allow_custom_routing":false}` (both measured 2026-09-13). So the two
+integration suites pin **different** expected texts for that object on purpose. The other measured
+difference is the one this section's neighbours already record: this product also refuses `_meta` on
+an ingest pipeline outright (*"pipeline [probe_json_edges] doesn't support one or more provided
+configuration parameters [_meta]"*, HTTP 400) where Elasticsearch accepts it, which is why the
+fixture's integer-like keys live inside a processor's value.
+
+**The bound is the caller's**, applied through the shared `applySourceBound`, and a text that fits is
+never marked.
 
 ---
+
+#### Object edit (#789)
+
+This engine is a REFUSAL, and the reason is that the READ is lossy, which makes any write back a rewrite dressed as an edit.
+The pane re-serialises the cluster's JSON rather than echoing it: a long past 2^53 comes back re-spelled, `1.0E30` becomes `1e+30`, and map key order changes (D61).
+Sending that text back would apply changes the author never made, on fields they never touched, which is a success that destroys something the user was not shown.
+The same measurement is why the plan digest this phase added is a hand-written length-framed walk and never `JSON.stringify`.
+No kind here declares `acceptsSourceEdits`, and `tests/isolated/object-edit-declarations.test.ts` is what holds that absence and this section together: one declaration constant serves this id and `elasticsearch`, so the two rows of the census always move together.
 
 ## 7. Monitoring & health
 
@@ -884,7 +1312,7 @@ The honest empties, each with its reason:
 `TableStats.rowCount`, `totalSize` and `totalSizeBytes` are required numbers, so for those three a
 closed index has nowhere to read but zero. `tableSize` and `tableSizeBytes` are *optional*, so they
 are **absent** rather than `0`: a zero there would be a fabricated measurement rather than a forced
-one. The schema tree makes the same distinction with its own optional `TableSchema.rowCount` and
+one. The schema tree makes the same distinction with its own optional `DatabaseObject.rowCount` and
 `size` (the comment over `toTableStats()` in
 [`search/index.ts`](../../src/lib/db/providers/sql/search/index.ts)).
 
@@ -957,11 +1385,13 @@ be told work happened.
 
 ## 9. Capabilities & labels
 
-### `getCapabilities()` ([index.ts:388](../../src/lib/db/providers/sql/search/index.ts))
+### `getCapabilities()` ([index.ts](../../src/lib/db/providers/sql/search/index.ts))
 
-One answer for both products, because every flag here measured the same on both. The single
-difference — `OFFSET` — has no field in `ProviderCapabilities` to declare it in, so it lives on
-`SearchProduct` and is read by `prepareQuery()` alone
+Two flags diverge between the products; every other one measured the same on both.
+`identifierQuoting` is one of them, below.
+`OFFSET` is the other, and since #816 it has a field of its own: `supportsResultPagination` is
+declared as `this.product.acceptsOffsetClause`, so the declaration and the `prepareQuery()`
+refusal are the same value and cannot drift apart
 ([§5.5](#55-offset-works-here-which-is-why-paging-does)).
 
 | Capability | Value | Why |
@@ -969,8 +1399,10 @@ difference — `OFFSET` — has no field in `ProviderCapabilities` to declare it
 | `queryLanguage` | `sql` | The bundled SQL plugin, present on a stock node ([§3.3](#33-sql-because-there-is-no-esql-here)) |
 | `supportsExplain` | **`false`** | The statement form is refused here and the plan lives behind a second endpoint outside this seam ([§3.10](#310-no-explain-the-statement-form-is-refused)) |
 | `supportsExternalQueryLimiting` | `true` | **Both** limiter forms are correct here, `LIMIT n` and `LIMIT n OFFSET m` |
-| `supportsCreateTable` | **`false`** | Not in the grammar ([§5.6](#56-this-grammar-has-delete-and-it-is-off)) |
+| `createTable` | **absent** | Not in the grammar ([§5.6](#56-this-grammar-has-delete-and-it-is-off)) |
 | `supportsInlineRowEdit` | **`false`** | `UPDATE` is not in the grammar, so the editor's statement could only ever produce an error (#269) |
+| `supportsTestDataGeneration` | **`false`** | An index takes a bulk document write, but the Generate Test Data dialog writes a SQL `INSERT`, which is not in the grammar either, so the row menus do not offer it (#1468) |
+| `supportsResultPagination` | **`true`** | OpenSearch SQL accepts an `OFFSET` clause, which is the one capability where this product diverges from Elasticsearch. Declared as `this.product.acceptsOffsetClause`, so it cannot drift from the refusal the shared `prepareQuery` enforces (#816) |
 | `supportsTransactions` | **`false`** | `BEGIN` is not in the grammar and the surface is stateless HTTP. Measured 2026-08-19 on OpenSearch 3.8.0: `POST /api/db/transaction` answered HTTP 400, *"Transaction control is not supported for this database type"*, for both `begin` and `rollback` — the measurement #U13 came from |
 | `declaresForeignKeys` | **`false`** | The engine has no such constraint in its model, so the empty `foreignKeys` means "impossible here" rather than "none declared, or none visible to this role" — the distinction #414 was about |
 | `supportsMaintenance` | **`false`** | Nothing in `MaintenanceType` is SQL-reachable ([§8](#8-maintenance)) |
@@ -979,13 +1411,15 @@ difference — `OFFSET` — has no field in `ProviderCapabilities` to declare it
 | `defaultPort` | `9200` | Both schemes; the fixture publishes 9201 on the host ([§4.1](#41-configuration-fields)) |
 | `identifierQuoting` | **`backtick`** | The difference that fails silently: a double-quoted name here is a string literal, so a generated `WHERE "customer" = 'acme'` answers HTTP 200 with no rows ([§5.4](#54-dialect-traps-a-user-will-hit)) |
 | `statementTerminator` | **`none`** | Declared even though this product accepts `;`: the absence runs here too, and the upstream grammar has no terminator at all, so one answer serves both ([§5.4](#54-dialect-traps-a-user-will-hit)) |
+| `containerLevels` | **`[]`** | An index is not inside anything, and both products' own SQL surfaces say so ([§6](#the-object-surface-789)) |
+| `objectKinds` | `index`, `alias`, `stream`, `pipeline`, `template` | The five objects a search cluster publishes over REST; `index` is the only one that accepts row writes ([§6](#the-object-surface-789)) |
 | `schemaRefreshPattern` | `\b(DELETE)\b` | **This is the product it exists for**: a cluster with DELETE enabled really changes the counts this provider reports ([§5.6](#56-this-grammar-has-delete-and-it-is-off)) |
 
 `isGroupedKeyspace` is deliberately **absent**: an index is a real object the cluster holds, named by
 whoever created it and addressable in a statement — not a grouping a server derived from a scan, which
 is what Redis and LibreDB declare.
 
-### `getLabels()` ([index.ts:455](../../src/lib/db/providers/sql/search/index.ts))
+### `getLabels()` ([index.ts](../../src/lib/db/providers/sql/search/index.ts))
 
 | Label | Value |
 |---|---|
@@ -1015,7 +1449,7 @@ These are not decoration. `inventory-noun.ts` lowercases `entityName` into the n
 reasons with, so a cluster described as holding "tables" of "rows" invites statements written for a
 relational engine. "Indices" rather than "Indexes" because that is the plural this product's own API and
 documentation use — and because "indexes" is the word this codebase already uses for the
-secondary-index objects an index does **not** have (`TableSchema.indexes`, empty by construction here).
+secondary-index objects an index does **not** have (`ObjectDetail.indexes`, empty by construction here).
 
 The two maintenance actions are named even though `supportsMaintenance` is false, because they are
 still rendered **where an engine has maintenance to run**, and their global descriptions say in words
@@ -1025,21 +1459,41 @@ end into a page whose maintenance card is gated on the same capability, and
 row and a declared capability. See
 [elasticsearch.md §9](./elasticsearch.md#9-capabilities--labels) for the measurement.
 
+### SQL writing
+
+[`search/opensearch-sql-writing.ts`](../../src/lib/db/providers/sql/search/opensearch-sql-writing.ts) declares how a generated statement spells a literal, a name and a bind for this engine, and it is this engine's row of `SQL_WRITING` ([`src/lib/db/sql-writing/index.ts`](../../src/lib/db/sql-writing/index.ts)), which the readers in [`src/lib/sql/values.ts`](../../src/lib/sql/values.ts) and [`src/lib/sql/identifier.ts`](../../src/lib/sql/identifier.ts) look up.
+A literal is written by `literalDoubleAndBackslash` and read back by `unquoteDoubleAndBackslash`: the quote is doubled and a backslash escapes, so the backslash is doubled first.
+A name is quoted by `identifierBacktickDoubled`: a backtick name with an inner backtick doubled and a backslash as data.
+There is no placeholder (`placeholder: null`), so a generator quotes the value with `quoteLiteral` instead of emitting a bind.
+OpenSearch reads both escapes, which is why its type id does not share a row with Elasticsearch's.
+Measured on 3.8.0 (2026-08-19): `SELECT 'a''b'` answers `a'b`, so doubling works; `SELECT 'a\'b'` answers `a'b` too, so a backslash escapes the quote; `SELECT 'a\\b'` answers one backslash, so it escapes itself; and `SELECT 'a\'` is a `ParserException`, because the trailing backslash escaped the closing quote and left the literal open, which is exactly the defect #290 is about.
+The fork's SQL plugin reads its literals the way MySQL does, and this row is not an inference from that lineage but the four probes above.
+OpenSearch shares MySQL's backtick, and it is not a stylistic choice: measured 2026-08-19 on 3.8.0, its SQL plugin reads a double-quoted name as a string literal, so `SELECT customer FROM "probe_orders"` is `IndexNotFoundException[no such index ["probe_orders"]]`, quotes and all, while ``FROM `probe_orders` `` is HTTP 200.
+It is worse in a predicate, where nothing fails: `WHERE "customer" = 'acme'` compares two literals and answers 0 rows.
+Backticks work for both a table and a field there, and Elasticsearch 9.1.4 is the exact opposite, so the two search ids cannot share a form.
+The backtick doubling is this repo's own convention carried over from MySQL and is not measured: an index or field name containing a backtick would be needed to probe it, and creating one on the probe cluster was judged not worth polluting the fixtures.
+It is the fail-safe direction either way: a doubled backtick can only make the engine refuse a name, never make it read one it should not.
+Both search endpoints do bind `?`, but the provider's seam carries the statement alone, so its `query()` refuses positional parameters outright, as Elasticsearch's section says.
+Inline row editing reads a key column's kind through the shared `INSTANT_TYPE_NAMES`, `FLOAT64_TYPE_NAMES` and `EXACT_DECIMAL_TYPE_NAMES` of the module's `inlineEdit`, and binds every edit as typed.
+
+The module's `export` field writes a result export's CREATE TABLE and INSERT from the shared building blocks alone: `STANDARD_DDL_TYPES` for the column types, `NOTHING_STANDS_ALONE` and `NO_BARE_SPELLING`, so every bare declared name is re-spelled from its family, `NULL_NON_FINITE` for NaN and the infinities, and `binaryStandardHex` for a binary cell (`X'0102'`).
+The SQL endpoint parses no CREATE TABLE, so a file written from it is meant to run somewhere else, and every bare name in it is re-spelled from its family, portably.
+
 ---
 
 ## 10. Error handling
 
 The transport normalizes every failure into
 `SearchTransportError { category, message, engineType? }`
-([transport.ts:153](../../src/lib/db/providers/sql/search/transport.ts)); `mapSearchError()`
-([index.ts:671](../../src/lib/db/providers/sql/search/index.ts)) maps the **category** — never the HTTP
+([transport.ts](../../src/lib/db/providers/sql/search/transport.ts)); `mapSearchError()`
+([index.ts](../../src/lib/db/providers/sql/search/index.ts)) maps the **category** — never the HTTP
 status — onto the shared classes in [`src/lib/db/errors.ts`](../../src/lib/db/errors.ts). Every category
 is listed and there is no `default`, so adding one to the seam fails the typecheck here instead of being
 quietly swallowed as a query error.
 
 | Category | Measured trigger on this product | Error raised |
 |---|---|---|
-| `auth` | HTTP 401/403 (status-decided; see [§3.7](#37-a-string-valued-error-means-the-request-never-reached-the-sql-engine)) | `AuthenticationError` |
+| `auth` | HTTP 401/403 with no body or a security fault in it (status-decided otherwise; see [§3.7](#37-a-string-valued-error-means-the-request-never-reached-the-sql-engine)) | `AuthenticationError` |
 | `unreachable` | A refused socket, an unresolvable host, or a **string-valued** `error` — the upstream endpoint path (HTTP 405 here), a missing content type (406) | `ConnectionError` carrying host and port |
 | `timeout` | The client deadline expired (`AbortSignal.timeout`) | `TimeoutError` — and the cluster is *still working on the statement* |
 | `cancelled` | The caller aborted | `QueryCancelledError` |
@@ -1053,7 +1507,7 @@ cluster read the statement and refused it — and the engine's own wording, carr
 verbatim, is what distinguishes them on screen. **`unsupported` is mapped here rather than to a
 configuration error for a measured reason**: on this product it is what a *mistyped* leading keyword
 answers, which is a statement problem and nothing about the deployment
-([index.ts:660-666](../../src/lib/db/providers/sql/search/index.ts)).
+(`mapSearchError()`, [index.ts](../../src/lib/db/providers/sql/search/index.ts)).
 
 A value that is **not** a seam error never came from the cluster (an internal defect, an assertion) and
 goes to the shared message-based `mapError()`, exactly as `druid/index.ts` and `clickhouse/index.ts`
@@ -1063,7 +1517,7 @@ The `unreachable` message quotes the cause from **both** places a runtime puts i
 runs on two: on Node a refused socket is `TypeError: fetch failed` whose `cause.code` is
 `ECONNREFUSED`, while Bun throws `Error: Unable to connect. Is the computer able to access the url?`
 with `code: "ConnectionRefused"` on the error **itself** and no cause at all
-([http-transport.ts:677-729](../../src/lib/db/providers/sql/search/http-transport.ts)).
+(`requestFailure()`, [http-transport.ts](../../src/lib/db/providers/sql/search/http-transport.ts)).
 
 | Situation | Error |
 |---|---|
@@ -1118,8 +1572,8 @@ empties, and `runMaintenance()` refusing with its reason.
 ### 11.3 Run it
 
 ```bash
-bun test tests/integration/db/opensearch-provider.test.ts
-bun test tests/unit/db/search
+bun tests/run-tests.ts tests/integration/db/opensearch-provider.test.ts
+bun tests/run-tests.ts tests/unit/db/search
 
 # Full isolated suite (CI-equivalent)
 bun run test
@@ -1204,7 +1658,8 @@ await provider.connect();                              // proves the port AND th
 const rows   = await provider.query('SELECT * FROM probe_orders LIMIT 50;');   // ';' is fine here
 const page2  = await provider.query('SELECT customer FROM probe_orders LIMIT 50 OFFSET 50');
 const quoted = await provider.query('SELECT customer FROM `top_queries-2026.08.18-74305`');
-const schema = await provider.getSchema();             // indices + mapped fields; indexes always []
+const objects = await provider.listObjects(container, 'table');
+const { details } = await provider.describeObjects(container, 'table');
 const stats  = await provider.getTableStats();         // documents and primary bytes per index
 
 await provider.disconnect();
@@ -1231,12 +1686,6 @@ because the provider exposes no `cancelQuery`
   behind `POST /_plugins/_sql/_explain` — a second endpoint outside this seam, whose tree shape is not
   what upstream returns either ([§3.10](#310-no-explain-the-statement-form-is-refused)). Widening the
   seam by one call is the concrete follow-up.
-- **Aliases and data streams are not listed in the schema tree.** They come from other endpoints
-  (`_alias`, `_data_stream`) that this seam does not carry, so a **queryable** alias does not appear in
-  the sidebar even though SQL accepts it. Recorded on the seam itself
-  ([transport.ts:205-219](../../src/lib/db/providers/sql/search/transport.ts)); the mapping read
-  already tolerates the case, taking the single entry of the payload rather than looking it up by the
-  requested name, because an alias resolves to the concrete index behind it.
 - **No maintenance operations at all** ([§8](#8-maintenance)).
 - **No active sessions, and no slow queries** — the second one by choice rather than by absence: this
   product's `top_queries-<date>` index really does hold them, and reading it would populate a panel for
@@ -1244,6 +1693,9 @@ because the provider exposes no `cancelQuery`
 - **An index whose mapping has `nested` fields reports more documents than a `SELECT` returns.**
   Measured here: `probe_shapes` is 2 documents in `_cat/indices` and 1 row to `SELECT COUNT(*)`
   ([§7](#7-monitoring--health)).
+- **`COUNT(DISTINCT ...)` is approximate**, and so is the Data Profiler's distinct count, which is that
+  aggregate. Measured on 3.9.0: 50,000 documents with 50,000 distinct `long` ids answer
+  `COUNT(DISTINCT id)` = 50,106. The null counts, MIN and MAX beside it are exact.
 - **`totalHits` is reported by this product and deliberately dropped**, so no surface behaves
   differently between the two type-ids — the upstream product sends no count at all
   ([§5.2](#52-result-shaping)).
@@ -1254,7 +1706,7 @@ because the provider exposes no `cancelQuery`
 - **A double-quoted identifier is silently wrong.** `SELECT "customer"` returns the literal string,
   and `WHERE "customer" = 'acme'` compares two literals and answers 0 rows with no error. The
   codebase's own quoter emits backticks for this dialect
-  ([`identifier.ts:36`](../../src/lib/sql/identifier.ts)), but a hand-typed statement has no such
+  ([`quoteIdentifier()`](../../src/lib/sql/identifier.ts)), but a hand-typed statement has no such
   protection ([§5.4](#54-dialect-traps-a-user-will-hit)).
 - **There is a paging ceiling.** A statement whose result the engine spreads over more than
   `MAX_PAGES = 1000` pages is **refused** rather than truncated, after the cursor is closed
@@ -1273,12 +1725,26 @@ because the provider exposes no `cancelQuery`
   here than for most providers because a default distribution ships a self-signed certificate
   ([§4.3](#43-tls)).
 - **No connection string**, deliberately ([§4.2](#42-there-is-no-connection-string-and-that-is-deliberate)).
-- **A type the engine maps but its SQL surface cannot read is still listed as a column**, because the
-  mapping does not say which types SQL supports, and enumerating them would be a per-version list this
-  code cannot verify
-  ([introspect.ts:46-52](../../src/lib/db/providers/sql/search/introspect.ts)).
+- **A type the engine maps but its SQL surface cannot read is still listed as a column.**
+  The column stays listed in the schema tree so the view reflects the index mapping faithfully.
+  Measured: OpenSearch SQL refuses `flat_object`, `unsigned_long` and `version` with "can't resolve Symbol(...) in type env", so introspection marks them as unprojectable.
+  Generate Query omits them from the SELECT list so the starter statement runs (#1459).
 - **The whole result body is buffered** before it is parsed
   ([§3.1](#31-http-only--no-driver-and-what-that-costs)).
+
+---
+
+## Migration DDL
+
+[`OPENSEARCH_MIGRATION_DDL`](../../src/lib/db/providers/sql/search/opensearch-migration-ddl.ts) is what the schema-diff migration generator writes for `opensearch`, read through `migrationDdlFor` in `src/lib/db/migration-ddl/`.
+It declines the whole diff: `refusal` is the one line the migration prints after its header, in place of any DDL, and `transactionWrapper` is `null`.
+Measured 2026-08-19 on OpenSearch 3.8.0: `ALTER TABLE probe_orders ADD COLUMN x INT` and `... MODIFY COLUMN customer TEXT` are refused with `SQLFeatureNotSupportedException`, "Query must start with SELECT, DELETE, SHOW or DESCRIBE".
+OpenSearch SQL has no `BEGIN` either, measured on 3.8.0, so there is no wrapper (#284).
+An existing field's type cannot be changed in a mapping at all, which is why the reason says reindex rather than "use the mapping API".
+
+The refusal reason it prints, verbatim:
+
+- "OpenSearch SQL reads only; change a field by reindexing into an index whose mapping declares it."
 
 ---
 
@@ -1290,8 +1756,8 @@ because the provider exposes no `cancelQuery`
 - Base class: [`src/lib/db/base-provider.ts`](../../src/lib/db/base-provider.ts)
 - Interface & DTOs: [`src/lib/db/types.ts`](../../src/lib/db/types.ts)
 - Errors: [`src/lib/db/errors.ts`](../../src/lib/db/errors.ts)
-- Connection form config: [`src/lib/db-ui-config.ts`](../../src/lib/db-ui-config.ts)
-- Dialect facts elsewhere in the codebase: [`src/lib/sql/grammar.ts:199`](../../src/lib/sql/grammar.ts) (`#`, `[…]`, block comments) · [`src/lib/sql/identifier.ts:36`](../../src/lib/sql/identifier.ts) (backticks) · [`src/lib/sql/values.ts:55`](../../src/lib/sql/values.ts) (both escape forms) · [`src/lib/sql/fence-tags.ts`](../../src/lib/sql/fence-tags.ts) (the fence tag)
+- Connection form config: [`src/lib/db/connection-form.ts`](../../src/lib/db/connection-form.ts)
+- Dialect facts elsewhere in the codebase: `OPENSEARCH_GRAMMAR` in [`src/lib/db/providers/sql/search/opensearch-sql-grammar.ts`](../../src/lib/db/providers/sql/search/opensearch-sql-grammar.ts) (`#`, `[…]`, block comments) · `quoteIdentifier()` in [`src/lib/sql/identifier.ts`](../../src/lib/sql/identifier.ts) (backticks) · `OPENSEARCH_SQL_WRITING` in [`opensearch-sql-writing.ts`](../../src/lib/db/providers/sql/search/opensearch-sql-writing.ts) (both escape forms) · [`src/lib/sql/fence-tags.ts`](../../src/lib/sql/fence-tags.ts) (the fence tag)
 - Local cluster: [`database-compose.yml`](../../database-compose.yml) (`opensearch` service, host port 9201)
 - Tests: [`tests/integration/db/opensearch-provider.test.ts`](../../tests/integration/db/opensearch-provider.test.ts) · [`tests/unit/db/search/`](../../tests/unit/db/search/)
 - API contract: [`docs/API_DOCS.md`](../API_DOCS.md)
@@ -1303,4 +1769,4 @@ because the provider exposes no `cancelQuery`
 - `_cat/indices`: <https://docs.opensearch.org/latest/api-reference/cat/cat-indices/>
 - Query insights (`top_queries`): <https://docs.opensearch.org/latest/observing-your-data/query-insights/index/>
 - Apache License, Version 2.0: <https://www.apache.org/licenses/LICENSE-2.0>
-- Sibling provider docs: [PostgreSQL](./postgres.md) · [MySQL](./mysql.md) · [Oracle](./oracle.md) · [SQL Server](./mssql.md) · [SQLite](./sqlite.md) · [MongoDB](./mongodb.md) · [Couchbase](./couchbase.md) · [ClickHouse](./clickhouse.md) · [Apache Druid](./druid.md) · [Apache Trino](./trino.md) · [Elasticsearch](./elasticsearch.md) · [Redis](./redis.md) · [LibreDB](./libredb.md)
+- Sibling provider docs: [PostgreSQL](./postgres.md) · [MySQL](./mysql.md) · [Oracle](./oracle.md) · [SQL Server](./mssql.md) · [SQLite](./sqlite.md) · [MongoDB](./mongodb.md) · [Couchbase](./couchbase.md) · [ClickHouse](./clickhouse.md) · [Apache Druid](./druid.md) · [Trino](./trino.md) · [Elasticsearch](./elasticsearch.md) · [Redis](./redis.md) · [LibreDB](./libredb.md)

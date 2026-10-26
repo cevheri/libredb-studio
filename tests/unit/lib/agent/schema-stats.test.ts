@@ -9,7 +9,7 @@ import {
   readSchemaStatistics,
 } from "@/lib/agent/schema-stats";
 import type { AgentToolContext } from "@/lib/agent/tools";
-import type { AgentRunMode } from "@/lib/agent/types";
+import type { AgentInventory, AgentInventoryObject, AgentRunMode } from "@/lib/agent/types";
 import { UNTRUSTED_CONTENT_BEGIN, UNTRUSTED_CONTENT_END } from "@/lib/agent/untrusted-content";
 import { QueryError } from "@/lib/db/errors";
 import { ExecutionArtifactStore } from "@/lib/db/operations/artifacts";
@@ -18,7 +18,7 @@ import { createCanonicalOperationRegistry } from "@/lib/db/operations/descriptor
 import { createTargetScope } from "@/lib/db/operations/policy";
 import type { DatabaseProvider, ProviderCapabilities } from "@/lib/db/types";
 import { TABLE_LABELS } from "../../../fixtures/provider-labels";
-import type { DatabaseConnection, DatabaseType, QueryResult, TableSchema } from "@/lib/types";
+import type { DatabaseConnection, DatabaseType, QueryResult } from "@/lib/types";
 
 /**
  * The run's estimated statistics: reading them, and saying honestly what they are
@@ -44,7 +44,6 @@ const capabilities: ProviderCapabilities = {
   supportsExplain: true,
   explainFormat: "postgres-json",
   supportsExternalQueryLimiting: true,
-  supportsCreateTable: true,
   supportsInlineRowEdit: true,
   supportsMaintenance: false,
   maintenanceOperations: [],
@@ -150,6 +149,22 @@ const SQLITE_STATISTICS = [
   { table_name: "notes", index_name: null, stat: null },
 ];
 
+/**
+ * What SQL Server answers `composeMssqlStatistics`: one row per user table, the sum of
+ * `sys.partitions.rows` over the heap or clustered index. `sa` reading
+ * AdventureWorks2022 gets 72 such rows.
+ *
+ * `estimated_rows` arrives as TEXT here on purpose: `SUM(p.rows)` is a `bigint` and a
+ * driver is entitled to hand one back as a string rather than lose precision, which is
+ * the case `numeric` exists for.
+ */
+const MSSQL_STATISTICS = [
+  { table_schema: "public", table_name: "orders", estimated_rows: "1000" },
+  { table_schema: "public", table_name: "audit_log", estimated_rows: 0 },
+];
+
+const answerMssql = async (): Promise<QueryResult> => result(MSSQL_STATISTICS);
+
 function answerSqlite(withStatisticsTable: boolean): (sql: string) => Promise<QueryResult> {
   return async (sql: string) => {
     if (sql.includes("name = 'sqlite_stat1'")) {
@@ -160,7 +175,7 @@ function answerSqlite(withStatisticsTable: boolean): (sql: string) => Promise<Qu
 }
 
 /** The inventory the statistics are packed against. Order is the inventory's own. */
-const TABLES: readonly TableSchema[] = [
+const TABLE_OBJECTS: readonly AgentInventoryObject[] = [
   {
     name: "public.orders",
     columns: [
@@ -185,6 +200,15 @@ const TABLES: readonly TableSchema[] = [
     foreignKeys: [],
   },
 ];
+
+/** The same inventory, with the kinds a PostgreSQL capture really carries. */
+const TABLES: AgentInventory = {
+  objects: TABLE_OBJECTS.map((object) => ({ ...object, kind: "table" })),
+  kinds: [
+    { id: "table", role: "relation", label: "Table", labelPlural: "Tables" },
+    { id: "function", role: "routine", label: "Function", labelPlural: "Functions" },
+  ],
+};
 
 async function readOf(h: Harness): Promise<AgentSchemaStatistics> {
   return readSchemaStatistics(h.context);
@@ -361,6 +385,66 @@ describe("readSchemaStatistics — SQLite", () => {
   });
 });
 
+describe("readSchemaStatistics — SQL Server", () => {
+  /**
+   * `ESTIMATE_BUILDERS` had arms for PostgreSQL and SQLite only, so every SQL Server run
+   * reported `DIALECT_HAS_NO_STATISTICS` while the composer beside it answered 72 rows of
+   * real table estimates. The composer being served is not enough on its own: this module
+   * reads the rows BACK, and the two decisions are separate.
+   */
+  test("sends one statement and no availability probe, because sys.partitions is always there", async () => {
+    const h = harness("mssql", answerMssql);
+
+    const statistics = await readOf(h);
+
+    expect(statistics.kind).toBe("read");
+    expect(h.statements()).toHaveLength(1);
+    expect(h.statements()[0]).toContain("SUM(p.rows)");
+  });
+
+  test("keys the estimates by the qualified name the inventory uses, so the two join", async () => {
+    const statistics = await readOf(harness("mssql", answerMssql));
+
+    if (statistics.kind !== "read") throw new Error("expected a reading");
+    expect(statistics.dialect).toBe("mssql");
+    expect([...statistics.byTable.keys()]).toEqual(["public.orders", "public.audit_log"]);
+  });
+
+  test("reads a bigint handed back as text as a number, and holds no column statistics", async () => {
+    const statistics = await readOf(harness("mssql", answerMssql));
+
+    if (statistics.kind !== "read") throw new Error("expected a reading");
+    expect(statistics.byTable.get("public.orders")).toEqual({ estimatedRows: 1000, columns: [] });
+    // 0 is a real count on this engine: `sys.partitions` is maintained, so an empty table
+    // is 0 rather than the "never counted" -1 PostgreSQL's `reltuples` carries.
+    expect(statistics.byTable.get("public.audit_log")).toEqual({ estimatedRows: 0, columns: [] });
+  });
+
+  test("an unreadable value is absence rather than a NaN that would print as a row count", async () => {
+    const h = harness("mssql", async () =>
+      result([{ table_schema: "public", table_name: "orders", estimated_rows: "not a number" }]),
+    );
+
+    const statistics = await readOf(h);
+
+    if (statistics.kind !== "read") throw new Error("expected a reading");
+    expect(statistics.byTable.get("public.orders")?.estimatedRows).toBeNull();
+  });
+
+  test("the estimates reach the packed block, which is what the run shows the model", async () => {
+    const packed = packSchemaStatistics(TABLES, await readOf(harness("mssql", answerMssql)));
+
+    expect(packed).toContain("public.orders: roughly 1000 row(s), estimated");
+    expect(packed).toContain("public.audit_log: roughly 0 row(s), estimated");
+    // In the inventory and absent from the reading: listed as unknown, never omitted.
+    expect(packed).toContain("public.staging: no statistics recorded for this table; its size is unknown");
+    // SQLite's absolute per-column limit is not claimed here: SQL Server DOES record
+    // distributions, behind a DBCC command this boundary refuses, so the sentence that
+    // says the engine records none would be false.
+    expect(packed).not.toContain("records no per-column distinct count");
+  });
+});
+
 describe("readSchemaStatistics — what it will not do", () => {
   test("an engine with no verified statistics composition is refused, and no statement is sent", async () => {
     const h = harness("mysql", async () => result([]));
@@ -368,6 +452,18 @@ describe("readSchemaStatistics — what it will not do", () => {
     expect(await readOf(h)).toEqual({ kind: "unavailable", reasonCode: "DIALECT_HAS_NO_STATISTICS" });
     expect(h.statements()).toHaveLength(0);
   });
+
+  // DuckDB is composed for but has no reader; Oracle is not composed for at all. Both arrive
+  // at the same answer before a statement is sent.
+  test.each(["duckdb", "oracle"] as const)(
+    "%s has no statistics this run reads, and no statement is sent",
+    async (type) => {
+      const h = harness(type, async () => result([]));
+
+      expect(await readOf(h)).toEqual({ kind: "unavailable", reasonCode: "DIALECT_HAS_NO_STATISTICS" });
+      expect(h.statements()).toHaveLength(0);
+    },
+  );
 
   test("it is the SERVER's grounding read, so it works in planning mode — where the MODEL still has no tools", async () => {
     // The mode gate in `tools.ts` refuses a model-driven call outside agent mode.
@@ -448,7 +544,10 @@ describe("packSchemaStatistics", () => {
   test("names the engine's own limits where they are absolute, rather than leaving a gap to be guessed at", async () => {
     const statistics = await statisticsOf(harness("sqlite", answerSqlite(true)));
 
-    const packed = packSchemaStatistics([{ name: "orders", columns: [], indexes: [], foreignKeys: [] }], statistics);
+    const packed = packSchemaStatistics(
+      { objects: [{ name: "orders", columns: [], indexes: [], foreignKeys: [] }] },
+      statistics,
+    );
 
     expect(packed).toContain("orders: roughly 1000 row(s), estimated");
     expect(packed).toContain("no per-column distinct count or null fraction at all");
@@ -481,10 +580,42 @@ describe("packSchemaStatistics", () => {
     expect(reasons[0]).toContain("does not hold");
   });
 
+  /*
+    The inventory carries the engine's functions and sequences too (#789), and this pack
+    speaks about every entry it is given in the words "no statistics recorded for this
+    table; its size is unknown". Said about a function that is a category error handed to
+    a model as a fact, so the pack reads only what the declared role says has rows.
+  */
+  test("a FUNCTION in the inventory gets no line, because a routine has no rows and no size", async () => {
+    const statistics = await statisticsOf(harness("postgres", answerPostgres));
+    const withRoutine: AgentInventory = {
+      ...TABLES,
+      objects: [
+        ...TABLES.objects,
+        { name: "public.order_total(integer)", kind: "function", label: "order_total", columns: [], indexes: [] },
+      ],
+    };
+
+    const packed = packSchemaStatistics(withRoutine, statistics);
+
+    expect(packed).not.toContain("order_total");
+    expect(packed).toContain("public.orders: roughly 1000 row(s), estimated");
+  });
+
+  test("an inventory of nothing but routines packs the same sentence an empty one does", async () => {
+    const statistics = await statisticsOf(harness("postgres", answerPostgres));
+    const routinesOnly: AgentInventory = {
+      kinds: TABLES.kinds,
+      objects: [{ name: "public.order_total(integer)", kind: "function", columns: [], indexes: [] }],
+    };
+
+    expect(packSchemaStatistics(routinesOnly, statistics)).toContain("no tables");
+  });
+
   test("an empty inventory packs to the reason it is empty rather than to a bare fence", async () => {
     const statistics = await statisticsOf(harness("postgres", answerPostgres));
 
-    const packed = packSchemaStatistics([], statistics);
+    const packed = packSchemaStatistics({ objects: [] }, statistics);
 
     expect(packed).toContain("no tables");
     expect(packed).not.toContain(UNTRUSTED_CONTENT_BEGIN);
@@ -505,9 +636,9 @@ describe("packSchemaStatistics", () => {
       columns: [],
       indexes: [],
       foreignKeys: [],
-    })) as TableSchema[];
+    })) as AgentInventoryObject[];
 
-    const packed = packSchemaStatistics(tables, statistics);
+    const packed = packSchemaStatistics({ objects: tables }, statistics);
 
     expect(packed.length).toBeLessThanOrEqual(AGENT_STATISTICS_PACK_MAX_CHARS);
     expect(packed).toContain("further table(s) omitted");
@@ -525,7 +656,7 @@ describe("packSchemaStatistics", () => {
     const statistics = await readOf(harness("postgres", async () => result(rows)));
 
     const packed = packSchemaStatistics(
-      [{ name: "public.orders", columns: [], indexes: [], foreignKeys: [] }],
+      { objects: [{ name: "public.orders", columns: [], indexes: [], foreignKeys: [] }] },
       statistics,
     );
 
@@ -569,7 +700,7 @@ describe("packSchemaStatistics", () => {
     const statistics = await readOf(harness("postgres", async () => result(rows)));
 
     const packed = packSchemaStatistics(
-      [{ name: "public.orders", columns: [], indexes: [], foreignKeys: [] }],
+      { objects: [{ name: "public.orders", columns: [], indexes: [], foreignKeys: [] }] },
       statistics,
       { detail: "rows" },
     );

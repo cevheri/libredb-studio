@@ -1,9 +1,19 @@
 import "../setup-dom";
-import "../helpers/mock-sonner";
+import { mockToastError, mockToastSuccess } from "../helpers/mock-sonner";
 import "../helpers/mock-navigation";
 
 import { mock } from "bun:test";
 import React from "react";
+
+const contextMenuContext = React.createContext<{
+  open: boolean;
+  setOpen: (open: boolean) => void;
+} | null>(null);
+
+const mockClipboardWriteText = mock((_text: string) => Promise.resolve());
+
+const originalClipboard = Object.getOwnPropertyDescriptor(globalThis.navigator, "clipboard");
+const originalExecCommand = Object.getOwnPropertyDescriptor(globalThis.document, "execCommand");
 
 // ── Mock framer-motion ──────────────────────────────────────────────────────
 mock.module("framer-motion", () => {
@@ -28,7 +38,7 @@ const mockShouldMask = mock(() => false);
 const mockCanToggleMasking = mock(() => true);
 const mockCanReveal = mock(() => true);
 const mockDetectSensitiveColumnsFromConfig = mock(() => new Map());
-const mockMaskValueByPattern = mock(() => "***");
+const mockMaskValueByPattern = mock((_value?: unknown) => "***");
 const mockLoadMaskingConfig = mock(() => ({
   enabled: false,
   patterns: [],
@@ -44,15 +54,76 @@ mock.module("@/lib/data-masking", () => ({
   loadMaskingConfig: mockLoadMaskingConfig,
 }));
 
+mock.module("@/components/ui/context-menu", () => ({
+  ContextMenu: ({ children }: { children: React.ReactNode }) => {
+    const [open, setOpen] = React.useState(false);
+    return React.createElement(
+      contextMenuContext.Provider,
+      { value: { open, setOpen } },
+      React.createElement("div", { "data-testid": "result-context-menu" }, children),
+    );
+  },
+  ContextMenuContent: ({ children }: { children: React.ReactNode }) => {
+    const context = React.useContext(contextMenuContext);
+    return context?.open ? React.createElement("div", { "data-testid": "context-menu-content" }, children) : null;
+  },
+  ContextMenuItem: ({ children, onClick }: { children: React.ReactNode; onClick?: () => void }) =>
+    React.createElement("button", { type: "button", role: "menuitem", onClick }, children),
+  ContextMenuTrigger: ({ children }: { children: React.ReactNode }) => {
+    const context = React.useContext(contextMenuContext);
+    return React.createElement(
+      "div",
+      {
+        "data-testid": "context-menu-trigger",
+        onContextMenu: (event: React.MouseEvent<HTMLDivElement>) => {
+          event.preventDefault();
+          context?.setOpen(true);
+        },
+      },
+      children,
+    );
+  },
+}));
+
 // ── Mock sub-components to simplify testing ─────────────────────────────────
 mock.module("@/components/results-grid/ResultCard", () => ({
   ResultCard: (props: Record<string, unknown>) =>
-    React.createElement("div", { "data-testid": "result-card", "data-index": props.index }),
+    React.createElement(
+      "div",
+      {
+        "data-testid": "result-card",
+        "data-index": props.index,
+        // The card decides its own preview fields from this list, so what it is HANDED is
+        // the whole of the question here (#870).
+        "data-fields": (props.fields as string[]).join(","),
+        // What the card is handed about vector columns, which it reads per preview field.
+        "data-vector-columns": JSON.stringify(props.vectorColumns ?? null),
+      },
+      React.createElement(
+        "button",
+        {
+          type: "button",
+          "data-testid": "result-card-content",
+          onClick: props.onSelect as () => void,
+        },
+        "Card content",
+      ),
+    ),
 }));
 
 mock.module("@/components/results-grid/RowDetailSheet", () => ({
   RowDetailSheet: (props: Record<string, unknown>) =>
-    props.isOpen ? React.createElement("div", { "data-testid": "row-detail-sheet" }, "Row Detail") : null,
+    props.isOpen
+      ? React.createElement(
+          "div",
+          {
+            "data-testid": "row-detail-sheet",
+            "data-row-index": String(props.rowIndex),
+            "data-vector-columns": JSON.stringify(props.vectorColumns ?? null),
+          },
+          "Row Detail",
+        )
+      : null,
 }));
 
 mock.module("@/components/results-grid/StatsBar", () => ({
@@ -71,6 +142,24 @@ mock.module("@/components/results-grid/StatsBar", () => ({
         { "data-testid": "exec-time" },
         `EXEC TIME: ${(props.result as { executionTime?: number })?.executionTime ?? 0}ms`,
       ),
+      React.createElement(
+        "button",
+        {
+          type: "button",
+          "data-testid": "view-card",
+          onClick: () => (props.onSetViewMode as (mode: "card" | "table") => void)("card"),
+        },
+        "Card",
+      ),
+      React.createElement(
+        "button",
+        {
+          type: "button",
+          "data-testid": "view-table",
+          onClick: () => (props.onSetViewMode as (mode: "card" | "table") => void)("table"),
+        },
+        "Table",
+      ),
       props.onToggleMasking
         ? React.createElement(
             "button",
@@ -85,6 +174,13 @@ mock.module("@/components/results-grid/StatsBar", () => ({
             `${(props.pendingChanges as unknown[]).length} changes`,
           )
         : null,
+      props.onToggleWrapText
+        ? React.createElement(
+            "button",
+            { "data-testid": "wrap-toggle", onClick: props.onToggleWrapText as () => void },
+            "WRAP",
+          )
+        : null,
       (props.activeFilterCount as number) > 0
         ? React.createElement(
             "button",
@@ -92,22 +188,46 @@ mock.module("@/components/results-grid/StatsBar", () => ({
             "Clear Filters",
           )
         : null,
-    ),
-  LoadMoreFooter: (props: Record<string, unknown>) =>
-    props.hasMore
-      ? React.createElement(
-          "div",
-          { "data-testid": "load-more-footer" },
-          React.createElement(
+      // The notice itself is rendered and worded in StatsBar; what this file is about is
+      // the DECISION ResultsGrid makes, so the mock only reports the prop it was handed.
+      props.orderAcrossPagesUnspecified
+        ? React.createElement("span", { "data-testid": "order-notice" }, "order notice")
+        : null,
+      // Same for the load-more control. It used to be a separate `LoadMoreFooter` export
+      // rendered BELOW the grid, and this file stubbed that too; the control now lives in
+      // the stats strip, so the only thing left for ResultsGrid to get right is whether it
+      // hands down an offer at all, and with what page size. Rendering it inside the
+      // stats-bar stub is also what lets a test assert the grid grew no chrome below.
+      // The menu is rendered and worded in StatsBar; what this file is about is whether
+      // ResultsGrid hands down a writer and what that writer does to the table, so the
+      // stub only reports the prop and flips one known field through it.
+      props.onToggleColumn
+        ? React.createElement(
             "button",
-            { onClick: props.onLoadMore as () => void, "data-testid": "load-more-btn" },
-            "Load More (500 rows)",
-          ),
-        )
-      : null,
+            {
+              "data-testid": "toggle-column",
+              "data-hidden": [...((props.hiddenColumns as Set<string>) ?? [])].join(","),
+              onClick: () => (props.onToggleColumn as (f: string) => void)("name"),
+            },
+            "toggle name",
+          )
+        : null,
+      props.pageOffer
+        ? React.createElement(
+            "button",
+            {
+              "data-testid": "page-offer",
+              "data-loading": String(props.isLoadingMore === true),
+              onClick: (props.pageOffer as { onLoadMore: () => void }).onLoadMore,
+            },
+            `offer ${(props.pageOffer as { pageSize: number }).pageSize}`,
+          )
+        : null,
+    ),
 }));
 
 // ── Mock @tanstack/react-virtual ────────────────────────────────────────────
+const mockVirtualizerMeasure = mock(() => {});
 mock.module("@tanstack/react-virtual", () => ({
   useVirtualizer: (opts: { count: number }) => ({
     getVirtualItems: () =>
@@ -118,6 +238,9 @@ mock.module("@tanstack/react-virtual", () => ({
         key: i,
       })),
     getTotalSize: () => opts.count * 36,
+    measureElement: () => {},
+    measure: mockVirtualizerMeasure,
+    scrollToIndex: () => {},
   }),
 }));
 
@@ -137,8 +260,13 @@ mock.module("lucide-react", () => {
 
 // ── Imports AFTER mocks ─────────────────────────────────────────────────────
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { render, fireEvent, cleanup, act } from "@testing-library/react";
+import { render, fireEvent, createEvent, cleanup, act, waitFor, within } from "@testing-library/react";
 import { ResultsGrid, type CellChange } from "@/components/ResultsGrid";
+import {
+  getContentFitColumnSize,
+  getHeaderFitColumnSize,
+  RESULT_COLUMN_RESIZE_MAX_SIZE,
+} from "@/components/results-grid/column-sizing";
 import type { QueryResult } from "@/lib/types";
 
 // ── Test data ───────────────────────────────────────────────────────────────
@@ -179,6 +307,66 @@ const mockPaginatedResult: QueryResult = {
   },
 };
 
+function findContextMenuForMode(
+  container: HTMLElement,
+  text: string,
+  mode: "card" | "mobile" | "desktop",
+): HTMLElement {
+  const contextMenu = Array.from(container.querySelectorAll<HTMLElement>('[data-testid="result-context-menu"]')).find(
+    (candidate) => {
+      const trigger = candidate.querySelector<HTMLElement>('[data-testid="context-menu-trigger"]');
+      const triggerChild = trigger?.firstElementChild;
+      const isMode =
+        mode === "card"
+          ? candidate.querySelector('[data-testid="result-card"]') !== null
+          : mode === "mobile"
+            ? triggerChild?.tagName === "BUTTON"
+            : candidate.closest("[data-desktop-grid]") !== null;
+      return isMode && candidate.textContent?.includes(text);
+    },
+  );
+
+  if (!contextMenu) {
+    throw new Error(`Could not find the ${mode} context menu containing ${text}`);
+  }
+
+  return contextMenu;
+}
+
+function findDesktopCell(container: HTMLElement, text: string): HTMLElement | undefined {
+  const row = findDesktopRow(container, text);
+  return row
+    ? Array.from(row.querySelectorAll<HTMLElement>(".cursor-text")).find((cell) => cell.textContent === text)
+    : undefined;
+}
+
+// Both tables key their rows by `data-index` now that the mobile one measures its own
+// wrapped height, so the desktop grid has to be named to reach only its rows.
+function findDesktopRow(container: HTMLElement, text: string): HTMLElement | undefined {
+  return Array.from(
+    container.querySelectorAll<HTMLElement>("[data-desktop-grid] [data-index]:not([data-testid])"),
+  ).find((row) => row.textContent?.includes(text));
+}
+
+/**
+ * What a column header reads as on screen. The name and type sit beside the sort control that
+ * carries the header's accessible name, not inside it, so the text is read off the header cell.
+ */
+function headerText(sortControl: HTMLElement): string | null | undefined {
+  return sortControl.closest('[role="columnheader"]')?.textContent;
+}
+
+function findDesktopHeader(container: HTMLElement, field: string): HTMLElement {
+  const header = Array.from(container.querySelectorAll<HTMLElement>("[data-desktop-grid] .cursor-col-resize"))
+    .map((handle) => handle.parentElement)
+    .find((candidate) =>
+      candidate?.querySelector<HTMLButtonElement>("button")?.getAttribute("aria-label")?.startsWith(field),
+    );
+
+  if (!header) throw new Error(`Could not find the desktop header for ${field}`);
+  return header;
+}
+
 // =============================================================================
 // ResultsGrid Tests
 // =============================================================================
@@ -186,6 +374,17 @@ const mockPaginatedResult: QueryResult = {
 describe("ResultsGrid", () => {
   afterEach(() => {
     cleanup();
+    mockClipboardWriteText.mockReset();
+    mockToastError.mockClear();
+    mockToastSuccess.mockClear();
+    Object.defineProperty(globalThis.navigator, "clipboard", {
+      configurable: true,
+      value: originalClipboard?.value,
+    });
+    Object.defineProperty(globalThis.document, "execCommand", {
+      configurable: true,
+      value: originalExecCommand?.value,
+    });
   });
 
   beforeEach(() => {
@@ -193,8 +392,15 @@ describe("ResultsGrid", () => {
     mockCanToggleMasking.mockClear();
     mockCanReveal.mockClear();
     mockDetectSensitiveColumnsFromConfig.mockClear();
+    mockMaskValueByPattern.mockClear();
     mockDetectSensitiveColumnsFromConfig.mockReturnValue(new Map());
+    mockMaskValueByPattern.mockReturnValue("***");
     mockShouldMask.mockReturnValue(false);
+    mockClipboardWriteText.mockResolvedValue(undefined);
+    Object.defineProperty(globalThis.navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: mockClipboardWriteText },
+    });
   });
 
   // ── 1. Renders "No results" when result has empty rows ────────────────────
@@ -205,24 +411,590 @@ describe("ResultsGrid", () => {
     expect(queryByText("Query returned no data")).not.toBeNull();
   });
 
+  // ── A write's affected-row count (#1425) ──────────────────────────────────
+
+  test("says how many rows a write affected instead of the empty state", () => {
+    const { container } = render(React.createElement(ResultsGrid, { result: { ...mockEmptyResult, rowCount: 10 } }));
+
+    expect(container.textContent).toContain("10 rows affected");
+    expect(container.textContent).not.toContain("Query returned no data");
+    expect(container.textContent).not.toContain("result set is currently empty");
+  });
+
+  test("uses the singular for a single affected row", () => {
+    const { container } = render(React.createElement(ResultsGrid, { result: { ...mockEmptyResult, rowCount: 1 } }));
+
+    expect(container.textContent).toContain("1 row affected");
+    expect(container.textContent).not.toContain("1 rows");
+  });
+
+  test("says the count was rolled back when the run recorded a confirmed rollback", () => {
+    const { container } = render(
+      React.createElement(ResultsGrid, { result: { ...mockEmptyResult, rowCount: 3, rolledBack: true } }),
+    );
+
+    expect(container.textContent).toContain("3 rows affected, rolled back");
+  });
+
+  test("keeps the empty state for a SELECT that matched nothing", () => {
+    const { container } = render(
+      React.createElement(ResultsGrid, { result: { ...mockEmptyResult, fields: ["id"], rowCount: 0 } }),
+    );
+
+    expect(container.textContent).toContain("Query returned no data");
+  });
+
   // ── 2. Renders column headers from result.fields ──────────────────────────
 
-  test("renders column headers from result.fields", () => {
-    const { queryAllByText } = render(React.createElement(ResultsGrid, { result: mockResult }));
+  test("renders desktop-table column headers from result.fields", () => {
+    const { getAllByRole, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
 
-    expect(queryAllByText("id").length).toBeGreaterThan(0);
-    expect(queryAllByText("name").length).toBeGreaterThan(0);
-    expect(queryAllByText("email").length).toBeGreaterThan(0);
+    expect(getAllByRole("button", { name: "id" }).length).toBeGreaterThan(0);
+    expect(getAllByRole("button", { name: "name" }).length).toBeGreaterThan(0);
+    expect(getAllByRole("button", { name: "email" }).length).toBeGreaterThan(0);
+  });
+
+  test("sizes desktop result columns from their header, widened only by a value longer than it", () => {
+    const longValue = "a value long enough to widen its two-letter column";
+    const result: QueryResult = {
+      rows: [{ id: longValue, name: "x" }],
+      fields: ["id", "name"],
+      rowCount: 1,
+      executionTime: 1,
+    };
+    const { container } = render(React.createElement(ResultsGrid, { result }));
+
+    expect(findDesktopHeader(container, "id").style.width).toBe(
+      `${getContentFitColumnSize("id", undefined, false, [longValue])}px`,
+    );
+    expect(findDesktopHeader(container, "name").style.width).toBe(`${getHeaderFitColumnSize("name")}px`);
+
+    cleanup();
+
+    const shortValueResult: QueryResult = {
+      ...result,
+      rows: [{ id: "1", name: "short" }],
+    };
+    const shortValueRender = render(React.createElement(ResultsGrid, { result: shortValueResult }));
+    expect(findDesktopHeader(shortValueRender.container, "id").style.width).toBe(`${getHeaderFitColumnSize("id")}px`);
+    expect(findDesktopHeader(shortValueRender.container, "name").style.width).toBe(
+      `${getHeaderFitColumnSize("name")}px`,
+    );
+
+    const longField = "x".repeat(200);
+    const longFieldRender = render(
+      React.createElement(ResultsGrid, {
+        result: { ...result, fields: [longField], rows: [{ [longField]: "short" }] },
+      }),
+    );
+    expect(
+      findDesktopHeader(longFieldRender.container, longField).querySelector("span.truncate")?.getAttribute("title"),
+    ).toBe(longField);
   });
 
   // ── 3. Renders data rows from result.rows ─────────────────────────────────
 
-  test("renders data rows from result.rows", () => {
-    const { queryAllByText } = render(React.createElement(ResultsGrid, { result: mockResult }));
+  test("renders desktop-table data rows from result.rows", () => {
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
 
+    expect(findDesktopRow(container, "Alice")).not.toBeUndefined();
+    expect(findDesktopRow(container, "Bob")).not.toBeUndefined();
+    expect(findDesktopRow(container, "Charlie")).not.toBeUndefined();
+  });
+
+  test("renders cell and row actions for a right-clicked mobile-table cell", () => {
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
+    const contextMenu = findContextMenuForMode(container, "Alice", "mobile");
+
+    fireEvent.contextMenu(within(contextMenu).getByText("Alice"));
+
+    expect(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" })).not.toBeNull();
+    expect(within(contextMenu).getByRole("menuitem", { name: "Copy Row as JSON" })).not.toBeNull();
+  });
+
+  test("renders only the row action for card, mobile-table, and desktop-table row backgrounds", () => {
+    const { container, getAllByTestId, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+
+    fireEvent.click(getByTestId("view-card"));
+    const cardContent = getAllByTestId("result-card-content")[0];
+    const cardMenu = findContextMenuForMode(container, "Card content", "card");
+    fireEvent.contextMenu(cardContent);
+    expect(within(cardMenu!).queryByRole("menuitem", { name: "Copy Cell" })).toBeNull();
+    expect(within(cardMenu!).getByRole("menuitem", { name: "Copy Row as JSON" })).not.toBeNull();
+
+    fireEvent.click(getByTestId("view-table"));
+    const mobileMenu = findContextMenuForMode(container, "Alice", "mobile");
+    const mobileRow = mobileMenu.querySelector<HTMLElement>('[data-testid="context-menu-trigger"]')?.firstElementChild;
+    expect(mobileRow).not.toBeNull();
+    fireEvent.contextMenu(mobileRow!);
+    expect(within(mobileMenu).queryByRole("menuitem", { name: "Copy Cell" })).toBeNull();
+    expect(within(mobileMenu).getByRole("menuitem", { name: "Copy Row as JSON" })).not.toBeNull();
+
+    fireEvent.click(getByTestId("view-table"));
+    const desktopMenu = findContextMenuForMode(container, "Alice", "desktop");
+    const desktopRow = desktopMenu.querySelector<HTMLElement>("[data-index]:not([data-testid])");
+    expect(desktopRow).not.toBeNull();
+    fireEvent.contextMenu(desktopRow!);
+    expect(within(desktopMenu!).queryByRole("menuitem", { name: "Copy Cell" })).toBeNull();
+    expect(within(desktopMenu!).getByRole("menuitem", { name: "Copy Row as JSON" })).not.toBeNull();
+  });
+
+  test("clears a stale mobile-table cell action after switching to card mode", () => {
+    const { container, getAllByTestId, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
+
+    const mobileMenu = findContextMenuForMode(container, "Alice", "mobile");
+    fireEvent.contextMenu(within(mobileMenu).getByText("Alice"));
+    expect(within(mobileMenu).getByRole("menuitem", { name: "Copy Cell" })).not.toBeNull();
+
+    fireEvent.click(getByTestId("view-card"));
+    const cardContent = getAllByTestId("result-card-content")[0];
+    const cardMenu = findContextMenuForMode(container, "Card content", "card");
+    fireEvent.contextMenu(cardContent);
+    expect(within(cardMenu).queryByRole("menuitem", { name: "Copy Cell" })).toBeNull();
+    expect(within(cardMenu).getByRole("menuitem", { name: "Copy Row as JSON" })).not.toBeNull();
+  });
+
+  test("renders cell and row actions for a right-clicked desktop-table cell", () => {
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
+    const contextMenu = findContextMenuForMode(container, "Alice", "desktop");
+
+    fireEvent.contextMenu(within(contextMenu).getByText("Alice"));
+
+    expect(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" })).not.toBeNull();
+    expect(within(contextMenu).getByRole("menuitem", { name: "Copy Row as JSON" })).not.toBeNull();
+  });
+
+  test("copies the right-clicked mobile-table cell value", async () => {
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
+    const contextMenu = findContextMenuForMode(container, "Alice", "mobile");
+
+    fireEvent.contextMenu(within(contextMenu).getByText("Alice"));
+    fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" }));
+
+    await waitFor(() => expect(mockClipboardWriteText).toHaveBeenCalledWith("Alice"));
+    expect(mockToastSuccess).toHaveBeenCalledWith("Cell copied to clipboard");
+  });
+
+  test("copies the displayed mobile-table pending-edit value", async () => {
+    const pendingChanges: CellChange[] = [
+      { rowIndex: 0, columnId: "name", originalValue: "Alice", newValue: "Alicia" },
+    ];
+    const { container, getByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: mockResult,
+        editingEnabled: true,
+        pendingChanges,
+      }),
+    );
+    fireEvent.click(getByTestId("view-table"));
+
+    const contextMenu = findContextMenuForMode(container, "Alicia", "mobile");
+    const displayedCell = within(contextMenu).getByText("Alicia");
+    expect(displayedCell).not.toBeNull();
+    fireEvent.contextMenu(displayedCell);
+    fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" }));
+
+    await waitFor(() => expect(mockClipboardWriteText).toHaveBeenCalledWith("Alicia"));
+  });
+
+  test("copies the pending value for the sorted desktop row, not its virtual position", async () => {
+    const result: QueryResult = {
+      rows: [
+        { id: 1, name: "Alice" },
+        { id: 2, name: "Charlie" },
+      ],
+      fields: ["id", "name"],
+      rowCount: 2,
+      executionTime: 1,
+    };
+    const pendingChanges: CellChange[] = [
+      { rowIndex: 1, columnId: "name", originalValue: "Charlie", newValue: "Charles" },
+    ];
+    const { container, getAllByRole, getByTestId } = render(
+      React.createElement(ResultsGrid, { result, editingEnabled: true, pendingChanges }),
+    );
+
+    fireEvent.click(getByTestId("view-table"));
+    fireEvent.click(getAllByRole("button", { name: "name" })[0]);
+    fireEvent.click(getAllByRole("button", { name: "name, sorted ascending" })[0]);
+
+    const contextMenu = findContextMenuForMode(container, "Charles", "desktop");
+    fireEvent.contextMenu(within(contextMenu).getByText("Charles"));
+    fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" }));
+
+    await waitFor(() => expect(mockClipboardWriteText).toHaveBeenCalledWith("Charles"));
+  });
+
+  test("copies the filtered desktop cell by its place in the result, not in the filter", async () => {
+    // The desktop table is built over the FILTERED rows, so TanStack's `row.index` is a
+    // position in that array, while a pending change and a reveal are both addressed by
+    // the position in `result.rows`. Copy has to read the same number the cell drew, or
+    // it puts a value on the clipboard that is not the one on screen.
+    const result: QueryResult = {
+      rows: [
+        { id: 1, name: "Alice" },
+        { id: 2, name: "Bob" },
+        { id: 3, name: "Charlie" },
+      ],
+      fields: ["id", "name"],
+      rowCount: 3,
+      executionTime: 1,
+    };
+    const pendingChanges: CellChange[] = [
+      { rowIndex: 2, columnId: "name", originalValue: "Charlie", newValue: "Charles" },
+    ];
+    const { container, getByTestId } = render(
+      React.createElement(ResultsGrid, { result, editingEnabled: true, pendingChanges }),
+    );
+    fireEvent.click(getByTestId("view-table"));
+
+    fireEvent.click(container.querySelectorAll('button[title="Filter column"]')[1]);
+    fireEvent.change(container.querySelector('input[placeholder="Filter name..."]')!, {
+      target: { value: "Charl" },
+    });
+
+    const contextMenu = findContextMenuForMode(container, "Charles", "desktop");
+    fireEvent.contextMenu(within(contextMenu).getByText("Charles"));
+    fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" }));
+
+    await waitFor(() => expect(mockClipboardWriteText).toHaveBeenCalledWith("Charles"));
+  });
+
+  test("Copy Cell on a bytea value copies the whole value, not the cell's preview", async () => {
+    // Reproduces the defect first: the grid cell shows the first 32 bytes and the size, and Copy Cell used to
+    // copy that preview, 77 characters for a 100-byte value, which no reader could paste back as the value.
+    const bytes = Array.from({ length: 100 }, (_, index) => index);
+    const hex = bytes.map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const preview = `\\x${hex.slice(0, 64)}... (100 B)`;
+    const result: QueryResult = {
+      rows: [{ id: 1, payload: { type: "Buffer", data: bytes } }],
+      fields: ["id", "payload"],
+      rowCount: 1,
+      executionTime: 1,
+      columnTypes: { id: "int4", payload: "bytea" },
+    };
+    expect(preview).toHaveLength(77);
+
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result }));
+    fireEvent.click(getByTestId("view-table"));
+    for (const mode of ["desktop", "mobile"] as const) {
+      mockClipboardWriteText.mockClear();
+      const contextMenu = findContextMenuForMode(container, preview, mode);
+      fireEvent.contextMenu(within(contextMenu).getByText(preview));
+      fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" }));
+      // oxlint-disable-next-line no-await-in-loop -- one copy per table, each read from a cleared clipboard mock.
+      await waitFor(() => expect(mockClipboardWriteText).toHaveBeenCalledWith(`\\x${hex}`));
+    }
+  });
+
+  describe("vector columns (vector-family spec 3.10)", () => {
+    const DIMENSION = 768;
+    const embedding = Array.from({ length: DIMENSION }, (_, index) => ((index % 9) - 4) / 4);
+    const DISPLAY = "[-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, …] 768 dims";
+    const COPY = `[${embedding.map((value) => (Number.isInteger(value) ? value.toFixed(1) : String(value))).join(",")}]`;
+    const vectorResult: QueryResult = {
+      rows: [{ id: 1, embedding }],
+      fields: ["id", "embedding"],
+      rowCount: 1,
+      executionTime: 1,
+      vectorColumns: { embedding: { kind: "dense", dtype: "float32", dimension: DIMENSION } },
+    };
+
+    test("a declared vector column draws the vector cell in the desktop and the mobile table", () => {
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: vectorResult }));
+      fireEvent.click(getByTestId("view-table"));
+      expect(within(findContextMenuForMode(container, DISPLAY, "desktop")).getByText(DISPLAY)).not.toBeNull();
+      expect(within(findContextMenuForMode(container, DISPLAY, "mobile")).getByText(DISPLAY)).not.toBeNull();
+    });
+
+    test("Copy Cell on a declared vector cell copies the whole value as compact JSON", async () => {
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: vectorResult }));
+      fireEvent.click(getByTestId("view-table"));
+      for (const mode of ["desktop", "mobile"] as const) {
+        mockClipboardWriteText.mockClear();
+        const contextMenu = findContextMenuForMode(container, DISPLAY, mode);
+        fireEvent.contextMenu(within(contextMenu).getByText(DISPLAY));
+        fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" }));
+        // oxlint-disable-next-line no-await-in-loop -- one copy per table, each read from a cleared clipboard mock.
+        await waitFor(() => expect(mockClipboardWriteText).toHaveBeenCalledWith(COPY));
+      }
+    });
+
+    test("the same array in a column the result does not declare draws and copies as the JSON it was", async () => {
+      const json = JSON.stringify(embedding);
+      const { container, getByTestId } = render(
+        React.createElement(ResultsGrid, { result: { ...vectorResult, vectorColumns: undefined } }),
+      );
+      fireEvent.click(getByTestId("view-table"));
+      const contextMenu = findContextMenuForMode(container, json, "desktop");
+      fireEvent.contextMenu(within(contextMenu).getByText(json));
+      fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" }));
+      await waitFor(() => expect(mockClipboardWriteText).toHaveBeenCalledWith(json));
+    });
+
+    test("a masked vector column shows and copies its mask, never the vector", async () => {
+      mockShouldMask.mockReturnValue(true);
+      mockDetectSensitiveColumnsFromConfig.mockReturnValue(new Map([["embedding", "custom"]]));
+      const { container, getByTestId } = render(
+        React.createElement(ResultsGrid, { result: vectorResult, maskingEnabled: true }),
+      );
+      fireEvent.click(getByTestId("view-table"));
+      const contextMenu = findContextMenuForMode(container, "***", "desktop");
+      expect(within(contextMenu).queryByText(DISPLAY)).toBeNull();
+      fireEvent.contextMenu(within(contextMenu).getByText("***"));
+      fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" }));
+      await waitFor(() => expect(mockClipboardWriteText).toHaveBeenCalledWith("***"));
+    });
+
+    test("a column named like an Object.prototype member is not taken for a declared vector", () => {
+      const result: QueryResult = {
+        rows: [{ constructor: [1, 2] }],
+        fields: ["constructor"],
+        rowCount: 1,
+        executionTime: 1,
+        vectorColumns: vectorResult.vectorColumns,
+      };
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result }));
+      fireEvent.click(getByTestId("view-table"));
+      expect(within(findContextMenuForMode(container, "[1,2]", "desktop")).getByText("[1,2]")).not.toBeNull();
+    });
+
+    test("the card view and the row detail are handed the result's vector columns", () => {
+      const declared = JSON.stringify(vectorResult.vectorColumns);
+      const { getAllByTestId, getByTestId } = render(React.createElement(ResultsGrid, { result: vectorResult }));
+      expect(getAllByTestId("result-card")[0].getAttribute("data-vector-columns")).toBe(declared);
+      fireEvent.click(getAllByTestId("result-card-content")[0]);
+      expect(getByTestId("row-detail-sheet").getAttribute("data-vector-columns")).toBe(declared);
+    });
+  });
+
+  test("offers no cell action for the row-detail column", () => {
+    // That column holds a control, not a value, so there is nothing in it to copy.
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
+    const contextMenu = findContextMenuForMode(container, "Alice", "desktop");
+
+    fireEvent.contextMenu(within(contextMenu).getByText("Alice"));
+    expect(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" })).not.toBeNull();
+
+    fireEvent.contextMenu(contextMenu.querySelector("[data-row-detail]")!);
+
+    expect(within(contextMenu).queryByRole("menuitem", { name: "Copy Cell" })).toBeNull();
+    expect(within(contextMenu).getByRole("menuitem", { name: "Copy Row as JSON" })).not.toBeNull();
+  });
+
+  test("copies the right-clicked mobile-table row as formatted JSON", async () => {
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
+    const contextMenu = findContextMenuForMode(container, "Alice", "mobile");
+
+    fireEvent.contextMenu(within(contextMenu).getByText("Alice"));
+    fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Row as JSON" }));
+
+    await waitFor(() =>
+      expect(mockClipboardWriteText).toHaveBeenCalledWith(JSON.stringify(mockResult.rows[0], null, 2)),
+    );
+    expect(mockToastSuccess).toHaveBeenCalledWith("Row copied to clipboard");
+  });
+
+  test("copies nested and null row values as exact JSON", async () => {
+    const row = { id: 1, name: "Nested", metadata: { active: true }, tags: ["a", "b"], missing: null };
+    const result: QueryResult = {
+      rows: [row],
+      fields: ["id", "name", "metadata", "tags", "missing"],
+      rowCount: 1,
+      executionTime: 1,
+    };
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result }));
+    fireEvent.click(getByTestId("view-table"));
+    const contextMenu = findContextMenuForMode(container, "Nested", "mobile");
+
+    fireEvent.contextMenu(within(contextMenu).getByText("Nested"));
+    fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Row as JSON" }));
+
+    await waitFor(() => expect(mockClipboardWriteText).toHaveBeenCalledWith(JSON.stringify(row, null, 2)));
+  });
+
+  // The cell shows `\x` hex, and the copied row used to carry the Buffer form instead,
+  // one number per byte (#1381). The row copies what the grid and the CSV show.
+  test("copies a binary cell as the hex the grid shows, not as the Buffer form", async () => {
+    const result: QueryResult = {
+      rows: [{ name: "Blob", payload: { type: "Buffer", data: [0xde, 0xad, 0x00, 0xff] } }],
+      fields: ["name", "payload"],
+      rowCount: 1,
+      executionTime: 1,
+    };
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result }));
+    fireEvent.click(getByTestId("view-table"));
+    const contextMenu = findContextMenuForMode(container, "Blob", "mobile");
+
+    fireEvent.contextMenu(within(contextMenu).getByText("Blob"));
+    fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Row as JSON" }));
+
+    await waitFor(() =>
+      expect(mockClipboardWriteText).toHaveBeenCalledWith(
+        JSON.stringify({ name: "Blob", payload: "\\xdead00ff" }, null, 2),
+      ),
+    );
+  });
+
+  // `JSON.stringify` throws on a bigint, which took the copy down with no clipboard
+  // write and no toast; the row now goes through `jsonText`, which writes the digits.
+  test("copies a bigint cell as its digits instead of throwing", async () => {
+    const result: QueryResult = {
+      rows: [{ name: "Big", n: BigInt("9007199254740993") }],
+      fields: ["name", "n"],
+      rowCount: 1,
+      executionTime: 1,
+    };
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result }));
+    fireEvent.click(getByTestId("view-table"));
+    const contextMenu = findContextMenuForMode(container, "Big", "mobile");
+
+    fireEvent.contextMenu(within(contextMenu).getByText("Big"));
+    expect(() =>
+      fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Row as JSON" })),
+    ).not.toThrow();
+
+    await waitFor(() =>
+      expect(mockClipboardWriteText).toHaveBeenCalledWith(
+        JSON.stringify({ name: "Big", n: "9007199254740993" }, null, 2),
+      ),
+    );
+  });
+
+  test("copies an unmasked binary cell as hex when masking is active", async () => {
+    mockShouldMask.mockReturnValue(true);
+    mockDetectSensitiveColumnsFromConfig.mockReturnValue(new Map([["email", "email"]]));
+    const result: QueryResult = {
+      rows: [{ name: "Blob", email: "a@b.c", payload: { type: "Buffer", data: [0x00, 0xff] } }],
+      fields: ["name", "email", "payload"],
+      rowCount: 1,
+      executionTime: 1,
+    };
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result, maskingEnabled: true }));
+    fireEvent.click(getByTestId("view-table"));
+    const contextMenu = findContextMenuForMode(container, "Blob", "mobile");
+
+    fireEvent.contextMenu(within(contextMenu).getByText("Blob"));
+    fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Row as JSON" }));
+
+    await waitFor(() =>
+      expect(mockClipboardWriteText).toHaveBeenCalledWith(
+        JSON.stringify({ name: "Blob", email: "***", payload: "\\x00ff" }, null, 2),
+      ),
+    );
+  });
+
+  test("copies masked mobile-table cell and row values when masking is active", async () => {
+    mockShouldMask.mockReturnValue(true);
+    mockDetectSensitiveColumnsFromConfig.mockReturnValue(new Map([["email", "email"]]));
+
+    const { container, getByTestId } = render(
+      React.createElement(ResultsGrid, { result: mockResult, maskingEnabled: true }),
+    );
+    fireEvent.click(getByTestId("view-table"));
+    const contextMenu = findContextMenuForMode(container, "Alice", "mobile");
+
+    fireEvent.contextMenu(within(contextMenu).getByText("***"));
+    fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" }));
+    await waitFor(() => expect(mockClipboardWriteText).toHaveBeenCalledWith("***"));
+
+    fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Row as JSON" }));
+    await waitFor(() =>
+      expect(mockClipboardWriteText).toHaveBeenLastCalledWith(
+        JSON.stringify({ id: 1, name: "Alice", email: "***" }, null, 2),
+      ),
+    );
+  });
+
+  test("reports mobile-table clipboard failures for cell actions", async () => {
+    mockClipboardWriteText.mockRejectedValue(new Error("clipboard unavailable"));
+    Object.defineProperty(globalThis.document, "execCommand", {
+      configurable: true,
+      value: () => false,
+    });
+
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
+    const contextMenu = findContextMenuForMode(container, "Alice", "mobile");
+
+    fireEvent.contextMenu(within(contextMenu).getByText("Alice"));
+    fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" }));
+
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith("Could not copy Cell — select the text and copy it yourself"),
+    );
+  });
+
+  test("reports mobile-table clipboard failures for row-copy actions", async () => {
+    mockClipboardWriteText.mockRejectedValue(new Error("clipboard unavailable"));
+    Object.defineProperty(globalThis.document, "execCommand", {
+      configurable: true,
+      value: () => false,
+    });
+
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
+    const contextMenu = findContextMenuForMode(container, "Alice", "mobile");
+
+    fireEvent.contextMenu(within(contextMenu).getByText("Alice"));
+    fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Row as JSON" }));
+
+    await waitFor(() =>
+      expect(mockToastError).toHaveBeenCalledWith("Could not copy Row — select the text and copy it yourself"),
+    );
+  });
+
+  /**
+   * Hiding a column stops the grid emitting it (#870).
+   *
+   * `columnVisibilityFeature` was registered here with no writer, so the assertion that
+   * matters is not that a menu exists but that the table state it writes reaches
+   * `row.getVisibleCells()`. The header AND a cell value are both asserted: a column
+   * dropped from the header while its cells still render would misalign every row.
+   */
+  test("stops rendering a column the stats strip hid", () => {
+    const { getByTestId, queryAllByText } = render(React.createElement(ResultsGrid, { result: mockResult }));
+
+    expect(queryAllByText("name").length).toBeGreaterThan(0);
     expect(queryAllByText("Alice").length).toBeGreaterThan(0);
-    expect(queryAllByText("Bob").length).toBeGreaterThan(0);
-    expect(queryAllByText("Charlie").length).toBeGreaterThan(0);
+
+    fireEvent.click(getByTestId("toggle-column"));
+
+    expect(queryAllByText("name").length).toBe(0);
+    expect(queryAllByText("Alice").length).toBe(0);
+    expect(getByTestId("toggle-column").getAttribute("data-hidden")).toBe("name");
+    // The control: a column nobody hid is untouched.
+    expect(queryAllByText("email").length).toBeGreaterThan(0);
+  });
+
+  /**
+   * The card view hides it too (#870).
+   *
+   * Cards are what this grid renders on a phone and what a desktop reader can switch to,
+   * and they take their preview fields from the list they are handed. Handed
+   * `result.fields` they show a column the reader hid a moment earlier in the table, which
+   * is the same split the mobile table had: one hidden column, two answers on one result
+   * depending on which view is open.
+   */
+  test("stops handing a hidden column to the card view", () => {
+    const { getByTestId, getAllByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+
+    expect(getAllByTestId("result-card")[0]!.getAttribute("data-fields")).toContain("name");
+
+    fireEvent.click(getByTestId("toggle-column"));
+
+    const fields = getAllByTestId("result-card")[0]!.getAttribute("data-fields")!;
+    expect(fields.split(",")).not.toContain("name");
+    // The control: the columns nobody hid are still handed over.
+    expect(fields.split(",")).toContain("email");
   });
 
   // ── 4. Shows row count via StatsBar ───────────────────────────────────────
@@ -253,12 +1025,48 @@ describe("ResultsGrid", () => {
       React.createElement(ResultsGrid, {
         result: mockPaginatedResult,
         onLoadMore,
+        supportsResultPagination: true,
       }),
     );
 
-    const loadMoreBtn = queryByTestId("load-more-btn");
-    expect(loadMoreBtn).not.toBeNull();
-    expect(loadMoreBtn!.textContent).toContain("Load More");
+    const offer = queryByTestId("page-offer");
+    expect(offer).not.toBeNull();
+    // The offer carries the page size the result reports, not a hardcoded 500: a 50-row
+    // table preview used to promise "Load More (500 rows)" and then fetch 50.
+    expect(offer!.textContent).toBe("offer 50");
+  });
+
+  // ── 6b. An offer adds nothing below the grid ──────────────────────────────
+
+  test("an offer adds no chrome below the grid", () => {
+    /*
+      THE UI RULING'S FIRST CRITERION, measured as a DIFFERENCE rather than as a property
+      of this file's stub.
+
+      Asserting that the offer element sits inside the stats bar cannot fail here: the
+      StatsBar stub above builds it as its own child, so it is a descendant whatever
+      `ResultsGrid` does. What the ruling actually says is that the grid gains no chrome
+      and keeps its height whether or not another page is available, and that is a
+      comparison: the grid's own children must be the same set either way. A `LoadMoreFooter`
+      restored below the table is a new sibling here and fails.
+    */
+    const shape = (root: Element) =>
+      Array.from(root.children).map((child) => `${child.tagName}#${child.getAttribute("data-testid") ?? ""}`);
+
+    const withoutOffer = render(React.createElement(ResultsGrid, { result: mockPaginatedResult }));
+    expect(withoutOffer.queryByTestId("page-offer")).toBeNull();
+    const plain = shape(withoutOffer.container.firstElementChild!);
+    cleanup();
+
+    const withOffer = render(
+      React.createElement(ResultsGrid, {
+        result: mockPaginatedResult,
+        onLoadMore: mock(() => {}),
+        supportsResultPagination: true,
+      }),
+    );
+    expect(withOffer.queryByTestId("page-offer")).not.toBeNull();
+    expect(shape(withOffer.container.firstElementChild!)).toEqual(plain);
   });
 
   // ── 7. Load More button fires onLoadMore ──────────────────────────────────
@@ -269,11 +1077,12 @@ describe("ResultsGrid", () => {
       React.createElement(ResultsGrid, {
         result: mockPaginatedResult,
         onLoadMore,
+        supportsResultPagination: true,
       }),
     );
 
-    const loadMoreBtn = getByTestId("load-more-btn");
-    fireEvent.click(loadMoreBtn);
+    // The callback reaches the strip intact, not just the decision to show a control.
+    fireEvent.click(getByTestId("page-offer"));
     expect(onLoadMore).toHaveBeenCalledTimes(1);
   });
 
@@ -325,11 +1134,169 @@ describe("ResultsGrid", () => {
 
   // ── 11. No Load More when no pagination ───────────────────────────────────
 
-  test("no Load More footer when pagination not present", () => {
+  test("no Load More when the result carries no pagination at all", () => {
     const { queryByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
 
-    const loadMore = queryByTestId("load-more-footer");
-    expect(loadMore).toBeNull();
+    expect(queryByTestId("page-offer")).toBeNull();
+  });
+
+  // ── the capability gate and the order notice (#816) ───────────────────────
+
+  /**
+   * The control appears only where page two is REACHABLE.
+   *
+   * `supportsExternalQueryLimiting` is not this flag: Cassandra declares that one true
+   * and throws on any positive offset. The five providers that cannot page declare
+   * `supportsResultPagination: false`, and an ABSENT flag reads the same as false — the
+   * #269 rule, so a host or a stale metadata read cannot open the control by omission.
+   */
+  test.each([
+    ["the provider cannot page", { supportsResultPagination: false }],
+    ["the flag is absent altogether", {}],
+  ])("no Load More when %s, even with hasMore", (_label, capability) => {
+    const { queryByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: mockPaginatedResult,
+        onLoadMore: mock(() => {}),
+        ...capability,
+      }),
+    );
+
+    expect(queryByTestId("page-offer")).toBeNull();
+  });
+
+  test("hands the in-flight state to the strip that renders the control", () => {
+    // Without this the control keeps its idle label and stays clickable while a page is
+    // already on the wire, and a second click asks for the same offset twice.
+    const { getByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: mockPaginatedResult,
+        onLoadMore: mock(() => {}),
+        supportsResultPagination: true,
+        isLoadingMore: true,
+      }),
+    );
+
+    expect(getByTestId("page-offer").getAttribute("data-loading")).toBe("true");
+  });
+
+  test("no Load More when the result reports no further page", () => {
+    const { queryByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: { ...mockPaginatedResult, pagination: { ...mockPaginatedResult.pagination!, hasMore: false } },
+        onLoadMore: mock(() => {}),
+        supportsResultPagination: true,
+      }),
+    );
+
+    expect(queryByTestId("page-offer")).toBeNull();
+  });
+
+  test("no Load More when the surface withholds the callback", () => {
+    // A result hydrated from an agent run comes this way: BottomPanel passes no
+    // `onLoadMore`, because there is no statement here to ask for another page of.
+    const { queryByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: mockPaginatedResult,
+        supportsResultPagination: true,
+      }),
+    );
+
+    expect(queryByTestId("page-offer")).toBeNull();
+  });
+
+  /**
+   * Criterion 7. Without an `ORDER BY` the engine may return pages that overlap or skip,
+   * and Studio does not inject one to prevent it. It states the condition instead — once,
+   * beside the existing AUTO-LIMITED badge, and only where a second page can actually be
+   * asked for. A notice about pages the user cannot reach describes nothing.
+   */
+  test("says order across pages is not guaranteed for an unordered pageable result", () => {
+    const { queryByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: mockPaginatedResult,
+        onLoadMore: mock(() => {}),
+        supportsResultPagination: true,
+        resultQuery: "SELECT * FROM users",
+      }),
+    );
+
+    expect(queryByTestId("page-offer")).not.toBeNull();
+    expect(queryByTestId("order-notice")).not.toBeNull();
+  });
+
+  test("says nothing when the statement orders its own result", () => {
+    const { queryByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: mockPaginatedResult,
+        onLoadMore: mock(() => {}),
+        supportsResultPagination: true,
+        resultQuery: "SELECT * FROM users ORDER BY id",
+      }),
+    );
+
+    expect(queryByTestId("page-offer")).not.toBeNull();
+    expect(queryByTestId("order-notice")).toBeNull();
+  });
+
+  test("reads the statement under the connection's own dialect", () => {
+    // `#` opens a comment in MySQL and is ordinary text in PostgreSQL (#292), so the
+    // same statement is ordered under one dialect and not the other.
+    const props = {
+      result: mockPaginatedResult,
+      onLoadMore: mock(() => {}),
+      supportsResultPagination: true,
+      resultQuery: "SELECT * FROM users # ORDER BY id",
+    };
+
+    expect(
+      render(React.createElement(ResultsGrid, { ...props, databaseType: "mysql" })).queryByTestId("order-notice"),
+    ).not.toBeNull();
+    cleanup();
+    expect(
+      render(React.createElement(ResultsGrid, { ...props, databaseType: "postgres" })).queryByTestId("order-notice"),
+    ).toBeNull();
+  });
+
+  /**
+   * The gate that #933 got wrong and its own test could not see, because its fixture
+   * always had `hasMore: true`. An auto-limited unordered result that fits in ONE page
+   * printed "order across pages is not guaranteed" with no Load More anywhere and no
+   * second page in existence.
+   */
+  test.each([
+    ["no further page exists", { pagination: { ...mockPaginatedResult.pagination!, hasMore: false } }, {}],
+    ["the provider cannot page", {}, { supportsResultPagination: false }],
+    ["the surface withholds the callback", {}, { onLoadMore: undefined }],
+  ])("says nothing about pages when %s", (_label, resultPatch, propPatch) => {
+    const { queryByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: { ...mockPaginatedResult, ...resultPatch },
+        onLoadMore: mock(() => {}),
+        supportsResultPagination: true,
+        resultQuery: "SELECT * FROM users",
+        ...propPatch,
+      }),
+    );
+
+    expect(queryByTestId("page-offer")).toBeNull();
+    expect(queryByTestId("order-notice")).toBeNull();
+  });
+
+  test("says nothing when the statement that produced the rows is unknown", () => {
+    // No `resultQuery` means the shell could not name the statement. Claiming its order
+    // either way would be a guess, and the quieter guess is the one that does not
+    // reassure.
+    const { queryByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: mockPaginatedResult,
+        onLoadMore: mock(() => {}),
+        supportsResultPagination: true,
+      }),
+    );
+
+    expect(queryByTestId("page-offer")).not.toBeNull();
+    expect(queryByTestId("order-notice")).toBeNull();
   });
 
   // ── 12. Empty state message is descriptive ────────────────────────────────
@@ -342,10 +1309,10 @@ describe("ResultsGrid", () => {
 
   // ── 13. Column headers are interactive (sort on click) ────────────────────
 
-  test("column headers render as interactive elements", () => {
-    const { queryAllByText } = render(React.createElement(ResultsGrid, { result: mockResult }));
-    // Headers render with field names
-    const idHeaders = queryAllByText("id");
+  test("desktop-table column headers render as interactive elements", () => {
+    const { getAllByRole, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
+    const idHeaders = getAllByRole("button", { name: "id" });
     expect(idHeaders.length).toBeGreaterThan(0);
     // Click doesn't crash
     fireEvent.click(idHeaders[0]);
@@ -353,9 +1320,10 @@ describe("ResultsGrid", () => {
 
   // ── 14. Click sort toggles data order ──────────────────────────────────
 
-  test("clicking column header twice for sort toggle does not crash", () => {
-    const { queryAllByText, container } = render(React.createElement(ResultsGrid, { result: mockResult }));
-    const idHeaders = queryAllByText("id");
+  test("clicking a desktop-table column header twice for sort toggle does not crash", () => {
+    const { getAllByRole, getByTestId, container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
+    const idHeaders = getAllByRole("button", { name: "id" });
     if (idHeaders[0]) {
       fireEvent.click(idHeaders[0]);
       fireEvent.click(idHeaders[0]);
@@ -365,12 +1333,11 @@ describe("ResultsGrid", () => {
 
   // ── 15. Filter inputs render ──────────────────────────────────────────────
 
-  test("filter input renders for column filtering", () => {
-    const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
-    // Filter inputs have type="text" and specific placeholder
-    const inputs = container.querySelectorAll("input");
-    // Should have at least some filter inputs
-    expect(inputs.length).toBeGreaterThanOrEqual(0);
+  test("desktop-table filter controls render in table mode", () => {
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
+
+    expect(container.querySelectorAll('button[title="Filter column"]').length).toBeGreaterThan(0);
   });
 
   // ── 16. Masking toggle fires callback ───────────────────────────────────
@@ -390,10 +1357,11 @@ describe("ResultsGrid", () => {
 
   // ── 17. Large dataset renders with virtualizer ──────────────────────────
 
-  test("large dataset renders rows via virtualizer", () => {
-    const { container } = render(React.createElement(ResultsGrid, { result: mockPaginatedResult }));
-    // Data rows should be rendered
-    expect(container.textContent).toContain("User 1");
+  test("desktop-table large dataset renders rows via virtualizer", () => {
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockPaginatedResult }));
+    fireEvent.click(getByTestId("view-table"));
+
+    expect(findDesktopRow(container, "User 1")).not.toBeUndefined();
   });
 
   // ── 18. No pending changes indicator when no changes ────────────────────
@@ -421,8 +1389,9 @@ describe("ResultsGrid", () => {
       rowCount: 1,
       executionTime: 2,
     };
-    const { queryAllByText, queryByTestId } = render(React.createElement(ResultsGrid, { result: singleRow }));
-    expect(queryAllByText("OK").length).toBeGreaterThan(0);
+    const { container, getByTestId, queryByTestId } = render(React.createElement(ResultsGrid, { result: singleRow }));
+    fireEvent.click(getByTestId("view-table"));
+    expect(findDesktopRow(container, "OK")).not.toBeUndefined();
     expect(queryByTestId("row-count")?.textContent).toContain("1 rows");
   });
 
@@ -435,9 +1404,9 @@ describe("ResultsGrid", () => {
       rowCount: 1,
       executionTime: 1,
     };
-    const { container } = render(React.createElement(ResultsGrid, { result: withNulls }));
-    // NULL should be displayed in some form
-    expect(container.textContent).toContain("NULL");
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: withNulls }));
+    fireEvent.click(getByTestId("view-table"));
+    expect(findDesktopRow(container, "NULL")).not.toBeUndefined();
   });
 
   // ── 21. Boolean values display ──────────────────────────────────────────
@@ -449,18 +1418,20 @@ describe("ResultsGrid", () => {
       rowCount: 1,
       executionTime: 1,
     };
-    const { container } = render(React.createElement(ResultsGrid, { result: withBool }));
-    expect(container.textContent).toContain("true");
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: withBool }));
+    fireEvent.click(getByTestId("view-table"));
+    expect(findDesktopRow(container, "true")).not.toBeUndefined();
   });
 
   // ── 22. Row number column shown ─────────────────────────────────────────
 
-  test("row number column shown", () => {
-    const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
-    // Row numbers (1, 2, 3) should appear in the rendered output
-    expect(container.textContent).toContain("1");
-    expect(container.textContent).toContain("2");
-    expect(container.textContent).toContain("3");
+  test("desktop-table rows retain their row values", () => {
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
+
+    expect(findDesktopRow(container, "Alice")?.textContent).toContain("1");
+    expect(findDesktopRow(container, "Bob")?.textContent).toContain("2");
+    expect(findDesktopRow(container, "Charlie")?.textContent).toContain("3");
   });
 
   // ── 23. Masking enabled shows lock icons ────────────────────────────────
@@ -478,7 +1449,7 @@ describe("ResultsGrid", () => {
         ],
       ]),
     );
-    const { container } = render(
+    const { container, getByTestId } = render(
       React.createElement(ResultsGrid, {
         result: mockResult,
         maskingEnabled: true,
@@ -489,9 +1460,8 @@ describe("ResultsGrid", () => {
         },
       }),
     );
-    // When masking is enabled and shouldMask returns true, values should be masked
-    // The mock maskValueByPattern returns '***'
-    expect(container.textContent).toContain("***");
+    fireEvent.click(getByTestId("view-table"));
+    expect(findDesktopRow(container, "Alice")?.textContent).toContain("***");
   });
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -499,8 +1469,166 @@ describe("ResultsGrid", () => {
   // ═══════════════════════════════════════════════════════════════════════
 
   describe("Column filtering", () => {
+    /**
+     * The filter panel closes on a press outside it (#870).
+     *
+     * It sits over the rows it filters, and until this it was dismissed only by pressing
+     * the same funnel again, which is the gesture the open panel covers. Escape already
+     * closed it from inside the input; a reader who had moved the mouse on had neither.
+     */
+    test("closes the filter panel on a press outside it", () => {
+      const { container, queryAllByPlaceholderText, queryAllByTitle } = render(
+        React.createElement(ResultsGrid, { result: mockResult }),
+      );
+
+      fireEvent.click(queryAllByTitle("Filter column")[0]!);
+      expect(queryAllByPlaceholderText(/^Filter /).length).toBeGreaterThan(0);
+
+      fireEvent.mouseDown(container);
+      expect(queryAllByPlaceholderText(/^Filter /).length).toBe(0);
+    });
+
+    /** The control: typing into the panel is a press inside it and must not close it. */
+    test("keeps the filter panel open while pressing inside it", () => {
+      const { queryAllByPlaceholderText, queryAllByTitle } = render(
+        React.createElement(ResultsGrid, { result: mockResult }),
+      );
+
+      fireEvent.click(queryAllByTitle("Filter column")[0]!);
+      const input = queryAllByPlaceholderText(/^Filter /)[0]!;
+      fireEvent.mouseDown(input);
+      expect(queryAllByPlaceholderText(/^Filter /).length).toBeGreaterThan(0);
+    });
+
+    /**
+     * A filter belongs to the result it was typed against (#1409). A different query in the
+     * same tab used to inherit it, and a column the new rows lack reads as "" so every row
+     * was hidden while the strip still reported the real count.
+     */
+    test("a new result without the filtered column starts unfiltered", () => {
+      const { container, getByTestId, rerender } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      fireEvent.click(getByTestId("view-table"));
+      fireEvent.click(container.querySelectorAll('button[title="Filter column"]')[1]);
+      fireEvent.change(container.querySelector('input[placeholder="Filter name..."]')!, { target: { value: "Alice" } });
+      expect(container.querySelector('[data-testid="filtered-count"]')?.textContent).toContain("1 filtered");
+
+      const other: QueryResult = {
+        rows: [{ sku: "a" }, { sku: "b" }],
+        fields: ["sku"],
+        rowCount: 2,
+        executionTime: 1,
+      };
+      rerender(React.createElement(ResultsGrid, { result: other }));
+
+      expect(container.querySelector('[data-testid="filtered-count"]')?.textContent).toContain("2 filtered");
+      expect(container.querySelector('[data-testid="clear-filters"]')).toBeNull();
+    });
+
+    test("filter matching folds the Turkish dotted and dotless I", () => {
+      const turkish: QueryResult = {
+        rows: [{ city: "İzmir" }, { city: "IZMIR" }, { city: "ızmir" }, { city: "Ankara" }],
+        fields: ["city"],
+        rowCount: 4,
+        executionTime: 1,
+      };
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: turkish }));
+      fireEvent.click(getByTestId("view-table"));
+      fireEvent.click(container.querySelector('button[title="Filter column"]')!);
+      const input = () => container.querySelector('input[placeholder="Filter city..."]')!;
+      const count = () => container.querySelector('[data-testid="filtered-count"]')?.textContent;
+
+      fireEvent.change(input(), { target: { value: "izmir" } });
+      expect(count()).toContain("3 filtered");
+      fireEvent.change(input(), { target: { value: "İZMİR" } });
+      expect(count()).toContain("3 filtered");
+      fireEvent.change(input(), { target: { value: "ANK" } });
+      expect(count()).toContain("1 filtered");
+    });
+
+    test("filter matching keeps other accents and scripts apart", () => {
+      const mixed: QueryResult = {
+        rows: [{ w: "caf\u00e9" }, { w: "cafe" }, { w: "\ud55c\uad6d" }, { w: "\u017caba" }],
+        fields: ["w"],
+        rowCount: 4,
+        executionTime: 1,
+      };
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mixed }));
+      fireEvent.click(getByTestId("view-table"));
+      fireEvent.click(container.querySelector('button[title="Filter column"]')!);
+      const input = () => container.querySelector('input[placeholder="Filter w..."]')!;
+      const count = () => container.querySelector('[data-testid="filtered-count"]')?.textContent;
+
+      fireEvent.change(input(), { target: { value: "cafe" } });
+      expect(count()).toContain("1 filtered");
+      fireEvent.change(input(), { target: { value: "\ud558" } });
+      expect(count()).toContain("0 filtered");
+      fireEvent.change(input(), { target: { value: "zaba" } });
+      expect(count()).toContain("0 filtered");
+    });
+
+    describe("filter lifetime (#1409)", () => {
+      const resultA = (fields = ["id", "name", "email"]): QueryResult => ({
+        rows: [
+          { id: 1, name: "Alice", email: "a@x" },
+          { id: 2, name: "Bob", email: "b@x" },
+        ].map((r) => Object.fromEntries(fields.map((f) => [f, (r as Record<string, unknown>)[f]]))),
+        fields,
+        rowCount: 2,
+        executionTime: 1,
+      });
+      const renderGrid = (result: QueryResult, resultQuery: string | undefined) =>
+        React.createElement(ResultsGrid, { result, resultQuery });
+      const typeNameFilter = (container: HTMLElement) => {
+        fireEvent.click(container.querySelectorAll('button[title="Filter column"]')[1]);
+        fireEvent.change(container.querySelector('input[placeholder="Filter name..."]')!, {
+          target: { value: "Alice" },
+        });
+      };
+      const count = (c: HTMLElement) => c.querySelector('[data-testid="filtered-count"]')?.textContent;
+
+      test("A, then B without the column, then A again starts unfiltered", () => {
+        const { container, getByTestId, rerender } = render(renderGrid(resultA(), "select * from a"));
+        fireEvent.click(getByTestId("view-table"));
+        typeNameFilter(container);
+        expect(count(container)).toContain("1 filtered");
+        rerender(renderGrid({ rows: [{ sku: "x" }], fields: ["sku"], rowCount: 1, executionTime: 1 }, "select sku"));
+        rerender(renderGrid(resultA(), "select * from a"));
+        expect(count(container)).toContain("2 filtered");
+        expect(container.querySelector('[data-testid="clear-filters"]')).toBeNull();
+      });
+
+      test("a different query with the same columns starts unfiltered", () => {
+        const { container, getByTestId, rerender } = render(renderGrid(resultA(), "select * from a"));
+        fireEvent.click(getByTestId("view-table"));
+        typeNameFilter(container);
+        rerender(renderGrid(resultA(), "select * from b"));
+        expect(count(container)).toContain("2 filtered");
+      });
+
+      test("the same run keeps its filter across a page that changes the columns", () => {
+        const { container, getByTestId, rerender } = render(renderGrid(resultA(), "db.a.find()"));
+        fireEvent.click(getByTestId("view-table"));
+        typeNameFilter(container);
+        rerender(renderGrid(resultA(["id", "name"]), "db.a.find()"));
+        expect(count(container)).toContain("1 filtered");
+        // a column that vanished takes its own filter with it, the others stay
+        rerender(renderGrid(resultA(["id"]), "db.a.find()"));
+        expect(count(container)).toContain("2 filtered");
+      });
+
+      test("an open filter panel closes when its column leaves the result", () => {
+        const { container, getByTestId, rerender } = render(renderGrid(resultA(), "q"));
+        fireEvent.click(getByTestId("view-table"));
+        fireEvent.click(container.querySelectorAll('button[title="Filter column"]')[1]);
+        expect(container.querySelector('input[placeholder="Filter name..."]')).not.toBeNull();
+        rerender(renderGrid(resultA(["id"]), "q"));
+        expect(container.querySelector('input[placeholder="Filter name..."]')).toBeNull();
+      });
+    });
+
     test("clicking filter button opens filter dropdown with input", () => {
-      const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      fireEvent.click(getByTestId("view-table"));
 
       const filterButtons = container.querySelectorAll('button[title="Filter column"]');
       expect(filterButtons.length).toBeGreaterThan(0);
@@ -512,7 +1640,8 @@ describe("ResultsGrid", () => {
     });
 
     test("typing in filter input filters rows", () => {
-      const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      fireEvent.click(getByTestId("view-table"));
 
       const filterButtons = container.querySelectorAll('button[title="Filter column"]');
       fireEvent.click(filterButtons[1]);
@@ -527,7 +1656,8 @@ describe("ResultsGrid", () => {
     });
 
     test("clearing filter value in input removes filter", () => {
-      const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      fireEvent.click(getByTestId("view-table"));
 
       const filterButtons = container.querySelectorAll('button[title="Filter column"]');
       fireEvent.click(filterButtons[1]);
@@ -543,7 +1673,8 @@ describe("ResultsGrid", () => {
     });
 
     test("Clear filter button removes single column filter", () => {
-      const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      fireEvent.click(getByTestId("view-table"));
 
       const filterButtons = container.querySelectorAll('button[title="Filter column"]');
       fireEvent.click(filterButtons[1]);
@@ -562,7 +1693,8 @@ describe("ResultsGrid", () => {
     });
 
     test("Escape key closes filter dropdown", () => {
-      const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      fireEvent.click(getByTestId("view-table"));
 
       const filterButtons = container.querySelectorAll('button[title="Filter column"]');
       fireEvent.click(filterButtons[0]);
@@ -576,7 +1708,8 @@ describe("ResultsGrid", () => {
     });
 
     test("Enter key closes filter dropdown", () => {
-      const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      fireEvent.click(getByTestId("view-table"));
 
       const filterButtons = container.querySelectorAll('button[title="Filter column"]');
       fireEvent.click(filterButtons[0]);
@@ -590,7 +1723,8 @@ describe("ResultsGrid", () => {
     });
 
     test("clicking same filter button again closes dropdown", () => {
-      const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      fireEvent.click(getByTestId("view-table"));
 
       const filterButtons = container.querySelectorAll('button[title="Filter column"]');
       fireEvent.click(filterButtons[0]);
@@ -603,7 +1737,8 @@ describe("ResultsGrid", () => {
     });
 
     test("clear all filters via StatsBar handleClearFilters", () => {
-      const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      fireEvent.click(getByTestId("view-table"));
 
       // Set a filter
       const filterButtons = container.querySelectorAll('button[title="Filter column"]');
@@ -626,7 +1761,8 @@ describe("ResultsGrid", () => {
     });
 
     test("filter with no matching rows shows 0 filtered", () => {
-      const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      fireEvent.click(getByTestId("view-table"));
 
       const filterButtons = container.querySelectorAll('button[title="Filter column"]');
       fireEvent.click(filterButtons[1]);
@@ -644,13 +1780,13 @@ describe("ResultsGrid", () => {
   describe("Inline editing", () => {
     function findEditInput(container: HTMLElement) {
       return Array.from(container.querySelectorAll("input")).find((input) =>
-        input.className.includes("border-blue-500"),
+        input.classList.contains("border-brand-tint"),
       );
     }
 
-    test("double-clicking cell enters edit mode with input", () => {
+    test("double-clicking a desktop-table cell enters edit mode with input", () => {
       const onCellChange = mock(() => {});
-      const { container } = render(
+      const { container, getByTestId } = render(
         React.createElement(ResultsGrid, {
           result: mockResult,
           editingEnabled: true,
@@ -658,8 +1794,9 @@ describe("ResultsGrid", () => {
           pendingChanges: [],
         }),
       );
+      fireEvent.click(getByTestId("view-table"));
 
-      const cells = container.querySelectorAll(".cursor-text");
+      const cells = container.querySelectorAll("[data-index]:not([data-testid]) .cursor-text");
       expect(cells.length).toBeGreaterThan(0);
 
       fireEvent.doubleClick(cells[0]);
@@ -673,7 +1810,7 @@ describe("ResultsGrid", () => {
       // used to open one whose edit was silently discarded on Enter, which is the
       // dead affordance the capability gate exists to remove.
       const onCellChange = mock(() => {});
-      const { container } = render(
+      const { container, getByTestId } = render(
         React.createElement(ResultsGrid, {
           result: mockResult,
           editingEnabled: false,
@@ -681,21 +1818,88 @@ describe("ResultsGrid", () => {
           pendingChanges: [],
         }),
       );
+      fireEvent.click(getByTestId("view-table"));
 
-      // The grid renders the value in both the desktop table and the mobile one, so
-      // every cell showing it is double-clicked rather than guessing which is which.
-      const labels = Array.from(container.querySelectorAll("span")).filter((s) => s.textContent === "Alice");
-      expect(labels.length).toBeGreaterThan(0);
-      for (const label of labels) fireEvent.doubleClick(label.parentElement!);
+      const desktopRow = findDesktopRow(container, "Alice");
+      expect(desktopRow).not.toBeUndefined();
+      fireEvent.doubleClick(within(desktopRow!).getByText("Alice"));
 
       expect(findEditInput(container)).toBeUndefined();
       expect(onCellChange).not.toHaveBeenCalled();
       expect(container.querySelectorAll(".cursor-text").length).toBe(0);
     });
 
-    test("Enter key commits edit and calls onCellChange", () => {
+    test("a column whose declared type the provider refuses opens no editor, and says why (K24)", () => {
+      // Db2 declares a CLOB, DBCLOB or BLOB column by its bare name, and db2-node writes nothing
+      // for a value bound to one declared 32768 bytes or longer, so its provider refuses the type.
       const onCellChange = mock(() => {});
-      const { container } = render(
+      const reason = "db2-node writes nothing for a value bound to this column";
+      const { container, getByTestId } = render(
+        React.createElement(ResultsGrid, {
+          result: {
+            ...mockResult,
+            rows: [{ id: 1, name: "Alice", email: "alice-notes" }],
+            columnTypes: { id: "INTEGER", name: "VARCHAR(20)", email: "CLOB" },
+          },
+          editingEnabled: true,
+          inlineEditRefusedColumns: { type: "^(CLOB|DBCLOB|BLOB)$", reason },
+          onCellChange,
+          pendingChanges: [],
+        }),
+      );
+      fireEvent.click(getByTestId("view-table"));
+
+      const row = findDesktopRow(container, "Alice")!;
+      const refused = within(row).getByText("alice-notes").parentElement!;
+      expect(refused.getAttribute("title")).toBe(reason);
+      expect(refused.classList.contains("cursor-text")).toBe(false);
+      fireEvent.doubleClick(refused);
+      expect(findEditInput(container)).toBeUndefined();
+
+      // The column beside it, whose type the rule does not match, still edits.
+      fireEvent.doubleClick(findDesktopCell(container, "Alice")!);
+      expect(findEditInput(container)).not.toBeUndefined();
+    });
+
+    // A repeated or unnamed column comes back under a name the result made up (`name (2)`,
+    // `(No column name)`), and inline edit writes the field name into `UPDATE ... SET`.
+    // Measured on PostgreSQL 16: `SET "name (2)"` on a table with `id, name` is refused as
+    // a missing column, and on a table that does have a column of that name it would
+    // write the wrong one. So such a cell opens no editor, and says why.
+    test("a column the result named itself opens no editor, and says why", () => {
+      const onCellChange = mock(() => {});
+      const { container, getByTestId } = render(
+        React.createElement(ResultsGrid, {
+          result: {
+            rows: [{ id: 1, name: "Alice", "name (2)": "Alice-copy", "(No column name)": "ALICE" }],
+            fields: ["id", "name", "name (2)", "(No column name)"],
+            rowCount: 1,
+            executionTime: 1,
+          },
+          editingEnabled: true,
+          onCellChange,
+          pendingChanges: [],
+        }),
+      );
+      fireEvent.click(getByTestId("view-table"));
+
+      const row = findDesktopRow(container, "Alice-copy")!;
+      for (const text of ["Alice-copy", "ALICE"]) {
+        const refused = within(row).getByText(text).parentElement!;
+        expect(refused.getAttribute("title")).toContain("not a column of the table");
+        expect(refused.classList.contains("cursor-text")).toBe(false);
+        fireEvent.doubleClick(refused);
+        expect(findEditInput(container)).toBeUndefined();
+      }
+
+      // The column the statement named itself still edits.
+      fireEvent.doubleClick(findDesktopCell(container, "Alice")!);
+      expect(findEditInput(container)).not.toBeUndefined();
+    });
+
+    test("Enter key commits a desktop-table edit and calls onCellChange", () => {
+      const onCellChange = mock(() => {});
+      const { container, getByTestId } = render(
         React.createElement(ResultsGrid, {
           result: mockResult,
           editingEnabled: true,
@@ -703,9 +1907,9 @@ describe("ResultsGrid", () => {
           pendingChanges: [],
         }),
       );
+      fireEvent.click(getByTestId("view-table"));
 
-      const cells = container.querySelectorAll(".cursor-text");
-      const nameCell = Array.from(cells).find((c) => c.textContent === "Alice");
+      const nameCell = findDesktopCell(container, "Alice");
       expect(nameCell).not.toBeUndefined();
       fireEvent.doubleClick(nameCell!);
 
@@ -724,7 +1928,7 @@ describe("ResultsGrid", () => {
 
     test("Escape key cancels edit without calling onCellChange", () => {
       const onCellChange = mock(() => {});
-      const { container } = render(
+      const { container, getByTestId } = render(
         React.createElement(ResultsGrid, {
           result: mockResult,
           editingEnabled: true,
@@ -732,9 +1936,9 @@ describe("ResultsGrid", () => {
           pendingChanges: [],
         }),
       );
+      fireEvent.click(getByTestId("view-table"));
 
-      const cells = container.querySelectorAll(".cursor-text");
-      fireEvent.doubleClick(cells[0]);
+      fireEvent.doubleClick(container.querySelector("[data-index]:not([data-testid]) .cursor-text")!);
 
       const editInput = findEditInput(container)!;
       // Press Escape directly (no value change to avoid stale ref)
@@ -744,9 +1948,61 @@ describe("ResultsGrid", () => {
       expect(findEditInput(container)).toBeUndefined();
     });
 
-    test("blur commits edit when value changed", () => {
+    test("a filtered row's edit is addressed to its place in the result, not in the filter", () => {
+      // The table is built over the FILTERED rows, so TanStack's `row.index` is a position
+      // in that array. `useInlineEditing` reads the row's primary key out of
+      // `result.rows[rowIndex]`, so with a filter on, an edit used to be keyed to whatever
+      // row happened to sit at the same position unfiltered — a silent write to the wrong
+      // row, which is #881's harm reached through the grid instead of the tab title.
+      const threeRows: QueryResult = {
+        rows: [
+          { id: 1, name: "Alice" },
+          { id: 2, name: "Bob" },
+          { id: 3, name: "Charlie" },
+        ],
+        fields: ["id", "name"],
+        rowCount: 3,
+        executionTime: 1,
+      };
       const onCellChange = mock(() => {});
       const { container } = render(
+        React.createElement(ResultsGrid, {
+          result: threeRows,
+          editingEnabled: true,
+          onCellChange,
+          pendingChanges: [],
+        }),
+      );
+
+      // Filter down to Charlie, who is the only visible row and so sits at filtered index 0.
+      const filterButton = Array.from(container.querySelectorAll("button")).find(
+        (b) =>
+          b.getAttribute("title") === "Filter column" && b.closest(".group\\/header")?.textContent?.includes("name"),
+      );
+      fireEvent.click(filterButton ?? container.querySelectorAll('button[title="Filter column"]')[1]);
+      const filterInput = Array.from(container.querySelectorAll("input")).find((i) =>
+        (i.getAttribute("placeholder") ?? "").startsWith("Filter"),
+      )!;
+      fireEvent.change(filterInput, { target: { value: "Charlie" } });
+
+      const visible = Array.from(container.querySelectorAll(".cursor-text")).filter((c) => c.textContent === "Charlie");
+      expect(visible).toHaveLength(1);
+      fireEvent.doubleClick(visible[0]);
+
+      const editInput = findEditInput(container)!;
+      fireEvent.change(editInput, { target: { value: "Charlize" } });
+      fireEvent.keyDown(findEditInput(container)!, { key: "Enter" });
+
+      expect(onCellChange).toHaveBeenCalledTimes(1);
+      const change = (onCellChange.mock.calls as unknown[][])[0][0] as Record<string, unknown>;
+      expect(change.rowIndex).toBe(2);
+      expect(change.originalValue).toBe("Charlie");
+      expect(change.newValue).toBe("Charlize");
+    });
+
+    test("blur commits a desktop-table edit when value changed", () => {
+      const onCellChange = mock(() => {});
+      const { container, getByTestId } = render(
         React.createElement(ResultsGrid, {
           result: mockResult,
           editingEnabled: true,
@@ -754,9 +2010,9 @@ describe("ResultsGrid", () => {
           pendingChanges: [],
         }),
       );
+      fireEvent.click(getByTestId("view-table"));
 
-      const cells = container.querySelectorAll(".cursor-text");
-      const nameCell = Array.from(cells).find((c) => c.textContent === "Alice");
+      const nameCell = findDesktopCell(container, "Alice");
       fireEvent.doubleClick(nameCell!);
 
       const editInput = findEditInput(container)!;
@@ -771,9 +2027,9 @@ describe("ResultsGrid", () => {
       expect(callArg.newValue).toBe("Alicia");
     });
 
-    test("Enter with unchanged value does not call onCellChange", () => {
+    test("Enter with unchanged desktop-table edit does not call onCellChange", () => {
       const onCellChange = mock(() => {});
-      const { container } = render(
+      const { container, getByTestId } = render(
         React.createElement(ResultsGrid, {
           result: mockResult,
           editingEnabled: true,
@@ -781,9 +2037,9 @@ describe("ResultsGrid", () => {
           pendingChanges: [],
         }),
       );
+      fireEvent.click(getByTestId("view-table"));
 
-      const cells = container.querySelectorAll(".cursor-text");
-      const nameCell = Array.from(cells).find((c) => c.textContent === "Alice");
+      const nameCell = findDesktopCell(container, "Alice");
       fireEvent.doubleClick(nameCell!);
 
       const editInput = findEditInput(container)!;
@@ -793,9 +2049,9 @@ describe("ResultsGrid", () => {
       expect(onCellChange).not.toHaveBeenCalled();
     });
 
-    test("blur with unchanged value does not call onCellChange", () => {
+    test("blur with unchanged desktop-table edit does not call onCellChange", () => {
       const onCellChange = mock(() => {});
-      const { container } = render(
+      const { container, getByTestId } = render(
         React.createElement(ResultsGrid, {
           result: mockResult,
           editingEnabled: true,
@@ -803,9 +2059,9 @@ describe("ResultsGrid", () => {
           pendingChanges: [],
         }),
       );
+      fireEvent.click(getByTestId("view-table"));
 
-      const cells = container.querySelectorAll(".cursor-text");
-      const nameCell = Array.from(cells).find((c) => c.textContent === "Alice");
+      const nameCell = findDesktopCell(container, "Alice");
       fireEvent.doubleClick(nameCell!);
 
       const editInput = findEditInput(container)!;
@@ -840,10 +2096,11 @@ describe("ResultsGrid", () => {
       },
     };
 
-    test("clicking reveal button shows actual value with lock icon", () => {
+    test("clicking the desktop-table reveal button shows actual value with lock icon", () => {
       setupMasking();
 
-      const { container } = render(React.createElement(ResultsGrid, maskingProps));
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, maskingProps));
+      fireEvent.click(getByTestId("view-table"));
 
       // Initially masked with '***'
       expect(container.textContent).toContain("***");
@@ -860,10 +2117,34 @@ describe("ResultsGrid", () => {
       expect(container.textContent).toContain("alice@example.com");
     });
 
-    test("revealed cell auto-hides after timeout", () => {
+    test("a reveal follows its row through a filter, not the position it sat at", () => {
+      // A revealed cell is keyed by its position, and the table iterates the FILTERED
+      // rows - so revealing Alice's email and then filtering down to Charlie handed
+      // Charlie's row the key Alice's reveal wrote, and a sensitive value nobody asked
+      // for was on screen unmasked. Same addressing defect as the pending-change one
+      // above it, and this half of it crosses the masking boundary.
       setupMasking();
 
       const { container } = render(React.createElement(ResultsGrid, maskingProps));
+
+      fireEvent.click(container.querySelectorAll('button[title="Reveal value (10s)"]')[0]);
+      expect(container.textContent).toContain("alice@example.com");
+
+      const filterButtons = container.querySelectorAll('button[title="Filter column"]');
+      fireEvent.click(filterButtons[1]);
+      fireEvent.change(container.querySelector('input[placeholder="Filter name..."]')!, {
+        target: { value: "Charlie" },
+      });
+
+      expect(container.textContent).not.toContain("charlie@example.com");
+      expect(container.textContent).toContain("***");
+    });
+
+    test("desktop-table revealed cell auto-hides after timeout", () => {
+      setupMasking();
+
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, maskingProps));
+      fireEvent.click(getByTestId("view-table"));
 
       // Mock setTimeout AFTER React initialization to avoid breaking React internals
       const origSetTimeout = globalThis.setTimeout;
@@ -890,7 +2171,7 @@ describe("ResultsGrid", () => {
       globalThis.setTimeout = origSetTimeout;
     });
 
-    test("reveal button not shown when canReveal is false", () => {
+    test("desktop-table reveal button is not shown when canReveal is false", () => {
       mockShouldMask.mockReturnValue(true);
       mockCanReveal.mockReturnValue(false);
       mockDetectSensitiveColumnsFromConfig.mockReturnValue(
@@ -899,12 +2180,182 @@ describe("ResultsGrid", () => {
         ]),
       );
 
-      const { container } = render(React.createElement(ResultsGrid, maskingProps));
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, maskingProps));
+      fireEvent.click(getByTestId("view-table"));
 
       expect(container.textContent).toContain("***");
 
       const revealButton = container.querySelector('button[title="Reveal value (10s)"]');
       expect(revealButton).toBeNull();
+    });
+
+    /**
+     * The column filter reads what the grid shows (#1477). It matched the clear value under a
+     * masked cell, so a user who may not lift masking could read a masked value one typed
+     * prefix at a time off the row count.
+     */
+    describe("column filter on a masked column (#1477)", () => {
+      function filterEmail(container: HTMLElement, value: string) {
+        fireEvent.click(container.querySelectorAll('button[title="Filter column"]')[2]);
+        fireEvent.change(container.querySelector('input[placeholder="Filter email..."]')!, { target: { value } });
+      }
+      const countText = (container: HTMLElement) =>
+        container.querySelector('[data-testid="filtered-count"]')?.textContent ?? "";
+
+      test("a prefix of the clear value does not narrow the rows while masking is in force", () => {
+        setupMasking();
+        // The masked text keeps the first character, like the email preset.
+        mockMaskValueByPattern.mockImplementation((value: unknown) => `${String(value)[0]}***`);
+        const { container, getByTestId } = render(React.createElement(ResultsGrid, maskingProps));
+        fireEvent.click(getByTestId("view-table"));
+
+        filterEmail(container, "al");
+        expect(countText(container)).toContain("0 filtered");
+        expect(container.textContent).not.toContain("alice@example.com");
+      });
+
+      test("matches the masked text the grid displays", () => {
+        setupMasking();
+        mockMaskValueByPattern.mockImplementation((value: unknown) => `${String(value)[0]}***`);
+        const { container, getByTestId } = render(React.createElement(ResultsGrid, maskingProps));
+        fireEvent.click(getByTestId("view-table"));
+
+        filterEmail(container, "b***");
+        expect(countText(container)).toContain("1 filtered");
+      });
+
+      test("with masking off the filter still matches the clear value", () => {
+        setupMasking();
+        mockShouldMask.mockReturnValue(false);
+        const { container, getByTestId } = render(
+          React.createElement(ResultsGrid, { ...maskingProps, maskingEnabled: false }),
+        );
+        fireEvent.click(getByTestId("view-table"));
+
+        filterEmail(container, "alice@");
+        expect(countText(container)).toContain("1 filtered");
+      });
+    });
+
+    /**
+     * Sorting reads what the grid shows too (#1491). It ordered a masked column by the clear
+     * value under each cell, so a user who may not lift masking could read the rank of the
+     * hidden values off the row order: whose email sorts first, which salary is the highest.
+     */
+    describe("sorting a masked column (#1491)", () => {
+      /** The first name in each rendered desktop row, in the order the table iterates them. */
+      const nameOrder = (container: HTMLElement) =>
+        Array.from(container.querySelectorAll("[data-index]:not([data-testid]):not(button)")).map(
+          (row) => /Alice|Bob|Charlie/.exec(row.textContent ?? "")?.[0],
+        );
+      const sortBy = (utils: ReturnType<typeof render>, name: string) =>
+        fireEvent.click(utils.getAllByRole("button", { name })[0]);
+      /** A mask whose order is not the clear order: clear alice < bob < charlie, masked b < c < a. */
+      const scrambledMask = (value: unknown) =>
+        ({ "alice@example.com": "c***", "bob@example.com": "a***", "charlie@example.com": "b***" })[String(value)] ??
+        "***";
+
+      test("orders the rows by the masked text the grid displays, not by the clear value", () => {
+        setupMasking();
+        mockMaskValueByPattern.mockImplementation(scrambledMask);
+        const utils = render(React.createElement(ResultsGrid, maskingProps));
+        fireEvent.click(utils.getByTestId("view-table"));
+
+        sortBy(utils, "email");
+        expect(nameOrder(utils.container)).toEqual(["Bob", "Charlie", "Alice"]);
+        sortBy(utils, "email, sorted ascending");
+        expect(nameOrder(utils.container)).toEqual(["Alice", "Charlie", "Bob"]);
+        expect(utils.container.textContent).not.toContain("alice@example.com");
+      });
+
+      test("identical masks keep the source order both ways, so the rank of the hidden values stays hidden", () => {
+        setupMasking();
+        const utils = render(React.createElement(ResultsGrid, maskingProps));
+        fireEvent.click(utils.getByTestId("view-table"));
+
+        sortBy(utils, "email");
+        sortBy(utils, "email, sorted ascending");
+        expect(nameOrder(utils.container)).toEqual(["Alice", "Bob", "Charlie"]);
+      });
+
+      test("a masked numeric column does not sort by the numbers under the mask", () => {
+        setupMasking();
+        mockDetectSensitiveColumnsFromConfig.mockReturnValue(
+          new Map([["id", { name: "id", maskType: "full" as const, columnPatterns: ["id"], enabled: true, id: "n1" }]]),
+        );
+        const result: QueryResult = { ...mockResult, columnTypes: { id: "bigint" } };
+        const utils = render(React.createElement(ResultsGrid, { ...maskingProps, result }));
+        fireEvent.click(utils.getByTestId("view-table"));
+
+        sortBy(utils, "id, bigint");
+        sortBy(utils, "id, bigint, sorted ascending");
+        expect(nameOrder(utils.container)).toEqual(["Alice", "Bob", "Charlie"]);
+      });
+
+      test("a per-cell reveal does not bring the clear value back into the sort", () => {
+        setupMasking();
+        mockMaskValueByPattern.mockImplementation(scrambledMask);
+        const utils = render(React.createElement(ResultsGrid, maskingProps));
+        fireEvent.click(utils.getByTestId("view-table"));
+
+        fireEvent.click(utils.container.querySelectorAll('button[title="Reveal value (10s)"]')[0]);
+        expect(utils.container.textContent).toContain("alice@example.com");
+
+        sortBy(utils, "email");
+        expect(nameOrder(utils.container)).toEqual(["Bob", "Charlie", "Alice"]);
+      });
+
+      test("turning masking on or off under an active sort re-sorts the rows", () => {
+        // The table caches its sorted rows on the sorting state and the rows it is given, so a
+        // new comparator alone left the clear-value order on screen after masking came on.
+        setupMasking();
+        mockMaskValueByPattern.mockImplementation(scrambledMask);
+        const utils = render(React.createElement(ResultsGrid, { ...maskingProps, maskingEnabled: false }));
+        fireEvent.click(utils.getByTestId("view-table"));
+
+        sortBy(utils, "email");
+        expect(nameOrder(utils.container)).toEqual(["Alice", "Bob", "Charlie"]);
+
+        utils.rerender(React.createElement(ResultsGrid, maskingProps));
+        expect(nameOrder(utils.container)).toEqual(["Bob", "Charlie", "Alice"]);
+
+        utils.rerender(React.createElement(ResultsGrid, { ...maskingProps, maskingEnabled: false }));
+        expect(nameOrder(utils.container)).toEqual(["Alice", "Bob", "Charlie"]);
+      });
+
+      test("with masking off the column sorts by the clear value", () => {
+        setupMasking();
+        mockShouldMask.mockReturnValue(false);
+        mockMaskValueByPattern.mockImplementation(scrambledMask);
+        const utils = render(React.createElement(ResultsGrid, { ...maskingProps, maskingEnabled: false }));
+        fireEvent.click(utils.getByTestId("view-table"));
+
+        sortBy(utils, "email");
+        sortBy(utils, "email, sorted ascending");
+        expect(nameOrder(utils.container)).toEqual(["Charlie", "Bob", "Alice"]);
+      });
+
+      test("with masking off a numeric column still sorts as numbers", () => {
+        setupMasking();
+        mockShouldMask.mockReturnValue(false);
+        mockDetectSensitiveColumnsFromConfig.mockReturnValue(
+          new Map([["id", { name: "id", maskType: "full" as const, columnPatterns: ["id"], enabled: true, id: "n1" }]]),
+        );
+        const result: QueryResult = {
+          ...mockResult,
+          rows: [
+            { id: "10", name: "Alice", email: "alice@example.com" },
+            { id: "9", name: "Bob", email: "bob@example.com" },
+            { id: "100", name: "Charlie", email: "charlie@example.com" },
+          ],
+          columnTypes: { id: "bigint" },
+        };
+        const utils = render(React.createElement(ResultsGrid, { ...maskingProps, maskingEnabled: false, result }));
+        fireEvent.click(utils.getByTestId("view-table"));
+
+        sortBy(utils, "id, bigint");
+        expect(nameOrder(utils.container)).toEqual(["Bob", "Alice", "Charlie"]);
+      });
     });
   });
 
@@ -913,11 +2364,12 @@ describe("ResultsGrid", () => {
   describe("declared column types", () => {
     test("shows the type the engine declared for a column beside its name", () => {
       const result: QueryResult = { ...mockResult, columnTypes: { name: "Nullable(String)" } };
-      const { getAllByRole, container } = render(React.createElement(ResultsGrid, { result }));
+      const { getAllByRole, getByTestId, container } = render(React.createElement(ResultsGrid, { result }));
+      fireEvent.click(getByTestId("view-table"));
 
       // The type is part of the header's accessible name, not sighted-only.
       const header = getAllByRole("button", { name: "name, Nullable(String)" })[0];
-      expect(header.textContent).toContain("Nullable(String)");
+      expect(headerText(header)).toContain("Nullable(String)");
       // Reachable in both headers: the desktop span and the compact mobile one,
       // which carries the type as a tooltip only (its columns are content-width).
       expect(container.querySelectorAll('[title="Nullable(String)"]').length).toBe(2);
@@ -925,9 +2377,10 @@ describe("ResultsGrid", () => {
 
     test("leaves a column the engine declared no type for exactly as it was", () => {
       const result: QueryResult = { ...mockResult, columnTypes: { name: "Nullable(String)" } };
-      const { getAllByRole } = render(React.createElement(ResultsGrid, { result }));
+      const { getAllByRole, getByTestId } = render(React.createElement(ResultsGrid, { result }));
+      fireEvent.click(getByTestId("view-table"));
 
-      expect(getAllByRole("button", { name: "id" })[0].textContent).toBe("id");
+      expect(headerText(getAllByRole("button", { name: "id" })[0])).toBe("id");
     });
 
     test("does not read a declared type off the prototype chain", () => {
@@ -941,15 +2394,16 @@ describe("ResultsGrid", () => {
         fields: ["id", "constructor", "toString"],
         columnTypes: { id: "BIGINT" },
       };
-      const { getAllByRole, container } = render(React.createElement(ResultsGrid, { result }));
+      const { getAllByRole, getByTestId, container } = render(React.createElement(ResultsGrid, { result }));
+      fireEvent.click(getByTestId("view-table"));
 
       // Accessible name is the bare field, and no inherited value is rendered.
-      expect(getAllByRole("button", { name: "constructor" })[0].textContent).toBe("constructor");
-      expect(getAllByRole("button", { name: "toString" })[0].textContent).toBe("toString");
+      expect(headerText(getAllByRole("button", { name: "constructor" })[0])).toBe("constructor");
+      expect(headerText(getAllByRole("button", { name: "toString" })[0])).toBe("toString");
       expect(container.textContent).not.toContain("function");
       expect(container.textContent).not.toContain("[object");
       // The column that DOES declare a type is unaffected.
-      expect(getAllByRole("button", { name: "id, BIGINT" })[0].textContent).toContain("BIGINT");
+      expect(headerText(getAllByRole("button", { name: "id, BIGINT" })[0])).toContain("BIGINT");
     });
 
     test("renders a dotted column name as one key, not as a path into the row", () => {
@@ -970,10 +2424,11 @@ describe("ResultsGrid", () => {
         fields: ["order_id", "shipping.city"],
         columnTypes: { "shipping.city": "keyword" },
       };
-      const { container } = render(React.createElement(ResultsGrid, { result }));
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result }));
+      fireEvent.click(getByTestId("view-table"));
 
-      expect(container.textContent).toContain("İzmir");
-      expect(container.textContent).not.toContain("NULL");
+      expect(findDesktopRow(container, "İzmir")).not.toBeUndefined();
+      expect(findDesktopRow(container, "NULL")).toBeUndefined();
     });
 
     test("prefers the flat key when a row carries BOTH it and a nested object", () => {
@@ -988,10 +2443,11 @@ describe("ResultsGrid", () => {
         fields: ["shipping.city"],
         columnTypes: {},
       };
-      const { container } = render(React.createElement(ResultsGrid, { result }));
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result }));
+      fireEvent.click(getByTestId("view-table"));
 
-      expect(container.textContent).toContain("İzmir");
-      expect(container.textContent).not.toContain("Ankara");
+      expect(findDesktopRow(container, "İzmir")).not.toBeUndefined();
+      expect(findDesktopRow(container, "Ankara")).toBeUndefined();
     });
 
     test("makes the compact header's declared type reachable without a pointer", () => {
@@ -1000,18 +2456,30 @@ describe("ResultsGrid", () => {
       // element is unavailable to touch and unreliable for assistive tech, so the
       // type also ships as screen-reader text. Reported by review on PR #289.
       const result: QueryResult = { ...mockResult, columnTypes: { name: "Nullable(String)" } };
-      const { container } = render(React.createElement(ResultsGrid, { result }));
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result }));
+      fireEvent.click(getByTestId("view-table"));
 
       const srOnly = Array.from(container.querySelectorAll(".sr-only")).map((n) => n.textContent);
       expect(srOnly.some((text) => text?.includes("Nullable(String)"))).toBe(true);
     });
 
     test("renders headers unchanged when the result declares no types at all", () => {
-      const { getAllByRole, container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      const { getAllByRole, getByTestId, container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      fireEvent.click(getByTestId("view-table"));
 
-      expect(getAllByRole("button", { name: "name" })[0].textContent).toBe("name");
-      // No header gains a tooltip it did not have before ("Filter column" is pre-existing).
-      expect(container.querySelectorAll('[title]:not([title="Filter column"])').length).toBe(0);
+      expect(headerText(getAllByRole("button", { name: "name" })[0])).toBe("name");
+      expect(container.querySelector('span.truncate[title="name"]')).not.toBeNull();
+      const unexpectedTooltips = Array.from(container.querySelectorAll<HTMLElement>("[title]")).filter(
+        (element) =>
+          element.title !== "Filter column" &&
+          element.title !== "Sort" &&
+          element.title !== "Select all cells" &&
+          !mockResult.fields.includes(element.title) &&
+          !element.hasAttribute("data-row-detail") &&
+          // A cell's tooltip is its own value, not a type.
+          element.closest('[role="gridcell"]') === null,
+      );
+      expect(unexpectedTooltips.length).toBe(0);
     });
   });
 
@@ -1029,11 +2497,29 @@ describe("ResultsGrid", () => {
     const text = container.textContent ?? "";
     expect(text).toContain("Query returned no data");
     expect(text).toContain("2 segments of the queried data were unavailable.");
-    // The warning has to come before the "operation was successful" reassurance -
-    // a reader who stops at the reassurance is back to being told the data is absent.
-    expect(text.indexOf("2 segments of the queried data were unavailable.")).toBeLessThan(
-      text.indexOf("The operation was successful"),
-    );
+    /*
+     * AND THE REASSURANCE IS GONE, rather than pushed below the warning as it used to be. The two
+     * contradict each other: measured in a browser on an OPC UA history read of a node that keeps
+     * none, the panel said "the server answered BadHistoryOperationUnsupported: that node keeps no
+     * history" in red and "The operation was successful, but the result set is currently empty"
+     * under it in grey. A reader who stops at either one has been told the opposite of the other.
+     */
+    expect(text).not.toContain("The operation was successful");
+  });
+
+  test("a result cut before its first row says it was cut, not that the query returned no data (SF-032)", () => {
+    const result: QueryResult = {
+      ...mockEmptyResult,
+      fields: ["S"],
+      warnings: [{ message: "The first row of this result is larger than Studio's statement budget of 16 MiB." }],
+      pagination: { limit: 100_000, offset: 0, hasMore: false, totalReturned: 0, wasLimited: true },
+    };
+    const { container } = render(React.createElement(ResultsGrid, { result }));
+
+    const text = container.textContent ?? "";
+    expect(text).toContain("No row is shown: the result was cut before its first row");
+    expect(text).not.toContain("Query returned no data");
+    expect(text).toContain("larger than Studio's statement budget");
   });
 
   test("keeps the empty state unchanged when the engine reported no warnings", () => {
@@ -1059,13 +2545,16 @@ describe("ResultsGrid", () => {
    * an ascending sort is indistinguishable from no sort at all.
    */
   test("sorting reorders the rendered rows, not just the header indicator", () => {
-    const { getAllByRole, container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    const { getAllByRole, getByTestId, container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
 
-    // `:not([data-testid])` excludes the mocked ResultCard above, which also
-    // carries data-index; only the desktop table's rows come off the table
-    // instance, and they are the ones the row model orders.
+    // `:not([data-testid])` excludes the mocked ResultCard above and `:not(button)`
+    // the mobile table's rows, which both carry data-index too; only the desktop
+    // table's rows come off the table instance, and they are the ones the row model orders.
     const renderedRows = () =>
-      Array.from(container.querySelectorAll("[data-index]:not([data-testid])")).map((row) => row.textContent ?? "");
+      Array.from(container.querySelectorAll("[data-index]:not([data-testid]):not(button)")).map(
+        (row) => row.textContent ?? "",
+      );
 
     expect(renderedRows()).toHaveLength(3);
     expect(renderedRows()[0]).toContain("Alice");
@@ -1079,18 +2568,80 @@ describe("ResultsGrid", () => {
     expect(descending[2]).toContain("Alice");
   });
 
+  /**
+   * 64-bit integers and decimals reach the grid as digit strings (#1384), and the table's
+   * default comparison orders a string lexicographically: 1, 10, 100, 9. The column's declared
+   * type picks a numeric comparison, and a text column keeps the default.
+   */
+  describe("sorting numeric columns (#1384)", () => {
+    const numericResult: QueryResult = {
+      rows: [
+        { id: "10", total: "100.00", label: "10", memo: "b" },
+        { id: "9", total: "1.25", label: "9", memo: "a" },
+        { id: "9007199254740993", total: "-5.5", label: "9007199254740993", memo: "d" },
+        { id: null, total: null, label: "100", memo: "c" },
+        { id: "-5", total: "1000.00", label: "-5", memo: "e" },
+        { id: "9007199254740992", total: "10.00", label: "1", memo: "f" },
+      ],
+      fields: ["id", "total", "label", "memo"],
+      columnTypes: { id: "bigint", total: "numeric(12,2)", label: "varchar(30)", memo: "text" },
+      rowCount: 6,
+      executionTime: 1,
+    };
+
+    /** The memo column names each row with one letter, so the order read back is unambiguous. */
+    const memoOrder = (container: HTMLElement) =>
+      Array.from(container.querySelectorAll("[data-index]:not([data-testid]):not(button)"))
+        .map((row) => /[a-f]$/.exec(row.textContent ?? "")?.[0])
+        .join("");
+
+    const clickHeader = (utils: ReturnType<typeof render>, name: RegExp) =>
+      fireEvent.click(utils.getAllByRole("button", { name })[0]);
+
+    test("a bigint column sorts ascending and descending as numbers, NULL last both ways", () => {
+      const utils = render(React.createElement(ResultsGrid, { result: numericResult }));
+      fireEvent.click(utils.getByTestId("view-table"));
+      clickHeader(utils, /^id, bigint$/);
+      // -5, 9, 10, 2^53, 2^53 + 1, NULL
+      expect(memoOrder(utils.container)).toBe("eabfdc");
+      clickHeader(utils, /^id, bigint, sorted ascending$/);
+      // 2^53 + 1, 2^53, 10, 9, -5, NULL
+      expect(memoOrder(utils.container)).toBe("dfbaec");
+    });
+
+    test("a numeric(12,2) column sorts decimals of different magnitudes as numbers", () => {
+      const utils = render(React.createElement(ResultsGrid, { result: numericResult }));
+      fireEvent.click(utils.getByTestId("view-table"));
+      clickHeader(utils, /^total, numeric\(12,2\)$/);
+      // -5.5, 1.25, 10.00, 100.00, 1000.00, NULL
+      expect(memoOrder(utils.container)).toBe("dafbec");
+      clickHeader(utils, /^total, numeric\(12,2\), sorted ascending$/);
+      expect(memoOrder(utils.container)).toBe("ebfadc");
+    });
+
+    test("a text column of digit strings keeps the text order", () => {
+      const utils = render(React.createElement(ResultsGrid, { result: numericResult }));
+      fireEvent.click(utils.getByTestId("view-table"));
+      clickHeader(utils, /^label, varchar\(30\)$/);
+      // "-5" < "1" < "10" < "100" < "9" < "9007199254740993" as text
+      expect(memoOrder(utils.container)).toBe("efbcad");
+    });
+  });
+
   // ── A11y semantics (#100): keyboard-reachable interactive elements ────────
 
   describe("a11y semantics", () => {
-    test("column sort headers are buttons named after the field", () => {
-      const { getAllByRole } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    test("desktop-table column sort headers are buttons named after the field", () => {
+      const { getAllByRole, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      fireEvent.click(getByTestId("view-table"));
       const sortButtons = getAllByRole("button", { name: "name" });
       expect(sortButtons.length).toBeGreaterThan(0);
       fireEvent.click(sortButtons[0]);
     });
 
-    test("sort buttons expose the current sort direction in their accessible name", () => {
-      const { getAllByRole } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    test("desktop-table sort buttons expose the current sort direction in their accessible name", () => {
+      const { getAllByRole, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      fireEvent.click(getByTestId("view-table"));
       fireEvent.click(getAllByRole("button", { name: "name" })[0]);
       const ascending = getAllByRole("button", { name: "name, sorted ascending" });
       expect(ascending.length).toBeGreaterThan(0);
@@ -1098,21 +2649,699 @@ describe("ResultsGrid", () => {
       expect(getAllByRole("button", { name: "name, sorted descending" }).length).toBeGreaterThan(0);
     });
 
-    test("mobile rows are buttons that open the row detail sheet", () => {
-      const { getAllByRole, queryByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
-      const rowButtons = getAllByRole("button", { name: /Alice/ });
-      expect(rowButtons.length).toBeGreaterThan(0);
-      fireEvent.click(rowButtons[0]);
+    test("mobile-table rows are buttons that open the row detail sheet", () => {
+      const { container, getByTestId, queryByTestId } = render(
+        React.createElement(ResultsGrid, { result: mockResult }),
+      );
+      fireEvent.click(getByTestId("view-table"));
+      const mobileMenu = findContextMenuForMode(container, "Alice", "mobile");
+      const rowButton = within(mobileMenu).getByRole("button", { name: /Alice/ });
+      fireEvent.click(rowButton);
       expect(queryByTestId("row-detail-sheet")).not.toBeNull();
     });
 
-    test("column resize handles are hidden from assistive technology", () => {
-      const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    test("desktop-table column resize handles are hidden from assistive technology", () => {
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      fireEvent.click(getByTestId("view-table"));
       const handles = container.querySelectorAll(".cursor-col-resize");
       expect(handles.length).toBeGreaterThan(0);
       for (const handle of handles) {
         expect(handle.getAttribute("aria-hidden")).toBe("true");
       }
+    });
+  });
+
+  describe("column sizing", () => {
+    test("keeps manual resizing and fits only the double-clicked column to its content", () => {
+      const result: QueryResult = {
+        rows: [{ name: "Ada", email: "ada@example.com" }],
+        fields: ["name", "email"],
+        rowCount: 1,
+        executionTime: 1,
+      };
+      const { container } = render(React.createElement(ResultsGrid, { result }));
+      const nameHeader = findDesktopHeader(container, "name");
+      const emailHeader = findDesktopHeader(container, "email");
+      const nameHandle = nameHeader.querySelector<HTMLElement>(".cursor-col-resize")!;
+      const emailHandle = emailHeader.querySelector<HTMLElement>(".cursor-col-resize")!;
+
+      fireEvent.mouseDown(nameHandle, { clientX: 100 });
+      fireEvent.mouseMove(document, { clientX: 150 });
+      fireEvent.mouseUp(document, { clientX: 150 });
+
+      fireEvent.mouseDown(emailHandle, { clientX: 200 });
+      fireEvent.mouseMove(document, { clientX: 260 });
+      fireEvent.mouseUp(document, { clientX: 260 });
+
+      // `name` opens at its header ("Ada" is shorter), `email` at its value.
+      const emailFit = getContentFitColumnSize("email", undefined, false, ["ada@example.com"]);
+      expect(nameHeader.style.width).toBe(`${getHeaderFitColumnSize("name") + 50}px`);
+      expect(emailHeader.style.width).toBe(`${emailFit + 60}px`);
+
+      fireEvent.doubleClick(nameHandle);
+
+      expect(nameHeader.style.width).toBe(`${getHeaderFitColumnSize("name")}px`);
+      expect(emailHeader.style.width).toBe(`${emailFit + 60}px`);
+    });
+
+    test("sizes a typed masked header for all of its visible markers", () => {
+      mockShouldMask.mockReturnValue(true);
+      mockDetectSensitiveColumnsFromConfig.mockReturnValue(new Map([["name", "sensitive"]]));
+
+      const result: QueryResult = {
+        rows: [{ name: "Ada" }],
+        fields: ["name"],
+        columnTypes: { name: "VARCHAR(255)" },
+        rowCount: 1,
+        executionTime: 1,
+      };
+      const { container } = render(React.createElement(ResultsGrid, { result, maskingEnabled: true }));
+      const header = findDesktopHeader(container, "name");
+
+      expect(header.style.width).toBe(`${getHeaderFitColumnSize("name", "VARCHAR(255)", true)}px`);
+      expect(header.querySelector("span.truncate")?.getAttribute("title")).toBe("name");
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Text Wrapping Tests
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe("Text wrapping", () => {
+    // Walks from every element showing `text` up to its virtual row (desktop and
+    // mobile both render in the DOM), collecting what could hold the value to one line.
+    function lineConstraints(container: HTMLElement, text: string) {
+      const found = Array.from(container.querySelectorAll("span")).filter((el) => el.textContent === text);
+      expect(found.length).toBeGreaterThan(0);
+      return found.map((el) => {
+        const classes: string[] = [];
+        let node: HTMLElement | null = el;
+        while (node && !node.style.transform) {
+          classes.push(...Array.from(node.classList));
+          node = node.parentElement;
+        }
+        expect(node).not.toBeNull();
+        // measureElement files a row's height under this attribute; a row without it
+        // grows on screen while the rows below it stay where the old height put them.
+        expect(node!.dataset.index).toBeDefined();
+        return { classes, rowHeight: node!.style.height, mobile: node!.tagName === "BUTTON" };
+      });
+    }
+
+    function expectSingleLine(container: HTMLElement, text: string) {
+      for (const { classes, rowHeight, mobile } of lineConstraints(container, text)) {
+        expect(classes).toContain("whitespace-nowrap");
+        // The desktop grid's ellipsis is part of the unchanged behaviour; the mobile table never had one.
+        if (!mobile) expect(classes).toContain("truncate");
+        expect(rowHeight).toBe("36px");
+      }
+    }
+
+    function expectWrapped(container: HTMLElement, text: string) {
+      for (const { classes, rowHeight } of lineConstraints(container, text)) {
+        expect(classes).not.toContain("truncate");
+        expect(classes).not.toContain("whitespace-nowrap");
+        expect(classes).not.toContain("h-full");
+        expect(rowHeight).toBe("");
+      }
+    }
+
+    test("a plain cell wraps and its row sheds the fixed height, and turning it off restores both", () => {
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      expectSingleLine(container, "alice@example.com");
+
+      fireEvent.click(getByTestId("wrap-toggle"));
+      expectWrapped(container, "alice@example.com");
+
+      fireEvent.click(getByTestId("wrap-toggle"));
+      expectSingleLine(container, "alice@example.com");
+    });
+
+    test("every toggle drops the measured row heights, so turning wrap off shrinks rows back", () => {
+      // The virtualizer caches each measured row; without a reset, rows grown while
+      // wrapping keep that height after the toggle is off again.
+      const { getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      mockVirtualizerMeasure.mockClear();
+
+      fireEvent.click(getByTestId("wrap-toggle"));
+      expect(mockVirtualizerMeasure).toHaveBeenCalledTimes(2);
+
+      fireEvent.click(getByTestId("wrap-toggle"));
+      expect(mockVirtualizerMeasure).toHaveBeenCalledTimes(4);
+    });
+
+    test("an editable cell wraps too", () => {
+      const { container, getByTestId } = render(
+        React.createElement(ResultsGrid, {
+          result: mockResult,
+          editingEnabled: true,
+          onCellChange: mock(() => {}),
+          pendingChanges: [],
+        }),
+      );
+      fireEvent.click(getByTestId("wrap-toggle"));
+      expectWrapped(container, "alice@example.com");
+    });
+
+    test("masked and revealed cells wrap too", () => {
+      mockShouldMask.mockReturnValue(true);
+      mockCanReveal.mockReturnValue(true);
+      mockDetectSensitiveColumnsFromConfig.mockReturnValue(
+        new Map([
+          ["email", { name: "email", maskType: "email" as const, columnPatterns: ["email"], enabled: true, id: "e1" }],
+        ]),
+      );
+      const { container, getByTestId } = render(
+        React.createElement(ResultsGrid, {
+          result: mockResult,
+          maskingEnabled: true,
+          maskingConfig: {
+            enabled: true,
+            patterns: [],
+            roleSettings: { admin: { canToggle: true, canReveal: true }, user: { canToggle: false, canReveal: false } },
+          },
+        }),
+      );
+      fireEvent.click(getByTestId("wrap-toggle"));
+      expectWrapped(container, "***");
+
+      fireEvent.click(container.querySelector('button[title="Reveal value (10s)"]')!);
+      expectWrapped(container, "alice@example.com");
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Row detail on the desktop grid (#800)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe("Row detail on the desktop grid", () => {
+    // The desktop table is the only place that renders through TanStack columns, so a
+    // control that came from the column list is on the desktop row and nowhere else.
+    function detailControls(container: HTMLElement): HTMLButtonElement[] {
+      return Array.from(container.querySelectorAll<HTMLButtonElement>("button[data-row-detail]"));
+    }
+
+    test("every desktop row carries a control that opens the row detail sheet", () => {
+      const { container, queryByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      const controls = detailControls(container);
+      expect(controls.length).toBe(mockResult.rows.length);
+
+      expect(queryByTestId("row-detail-sheet")).toBeNull();
+      fireEvent.click(controls[1]);
+      expect(queryByTestId("row-detail-sheet")).not.toBeNull();
+      expect(queryByTestId("row-detail-sheet")!.getAttribute("data-row-index")).toBe("1");
+    });
+
+    test("the control names the row it opens, so its accessible name is not bare", () => {
+      const { getByRole } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      expect(getByRole("button", { name: "Show row 3 field by field" })).not.toBeNull();
+    });
+
+    test("the control opens the row the reader sees after sorting, not the unsorted one", () => {
+      const { container, getAllByRole, queryByTestId } = render(
+        React.createElement(ResultsGrid, { result: mockResult }),
+      );
+      // Descending on `name` puts Charlie first, so the first control must open row 2.
+      fireEvent.click(getAllByRole("button", { name: "name" })[0]);
+      fireEvent.click(getAllByRole("button", { name: "name, sorted ascending" })[0]);
+      fireEvent.click(detailControls(container)[0]);
+      expect(queryByTestId("row-detail-sheet")!.getAttribute("data-row-index")).toBe("2");
+    });
+
+    /**
+     * The reason this issue existed at all: the vertical view shipped behind `md:hidden`,
+     * so it was absent on exactly the screens that meet a wide table (#800). A breakpoint
+     * class on the control or on the cell holding it would put it back there, and a
+     * narrowed desktop window or a tablet would lose it in silence.
+     */
+    test("no breakpoint hides the control or the cell holding it", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      // Without this the loop below asserts nothing when no control was rendered at all.
+      expect(detailControls(container).length).toBeGreaterThan(0);
+      for (const control of detailControls(container)) {
+        for (let el: HTMLElement | null = control; el !== null; el = el.parentElement) {
+          // The desktop grid's own `hidden md:block` is the boundary, not a finding: below
+          // that width the card and mobile table render, and both already open the sheet.
+          if (el.hasAttribute("data-desktop-grid")) break;
+          const classes = (el.getAttribute("class") ?? "").split(/\s+/);
+          expect(classes.filter((c) => /^(sm|md|lg|xl|2xl):/.test(c) || c === "hidden")).toEqual([]);
+        }
+      }
+    });
+
+    test("the control column cannot be resized, so it keeps its width", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      const headers = Array.from(container.querySelectorAll("[data-row-detail-header]"));
+      expect(headers.length).toBe(1);
+      expect(headers[0].querySelector(".cursor-col-resize")).toBeNull();
+      // The field columns keep theirs: the guard is per column, not a removal.
+      expect(container.querySelectorAll(".cursor-col-resize").length).toBe(mockResult.fields.length);
+    });
+
+    /**
+     * `SELECT 1 AS "__libredb_row_detail__"` is legal, and a result set carrying that
+     * column name must still render both it and the control, not one column swallowing
+     * the other.
+     */
+    test("a field named like the control column still gets its own column", () => {
+      const collidingResult: QueryResult = {
+        rows: [{ __libredb_row_detail__: "value", id: 1 }],
+        fields: ["__libredb_row_detail__", "id"],
+        rowCount: 1,
+        executionTime: 1,
+      };
+      const { container, getAllByRole } = render(React.createElement(ResultsGrid, { result: collidingResult }));
+      expect(detailControls(container).length).toBe(1);
+      expect(getAllByRole("button", { name: "__libredb_row_detail__" }).length).toBeGreaterThan(0);
+
+      // Two columns under one id is what breaks: the grid keys header and body cells by
+      // the column id, and every cell answering to it is then styled as the control -
+      // the field's own value would be pinned to the left edge in the control's place.
+      const desktop = container.querySelector("[data-desktop-grid]")!;
+      const valueCell = Array.from(desktop.querySelectorAll("span")).find((el) => el.textContent === "value");
+      expect(valueCell).toBeDefined();
+      expect(valueCell!.closest("[style*='width']")!.getAttribute("class")).not.toContain("sticky");
+    });
+  });
+  // ═══════════════════════════════════════════════════════════════════════
+  // Cell selection and copy: the spreadsheet behaviour users bring from
+  // Excel, DataGrip and SQL Server Management Studio
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe("Cell selection and copy", () => {
+    const selectionResult: QueryResult = {
+      rows: [
+        { id: 1, name: "Alice", email: "alice@example.com" },
+        { id: 2, name: "Bob", email: "bob@example.com" },
+        { id: 3, name: "Charlie", email: "charlie@example.com" },
+      ],
+      fields: ["id", "name", "email"],
+      rowCount: 3,
+      executionTime: 1,
+    };
+
+    const desktopGrid = (container: HTMLElement) => container.querySelector<HTMLElement>("[data-desktop-grid]")!;
+
+    function gridCell(container: HTMLElement, text: string): HTMLElement {
+      const cell = Array.from(desktopGrid(container).querySelectorAll<HTMLElement>('[role="gridcell"]')).find(
+        (candidate) => candidate.textContent === text,
+      );
+      if (!cell) throw new Error(`No desktop grid cell reads ${text}`);
+      return cell;
+    }
+
+    const selectedTexts = (container: HTMLElement) =>
+      Array.from(desktopGrid(container).querySelectorAll('[role="gridcell"][aria-selected="true"]')).map(
+        (cell) => cell.textContent,
+      );
+
+    const columnHeader = (container: HTMLElement, field: string) =>
+      Array.from(desktopGrid(container).querySelectorAll<HTMLElement>('[role="columnheader"]')).find(
+        (header) => header.querySelector("span.truncate")?.textContent === field,
+      )!;
+
+    const rowHeader = (container: HTMLElement, rowNumber: number) =>
+      Array.from(desktopGrid(container).querySelectorAll<HTMLElement>('[role="rowheader"]')).find(
+        (header) => header.querySelector("[data-row-number]")?.textContent === String(rowNumber),
+      )!;
+
+    function copyFrom(target: HTMLElement) {
+      const setData = mock((_format: string, _text: string) => {});
+      const event = createEvent.copy(target, { clipboardData: { setData } });
+      fireEvent(target, event);
+      return { setData, event };
+    }
+
+    const press = (container: HTMLElement, key: string, modifiers: Record<string, boolean> = {}) =>
+      fireEvent.keyDown(desktopGrid(container), { key, ...modifiers });
+
+    test("the grid is one keyboard stop that names itself and its size", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      const grid = desktopGrid(container);
+      expect(grid.getAttribute("role")).toBe("grid");
+      expect(grid.getAttribute("tabindex")).toBe("0");
+      expect(grid.getAttribute("aria-multiselectable")).toBe("true");
+      expect(grid.getAttribute("aria-rowcount")).toBe("4");
+      expect(grid.getAttribute("aria-colcount")).toBe("4");
+    });
+
+    test("pressing a cell selects that cell alone", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      expect(selectedTexts(container)).toEqual([]);
+
+      fireEvent.mouseDown(gridCell(container, "Bob"), { button: 0 });
+      expect(selectedTexts(container)).toEqual(["Bob"]);
+
+      fireEvent.mouseUp(document);
+      fireEvent.mouseDown(gridCell(container, "alice@example.com"), { button: 0 });
+      expect(selectedTexts(container)).toEqual(["alice@example.com"]);
+    });
+
+    test("Shift with a press extends the selection to a rectangle", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      fireEvent.mouseDown(gridCell(container, "1"), { button: 0 });
+      fireEvent.mouseUp(document);
+      fireEvent.mouseDown(gridCell(container, "Bob"), { button: 0, shiftKey: true });
+      expect(selectedTexts(container)).toEqual(["1", "Alice", "2", "Bob"]);
+    });
+
+    test("dragging across cells selects the rectangle the pointer covered", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      fireEvent.mouseDown(gridCell(container, "Alice"), { button: 0 });
+      fireEvent.mouseEnter(gridCell(container, "bob@example.com"));
+      fireEvent.mouseUp(document);
+      // Released, so passing over another cell no longer moves the selection.
+      fireEvent.mouseEnter(gridCell(container, "Charlie"));
+      expect(selectedTexts(container)).toEqual(["Alice", "alice@example.com", "Bob", "bob@example.com"]);
+    });
+
+    test("Ctrl with a press adds a second rectangle", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      fireEvent.mouseDown(gridCell(container, "1"), { button: 0 });
+      fireEvent.mouseUp(document);
+      fireEvent.mouseDown(gridCell(container, "Charlie"), { button: 0, ctrlKey: true });
+      fireEvent.mouseUp(document);
+      expect(selectedTexts(container)).toEqual(["1", "Charlie"]);
+    });
+
+    test("a right or middle press does not move the selection", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      fireEvent.mouseDown(gridCell(container, "Alice"), { button: 0 });
+      fireEvent.mouseUp(document);
+      fireEvent.mouseDown(gridCell(container, "Bob"), { button: 2 });
+      fireEvent.mouseDown(gridCell(container, "Charlie"), { button: 1 });
+      expect(selectedTexts(container)).toEqual(["Alice"]);
+    });
+
+    test("copy writes the selected rectangle as tab-separated rows, in the order on screen", () => {
+      const { container, getAllByRole } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      // Descending on name: Charlie, Bob, Alice.
+      fireEvent.click(getAllByRole("button", { name: "name" })[0]);
+      fireEvent.click(getAllByRole("button", { name: "name, sorted ascending" })[0]);
+      fireEvent.mouseDown(gridCell(container, "3"), { button: 0 });
+      fireEvent.mouseUp(document);
+      fireEvent.mouseDown(gridCell(container, "Bob"), { button: 0, shiftKey: true });
+
+      const { setData, event } = copyFrom(desktopGrid(container));
+      expect(event.defaultPrevented).toBe(true);
+      expect(setData).toHaveBeenCalledWith("text/plain", "3\tCharlie\n2\tBob");
+      expect(mockToastSuccess).toHaveBeenCalledWith("4 cells copied to clipboard");
+    });
+
+    test("copying one cell copies its whole value, raw", () => {
+      const result: QueryResult = {
+        rows: [{ id: 1, note: "first line\nsecond line" }],
+        fields: ["id", "note"],
+        rowCount: 1,
+        executionTime: 1,
+      };
+      const { container } = render(React.createElement(ResultsGrid, { result }));
+      const noteCell = Array.from(desktopGrid(container).querySelectorAll<HTMLElement>('[role="gridcell"]'))[1];
+      fireEvent.mouseDown(noteCell, { button: 0 });
+
+      const { setData } = copyFrom(desktopGrid(container));
+      expect(setData).toHaveBeenCalledWith("text/plain", "first line\nsecond line");
+      expect(mockToastSuccess).toHaveBeenCalledWith("Cell copied to clipboard");
+    });
+
+    test("copy with nothing selected, or from a text box inside the grid, is left to the browser", () => {
+      const { container, getAllByTitle } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      const nothing = copyFrom(desktopGrid(container));
+      expect(nothing.event.defaultPrevented).toBe(false);
+      expect(nothing.setData).not.toHaveBeenCalled();
+
+      fireEvent.mouseDown(gridCell(container, "Bob"), { button: 0 });
+      fireEvent.click(getAllByTitle("Filter column")[0]);
+      const filterInput = desktopGrid(container).querySelector<HTMLInputElement>("input")!;
+      const fromInput = copyFrom(filterInput);
+      expect(fromInput.event.defaultPrevented).toBe(false);
+      expect(fromInput.setData).not.toHaveBeenCalled();
+    });
+
+    test("a masked cell copies as its mask, never the value under it", () => {
+      mockShouldMask.mockReturnValue(true);
+      mockDetectSensitiveColumnsFromConfig.mockReturnValue(new Map([["email", "email"]]));
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult, maskingEnabled: true }));
+      fireEvent.mouseDown(gridCell(container, "Alice"), { button: 0 });
+      fireEvent.mouseUp(document);
+      fireEvent.mouseDown(gridCell(container, "***"), { button: 0, shiftKey: true });
+
+      const { setData } = copyFrom(desktopGrid(container));
+      expect(setData).toHaveBeenCalledWith("text/plain", "Alice\t***");
+    });
+
+    test("a hidden column is neither selected nor copied", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      press(container, "a", { ctrlKey: true });
+      expect(selectedTexts(container)).toHaveLength(9);
+      cleanup();
+
+      const hiddenRender = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      // The mocked strip hides `name`.
+      fireEvent.click(hiddenRender.getByTestId("toggle-column"));
+      press(hiddenRender.container, "a", { ctrlKey: true });
+      const { setData } = copyFrom(desktopGrid(hiddenRender.container));
+      expect(setData).toHaveBeenCalledWith(
+        "text/plain",
+        "1\talice@example.com\n2\tbob@example.com\n3\tcharlie@example.com",
+      );
+    });
+
+    test("pressing a column's name selects the whole column, and Shift extends across columns", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      fireEvent.mouseDown(columnHeader(container, "name").querySelector("span.truncate")!, { button: 0 });
+      expect(selectedTexts(container)).toEqual(["Alice", "Bob", "Charlie"]);
+
+      fireEvent.mouseDown(columnHeader(container, "email").querySelector("span.truncate")!, {
+        button: 0,
+        shiftKey: true,
+      });
+      expect(selectedTexts(container)).toEqual([
+        "Alice",
+        "alice@example.com",
+        "Bob",
+        "bob@example.com",
+        "Charlie",
+        "charlie@example.com",
+      ]);
+      expect(columnHeader(container, "name").getAttribute("aria-selected")).toBe("true");
+      expect(columnHeader(container, "id").getAttribute("aria-selected")).toBe("false");
+    });
+
+    test("pressing a column's name does not sort it; the sort control does", () => {
+      const { container, getAllByRole } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      fireEvent.mouseDown(columnHeader(container, "name").querySelector("span.truncate")!, { button: 0 });
+      fireEvent.click(columnHeader(container, "name").querySelector("span.truncate")!);
+      expect(getAllByRole("button", { name: "name" }).length).toBeGreaterThan(0);
+      expect(within(desktopGrid(container)).queryAllByRole("button", { name: "name, sorted ascending" })).toEqual([]);
+    });
+
+    test("pressing a row number selects the row, and Shift extends across rows", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      fireEvent.mouseDown(rowHeader(container, 1), { button: 0 });
+      expect(selectedTexts(container)).toEqual(["1", "Alice", "alice@example.com"]);
+
+      fireEvent.mouseDown(rowHeader(container, 2), { button: 0, shiftKey: true });
+      expect(selectedTexts(container)).toHaveLength(6);
+      expect(rowHeader(container, 2).getAttribute("aria-selected")).toBe("true");
+      expect(rowHeader(container, 3).getAttribute("aria-selected")).toBe("false");
+    });
+
+    test("pressing the row-number cell's detail control still opens the row, without starting a selection", () => {
+      const { container, getByRole, queryByTestId } = render(
+        React.createElement(ResultsGrid, { result: selectionResult }),
+      );
+      const control = getByRole("button", { name: "Show row 2 field by field" });
+      fireEvent.mouseDown(control, { button: 0 });
+      fireEvent.click(control);
+      expect(queryByTestId("row-detail-sheet")!.getAttribute("data-row-index")).toBe("1");
+      expect(selectedTexts(container)).toEqual([]);
+    });
+
+    test("the corner control selects every cell", () => {
+      const { container, getByRole } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      fireEvent.click(getByRole("button", { name: "Select all cells" }));
+      expect(selectedTexts(container)).toHaveLength(9);
+    });
+
+    test("arrows move the active cell and Shift with an arrow extends from it", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      // With nothing selected, the first arrow lands on the first cell.
+      press(container, "ArrowDown");
+      expect(selectedTexts(container)).toEqual(["1"]);
+      press(container, "ArrowRight");
+      press(container, "ArrowDown");
+      expect(selectedTexts(container)).toEqual(["Bob"]);
+      press(container, "ArrowRight", { shiftKey: true });
+      press(container, "ArrowDown", { shiftKey: true });
+      expect(selectedTexts(container)).toEqual(["Bob", "bob@example.com", "Charlie", "charlie@example.com"]);
+      press(container, "Home", { ctrlKey: true });
+      expect(selectedTexts(container)).toEqual(["1"]);
+      press(container, "End", { ctrlKey: true, shiftKey: true });
+      expect(selectedTexts(container)).toHaveLength(9);
+    });
+
+    test("Shift+Space selects the rows of the selection, Ctrl+Space its columns, Escape clears it", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      fireEvent.mouseDown(gridCell(container, "Bob"), { button: 0 });
+      fireEvent.mouseUp(document);
+      press(container, " ", { shiftKey: true });
+      expect(selectedTexts(container)).toEqual(["2", "Bob", "bob@example.com"]);
+      fireEvent.mouseDown(gridCell(container, "Bob"), { button: 0 });
+      fireEvent.mouseUp(document);
+      press(container, " ", { ctrlKey: true });
+      expect(selectedTexts(container)).toEqual(["Alice", "Bob", "Charlie"]);
+      press(container, "Escape");
+      expect(selectedTexts(container)).toEqual([]);
+    });
+
+    test("a key typed into a text box inside the grid does not move the selection", () => {
+      const { container, getAllByTitle } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      fireEvent.mouseDown(gridCell(container, "Bob"), { button: 0 });
+      fireEvent.click(getAllByTitle("Filter column")[0]);
+      const filterInput = desktopGrid(container).querySelector<HTMLInputElement>("input")!;
+      fireEvent.keyDown(filterInput, { key: "ArrowDown" });
+      expect(selectedTexts(container)).toEqual(["Bob"]);
+    });
+
+    test("Enter edits the active cell where editing is on, and nowhere else", () => {
+      const editable = render(
+        React.createElement(ResultsGrid, { result: selectionResult, editingEnabled: true, onCellChange: () => {} }),
+      );
+      fireEvent.mouseDown(gridCell(editable.container, "Bob"), { button: 0 });
+      press(editable.container, "Enter");
+      expect(desktopGrid(editable.container).querySelector<HTMLInputElement>("input")?.value).toBe("Bob");
+      cleanup();
+
+      const readOnly = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      fireEvent.mouseDown(gridCell(readOnly.container, "Bob"), { button: 0 });
+      press(readOnly.container, "F2");
+      expect(desktopGrid(readOnly.container).querySelector("input")).toBeNull();
+    });
+
+    test("committing an edit with Enter hands the keyboard back to the grid", () => {
+      const onCellChange = mock((_change: CellChange) => {});
+      const { container } = render(
+        React.createElement(ResultsGrid, { result: selectionResult, editingEnabled: true, onCellChange }),
+      );
+      fireEvent.mouseDown(gridCell(container, "Bob"), { button: 0 });
+      press(container, "Enter");
+      fireEvent.change(desktopGrid(container).querySelector<HTMLInputElement>("input")!, {
+        target: { value: "Robert" },
+      });
+      // Re-queried: the columns memo recomputes on every edit keystroke and remounts the input.
+      fireEvent.keyDown(desktopGrid(container).querySelector<HTMLInputElement>("input")!, { key: "Enter" });
+      expect(onCellChange).toHaveBeenCalledTimes(1);
+      expect(document.activeElement).toBe(desktopGrid(container));
+      expect(desktopGrid(container).querySelector("input")).toBeNull();
+    });
+
+    test("right-clicking a cell outside the selection selects it, inside keeps the selection", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      fireEvent.mouseDown(gridCell(container, "1"), { button: 0 });
+      fireEvent.mouseUp(document);
+      fireEvent.mouseDown(gridCell(container, "Bob"), { button: 0, shiftKey: true });
+      fireEvent.contextMenu(gridCell(container, "Alice"));
+      expect(selectedTexts(container)).toEqual(["1", "Alice", "2", "Bob"]);
+
+      fireEvent.contextMenu(gridCell(container, "Charlie"));
+      expect(selectedTexts(container)).toEqual(["Charlie"]);
+    });
+
+    test("the context menu copies the selection, with or without its headers", async () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      fireEvent.mouseDown(gridCell(container, "1"), { button: 0 });
+      fireEvent.mouseUp(document);
+      fireEvent.mouseDown(gridCell(container, "Bob"), { button: 0, shiftKey: true });
+      fireEvent.contextMenu(gridCell(container, "Bob"));
+      const menu = findContextMenuForMode(container, "Bob", "desktop");
+
+      fireEvent.click(within(menu).getByRole("menuitem", { name: "Copy Selection" }));
+      await waitFor(() => expect(mockClipboardWriteText).toHaveBeenCalledWith("1\tAlice\n2\tBob"));
+      expect(mockToastSuccess).toHaveBeenCalledWith("Selection copied to clipboard");
+
+      fireEvent.click(within(menu).getByRole("menuitem", { name: "Copy Selection with Headers" }));
+      await waitFor(() => expect(mockClipboardWriteText).toHaveBeenCalledWith("id\tname\n1\tAlice\n2\tBob"));
+    });
+
+    test("a single selected cell offers Copy with Headers, not Copy Selection", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: selectionResult }));
+      fireEvent.contextMenu(gridCell(container, "Bob"));
+      const menu = findContextMenuForMode(container, "Bob", "desktop");
+      expect(within(menu).queryByRole("menuitem", { name: "Copy Selection" })).toBeNull();
+      expect(within(menu).getByRole("menuitem", { name: "Copy Cell" })).not.toBeNull();
+      expect(within(menu).getByRole("menuitem", { name: "Copy with Headers" })).not.toBeNull();
+    });
+
+    test("a sort or a new result clears the selection", () => {
+      const { container, getAllByRole, rerender } = render(
+        React.createElement(ResultsGrid, { result: selectionResult }),
+      );
+      fireEvent.mouseDown(gridCell(container, "Bob"), { button: 0 });
+      fireEvent.mouseUp(document);
+      fireEvent.click(getAllByRole("button", { name: "name" })[0]);
+      expect(selectedTexts(container)).toEqual([]);
+
+      fireEvent.mouseDown(gridCell(container, "Bob"), { button: 0 });
+      fireEvent.mouseUp(document);
+      rerender(React.createElement(ResultsGrid, { result: { ...selectionResult, rows: [...selectionResult.rows] } }));
+      expect(selectedTexts(container)).toEqual([]);
+    });
+
+    test("a cell's full value is its tooltip, so a cut-off value can be read in place", () => {
+      const long = "x".repeat(80);
+      const result: QueryResult = {
+        rows: [{ id: 1, note: long }],
+        fields: ["id", "note"],
+        rowCount: 1,
+        executionTime: 1,
+      };
+      const { container } = render(React.createElement(ResultsGrid, { result }));
+      expect(desktopGrid(container).querySelector(`[title="${long}"]`)).not.toBeNull();
+    });
+  });
+
+  describe("column sizing from content", () => {
+    test("a column opens wide enough for the values it shows, not only its name", () => {
+      const result: QueryResult = {
+        rows: [{ id: "a value far longer than the two-letter header above it", n: 1 }],
+        fields: ["id", "n"],
+        rowCount: 1,
+        executionTime: 1,
+      };
+      const { container } = render(React.createElement(ResultsGrid, { result }));
+      expect(findDesktopHeader(container, "id").style.width).toBe(
+        `${getContentFitColumnSize("id", undefined, false, ["a value far longer than the two-letter header above it"])}px`,
+      );
+      expect(findDesktopHeader(container, "n").style.width).toBe(`${getHeaderFitColumnSize("n")}px`);
+    });
+
+    test("a masked column is sized by its mask, so the width does not tell the hidden value's length", () => {
+      mockShouldMask.mockReturnValue(true);
+      mockDetectSensitiveColumnsFromConfig.mockReturnValue(new Map([["secret", "sensitive"]]));
+      const result: QueryResult = {
+        rows: [{ secret: "a secret value that is much longer than its mask" }],
+        fields: ["secret"],
+        rowCount: 1,
+        executionTime: 1,
+      };
+      const { container } = render(React.createElement(ResultsGrid, { result, maskingEnabled: true }));
+      expect(findDesktopHeader(container, "secret").style.width).toBe(
+        `${getContentFitColumnSize("secret", undefined, true, ["***"])}px`,
+      );
+    });
+
+    test("double-clicking a resize handle fits the column to its content, past the initial cap", () => {
+      const long = "y".repeat(120);
+      const result: QueryResult = { rows: [{ doc: long }], fields: ["doc"], rowCount: 1, executionTime: 1 };
+      const { container } = render(React.createElement(ResultsGrid, { result }));
+      const header = findDesktopHeader(container, "doc");
+      expect(header.style.width).toBe(`${getContentFitColumnSize("doc", undefined, false, [long])}px`);
+
+      fireEvent.doubleClick(header.querySelector<HTMLElement>(".cursor-col-resize")!);
+      expect(header.style.width).toBe(
+        `${getContentFitColumnSize("doc", undefined, false, [long], RESULT_COLUMN_RESIZE_MAX_SIZE)}px`,
+      );
     });
   });
 });

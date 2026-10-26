@@ -158,6 +158,27 @@ describe("AgentRunStore — opening a run", () => {
     expect(folded?.threadId).toBe(record.runId);
   });
 
+  test("a run opened on kubectl carries its language and verifier, and a run opened without reads as neither", async () => {
+    const { store, dataDir } = storeAt();
+    const kubectl = await store.openRun({
+      ...OPEN_INPUT,
+      statementLanguage: "kubectl",
+      verifier: "agent-investigation.1",
+    });
+    const plain = await store.openRun({ ...OPEN_INPUT });
+
+    // Read back through a second store on the same files: a resumed drive in a fresh process has the ledger and
+    // nothing else, so the language and the verifier must come back from it alone.
+    const { store: resumed } = storeAt(dataDir);
+    expect((await resumed.read(kubectl.runId))?.record).toMatchObject({
+      statementLanguage: "kubectl",
+      verifier: "agent-investigation.1",
+    });
+    const folded = (await resumed.read(plain.runId))?.record;
+    expect(folded && "statementLanguage" in folded).toBe(false);
+    expect(folded && "verifier" in folded).toBe(false);
+  });
+
   test("a run that continues nothing folds to a thread of one named after itself", async () => {
     const { store } = storeAt();
 
@@ -340,6 +361,68 @@ describe("AgentRunStore — folding the ledger into a record", () => {
     expect(view?.record.events.map((entry) => (entry as { stepId: string }).stepId)).toEqual(
       Array.from({ length: 150 }, (_unused, index) => `s${index}`),
     );
+  });
+
+  test("a ledger holding a usage reading and a cluster without usage metrics folds", async () => {
+    const { store } = storeAt();
+    const { runId } = await store.openRun(OPEN_INPUT);
+    await store.appendEvent(runId, event("run-started", 1, { mode: "agent" }));
+    await store.appendEvent(
+      runId,
+      event("usage-read", 2, {
+        artifact: { ...artifactFor(runId, "usage_1"), operationId: "cluster.usage.read" },
+        namespace: "shop",
+        selector: "app=web",
+      }),
+    );
+    await store.appendEvent(runId, event("usage-unavailable", 3, { namespace: "web" }));
+
+    const view = await store.read(runId);
+    expect(view?.record.events.map((entry) => entry.kind)).toEqual(["run-started", "usage-read", "usage-unavailable"]);
+    expect(view?.record.status).toBe("running");
+  });
+
+  test("a ledger holding a workload profile folds", async () => {
+    const { store } = storeAt();
+    const { runId } = await store.openRun(OPEN_INPUT);
+    await store.appendEvent(runId, event("run-started", 1, { mode: "agent" }));
+    await store.appendEvent(
+      runId,
+      event("workloads-profiled", 2, {
+        artifact: { ...artifactFor(runId, "profile_1"), operationId: "cluster.workloads.read" },
+        namespace: "shop",
+      }),
+    );
+
+    const view = await store.read(runId);
+    expect(view?.record.events.map((entry) => entry.kind)).toEqual(["run-started", "workloads-profiled"]);
+    expect(view?.record.events[1]).toMatchObject({ kind: "workloads-profiled", namespace: "shop" });
+    expect(view?.record.status).toBe("running");
+  });
+
+  test("a ledger holding a resources recommendation folds", async () => {
+    const { store } = storeAt();
+    const { runId } = await store.openRun(OPEN_INPUT);
+    await store.appendEvent(runId, event("run-started", 1, { mode: "agent" }));
+    await store.appendEvent(
+      runId,
+      event("recommendation", 2, {
+        change: "resources",
+        namespace: "shop",
+        ownerKind: "Deployment",
+        ownerName: "web",
+        container: "web",
+        current: { requests: { cpu: "500m", memory: "256Mi" }, limits: { cpu: "1", memory: "512Mi" } },
+        proposed: { requests: { cpu: "150m", memory: "128Mi" }, limits: { cpu: "500m", memory: "256Mi" } },
+        rationale: "r",
+        evidence: [{ source: "artifact", correlationId: "u1" }],
+      }),
+    );
+
+    const view = await store.read(runId);
+    expect(view?.record.events.map((entry) => entry.kind)).toEqual(["run-started", "recommendation"]);
+    expect(view?.record.events[1]).toMatchObject({ change: "resources", container: "web" });
+    expect(view?.record.status).toBe("running");
   });
 
   test("a cancellation request is visible in the view but is not one of the run's events", async () => {
@@ -733,6 +816,7 @@ const WORLD_ENV_KEYS = [
   "LLM_API_KEY",
   "LLM_MODEL",
   "LLM_API_URL",
+  "LLM_MODEL_EFFORT",
 ] as const;
 
 /** The model configuration that makes the runtime available. */
@@ -819,5 +903,131 @@ describe("AgentRunStore — a closed run refuses further appends", () => {
     await store.close(run.runId);
 
     expect((await store.read(run.runId))?.record.runId).toBe(run.runId);
+  });
+});
+
+// ─── drive claims (B5) ──────────────────────────────────────────────────────
+
+describe("AgentRunStore — drive claims", () => {
+  test("the first claim on a run succeeds and is folded back", async () => {
+    const clock = fakeClock();
+    const { store } = storeAt(undefined, clock.read);
+    const run = await store.openRun(OPEN_INPUT);
+
+    const result = await store.tryClaimDrive(run.runId, "drive_1", clock.read() + 300_000);
+
+    expect(result).toEqual({ claimed: true, driveId: "drive_1" });
+    expect((await store.read(run.runId))?.driveClaim).toEqual({
+      driveId: "drive_1",
+      expiresAtMs: 1_700_000_300_000,
+    });
+  });
+
+  test("a second, unexpired claim on the same run is refused", async () => {
+    const clock = fakeClock();
+    const { store } = storeAt(undefined, clock.read);
+    const run = await store.openRun(OPEN_INPUT);
+    await store.tryClaimDrive(run.runId, "drive_1", clock.read() + 300_000);
+
+    const second = await store.tryClaimDrive(run.runId, "drive_2", clock.read() + 300_000);
+
+    expect(second).toEqual({ claimed: false, reason: "RUN_ALREADY_DRIVEN" });
+  });
+
+  test("an expired claim is no claim, so a new drive takes over", async () => {
+    const clock = fakeClock();
+    const { store } = storeAt(undefined, clock.read);
+    const run = await store.openRun(OPEN_INPUT);
+    await store.tryClaimDrive(run.runId, "drive_1", clock.read() + 60_000);
+
+    clock.set(clock.read() + 60_001);
+    const second = await store.tryClaimDrive(run.runId, "drive_2", clock.read() + 60_000);
+
+    expect(second).toEqual({ claimed: true, driveId: "drive_2" });
+  });
+
+  test("releasing a claim lets the next drive take it", async () => {
+    const clock = fakeClock();
+    const { store } = storeAt(undefined, clock.read);
+    const run = await store.openRun(OPEN_INPUT);
+    await store.tryClaimDrive(run.runId, "drive_1", clock.read() + 300_000);
+
+    await store.releaseDrive(run.runId, "drive_1");
+
+    expect((await store.read(run.runId))?.driveClaim).toBeNull();
+    expect(await store.tryClaimDrive(run.runId, "drive_2", clock.read() + 300_000)).toEqual({
+      claimed: true,
+      driveId: "drive_2",
+    });
+  });
+
+  test("a release from a different drive does not clear the live claim", async () => {
+    const clock = fakeClock();
+    const { store } = storeAt(undefined, clock.read);
+    const run = await store.openRun(OPEN_INPUT);
+    await store.tryClaimDrive(run.runId, "drive_1", clock.read() + 300_000);
+
+    await store.releaseDrive(run.runId, "drive_other");
+
+    expect((await store.read(run.runId))?.driveClaim).toEqual({
+      driveId: "drive_1",
+      expiresAtMs: 1_700_000_300_000,
+    });
+  });
+
+  test("claiming a run that does not exist refuses with RUN_NOT_FOUND", async () => {
+    const { store } = storeAt();
+
+    const error = await captureStoreError(() => store.tryClaimDrive("arun_missing", "drive_1", 1));
+
+    expect(error.reasonCode).toBe("RUN_NOT_FOUND");
+  });
+
+  test("claiming a terminal run is refused with RUN_ALREADY_TERMINAL", async () => {
+    const { store } = storeAt();
+    const run = await store.openRun(OPEN_INPUT);
+    await store.appendEvent(run.runId, event("run-started", 2, { mode: "agent" }));
+    await store.appendEvent(run.runId, event("run-finished", 3, { status: "succeeded" }));
+
+    const result = await store.tryClaimDrive(run.runId, "drive_1", 4);
+
+    expect(result).toEqual({ claimed: false, reason: "RUN_ALREADY_TERMINAL" });
+  });
+
+  test("two concurrent claims in one process: exactly one wins", async () => {
+    const clock = fakeClock();
+    const { store } = storeAt(undefined, clock.read);
+    const run = await store.openRun(OPEN_INPUT);
+
+    const [a, b] = await Promise.all([
+      store.tryClaimDrive(run.runId, "drive_a", clock.read() + 300_000),
+      store.tryClaimDrive(run.runId, "drive_b", clock.read() + 300_000),
+    ]);
+
+    expect([a, b].filter((result) => result.claimed).length).toBe(1);
+  });
+
+  test("a ledger written before claims existed folds to no claim", async () => {
+    const { store } = storeAt();
+    const run = await store.openRun(OPEN_INPUT);
+    await store.appendEvent(run.runId, event("run-started", 2, { mode: "agent" }));
+
+    expect((await store.read(run.runId))?.driveClaim).toBeNull();
+  });
+
+  test("fifty concurrent claims in one process: exactly one wins", async () => {
+    const clock = fakeClock();
+    const { store } = storeAt(undefined, clock.read);
+    const run = await store.openRun(OPEN_INPUT);
+
+    const results = await Promise.all(
+      Array.from({ length: 50 }, (_, index) =>
+        store.tryClaimDrive(run.runId, `drive_${index}`, clock.read() + 300_000),
+      ),
+    );
+
+    const winners = results.filter((result) => result.claimed);
+    expect(winners).toHaveLength(1);
+    expect(winners[0]?.driveId).toBeTruthy();
   });
 });

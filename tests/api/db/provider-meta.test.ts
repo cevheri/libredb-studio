@@ -30,6 +30,10 @@ const mockGetSession = mock(
 // ─── Mock auth + seed resolution BEFORE importing the route ─────────────────
 mock.module("@/lib/auth", () => ({
   getSession: mockGetSession,
+  readSession: mock(async () => {
+    const s = await mockGetSession();
+    return s ? { kind: "authenticated", session: s } : { kind: "anonymous" };
+  }),
   signJWT: mock(async () => "mock-token"),
   verifyJWT: mock(async () => null),
   login: mock(async () => {}),
@@ -152,6 +156,23 @@ describe("POST /api/db/provider-meta", () => {
     expect(data.labels).toBeDefined();
     expect(data.capabilities.queryLanguage).toBe("sql");
     expect(data.labels.entityName).toBe("Table");
+  });
+
+  // The editor gates Cancel on this flag, and the cancel route refuses by the same check,
+  // so the flag is read off the provider rather than declared by it (#1364).
+  test("reports supportsQueryCancel from whether the provider implements cancelQuery", async () => {
+    const read = async () => {
+      const res = await POST(
+        createMockRequest("/api/db/provider-meta", { method: "POST", body: validConnection }) as never,
+      );
+      return (await parseResponseJSON<{ capabilities: Record<string, unknown> }>(res)).capabilities;
+    };
+
+    expect((await read()).supportsQueryCancel).toBe(false);
+
+    const cancellable = Object.assign(createMockProvider(), { cancelQuery: async () => true });
+    mockCreateDatabaseProvider.mockImplementation(async () => cancellable);
+    expect((await read()).supportsQueryCancel).toBe(true);
   });
 
   test("returns 400 when body is empty", async () => {

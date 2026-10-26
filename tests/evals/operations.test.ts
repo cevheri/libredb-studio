@@ -6,16 +6,17 @@ import { chatToolCallStream } from "../isolated/fixtures/agent-transport";
 import { QueryError } from "@/lib/db/errors";
 
 /**
- * The `operations` template, driven end to end — including on an engine the rest of
- * agent mode is refused on.
+ * The `operations` template, driven end to end, including on an engine outside
+ * `AGENT_EXECUTION_ENGINES`, which the rest of agent mode is refused on.
  *
  * The invariant asserted hardest here is not the arc but the reason the workflow
  * exists: **it reaches a database that offers no read-only statement path, and it
  * sends no statement to get there.** Both halves are checked against what the run
  * actually did, not against what its tools intend — and the MySQL preset carries no
- * `queryReadOnly` at all, exactly as the real provider does not, so a run that sent a
- * statement dies on the fixture rather than being quietly answered by PostgreSQL's
- * default row.
+ * `queryReadOnly` at all, so a run that sent a statement dies on the fixture rather
+ * than being quietly answered by PostgreSQL's default row. The preset stands for an
+ * engine outside `AGENT_EXECUTION_ENGINES`: the real MySQL provider has implemented
+ * `queryReadOnly` since #1629.
  */
 
 const runs: EvalRun[] = [];
@@ -71,7 +72,7 @@ describe("the operations arc, on every engine including one agent mode otherwise
       const drive = await run.drive(operationsArc);
 
       // `context-captured` appears exactly where a catalog can be read (#411): the two
-      // engines `CATALOG_PLANS` serves ground the run before its first turn, and every
+      // engines that supply a `catalogCapture` ground the run before its first turn, and every
       // other engine continues ungrounded rather than failing.
       //
       // Ungrounded is now WRITTEN DOWN rather than left as a hole (B54). The entry the
@@ -232,7 +233,7 @@ describe("an operations run is grounded in the objects its readings will name (#
 
   for (const mode of ["agent", "planning"] as const) {
     test(`mysql: a ${mode} run this server cannot ground is told so, and is not told it has an inventory`, async () => {
-      // `CATALOG_PLANS` serves PostgreSQL and SQLite; since #414 every other dialect
+      // PostgreSQL and SQLite supply a `catalogCapture`; since #414 every other dialect
       // asks its PROVIDER for the same inventory instead of refusing on the dialect.
       // This preset's provider carries only the curated readings — exactly as it did
       // before, and exactly as an engine whose provider cannot describe itself would
@@ -537,7 +538,7 @@ describe("a run that read NOTHING is told what this workflow is scored on", () =
     that reads competently on other surfaces — this is not capacity, it is a run answering
     on turn one because nothing said the answer had to rest on a reading.
 
-    NOT narrowed, and that is load-bearing: `AGENT_NARROWED_EXTRA_TOOLS.operations` is `[]`,
+    NOT narrowed, and that is load-bearing: the operations variant's `narrowedExtras` is `[]`,
     so narrowing here would take `inspect_operations` away — the one tool the sentence asks
     for. The same trap `no-plan-evidence` documents.
   */

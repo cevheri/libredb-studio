@@ -7,6 +7,8 @@
 > architecture, usage, and tests. If you are reading the code, extending Druid support, or authoring
 > a new provider over HTTP, start here.
 
+`DB_HTTP_BLOCK_PRIVATE_HOSTS=true` blocks loopback, private, link-local and other non-public HTTP destinations; it is off by default so local connections work.
+
 | | |
 |---|---|
 | **Status** | Implemented & shipped |
@@ -58,7 +60,7 @@ Three things are Druid-shaped, and nearly every decision below flows from one of
 
 | `DatabaseProvider` slot | Druid realisation | Mechanism |
 |---|---|---|
-| "Table" (`TableSchema`) | A **datasource**, displayed by its bare name | `INFORMATION_SCHEMA.TABLES` where `TABLE_SCHEMA = 'druid'` |
+| "Table" (the relation kind) | A **datasource**, displayed by its bare name | `INFORMATION_SCHEMA.TABLES` where `TABLE_SCHEMA = 'druid'` |
 | "Row" | One result row | One positional array element behind the header rows |
 | Columns | The datasource's column list, SQL types verbatim | `INFORMATION_SCHEMA.COLUMNS` / the query response's header rows |
 | Primary key | none — nothing in a datasource is unique | `isPrimary: false` on every column, `__time` included ([§6](#6-schema-introspection)) |
@@ -124,14 +126,18 @@ the case [`docs/ADDING_A_PROVIDER.md`](../ADDING_A_PROVIDER.md) names ClickHouse
 |---|---|
 | `escapeIdentifier()` | Double-quoted, since `this.type` (`druid`) falls through to the default branch — the same quoting PostgreSQL uses, and correct here: `SELECT "id" FROM "libredb_demo"` parses. Quoting is not optional in generated SQL — see the reserved-word trap in [§5.4](#54-dialect-traps-a-user-will-hit) |
 | `buildLimitClause()` | `LIMIT n` / `LIMIT n OFFSET m`, both accepted by Druid |
-| `getPlaceholder()` | Returns `?`, which is exactly what Druid's positional parameters use ([§3.10](#310-positional-parameters-really-execute)) |
 | `shouldEnableSSL()` | Inherited but **never called**, deliberately. It infers TLS from substrings in the host name, which would silently switch a self-hosted cluster whose hostname merely contains one. TLS here comes from the connection's own `ssl` config only ([§4.3](#43-tls)) |
 | `prepareQuery()` (base) | The shared query limiter; `DruidProvider` calls it first and only overrides the `OFFSET`-with-no-`LIMIT` case |
 | `getLabels()` (base) | Everything but the two entity labels and the slow-query empty state ([§9](#9-capabilities--labels)) |
 
+Not in the list: a placeholder helper. `SQLBaseProvider` no longer has one (#304 removed it).
+Positional `?` still binds via `query(sql, params)`
+([§3.10](#310-positional-parameters-really-execute)).
+
 ### 2.4 Registration & lifecycle
 
-The factory wires Druid in via a dynamic import ([`factory.ts:95`](../../src/lib/db/factory.ts)):
+The factory wires Druid in via a dynamic import inside `createDatabaseProvider()`
+([`factory.ts`](../../src/lib/db/factory.ts)):
 
 ```ts
 case "druid": {
@@ -194,7 +200,7 @@ either:
 ### 3.2 The transport seam: one interface, one implementation
 
 Provider logic never calls `fetch`. It goes through `DruidTransport`
-([transport.ts:156](../../src/lib/db/providers/sql/druid/transport.ts)), so adopting the Avatica
+([`transport.ts`](../../src/lib/db/providers/sql/druid/transport.ts)), so adopting the Avatica
 driver later — or any client that is not this endpoint — is one new file implementing the same
 contract rather than a rewrite of the provider, the introspection and the explain strategy:
 
@@ -210,8 +216,8 @@ There is no second entry point next to `query()`, unlike Couchbase's `manage()`:
 task and storage statistic the provider needs is a `sys.*` table reachable by SQL
 ([§7](#7-monitoring--health)), so a permanent second HTTP surface would buy nothing.
 
-The result type is deliberately **neutral** rather than the wire envelope
-([transport.ts:47](../../src/lib/db/providers/sql/druid/transport.ts)):
+The result type, `DruidQueryResult`, is deliberately **neutral** rather than the wire envelope
+([`transport.ts`](../../src/lib/db/providers/sql/druid/transport.ts)):
 
 ```ts
 interface DruidQueryResult {
@@ -320,9 +326,13 @@ convincing possible lie: a successful query, over the right datasource, that hap
 nothing. Data loss has to surface as an error, which is the same reason the mid-response truncation
 case above raises instead of returning what it managed to read.
 
-Rows are rebuilt from the declared names, and a repeat is **disambiguated rather than overwritten**:
-`SELECT 1 AS c, 2 AS c` reaches the grid as columns `c` and `c (2)`, both with their values. The
-suffix keeps climbing (`c (3)`, …) because `SELECT 1 AS c, 2 AS "c (2)", 3 AS c` is legal too. Without
+Rows are rebuilt from the declared names, and a repeat is **numbered rather than overwritten**:
+`SELECT 1 AS c, 2 AS c` reaches the grid as columns `c` and `c (2)`, both with their values. A
+number never takes a name the statement itself declares, before or after the repeat:
+`SELECT 1 AS a, 2 AS a, 3 AS "a (2)"` reaches the grid as `a`, `a (3)`, `a (2)`, so the user's own
+`a (2)` keeps its value. A header naming a column with an empty string would be shown as
+`(No column name)`. A data row whose value count differs from the header is refused as
+unreadable rather than padded with nulls or cut, the same reasoning as the short header above. Without
 this the array format would have been chosen and then thrown away one step later, since a row is a
 `Record<string, unknown>`.
 
@@ -376,9 +386,10 @@ off by one is worse than an error, because nothing signals it.
 **Druid has no server-side "quote longs" setting.** This is the one place the provider genuinely
 diverges from ClickHouse (#264), which could push the problem to the server with
 `output_format_json_quote_64bit_integers=1`. Here the only place left to fix it is the raw body,
-before it is parsed — so `http-transport.ts` owns `quoteUnsafeIntegers()`
-([http-transport.ts:264](../../src/lib/db/providers/sql/druid/http-transport.ts)), a single-pass,
-**string-aware** scanner that wraps any integer literal outside
+before it is parsed — so `http-transport.ts` runs the body through `quoteUnsafeIntegers()`
+([`json-integers.ts`](../../src/lib/db/utils/json-integers.ts), shared with the Trino provider and
+the native EXPLAIN strategy) before `JSON.parse` sees it: a single-pass, **string-aware** scanner
+that wraps any integer literal outside
 `Number.MIN_SAFE_INTEGER … Number.MAX_SAFE_INTEGER` in quotes. The value then reaches the UI as an
 exact string — the same thing the `pg` driver already does for `int8`, so the grid renders it
 correctly with no further change.
@@ -478,7 +489,7 @@ Four consequences the implementation honours:
    spoken and classified the failure when nothing ever answered.
 
 `DruidTransportError`
-([transport.ts:256](../../src/lib/db/providers/sql/druid/transport.ts)) carries `category`,
+([`transport.ts`](../../src/lib/db/providers/sql/druid/transport.ts)) carries `category`,
 `errorCode`, `persona` and the resolved message, and offers two predicates so no call site spells a
 literal:
 
@@ -529,7 +540,7 @@ SELECT id FROM libredb_demo OFFSET 2 LIMIT 3
 ```
 
 `DruidProvider.prepareQuery()`
-([index.ts:271](../../src/lib/db/providers/sql/druid/index.ts)) asks `analyzeQuery()` — the shared
+([`index.ts`](../../src/lib/db/providers/sql/druid/index.ts)) asks `analyzeQuery()` — the shared
 analyzer, not a regex of its own, because it already reads the end of the statement (so the
 terminating semicolon and any trailing comment are outside what its probes see) and already
 distinguishes an `OFFSET` that follows a `LIMIT` (the ordinary paginated form, which the limiter
@@ -557,7 +568,7 @@ throws on positional ones — Druid takes `?` placeholders with a typed paramete
 -> [["c"],[20]]
 ```
 
-So `query(sql, params)` binds rather than refuses, and `getPlaceholder()` needs no override. The
+So `query(sql, params)` binds rather than refuses. The
 mapping:
 
 | JS value | Druid parameter type | Note |
@@ -613,7 +624,7 @@ it the live cluster disproved, and this is the record of why the code differs.
 
 ### 3.11 The three `false` capabilities are each impossible, not merely unimplemented
 
-- **`supportsCreateTable: false`.** `CREATE TABLE t (id BIGINT)` is not unsupported — it is not in the
+- **No `createTable` declared.** `CREATE TABLE t (id BIGINT)` is not unsupported — it is not in the
   grammar. Live: `400`, *"Incorrect syntax near the keyword 'CREATE' at line 1, column 1."*, and the
   parser then lists what it expected: `"INSERT"`, `"UPSERT"`, `"EXPLAIN"`, `"SET"`, `"RESET"`, … with
   no form of `CREATE` among them. A datasource comes into existence by being ingested into. Per the
@@ -707,14 +718,26 @@ Strategy details:
   only way to show both without pretending one is the parent of the other; a single query is its own
   root.
 
+### 3.13 `endOpenQueryTransaction()` is not implemented, because the engine has no transaction to leave open
+
+The providers that implement `endOpenQueryTransaction()` ([`types.ts`](../../src/lib/db/types.ts)) let `POST /api/db/multi-query` end a transaction a failed script left open on the session the next request borrows; the set is read from the type rather than listed here, because a list repeated across provider docs goes stale the moment it grows.
+This provider does not, and here **the engine has no transaction to leave open**.
+
+Two facts, and neither is an inference from the engine's name.
+Druid SQL through this endpoint cannot write at all - the server refuses INSERT, UPDATE and DELETE itself ([§5.5](#55-druid-sql-cannot-write-and-the-server-says-so-clearly)) - so there is no uncommitted work for a transaction to hold, which is the same reason `supportsTransactions` is `false` ([§9](#9-capabilities--labels)).
+And the transport is one `POST /druid/v2/sql` per statement with no session identifier of any kind ([`http-transport.ts`](../../src/lib/db/providers/sql/druid/http-transport.ts)), so there is no handle between two statements for state to survive on even if the engine had some.
+
+This is a declared boundary, not a default: `endOpenQueryTransaction` is optional on `DatabaseProvider` with no default value, and the route shape-checks for it rather than assuming `"none"`.
+
+
 ---
 
 ## 4. Connection
 
 ### 4.1 Configuration fields
 
-The form offers exactly four fields
-([`db-ui-config.ts:115`](../../src/lib/db-ui-config.ts)): `host`, `port`, `user`, `password`.
+The form offers exactly four fields (`connectionFields` under `CONNECTION_FORM.druid`,
+[`connection-form.ts`](../../src/lib/db/connection-form.ts)): `host`, `port`, `user`, `password`.
 
 | Field | Required | Notes |
 |---|---|---|
@@ -793,13 +816,39 @@ global `fetch` cannot carry a custom CA or relax verification without an undici 
 fails verification; one with a publicly-trusted certificate works. Honouring them needs the
 `node:https` path Couchbase already has, which is a follow-up rather than a limitation of the scheme.
 
+
+### 4.4 Endpoint validation and redirects
+
+`host` and `port` are validated when the transport is constructed, which happens in `connect()`, so
+a bad value fails Test Connection and never a capability read. A host must be a hostname, an IPv4
+address or an IPv6 address (bracketed or not), and a port must be an integer from 1 to 65535.
+Anything else is a `DatabaseConfigError` that names the field and does not repeat the value.
+Every request URL is built by the shared [`endpoint.ts`](../../src/lib/db/http/endpoint.ts) with
+`URL` and `URLSearchParams` and checked against the intended hostname, port and path before it is
+sent, so no value can move a request to another path or another server. A scheme's default port
+(80 for `http`, 443 for `https`) is left out of the URL the way `URL` serializes it.
+
+Redirects are not followed. Every request sets `redirect: "manual"`, and a 3xx answer becomes a
+`ConnectionError` naming the status and only the origin of its `Location`, since a followed
+redirect would take the Basic credential and the statement to wherever the server pointed.
+
+### Connection string
+
+`druid` has no connection string scheme, no `readTls` and no seed load check: every field of its row in `CONNECTION_STRING` is `null` ([`connection-string.ts`](../../src/lib/db/providers/sql/druid/connection-string.ts)).
+Druid is reached over plain HTTP through the form, so inventing `druid://` would put a scheme on the login page that `parseConnectionString` rejects.
+
+### Execution UI
+
+The rolled-back notice names `COMMIT` as the keyword that keeps an open transaction, and `druid` has no consent deadline, so the agent's consent card shows no deadline chip or sentence for it.
+Its row in `EXECUTION_UI` is declared in [`execution-ui.ts`](../../src/lib/db/providers/sql/druid/execution-ui.ts).
+
 ---
 
 ## 5. Query interface
 
 ### 5.1 Execution
 
-`query(sql, params?)` ([index.ts:328](../../src/lib/db/providers/sql/druid/index.ts)) sends one
+`query(sql, params?)` ([`index.ts`](../../src/lib/db/providers/sql/druid/index.ts)) sends one
 statement under both deadlines from [§3.8](#38-both-halves-of-the-timeout), with its `?` parameters
 bound ([§3.10](#310-positional-parameters-really-execute)):
 
@@ -827,12 +876,17 @@ both the reason and the alternative, which is more useful than anything this pro
 
 | Source | `QueryResult` field | Notes |
 |---|---|---|
-| the data rows | `rows` | Rebuilt from the positional arrays, keyed by the disambiguated column names |
-| header row 0 | `fields` | Declared column order, made unique (`c`, `c (2)`); `[]` when the payload carried no header |
+| the data rows | `rows` | Rebuilt from the positional arrays, keyed by the unique column names |
+| header row 0 | `fields` | Declared column order, made unique (`c`, `c (2)`, never a name the payload itself declares); `[]` when the payload carried no header |
 | — | `rowCount` | `rows.length`. There is no second number: no Druid statement mutates, so a mutation count could only ever be zero |
 | the measured exchange | `executionTime` | Rounded milliseconds, **measured by the transport**. The endpoint reports no timing whatsoever, so there is no server-side number this could be preferred over ([§3.2](#32-the-transport-seam-one-interface-one-implementation)) |
-| header row 2 (SQL types) | `columnTypes` | Keyed by the same disambiguated names; **absent** when the payload declared no types. The native types (header row 1) deliberately do not travel — they lie for an expression ([§3.5](#35-the-sql-type-labels-the-column-because-the-native-type-lies)) |
+| header row 2 (SQL types) | `columnTypes` | Keyed by the same unique names; **absent** when the payload declared no types. The native types (header row 1) deliberately do not travel: they lie for an expression ([§3.5](#35-the-sql-type-labels-the-column-because-the-native-type-lies)) |
 | `X-Druid-Response-Context.missingSegments` | `warnings` | One warning naming how many segments were unavailable, and **absent** for a whole answer or an answer that said nothing about availability ([§13](#13-known-limitations--future-work)) |
+
+**`COUNT(DISTINCT ...)` answers an estimate.** Druid documents it as an alias for
+`APPROX_COUNT_DISTINCT` while the query context's `useApproximateCountDistinct` is `true`, its default,
+and the only context key this provider sends is `timeout`. So the Data Profiler's distinct count, which
+is that aggregate, is an estimate on Druid; its null counts, MIN and MAX are exact.
 
 ### 5.3 `ARRAY` cells arrive as JSON strings
 
@@ -866,7 +920,8 @@ SELECT id FROM libredb_demo ORDER BY id LIMIT 2
 Ordering by `__time` works, and ordering *anything* works once there is a `GROUP BY`, because that is
 an aggregation rather than a scan. Sort in the results grid, add a `GROUP BY`, or order by `__time`.
 The provider's own generated SQL is safe by construction: `generateTableQuery` emits
-`SELECT * FROM libredb_demo LIMIT 50;` with **no** `ORDER BY`, and no provider-generated statement may
+`SELECT * FROM "libredb_demo";` with **no** `ORDER BY` — and, since #816, with no row bound either, the
+preview cap having moved into the `limit` execution option. No provider-generated statement may
 ever add one to a scan — ordering by the primary key, the obvious thing for a generator to do, would
 break every datasource browse.
 
@@ -942,21 +997,31 @@ Druid's planner publishes none.
 
 ---
 
+### 5.7 SQL grammar
+
+How this engine's statement text is read is declared once, in [`src/lib/db/providers/sql/druid/sql-grammar.ts`](../../src/lib/db/providers/sql/druid/sql-grammar.ts), the `druid` row of the SQL grammar registry in `src/lib/db/sql-grammar/`.
+Its grammar is `DEFAULT_SQL_GRAMMAR`, the compatibility default, because no rule was established for Druid SQL, not because Druid SQL agrees with the default.
+`readsSqlText` is `true`: the editor text is SQL, and the provider extends `SQLBaseProvider`.
+Redaction is `none`, since the engine has no grammar of its own: a redacted statement is stored as `?`, because a reader guessing where a literal ends can store the literal.
+
 ## 6. Schema introspection
 
-`getSchema()` ([introspect.ts:493](../../src/lib/db/providers/sql/druid/introspect.ts)) makes **two**
-`INFORMATION_SCHEMA` reads in parallel with `Promise.all`, both through the transport seam:
+The object surface ([`objects.ts`](../../src/lib/db/providers/sql/druid/objects.ts)) reads
+`INFORMATION_SCHEMA` through the transport seam: `SCHEMATA` for the containers, `TABLES` for the
+objects in one of them, and `COLUMNS` for one object or for a whole folder at once.
 
 | Data | Source |
 |---|---|
-| Datasources | `INFORMATION_SCHEMA.TABLES` where `TABLE_SCHEMA = 'druid'`, ordered by name |
-| Columns | `INFORMATION_SCHEMA.COLUMNS` where `TABLE_SCHEMA = 'druid'`, ordered by `TABLE_NAME, ORDINAL_POSITION` |
+| Schemas (the one container level) | `INFORMATION_SCHEMA.SCHEMATA`, ordered by name |
+| Datasources, lookups and system tables | `INFORMATION_SCHEMA.TABLES` for the schema asked for |
+| Columns | `INFORMATION_SCHEMA.COLUMNS`, ordered by `TABLE_NAME, ORDINAL_POSITION` |
 | Indexes | always `[]` — Druid has no user-defined indexes |
 | Foreign keys | always `[]` — Druid has no foreign keys anywhere |
 
-**Only the `druid` schema is listed.** The same catalog also carries the four `INFORMATION_SCHEMA`
-views and the six `sys` tables as `TABLE_TYPE = 'SYSTEM_TABLE'`, and a cluster with lookups or views
-carries rows under a `lookup` / `view` schema besides. Live, on the fixture cluster:
+**Every schema is listed, which is a change.** The flat schema reading this replaced filtered to
+`TABLE_SCHEMA = 'druid'` and nothing else reached the sidebar. `INFORMATION_SCHEMA.SCHEMATA` reports
+five schemas on a bare cluster — `INFORMATION_SCHEMA`, `druid`, `lookup`, `sys` and `view` — and the
+container list is now that answer rather than one hardcoded name. Live, on the fixture cluster:
 
 ```
 ["INFORMATION_SCHEMA","COLUMNS","SYSTEM_TABLE","NO","NO"]      ... 4 rows
@@ -965,11 +1030,13 @@ carries rows under a `lookup` / `view` schema besides. Live, on the fixture clus
 ["sys","segments","SYSTEM_TABLE","NO","NO"]                    ... 6 rows
 ```
 
-The schema predicate is the entire mechanism that keeps all of that out of the sidebar. Everything
-excluded stays **queryable by typing SQL** — the monitoring panels read `sys` themselves — so nothing
-is lost, only unlisted.
+So a **lookup** and a **system table** are now browsable objects, each under the schema that holds
+it, and a run's grounding sees them too: a model asked about a lookup used to be told the database
+holds nothing by that name. Nothing became queryable that was not queryable before — all of it
+always answered `SELECT` by typing SQL, and the monitoring panels have always read `sys` — the
+change is that it is listed rather than hidden.
 
-**`TableSchema.name` is the bare datasource name.** `druid` is the default schema, so
+**`DatabaseObject.name` is the bare datasource name.** `druid` is the default schema, so
 `SELECT * FROM "libredb_demo"` resolves without qualification. No prefix is added and none is needed.
 
 **No column is primary — `__time` included.** It is mandatory in every datasource, it is the
@@ -1050,13 +1117,318 @@ found"* and disappears from the schema tree, suspect availability before suspect
 segments. Nothing in this provider can improve the message — Druid owns both the classification and
 the wording — so this paragraph is the mitigation.
 
-`getSchemaList()` and `getSchemaRelations()` are deliberately **not implemented**. Both are optional
-and the client falls back to `getSchema()`; the split exists so a slow relationship read cannot block
-the table list, and Druid has neither half of that problem — a list would be byte-identical to
-`getSchema()`, and a relations read would spend a round trip to answer two empty arrays per
-datasource.
+The two-phase flat schema split no longer exists anywhere (#789). It existed so a slow relationship
+read could not block the table list, and Druid had neither half of that problem: a list would have been
+byte-identical to the object surface, and a relations read would have spent a round trip to answer two
+empty arrays per datasource.
 
 ---
+
+### 6.1 The object surface (#789)
+
+The object surface answers a lazy,
+container-aware, kind-tagged tree through four methods, and it lives in
+[`objects.ts`](../../src/lib/db/providers/sql/druid/objects.ts) rather than in the provider class:
+the statements and every derivation over the declaration are there, the connection check and the
+error mapping stay on the class.
+
+Everything below was measured on **Apache Druid 37.0.0**, the build `database-compose.yml` pins,
+against the fixture in [`docker/druid-init/`](../../docker/druid-init/) (see
+[§11.5](#115-the-object-surface-fixture)).
+
+#### The declaration
+
+One container level, and there is no second one to add: `INFORMATION_SCHEMA.SCHEMATA` reports exactly
+one catalog, always `druid`, so a catalog level would be a folder with one child forever. The level's
+structural `id` is `schema`, and here the engine's own word is Schema too.
+
+| Kind | Role | Catalog |
+|---|---|---|
+| `datasource` | `relation` | `INFORMATION_SCHEMA.TABLES`, the DEFAULT arm |
+| `lookup` | `config` | `INFORMATION_SCHEMA.TABLES`, `TABLE_SCHEMA = 'lookup'` |
+| `system_table` | `relation` | `INFORMATION_SCHEMA.TABLES`, `TABLE_TYPE = 'SYSTEM_TABLE'` |
+
+**Five kinds are absent rather than declared and zero, and that is the point of this engine.** Druid
+has no view, no materialized view, no user-defined function, no stored procedure and no trigger, so
+the tree draws no folder for any of them and a user is told the truth instead of being shown five
+empty folders. It is not an omission we are choosing to make: `CREATE` in **any** form is a syntax
+error, and the parser answers by listing every statement it expected, with no form of `CREATE` among
+them.
+
+```
+$ CREATE VIEW v AS SELECT 1
+Incorrect syntax near the keyword 'CREATE' at line 1, column 1.
+Was expecting one of:
+    "INSERT" ... "UPSERT" ... "EXPLAIN" ... "SET" ... "RESET" ... "ALTER" ... "WITH" ...
+    "SELECT" ... "VALUES" ... "VALUE" ... "TABLE" ...
+```
+
+`INFORMATION_SCHEMA.ROUTINES` exists and holds **228 rows**, every one of them `ROUTINE_TYPE =
+'FUNCTION'` and every one of them built in (`COUNT`, `PERCENT_RANK`, `EARLIEST_BY`, ...). With no
+`CREATE FUNCTION` to add to it, a `function` kind here would be a folder holding the engine's own
+operator reference manual rather than anything a person made, so the routine catalog is deliberately
+not read.
+
+No kind declares `acceptsRowWrites`: Druid SQL has no row-level DML at all, which is the same
+measurement behind `supportsInlineRowEdit: false` ([§3.11](#311-the-three-false-capabilities-are-each-impossible-not-merely-unimplemented)).
+
+#### A lookup IS in SQL, and the plan behind #789 said it was not
+
+The plan for this work stated that lookups are not in SQL at all and would have to come from the
+Coordinator's REST API. Measured, that is false, and it is the difference between one transport and
+two. A lookup the Broker has **loaded** is an ordinary row of the catalog:
+
+```
+$ SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, IS_JOINABLE, IS_BROADCAST
+    FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'lookup'
+{"TABLE_SCHEMA":"lookup","TABLE_NAME":"libredb_country_names","TABLE_TYPE":"TABLE",
+ "IS_JOINABLE":"YES","IS_BROADCAST":"YES"}
+
+$ SELECT * FROM lookup.libredb_country_names
+{"k":"TR","v":"Turkey"} ...
+```
+
+So the Coordinator API is how a lookup is **registered**, not how it is read, and the object surface
+speaks nothing but SQL over the existing transport seam. One caveat, and it is a real one: a lookup
+that is registered and **not yet loaded** has no row anywhere in SQL, so this surface shows what is
+queryable and nothing else. That is the honest half of the pair - the tree cannot offer to describe
+an object no query could reach.
+
+#### The kind expression is total, and the schema is what separates a lookup from a datasource
+
+A lookup and a datasource **both** carry `TABLE_TYPE = 'TABLE'`, so the type alone cannot tell them
+apart and the schema is what does. The expression is one `CASE`, and its last arm has no predicate:
+
+```sql
+CASE WHEN TABLE_TYPE = 'SYSTEM_TABLE' THEN 'system_table'
+     WHEN TABLE_SCHEMA = 'lookup'     THEN 'lookup'
+     ELSE 'datasource' END
+```
+
+Totality is standing ruling 5a written as code: every row of `INFORMATION_SCHEMA.TABLES` lands in
+exactly one declared kind, so a `TABLE_TYPE` a later build introduces still reaches the tree as a
+datasource. An inclusion list of known types would drop it out of the count **and** the listing at
+once, which keeps the badge agreeing with its own folder while the object cannot be reached at all -
+the worst shape of absence there is. The vocabulary itself comes from the engine: Druid publishes
+Calcite's `Schema.TableType` names here, and the fixture was built to hold both of the two this
+build produces.
+
+#### Why `system_table` is a kind
+
+`sys` holds six tables and `INFORMATION_SCHEMA` holds four, and `TABLE_TYPE = 'SYSTEM_TABLE'` is the
+engine's own word for them. Without the kind, both of those containers would open onto nothing at
+all while `sys.segments` is right there to be selected from. the object surface's sidebar deliberately
+filters them out ([§6](#6-schema-introspection)); the object tree does not need to, because a tree
+addresses by container and the two system schemas are containers of their own.
+
+#### The containers are READ, not hardcoded
+
+`INFORMATION_SCHEMA.SCHEMATA` reports **five** schemas on a bare cluster, not the three a person
+would name:
+
+```
+INFORMATION_SCHEMA, druid, lookup, sys, view
+```
+
+`view` is a real schema that this build can hold nothing in, and it is listed anyway: a container
+holding nothing is a true statement about the cluster, while a container we withheld is not. Reading
+the list is also what keeps this right on a cluster whose extensions publish a schema this code has
+never heard of. `isSessionDefault` is `druid`, which is a fact rather than a guess - a Druid
+connection carries no schema to choose, and there is no `CURRENT_SCHEMA` to ask instead (measured:
+*"Column 'CURRENT_SCHEMA' not found in any table"*).
+
+#### One subquery, so the count and the listing cannot drift
+
+`countObjects` GROUPs exactly the text `listObjects` FILTERs, so standing ruling 5f holds by
+construction rather than by two statements agreeing: there is no second `WHERE` clause for the two to
+disagree in. Every declared kind is seeded `{count: 0}` before the rows are applied, so a
+declared-and-empty folder still badges - which on this engine is the ordinary case, since the `druid`
+schema holds no lookup and the `lookup` schema holds nothing else.
+
+A refused read is **never** zero. A `druid-basic-security` cluster answers `FORBIDDEN` for a schema a
+role may not see, and `countObjects` then carries Druid's own sentence in `{unavailable}` for every
+declared kind, unprefixed: the reason a folder has no number is rendered to a person, so our words do
+not go in front of the server's.
+
+#### Escaping: doubling the quote, and NOTHING else
+
+A backslash is an ordinary character inside a Druid string literal, unlike ClickHouse where it
+escapes:
+
+```
+$ SELECT LENGTH('a\b')   -> 3
+$ SELECT LENGTH('a\\b')  -> 4
+$ SELECT LENGTH('a''b')   -> 3
+```
+
+So `druidLiteral()` doubles the quote and leaves everything else alone. Copying ClickHouse's helper
+here would be actively wrong: a datasource really can be called `libredb_back\slash` (it ingests, and
+the fixture holds it), and `TABLE_NAME = 'libredb_back\\slash'` matches **nothing** on this cluster.
+The tree would draw that object and then fail to describe it. The fixture holds `libredb_o'brien` for
+the other half of the rule.
+
+#### `describeObject`
+
+One statement, `INFORMATION_SCHEMA.COLUMNS`, answers for all three kinds - a datasource's dimensions
+and metrics, a lookup's `k` and `v`, and a system table's own columns - so there is no per-kind
+branch and no kind that answers three empty arrays. The rows go through the same `readColumn()` that
+the object surface uses, which is what keeps the detail panel and the sidebar from ever describing one
+datasource two different ways: the type fallback, the nullable reading, and `isPrimary: false` for
+every column including `__time`, are all stated once (§6 above).
+
+`indexes` and `foreignKeys` are always `[]`, by construction rather than by omission, for the same
+two reasons the object surface gives. Zero columns **raises**: every object of every declared kind has at
+least one column, so an empty answer means the object is not there under that name in this schema.
+
+All three kinds declare `hasColumns`, so every object row in the tree expands and there is no kind
+here whose `describeObject` answers `columns: []` (#789). That makes Druid one of the engines
+whose conformance expectation must set `noAbstainingKinds`: the invariant's negative direction, which
+asserts that a kind declaring nothing answers no column, iterates zero times on this provider, and the
+positive direction is the only one carrying it. `lookup` is the case worth naming: it is
+`role: "config"` and it answers `k` and `v`, which is why the twisty is decided by the declaration and
+never by the role.
+
+`DatabaseObject` carries no `rowCount` and no `sizeBytes` here. Both would have to come from
+`sys.segments`, and nothing in this surface reads `sys` on purpose: a cluster running
+`druid-basic-security` grants the `sys` schema separately from the catalogs, so a row count taken
+from it would make the whole object tree fail on a cluster that merely declines to describe its
+segments. The per-datasource numbers stay on the Tables panel, which is allowed to lose one panel.
+
+#### `describeObjects()` describes a whole folder in ONE statement (#789)
+
+`describeObjects(container, kind, limit?)` answers the columns of EVERY object of one kind in one
+schema, in **one round trip** rather than one per object.
+Measured on the live 37.0.0 cluster: **23 ms for one `describeObjects(["druid"], "datasource")`
+against 90 ms for four `describeObject()` calls**, the same thirteen columns.
+
+The statement is the LISTING's own target with the column catalog joined onto it:
+
+```sql
+SELECT t."objectName" AS "tableName", c.COLUMN_NAME AS "columnName",
+       c.DATA_TYPE AS "dataType", c.IS_NULLABLE AS "isNullable"
+FROM (<the listing statement, plus LIMIT n+1 when the caller bounds it>) t
+LEFT JOIN INFORMATION_SCHEMA.COLUMNS c
+  ON c.TABLE_SCHEMA = '<schema>' AND c.TABLE_NAME = t."objectName"
+ORDER BY t."objectName", c.ORDINAL_POSITION
+```
+
+Five decisions, each measured on Apache Druid 37.0.0 rather than reasoned about.
+
+1. **The catalog is the same one the single read uses**, `INFORMATION_SCHEMA.COLUMNS`, and the same
+   `readColumn()` maps a row for both: one mapper, so the batch cannot spell a column's type
+   differently from the single read of the same datasource. It is also the catalog the object surface
+   reads, unlike most engines in this epic - the difference there is SCOPE, not source:
+   the object surface is pinned to `TABLE_SCHEMA = 'druid'` (`DATASOURCE_SCHEMA_FILTER`), so it cannot
+   see a lookup or a system table at all, and the bulk read answers for every schema the cluster
+   publishes.
+2. **No kind answers an empty batch without a round trip**, which is what makes Druid unlike providers
+   such as PostgreSQL, MySQL and Cassandra: `INFORMATION_SCHEMA.COLUMNS` answers for a datasource, for a
+   lookup's `k` and `v` and for a `sys` table alike, measured, so the columnless-kind guard the reference
+   implementation writes has nothing to guard here and is deliberately absent rather than written
+   as an unreachable branch.
+3. **The bound is `LIMIT n+1` INSIDE the target**, interpolated rather than bound: this transport
+   sends a statement as text and has no parameter channel, so the positive-whole-number guard
+   protects the STATEMENT as well as the answer. `ORDER BY` and `LIMIT` were both measured accepted
+   inside a subquery, and the `LIMIT` belongs in the target rather than on the joined rows, where it
+   would cut columns instead of objects. The extra object is dropped in TypeScript and `truncated`
+   carries the CALLER's limit with `callerBoundTruncationReason()`'s shared sentence.
+4. **The cut is ordered by `"objectName"` under the cluster's own String comparison**, which is the
+   UTF-8 byte order: `SELECT U&'\+00e000' < U&'\+01f600'` is **true** on 37.0.0, while a JavaScript
+   sort compares UTF-16 code units and reverses that pair. So the cross-cutting finding recorded for
+   SQLite, libSQL, ClickHouse and Trino **holds here too**: a bounded read's MEMBERSHIP is the
+   cluster's and the ORDER of the answer is ours, re-sorted by `comparePaths`.
+5. **No kind has mixed path depth.** No Druid kind declares `attachedTo` and every object is
+   `[schema, name]`, built by the same `objectPath()` the listing uses.
+
+The join is a **LEFT** one and that is the membership rule rather than a style choice: the set of
+objects is what the TARGET read answered, so an object whose column read returns nothing is still in
+the batch with an empty column list. Druid says that cannot happen - every object has at least one
+column, which is why the single read raises on zero - but a bulk read whose membership came from the
+COLUMN catalog would lose an object the folder lists the moment one did.
+
+**The contract this provider satisfies directly rather than through the shared helper:** the batch
+describes every object `listObjects` names for that container and kind, and an unbounded call leaves
+`truncated` absent. Verified live for all five container-and-kind pairs the fixture holds
+(`druid/datasource` 4, `lookup/lookup` 2, `sys/system_table` 6, `INFORMATION_SCHEMA/system_table` 4,
+`view/datasource` 0), each batch compared set-for-set against `listObjects` and object-for-object
+against `describeObject`.
+
+#### Neither derivation is positional
+
+The schema comes from the segment the **declaration** assigns to the `schema` level, the object's own
+name from the last segment, and the expected depth from `containerDepth()`. None of those is a
+literal index, and the provider's own suite pins all three by swapping a **two-level** declaration in
+through `spyOn` and driving the reads to a bound value - with a catalog segment deliberately spelled
+something other than `druid`, because Druid's catalog and its main schema share that name and a test
+written with the engine's own names would certify the defect it exists to catch.
+
+#### Object source (#789): nothing to read, and three different reasons
+
+Druid contributes **no Source tab and no `unavailable` sentence**, and that is a different answer
+from "the read was refused". No kind declares `hasSource`, the provider implements no
+`readObjectSource`, and `assertObjectSurface` certifies that pairing directly: a declaration with no
+method behind it, or a method with no declaration in front of it, fails the suite by name. The
+provider's own suite pins the same absence from the other side, kind by kind and through
+`kindHasSource()`, which is the derivation the route and the row menu read.
+
+The three kinds are absent from the source surface for **three different reasons**, and collapsing
+them into one "Druid has no source" sentence would lose the only one of them that is work somebody
+could do:
+
+| Kind | Why there is no source read | Which fact it is |
+|---|---|---|
+| `datasource` | the engine publishes no definition text for it, anywhere | the engine has no such text at all |
+| `system_table` | the engine publishes no definition text for it, anywhere | the engine has no such text at all |
+| `lookup` | it HAS a JSON definition, and it lives on a REST API this provider's transport cannot address | it exists somewhere this product does not reach, and it is filed |
+
+**`datasource` and `system_table`: there is no text, so there is nothing to refuse.** This is the
+same measurement the declaration rests on, one level down. `CREATE` in any form is a syntax error and
+the parser answers by enumerating every statement it expected, with no form of `CREATE` among them
+(the refusal is quoted in full under [the declaration](#the-declaration) above). A datasource comes
+into existence by ingestion, and a system table is compiled into the Broker; neither was ever written
+down as a statement, so there is no stored text, no regenerable statement and nothing to render. A
+refusal part would be worse than the absence, because a refusal sentence tells a user the read failed
+when in truth there was never anything to read.
+
+**`lookup`: the definition exists and this transport cannot address it.** A lookup is the one kind
+here that a person really does author, as a JSON spec, and four separate facts make reading it a
+transport change rather than a source read:
+
+- **Where the definition is.** A lookup is registered by posting its spec to the Coordinator, and
+  `GET /druid/coordinator/v1/lookups/config/{tier}/{id}` answers that spec back. DOCUMENTED against
+  the Druid 37.0.0 API reference and **not** measured against a cluster here, which is exactly why
+  the first step of the filed work is to measure it.
+- **What SQL answers instead, and why it is not the definition.** Measured on 37.0.0:
+  `SELECT * FROM lookup.<name>` returns the key and value PAIRS, and `INFORMATION_SCHEMA.COLUMNS`
+  describes them as `k` and `v`. Those pairs are the lookup's CONTENT. The spec's type (`map` versus
+  `cachedNamespace`), its polling period and the namespace it extracts from appear nowhere in SQL, so
+  rendering the pairs under a caption that says "definition" would show a user something that is not
+  the definition, which is the failure the `rendered` origin exists to prevent.
+- **Why it is the transport that would have to change.**
+  [`transport.ts`](../../src/lib/db/providers/sql/druid/transport.ts) publishes exactly two members,
+  `query(sql, opts)` and `close()`, and `query` takes a SQL string: there is no member that can
+  address any other path on the cluster. Nor can provider logic reach around it, because
+  [`tests/unit/db/druid/seam-guard.test.ts`](../../tests/unit/db/druid/seam-guard.test.ts) parses
+  every file in the provider directory and **fails the build** when a bare `fetch` or an endpoint
+  path appears outside [`http-transport.ts`](../../src/lib/db/providers/sql/druid/http-transport.ts).
+  So the smallest honest version of this read is a new seam member plus its one implementation, which
+  is a change to the contract every other read in this provider shares.
+- **And the connection may not reach the Coordinator at all.** The connection carries one host and
+  one port ([§3.3](#33-router-8888-or-broker-8082--both-work-identically)). A Broker-only deployment
+  serves the SQL endpoint and no Coordinator API whatsoever, and a Router serves it only when
+  `druid.router.managementProxy.enabled` is set, which `database-compose.yml` does set for this
+  repository's own cluster and a production deployment need not. So the read would have to be able to
+  come back empty-handed for a reason that is about the deployment rather than about the object,
+  which is a refusal sentence this provider does not have today.
+
+That last one is the reason `lookup` is a **deferral and not an absence**, and it is filed in
+[`docs/BACKLOG.md`](../BACKLOG.md) with this measurement rather than only here.
+
+#### Object edit (#789): nothing to write, for the same reason there is nothing to read
+
+This engine is the simplest absence in the fleet: it declares no source-bearing kind at all, so there is no definition text for a reader to edit and no plan for a provider to build.
+The three reasons are the ones in the section above, and none of them changes for a write path.
+No kind here declares `acceptsSourceEdits`, and `tests/isolated/object-edit-declarations.test.ts` is what holds that absence and this section together: it asserts the absence over EVERY kind this provider declares, not only over the ones that would carry a definition.
 
 ## 7. Monitoring & health
 
@@ -1067,14 +1439,14 @@ becomes a message the user sees.
 
 | Method | Source | Mapping |
 |---|---|---|
-| `getOverview()` ([introspect.ts:524](../../src/lib/db/providers/sql/druid/introspect.ts)) | `sys.servers`, `sys.segments`, `INFORMATION_SCHEMA.TABLES`, `sys.tasks` — **four separate reads** | `version` and `startTime` from the Coordinator's `sys.servers` row (Broker as fallback); `uptime` from `CURRENT_TIMESTAMP - start_time`; `databaseSizeBytes` = `SUM(size)` over active segments; `tableCount` = datasource count; `activeConnections` = count of `RUNNING` tasks; `maxConnections` = **0**; `indexCount` = **0** |
+| `getOverview()` ([`introspect.ts`](../../src/lib/db/providers/sql/druid/introspect.ts)) | `sys.servers`, `sys.segments`, `INFORMATION_SCHEMA.TABLES`, `sys.tasks` — **four separate reads** | `version` and `startTime` from the Coordinator's `sys.servers` row (Broker as fallback); `uptime` from `CURRENT_TIMESTAMP - start_time`; `databaseSizeBytes` = `SUM(size)` over active segments; `tableCount` = datasource count; `activeConnections` = count of `RUNNING` tasks; `maxConnections` = **0**; `indexCount` = **0** |
 | `getPerformanceMetrics()` | — | **Zeroed, and sends no statement.** Druid's cache, query and ingestion metrics all reach a metrics *emitter* (statsd, Kafka, an HTTP endpoint, the log) and none reaches a SQL-readable table |
 | `getSlowQueries()` | — | **`[]`**, and sends no statement. Druid keeps no query log at all |
-| `getActiveSessions()` ([introspect.ts:609](../../src/lib/db/providers/sql/druid/introspect.ts)) | `sys.tasks` where `status IN ('RUNNING','PENDING')`, newest first | **Ingestion tasks, not query sessions** — see below |
-| `getTableStats()` ([introspect.ts:649](../../src/lib/db/providers/sql/druid/introspect.ts)) | `sys.segments` where `is_active = 1`, grouped by `datasource` | `rowCount` = `SUM(num_rows)`; `tableSizeBytes` and `totalSizeBytes` both = `SUM(size)`; `schemaName` = `"druid"`. A `{ schema }` filter naming anything but `druid` returns `[]` without a round trip |
+| `getActiveSessions()` ([`introspect.ts`](../../src/lib/db/providers/sql/druid/introspect.ts)) | `sys.tasks` where `status IN ('RUNNING','PENDING')`, newest first | **Ingestion tasks, not query sessions** — see below |
+| `getTableStats()` ([`introspect.ts`](../../src/lib/db/providers/sql/druid/introspect.ts)) | `sys.segments` where `is_active = 1`, grouped by `datasource` | `rowCount` = `SUM(num_rows)`; `tableSizeBytes` and `totalSizeBytes` both = `SUM(size)`; `schemaName` = `"druid"`. A `{ schema }` filter naming anything but `druid` returns `[]` without a round trip |
 | `getIndexStats()` | — | **`[]`**, and sends no statement. No index objects exist |
-| `getStorageStats()` ([introspect.ts:678](../../src/lib/db/providers/sql/druid/introspect.ts)) | `sys.servers` where `server_type = 'historical'` | one row per historical: `name` = `server`, `location` = `host`, `sizeBytes` = `curr_size`, `usagePercent` = `curr_size / max_size` |
-| `getHealth()` ([introspect.ts:700](../../src/lib/db/providers/sql/druid/introspect.ts)) | the above, composed | `activeConnections`, `databaseSize`, up to 10 sessions; `cacheHitRatio` = **`"N/A"`**; `slowQueries` = `[]` |
+| `getStorageStats()` ([`introspect.ts`](../../src/lib/db/providers/sql/druid/introspect.ts)) | `sys.servers` where `server_type = 'historical'` | one row per historical: `name` = `server`, `location` = `host`, `sizeBytes` = `curr_size`, `usagePercent` = `curr_size / max_size` |
+| `getHealth()` ([`introspect.ts`](../../src/lib/db/providers/sql/druid/introspect.ts)) | the above, composed | `activeConnections`, `databaseSize`, up to 10 sessions; `cacheHitRatio` = **`"N/A"`**; `slowQueries` = `[]` |
 
 **The Active Sessions panel shows ingestion TASKS, and this is deliberate.** Druid has **no query
 sessions** — no `sys.queries`, no connection catalog, nothing that describes a client. Its tasks are
@@ -1210,7 +1582,13 @@ Global Operations group where `supportsMaintenance` is `false`, each individual 
 resolved. So for Druid no maintenance control renders in either place — the statement above now
 describes the software rather than the intent.
 
-`runMaintenance(type)` ([index.ts:471](../../src/lib/db/providers/sql/druid/index.ts)) exists because
+**The session lists' Terminate button followed later (issue #1424).** Monitoring > Sessions and
+Admin > Operations > Sessions drew it on every row without reading `maintenanceOperations`, so a
+running ingestion task was offered it, and confirming answered `HTTP 400 {"error":"Maintenance
+operations not supported for this database"}` while the task kept running. Both lists now draw it
+only where `kill` is declared, so it does not render for Druid either.
+
+`runMaintenance(type)` ([`index.ts`](../../src/lib/db/providers/sql/druid/index.ts)) exists because
 the `DatabaseProvider` interface obliges every provider to implement it, and **not** because any
 request reaches it: `/api/db/maintenance`
 ([route.ts](../../src/app/api/db/maintenance/route.ts)) checks `supportsMaintenance` and returns
@@ -1240,7 +1618,7 @@ Both halves of that are real constraints, not scope cuts made lightly:
 
 ## 9. Capabilities & labels
 
-### `getCapabilities()` ([index.ts:151](../../src/lib/db/providers/sql/druid/index.ts))
+### `getCapabilities()` ([`index.ts`](../../src/lib/db/providers/sql/druid/index.ts))
 
 | Capability | Value | Why |
 |---|---|---|
@@ -1248,8 +1626,10 @@ Both halves of that are real constraints, not scope cuts made lightly:
 | `supportsExplain` | `true` | `EXPLAIN PLAN FOR` returns a structured native plan ([§3.12](#312-explain-the-native-plan-is-genuinely-a-tree)) |
 | `explainFormat` | `druid-native` | The strategy id in `src/lib/explain/index.ts` |
 | `supportsExternalQueryLimiting` | `true` | `LIMIT n` / `LIMIT n OFFSET m` are both correct Druid SQL |
-| `supportsCreateTable` | **`false`** | `CREATE` is not in the grammar; a datasource is created by ingestion ([§3.11](#311-the-three-false-capabilities-are-each-impossible-not-merely-unimplemented)) |
+| `createTable` | **absent** | `CREATE` is not in the grammar; a datasource is created by ingestion ([§3.11](#311-the-three-false-capabilities-are-each-impossible-not-merely-unimplemented)) |
 | `supportsInlineRowEdit` | **`false`** | `UPDATE t SET ...` answers `Unsupported SQL statement [UPDATE]`; Druid SQL has no row-level DML ([§5.5](#55-druid-sql-cannot-write-and-the-server-says-so-clearly)) |
+| `supportsTestDataGeneration` | **`false`** | Druid SQL has no `INSERT ... VALUES` for the Generate Test Data dialog to emit, and no kind here declares a row write |
+| `supportsResultPagination` | **`true`** | Druid SQL takes both clauses; the shared limiter emits `LIMIT n OFFSET m` (#816) |
 | `supportsTransactions` | **`false`** | Druid SQL has no DML at all, so there is nothing for a transaction to hold; the trio and SANDBOX are withheld instead of answering HTTP 400 (#464) |
 | `declaresForeignKeys` | **`false`** | Druid has no constraints — no primary key either — and a datasource cannot reference another, so an empty relations list is the engine and not the schema |
 | `supportsMaintenance` | **`false`** | Nothing in `MaintenanceType` is reachable from Druid SQL ([§8](#8-maintenance)) |
@@ -1257,8 +1637,11 @@ Both halves of that are real constraints, not scope cuts made lightly:
 | `supportsConnectionString` | **`false`** | Druid has no URI convention, and `http(s)://` is ClickHouse's ([§4.2](#42-there-is-no-connection-string-and-that-is-deliberate)) |
 | `defaultPort` | `8888` | The Router. `8082` (Broker) is equally valid ([§3.3](#33-router-8888-or-broker-8082--both-work-identically)) |
 | `schemaRefreshPattern` | `\b(INSERT\|REPLACE)\b` | The only statements that could change a datasource — and the native engine rejects both, so in practice a query never refreshes the schema, which is correct |
+| `containerLevels` | one `schema` level | `INFORMATION_SCHEMA.SCHEMATA` reports one catalog, always `druid`, so there is no second level to add ([§6.1](#61-the-object-surface-789)) |
+| `containerPathShapes` | `exact` | Only `[schema]` addresses a container, so a shorter or a longer path is refused, by the object routes over HTTP and by this provider directly (#1147) |
+| `objectKinds` | `datasource`, `lookup`, `system_table` | And five kinds ABSENT rather than declared and zero, because `CREATE` is not in the grammar in any form ([§6.1](#61-the-object-surface-789)) |
 
-### `getLabels()` ([index.ts:194](../../src/lib/db/providers/sql/druid/index.ts))
+### `getLabels()` ([`index.ts`](../../src/lib/db/providers/sql/druid/index.ts))
 
 Three overrides:
 
@@ -1275,13 +1658,26 @@ grid speak a dialect the cluster does not. The maintenance labels are irrelevant
 stay as inherited rather than naming operations that do not exist. `selectAction` ("Select Top 50")
 and the generate action are inherited unchanged and are correct for Druid.
 
+### SQL writing
+
+[`druid/sql-writing.ts`](../../src/lib/db/providers/sql/druid/sql-writing.ts) declares how a generated statement spells a literal, a name and a bind for this engine, and it is this engine's row of `SQL_WRITING` ([`src/lib/db/sql-writing/index.ts`](../../src/lib/db/sql-writing/index.ts)), which the readers in [`src/lib/sql/values.ts`](../../src/lib/sql/values.ts) and [`src/lib/sql/identifier.ts`](../../src/lib/sql/identifier.ts) look up.
+A literal is written by `literalStandard` and read back by `unquoteStandard`: the quote is doubled and a backslash is data.
+A name is quoted by `identifierDoubleQuoted`, the SQL standard form: a double-quoted name with an inner double quote doubled.
+A bind is spelled by `placeholderQuestion`, as `?` at every position.
+Druid quotes a string with single quotes and puts its backslash escapes in the separate `U&'fo\00F6'` form, so a backslash in a plain literal is data.
+Druid binds a `parameters` array against `?`, live-verified when the provider was written ([`index.ts`](../../src/lib/db/providers/sql/druid/index.ts)).
+Inline row editing reads a key column's kind through the shared `INSTANT_TYPE_NAMES`, `FLOAT64_TYPE_NAMES` and `EXACT_DECIMAL_TYPE_NAMES` of the module's `inlineEdit`, and binds every edit as typed.
+
+The module's `export` field writes a result export's CREATE TABLE and INSERT from the shared building blocks alone: `STANDARD_DDL_TYPES` for the column types, `NOTHING_STANDS_ALONE` and `NO_BARE_SPELLING`, so every bare declared name is re-spelled from its family, `NULL_NON_FINITE` for NaN and the infinities, and `binaryStandardHex` for a binary cell (`X'0102'`).
+Druid takes no INSERT at all without the MSQ extension, so every bare name in a file written from it is re-spelled from its family, portably.
+
 ---
 
 ## 10. Error handling
 
 The transport normalizes every failure into `DruidTransportError { message, category, errorCode,
 persona }`; `mapDruidError()`
-([index.ts:358](../../src/lib/db/providers/sql/druid/index.ts)) maps that onto the shared classes from
+([`index.ts`](../../src/lib/db/providers/sql/druid/index.ts)) maps that onto the shared classes from
 [`src/lib/db/errors.ts`](../../src/lib/db/errors.ts) — **keyed on `category`, never on the HTTP
 status**:
 
@@ -1378,9 +1774,9 @@ end through the registry.
 
 ```bash
 # Just this provider
-bun test tests/integration/db/druid-provider.test.ts
-bun test tests/unit/db/druid
-bun test tests/unit/lib/explain/druid-native.test.ts
+bun tests/run-tests.ts tests/integration/db/druid-provider.test.ts
+bun tests/run-tests.ts tests/unit/db/druid
+bun tests/run-tests.ts tests/unit/lib/explain/druid-native.test.ts
 
 # Full isolated suite (CI-equivalent)
 bun run test
@@ -1470,6 +1866,39 @@ details in that payload are load-bearing for reproducing this document's finding
   what a Druid user's aggregating datasource looks like and what the join plan in
   [§3.12](#312-explain-the-native-plan-is-genuinely-a-tree) was captured against.
 
+### 11.5 The object surface fixture
+
+The object surface's fixture is **committed**, not typed into a shell while measuring and then lost
+with the container. It is [`docker/druid-init/`](../../docker/druid-init/), mounted read-only into the
+Router at `/opt/druid-init` by `database-compose.yml`, and it is applied with one command:
+
+```bash
+docker exec libredb-druid-router bash /opt/druid-init/apply.sh
+# or, from the repo, against any cluster:
+DRUID_URL=http://localhost:8888 bash docker/druid-init/apply.sh
+```
+
+**Druid's image has no init-script directory, and there is no DDL a script could run**: a datasource
+comes into existence by being ingested into, and a lookup is registered through the Coordinator's own
+API. So the fixture is four native batch task specs plus a lookup map, and `apply.sh` is what applies
+them. It waits for the Router, submits the tasks, and then waits for two things a naive script would
+miss: for every lookup to report `loaded` on every node, because a registered lookup that the Broker
+has not loaded has no SQL row at all, and for the datasources to appear in SQL, because a task
+reporting `SUCCESS` is a moment earlier than the catalog showing its segments.
+
+| File | What it is for |
+|---|---|
+| `00-lookups.json` | two map lookups, so the `lookup` kind has objects |
+| `01-datasource-orders.json` | six columns over the four SQL types a datasource shows: `TIMESTAMP`, `VARCHAR`, `BIGINT`, `DOUBLE` |
+| `02-datasource-events.json` | a second, smaller datasource, named with a hyphen so the name needs quoting to query |
+| `03-datasource-quoted-name.json` | `libredb_o'brien` - the apostrophe the literal helper must double |
+| `04-datasource-backslash-name.json` | `libredb_back\slash` - the backslash the literal helper must NOT escape |
+
+It is idempotent, and one detail of that is worth knowing before editing it: the lookup version is
+stamped per run as `v<epoch>`, because re-posting a lookup whose version does not sort **above** the
+stored one is refused with HTTP 500 and *"can't replace existing spec"*. The comparison is a string
+compare, so the `v` prefix is load-bearing: a bare epoch sorts below `v1`.
+
 `docker compose -f database-compose.yml --profile druid down -v` resets the cluster to empty — the
 named volumes hold deep storage and task history, so without `-v` a restart keeps both.
 
@@ -1494,7 +1923,8 @@ const rows = await provider.query('SELECT * FROM "libredb_demo" LIMIT 50');
 const one = await provider.query(
   'SELECT COUNT(*) AS "c" FROM "libredb_demo" WHERE region = ?', ['emea'],
 );
-const schema = await provider.getSchema();      // datasources + columns, indexes always []
+const objects = await provider.listObjects(container, 'table');
+const { details } = await provider.describeObjects(container, 'table');
 const tasks  = await provider.getActiveSessions(); // RUNNING/PENDING ingestion tasks
 
 await provider.disconnect();
@@ -1586,6 +2016,18 @@ cancellation as unsupported because the provider exposes no `cancelQuery`
 
 ---
 
+## Migration DDL
+
+[`DRUID_MIGRATION_DDL`](../../src/lib/db/providers/sql/druid/migration-ddl.ts) is what the schema-diff migration generator writes for `druid`, read through `migrationDdlFor` in `src/lib/db/migration-ddl/`.
+It declines the whole diff: `refusal` is the one line the migration prints after its header, in place of any DDL, and `transactionWrapper` is `null`.
+Druid has no transaction concept to translate the wrapper into: a datasource is rewritten by an MSQ task, not by a bracketed statement list (#284).
+
+The refusal reason it prints, verbatim:
+
+- "Druid SQL has no ALTER TABLE; rewrite the datasource with REPLACE INTO through an MSQ task."
+
+---
+
 ## 14. References
 
 - Source: [`src/lib/db/providers/sql/druid/`](../../src/lib/db/providers/sql/druid/)
@@ -1594,7 +2036,7 @@ cancellation as unsupported because the provider exposes no `cancelQuery`
 - Base class: [`src/lib/db/base-provider.ts`](../../src/lib/db/base-provider.ts)
 - Interface & DTOs: [`src/lib/db/types.ts`](../../src/lib/db/types.ts)
 - Errors: [`src/lib/db/errors.ts`](../../src/lib/db/errors.ts)
-- Connection form config: [`src/lib/db-ui-config.ts`](../../src/lib/db-ui-config.ts)
+- Connection form config: [`src/lib/db/connection-form.ts`](../../src/lib/db/connection-form.ts)
 - Local cluster: [`database-compose.yml`](../../database-compose.yml) (`--profile druid`)
 - Tests: [`tests/integration/db/druid-provider.test.ts`](../../tests/integration/db/druid-provider.test.ts) · [`tests/unit/db/druid/`](../../tests/unit/db/druid/) · [`tests/unit/lib/explain/druid-native.test.ts`](../../tests/unit/lib/explain/druid-native.test.ts)
 - API contract: [`docs/API_DOCS.md`](../API_DOCS.md)
@@ -1604,4 +2046,4 @@ cancellation as unsupported because the provider exposes no `cancelQuery`
 - Metadata tables (`INFORMATION_SCHEMA`, `sys`): <https://druid.apache.org/docs/latest/querying/sql-metadata-tables>
 - `EXPLAIN PLAN FOR`: <https://druid.apache.org/docs/latest/querying/sql-translation>
 - Native batch ingestion: <https://druid.apache.org/docs/latest/ingestion/native-batch>
-- Sibling provider docs: [PostgreSQL](./postgres.md) · [MySQL](./mysql.md) · [Oracle](./oracle.md) · [SQL Server](./mssql.md) · [SQLite](./sqlite.md) · [MongoDB](./mongodb.md) · [Couchbase](./couchbase.md) · [ClickHouse](./clickhouse.md) · [Apache Trino](./trino.md) · [Redis](./redis.md) · [LibreDB](./libredb.md)
+- Sibling provider docs: [PostgreSQL](./postgres.md) · [MySQL](./mysql.md) · [Oracle](./oracle.md) · [SQL Server](./mssql.md) · [SQLite](./sqlite.md) · [MongoDB](./mongodb.md) · [Couchbase](./couchbase.md) · [ClickHouse](./clickhouse.md) · [Trino](./trino.md) · [Redis](./redis.md) · [LibreDB](./libredb.md)

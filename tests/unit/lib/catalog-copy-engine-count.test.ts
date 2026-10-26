@@ -1,14 +1,14 @@
 /**
  * The accuracy gate for the engine COUNT in outward-facing catalog copy (#518).
  *
- * Nine files outside `src/` name the engine set by hand, and until this test nothing
+ * Sixteen files outside `src/` name the engine set by hand, and until this test nothing
  * counted them: `scripts/readme-check.mjs` locates the engine table in the three
  * READMEs and `chart:check` pins a version across files, but a storefront listing was
  * only ever corrected by somebody noticing. Measured on the DuckDB registration branch,
- * every one of these nine was a full engine behind two weeks after libSQL shipped
+ * every one of the original nine was a full engine behind two weeks after libSQL shipped
  * (#511), and DuckDB was the second engine in a row to walk into it.
  *
- * The rule is not "every file names every engine" - three of the nine deliberately
+ * The rule is not "every file names every engine" - several of them deliberately
  * abridge, because a numeral there goes stale the day the next engine lands (#445). It
  * is:
  *
@@ -29,14 +29,22 @@ import { EXTERNAL_DATABASE_TYPES } from "@/lib/db/compatibility";
 const REPO_ROOT = join(import.meta.dir, "../../..");
 
 /**
- * The nine files that publish the engine set outward. Each is copy somebody else's
+ * The sixteen files that publish the engine set outward. Each is copy somebody else's
  * catalog renders, so nobody in this repo reads it again once it is submitted.
+ *
+ * `deploy/rancher/app-readme.md` is the one that is not itself the submitted artifact: the
+ * file Rancher renders lives in `rancher/partner-charts` under
+ * `packages/libredb/libredb-studio/overlay/`, out of reach of any test here, and it drifted
+ * six engines behind before anybody looked. This copy is what a submission is cut from, so
+ * the drift fails here first.
  *
  * `from`/`to` cut away editorial matter, and only `CATALOG_LISTING.md` has any: its
  * accuracy-gate blockquote and its outstanding-corrections table exist to NAME stale
  * numerals (including a quote of the count the LIVE listing still publishes), so a
  * count check over the whole file would fail on the note that warns about the count.
- * The same slice is used by `tests/unit/marketplace-copy.test.ts`.
+ * The same slice is used by `tests/unit/marketplace-copy.test.ts`. `packaging/aur/PKGBUILD` is cut to
+ * its `pkgdesc` line, because the rest of the file is build script; its `.SRCINFO` is generated
+ * from it by `makepkg --printsrcinfo` and follows it.
  */
 const COPY_FILES: ReadonlyArray<{ path: string; from?: string; to?: string }> = [
   { path: "packaging/linux/nfpm.yaml" },
@@ -44,10 +52,18 @@ const COPY_FILES: ReadonlyArray<{ path: string; from?: string; to?: string }> = 
   { path: "packaging/chocolatey/libredb-studio.nuspec.tmpl" },
   { path: "desktop/src-tauri/tauri.conf.json" },
   { path: "deploy/caprover/libredb-studio.yml" },
+  { path: "deploy/caprover/libredb-studio-autoconnect.yml" },
   { path: "deploy/railway/template.json" },
   { path: "deploy/azure/listing/listing-fields.md" },
   { path: "deploy/azure/listing/description.html" },
+  { path: "deploy/aws/listing/listing-fields.md" },
+  { path: "deploy/aws/listing/description.md" },
   { path: "deploy/rancher/CATALOG_LISTING.md", from: "## Short description", to: "## Outstanding corrections" },
+  { path: "deploy/rancher/app-readme.md" },
+  { path: "deploy/rancher/pcsc-listing.html" },
+  { path: "packaging/aur/PKGBUILD", from: "pkgdesc=", to: "\narch=" },
+  { path: "deploy/digitalocean/assets/description-long.md" },
+  { path: "portainer-template.json" },
 ];
 
 const NUMERAL_WORDS: Record<string, number> = {
@@ -71,6 +87,36 @@ const NUMERAL_WORDS: Record<string, number> = {
   eighteen: 18,
   nineteen: 19,
   twenty: 20,
+  "twenty-one": 21,
+  "twenty-two": 22,
+  "twenty-three": 23,
+  "twenty-four": 24,
+  "twenty-five": 25,
+  "twenty-six": 26,
+  "twenty-seven": 27,
+  "twenty-eight": 28,
+  "twenty-nine": 29,
+  thirty: 30,
+  "thirty-one": 31,
+  "thirty-two": 32,
+  "thirty-three": 33,
+  "thirty-four": 34,
+  "thirty-five": 35,
+  // Two past the registry, which is what the test below asks for: a copy that states the count in
+  // words has to fail loudly on the next two providers rather than pass unread.
+  "thirty-six": 36,
+  "thirty-seven": 37,
+  // Two past the registry, which the test at the foot of this file holds: 39 external engines once
+  // Sparkplug B (#1720) joined MTConnect (#1722) and Modbus (#1723), so the map reaches 41 and the
+  // next two providers get a failing test rather than a numeral nothing reads. The headroom is what
+  // makes the gate work: the pattern the scan builds comes from THIS MAP's keys, so a word the map
+  // does not know never matches and is passed over in silence.
+  "thirty-eight": 38,
+  "thirty-nine": 39,
+  forty: 40,
+  "forty-one": 41,
+  "forty-two": 42,
+  "forty-three": 43,
 };
 
 /**
@@ -83,13 +129,23 @@ const ENGINE_COUNT_RE = new RegExp(
   "gi",
 );
 
+/**
+ * The relative form, "PostgreSQL, MySQL, MongoDB, Redis and N more engines": the claim is
+ * the engines named in front of it plus N. The form above never reads it, because "more"
+ * stands between the numeral and the noun, and the DigitalOcean listing kept "fifteen
+ * more" for a release after the twentieth engine landed.
+ */
+const RELATIVE_ENGINE_COUNT_RE = new RegExp(
+  `\\b(\\d{1,3}|${Object.keys(NUMERAL_WORDS).join("|")})\\s+more\\s+(?:database\\s+)?engines\\b`,
+  "gi",
+);
+
 /** A list that says so is checked on its numeral only (#445). */
 const ABRIDGED_RE = /\band more\b|\bamong them\b|\bfrom\b[^.]*?\bto\b/i;
 
 /**
  * The name each engine is searched for. Taken from the `DB_UI_CONFIG` label with a
- * leading "Apache " dropped, because the copy is inconsistent about it in both
- * directions - the label says "Trino" where the listings say "Apache Trino", and says
+ * leading "Apache " dropped, because the copy is inconsistent about it - the label says
  * "Apache Druid" where one listing says "Druid" - and because the bare product name is
  * what survives every spelling a listing uses for a family ("MySQL/MariaDB/TiDB",
  * "Microsoft SQL Server", "libSQL/Turso").
@@ -131,6 +187,16 @@ function withoutMarkup(text: string): string {
   return stripped;
 }
 
+/** The sentence (or bullet, or block) up to `offset`: what a relative numeral adds to. */
+function leadSegment(text: string, offset: number): string {
+  const before = text.slice(0, offset);
+  let start = 0;
+  for (const end of before.matchAll(new RegExp(SEGMENT_END_RE.source, "g"))) {
+    start = (end.index ?? 0) + end[0].length;
+  }
+  return before.slice(start);
+}
+
 function listSegment(text: string, offset: number): string {
   const rest = text.slice(offset);
   const end = SEGMENT_END_RE.exec(rest);
@@ -159,6 +225,16 @@ function engineCountProblems(text: string, label: string): string[] {
     if (named.length !== expected) {
       const missing = ENGINE_NAMES.filter(({ name }) => !segment.includes(name)).map(({ type }) => type);
       problems.push(`${label}: the list after "${match[0]}" names ${named.length}, missing ${missing.join(", ")}`);
+    }
+  }
+
+  for (const match of text.matchAll(RELATIVE_ENGINE_COUNT_RE)) {
+    const written = match[1].toLowerCase();
+    const more = NUMERAL_WORDS[written] ?? Number(written);
+    const lead = leadSegment(text, match.index ?? 0);
+    const named = ENGINE_NAMES.filter(({ name }) => lead.includes(name)).length;
+    if (named + more !== expected) {
+      problems.push(`${label}: "${named} named and ${match[0]}" publishes ${named + more}, and there are ${expected}`);
     }
   }
 
@@ -191,7 +267,8 @@ describe("outward-facing catalog copy counts the engines the registry ships", ()
       );
     });
 
-    // Nine numerals and seven counted lists on this revision.
+    // Sixteen numerals and eight counted lists on this revision - the two AWS
+    // listing files abridge, so they add numerals without adding counted lists.
     expect(segments.length).toBeGreaterThanOrEqual(8);
     const counted = segments.filter(
       (segment) => !ABRIDGED_RE.test(segment) && ENGINE_NAMES.filter(({ name }) => segment.includes(name)).length >= 2,
@@ -242,8 +319,25 @@ describe("the gate fails the copy it exists to catch", () => {
   });
 
   test("an English numeral is read as well as a digit", () => {
+    // The word for the current count is looked up, not written here, so this fixture does
+    // not go stale with the copy it guards.
+    const word = Object.keys(NUMERAL_WORDS).find((key) => NUMERAL_WORDS[key] === expected);
+    expect(word).toBeDefined();
+    const capitalized = `${word?.charAt(0).toUpperCase()}${word?.slice(1)}`;
+
     expect(engineCountProblems("Query fourteen engines from your browser.", "fixture")).toHaveLength(1);
-    expect(engineCountProblems(`Sixteen database engines in one IDE: ${fullList}`, "fixture")).toEqual([]);
+    expect(engineCountProblems(`${capitalized} database engines in one IDE: ${fullList}`, "fixture")).toEqual([]);
+  });
+
+  test("a hyphenated numeral is read whole, not as its first word", () => {
+    // "twenty-one engines" must publish 21. Read as "twenty" it would pass on the day the
+    // count is twenty and the copy is one ahead.
+    expect(engineCountProblems("Query twenty-one engines from your browser.", "fixture")).toEqual(
+      expected === 21 ? [] : [`fixture: "twenty-one engines" publishes 21, and there are ${expected}`],
+    );
+    expect(engineCountProblems("Query Twenty-Five database engines.", "fixture")).toEqual(
+      expected === 25 ? [] : [`fixture: "Twenty-Five database engines" publishes 25, and there are ${expected}`],
+    );
   });
 
   test("a deliberately abridged list is checked on its numeral only", () => {
@@ -257,6 +351,20 @@ describe("the gate fails the copy it exists to catch", () => {
     ).toEqual([]);
   });
 
+  test("a relative numeral is counted with the engines named before it", () => {
+    // "PostgreSQL, MySQL, MongoDB, Redis and N more engines" claims 4 + N. The DigitalOcean
+    // listing published "and fifteen more" for a release after the twentieth engine
+    // landed, because the walk read only the "N engines" form.
+    const lead = "connect to PostgreSQL, MySQL, MongoDB, Redis and";
+    const rightWord = Object.keys(NUMERAL_WORDS).find((key) => NUMERAL_WORDS[key] === expected - 4);
+    expect(rightWord).toBeDefined();
+
+    expect(engineCountProblems(`${lead} ${rightWord} more engines, write queries.`, "fixture")).toEqual([]);
+    expect(engineCountProblems(`${lead} ${expected - 5} more engines, write queries.`, "fixture")).toEqual([
+      `fixture: "4 named and ${expected - 5} more engines" publishes ${expected - 1}, and there are ${expected}`,
+    ]);
+  });
+
   test("a numeral qualifying a narrower noun is not a claim about the set", () => {
     // A real sentence from the Rancher listing's long description.
     expect(engineCountProblems("the two search engines accept no mutation at all", "fixture")).toEqual([]);
@@ -267,5 +375,34 @@ describe("the gate fails the copy it exists to catch", () => {
     expect(engineCountProblems("Web-based SQL IDE for SQL, NoSQL, analytics and search engines.", "fixture")).toEqual(
       [],
     );
+  });
+
+  test("the numeral map has a word for every count up to two past the registry's", () => {
+    // The map stopped at "twenty-seven" while the registry grew past it, so a word-form numeral above the last
+    // word would have passed unread. Two of headroom gives the next two providers a failing test, not a silent one.
+    const words = new Set(Object.values(NUMERAL_WORDS));
+    for (let count = 1; count <= expected + 2; count += 1) expect(words.has(count), String(count)).toBe(true);
+  });
+
+  test("the S3 label is matched whole, so the shorter spelling is refused", () => {
+    // The count rule reads a list as naming an engine when the list contains its label verbatim, so the outward
+    // name and DB_UI_CONFIG.s3.label must be one string. This fixture is the one place the series writes the
+    // shorter spelling, and only to show that it fails.
+    expect(ENGINE_NAMES).toContainEqual({ type: "s3", name: "S3-compatible object storage" });
+    const others = ENGINE_NAMES.filter(({ type }) => type !== "s3")
+      .map(({ name }) => name)
+      .join(", ");
+    expect(
+      engineCountProblems(
+        `SQL IDE for ${expected} engines - ${others} and S3-compatible object storage - with AI.`,
+        "fixture",
+      ),
+    ).toEqual([]);
+    expect(
+      engineCountProblems(
+        `SQL IDE for ${expected} engines - ${others} and S3-compatible storage - with AI.`,
+        "fixture",
+      ),
+    ).toEqual([`fixture: the list after "${expected} engines" names ${expected - 1}, missing s3`]);
   });
 });

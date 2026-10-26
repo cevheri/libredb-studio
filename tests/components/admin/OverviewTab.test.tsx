@@ -1,3 +1,4 @@
+import { withBasePathEnv } from "../../helpers/base-path";
 import "../../setup-dom";
 import "../../helpers/mock-sonner";
 import "../../helpers/mock-navigation";
@@ -55,8 +56,8 @@ mock.module("@/lib/db-ui-config", () => ({
     const React = require("react");
     return (props: Record<string, unknown>) => React.createElement("span", { ...props, "data-testid": "db-icon" });
   },
-  getDBColor: () => "text-blue-400",
-  getDBConfig: () => ({ icon: () => null, color: "text-blue-400", label: "PostgreSQL", defaultPort: "5432" }),
+  getDBColor: () => "text-hue-blue",
+  getDBConfig: () => ({ icon: () => null, color: "text-hue-blue", label: "PostgreSQL", defaultPort: "5432" }),
 }));
 
 mock.module("next/link", () => ({
@@ -73,7 +74,10 @@ import React from "react";
 
 import { mockGlobalFetch, restoreGlobalFetch } from "../../helpers/mock-fetch";
 
-import { OverviewTab } from "@/components/admin/tabs/OverviewTab";
+import { OverviewTab, DB_TYPES_PREVIEW } from "@/components/admin/tabs/OverviewTab";
+import { adminSectionPath } from "@/lib/admin-sections";
+import { EXTERNAL_DATABASE_TYPES } from "@/lib/db/compatibility";
+import { getDBConfig } from "@/lib/db-ui-config";
 
 // =============================================================================
 // OverviewTab Tests
@@ -142,6 +146,28 @@ describe("OverviewTab", () => {
     restoreGlobalFetch();
   });
 
+  test("fleet cards keep native anchor navigation inside the mount", async () => {
+    await withBasePathEnv("/tools/libredb", async () => {
+      const { container } = render(<OverviewTab user={{ username: "admin", role: "admin" }} />);
+      await waitFor(() => {
+        const link = Array.from(container.querySelectorAll("[href]")).find((element) =>
+          element.textContent?.includes("PG Dev"),
+        );
+        expect(link?.getAttribute("href")).toBe("/tools/libredb/admin/monitoring");
+        for (const [label, path] of [
+          ["Maintenance", "/admin/operations"],
+          ["Security & Masking", "/admin/security"],
+          ["Real-time Monitoring", "/admin/monitoring"],
+        ]) {
+          const action = Array.from(container.querySelectorAll("[href]")).find((element) =>
+            element.textContent?.includes(label),
+          );
+          expect(action?.getAttribute("href")).toBe(`/tools/libredb${path}`);
+        }
+      });
+    });
+  });
+
   test("renders when user provided", async () => {
     let renderResult: ReturnType<typeof render>;
     await act(async () => {
@@ -154,6 +180,8 @@ describe("OverviewTab", () => {
       // Hero section should contain status text
       expect(queryByText("All Systems Operational")).not.toBeNull();
     });
+    // An all-healthy fleet has nothing unchecked to count, so no such badge.
+    expect(queryByText(/not checked/i)).toBeNull();
   });
 
   test("shows empty state when no connections", async () => {
@@ -167,6 +195,30 @@ describe("OverviewTab", () => {
 
     // The empty state shows "Welcome to Command Center"
     expect(queryByText("Welcome to Command Center")).not.toBeNull();
+  });
+
+  test("empty state DB Types card is derived from EXTERNAL_DATABASE_TYPES, not hand-typed", async () => {
+    mockGetConnections.mockImplementation(() => []);
+
+    let renderResult: ReturnType<typeof render>;
+    await act(async () => {
+      renderResult = render(<OverviewTab user={{ username: "admin", role: "admin" }} />);
+    });
+    const { queryByText } = renderResult!;
+
+    // The count matches the real external-engine catalog, not a stale literal.
+    expect(queryByText(`${EXTERNAL_DATABASE_TYPES.length} DB Types`)).not.toBeNull();
+    expect(queryByText("7 DB Types")).toBeNull();
+
+    // The description previews the hand-picked DB_TYPES_PREVIEW labels and names the rest as
+    // "+N more". getDBConfig is mocked to "PostgreSQL" for every type in this file, so this
+    // only pins the join/count mechanics; DB_TYPES_PREVIEW's real, category-spanning labels
+    // and its membership in EXTERNAL_DATABASE_TYPES are checked unmocked in
+    // tests/unit/components/overview-tab-db-types-preview.test.ts.
+    const labels = DB_TYPES_PREVIEW.map((type) => getDBConfig(type).label);
+    const hidden = EXTERNAL_DATABASE_TYPES.length - DB_TYPES_PREVIEW.length;
+    const expectedDescription = `${labels.join(", ")}, +${hidden} more`;
+    expect(queryByText(expectedDescription)).not.toBeNull();
   });
 
   test("shows hero section when connections exist", async () => {
@@ -272,6 +324,78 @@ describe("OverviewTab", () => {
     });
   });
 
+  const gaugeOf = (label: string) => {
+    const caption = Array.from(document.querySelectorAll("span")).find((el) => el.textContent === label);
+    return caption!.parentElement as HTMLElement;
+  };
+
+  test("Query Success reads N/A in the neutral color before any query has run", async () => {
+    mockGetHistory.mockImplementation(() => [] as never);
+    await act(async () => {
+      render(<OverviewTab user={{ username: "admin", role: "admin" }} />);
+    });
+
+    await waitFor(() => {
+      const gauge = gaugeOf("Query Success");
+      expect(gauge.textContent).toContain("N/A");
+      expect(gauge.textContent).not.toContain("0");
+      const value = Array.from(gauge.querySelectorAll("span")).find((el) => el.textContent === "N/A") as HTMLElement;
+      expect(value.style.color).not.toBe("");
+      expect(value.style.color).not.toBe("rgb(239, 68, 68)");
+    });
+  });
+
+  test("Query Success reads 100% after one successful query", async () => {
+    await act(async () => {
+      render(<OverviewTab user={{ username: "admin", role: "admin" }} />);
+    });
+
+    await waitFor(
+      () => {
+        const gauge = gaugeOf("Query Success");
+        expect(gauge.textContent).toContain("100");
+        expect(gauge.textContent).not.toContain("N/A");
+      },
+      { timeout: 3000 },
+    );
+  });
+
+  test("Avg Response reads N/A when no connection answered, and the latency when one did", async () => {
+    await act(async () => {
+      render(<OverviewTab user={{ username: "admin", role: "admin" }} />);
+    });
+    await waitFor(() => {
+      expect(gaugeOf("Avg Response").textContent).toContain("15");
+    });
+    cleanup();
+
+    restoreGlobalFetch();
+    mockGlobalFetch({
+      "/api/admin/audit": { json: { events: [] } },
+      "/api/admin/fleet-health": {
+        json: {
+          results: [
+            {
+              connectionId: "c1",
+              connectionName: "PG Dev",
+              type: "postgres",
+              status: "error",
+              latencyMs: 0,
+              databaseSize: "N/A",
+              activeConnections: 0,
+            },
+          ],
+        },
+      },
+    });
+    await act(async () => {
+      render(<OverviewTab user={{ username: "admin", role: "admin" }} />);
+    });
+    await waitFor(() => {
+      expect(gaugeOf("Avg Response").textContent).toContain("N/A");
+    });
+  });
+
   test("shows user badge in hero section", async () => {
     let renderResult: ReturnType<typeof render>;
     await act(async () => {
@@ -344,7 +468,7 @@ describe("OverviewTab", () => {
     await act(async () => {
       renderResult = render(<OverviewTab user={{ username: "admin", role: "admin" }} />);
     });
-    const { queryByText } = renderResult!;
+    const { queryByText, queryByTestId } = renderResult!;
 
     await waitFor(() => {
       // Audit events are mapped into the feed alongside query history
@@ -354,6 +478,30 @@ describe("OverviewTab", () => {
       expect(queryByText("5m ago")).not.toBeNull();
       expect(queryByText("5h ago")).not.toBeNull();
       expect(queryByText("3d ago")).not.toBeNull();
+      const auditLink = queryByTestId("overview-audit-link");
+      expect(auditLink).not.toBeNull();
+      expect(auditLink?.getAttribute("href")).toBe(adminSectionPath("audit"));
+    });
+  });
+
+  test("Recent Activity uses an honest empty state and still links to Audit", async () => {
+    mockGetHistory.mockImplementation(() => []);
+
+    let renderResult: ReturnType<typeof render>;
+    await act(async () => {
+      renderResult = render(<OverviewTab user={{ username: "admin", role: "admin" }} />);
+    });
+    const { queryByText, queryByTestId } = renderResult!;
+
+    await waitFor(() => {
+      const auditLink = queryByTestId("overview-audit-link");
+      expect(auditLink).not.toBeNull();
+      expect(auditLink?.getAttribute("href")).toBe(adminSectionPath("audit"));
+      expect(queryByTestId("overview-recent-activity-empty")).not.toBeNull();
+      expect(
+        queryByText("No recent activity here. The Audit tab explains what this feed does not capture."),
+      ).not.toBeNull();
+      expect(queryByText("No recent activity.")).toBeNull();
     });
   });
 
@@ -370,6 +518,7 @@ describe("OverviewTab", () => {
               status: "healthy",
               latencyMs: 150,
               databaseSize: "512 kb",
+              databaseSizeBytes: 524288,
               activeConnections: 5,
             },
           ],
@@ -388,6 +537,54 @@ describe("OverviewTab", () => {
       expect(queryByText("150")).not.toBeNull();
       // totalDBSize aggregation: "kb" branch
       expect(queryByText("512 KB")).not.toBeNull();
+    });
+  });
+
+  // Issue #540: databaseSize's display string had no "tb" branch, so re-parsing it counted a
+  // 1 TB database as 1 byte. totalDBSize now sums databaseSizeBytes directly - this pins a
+  // TB-scale connection plus one with no byte figure at all, and asserts the total is correct
+  // and the excluded connection is called out rather than silently zeroed into the sum.
+  test("sums a TB-scale byte figure correctly and excludes a connection with none", async () => {
+    fetchMock = mockGlobalFetch({
+      "/api/admin/audit": { json: { events: [] } },
+      "/api/admin/fleet-health": {
+        json: {
+          results: [
+            {
+              connectionId: "c1",
+              connectionName: "Archive",
+              type: "postgres",
+              status: "healthy",
+              latencyMs: 100,
+              databaseSize: "1.00 TB",
+              databaseSizeBytes: 1099511627776,
+              activeConnections: 3,
+            },
+            {
+              connectionId: "c2",
+              connectionName: "ScyllaDB Node",
+              type: "cassandra",
+              status: "healthy",
+              latencyMs: 90,
+              activeConnections: 2,
+            },
+          ],
+        },
+      },
+    });
+
+    let renderResult: ReturnType<typeof render>;
+    await act(async () => {
+      renderResult = render(<OverviewTab user={{ username: "admin", role: "admin" }} />);
+    });
+    const { queryByText } = renderResult!;
+
+    await waitFor(() => {
+      // 1 TB correctly reflected as "1 TB" via the shared formatBytes ladder, not the old bug's
+      // "1 B" (parseFloat("1 tb") falls through every gb/mb/kb branch to a bare byte read).
+      expect(queryByText("1 TB")).not.toBeNull();
+      // The connection with no databaseSizeBytes is excluded from the sum, not zeroed into it.
+      expect(queryByText("(1 excluded)")).not.toBeNull();
     });
   });
 
@@ -495,7 +692,156 @@ describe("OverviewTab", () => {
       expect(queryByText("PG Prod")).not.toBeNull();
       expect(queryByText("timeout")).not.toBeNull();
       expect(queryByText("Connection refused")).not.toBeNull();
+      // one failing connection: singular badge
+      expect(queryByText("1 error")).not.toBeNull();
     });
+  });
+
+  test("fleet status badge pluralizes the error count", async () => {
+    fetchMock = mockGlobalFetch({
+      "/api/admin/audit": { json: { events: [] } },
+      "/api/admin/fleet-health": {
+        json: {
+          results: [
+            {
+              connectionId: "c1",
+              connectionName: "PG Prod",
+              type: "postgres",
+              status: "error",
+              latencyMs: 999,
+              error: "Connection refused",
+            },
+            {
+              connectionId: "c2",
+              connectionName: "PG Prod Replica",
+              type: "postgres",
+              status: "error",
+              latencyMs: 999,
+              error: "Connection refused",
+            },
+          ],
+        },
+      },
+    });
+
+    let renderResult: ReturnType<typeof render>;
+    await act(async () => {
+      renderResult = render(<OverviewTab user={{ username: "admin", role: "admin" }} />);
+    });
+    const { queryByText } = renderResult!;
+
+    await waitFor(() => {
+      // two failing connections: plural badge, not the unpluralized singular text
+      expect(queryByText("2 errors")).not.toBeNull();
+      expect(queryByText("2 error")).toBeNull();
+    });
+  });
+
+  // A connection that resumes billed compute (a Databend Cloud warehouse) is answered
+  // `not-checked` by the route, which sent it nothing: the card says why in one sentence, and
+  // the row counts as neither healthy nor unhealthy, nor as a 0 ms answer in the average.
+  test("a not-checked connection shows the billing sentence and stays out of the health counts", async () => {
+    fetchMock = mockGlobalFetch({
+      "/api/admin/audit": { json: { events: [] } },
+      "/api/admin/fleet-health": {
+        json: {
+          results: [
+            {
+              connectionId: "c1",
+              connectionName: "PG Dev",
+              type: "postgres",
+              status: "healthy",
+              latencyMs: 15,
+            },
+            {
+              connectionId: "c2",
+              connectionName: "Cloud Warehouse",
+              type: "postgres",
+              status: "not-checked",
+              latencyMs: 0,
+            },
+          ],
+        },
+      },
+    });
+
+    let renderResult: ReturnType<typeof render>;
+    await act(async () => {
+      renderResult = render(<OverviewTab user={{ username: "admin", role: "admin" }} />);
+    });
+    const { queryByText } = renderResult!;
+
+    await waitFor(
+      () => {
+        expect(queryByText("Cloud Warehouse")).not.toBeNull();
+        expect(
+          queryByText("Not checked: this connection resumes billed compute, so Studio does not poll it."),
+        ).not.toBeNull();
+        expect(queryByText("not checked")).not.toBeNull();
+        expect(queryByText("0ms")).toBeNull();
+        expect(queryByText("1 healthy")).not.toBeNull();
+        expect(queryByText("1 not checked")).not.toBeNull();
+        expect(queryByText("All Systems Operational")).not.toBeNull();
+        expect(gaugeOf("Fleet Health").textContent).toContain("100");
+        expect(gaugeOf("Avg Response").textContent).toContain("15");
+      },
+      { timeout: 3000 },
+    );
+  });
+
+  // A fleet whose every row is `not-checked` has no score: N/A in the neutral color, as Query
+  // Success reads before any query, never a critical-red 0%. Nothing was checked, so the status
+  // line is a neutral "Not checked", not a green "All Systems Operational".
+  test("a fleet with only not-checked connections reads N/A in the neutral color", async () => {
+    fetchMock = mockGlobalFetch({
+      "/api/admin/audit": { json: { events: [] } },
+      "/api/admin/fleet-health": {
+        json: {
+          results: [
+            {
+              connectionId: "c2",
+              connectionName: "Cloud Warehouse",
+              type: "postgres",
+              status: "not-checked",
+              latencyMs: 0,
+            },
+            {
+              connectionId: "c3",
+              connectionName: "Second Warehouse",
+              type: "postgres",
+              status: "not-checked",
+              latencyMs: 0,
+            },
+          ],
+        },
+      },
+    });
+    let renderResult: ReturnType<typeof render>;
+    await act(async () => {
+      renderResult = render(<OverviewTab user={{ username: "admin", role: "admin" }} />);
+    });
+    const { queryByText } = renderResult!;
+
+    await waitFor(
+      () => {
+        expect(document.body.textContent).toContain("Cloud Warehouse");
+        const gauge = gaugeOf("Fleet Health");
+        expect(gauge.textContent).toContain("N/A");
+        expect(gauge.textContent).not.toContain("0%");
+        expect(gauge.innerHTML).not.toContain("#ef4444");
+        const hero = gaugeOf("Health");
+        expect(hero.textContent).toContain("N/A");
+        expect(hero.textContent).not.toContain("0%");
+        expect(hero.innerHTML).not.toContain("#ef4444");
+        expect(queryByText("All Systems Operational")).toBeNull();
+        const status = queryByText("Not checked") as HTMLElement;
+        expect(status).not.toBeNull();
+        expect(status.className).toContain("text-fg-muted");
+        expect(status.className).not.toContain("text-success");
+        expect(queryByText("2 not checked")).not.toBeNull();
+      },
+      { timeout: 3000 },
+    );
   });
 
   // ── Fleet-health request race ──────────────────────────────────────────────
@@ -643,6 +989,43 @@ describe("OverviewTab", () => {
       expect(refreshButton().disabled).toBe(false);
     } finally {
       restore();
+    }
+  });
+
+  // ── Gauge track ────────────────────────────────────────────────────────────
+
+  /**
+   * The unfilled part of a gauge is the ring its arc is read against. Both gauges painted
+   * it in 4% white, which on a light panel is nothing at all, so the score read as an arc
+   * floating on its own (#856). Recharts inline-styles it, so the palette has to be handed
+   * over the same way the tooltip's is.
+   */
+  async function gaugeTracksUnderTheme(theme: "dark" | "light") {
+    document.documentElement.classList.remove("dark", "light");
+    document.documentElement.classList.add(theme);
+    mockGlobalFetch({ "/api/admin/audit": { ok: true, json: { events: [] } } });
+
+    let result: ReturnType<typeof render>;
+    await act(async () => {
+      result = render(<OverviewTab user={{ username: "admin", role: "admin" }} />);
+    });
+    return Array.from(result!.container.querySelectorAll("[data-testid='mock-radial-bar']")).map((el) =>
+      el.getAttribute("data-track"),
+    );
+  }
+
+  test("the gauge track is the palette's grid line in the dark theme", async () => {
+    const tracks = await gaugeTracksUnderTheme("dark");
+    expect(tracks.length).toBeGreaterThan(0);
+    for (const track of tracks) expect(track).toBe("#222222");
+  });
+
+  test("and turns into the light theme's grid line, not an invisible white", async () => {
+    const tracks = await gaugeTracksUnderTheme("light");
+    expect(tracks.length).toBeGreaterThan(0);
+    for (const track of tracks) {
+      expect(track).toBe("#e4e4e7");
+      expect(track).not.toContain("255, 255, 255");
     }
   });
 

@@ -1,7 +1,10 @@
+import { getBasePath } from "@/lib/config/base-path";
 import { SignJWT, jwtVerify } from "jose";
 import { cookies, headers } from "next/headers";
 import { logger } from "@/lib/logger";
-import { getJwtSecret } from "@/lib/config/auth-env";
+import { getJwtSecret, sessionTtlSeconds } from "@/lib/config/auth-env";
+import { storedAccountAllows } from "@/lib/local-accounts";
+import { authenticateBearer } from "@/lib/oidc-bearer";
 
 // getJwtSecret is called per sign/verify rather than at module load, so a
 // misconfigured JWT_SECRET surfaces as an AuthConfigError the login route can turn
@@ -20,13 +23,36 @@ export type Role = "admin" | "user";
 export interface UserPayload {
   role: Role;
   username: string;
+  /**
+   * Set only on sessions for an account in the server store (src/lib/local-accounts.ts), and
+   * compared with that account's current value on every request. Env and OIDC sessions omit it.
+   */
+  sessionVersion?: number;
+  /**
+   * The ID token's `sub`, set only on sessions the OIDC callback mints; password, passkey and
+   * launch sessions omit it. A private name, because the registered `sub` already holds the
+   * username in MCP tokens (src/lib/mcp/token.ts), and `username` keeps its display meaning.
+   */
+  idpSubject?: string;
+  /** The ID token's `iss`, set together with `idpSubject`. */
+  idpIssuer?: string;
+  /**
+   * Set only on a session an identity provider's access token stands for (src/lib/oidc-bearer.ts), never signed into
+   * a cookie. A route that would write the session cookie or mint a credential from the session reads it.
+   */
+  channel?: "bearer";
+  /**
+   * Custom roles extracted from OIDC_ROLE_CLAIM matching OIDC_ROLE_PREFIX. Set only by the
+   * OIDC callback and only when non-empty.
+   */
+  claimRoles?: string[];
 }
 
 export async function signJWT(payload: UserPayload) {
   return await new SignJWT({ ...payload })
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
-    .setExpirationTime("24h")
+    .setExpirationTime(`${sessionTtlSeconds()}s`)
     .sign(getJwtSecret());
 }
 
@@ -46,11 +72,59 @@ export async function verifyJWT(token: string) {
   }
 }
 
-export async function getSession() {
+export type SessionReading =
+  | { readonly kind: "authenticated"; readonly session: UserPayload }
+  | { readonly kind: "anonymous" }
+  | { readonly kind: "store_unavailable"; readonly error: unknown };
+
+export async function readSession(): Promise<SessionReading> {
+  // A Bearer header decides alone while the channel is on, even next to a valid cookie, and with it on or off the
+  // cookie is never touched here. Absent, the cookie decides as it always did.
+  const headerList = await headers();
+  const authHeader = headerList.get("authorization");
+  const bearer = await authenticateBearer(authHeader);
+  if (bearer.kind === "fault") {
+    logger.error("Could not verify a bearer access token; refusing", bearer.error, { route: "auth" });
+    return { kind: "anonymous" };
+  }
+  if (bearer.kind === "denied") return { kind: "anonymous" };
+  if (bearer.kind === "authenticated") {
+    // Under governance the access token's subject, issuer and own iat meet the same rule as a cookie session's.
+    try {
+      const allowed = await storedAccountAllows(bearer.session);
+      return allowed ? { kind: "authenticated", session: bearer.session } : { kind: "anonymous" };
+    } catch (error) {
+      logger.error("Could not read the account registry, store unavailable", error, { route: "auth" });
+      return { kind: "store_unavailable", error };
+    }
+  }
+
   const cookieStore = await cookies();
   const token = cookieStore.get("auth-token")?.value;
-  if (!token) return null;
-  return await verifyJWT(token);
+  if (!token) return { kind: "anonymous" };
+  const session = await verifyJWT(token);
+  if (!session) return { kind: "anonymous" };
+  // The token is valid for 24 hours whatever happens to the account, so a stored account is read
+  // again here: disabled, deleted, demoted or password-reset means this session is over. A registry
+  // that cannot be read reports an outage (store_unavailable) rather than refusing a valid session
+  // or clearing its cookie (#1942).
+  let allowed: boolean;
+  try {
+    allowed = await storedAccountAllows(session);
+  } catch (error) {
+    logger.error("Could not read the account registry, store unavailable", error, { route: "auth" });
+    return { kind: "store_unavailable", error };
+  }
+  if (allowed) return { kind: "authenticated", session };
+  // The proxy verifies only the signature, so a refused cookie would keep sending /login back to
+  // the editor. Clearing it here, on the route's response, lets the next navigation reach login.
+  await logout();
+  return { kind: "anonymous" };
+}
+
+export async function getSession(): Promise<UserPayload | null> {
+  const reading = await readSession();
+  return reading.kind === "authenticated" ? reading.session : null;
 }
 
 /** Hosts whose traffic never leaves the machine (port is stripped before the check). */
@@ -85,7 +159,7 @@ function warnOnce(message: string): void {
  * "on"/"true"/"1", trimmed, case-insensitive); anything else warns and falls
  * through to the default, so a typo never silently flips the security posture.
  */
-function readCookieSecureOverride(): boolean | undefined {
+export function readCookieSecureOverride(): boolean | undefined {
   const raw = process.env.AUTH_COOKIE_SECURE;
   const normalized = raw?.trim().toLowerCase();
   if (!normalized) return undefined;
@@ -97,7 +171,7 @@ function readCookieSecureOverride(): boolean | undefined {
   return undefined;
 }
 
-function isLoopbackHost(host: string | null): boolean {
+export function isLoopbackHost(host: string | null): boolean {
   if (!host) return false;
   // Strip the port, then the brackets of an IPv6 literal ("[::1]:3000" -> "::1").
   const hostname = host
@@ -145,8 +219,17 @@ export async function shouldMarkCookieSecure(): Promise<boolean> {
   }
 }
 
-export async function login(role: Role, username?: string) {
-  const token = await signJWT({ role, username: username || role });
+export async function login(
+  role: Role,
+  username?: string,
+  sessionVersion?: number,
+  identity?: { subject: string; issuer: string },
+  claimRoles?: string[],
+) {
+  // Only the OIDC callback passes an identity, so every other sign-in signs exactly the claims it did before.
+  const idp = identity ? { idpSubject: identity.subject, idpIssuer: identity.issuer } : {};
+  const claims = claimRoles && claimRoles.length > 0 ? { claimRoles } : {};
+  const token = await signJWT({ role, username: username || role, sessionVersion, ...idp, ...claims });
   const cookieStore = await cookies();
   cookieStore.set("auth-token", token, {
     httpOnly: true,
@@ -156,12 +239,12 @@ export async function login(role: Role, username?: string) {
     // notably a cross-site POST /api/auth/login, where there is no pre-existing cookie to withhold
     // - are covered by the Origin check in src/proxy.ts (src/lib/api/origin-check.ts).
     sameSite: "lax",
-    maxAge: 60 * 60 * 24, // 1 day
-    path: "/",
+    maxAge: sessionTtlSeconds(),
+    path: getBasePath() || "/",
   });
 }
 
 export async function logout() {
   const cookieStore = await cookies();
-  cookieStore.delete("auth-token");
+  cookieStore.delete({ name: "auth-token", path: getBasePath() || "/" });
 }

@@ -8,8 +8,11 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { type MaskingPattern, maskValueByPattern } from "@/lib/data-masking";
 import { writeToClipboard } from "@/components/copy-button";
+import { binaryCellsAsHex, jsonText } from "@/lib/export/json";
+import type { VectorColumn } from "@/lib/db/vector/types";
 import { classifyValue } from "./renderers/classify";
 import { getRenderer } from "./renderers/registry";
+import { renderContextFor } from "./utils";
 
 export interface RowDetailSheetProps {
   row: Record<string, unknown>;
@@ -20,6 +23,8 @@ export interface RowDetailSheetProps {
   maskingActive?: boolean;
   sensitiveColumns?: Map<string, MaskingPattern>;
   allowReveal?: boolean;
+  /** The result's vector columns (`QueryResult.vectorColumns`), so a field of one shows its header and whole value. */
+  vectorColumns?: Readonly<Record<string, VectorColumn>>;
 }
 
 export function RowDetailSheet({
@@ -31,6 +36,7 @@ export function RowDetailSheet({
   maskingActive,
   sensitiveColumns,
   allowReveal,
+  vectorColumns,
 }: RowDetailSheetProps) {
   /**
    * Which copy just ran, and whether it actually happened (B43). A bare field name
@@ -69,10 +75,11 @@ export function RowDetailSheet({
           isMasked: true,
         };
       }
-      const detail = getRenderer(classifyValue(value)).renderDetail(value);
+      const context = renderContextFor(vectorColumns, field);
+      const detail = getRenderer(classifyValue(value, context)).renderDetail(value, context);
       return { ...detail, isMasked: false };
     },
-    [maskingActive, sensitiveColumns, revealedFields],
+    [maskingActive, sensitiveColumns, revealedFields, vectorColumns],
   );
 
   /** The outcome is reported only once the write has one, never alongside starting it. */
@@ -83,33 +90,52 @@ export function RowDetailSheet({
     });
   };
 
+  /**
+   * What a copy of one field writes: the mask when the field is masked, otherwise the renderer's copy form where it
+   * has one, because a vector's detail is a header line over the value and only the value is search data. Every
+   * other kind copies the detail text, as it always did.
+   */
+  const copyTextOf = (field: string, value: unknown): string => {
+    const shown = getDisplayValue(field, value);
+    if (shown.isMasked) return shown.text;
+    const context = renderContextFor(vectorColumns, field);
+    return getRenderer(classifyValue(value, context)).renderCopy?.(value, context) ?? shown.text;
+  };
+
   const copyValue = (field: string, value: unknown) => {
-    const { text } = getDisplayValue(field, value);
-    copyAndReport(field, text);
+    copyAndReport(field, copyTextOf(field, value));
   };
 
   const copyAllAsJson = () => {
-    // If masking is active, copy masked version
-    if (maskingActive && sensitiveColumns && sensitiveColumns.size > 0) {
-      const maskedRow: Record<string, unknown> = {};
-      for (const field of fields) {
-        const { text } = getDisplayValue(field, row[field]);
-        maskedRow[field] = text;
+    // Keep raw JSON values for unmasked fields; display text would stringify their types.
+    const copiedRow = { ...row };
+    for (const field of fields) {
+      if (!Object.hasOwn(row, field)) continue;
+      const value = row[field];
+      const pattern = sensitiveColumns?.get(field);
+      if (maskingActive && pattern && value != null && !revealedFields.has(field)) {
+        copiedRow[field] = maskValueByPattern(value, pattern);
+      } else if (maskingActive && sensitiveColumns && sensitiveColumns.size > 0 && vectorColumns?.[field]) {
+        // Declared vectors keep their established renderer copy form under masking.
+        const context = renderContextFor(vectorColumns, field);
+        copiedRow[field] = getRenderer(classifyValue(value, context)).renderCopy?.(value, context) ?? value;
       }
-      copyAndReport("__all__", JSON.stringify(maskedRow, null, 2));
-    } else {
-      copyAndReport("__all__", JSON.stringify(row, null, 2));
     }
+    copyAndReport("__all__", jsonText(binaryCellsAsHex(copiedRow), 2));
   };
 
   return (
     <Sheet open={isOpen} onOpenChange={onClose}>
-      <SheetContent side="bottom" className="h-[85vh] bg-surface border-t border-hairline-strong rounded-t-3xl">
+      {/*
+        Capped rather than fixed: a six field row took 85% of the screen to show six
+        lines, and a 200 field row still needs every pixel of the cap (#800).
+      */}
+      <SheetContent side="bottom" className="max-h-[85vh] bg-surface border-t border-hairline-strong rounded-t-3xl">
         <SheetHeader className="pb-4 border-b border-hairline">
           <div className="flex items-center justify-between">
             <SheetTitle className="text-fg flex items-center gap-2">
-              <div className="w-8 h-8 rounded-lg bg-blue-500/10 flex items-center justify-center">
-                <FileBraces strokeWidth={1.5} className="w-3.5 h-3.5 text-blue-400" />
+              <div className="w-8 h-8 rounded-lg bg-brand-tint/10 flex items-center justify-center">
+                <FileBraces strokeWidth={1.5} className="w-3.5 h-3.5 text-brand" />
               </div>
               Row #{rowIndex + 1}
             </SheetTitle>
@@ -121,12 +147,12 @@ export function RowDetailSheet({
             >
               {copyOutcome?.key === "__all__" && copyOutcome.copied && (
                 <>
-                  <Check strokeWidth={1.5} className="w-3 h-3 mr-1 text-emerald-400" /> Copied
+                  <Check strokeWidth={1.5} className="w-3 h-3 mr-1 text-success" /> Copied
                 </>
               )}
               {copyOutcome?.key === "__all__" && !copyOutcome.copied && (
                 <>
-                  <TriangleAlert strokeWidth={1.5} className="w-3 h-3 mr-1 text-amber-400" /> Copy failed
+                  <TriangleAlert strokeWidth={1.5} className="w-3 h-3 mr-1 text-warning" /> Copy failed
                 </>
               )}
               {copyOutcome?.key !== "__all__" && (
@@ -138,58 +164,78 @@ export function RowDetailSheet({
           </div>
         </SheetHeader>
 
-        <ScrollArea className="h-[calc(85vh-100px)] mt-4">
-          <div className="space-y-1 pr-4">
+        <ScrollArea className="max-h-[calc(85vh-100px)] mt-4">
+          {/*
+            One field per line is the readable shape on a phone and a waste of a desktop
+            window: a 40 column row left most of a 1440px screen empty and scrolled for
+            no reason (#800). The list flows into as many columns as the window fits,
+            asked for by column WIDTH rather than by a breakpoint, so there is no width
+            at which a field is dropped or a column count is wrong for the window - one
+            column on a phone, three on a 1440px screen, and every step between.
+
+            Column flow rather than a grid: a grid row is as tall as its tallest cell, so
+            one long value left the two fields beside it sitting over a screenful of
+            empty space.
+          */}
+          <div className="columns-sm gap-x-6 px-4 pb-4">
             {fields.map((field) => {
               const { text, className, preserveWhitespace, isMasked } = getDisplayValue(field, row[field]);
               const isLongValue = text.length > 50;
 
               return (
-                <div key={field} className="group p-3 rounded-lg hover:bg-fill transition-colors">
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs text-fg-muted mb-1 font-mono flex items-center gap-1">
-                        {field}
-                        {isMasked && <Lock strokeWidth={1.5} className="w-2.5 h-2.5 text-purple-400" />}
-                      </p>
-                      <p
-                        className={cn(
-                          "font-mono text-xs break-all",
-                          className,
-                          preserveWhitespace && "whitespace-pre-wrap",
-                          isLongValue && "text-xs",
-                        )}
-                      >
-                        {text}
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-1 shrink-0">
-                      {isMasked && allowReveal && (
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-7 w-7 p-0 opacity-0 group-hover:opacity-100 transition-opacity"
-                          onClick={() => revealField(field)}
-                          title="Reveal value (10s)"
-                        >
-                          <Eye className="w-3.5 h-3.5 text-purple-400" />
-                        </Button>
-                      )}
+                <div
+                  key={field}
+                  className="group flex items-start gap-3 break-inside-avoid px-2 py-1.5 rounded-lg border-b border-hairline hover:bg-fill transition-colors"
+                >
+                  {/*
+                    Name beside the value rather than above it. Stacked, one field cost two
+                    lines and the window's whole width for a value a few characters long, so
+                    a wide row scrolled far past what it needed. The name column is fixed so
+                    the names line up and the eye can run down them (#800).
+                  */}
+                  <p
+                    className="w-32 shrink-0 text-xs text-fg-muted font-mono flex items-center gap-1 leading-5"
+                    title={field}
+                  >
+                    <span className="truncate">{field}</span>
+                    {isMasked && <Lock strokeWidth={1.5} className="w-2.5 h-2.5 text-hue-purple shrink-0" />}
+                  </p>
+                  <p
+                    className={cn(
+                      "flex-1 min-w-0 font-mono text-xs break-all leading-5",
+                      className,
+                      preserveWhitespace && "whitespace-pre-wrap",
+                      isLongValue && "text-xs",
+                    )}
+                  >
+                    {text}
+                  </p>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {isMasked && allowReveal && (
                       <Button
                         variant="ghost"
                         size="sm"
                         className="h-7 w-7 p-0 opacity-0 group-hover:opacity-100 transition-opacity"
-                        onClick={() => copyValue(field, row[field])}
+                        onClick={() => revealField(field)}
+                        title="Reveal value (10s)"
                       >
-                        {copyOutcome?.key === field && copyOutcome.copied && (
-                          <Check strokeWidth={1.5} className="w-3.5 h-3.5 text-emerald-400" />
-                        )}
-                        {copyOutcome?.key === field && !copyOutcome.copied && (
-                          <TriangleAlert strokeWidth={1.5} className="w-3.5 h-3.5 text-amber-400" />
-                        )}
-                        {copyOutcome?.key !== field && <Copy strokeWidth={1.5} className="w-3.5 h-3.5 text-fg-muted" />}
+                        <Eye className="w-3.5 h-3.5 text-hue-purple" />
                       </Button>
-                    </div>
+                    )}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 w-7 p-0 opacity-0 group-hover:opacity-100 transition-opacity"
+                      onClick={() => copyValue(field, row[field])}
+                    >
+                      {copyOutcome?.key === field && copyOutcome.copied && (
+                        <Check strokeWidth={1.5} className="w-3.5 h-3.5 text-success" />
+                      )}
+                      {copyOutcome?.key === field && !copyOutcome.copied && (
+                        <TriangleAlert strokeWidth={1.5} className="w-3.5 h-3.5 text-warning" />
+                      )}
+                      {copyOutcome?.key !== field && <Copy strokeWidth={1.5} className="w-3.5 h-3.5 text-fg-muted" />}
+                    </Button>
                   </div>
                 </div>
               );

@@ -47,6 +47,54 @@ describe("hydrateAgentArtifact", () => {
     expect(hydrated?.explainPlan).toBeNull();
   });
 
+  /*
+    A cluster reading is rows like any read: the usage rows an `inspect_usage` call stored are shown in the grid, and
+    the operation id, which names no plan, keeps them out of the explain view.
+  */
+  test("a cluster usage reading hydrates the results grid with its rows", () => {
+    const rows = [
+      {
+        namespace: "shop",
+        ownerKind: "Deployment",
+        ownerName: "web",
+        pod: "web-1",
+        container: "web",
+        cpuMillicores: 120,
+      },
+      {
+        namespace: "shop",
+        ownerKind: "Deployment",
+        ownerName: "web",
+        pod: "web-2",
+        container: "web",
+        cpuMillicores: 90,
+      },
+    ];
+    const hydrated = hydrateAgentArtifact(
+      payload({
+        operationId: "cluster.usage.read",
+        summary: {
+          rowCount: 2,
+          columnNames: ["namespace", "ownerKind", "ownerName", "pod", "container", "cpuMillicores"],
+          elapsedMs: 40,
+        },
+        result: {
+          rows,
+          fields: ["namespace", "ownerKind", "ownerName", "pod", "container", "cpuMillicores"],
+          rowCount: 2,
+          executionTime: 40,
+        },
+      }),
+      undefined,
+    );
+
+    expect(hydrated?.surface).toBe("results");
+    expect(hydrated?.operationId).toBe("cluster.usage.read");
+    expect(hydrated?.result.rows).toEqual(rows);
+    expect(hydrated?.explainPlan).toBeNull();
+    expect(hydrated?.chartSpec).toBeNull();
+  });
+
   test("a plan artifact hydrates the explain surface, through the connection's own strategy", () => {
     const hydrated = hydrateAgentArtifact(
       payload({
@@ -145,8 +193,10 @@ describe("hydrateAgentArtifact", () => {
  * rail fails here rather than shipping a second one to keep correct.
  */
 describe("the agent rail's module boundary", () => {
-  const AGENT_DIR = path.join(process.cwd(), "src/components/agent");
+  // Anchored to this file rather than to process.cwd(), so the scan is correct whoever launches it.
+  const AGENT_DIR = path.resolve(import.meta.dir, "../../..", "src/components/agent");
   const RAIL_MODULES = [
+    "AgentHistory.tsx",
     "AgentRail.tsx",
     // The three the 2026-08-21 redesign split out of `AgentRail.tsx`, plus the module
     // holding what it and the answer card both render. They are listed for the same

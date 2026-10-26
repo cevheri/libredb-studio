@@ -15,8 +15,11 @@ import type { DatabaseType, ReadOnlyStatementBudget } from "../../types";
 import { QueryError } from "../../errors";
 
 /** PostgreSQL's statement_timeout is a 32-bit millisecond setting; the same
- * ceiling is applied everywhere — a timeout beyond ~24 days is not a budget. */
-const MAX_STATEMENT_TIMEOUT_MS = 2_147_483_647;
+ * ceiling is applied everywhere: a timeout beyond ~24 days is not a budget.
+ * It is also the largest delay `setTimeout` accepts (a larger one fires after
+ * 1 ms) and the largest `maxTimeMS` MongoDB takes, so a provider that arms its
+ * own timer past the budget clamps it here. */
+export const MAX_STATEMENT_TIMEOUT_MS = 2_147_483_647;
 
 export function assertReadOnlyBudget(budget: ReadOnlyStatementBudget, provider: DatabaseType): void {
   const fields: Array<[name: string, value: unknown, max: number]> = [
@@ -39,5 +42,18 @@ export function assertReadOnlyBudget(budget: ReadOnlyStatementBudget, provider: 
 export function measureResultBytes(rows: unknown[]): number {
   return Buffer.byteLength(
     JSON.stringify(rows, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value)),
+  );
+}
+
+/**
+ * One row's share of the byte budget: the JSON size `measureResultBytes` would count
+ * for that row, taken per row because the MySQL profile reads its results as a
+ * stream and refuses on the row that crosses the budget rather than on a completed
+ * result. BigInt values count as their decimal text, the same exception
+ * `measureResultBytes` makes.
+ */
+export function measureRowBytes(row: unknown): number {
+  return Buffer.byteLength(
+    JSON.stringify(row, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value)),
   );
 }

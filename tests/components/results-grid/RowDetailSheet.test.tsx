@@ -24,8 +24,10 @@ function refuseEveryWritePath(): void {
 mock.module("@/components/ui/sheet", () => ({
   Sheet: ({ open, children }: { open: boolean; children: React.ReactNode }) =>
     open ? React.createElement("div", { "data-testid": "sheet" }, children) : null,
-  SheetContent: ({ children }: { children: React.ReactNode }) =>
-    React.createElement("div", { "data-testid": "sheet-content" }, children),
+  // The className is forwarded because the panel's own height cap is asserted below:
+  // a double that drops it makes the real element's sizing unobservable.
+  SheetContent: ({ children, className }: { children: React.ReactNode; className?: string }) =>
+    React.createElement("div", { "data-testid": "sheet-content", className }, children),
   SheetHeader: ({ children }: { children: React.ReactNode }) => React.createElement("div", {}, children),
   SheetTitle: ({ children }: { children: React.ReactNode }) => React.createElement("h2", {}, children),
 }));
@@ -108,6 +110,106 @@ describe("results-grid/RowDetailSheet", () => {
     expect(String(writeText.mock.calls[0]?.[0])).toContain("***MASKED***");
   });
 
+  test("Copy JSON preserves unmasked types and masks sensitive fields", () => {
+    const sensitiveColumns = new Map<string, unknown>([["email", { type: "email" }]]);
+    const row = {
+      id: 12,
+      score: 98.5,
+      active: true,
+      name: "Alex",
+      middle_name: null,
+      tags: ["admin", 3],
+      profile: { verified: true },
+      email: "alice@example.com",
+      payload: { type: "Buffer", data: [0xde, 0xad] },
+      count: BigInt("9007199254740993"),
+      excluded: "not in fields",
+    };
+    const { queryByText } = render(
+      <RowDetailSheet
+        row={row}
+        fields={["id", "score", "active", "name", "middle_name", "tags", "profile", "email", "payload", "count"]}
+        isOpen
+        onClose={mock(() => {})}
+        rowIndex={0}
+        maskingActive
+        sensitiveColumns={sensitiveColumns as never}
+      />,
+    );
+
+    fireEvent.click(queryByText("Copy JSON")!);
+    const copiedText = String(writeText.mock.calls[0]?.[0]);
+    const expectedRow = {
+      ...row,
+      email: "***MASKED***",
+      payload: "\\xdead",
+      count: "9007199254740993",
+    };
+    expect(JSON.parse(copiedText)).toEqual(expectedRow);
+    expect(copiedText).not.toContain("alice@example.com");
+    expect(JSON.parse(copiedText).excluded).toBe(row.excluded);
+  });
+
+  test("Copy JSON preserves a revealed sensitive value in clear text", () => {
+    const sensitiveColumns = new Map<string, unknown>([["email", { type: "email" }]]);
+    const { queryByText, queryByTitle } = render(
+      <RowDetailSheet
+        row={{ email: "alice@example.com" }}
+        fields={["email"]}
+        isOpen
+        onClose={mock(() => {})}
+        rowIndex={0}
+        maskingActive
+        sensitiveColumns={sensitiveColumns as never}
+        allowReveal
+      />,
+    );
+
+    fireEvent.click(queryByTitle("Reveal value (10s)")!);
+    fireEvent.click(queryByText("Copy JSON")!);
+
+    const copiedText = String(writeText.mock.calls[0]?.[0]);
+    expect(JSON.parse(copiedText)).toEqual({ email: "alice@example.com" });
+    expect(copiedText).toContain("alice@example.com");
+  });
+
+  test("Copy JSON preserves a NULL sensitive value as JSON null", () => {
+    const sensitiveColumns = new Map<string, unknown>([["email", { type: "email" }]]);
+    const { queryByText } = render(
+      <RowDetailSheet
+        row={{ email: null }}
+        fields={["email"]}
+        isOpen
+        onClose={mock(() => {})}
+        rowIndex={0}
+        maskingActive
+        sensitiveColumns={sensitiveColumns as never}
+      />,
+    );
+
+    fireEvent.click(queryByText("Copy JSON")!);
+    expect(JSON.parse(String(writeText.mock.calls[0]?.[0]))).toEqual({ email: null });
+  });
+
+  test("Copy JSON copies a sensitive value raw when masking is disabled", () => {
+    const sensitiveColumns = new Map<string, unknown>([["email", { type: "email" }]]);
+    const row = { email: "alice@example.com", unrelated: "preserved" };
+    const { queryByText } = render(
+      <RowDetailSheet
+        row={row}
+        fields={["email"]}
+        isOpen
+        onClose={mock(() => {})}
+        rowIndex={0}
+        maskingActive={false}
+        sensitiveColumns={sensitiveColumns as never}
+      />,
+    );
+
+    fireEvent.click(queryByText("Copy JSON")!);
+    expect(JSON.parse(String(writeText.mock.calls[0]?.[0]))).toEqual(row);
+  });
+
   test("shows masked value and reveals when reveal button is clicked", () => {
     const sensitiveColumns = new Map<string, unknown>([["email", { type: "email" }]]);
     const { queryByText, queryByTitle } = render(
@@ -177,8 +279,8 @@ describe("results-grid/RowDetailSheet", () => {
     // Click the first copy button (for "id" field)
     fireEvent.click(copyButtons[0]!);
 
-    // After copy, the Check icon (emerald-400 colored) should replace the Copy icon
-    await waitFor(() => expect(container.querySelector(".text-emerald-400")).not.toBeNull());
+    // After copy, the Check icon (success token) should replace the Copy icon
+    await waitFor(() => expect(container.querySelector(".text-success")).not.toBeNull());
   });
 
   // B43: both of these labels used to flip in the same statement that started the write,
@@ -202,8 +304,8 @@ describe("results-grid/RowDetailSheet", () => {
     );
     fireEvent.click(copyButtons[0]!);
 
-    await waitFor(() => expect(container.querySelector(".text-amber-400")).not.toBeNull());
-    expect(container.querySelector(".text-emerald-400")).toBeNull();
+    await waitFor(() => expect(container.querySelector(".text-warning")).not.toBeNull());
+    expect(container.querySelector(".text-success")).toBeNull();
   });
 
   test("Copy JSON says Copied once the write has reported one", async () => {
@@ -421,7 +523,7 @@ describe("results-grid/RowDetailSheet", () => {
   });
 
   test("raw JSON copy contains exact row data when no masking active", () => {
-    const row = { id: 42, name: "Charlie", active: true, score: 99.5 };
+    const row = { id: 42, name: "Charlie", active: true, score: 99.5, excluded: "not in fields" };
     const { queryByText } = render(
       <RowDetailSheet
         row={row}
@@ -437,5 +539,157 @@ describe("results-grid/RowDetailSheet", () => {
     const copiedJson = String(writeText.mock.calls[0]?.[0]);
     const parsed = JSON.parse(copiedJson);
     expect(parsed).toEqual(row);
+  });
+
+  // The sheet shows a binary field as `\x` hex, and Copy JSON used to copy the Buffer
+  // form beside it, one number per byte (#1381).
+  test("Copy JSON writes a binary field as the hex the sheet shows", () => {
+    const { queryByText } = render(
+      <RowDetailSheet
+        row={{ id: 7, payload: { type: "Buffer", data: [0xde, 0xad, 0x00, 0xff] } }}
+        fields={["id", "payload"]}
+        isOpen
+        onClose={mock(() => {})}
+        rowIndex={0}
+      />,
+    );
+
+    fireEvent.click(queryByText("Copy JSON")!);
+    expect(JSON.parse(String(writeText.mock.calls[0]?.[0]))).toEqual({ id: 7, payload: "\\xdead00ff" });
+  });
+
+  // ── Layout on a wide window (#800) ────────────────────────────────────────
+
+  describe("layout", () => {
+    function fieldList(container: HTMLElement): HTMLElement {
+      const label = Array.from(container.querySelectorAll("p")).find((el) => el.textContent === "col_01")!;
+      return label.parentElement!.parentElement!;
+    }
+
+    /**
+     * The list is read on a phone and on a 1440px window, and the single column that
+     * suits the first wastes the second: a 40 field row scrolled for no reason. The
+     * flow is asked for by column WIDTH, so the count follows the window with no
+     * breakpoint deciding it - measured 2026-09-15 in the browser on a 40 field row as
+     * 1 column at 390px and 768px, 2 at 834px and 1024px, 3 at 1280px and 1440px, 4 at
+     * 1920px and 8 at 3840px. A breakpoint here is what the reported defect was made
+     * of, so a class carrying one is a finding (#800).
+     */
+    test("the field list flows into as many columns as the window fits, without a breakpoint", () => {
+      const { container } = render(
+        <RowDetailSheet row={{ col_01: "a" }} fields={["col_01"]} isOpen onClose={mock(() => {})} rowIndex={0} />,
+      );
+      const classes = (fieldList(container).getAttribute("class") ?? "").split(/\s+/);
+      expect(classes).toContain("columns-sm");
+      expect(classes.filter((c) => /^(sm|md|lg|xl|2xl):/.test(c) || c === "hidden")).toEqual([]);
+
+      // A flowed column would otherwise break between a field's name and its value,
+      // leaving the two halves of one field in different columns.
+      const label = Array.from(container.querySelectorAll("p")).find((el) => el.textContent === "col_01")!;
+      expect((label.parentElement!.getAttribute("class") ?? "").split(/\s+/)).toContain("break-inside-avoid");
+    });
+
+    /**
+     * Capped, not fixed. A six field row took 85% of the screen to show six lines and
+     * hid the grid it came from behind it; a 200 field row still needs the whole cap.
+     * Measured 2026-09-15 at 900px tall: 180px for six fields, 763px for 202 (#800).
+     */
+    test("the panel is capped at a share of the window rather than always filling it", () => {
+      const { getByTestId } = render(
+        <RowDetailSheet row={{ id: 1 }} fields={["id"]} isOpen onClose={mock(() => {})} rowIndex={0} />,
+      );
+      const classes = (getByTestId("sheet-content").getAttribute("class") ?? "").split(/\s+/);
+      expect(classes).toContain("max-h-[85vh]");
+      expect(classes.filter((c) => /^h-\[/.test(c))).toEqual([]);
+    });
+
+    test("the field name sits beside its value rather than above it", () => {
+      const { container } = render(
+        <RowDetailSheet row={{ col_01: "a" }} fields={["col_01"]} isOpen onClose={mock(() => {})} rowIndex={0} />,
+      );
+      const label = Array.from(container.querySelectorAll("p")).find((el) => el.textContent === "col_01")!;
+      const value = Array.from(container.querySelectorAll("p")).find((el) => el.textContent === "a")!;
+      // Same parent, and that parent lays its children out in a row.
+      expect(value.parentElement).toBe(label.parentElement);
+      expect((label.parentElement!.getAttribute("class") ?? "").split(/\s+/)).toContain("flex");
+    });
+  });
+
+  test("a declared vector field shows its header line over the whole value, and its copy button copies the value alone", () => {
+    const { container } = render(
+      <RowDetailSheet
+        row={{ id: 1, embedding: [1, 0.5, 0] }}
+        fields={["id", "embedding"]}
+        isOpen
+        onClose={mock(() => {})}
+        rowIndex={0}
+        vectorColumns={{ embedding: { kind: "dense", dtype: "float32", dimension: 3 } }}
+      />,
+    );
+    expect(container.textContent).toContain("dense float32, 3 dims\n[1.0,0.5,0.0]");
+    const copyButtons = Array.from(container.querySelectorAll("button")).filter(
+      (b) => !b.textContent?.includes("Copy JSON") && !b.textContent?.includes("Copied"),
+    );
+    fireEvent.click(copyButtons[1]!);
+    expect(String(writeText.mock.calls[0]?.[0])).toBe("[1.0,0.5,0.0]");
+  });
+
+  test("without the declaration the same field is the JSON block it was", () => {
+    const { container } = render(
+      <RowDetailSheet
+        row={{ id: 1, embedding: [1, 0.5, 0] }}
+        fields={["id", "embedding"]}
+        isOpen
+        onClose={mock(() => {})}
+        rowIndex={0}
+      />,
+    );
+    expect(container.textContent).toContain(JSON.stringify([1, 0.5, 0], null, 2));
+  });
+
+  test("a masked vector field shows and copies its mask", () => {
+    const sensitiveColumns = new Map<string, unknown>([["embedding", { type: "custom" }]]);
+    const { container, queryByText } = render(
+      <RowDetailSheet
+        row={{ id: 1, embedding: [1, 0.5, 0] }}
+        fields={["id", "embedding"]}
+        isOpen
+        onClose={mock(() => {})}
+        rowIndex={0}
+        maskingActive
+        sensitiveColumns={sensitiveColumns as never}
+        vectorColumns={{ embedding: { kind: "dense", dtype: "float32", dimension: 3 } }}
+      />,
+    );
+    expect(queryByText("***MASKED***")).not.toBeNull();
+    const copyButtons = Array.from(container.querySelectorAll("button")).filter(
+      (b) => !b.textContent?.includes("Copy JSON") && !b.textContent?.includes("Copied"),
+    );
+    fireEvent.click(copyButtons[1]!);
+    expect(String(writeText.mock.calls[0]?.[0])).toBe("***MASKED***");
+  });
+
+  test("Copy JSON under masking writes an unmasked vector field as its value, not its header line", () => {
+    const sensitiveColumns = new Map<string, unknown>([["email", { type: "email" }]]);
+    const { queryByText } = render(
+      <RowDetailSheet
+        row={{ id: 1, email: "alice@example.com", embedding: [1, 0.5, 0] }}
+        fields={["id", "email", "embedding"]}
+        isOpen
+        onClose={mock(() => {})}
+        rowIndex={0}
+        maskingActive
+        sensitiveColumns={sensitiveColumns as never}
+        vectorColumns={{ embedding: { kind: "dense", dtype: "float32", dimension: 3 } }}
+      />,
+    );
+
+    fireEvent.click(queryByText("Copy JSON")!);
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(writeText.mock.calls[0]?.[0]))).toEqual({
+      id: 1,
+      email: "***MASKED***",
+      embedding: "[1.0,0.5,0.0]",
+    });
   });
 });

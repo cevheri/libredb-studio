@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { createLocalWorld } from "@workflow/world-local";
 import { streamText, tool } from "ai";
+import { AGENT_WORKFLOW_VARIANTS, persistedRunFacts, workflowAvailability } from "@/lib/agent/agent-manifest";
+import { unreadStopAsksFor } from "@/lib/agent/models";
 import { forgetHeldSnapshots } from "@/lib/agent/context-snapshot";
 import { AgentRunDeadline } from "@/lib/agent/deadline";
 import { AGENT_REPORT_RESERVE_TURNS, AGENT_WORKFLOW_BUDGETS } from "@/lib/agent/execution-policy";
@@ -12,15 +14,15 @@ import {
   AGENT_REPORT_RESERVE_NOTICE,
   type AgentToolResources,
   guidanceDelivered,
-  PLAN_NO_REASONING_EFFORT,
   runInvestigation,
 } from "@/lib/agent/investigation";
-import type { AgentModel } from "@/lib/agent/model-adapter";
+import { type AgentModel, PLAN_NO_REASONING_EFFORT } from "@/lib/agent/model-adapter";
 import { resolveAgentProviderAdapter } from "@/lib/agent/provider-registry";
+import * as providerRegistry from "@/lib/agent/provider-registry";
 import { AgentRepairLedger } from "@/lib/agent/repair-ledger";
 import { AgentRunService, AgentRunServiceError } from "@/lib/agent/run-service";
 import { AgentRunStore } from "@/lib/agent/run-store";
-import { AGENT_TOOL_DEFINITIONS } from "@/lib/agent/tools";
+import { AGENT_TOOL_DEFINITIONS, type AgentToolContext, groundsUnderExecutionProfile } from "@/lib/agent/tools";
 import type { AgentRunActor, AgentRunEvent, AgentRunRecord, AgentRunWorkflowType } from "@/lib/agent/types";
 import { UNTRUSTED_CONTENT_BEGIN } from "@/lib/agent/untrusted-content";
 import { ExecutionProfileError, QueryError } from "@/lib/db/errors";
@@ -28,10 +30,20 @@ import { ExecutionArtifactStore } from "@/lib/db/operations/artifacts";
 import { ExecutionBudgetTracker } from "@/lib/db/operations/budgets";
 import { createCanonicalOperationRegistry } from "@/lib/db/operations/descriptors";
 import { createTargetScope } from "@/lib/db/operations/policy";
+import { KafkaProvider } from "@/lib/db/providers/stream/kafka/index";
+import { EtcdProvider } from "@/lib/db/providers/keyvalue/etcd/index";
+import { InfluxDB3Provider, InfluxDBProvider } from "@/lib/db/providers/timeseries/influxdb/index";
 import type { DatabaseProvider, ProviderCapabilities, ProviderLabels } from "@/lib/db/types";
 import { KEY_PATTERN_LABELS, SEARCH_INDEX_LABELS, TABLE_LABELS } from "../fixtures/provider-labels";
-import { LLMAuthError } from "@/lib/llm/types";
-import type { ColumnSchema, DatabaseConnection, DatabaseType, QueryResult, TableSchema } from "@/lib/types";
+import { LLMAuthError, LLMConfigError, LLMStreamError } from "@/lib/llm/types";
+import type {
+  ColumnSchema,
+  DatabaseConnection,
+  DatabaseType,
+  ForeignKeySchema,
+  IndexSchema,
+  QueryResult,
+} from "@/lib/types";
 import {
   type Turn,
   answersProse,
@@ -44,7 +56,15 @@ import {
   scriptedModel,
   unansweredCall,
 } from "./fixtures/agent-scripted-model";
-import { chatNeverAnswers, chatToolCallStream, endpointError } from "./fixtures/agent-transport";
+import {
+  chatNeverAnswers,
+  chatTextStream,
+  chatToolCallStream,
+  endpointError,
+  geminiTextStream,
+  responsesTextStream,
+  responsesToolCallStream,
+} from "./fixtures/agent-transport";
 
 /**
  * The investigation workflow (#329 T7b): the loop that turns one objective into a
@@ -85,13 +105,33 @@ const CAPABILITIES: ProviderCapabilities = {
   supportsExplain: true,
   explainFormat: "postgres-json",
   supportsExternalQueryLimiting: true,
-  supportsCreateTable: true,
   supportsInlineRowEdit: true,
   supportsMaintenance: false,
   maintenanceOperations: [],
   supportsConnectionString: true,
   defaultPort: 5432,
   schemaRefreshPattern: "manual",
+};
+
+/** One object as a grounding fixture declares it, before the walk addresses it. */
+interface GroundedObject {
+  readonly name: string;
+  readonly columns: readonly ColumnSchema[];
+  readonly indexes: readonly IndexSchema[];
+  readonly foreignKeys?: readonly ForeignKeySchema[];
+}
+
+/**
+ * The capabilities a run grounded through the OBJECT surface needs.
+ *
+ * A kind has to be DECLARED before anything can be listed under it (standing ruling 4), so
+ * a fixture that declares none is an engine with nothing to read and the walk says so.
+ * Kept apart from `CAPABILITIES` rather than folded into it: the composed catalog path
+ * reads declared kinds too, and every dialect it serves would start composing them.
+ */
+const OBJECT_CAPABILITIES: ProviderCapabilities = {
+  ...CAPABILITIES,
+  objectKinds: [{ id: "table", role: "relation", label: "Table", labelPlural: "Tables" }],
 };
 
 const OBJECTIVE = "Why is the orders report slow?";
@@ -128,35 +168,53 @@ interface BootOptions {
   readonly spentMs?: number;
   /**
    * Fails the provider acquisition — a reach that dies before the statement is
-   * sent. Called once per acquisition and may return nothing, so a fixture can let
-   * the drive's context capture succeed and take the pool away afterwards.
+   * sent. Called once per acquisition, with the execution profile asked for, and may
+   * return nothing, so a fixture can let the drive's context capture succeed and take
+   * the pool away afterwards, or refuse one profile and grant another.
    */
-  readonly acquireFails?: () => Error | undefined;
+  readonly acquireFails?: (profile: string) => Error | undefined;
   /**
    * What the provider says when asked to describe its own schema (#414).
    *
-   * Absent means a `getSchema()` that REJECTS, which is the shape a provider that
-   * cannot describe this database really has: `getSchema` is a required member of
-   * `DatabaseProvider`, so no provider reaching this path is missing it, and the
+   * Absent means an object read that REJECTS, which is the shape a provider that cannot
+   * describe this database really has: the five object methods are required members of
+   * `DatabaseProvider`, so no provider reaching this path is missing them, and the
    * reachable failure is a rejection. Supplying one is how a run on a dialect with no
    * catalog plan becomes GROUNDED, which is the case #414 exists for.
+   *
+   * One container and one kind, which is what a zero-level engine has: the walk reads the
+   * empty container path, asks for the kinds `OBJECT_CAPABILITIES` declares, and joins the
+   * bulk column read onto the listing by path.
    */
-  readonly describesSchema?: () => Promise<readonly TableSchema[]>;
+  readonly describesSchema?: () => Promise<readonly GroundedObject[]>;
 }
 
 function boot(dataDir: string, options: BootOptions = {}): Boot {
   const answer = options.answer ?? (async () => queryResult());
   const queryReadOnly = mock((sql: string) => answer(sql));
+  const describes =
+    options.describesSchema ??
+    ((): Promise<readonly GroundedObject[]> => {
+      throw new QueryError("this database refused to describe its own objects");
+    });
   const provider = {
     queryReadOnly,
-    getSchema:
-      options.describesSchema ??
-      (async (): Promise<readonly TableSchema[]> => {
-        throw new QueryError("this database refused to describe its own schema");
-      }),
+    listContainers: async () => [],
+    countObjects: async () => ({ table: { count: (await describes()).length } }),
+    listObjects: async () =>
+      (await describes()).map((object) => ({ path: [object.name], name: object.name, kind: "table" })),
+    describeObject: async (path: readonly string[]) => ({ path, columns: [], indexes: [], foreignKeys: [] }),
+    describeObjects: async () => ({
+      details: (await describes()).map((object) => ({
+        path: [object.name],
+        columns: object.columns,
+        indexes: object.indexes,
+        foreignKeys: object.foreignKeys ?? [],
+      })),
+    }),
   } as unknown as DatabaseProvider;
-  const acquireProvider = mock(async () => {
-    const failure = options.acquireFails?.();
+  const acquireProvider = mock(async (_connection: DatabaseConnection, profile: string) => {
+    const failure = options.acquireFails?.(profile);
     if (failure) throw failure;
     return provider;
   });
@@ -534,7 +592,7 @@ describe("a fresh run drives the investigation arc", () => {
   test("the model is offered exactly the four read-class tools", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b);
-    const script = scriptedModel(answersProse("nothing to do"));
+    const script = scriptedModel(answersProse("nothing to do"), answersProse("nothing to do"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -556,7 +614,7 @@ describe("a fresh run drives the investigation arc", () => {
   test("the objective and the untrusted-content rule are both stated to the model", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b);
-    const script = scriptedModel(answersProse("ok"));
+    const script = scriptedModel(answersProse("ok"), answersProse("ok"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -573,6 +631,8 @@ describe("a fresh run drives the investigation arc", () => {
     expect(messages.filter((message) => message.role === "user").map((message) => message.content)).toContain(
       OBJECTIVE,
     );
+    // A SQL inventory is declared, not sampled, so it carries no sampling note.
+    expect(JSON.stringify(messages)).not.toContain("inferred from sampled documents");
   });
 });
 
@@ -604,7 +664,7 @@ describe("the model is told what a citation IS, not only that it must cite (#350
   test("the run's rules carry both arms of the evidence contract", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b);
-    const script = scriptedModel(answersProse("ok"));
+    const script = scriptedModel(answersProse("ok"), answersProse("ok"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -622,7 +682,7 @@ describe("the model is told what a citation IS, not only that it must cite (#350
   test("the snapshot's own fingerprint is offered as a citation when it is captured", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b);
-    const script = scriptedModel(answersProse("ok"));
+    const script = scriptedModel(answersProse("ok"), answersProse("ok"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -679,7 +739,7 @@ describe("the model is told what a citation IS, not only that it must cite (#350
     ).rejects.toThrow();
 
     const second = boot(dataDir);
-    const resumed = scriptedModel(answersProse("ok"));
+    const resumed = scriptedModel(answersProse("ok"), answersProse("ok"));
     await runInvestigation(run.runId, {
       service: second.service,
       model: await modelOver(resumed.fetch),
@@ -701,7 +761,7 @@ describe("the model is told what a citation IS, not only that it must cite (#350
   test("planning mode is not told to cite anything, because it has nothing to cite", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b, "planning");
-    const script = scriptedModel(answersProse("a plan"));
+    const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -743,7 +803,10 @@ describe("planning mode runs no statement of the user's", () => {
   test("the model is handed no tools, only the server's catalog reads are sent, and the prose is returned", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b, "planning");
-    const script = scriptedModel(answersProse("First ", "look at the index."));
+    const script = scriptedModel(
+      answersProse("First ", "look at the index."),
+      answersProse("First ", "look at the index."),
+    );
 
     const result = await runInvestigation(run.runId, {
       service: b.service,
@@ -777,7 +840,10 @@ describe("planning mode runs no statement of the user's", () => {
   test("an operations plan reads its own inventory, is told what it holds, and is told of no tool", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b, "planning", "operations");
-    const script = scriptedModel(answersProse("I would read the wait events."));
+    const script = scriptedModel(
+      answersProse("I would read the wait events."),
+      answersProse("I would read the wait events."),
+    );
 
     const result = await runInvestigation(run.runId, {
       service: b.service,
@@ -827,19 +893,15 @@ describe("planning mode runs no statement of the user's", () => {
             {
               table_schema: "public",
               table_name: "orders",
-              column_name: "customer_id",
-              data_type: "character varying",
-              is_nullable: "NO",
+              columns: [{ name: "customer_id", type: "character varying", nullable: "NO" }],
             },
             {
               table_schema: "public",
               table_name: "customers",
-              column_name: "id",
-              data_type: "character varying",
-              is_nullable: "NO",
+              columns: [{ name: "id", type: "character varying", nullable: "NO" }],
             },
           ],
-          fields: ["table_schema", "table_name", "column_name", "data_type", "is_nullable"],
+          fields: ["table_schema", "table_name", "columns"],
           rowCount: 2,
         });
       }
@@ -870,7 +932,7 @@ describe("planning mode runs no statement of the user's", () => {
     };
     const b = boot(freshDataDir(), { answer: catalog });
     const operationsRun = await startRun(b, "agent", "operations");
-    const operationsScript = scriptedModel(answersProse("nothing to add"));
+    const operationsScript = scriptedModel(answersProse("nothing to add"), answersProse("nothing to add"));
     await runInvestigation(operationsRun.runId, {
       service: b.service,
       model: await modelOver(operationsScript.fetch),
@@ -879,7 +941,10 @@ describe("planning mode runs no statement of the user's", () => {
     const catalogReadsSoFar = b.queryReadOnly.mock.calls.length;
 
     const laterRun = await startRun(b, "planning", "investigation");
-    const laterScript = scriptedModel(answersProse("```postgres\nSELECT id FROM orders\n```"));
+    const laterScript = scriptedModel(
+      answersProse("```postgres\nSELECT id FROM orders\n```"),
+      answersProse("```postgres\nSELECT id FROM orders\n```"),
+    );
     await runInvestigation(laterRun.runId, {
       service: b.service,
       model: await modelOver(laterScript.fetch),
@@ -930,11 +995,9 @@ describe("planning mode runs no statement of the user's", () => {
             rows: Array.from({ length: 300 }, (_unused, index) => ({
               table_schema: "public",
               table_name: `department_table_${index}`,
-              column_name: "identifier_column",
-              data_type: "character varying",
-              is_nullable: "NO",
+              columns: [{ name: "identifier_column", type: "character varying", nullable: "NO" }],
             })),
-            fields: ["table_schema", "table_name", "column_name", "data_type", "is_nullable"],
+            fields: ["table_schema", "table_name", "columns"],
             rowCount: 300,
           })
         : queryResult({ rows: [], fields: [], rowCount: 0 });
@@ -942,7 +1005,7 @@ describe("planning mode runs no statement of the user's", () => {
     for (const mode of ["agent", "planning"] as const) {
       const b = boot(freshDataDir(), { answer: wide });
       const run = await startRun(b, mode, "operations");
-      const script = scriptedModel(answersProse("understood"));
+      const script = scriptedModel(answersProse("understood"), answersProse("understood"));
 
       await runInvestigation(run.runId, {
         service: b.service,
@@ -963,7 +1026,7 @@ describe("planning mode runs no statement of the user's", () => {
     for (const mode of ["agent", "planning"] as const) {
       const b = boot(freshDataDir());
       const run = await startRun(b, mode, "operations");
-      const script = scriptedModel(answersProse("understood"));
+      const script = scriptedModel(answersProse("understood"), answersProse("understood"));
 
       await runInvestigation(run.runId, {
         service: b.service,
@@ -987,7 +1050,10 @@ describe("planning mode runs no statement of the user's", () => {
   test("the plan reaches the ledger, not just the caller", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b, "planning");
-    const script = scriptedModel(answersProse("Start with ", "the salary index."));
+    const script = scriptedModel(
+      answersProse("Start with ", "the salary index."),
+      answersProse("Start with ", "the salary index."),
+    );
 
     const result = await runInvestigation(run.runId, {
       service: b.service,
@@ -1006,7 +1072,7 @@ describe("planning mode runs no statement of the user's", () => {
   test("the ledger records how the loop ended, not only that it did", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b, "planning");
-    const script = scriptedModel(answersProse("a plan"));
+    const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -1021,7 +1087,7 @@ describe("planning mode runs no statement of the user's", () => {
   test("a run that says nothing writes no empty closing statement", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b, "planning");
-    const script = scriptedModel(answersProse(""));
+    const script = scriptedModel(answersProse(""), answersProse(""));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -1063,7 +1129,11 @@ describe("planning mode runs no statement of the user's", () => {
   test("a tool the run was never offered is refused without reaching the database", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b, "planning");
-    const script = scriptedModel(callsTool("run_read_query", { sql: "SELECT 1" }), answersProse("understood"));
+    const script = scriptedModel(
+      callsTool("run_read_query", { sql: "SELECT 1" }),
+      answersProse("understood"),
+      answersProse("understood"),
+    );
 
     const result = await runInvestigation(run.runId, {
       service: b.service,
@@ -1114,27 +1184,19 @@ describe("planning mode runs no statement of the user's", () => {
             {
               table_schema: "public",
               table_name: "orders",
-              column_name: "id",
-              data_type: "integer",
-              is_nullable: "NO",
-            },
-            {
-              table_schema: "public",
-              table_name: "orders",
-              column_name: "customer_id",
-              data_type: "integer",
-              is_nullable: "NO",
+              columns: [
+                { name: "id", type: "integer", nullable: "NO" },
+                { name: "customer_id", type: "integer", nullable: "NO" },
+              ],
             },
             {
               table_schema: "public",
               table_name: "customers",
-              column_name: "id",
-              data_type: "integer",
-              is_nullable: "NO",
+              columns: [{ name: "id", type: "integer", nullable: "NO" }],
             },
           ],
-          fields: ["table_schema", "table_name", "column_name", "data_type", "is_nullable"],
-          rowCount: 3,
+          fields: ["table_schema", "table_name", "columns"],
+          rowCount: 2,
         });
       }
       if (sql.includes("pg_constraint")) {
@@ -1159,7 +1221,7 @@ describe("planning mode runs no statement of the user's", () => {
     /** One agent run, which is what puts this connection's inventory in the process. */
     const readTheCatalogOnce = async (b: Boot): Promise<void> => {
       const run = await startRun(b, "agent");
-      const script = scriptedModel(answersProse("understood"));
+      const script = scriptedModel(answersProse("understood"), answersProse("understood"));
       await runInvestigation(run.runId, {
         service: b.service,
         model: await modelOver(script.fetch),
@@ -1173,7 +1235,7 @@ describe("planning mode runs no statement of the user's", () => {
 
       const b = boot(freshDataDir(), { answer: catalog });
       const run = await startRun(b, "planning");
-      const script = scriptedModel(answersProse("a plan"));
+      const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
 
       const result = await runInvestigation(run.runId, {
         service: b.service,
@@ -1221,7 +1283,7 @@ describe("planning mode runs no statement of the user's", () => {
       const capturedAtMs = 1_000_000;
       const reader = boot(freshDataDir(), { answer: catalog });
       const readerRun = await startRun(reader, "agent");
-      const readerScript = scriptedModel(answersProse("understood"));
+      const readerScript = scriptedModel(answersProse("understood"), answersProse("understood"));
       await runInvestigation(readerRun.runId, {
         service: reader.service,
         model: await modelOver(readerScript.fetch),
@@ -1233,7 +1295,7 @@ describe("planning mode runs no statement of the user's", () => {
 
       const b = boot(freshDataDir(), { answer: catalog });
       const run = await startRun(b, "planning");
-      const script = scriptedModel(answersProse("a plan"));
+      const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
       await runInvestigation(run.runId, {
         service: b.service,
         model: await modelOver(script.fetch),
@@ -1265,7 +1327,7 @@ describe("planning mode runs no statement of the user's", () => {
 
       const b = boot(freshDataDir(), { answer: catalog });
       const run = await startRun(b, "planning");
-      const script = scriptedModel(answersProse("a plan"));
+      const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
 
       await runInvestigation(run.runId, {
         service: b.service,
@@ -1298,7 +1360,7 @@ describe("planning mode runs no statement of the user's", () => {
 
     /*
       The honest-limits half of the design (item 6): grounding is served for the
-      dialects `CATALOG_COMPOSERS` covers — PostgreSQL and SQLite — and on any other
+      dialects that supply a `catalogCapture` — PostgreSQL and SQLite — and on any other
       engine the run is ungrounded and must KNOW it. This used to be reachable by
       simply not having read the catalog; since a plan run reads its own, the engine
       is what makes it reachable, and it is the case that still ships.
@@ -1306,12 +1368,19 @@ describe("planning mode runs no statement of the user's", () => {
     test("a run on an engine this server cannot ground is told so rather than left to invent a schema", async () => {
       const b = boot(freshDataDir(), { answer: catalog });
       const run = await startRun(b, "planning");
-      const script = scriptedModel(answersProse("a plan"));
+      const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
 
       await runInvestigation(run.runId, {
         service: b.service,
         model: await modelOver(script.fetch),
-        resources: { ...b.resources, connection: { ...CONNECTION, type: "mongodb" } },
+        // `OBJECT_CAPABILITIES` so the walk REACHES the provider and is refused by it. With no
+        // kind declared it would be refused one step earlier, by this server, and the run would
+        // be told something true about the declaration instead of about the database.
+        resources: {
+          ...b.resources,
+          connection: { ...CONNECTION, type: "mongodb" },
+          capabilities: OBJECT_CAPABILITIES,
+        },
       });
 
       const rules = rulesOf(script.turns[0] as Turn);
@@ -1330,9 +1399,9 @@ describe("planning mode runs no statement of the user's", () => {
       // dialect only decides which of two readings is taken, and what this run is told
       // is the thing that actually stopped it — the same forwarding `operations` has
       // done since #411, for the reason #411 recorded. What stopped it is a
-      // `getSchema()` that rejected, which is the only shape "this provider cannot
-      // describe the database" has: the method is required on `DatabaseProvider`.
-      expect(script.turns[0]?.transcript).toContain("this database refused to describe its own schema");
+      // an object read that rejected, which is the only shape "this provider cannot describe
+      // the database" has: the five object methods are required on `DatabaseProvider`.
+      expect(script.turns[0]?.transcript).toContain("this database refused to describe its own objects");
       expect(script.turns[0]?.transcript).not.toContain("inspect_schema");
       // Since #414 the capture DOES acquire a provider here, under the operations
       // profile, and asks it to describe itself; this fixture's provider carries only
@@ -1355,7 +1424,7 @@ describe("planning mode runs no statement of the user's", () => {
     */
     describe("a plan run grounded through the engine's own schema inspection", () => {
       const column = (name: string): ColumnSchema => ({ name, type: "string", nullable: true, isPrimary: false });
-      const PROVIDER_INVENTORY: readonly TableSchema[] = [
+      const PROVIDER_INVENTORY: readonly GroundedObject[] = [
         { name: "orders", columns: [column("customerId")], indexes: [], foreignKeys: [] },
         { name: "customers", columns: [column("name")], indexes: [], foreignKeys: [] },
       ];
@@ -1363,18 +1432,19 @@ describe("planning mode runs no statement of the user's", () => {
       const planOnProvider = async (
         language: ProviderCapabilities["queryLanguage"],
         labels?: ProviderLabels,
+        type: DatabaseType = "mongodb",
       ): Promise<{ readonly rules: string; readonly transcript: string }> => {
         const b = boot(freshDataDir(), { describesSchema: async () => PROVIDER_INVENTORY });
         const run = await startRun(b, "planning");
-        const script = scriptedModel(answersProse("a plan"));
+        const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
 
         await runInvestigation(run.runId, {
           service: b.service,
           model: await modelOver(script.fetch),
           resources: {
             ...b.resources,
-            connection: { ...CONNECTION, type: "mongodb" },
-            capabilities: { ...CAPABILITIES, queryLanguage: language, declaresForeignKeys: false },
+            connection: { ...CONNECTION, type },
+            capabilities: { ...OBJECT_CAPABILITIES, queryLanguage: language, declaresForeignKeys: false },
             ...(labels === undefined ? {} : { labels }),
           },
         });
@@ -1460,6 +1530,133 @@ describe("planning mode runs no statement of the user's", () => {
         // And the vocabulary warning, because this product records every engine's
         // inventory under the words table and column.
         expect(rules).toContain("those are the names of its own objects and of the fields inside them");
+      });
+
+      /*
+        #1085: a third language takes the non-SQL arm of `planningStatementContract`, and that arm
+        says nothing that is only true of JSON. The connection stays this describe's `mongodb`
+        fixture, because the type reaches only the two sentences that name the engine; what is
+        under test is which arm the LANGUAGE selects.
+      */
+      test("a PromQL engine takes the same neutral contract, and is never told to write SQL", async () => {
+        const { rules } = await planOnProvider("promql");
+
+        expect(rules).toContain("database's own query language");
+        expect(rules).toContain("This engine speaks no SQL");
+        expect(rules).toContain("those are the names of its own objects and of the fields inside them");
+        // The SQL arm's opening and its SQL-only name rule, neither of which may also be present.
+        expect(rules).not.toContain("Produce ONE runnable statement: the statement that answers the question.");
+        expect(rules).not.toContain("and no column name that is not in that inventory");
+      });
+
+      /*
+        InfluxDB spec 6.5 and A.11: `influxdb` declares `"influxql"`, which is not `"sql"`, so it takes the
+        neutral arm with its fence tag `influxdb` and its `statementLanguage` label after the opening. The
+        labels are the ones the provider ships, and the connection is an `influxdb` one, because the tag
+        the block must carry is the type-id.
+      */
+      test("an InfluxQL engine takes the neutral contract, its own language sentence and the influxdb tag", async () => {
+        const labels = new InfluxDBProvider({
+          id: "influxdb-plan",
+          name: "InfluxDB",
+          type: "influxdb",
+          host: "127.0.0.1",
+          port: 8086,
+          createdAt: new Date(0),
+        }).getLabels();
+        const { rules } = await planOnProvider("influxql", labels, "influxdb");
+
+        expect(rules).toContain("written in this influxdb database's own query language");
+        expect(rules).toContain("This engine speaks no SQL");
+        expect(rules).toContain(`Write it in ${labels.statementLanguage}.`);
+        expect(rules).toContain("Put it in a single fenced block tagged `influxdb`");
+        expect(rules.indexOf("own query language")).toBeLessThan(rules.indexOf("Write it in InfluxQL"));
+        expect(rules).not.toContain("Produce ONE runnable statement: the statement that answers the question.");
+        expect(rules).not.toContain("and no column name that is not in that inventory");
+      });
+
+      /*
+        InfluxDB spec I13: `influxdb3` declares `"sql"`, so it takes the SQL contract, and its
+        `statementLanguage` sentence says which SQL: DataFusion as InfluxDB 3 runs it, not InfluxQL.
+      */
+      test("an InfluxDB 3 engine takes the SQL contract plus its DataFusion sentence and the influxdb3 tag", async () => {
+        const labels = new InfluxDB3Provider({
+          id: "influxdb3-plan",
+          name: "InfluxDB 3",
+          type: "influxdb3",
+          host: "127.0.0.1",
+          port: 8181,
+          createdAt: new Date(0),
+        }).getLabels();
+        const { rules } = await planOnProvider("sql", labels, "influxdb3");
+
+        expect(rules).toContain("Produce ONE runnable statement: the statement that answers the question.");
+        expect(rules).toContain(`Write it in ${labels.statementLanguage}.`);
+        expect(rules).toContain("Apache DataFusion SQL as InfluxDB 3 runs it, not InfluxQL and not Flux");
+        expect(rules).toContain("Put it in a single fenced block tagged `influxdb3`");
+        expect(rules).not.toContain("This engine speaks no SQL");
+      });
+
+      /*
+        #1088: Kafka declares `"json"`, so it takes the same neutral arm, and the one fact about how
+        its statement is written is its provider's `statementLanguage` label, stated verbatim after
+        that arm's opening: the read request's schema, which is this product's own, with its keys as
+        the label quotes them. The labels are the ones the provider ships, so the sentence that
+        reaches the model is the one under test. The non-SQL name rule stays beside it, and the
+        label's clause is what answers it: the inventory's columns are not keys of the request.
+      */
+      test("a Kafka engine is told its read request's keys, after the neutral contract", async () => {
+        const labels = new KafkaProvider({
+          id: "kafka-plan",
+          name: "Kafka",
+          type: "kafka",
+          host: "localhost",
+          port: 9092,
+          createdAt: new Date(0),
+        }).getLabels();
+        const { rules } = await planOnProvider("json", labels);
+
+        expect(rules).toContain("database's own query language");
+        expect(rules).toContain("Write it in the JSON read request this editor executes");
+        for (const key of ['"topic"', '"partition"', '"from"', '"limit"', '{"offset"', '{"timestamp"']) {
+          expect(rules, key).toContain(key);
+        }
+        expect(rules).toContain("Use no name that is not in that inventory");
+        expect(rules).toContain("not keys of the request");
+        // The label adds to the contract rather than replacing it: the neutral opening comes first.
+        expect(rules.indexOf("own query language")).toBeLessThan(rules.indexOf("Write it in the JSON read request"));
+        // The SQL arm's opening and its SQL-only name rule, neither of which may also be present.
+        expect(rules).not.toContain("Produce ONE runnable statement: the statement that answers the question.");
+        expect(rules).not.toContain("and no column name that is not in that inventory");
+      });
+
+      /*
+        #1089: etcd declares `"json"` too, so it takes the same neutral arm, and the one fact about how its
+        statement is written is its provider's `statementLanguage` label, stated verbatim after that arm's
+        opening (spec 6.3): one etcdctl command per run, the reads plan mode drafts, the prefix rule, two
+        read examples, and that every write is the user's to type. The labels are the ones the provider ships.
+      */
+      test("an etcd engine is told its etcdctl subset, after the neutral contract (#1089)", async () => {
+        const labels = new EtcdProvider({
+          id: "etcd-plan",
+          name: "etcd",
+          type: "etcd",
+          host: "127.0.0.1",
+          port: 2379,
+          createdAt: new Date(0),
+        }).getLabels();
+        const { rules } = await planOnProvider("json", labels);
+
+        expect(rules).toContain("database's own query language");
+        expect(rules).toContain(`Write it in ${labels.statementLanguage}.`);
+        expect(rules).toContain("exactly one command per run");
+        expect(rules).toContain("get /app/config/ --prefix --limit=50");
+        expect(rules).toContain("is typed by the user in the editor and never drafted");
+        // The label adds to the contract rather than replacing it: the neutral opening comes first.
+        expect(rules.indexOf("own query language")).toBeLessThan(rules.indexOf("the etcdctl command this editor runs"));
+        // The SQL arm's opening and its SQL-only name rule, neither of which may also be present.
+        expect(rules).not.toContain("Produce ONE runnable statement: the statement that answers the question.");
+        expect(rules).not.toContain("and no column name that is not in that inventory");
       });
 
       /*
@@ -1577,7 +1774,7 @@ describe("planning mode runs no statement of the user's", () => {
       test("a composed reading keeps its own two sentences", async () => {
         const first = boot(freshDataDir(), { answer: catalog });
         const firstRun = await startRun(first, "planning");
-        const firstScript = scriptedModel(answersProse("a plan"));
+        const firstScript = scriptedModel(answersProse("a plan"), answersProse("a plan"));
         await runInvestigation(firstRun.runId, {
           service: first.service,
           model: await modelOver(firstScript.fetch),
@@ -1589,7 +1786,7 @@ describe("planning mode runs no statement of the user's", () => {
         // The same connection, a second process: the reading is now the hold's.
         const second = boot(freshDataDir(), { answer: catalog });
         const secondRun = await startRun(second, "planning");
-        const secondScript = scriptedModel(answersProse("a plan"));
+        const secondScript = scriptedModel(answersProse("a plan"), answersProse("a plan"));
         await runInvestigation(secondRun.runId, {
           service: second.service,
           model: await modelOver(secondScript.fetch),
@@ -1618,7 +1815,7 @@ describe("planning mode runs no statement of the user's", () => {
       that these rows are this product's own summary of a bounded reading.
     */
     describe("a plan run on an engine whose inventory rows are groupings this server derived", () => {
-      const KEY_PREFIXES: readonly TableSchema[] = [
+      const KEY_PREFIXES: readonly GroundedObject[] = [
         { name: "user:*", columns: [], indexes: [], foreignKeys: [] },
         { name: "order:*", columns: [], indexes: [], foreignKeys: [] },
       ];
@@ -1636,7 +1833,7 @@ describe("planning mode runs no statement of the user's", () => {
       }> => {
         const b = boot(freshDataDir(), { describesSchema: async () => KEY_PREFIXES });
         const run = await startRun(b, "planning", workflowType);
-        const script = scriptedModel(answersProse("a plan"));
+        const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
 
         await runInvestigation(run.runId, {
           service: b.service,
@@ -1645,7 +1842,7 @@ describe("planning mode runs no statement of the user's", () => {
             ...b.resources,
             connection: { ...CONNECTION, type: "redis" },
             capabilities: {
-              ...CAPABILITIES,
+              ...OBJECT_CAPABILITIES,
               queryLanguage: "json",
               declaresForeignKeys: false,
               tablesAreDerivedGroupings: true,
@@ -1734,7 +1931,7 @@ describe("planning mode runs no statement of the user's", () => {
       test("an engine that declares neither the noun nor the grouping is untouched", async () => {
         const b = boot(freshDataDir(), { answer: catalog });
         const run = await startRun(b, "planning");
-        const script = scriptedModel(answersProse("a plan"));
+        const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
         await runInvestigation(run.runId, {
           service: b.service,
           model: await modelOver(script.fetch),
@@ -1767,12 +1964,10 @@ describe("planning mode runs no statement of the user's", () => {
                 {
                   table_schema: "public",
                   table_name: "invoices",
-                  column_name: "id",
-                  data_type: "integer",
-                  is_nullable: "NO",
+                  columns: [{ name: "id", type: "integer", nullable: "NO" }],
                 },
               ],
-              fields: ["table_schema", "table_name", "column_name", "data_type", "is_nullable"],
+              fields: ["table_schema", "table_name", "columns"],
               rowCount: 1,
             })
           : queryResult({ rows: [], fields: [], rowCount: 0 });
@@ -1784,7 +1979,7 @@ describe("planning mode runs no statement of the user's", () => {
         connectionId: "conn_2",
         objective: OBJECTIVE,
       });
-      const script = scriptedModel(answersProse("a plan"));
+      const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
 
       await runInvestigation(run.runId, {
         service: other.service,
@@ -1838,11 +2033,9 @@ describe("planning mode runs no statement of the user's", () => {
           rows: Array.from({ length: 300 }, (_, index) => ({
             table_schema: "public",
             table_name: `department_table_${index}`,
-            column_name: "identifier_column",
-            data_type: "character varying",
-            is_nullable: "NO",
+            columns: [{ name: "identifier_column", type: "character varying", nullable: "NO" }],
           })),
-          fields: ["table_schema", "table_name", "column_name", "data_type", "is_nullable"],
+          fields: ["table_schema", "table_name", "columns"],
           rowCount: 300,
         });
       }
@@ -1873,7 +2066,7 @@ describe("planning mode runs no statement of the user's", () => {
     const firstTurnOf = async (mode: "agent" | "planning"): Promise<string> => {
       const b = boot(freshDataDir(), { answer: wideCatalog });
       const run = await startRun(b, mode);
-      const script = scriptedModel(answersProse("understood"));
+      const script = scriptedModel(answersProse("understood"), answersProse("understood"));
       await runInvestigation(run.runId, {
         service: b.service,
         model: await modelOver(script.fetch),
@@ -1933,7 +2126,7 @@ describe("planning mode runs no statement of the user's", () => {
     const planRulesFor = async (workflowType: AgentRunWorkflowType): Promise<string> => {
       const b = boot(freshDataDir());
       const run = await startRun(b, "planning", workflowType);
-      const script = scriptedModel(answersProse("a plan"));
+      const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
       await runInvestigation(run.runId, {
         service: b.service,
         model: await modelOver(script.fetch),
@@ -1941,6 +2134,75 @@ describe("planning mode runs no statement of the user's", () => {
       });
       return rulesOfTurn(script.turns[0] as Turn);
     };
+
+    describe("a run that named neither statement nor refusal is ASKED, whoever it is", () => {
+      /*
+        The ask existed and was unreachable for anyone nobody had measured.
+
+        `askForPlanStatement` tested the model's `planStatementRetries` — 0 unless a profile says
+        otherwise — BEFORE it tested whether the run had fallen short. So the server read the
+        closing prose, learned through `readPlanStatement` that it held neither a fenced statement
+        nor the `NO STATEMENT:` marker, held the sentence written for exactly that shape, and
+        returned false on the line above: because of who the model was, not what the run did.
+
+        The order was the whole defect. The reader below is the same reader, with the same dialect,
+        that `verifyPlanningGoal` is about to score `no-statement` on, so the branch is reachable
+        only on a run already earning that verdict; a run that clears the bar returns non-absent
+        and is never touched. The turn provably cannot cost a pass.
+
+        Measured. `cogito:32b` and `qwen2.5:32b` each hold five surfaces and lose plan 4/5, every
+        loss `no-statement` with the model stopping on its own after prose that describes the
+        schema correctly and names no statement — and neither has a row in the document, so
+        neither was ever told. `ornith:9b` and `qwen3:14b` lost that cell in that exact shape and
+        BOTH were won by this one sentence, recorded as a number against their names rather than
+        as a rule.
+      */
+      test("a model with no measured profile is sent the sentence, and given the turn to act on it", async () => {
+        const b = boot(freshDataDir());
+        const run = await startRun(b, "planning");
+        // Two turns of prose, neither naming a statement — the losing shape, twice.
+        const script = scriptedModel(
+          answersProse("The database holds orders and customers."),
+          answersProse("Still prose."),
+        );
+
+        await runInvestigation(run.runId, {
+          service: b.service,
+          // A model nobody has measured, which is the case the ask could not reach.
+          model: await modelOver(script.fetch, undefined, "some-model-nobody-measured:9b"),
+          resources: b.resources,
+        });
+
+        const events = await eventsOf(b.store, run.runId);
+        expect(events.filter((event) => event.kind === "guidance-issued").map((event) => event.notice)).toContain(
+          "plan-statement",
+        );
+        // The sentence itself reached the model, on a turn it could still act on.
+        expect(script.turns[1]?.transcript).toContain("names no statement");
+      });
+
+      test("a run whose prose already holds a refusal is not asked", async () => {
+        // The guard, and the reason the reader runs where it does: a run that ended correctly
+        // must not be told it failed. `NO STATEMENT:` IS a correct ending.
+        const b = boot(freshDataDir());
+        const run = await startRun(b, "planning");
+        const script = scriptedModel(
+          answersProse("NO STATEMENT: the inventory cannot derive the columns this question needs."),
+          answersProse("unused"),
+        );
+
+        await runInvestigation(run.runId, {
+          service: b.service,
+          model: await modelOver(script.fetch, undefined, "some-model-nobody-measured:9b"),
+          resources: b.resources,
+        });
+
+        const events = await eventsOf(b.store, run.runId);
+        expect(events.filter((event) => event.kind === "guidance-issued").map((event) => event.notice)).not.toContain(
+          "plan-statement",
+        );
+      });
+    });
 
     test("a grounded plan is asked for one runnable statement, fenced and tagged with this engine", async () => {
       const rules = await planRulesFor("investigation");
@@ -1991,13 +2253,13 @@ describe("planning mode runs no statement of the user's", () => {
     test("an ungrounded plan is told to refuse with NO STATEMENT: rather than invent one", async () => {
       const b = boot(freshDataDir());
       const run = await startRun(b, "planning");
-      const script = scriptedModel(answersProse("a plan"));
+      const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
 
       await runInvestigation(run.runId, {
         service: b.service,
         model: await modelOver(script.fetch),
         // The engine decides it: grounding is served for the dialects
-        // `CATALOG_COMPOSERS` covers, and on anything else the run has no inventory
+        // that supply a `catalogCapture`, and on anything else the run has no inventory
         // at all.
         resources: { ...b.resources, connection: { ...CONNECTION, type: "mongodb" } },
       });
@@ -2082,19 +2344,23 @@ describe("planning mode runs no statement of the user's", () => {
 
     /*
       The engine decides it, exactly as it does for every other workflow since #411:
-      `CATALOG_PLANS` serves PostgreSQL and SQLite, and on anything else an operations
+      PostgreSQL and SQLite supply a `catalogCapture`, and on anything else an operations
       plan is ungrounded and must KNOW it — otherwise the rules that keep it from
       naming tables nobody has are resting on a flag that is not honest.
     */
     test("an operations plan on an engine this server cannot ground is told it has seen nothing", async () => {
       const b = boot(freshDataDir());
       const run = await startRun(b, "planning", "operations");
-      const script = scriptedModel(answersProse("a plan"));
+      const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
 
       await runInvestigation(run.runId, {
         service: b.service,
         model: await modelOver(script.fetch),
-        resources: { ...b.resources, connection: { ...CONNECTION, type: "mongodb" } },
+        resources: {
+          ...b.resources,
+          connection: { ...CONNECTION, type: "mongodb" },
+          capabilities: OBJECT_CAPABILITIES,
+        },
       });
 
       const rules = rulesOfTurn(script.turns[0] as Turn);
@@ -2105,7 +2371,7 @@ describe("planning mode runs no statement of the user's", () => {
       // thing that knows WHY. Until #414 what it knew here was the DIALECT; now the
       // dialect only decides which of the two readings is taken, and what it knows is
       // that this connection's provider rejected the request to describe the database.
-      expect(script.turns[0]?.transcript).toContain("this database refused to describe its own schema");
+      expect(script.turns[0]?.transcript).toContain("this database refused to describe its own objects");
       // And never the capture's own ADVICE, which sends a model to a tool no operations
       // run holds in either mode (#350).
       expect(script.turns[0]?.transcript).not.toContain("Use inspect_schema");
@@ -2137,7 +2403,7 @@ describe("planning mode runs no statement of the user's", () => {
     test("an ungrounded operations plan may still write the engine's own reporting reading as a statement", async () => {
       const b = boot(freshDataDir());
       const run = await startRun(b, "planning", "operations");
-      const script = scriptedModel(answersProse("a plan"));
+      const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
 
       await runInvestigation(run.runId, {
         service: b.service,
@@ -2182,7 +2448,7 @@ describe("planning mode runs no statement of the user's", () => {
         },
       });
       const run = await startRun(b, "planning", "operations");
-      const script = scriptedModel(answersProse("a plan"));
+      const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
 
       await runInvestigation(run.runId, {
         service: b.service,
@@ -2197,9 +2463,9 @@ describe("planning mode runs no statement of the user's", () => {
     });
 
     /*
-      The record is TOTAL over `AgentRunWorkflowType`, the same way
-      `WORKFLOW_OBJECTIVES` and `WORKFLOW_TOOL_RULES` are, so a workflow added to the
-      union stops `investigation.ts` compiling until someone decides what a plan of it
+      The SQL variants are TOTAL over `AgentRunWorkflowType`, the same way
+      `WORKFLOW_TOOL_RULES` is, so a workflow added to the union stops
+      `agent-manifest.ts` compiling until someone decides what a plan of it
       produces. The compiler enforces that a key exists; this asserts that the key is
       worth having — that every workflow's plan rules actually name a deliverable
       rather than falling through to a shared sentence.
@@ -2283,15 +2549,16 @@ describe("planning mode runs no statement of the user's", () => {
       const operationsPlanRulesOn = async (
         type: DatabaseType,
         options: BootOptions = {},
+        capabilities: ProviderCapabilities = CAPABILITIES,
       ): Promise<{ readonly rules: string; readonly transcript: string }> => {
         const b = boot(freshDataDir(), options);
         const run = await startRun(b, "planning", "operations");
-        const script = scriptedModel(answersProse("a plan"));
+        const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
 
         await runInvestigation(run.runId, {
           service: b.service,
           model: await modelOver(script.fetch),
-          resources: { ...b.resources, connection: { ...CONNECTION, type } },
+          resources: { ...b.resources, connection: { ...CONNECTION, type }, capabilities },
         });
 
         const turn = script.turns[0] as Turn;
@@ -2333,7 +2600,9 @@ describe("planning mode runs no statement of the user's", () => {
         specific about, so everything it can be specific about is the mechanism it names.
       */
       test("an ungrounded operations plan on Redis is told the engine as well as that it saw nothing", async () => {
-        const { rules, transcript } = await operationsPlanRulesOn("redis");
+        // `OBJECT_CAPABILITIES` so the walk reaches this fixture's provider and is refused BY
+        // IT, which is what "this server cannot ground this engine" means here.
+        const { rules, transcript } = await operationsPlanRulesOn("redis", {}, OBJECT_CAPABILITIES);
 
         expect(rules).toContain("No schema inventory is available to this run");
         expect(rules).toContain("This database is redis and nothing else");
@@ -2341,8 +2610,8 @@ describe("planning mode runs no statement of the user's", () => {
         expect(rules).not.toContain("inspect_operations");
         // The capture's own diagnosis still reaches the model, unchanged by this rule.
         // It names the reading rather than the dialect since #414: Redis takes the
-        // provider path now, and this fixture's `getSchema()` rejects.
-        expect(transcript).toContain("this database refused to describe its own schema");
+        // provider path now, and this fixture's object reads reject.
+        expect(transcript).toContain("this database refused to describe its own objects");
       });
 
       /*
@@ -2387,10 +2656,18 @@ describe("planning mode runs no statement of the user's", () => {
       sql.includes("information_schema.columns")
         ? queryResult({
             rows: [
-              { table_schema: "public", table_name: "film", column_name: "title", data_type: "text" },
-              { table_schema: "public", table_name: "actor", column_name: "name", data_type: "text" },
+              {
+                table_schema: "public",
+                table_name: "film",
+                columns: [{ name: "title", type: "text", nullable: "NO" }],
+              },
+              {
+                table_schema: "public",
+                table_name: "actor",
+                columns: [{ name: "name", type: "text", nullable: "NO" }],
+              },
             ],
-            fields: ["table_schema", "table_name", "column_name", "data_type"],
+            fields: ["table_schema", "table_name", "columns"],
             rowCount: 2,
           })
         : queryResult({ rows: [], fields: [], rowCount: 0 });
@@ -2425,7 +2702,10 @@ describe("planning mode runs no statement of the user's", () => {
     ): Promise<readonly AgentRunEvent[]> => {
       const b = boot(freshDataDir(), { answer: catalog });
       const run = await startRun(b, "planning", options.workflowType);
-      const script = scriptedModel(answersProse(closing));
+      // Two turns of the same prose: the drive now asks a grounded plan run that named no
+      // statement to write one, and a model with nothing new to say repeats itself. The
+      // verdict, the ledger and every assertion below are unchanged by the extra turn.
+      const script = scriptedModel(answersProse(closing), answersProse(closing));
 
       await runInvestigation(run.runId, {
         service: b.service,
@@ -2543,6 +2823,70 @@ describe("planning mode runs no statement of the user's", () => {
       expect(draftedIn(events)).toBeUndefined();
     });
 
+    /*
+      #1085. `promql` is a language tag that names the `prometheus` type-id, the one every PromQL
+      server this product reaches connects through, so on this suite's PostgreSQL connection a
+      PromQL block is written for another engine exactly as the `mysql` one above is. Read as
+      naming no engine, it was recorded as this run's statement: stamped `postgres`, judged by
+      the SQL guard, its identifier check reporting no unknown table in a text that names none,
+      and the run scored answered without ever being asked for the SQL.
+    */
+    test("a PromQL block is not recorded as a PostgreSQL run's statement, and the run is asked for one", async () => {
+      const events = await planWith(fenced("pg_replication_lag_seconds > 30", "promql"));
+
+      expect(draftedIn(events)).toBeUndefined();
+      expect(events.filter((event) => event.kind === "guidance-issued").map((event) => event.notice)).toContain(
+        "plan-statement",
+      );
+      expect(events.find((event) => event.kind === "run-finished")).toMatchObject({
+        goalVerdict: { outcome: "unanswered", unmet: ["no-statement"] },
+      });
+    });
+
+    test("a PromQL block written before the run's own statement does not hide it", async () => {
+      const closing = [
+        fenced("pg_replication_lag_seconds > 30", "promql"),
+        "",
+        "```postgres",
+        "SELECT title FROM film;",
+        "```",
+      ];
+
+      expect(draftedIn(await planWith(closing.join("\n")))).toMatchObject({
+        sql: "SELECT title FROM film;",
+        dialect: "postgres",
+        readOnly: true,
+      });
+    });
+
+    /*
+      InfluxDB spec 6.5: `influxql` is a language tag that names the `influxdb` type-id (the `promql`
+      rule), so on this suite's PostgreSQL connection an InfluxQL block is written for another engine.
+    */
+    test("an InfluxQL block is not recorded as a PostgreSQL run's statement, and the run is asked for one", async () => {
+      const events = await planWith(fenced("SELECT mean(temp) FROM home WHERE time > now() - 1h", "influxql"));
+
+      expect(draftedIn(events)).toBeUndefined();
+      expect(events.filter((event) => event.kind === "guidance-issued").map((event) => event.notice)).toContain(
+        "plan-statement",
+      );
+    });
+
+    test.each(["influxdb", "influxql"])(
+      "an InfluxQL block on an InfluxDB run is recorded as unjudged, under its tag %s",
+      async (tag) => {
+        const statement = "SELECT mean(temp) FROM home WHERE time > now() - 1h GROUP BY time(5m)";
+        const drafted = draftedIn(await planWith(fenced(statement, tag), { type: "influxdb", language: "influxql" }));
+        expect(drafted).toMatchObject({
+          dialect: "influxdb",
+          sql: statement,
+          guardApplicable: false,
+          readOnly: false,
+          identifiers: { kind: "not-applicable" },
+        });
+      },
+    );
+
     test("an explicit refusal drafts no statement, and is not recorded as one", async () => {
       const events = await planWith("NO STATEMENT: nothing in the inventory records payments.");
 
@@ -2567,7 +2911,12 @@ describe("planning mode runs no statement of the user's", () => {
     test("an agent run's closing prose is not a plan statement, however it is fenced", async () => {
       const b = boot(freshDataDir(), { answer: catalog });
       const run = await startRun(b, "agent");
-      const script = scriptedModel(answersProse(fenced("SELECT title FROM film")));
+      // Twice: this run reads nothing, so the drive names the instruments once before
+      // letting it stop.
+      const script = scriptedModel(
+        answersProse(fenced("SELECT title FROM film")),
+        answersProse(fenced("SELECT title FROM film")),
+      );
 
       await runInvestigation(run.runId, {
         service: b.service,
@@ -2591,6 +2940,8 @@ describe("planning mode runs no statement of the user's", () => {
     const run = await startRun(b, "agent");
     const script = scriptedModel(
       callsTool("present_answer", { artifact: "corr_1", presentation: { kind: "table" } }),
+      answersProse("understood"),
+      // A refused call read nothing, so the drive names the instruments once more.
       answersProse("understood"),
     );
 
@@ -2703,7 +3054,10 @@ describe("a run survives the process driving it dying", () => {
     await first.service.cancel(run.runId, ACTOR);
 
     const second = boot(dataDir);
-    const resumed = scriptedModel(answersProse("I would look at the index."));
+    const resumed = scriptedModel(
+      answersProse("I would look at the index."),
+      answersProse("I would look at the index."),
+    );
     const result = await runInvestigation(run.runId, {
       service: second.service,
       model: await modelOver(resumed.fetch),
@@ -2875,6 +3229,165 @@ describe("cancellation is honoured at the next checkpoint", () => {
   });
 });
 
+describe("pause is honoured at the next checkpoint", () => {
+  test("a pause asked for while the model was thinking leaves the run paused before the statement", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(async () => {
+      // Recorded while the model "answers": the loop's next checkpoint is the step.
+      await b.service.pause(run.runId);
+      return chatToolCallStream("run_read_query", JSON.stringify({ sql: "SELECT id FROM orders" }));
+    });
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.stopReason).toBeNull();
+    // The context capture ran (the pause was recorded after it, while the model was
+    // answering); the model's own statement never reached the database.
+    expect(modelStatements(b.queryReadOnly)).toEqual([]);
+    const kinds = kindsOf(await eventsOf(b.store, run.runId));
+    expect(kinds).toContain("run-paused");
+    expect(kinds).not.toContain("run-finished");
+    // Nor was it narrated: the drive reads the pause before it writes a draft, so the ledger shows no statement the
+    // drive then declined to run. `runStep`'s own checkpoint would stop the read, but only after the draft.
+    expect(kinds).not.toContain("statement-drafted");
+  });
+
+  test("a pause while the model was thinking reaches a draftless tool at runStep's checkpoint", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(async () => {
+      await b.service.pause(run.runId);
+      return chatToolCallStream("inspect_schema", JSON.stringify({ table: "orders" }));
+    });
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.stopReason).toBeNull();
+    expect(modelStatements(b.queryReadOnly)).toEqual([]);
+    expect(kindsOf(await eventsOf(b.store, run.runId))).not.toContain("run-finished");
+  });
+
+  test("a pause that lands mid-step stops the drive at the loop's next checkpoint", async () => {
+    let runId = "";
+    let service: AgentRunService | null = null;
+    const b = boot(freshDataDir(), {
+      answer: async (sql) => {
+        if (runId !== "" && String(sql).includes("SELECT id FROM orders")) {
+          await service?.pause(runId);
+        }
+        return queryResult();
+      },
+    });
+    service = b.service;
+    const run = await startRun(b);
+    runId = run.runId;
+    const script = scriptedModel(callsTool("run_read_query", { sql: "SELECT id FROM orders" }), reportOn());
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.stopReason).toBeNull();
+    expect(kindsOf(await eventsOf(b.store, run.runId))).not.toContain("run-finished");
+  });
+
+  test("a pause while the model composes its report keeps the run paused and the report", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(callsTool("run_read_query", { sql: "SELECT id FROM orders" }), async (turn) => {
+      // Recorded while the model "answers" its final turn: the report it already
+      // composed must still land, and the drive must not finish the run over it.
+      await b.service.pause(run.runId);
+      return chatToolCallStream(
+        "compose_report",
+        JSON.stringify({
+          claims: [
+            {
+              claim: "The orders report scans the whole table.",
+              evidence: [{ source: "artifact", correlationId: correlationIdIn(turn.transcript) }],
+            },
+          ],
+        }),
+        "call_report",
+      );
+    });
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.stopReason).toBeNull();
+    const kinds = kindsOf(await eventsOf(b.store, run.runId));
+    expect(kinds).toContain("report-composed");
+    expect(kinds).not.toContain("run-finished");
+  });
+
+  test("a pause asked for while the model was thinking leaves a profile_table call paused too", async () => {
+    const b = boot(freshDataDir(), {
+      describesSchema: async () => [
+        {
+          name: "orders",
+          columns: [{ name: "customerId", type: "string", nullable: true, isPrimary: false }],
+          indexes: [],
+          foreignKeys: [],
+        },
+      ],
+    });
+    const run = await startRun(b, "agent", "database-assessment");
+    const script = scriptedModel(async () => {
+      await b.service.pause(run.runId);
+      return chatToolCallStream("profile_table", JSON.stringify({ table: "orders" }));
+    });
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.stopReason).toBeNull();
+    expect(kindsOf(await eventsOf(b.store, run.runId))).not.toContain("run-finished");
+  });
+
+  test("a run already paused before its drive is left paused, not failed", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    await b.service.markRunning(run.runId);
+    await b.service.pause(run.runId);
+    const script = scriptedModel(answersProse("never asked"));
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(result.status).toBe("paused");
+    expect(result.stopReason).toBeNull();
+    // The model is never asked: a paused run gets no turn.
+    expect(script.turns).toHaveLength(0);
+    expect(kindsOf(await eventsOf(b.store, run.runId))).not.toContain("run-finished");
+  });
+});
+
 // ─── bounds ─────────────────────────────────────────────────────────────────
 
 describe("the run loop is bounded", () => {
@@ -2960,6 +3473,250 @@ describe("the run loop is bounded", () => {
 
     const finished = (await eventsOf(b.store, run.runId)).find((event) => event.kind === "run-finished");
     expect(finished).toMatchObject({ status: "failed", stopReason: "model-timeout" });
+  });
+
+  describe("a turn whose STREAM broke is re-asked, because the model did not fail", () => {
+    /*
+      `isRetryableError` is this repository's own reading of an `LLMStreamError`, and
+      `base-provider.ts` already acts on it three times over on the chat surface against these
+      same endpoints. This loop held that judgement and spent runs anyway.
+
+      Measured on `gpt-oss:20b`, database-assessment: runs died on a broken frame a median of 17
+      seconds into a 630-second budget, having called a median of four tools — indistinguishable,
+      up to the break, from the runs that answered. Nothing about the model had failed.
+
+      Re-asked rather than ended because nothing was written: `takeTurn` copies the transcript and
+      never mutates the caller's array, and every ledger write for a call happens downstream in
+      `handleCall`, so the re-ask sends byte-identical bytes.
+    */
+    test("a broken frame costs the turn, not the run", async () => {
+      const b = boot(freshDataDir());
+      const run = await startRun(b);
+      /*
+        A read, then a broken frame, then a report — the measured arc: gpt-oss:20b was cut having
+        already called a median of four tools, holding readings it never filed.
+      */
+      const script = scriptedModel(
+        callsTool("run_read_query", { sql: "SELECT id FROM orders" }),
+        () => {
+          throw new LLMStreamError("terminated", "openai");
+        },
+        reportOn(),
+      );
+
+      const result = await runInvestigation(run.runId, {
+        service: b.service,
+        model: await modelOver(script.fetch),
+        resources: b.resources,
+      });
+
+      // Three turns asked: the read, the frame that broke, and the re-ask that filed.
+      expect(script.turns).toHaveLength(3);
+      expect(result.status).not.toBe("failed");
+    });
+
+    test("an auth failure is not re-asked, because it is not the connection", async () => {
+      // The bound `isRetryableError` draws: a misconfigured server still fails on its first turn.
+      const b = boot(freshDataDir());
+      const run = await startRun(b);
+      const script = scriptedModel(() => {
+        throw new LLMAuthError("no key", "openai");
+      }, reportOn());
+
+      await expect(
+        runInvestigation(run.runId, {
+          service: b.service,
+          model: await modelOver(script.fetch),
+          resources: b.resources,
+        }),
+      ).rejects.toThrow();
+      // One turn only: the second scripted entry is never reached.
+      expect(script.turns).toHaveLength(1);
+    });
+
+    /*
+      The other half, and the reason the re-ask above is not enough on its own.
+
+      A broken frame is an accident: the same bytes sent again land. A tool call the ENDPOINT
+      could not parse is not an accident, and re-sending byte-identical bytes asks the model to
+      make the same mistake a second time. Measured on `gpt-oss:20b`, database-assessment, on the
+      build this branch carries: three runs, each re-asked the full two allowed times, six
+      attempts, all six dead the same way, and the run ended `model-unavailable` seventeen seconds
+      into a 630-second budget having called four tools.
+
+      The endpoint says exactly what is wrong and hands back the model's own text:
+
+          error parsing tool call: raw='We need to answer: "Where is this database's data
+          incomplete or surprising?" ... First, profile salary.{"depth":"basic","table":"salary"}'
+          err=invalid character 'W' looking for beginning of value
+
+      A reasoning model writing its thinking into the argument field, with valid JSON after it.
+      Studio holds that sentence, throws it away, and ends the run without telling the model
+      anything — which is the shape this repository has now corrected five times.
+
+      Free, on the same argument as every other recovery here: the alternative is the throw two
+      lines below, so the run is already over. The turn cannot cost a pass.
+    */
+    test("a tool call the endpoint could not read is answered, not re-sent unchanged", async () => {
+      const b = boot(freshDataDir());
+      const run = await startRun(b);
+      const unreadable = () => {
+        throw new LLMStreamError(
+          `error parsing tool call: raw='We need to answer. First, profile salary.{"depth":"basic","table":"salary"}', err=invalid character 'W' looking for beginning of value`,
+          "openai",
+        );
+      };
+      // The call that could not be read, then the same work done readably.
+      const script = scriptedModel(unreadable, callsTool("inspect_schema", { schema: "public" }), reportOn());
+
+      const result = await runInvestigation(run.runId, {
+        service: b.service,
+        model: await modelOver(script.fetch),
+        resources: b.resources,
+      });
+
+      // Three turns: the unreadable call, the read it makes once told, and the report. Not the
+      // four a run spends re-sending the identical bytes twice before dying.
+      expect(script.turns).toHaveLength(3);
+      const events = await eventsOf(b.store, run.runId);
+      expect(events.filter((event) => event.kind === "guidance-issued").map((event) => event.notice)).toContain(
+        "tool-call-unreadable",
+      );
+      // The sentence names the fault, so the model has something to do differently.
+      expect(script.turns[1]?.transcript).toContain("could not be read");
+      expect(result.stopReason).toBe("report-composed");
+    });
+
+    test("a SECOND unreadable call is answered too, because the fault recurs within one run", async () => {
+      /*
+        The correction to this bound, measured rather than argued.
+
+        It shipped as once per run on the reasoning that a model which hears the sentence and
+        writes the same unparseable arguments again is not rescued by hearing it twice. On
+        `gpt-oss:20b` that is wrong in the way that matters: of ten runs four met the fault, TWO
+        heard the sentence once and went on to answer, and the other two met it a SECOND time
+        later in the run and were ended `model-unavailable` by the bound rather than by anything
+        the model did. Both endings are on the ledger as `failed / model-unavailable` after
+        exactly one `tool-call-unreadable`.
+
+        The sentence works when it is allowed to be said. What the flag encoded was the assumption
+        that the mistake happens once; a long run of a reasoning model makes it more than once, in
+        different turns and over different arguments.
+      */
+      const b = boot(freshDataDir());
+      const run = await startRun(b);
+      const unreadable = () => {
+        throw new LLMStreamError("error parsing tool call: raw='thinking'", "openai");
+      };
+      const script = scriptedModel(
+        unreadable,
+        callsTool("inspect_schema", { schema: "public" }),
+        // The same fault again, turns later and over different arguments.
+        unreadable,
+        reportOn(),
+      );
+
+      const result = await runInvestigation(run.runId, {
+        service: b.service,
+        model: await modelOver(script.fetch),
+        resources: b.resources,
+      });
+
+      const notices = (await eventsOf(b.store, run.runId))
+        .filter((event) => event.kind === "guidance-issued")
+        .map((event) => event.notice);
+      expect(notices.filter((notice) => notice === "tool-call-unreadable")).toHaveLength(2);
+      expect(result.stopReason).toBe("report-composed");
+    });
+
+    test("a third ends the run, so a model that cannot comply still fails fast", async () => {
+      const b = boot(freshDataDir());
+      const run = await startRun(b);
+      const unreadable = () => {
+        throw new LLMStreamError("error parsing tool call: raw='thinking'", "openai");
+      };
+      // Told twice and unable to act on it, which is the case the bound exists for.
+      const script = scriptedModel(unreadable, unreadable, unreadable, unreadable, unreadable, unreadable);
+
+      await expect(
+        runInvestigation(run.runId, {
+          service: b.service,
+          model: await modelOver(script.fetch),
+          resources: b.resources,
+        }),
+      ).rejects.toThrow(/parsing tool call/);
+    });
+  });
+
+  describe("a turn the ceiling cut is given back, because the RUN still has its time", () => {
+    /*
+      `AGENT_MODEL_TURN_TIMEOUT_MS` says what it bounds in as many words — "It bounds ONE call,
+      never the run" — and this branch ended the run anyway. It computed the distinction,
+      `turnBudgetMs < remainingMs`, and spent it on choosing a WORD while taking the same action
+      either way: the branch that PROVES the run still has time was the branch that threw it away.
+
+      Measured on `qwen3.6:35b`, query-optimization: nine losses, every one `model-timeout` with
+      `no-report`, every one ending between 96.9s and 117.2s of a 450000ms deadline — 333 to 353
+      seconds unspent, on turn 2 or 3 of 36. The same cell's longest PASSING run took 183.1s,
+      longer than the total spend of any loss. The premise that licensed the ending ("a ceiling
+      this far above them is only ever reached by a call that is not coming back") holds for a
+      hosted API and is false on a local model: this cell's passing turns run 56.5s and 63.1s.
+
+      It was also the only stop shape in the drive with no recovery path. An empty turn is
+      re-asked, an unread stop is answered with the instruments, the call ceiling is narrowed and
+      reminded, a premature report is held with the next call named — and three of that cell's
+      seven passes are runs one of those paths rescued. This one got silence.
+    */
+    test("the run keeps going, is told what happened, and can still file", async () => {
+      const b = boot(freshDataDir());
+      const run = await startRun(b);
+      /*
+        A read, then a call that never comes back, then a report. The middle turn is the one the
+        ceiling cuts, and the run holds a reading at that moment — which is the losing arc:
+        `qwen3.6:35b` was cut having already called tools, with its report never filed.
+
+        The deadline is five minutes and the ceiling is 200ms, so the run's own clock is untouched
+        when the call is cut, and `turnBudgetMs < remainingMs` is true.
+      */
+      const script = scriptedModel(
+        callsTool("run_read_query", { sql: "SELECT id FROM orders" }),
+        unansweredCall,
+        reportOn(),
+      );
+
+      const result = await runInvestigation(run.runId, {
+        service: b.service,
+        model: await modelOver(script.fetch),
+        resources: b.resources,
+        turnTimeoutMs: 200,
+      });
+
+      expect(result.status).toBe("succeeded");
+      const events = await eventsOf(b.store, run.runId);
+      expect(events.filter((event) => event.kind === "guidance-issued").map((event) => event.notice)).toContain(
+        "turn-cut-off",
+      );
+      // The THIRD turn: the read was turn 1, the cut call turn 2, and the notice rides turn 3.
+      expect(script.turns[2]?.transcript).toContain("cut off at this server's per-call limit");
+    });
+
+    test("once only, so an endpoint that is genuinely gone still fails fast", async () => {
+      // The bound. A second cut ends the run, with the reason it always had.
+      const b = boot(freshDataDir());
+      const run = await startRun(b);
+      const script = scriptedModel(unansweredCall, unansweredCall);
+
+      const result = await runInvestigation(run.runId, {
+        service: b.service,
+        model: await modelOver(script.fetch),
+        resources: b.resources,
+        turnTimeoutMs: 200,
+      });
+
+      expect(result.status).toBe("failed");
+      expect(result.stopReason).toBe("model-timeout");
+      expect(script.turns).toHaveLength(2);
+    });
   });
 
   test("a run that runs out of time is still reported as out of time, not as a slow call", async () => {
@@ -3095,7 +3852,10 @@ describe("a run reserves its last turns for its report", () => {
     // inside its reserve before its first turn.
     const b = boot(freshDataDir());
     const run = await startRun(b, "planning");
-    const script = scriptedModel(answersProse("I would start with the orders table."));
+    const script = scriptedModel(
+      answersProse("I would start with the orders table."),
+      answersProse("I would start with the orders table."),
+    );
 
     const result = await runInvestigation(run.runId, {
       service: b.service,
@@ -3167,7 +3927,7 @@ describe("a run reserves its last turns for its report", () => {
 
     const b = boot(freshDataDir());
     const run = await startRun(b);
-    const script = scriptedModel(answersProse("nothing to add"));
+    const script = scriptedModel(answersProse("nothing to add"), answersProse("nothing to add"));
     await runInvestigation(run.runId, {
       service: b.service,
       model: await modelOver(script.fetch),
@@ -3193,9 +3953,10 @@ describe("a run that stops having read nothing is told to read it itself", () =>
     `no-report`. The extra turn is spent on a run that has lost; it cannot turn a pass into
     a failure, only a failure into another attempt.
 
-    Per-model all the same, and off by default: the ten models locked at 300/300 were
-    measured without it, and a drive-wide change is how this repository has twice handed
-    back cells it had already won.
+    A stated `false` is obeyed all the same: the ten models locked at 300/300 were measured
+    without it, and overruling a measurement is how this repository has twice handed back
+    cells it had already won. What is NOT obeyed is an absent entry, which is not a
+    measurement — see the pair below.
   */
   const asksTheUser = answersProse("Could you please share the exact SQL statement you are running?");
 
@@ -3216,10 +3977,34 @@ describe("a run that stops having read nothing is told to read it itself", () =>
     expect(script.turns[1]?.transcript).toContain("inspect_schema");
   });
 
-  test("a model that was not measured needing it is left alone", async () => {
+  /*
+    Whose sentence it is, decided on the two answers a profile can give.
+
+    The drive holds a sentence written for exactly this ending — "Read it yourself. Call
+    inspect_schema for the tables and their columns, and inspect_plan for how a statement will
+    run" — and for a while sent it only to a model whose profile asked for it. One profile of
+    thirty does, and a model nobody has measured has no profile at all, so the model most
+    in need of the sentence was the one guaranteed not to receive it.
+
+    Measured across the sweep behind 0.14.1: three hundred runs ended `model-stopped` with
+    `no-report`, and HALF of them — a hundred and fifty — had called no tool at all. Ninety-four
+    of those hundred and fifty were ended without the drive saying anything. By model:
+    `mistral-small3.1:24b` 51, `granite3.3:8b` 41, `mistral:7b` 40, `gpt-oss:20b` 18; a hundred
+    and ten of the hundred and fifty on `investigation`, the first surface a model meets.
+
+    The gate's own comment already argued the cost away: it fires only where `anyToolCalled` is
+    false, so the run composed no report and has already earned `no-report` — "the turn cannot
+    cost a pass". A bound that cannot protect a passing run is not protecting anything; what it
+    was withholding was a sentence on a run already lost.
+
+    This is the fourth setting found in this shape and the second corrected. A measured profile
+    is still obeyed: every shipped entry states the field, so no model's turn count moved on it.
+  */
+  test("a model NOBODY has measured is told to read, because the sentence is the server's own", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b);
-    const script = scriptedModel(asksTheUser, answersProse("Understood."));
+    // Prose, nothing read; then, once the drive has named the instruments, it uses them.
+    const script = scriptedModel(asksTheUser, callsTool("inspect_schema", { schema: "public" }), reportOn());
 
     const result = await runInvestigation(run.runId, {
       service: b.service,
@@ -3227,7 +4012,390 @@ describe("a run that stops having read nothing is told to read it itself", () =>
       resources: b.resources,
     });
 
+    const events = await eventsOf(b.store, run.runId);
+    expect(events.filter((event) => event.kind === "guidance-issued").map((event) => event.notice)).toContain(
+      "unread-stop",
+    );
+    expect(script.turns[1]?.transcript).toContain("Read it yourself");
+    // The point of the extra turn: the run ends on a report rather than where the model left it.
+    expect(result.stopReason).toBe("report-composed");
+  });
+
+  test.skip("and so is a model that read something FIRST and then asked the user", async () => {
+    /*
+      The same ending reached by the longer road, and the road the measured losses actually take.
+
+      The gate was `!anyToolCalled`, so the sentence reached a run that had called nothing and
+      was withheld from one that called a tool, looked at what came back, and then asked the
+      user for the rest. That second run is not better off for having read: it is stopped on a
+      question in a run with nobody to answer it, which is the exact ending the sentence was
+      written for, and it has spent a tool call proving it was willing to work.
+
+      `remindToReport` does not cover it either. That one fires — it is gated the other way, on
+      `anyToolCalled` — and it asks for a report. Measured on `glm-4.7-flash`, a
+      query-optimization cell that read 4/5 across ten rolls: the model called `inspect_schema`,
+      was reminded to report, answered the reminder by asking the user to paste the query it had
+      been sent to diagnose, and stopped. Ten of eighteen losses in forty-three runs were that
+      one shape. What it needed was not "file what you found" but "go and find it", which is the
+      sentence this gate was holding back.
+
+      The cost argument the gate's own comment makes is unchanged, and is why the condition can
+      be widened at all: `compose_report` ENDS a run, so a run reaching this branch has composed
+      no report whatever it called, and has already earned `no-report`. The turn cannot cost a
+      pass. Still once per run, and still only where the profile has not measured otherwise.
+    */
+    // SKIPPED, not deleted. Widening the gate to reach this run is a real fix for a measured
+    // loss, and it also gives a second nudge to every run that reads and then narrates - which
+    // is a contract this suite states on purpose ("the reminder is sent once, so a model that
+    // narrates again still stops") and which twenty-two tests encode. That is a design decision
+    // about how many times a run is nudged, not a gate someone mis-wrote, so it is recorded
+    // here with its measurement and left for that decision rather than taken unilaterally.
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    // Reads one thing, asks the user for the rest; then, once the drive has named the
+    // instruments, it goes back and finishes.
+    const script = scriptedModel(
+      callsTool("inspect_schema", { schema: "public" }),
+      asksTheUser,
+      callsTool("inspect_schema", { schema: "public" }),
+      reportOn(),
+    );
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const events = await eventsOf(b.store, run.runId);
+    expect(events.filter((event) => event.kind === "guidance-issued").map((event) => event.notice)).toContain(
+      "unread-stop",
+    );
+    expect(result.stopReason).toBe("report-composed");
+  });
+
+  /*
+    The stop that IS a tool call, written into the text channel instead of the tool one.
+
+    Measured on `llama3.1:8b`, the most-pulled tool-capable model on Ollama, whose analyze cell sat
+    at 4/5 across eight rolls and lost the same run every time. Its losing turn is not prose:
+
+      {"name": "present_answer", "parameters": {"artifact_id": "022dc42c-...", "presentation":
+       {"kind": "chart", "spec": {"type": "bar", "x": "dept_no", ...
+
+    A complete, well-formed call for a tool the run holds, carrying an artifact this run produced -
+    sent as ordinary assistant text. Nothing runs, the drive records a model that stopped talking,
+    and the run ends `no-report` having done every part of the work but the transport.
+
+    `unreadableToolCall` does not serve it and cannot: that notice answers a call that arrived
+    through the TOOL channel and could not be parsed, and tells the model to send arguments only.
+    This call parses perfectly.
+
+    It is RUN, not answered. The first remedy here was a notice - the run was told which channel it
+    had used and given the turn to use the other one - and the wider measurement then showed what
+    that costs. Counted over the open cells' ledgers: 45 of the 46 tool-call-shaped stops are this
+    exact wire form, from three models, every payload complete and citing ids from its own run.
+    Every one got the notice; the notice moved none of them, because a model that already wrote the
+    call correctly has nothing new to write when asked again.
+
+    So `readPromptedAction` reads it and the run dispatches it, on the same terms as every other
+    recovery in this file: the named tool must be one the run HOLDS, and what comes back goes
+    through `AGENT_TOOL_DEFINITIONS` and the audited pipeline exactly as a native call does. The
+    notice stays for the shape that cannot be recovered - the FENCED call in the test below, which
+    is not JSON and carries no arguments to run.
+  */
+  test("a tool call written as text is run, not answered with a reminder", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const callAsText = (): Response =>
+      chatTextStream(JSON.stringify({ name: "inspect_schema", parameters: { kind: "columns" } }));
+    const script = scriptedModel(callsTool("inspect_schema", { schema: "public" }), callAsText, reportOn());
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const events = await eventsOf(b.store, run.runId);
+    // The written call was dispatched, so the turn cost nothing and no notice was needed. Its
+    // arguments differ from the native call above only so that the repeat-call guard does not
+    // collapse the two and hide what this asserts.
+    expect(events.filter((event) => event.kind === "guidance-issued").map((event) => event.notice)).not.toContain(
+      "tool-call-as-text",
+    );
+    expect(events.filter((event) => event.kind === "tool-invoked" && event.tool === "inspect_schema")).toHaveLength(2);
+    expect(result.stopReason).toBe("report-composed");
+  });
+
+  /*
+    The same stop in its other dress: the call written as a FENCED call rather than as JSON.
+
+    Measured on `cogito:8b`, investigate, five runs at one sitting, all five identical and all five
+    with zero tools invoked. The model does not narrate vaguely - it writes the calls out:
+
+        ```sql
+        inspect_schema(kind="columns")
+        ```
+
+    and then reports "based on the schema inspection" on a run that inspected nothing. The JSON
+    reader above does not see this, and should not be made to see prose that merely mentions a
+    tool: what makes this recognisable is the FENCE. A fenced block is a deliberate emission of
+    code, and a fenced block whose first token is a tool this run holds, followed by an opening
+    parenthesis, is a call that went to the wrong channel.
+
+    Same bound, same argument: the run is concluding on `model-stopped` when this fires, so it has
+    already earned `no-report` and the turn cannot cost a pass. Once per run.
+  */
+  test("and the same call written inside a fence is recognised too", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const fencedCall = (): Response =>
+      chatTextStream(
+        'Let me investigate the schema:\n\n```sql\ninspect_schema(kind="columns")\n```\n\nBased on that, the tables are related.',
+      );
+    const script = scriptedModel(
+      callsTool("inspect_schema", { schema: "public" }),
+      fencedCall,
+      callsTool("inspect_schema", { schema: "public" }),
+      reportOn(),
+    );
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const events = await eventsOf(b.store, run.runId);
+    expect(events.filter((event) => event.kind === "guidance-issued").map((event) => event.notice)).toContain(
+      "tool-call-as-text",
+    );
+    expect(result.stopReason).toBe("report-composed");
+  });
+
+  /*
+    The two dresses that made the guard above fire on nothing, both measured 2026-09-16.
+
+    Sixty-nine `model-stopped-saying` events across the last sweep, TWENTY-SEVEN of them carrying a
+    complete call for a tool the run held - eighteen of those `compose_report`, the one tool whose
+    absence is what `no-report` means. Every one of the twenty-seven was invisible to the reader
+    above, for two reasons that are each one line wide:
+
+      the KEY. Twenty wrote `"name"`, seven wrote `"action"`. Only the first was read.
+
+      the BRACE. Not one of the twenty-seven parsed. Twenty-four failed identically -
+      `Expecting ',' delimiter` - a claims array whose last object closes twice:
+      `[{...}, {...}}]`. The call is otherwise perfect: the claims are true, the evidence
+      arrays are there, the correlation ids are ones the run actually produced.
+
+    So the reader is widened from "parses whole as JSON naming a tool" to "names a tool this run
+    holds in the position a call names it". That is deliberately weaker than parsing and it is still
+    far narrower than prose: a key that introduces a call, a colon, and a quoted tool this run HOLDS.
+    The test below this pair pins the line - prose that merely mentions a tool stays untouched.
+
+    It is now REPAIRED and run, which reverses what this test first asserted. The original rule was
+    that a malformed call is recognised and never made good - the model is told where its call went
+    and given the turn to resend. The wider count retired that: of the runs ending in prose holding
+    a tool-call-shaped object, 113 held one that would not parse, and dropping closers that match
+    nothing while appending the ones owed recovers 22 - every one of them citing an artifact id its
+    own run produced. A model that already wrote the call correctly except for one bracket has
+    nothing new to write when asked again. See `parseTolerantly` for the two rules that keep the
+    repair from inventing anything, and the test beside it for the string it refuses to close.
+  */
+  test("a call whose JSON is one brace short is repaired and run, because the brace is not what went wrong", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    // The exact shape twenty-four of the twenty-seven wore: the closing brace of the last array
+    // member written twice. `JSON.parse` refuses it; the call it describes is unambiguous.
+    const brokenCall = (): Response =>
+      chatTextStream('{"name": "inspect_schema", "arguments": {"kind": "columns"}, "extra": [{"a": 1}, {"b": 2}}]}');
+    const script = scriptedModel(callsTool("inspect_schema", { schema: "public" }), brokenCall, reportOn());
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const events = await eventsOf(b.store, run.runId);
+    expect(events.filter((event) => event.kind === "guidance-issued").map((event) => event.notice)).not.toContain(
+      "tool-call-as-text",
+    );
+    expect(events.filter((event) => event.kind === "tool-invoked" && event.tool === "inspect_schema")).toHaveLength(2);
+    expect(result.stopReason).toBe("report-composed");
+  });
+
+  test("and the same, with the key models used second most often", async () => {
+    /*
+      `action` rather than `name`, on a body that still does not parse.
+
+      Where it parses, `readPromptedAction` recovers the call and RUNS it, and has since #4xx - so
+      the seven `action` calls in the measurement were never about the key. They are here because
+      the key and the brace arrived together: an envelope naming the tool under a second key, with
+      the brace fault that keeps every reader before this one from seeing it at all.
+    */
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const actionCall = (): Response =>
+      chatTextStream('{"action": "inspect_schema", "arguments": {"kind": "columns"}, "why": [{"a": 1}}]}');
+    const script = scriptedModel(callsTool("inspect_schema", { schema: "public" }), actionCall, reportOn());
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const events = await eventsOf(b.store, run.runId);
+    expect(events.filter((event) => event.kind === "tool-invoked" && event.tool === "inspect_schema")).toHaveLength(2);
+    expect(result.stopReason).toBe("report-composed");
+  });
+
+  test("an object naming a tool it holds, cut off mid-argument, is answered with the reminder", async () => {
+    /*
+      The half of the detector that no test reached: an UNFENCED object.
+
+      `readPromptedAction` recovers a written call and runs it, which is why the tests above assert
+      no notice - and `parseTolerantly` widens that to calls a bracket short. The one shape it
+      refuses on purpose is an UNTERMINATED STRING: closing it would invent the rest of a value the
+      model never finished writing, and a recovered call resting on an invented argument is worse
+      than no call. So that run reaches this detector instead, which reads only the NAME and asks
+      for the call again rather than guessing at it.
+
+      The fenced form was covered and this one was not, which is the wrong way round: the fence is
+      the rarer dress. Found by the coverage gate rather than by a measurement, and that is the gate
+      doing its job - both dresses of the same mistake now have a test.
+    */
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    // Names a tool this run holds, in the position a call names it, and then stops mid-value.
+    const cutOff = (): Response => chatTextStream('{"name": "inspect_schema", "arguments": {"schema": "pub');
+    const script = scriptedModel(callsTool("inspect_schema", { schema: "public" }), cutOff, reportOn());
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const events = await eventsOf(b.store, run.runId);
+    expect(events.filter((event) => event.kind === "guidance-issued").map((event) => event.notice)).toContain(
+      "tool-call-as-text",
+    );
+    // The turn was given back rather than spent: the run went on to report.
+    expect(result.stopReason).toBe("report-composed");
+  });
+
+  test("but prose that only NAMES a tool is left alone, because that is a model thinking aloud", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const mentions = (): Response =>
+      chatTextStream("I could call inspect_schema here, but the inventory I was given already answers this.");
+    const script = scriptedModel(callsTool("inspect_schema", { schema: "public" }), mentions, answersProse("done"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const events = await eventsOf(b.store, run.runId);
+    expect(events.filter((event) => event.kind === "guidance-issued").map((event) => event.notice)).not.toContain(
+      "tool-call-as-text",
+    );
+  });
+
+  test("it answers the question the run actually asked: WHICH statement", async () => {
+    /*
+      The half of this notice that did not answer the model, measured 2026-10-04.
+
+      `devstral-small-2:24b` holds five of six surfaces at 5/5 and loses optimize the same way
+      every time: five runs, ZERO tools, stopped in nine to thirteen seconds with
+
+          "I need the query text to investigate why it is slow.
+           Please provide the employee listing query you are asking about."
+
+      It is told to read it itself and to call `inspect_plan` "for how a statement will run" - and
+      it asks the same question again, because that sentence answers "how do I read" while the run
+      asked "which statement". `inspect_plan` takes a statement; the objective names one in prose
+      ("Why is the employee listing query slow?") and the sample has no `employee_listing` object,
+      which `composed-sql`'s own docblock records as the shape three other families tripped on.
+
+      Nothing was ever handed a statement here: every surface drafts its own from the schema. That
+      is the fact the notice was missing, and it is true on all of them, so it is said once in the
+      shared sentence rather than per workflow.
+    */
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(asksTheUser, callsTool("inspect_schema", { schema: "public" }), reportOn());
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const told = script.turns[1]?.transcript ?? "";
+    expect(told).toContain("No statement was given to you");
+    expect(told).toContain("write the one you need");
+  });
+
+  test("the ask count is a setting, and the default still asks exactly once", async () => {
+    /*
+      The field was a boolean, and the measurement says it has to be a count.
+
+      `devstral-small-2:24b` holds five of six surfaces at 5/5 and loses optimize on runs that call
+      NOTHING: it says what it needs, is answered with this notice, says the same thing again, and
+      the run ends. `said=2` in the ledger, three runs out of five, 14 to 20 seconds each.
+      Temperature 0.3 moved two of the five to a pass; a worked call made it worse (0/5). What the
+      three remaining losses show is not a model that will not start - it is a model that needs more
+      than one nudge, and `retryUnreadStop` as a boolean can only ever give one.
+
+      `planStatementRetries` is a count for the same reason and `reportReminderLimit` is a count, so
+      the shape is the repo's own. An operator document is where a candidate's count belongs until
+      it ships, which is what `unreadStopAsksFor` reads. What this pins is the default: nothing
+      measured moves, so an unmeasured model is asked exactly once, as before.
+    */
+    expect(unreadStopAsksFor("devstral-small-2:24b")).toBe(1);
+    expect(unreadStopAsksFor("a-model-nobody-measured:7b")).toBe(1);
+
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(asksTheUser, asksTheUser, answersProse("done"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const events = await eventsOf(b.store, run.runId);
+    const asks = events.filter((event) => event.kind === "guidance-issued" && event.notice === "unread-stop").length;
+    expect(asks).toBe(1);
+  });
+
+  test("a profile that states false is still obeyed", async () => {
+    /*
+      The other half of the distinction, and the reason this is a second resolver rather than a
+      changed default. `qwen3:4b` states `retryUnreadStop: false` — a measurement, not an
+      absence — and a number somebody measured is not the drive's to overrule.
+    */
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(asksTheUser, answersProse("Understood."));
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", "qwen3:4b"),
+      resources: b.resources,
+    });
+
     expect(script.turns.length).toBe(1);
+    const events = await eventsOf(b.store, run.runId);
+    expect(events.filter((event) => event.kind === "guidance-issued").map((event) => event.notice)).not.toContain(
+      "unread-stop",
+    );
     expect(result.stopReason).toBe("model-stopped");
   });
 
@@ -3316,7 +4484,11 @@ describe("a run that used its tools and then narrated is reminded once", () => {
     // for reaching outside its set is not evidence that it used one.
     const b = boot(freshDataDir());
     const run = await startRun(b, "planning");
-    const script = scriptedModel(callsTool("run_read_query", { sql: "SELECT 1" }), answersProse("understood"));
+    const script = scriptedModel(
+      callsTool("run_read_query", { sql: "SELECT 1" }),
+      answersProse("understood"),
+      answersProse("understood"),
+    );
 
     const result = await runInvestigation(run.runId, {
       service: b.service,
@@ -3335,7 +4507,9 @@ describe("a run that used its tools and then narrated is reminded once", () => {
     // then told to cite artifacts it has not got.
     const b = boot(freshDataDir());
     const run = await startRun(b);
-    const script = scriptedModel(invents, answersProse("I could not do that."));
+    // Three: an invented name reached nothing, so this run also read nothing, and the
+    // drive names the instruments once before letting it stop.
+    const script = scriptedModel(invents, answersProse("I could not do that."), answersProse("I could not do that."));
 
     const result = await runInvestigation(run.runId, {
       service: b.service,
@@ -3710,7 +4884,7 @@ describe("prior progress is described from the ledger alone", () => {
     });
 
     const second = boot(dataDir);
-    const resumed = scriptedModel(answersProse("continuing"));
+    const resumed = scriptedModel(answersProse("continuing"), answersProse("continuing"));
     await runInvestigation(run.runId, {
       service: second.service,
       model: await modelOver(resumed.fetch),
@@ -3737,7 +4911,7 @@ describe("prior progress is described from the ledger alone", () => {
     });
 
     const second = boot(dataDir);
-    const resumed = scriptedModel(answersProse("continuing"));
+    const resumed = scriptedModel(answersProse("continuing"), answersProse("continuing"));
     await runInvestigation(run.runId, {
       service: second.service,
       model: await modelOver(resumed.fetch),
@@ -3803,7 +4977,7 @@ describe("prior progress is described from the ledger alone", () => {
     }
 
     const second = boot(dataDir);
-    const resumed = scriptedModel(answersProse("continuing"));
+    const resumed = scriptedModel(answersProse("continuing"), answersProse("continuing"));
     await runInvestigation(run.runId, {
       service: second.service,
       model: await modelOver(resumed.fetch),
@@ -3833,7 +5007,7 @@ describe("the run reads its schema context through the catalog tool", () => {
   test("captures the inventory before the first turn, through the audited tool path", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b);
-    const script = scriptedModel(answersProse("understood"));
+    const script = scriptedModel(answersProse("understood"), answersProse("understood"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -3878,7 +5052,7 @@ describe("the run reads its schema context through the catalog tool", () => {
   test("the capture records the statements the tracker charged it, and not a count of its plan", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b);
-    const script = scriptedModel(answersProse("understood"));
+    const script = scriptedModel(answersProse("understood"), answersProse("understood"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -3905,7 +5079,7 @@ describe("the run reads its schema context through the catalog tool", () => {
       },
     });
     const run = await startRun(b);
-    const script = scriptedModel(answersProse("understood"));
+    const script = scriptedModel(answersProse("understood"), answersProse("understood"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -3921,7 +5095,7 @@ describe("the run reads its schema context through the catalog tool", () => {
   test("the packed inventory reaches the model fenced, carrying the fingerprint a claim can cite", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b);
-    const script = scriptedModel(answersProse("understood"));
+    const script = scriptedModel(answersProse("understood"), answersProse("understood"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -3980,7 +5154,7 @@ describe("the run reads its schema context through the catalog tool", () => {
     ).rejects.toThrow();
 
     const second = boot(dataDir);
-    const resumed = scriptedModel(answersProse("continuing"));
+    const resumed = scriptedModel(answersProse("continuing"), answersProse("continuing"));
     await runInvestigation(run.runId, {
       service: second.service,
       model: await modelOver(resumed.fetch),
@@ -4006,7 +5180,7 @@ describe("the run reads its schema context through the catalog tool", () => {
     await first.service.recordEvent(run.runId, { kind: "context-captured", fingerprint: "ctx_old", tableCount: 2 });
 
     const second = boot(dataDir);
-    const resumed = scriptedModel(answersProse("continuing"));
+    const resumed = scriptedModel(answersProse("continuing"), answersProse("continuing"));
     await runInvestigation(run.runId, {
       service: second.service,
       model: await modelOver(resumed.fetch),
@@ -4035,7 +5209,10 @@ describe("the run reads its schema context through the catalog tool", () => {
   test("a planning run on a cold process captures its own context, and still sends no statement of the user's", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b, "planning");
-    const script = scriptedModel(answersProse("I would start with the index."));
+    const script = scriptedModel(
+      answersProse("I would start with the index."),
+      answersProse("I would start with the index."),
+    );
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -4069,7 +5246,7 @@ describe("the run reads its schema context through the catalog tool", () => {
       },
     });
     const run = await startRun(b);
-    const script = scriptedModel(answersProse("I will inspect it myself."));
+    const script = scriptedModel(answersProse("I will inspect it myself."), answersProse("I will inspect it myself."));
 
     const result = await runInvestigation(run.runId, {
       service: b.service,
@@ -4101,7 +5278,7 @@ describe("a run opened with auto-execute is told what the gate needs", () => {
   test("the rule names the plan the gate reads, and the bound the editor does not have", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b, "agent", "data-analysis", true);
-    const script = scriptedModel(answersProse("ok"));
+    const script = scriptedModel(answersProse("ok"), answersProse("ok"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -4118,7 +5295,7 @@ describe("a run opened with auto-execute is told what the gate needs", () => {
   test("a run opened without it is told nothing: a rule about what cannot happen is noise", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b, "agent", "data-analysis");
-    const script = scriptedModel(answersProse("ok"));
+    const script = scriptedModel(answersProse("ok"), answersProse("ok"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -4140,7 +5317,7 @@ describe("a run opened with auto-execute is told what the gate needs", () => {
     for (const workflowType of ["investigation", "query-optimization", "database-assessment", "operations"] as const) {
       const b = boot(freshDataDir());
       const run = await startRun(b, "agent", workflowType, true);
-      const script = scriptedModel(answersProse("ok"));
+      const script = scriptedModel(answersProse("ok"), answersProse("ok"));
 
       await runInvestigation(run.runId, {
         service: b.service,
@@ -4151,6 +5328,465 @@ describe("a run opened with auto-execute is told what the gate needs", () => {
       expect(rulesOf(script.turns[0] as Turn), workflowType).not.toContain("AUTO-EXECUTE IS ON");
     }
   });
+});
+
+/*
+  A MongoDB run is offered no `compare_plans` (`languages/mongo/client.ts` says why), so every sentence it is told must name only
+  the tools it holds. Its plans are recorded under `mongo.plan.estimate`, and a count of plans taken over the SQL id
+  alone told a run that had inspected one plan that it had "inspected none", and sent it to a tool it does not have.
+*/
+describe("a MongoDB run is told only what its own tools can do", () => {
+  const column = (name: string): ColumnSchema => ({ name, type: "string", nullable: true, isPrimary: false });
+  const ORDERS: GroundedObject = { name: "orders", columns: [column("customerId")], indexes: [], foreignKeys: [] };
+
+  const mongoResources = (b: Boot): AgentToolResources => ({
+    ...b.resources,
+    connection: { ...CONNECTION, type: "mongodb" },
+    capabilities: { ...OBJECT_CAPABILITIES, queryLanguage: "json", declaresForeignKeys: false },
+  });
+
+  async function startMongoRun(
+    b: Boot,
+    workflowType: AgentRunWorkflowType,
+    autoExecute = false,
+    verifier?: "agent-query-optimization.3",
+  ): Promise<AgentRunRecord> {
+    const availability = workflowAvailability("agent", workflowType, "mongodb");
+    if (!availability.open) throw new Error(`${workflowType} does not open on mongodb`);
+    return b.service.start({
+      mode: "agent",
+      workflowType,
+      autoExecute,
+      ...persistedRunFacts("agent", workflowType, availability),
+      // A ledger opened before `agent-query-optimization-mongo.1` existed carries `.3`, and keeps its rule.
+      ...(verifier === undefined ? {} : { verifier }),
+      actor: ACTOR,
+      connectionId: "conn_1",
+      objective: OBJECTIVE,
+    });
+  }
+
+  /** A report whose one claim cites only the captured inventory, never an artifact the run read. */
+  const reportOnTheInventory =
+    (claim: string) =>
+    (turn: Turn): Response =>
+      chatToolCallStream(
+        "compose_report",
+        JSON.stringify({
+          claims: [
+            {
+              claim,
+              evidence: [{ source: "context-snapshot", fingerprint: /ctx_[0-9a-f]+/.exec(turn.transcript)?.[0] }],
+            },
+          ],
+        }),
+        "call_report",
+      );
+
+  test("a run whose plan already uses an index answers by citing that plan and recommending nothing", async () => {
+    const b = boot(freshDataDir(), { describesSchema: async () => [ORDERS] });
+    const run = await startMongoRun(b, "query-optimization");
+    const script = scriptedModel(
+      callsTool("inspect_plan", { command: { collection: "orders", operation: "find", filter: { customerId: 7 } } }),
+      reportOn("The plan already reaches the orders through an index, so nothing needs to change."),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: mongoResources(b),
+    });
+
+    const events = await eventsOf(b.store, run.runId);
+    expect(events.find((event) => event.kind === "call-held")).toBeUndefined();
+    expect(events.find((event) => event.kind === "recommendation")).toBeUndefined();
+    expect(events.find((event) => event.kind === "run-finished")).toMatchObject({
+      goalVerdict: { outcome: "answered", verifier: "agent-query-optimization-mongo.1" },
+    });
+  });
+
+  test("a run that holds a plan and reports off the inventory is told both routes, naming the plan, and narrowed to them", async () => {
+    const b = boot(freshDataDir(), { describesSchema: async () => [ORDERS] });
+    const run = await startMongoRun(b, "query-optimization");
+    const script = scriptedModel(
+      callsTool("inspect_plan", { command: { collection: "orders", operation: "find", filter: { customerId: 7 } } }),
+      reportOnTheInventory("The orders collection holds a customerId field."),
+      answersProse("No report."),
+      answersProse("No report."),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: mongoResources(b),
+    }).catch(() => undefined);
+
+    const events = await eventsOf(b.store, run.runId);
+    const plan = events.find(
+      (event) => event.kind === "tool-completed" && event.artifact.operationId === "mongo.plan.estimate",
+    );
+    if (plan?.kind !== "tool-completed") throw new Error("the run took no plan");
+    const held = events.find((event) => event.kind === "call-held");
+    if (held?.kind !== "call-held") throw new Error("the report was not held");
+    expect(held).toMatchObject({ tool: "compose_report", shortfall: "no-plan-cited" });
+    expect(held.reason).toContain(`call recommend_change for an index citing it`);
+    expect(held.reason).toContain("nothing needs to change");
+    expect(held.reason).toContain(plan.artifact.correlationId);
+    expect(held.reason).not.toContain("compare_plans");
+    const declared = (script.turns[2]?.body.tools ?? []) as { function?: { name?: string } }[];
+    expect(declared.map((entry) => entry.function?.name)).toEqual(["recommend_change", "compose_report"]);
+  });
+
+  test("a run that reports holding no plan is sent to plan its command, then to either route", async () => {
+    const b = boot(freshDataDir(), { describesSchema: async () => [ORDERS] });
+    const run = await startMongoRun(b, "query-optimization");
+    const script = scriptedModel(
+      callsTool("run_read_query", {
+        command: { collection: "orders", operation: "find", filter: { customerId: 7 }, options: { limit: 5 } },
+      }),
+      reportOn("The orders read returns few documents."),
+      answersProse("No report."),
+      answersProse("No report."),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: mongoResources(b),
+    }).catch(() => undefined);
+
+    const held = (await eventsOf(b.store, run.runId)).find((event) => event.kind === "call-held");
+    if (held?.kind !== "call-held") throw new Error("the report was not held");
+    expect(held).toMatchObject({ tool: "compose_report", shortfall: "no-plan-cited" });
+    expect(held.reason).toContain(
+      "Call inspect_plan on the command in question, then either recommend_change for an index citing that plan's artifact id, or, if the plan already uses an index, cite it in a claim that nothing needs to change",
+    );
+  });
+
+  test("a run opened under agent-query-optimization.3 that inspected one plan is asked for an index citing that plan, never told it has none", async () => {
+    const b = boot(freshDataDir(), { describesSchema: async () => [ORDERS] });
+    const run = await startMongoRun(b, "query-optimization", false, "agent-query-optimization.3");
+    const script = scriptedModel(
+      callsTool("inspect_plan", { command: { collection: "orders", operation: "find", filter: { customerId: 7 } } }),
+      reportOn("The orders read scans the whole collection."),
+      answersProse("No report."),
+      answersProse("No report."),
+    );
+
+    // A script that runs out is the driving process dying, which the drive surfaces as a rejection; the ledger it
+    // left is what this reads.
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: mongoResources(b),
+    }).catch(() => undefined);
+
+    const events = await eventsOf(b.store, run.runId);
+    const plan = events.find(
+      (event) => event.kind === "tool-completed" && event.artifact.operationId === "mongo.plan.estimate",
+    );
+    if (plan?.kind !== "tool-completed") throw new Error("the run took no plan");
+    const held = events.find((event) => event.kind === "call-held");
+    if (held?.kind !== "call-held") throw new Error("the report was not held");
+    expect(held).toMatchObject({ tool: "compose_report", shortfall: "no-plan-comparison" });
+    expect(held.reason).toContain("recommend_change");
+    expect(held.reason).toContain(plan.artifact.correlationId);
+    expect(held.reason).not.toContain("inspected none");
+    expect(held.reason).not.toContain("compare_plans");
+    // The model reads the same sentence the ledger records.
+    expect(promptText(script.turns[2] as Turn)).toContain(plan.artifact.correlationId);
+    // And holds only what the sentence asks for: the run is narrowed to the variant's `narrowedExtras` and the report.
+    const declared = (script.turns[2]?.body.tools ?? []) as { function?: { name?: string } }[];
+    expect(declared.map((entry) => entry.function?.name)).toEqual(["recommend_change", "compose_report"]);
+  });
+
+  test("a run whose index rests on a read rather than a plan is sent to plan the slow command, in its own noun", async () => {
+    const b = boot(freshDataDir(), { describesSchema: async () => [ORDERS] });
+    const run = await startMongoRun(b, "query-optimization");
+    const recommendsOnTheRead = (turn: Turn): Response =>
+      chatToolCallStream(
+        "recommend_change",
+        JSON.stringify({
+          change: "document-index",
+          collection: "orders",
+          keys: { customerId: 1 },
+          evidence: [{ source: "artifact", correlationId: correlationIdIn(turn.transcript) }],
+        }),
+        "call_recommend",
+      );
+    const script = scriptedModel(
+      callsTool("run_read_query", {
+        command: { collection: "orders", operation: "find", filter: { customerId: 7 }, options: { limit: 5 } },
+      }),
+      recommendsOnTheRead,
+      reportOn("The orders read needs an index on customerId."),
+      answersProse("No report."),
+      answersProse("No report."),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: mongoResources(b),
+    }).catch(() => undefined);
+
+    const events = await eventsOf(b.store, run.runId);
+    expect(events.find((event) => event.kind === "recommendation")).toMatchObject({ change: "document-index" });
+    const held = events.find((event) => event.kind === "call-held");
+    if (held?.kind !== "call-held") throw new Error("the report was not held");
+    expect(held).toMatchObject({ tool: "compose_report", shortfall: "no-plan-evidence" });
+    expect(held.reason).toContain("Call inspect_plan on the slow command, then call recommend_change again");
+  });
+
+  test("a run opened under agent-query-optimization.3 that reports holding no plan is sent to plan its command and recommend an index, never to compare", async () => {
+    const b = boot(freshDataDir(), { describesSchema: async () => [ORDERS] });
+    const run = await startMongoRun(b, "query-optimization", false, "agent-query-optimization.3");
+    const script = scriptedModel(
+      callsTool("run_read_query", {
+        command: { collection: "orders", operation: "find", filter: { customerId: 7 }, options: { limit: 5 } },
+      }),
+      reportOn("The orders read returns few documents."),
+      answersProse("No report."),
+      answersProse("No report."),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: mongoResources(b),
+    }).catch(() => undefined);
+
+    const held = (await eventsOf(b.store, run.runId)).find((event) => event.kind === "call-held");
+    if (held?.kind !== "call-held") throw new Error("the report was not held");
+    expect(held).toMatchObject({ tool: "compose_report", shortfall: "no-plan-comparison" });
+    // In the language's own noun, and by the one route its variant holds.
+    expect(held.reason).toContain(
+      "Call inspect_plan on the command in question, then recommend_change for an index citing that plan's artifact id",
+    );
+    expect(held.reason).not.toContain("compare_plans");
+  });
+
+  // Every workflow whose variant writes a command, read off the variants rather than listed, so a workflow added later
+  // is held to the rule by being offered the read.
+  const commandWorkflows = Object.entries(AGENT_WORKFLOW_VARIANTS.mongo).flatMap(([workflow, variant]) =>
+    variant?.tools.includes("run_read_query") === true ? [workflow as AgentRunWorkflowType] : [],
+  );
+
+  test.each(commandWorkflows)(
+    "a %s run is told a command names the collection alone, not as the inventory spells it",
+    async (workflowType) => {
+      // Written whole, the inventory's app.orders names a collection of that name inside the bound database, which does
+      // not exist, and the read answers empty rather than failing, so nothing else would tell the run its spelling.
+      const b = boot(freshDataDir(), { describesSchema: async () => [ORDERS] });
+      const run = await startMongoRun(b, workflowType);
+      const script = scriptedModel(answersProse("ok"), answersProse("ok"));
+
+      await runInvestigation(run.runId, {
+        service: b.service,
+        model: await modelOver(script.fetch),
+        resources: mongoResources(b),
+      });
+
+      expect(rulesOfTurn(script.turns[0] as Turn)).toContain(
+        'a command names the collection alone, as in "collection": "orders", and reads the database this run\'s connection is bound to.',
+      );
+    },
+  );
+
+  test.each(commandWorkflows)(
+    "a %s run is told an aggregation reads a field with its dollar sign, and a filter names it without",
+    async (workflowType) => {
+      // A real model summed {"$sum": "total"} on the browser pass: the server answers 0 for a string it cannot add, so
+      // the run reported every customer's total as 0 and was scored answered, and nothing else would have told it.
+      const b = boot(freshDataDir(), { describesSchema: async () => [ORDERS] });
+      const run = await startMongoRun(b, workflowType);
+      const script = scriptedModel(answersProse("ok"), answersProse("ok"));
+
+      await runInvestigation(run.runId, {
+        service: b.service,
+        model: await modelOver(script.fetch),
+        resources: mongoResources(b),
+      });
+
+      const rules = rulesOfTurn(script.turns[0] as Turn);
+      expect(rules).toContain('write "$<field>", with the dollar sign, as in {"$sum": "$total"}');
+      expect(rules).toContain('a bare "total" is the string itself, which $sum ignores, so the sum reads 0');
+      expect(rules).toContain("A filter, in a find or a $match stage, names its fields without the dollar sign.");
+    },
+  );
+
+  test("its rules name neither a plan comparison nor an untouched document", async () => {
+    // A plan with several candidates runs each for a bounded trial, so "no document touched" is not true of it, and
+    // a comparison tool the run does not hold is a rule its tool set cannot satisfy (#350).
+    const b = boot(freshDataDir(), { describesSchema: async () => [ORDERS] });
+    const run = await startMongoRun(b, "query-optimization");
+    const script = scriptedModel(answersProse("ok"), answersProse("ok"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: mongoResources(b),
+    });
+
+    const rules = rulesOfTurn(script.turns[0] as Turn);
+    expect(rules).toContain("recommend_change");
+    expect(rules).not.toContain("compare_plans");
+    expect(rules).not.toContain("no document touched");
+  });
+
+  test("a data-analysis run is told a plan returns none of the command's documents, never that it runs nothing", async () => {
+    // The variant offers inspect_plan as well, and a plan with several candidates runs each for a bounded trial, so
+    // "without running it" is not true of it: what a plan never does is answer with the command's documents. The
+    // opening turn says so in both places it states the rule, the rules and the answer tool's own description, and
+    // the refusal a presented plan meets says so too (`mongo-tools.test.ts`).
+    const b = boot(freshDataDir(), { describesSchema: async () => [ORDERS] });
+    const run = await startMongoRun(b, "data-analysis");
+    const script = scriptedModel(answersProse("ok"), answersProse("ok"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: mongoResources(b),
+    });
+
+    const rules = rulesOfTurn(script.turns[0] as Turn);
+    expect(rules).toContain("a plan returns none of the command's documents");
+    expect(rules).not.toContain("without running it");
+    const declared = (script.turns[0]?.body.tools ?? []) as { function?: { name?: string; description?: string } }[];
+    const answer = declared.find((entry) => entry.function?.name === "present_answer")?.function?.description;
+    expect(answer).toContain("a plan returns none of the command's documents");
+    expect(answer).not.toContain("without running it");
+  });
+
+  test("a data-analysis record carrying auto-execute is not told it is on, because no mongo variant hands over", async () => {
+    const b = boot(freshDataDir(), { describesSchema: async () => [ORDERS] });
+    const run = await startMongoRun(b, "data-analysis", true);
+    const script = scriptedModel(answersProse("ok"), answersProse("ok"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: mongoResources(b),
+    });
+
+    expect(rulesOfTurn(script.turns[0] as Turn)).not.toContain("AUTO-EXECUTE IS ON");
+  });
+});
+
+/*
+  A run that sends statements and whose grounding the execution profile refuses ends before its first model turn, on
+  every engine (#1614). Every database tool such a run holds acquires the same profile and would be refused the same
+  way, so a model turn there buys nothing but a drafted statement that never runs. Plan mode and the operations workflow
+  send no statement of the model's, and keep going ungrounded (B48).
+*/
+describe("a run whose grounding the execution profile refuses", () => {
+  const column = (name: string): ColumnSchema => ({ name, type: "string", nullable: true, isPrimary: false });
+  const ORDERS: GroundedObject = { name: "orders", columns: [column("customerId")], indexes: [], foreignKeys: [] };
+  const tooBroad = () =>
+    new ExecutionProfileError("this user can write, so the profile will not run as it", "PROFILE_PRIVILEGES_TOO_BROAD");
+
+  const mongoResources = (b: Boot): AgentToolResources => ({
+    ...b.resources,
+    connection: { ...CONNECTION, type: "mongodb" },
+    capabilities: { ...OBJECT_CAPABILITIES, queryLanguage: "json", declaresForeignKeys: false },
+  });
+
+  test("an engine's own inventory is read under the profile its statements take exactly when the run sends them", () => {
+    // The composed SQL catalog already reads under the read-only profile; the provider's own inventory does for a
+    // statement-sending agent run on a language of its own, so its refusal lands at the grounding, before any turn.
+    const run = (fields: Pick<AgentToolContext, "mode" | "workflowType" | "statementLanguage">) =>
+      groundsUnderExecutionProfile(fields as AgentToolContext);
+    expect(run({ mode: "agent", workflowType: "investigation", statementLanguage: "mongo" })).toBe(true);
+    expect(run({ mode: "agent", workflowType: "data-analysis", statementLanguage: "kubectl" })).toBe(true);
+    expect(run({ mode: "agent", workflowType: "operations", statementLanguage: "mongo" })).toBe(false);
+    expect(run({ mode: "planning", workflowType: "investigation", statementLanguage: "mongo" })).toBe(false);
+    expect(run({ mode: "agent", workflowType: "investigation" })).toBe(false);
+  });
+
+  async function startRunIn(
+    b: Boot,
+    mode: "agent" | "planning",
+    workflowType: AgentRunWorkflowType,
+    type: DatabaseType,
+  ): Promise<AgentRunRecord> {
+    const availability = workflowAvailability(mode, workflowType, type);
+    if (!availability.open) throw new Error(`${workflowType} does not open on ${type}`);
+    return b.service.start({
+      mode,
+      workflowType,
+      ...persistedRunFacts(mode, workflowType, availability),
+      actor: ACTOR,
+      connectionId: "conn_1",
+      objective: OBJECTIVE,
+    });
+  }
+
+  /** What every refused statement-sending run must show: no turn, no statement, the code recorded, the error thrown. */
+  async function expectEndedBeforeAnyTurn(b: Boot, run: AgentRunRecord, resources: AgentToolResources): Promise<void> {
+    const script = scriptedModel(answersProse("never asked"), answersProse("never asked"));
+    const refused = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources,
+    }).catch((error: unknown) => error);
+
+    expect(refused).toBeInstanceOf(ExecutionProfileError);
+    expect((refused as ExecutionProfileError).reasonCode).toBe("PROFILE_PRIVILEGES_TOO_BROAD");
+    expect(script.turns).toHaveLength(0);
+    const events = await eventsOf(b.store, run.runId);
+    expect(kindsOf(events)).not.toContain("statement-drafted");
+    expect(kindsOf(events)).not.toContain("tool-invoked");
+    const unavailable = events.filter((event) => event.kind === "context-unavailable");
+    expect(unavailable).toHaveLength(1);
+    expect(unavailable[0]).toMatchObject({
+      reasonCode: "CATALOG_READ_REFUSED",
+      profileReasonCode: "PROFILE_PRIVILEGES_TOO_BROAD",
+    });
+  }
+
+  test("a MongoDB run ends before its first model turn, its grounding taken under the profile its reads take", async () => {
+    // Only the read-only profile refuses here: a grounding taken under the operations profile, which sends no
+    // statement and so proves nothing, would be granted, and the run would go on to a turn it cannot use.
+    const b = boot(freshDataDir(), {
+      describesSchema: async () => [ORDERS],
+      acquireFails: (profile) => (profile === "agent-read-only" ? tooBroad() : undefined),
+    });
+    const run = await startRunIn(b, "agent", "investigation", "mongodb");
+
+    await expectEndedBeforeAnyTurn(b, run, mongoResources(b));
+    expect(b.acquireProvider.mock.calls.map((call) => call[1])).toEqual(["agent-read-only"]);
+  });
+
+  test("a PostgreSQL run ends the same way: the drive decides it, never the engine", async () => {
+    // A superuser on PostgreSQL is refused at the composed catalog read, which acquires the read-only profile like
+    // every statement does. Before #1614 it spent a paid turn and drafted a statement first.
+    const b = boot(freshDataDir(), { acquireFails: () => tooBroad() });
+    const run = await startRun(b, "agent");
+
+    await expectEndedBeforeAnyTurn(b, run, b.resources);
+  });
+
+  test.each([
+    ["planning", "investigation"],
+    ["agent", "operations"],
+  ] as const)(
+    "a %s %s run records the refusal and goes on to its first turn, ungrounded",
+    async (mode, workflowType) => {
+      const b = boot(freshDataDir(), { describesSchema: async () => [ORDERS], acquireFails: () => tooBroad() });
+      const run = await startRunIn(b, mode, workflowType, "mongodb");
+      const script = scriptedModel(answersProse("a plan"), answersProse("a plan"));
+
+      await runInvestigation(run.runId, {
+        service: b.service,
+        model: await modelOver(script.fetch),
+        resources: mongoResources(b),
+      });
+
+      expect(script.turns.length).toBeGreaterThan(0);
+      const unavailable = (await eventsOf(b.store, run.runId)).find((event) => event.kind === "context-unavailable");
+      expect(unavailable).toMatchObject({ profileReasonCode: "PROFILE_PRIVILEGES_TOO_BROAD" });
+    },
+  );
 });
 
 describe("a run that would report an answer it never presented", () => {
@@ -4231,6 +5867,44 @@ describe("a run that would report an answer it never presented", () => {
     expect(guidanceDelivered(events)["present-before-report"]).toBe(1);
   });
 
+  /*
+    A hold inside the TURN reserve files no report at all, which is the verdict the hold
+    exists to avoid.
+
+    `noTimeToHold` reads as "is there still room to act on this", and the comment above it
+    says turn: a run held with no turn left to act on the holding files no report at all,
+    which is worse than the verdict the hold was avoiding. The expression consulted only
+    the wall clock. `announceReserve` consults the pair — `AGENT_REPORT_RESERVE_TURNS`
+    alongside `AGENT_REPORT_RESERVE_MS`, whose own doc calls itself the same reserve
+    against the wall clock — so the turn half was simply dropped at this one site.
+
+    Measured: three of five optimize runs spent eleven calls reading, were told twice that
+    the reserve had been reached, finally called `compose_report` on the last turn, and had
+    it held for a step there was no turn left to take. Each ended `turn-limit` and
+    `unanswered`, holding a report that would otherwise have been filed. The clock was
+    never the scarce resource — those runs used a hundred seconds of four hundred fifty.
+  */
+  test("a report arriving inside the turn reserve is filed rather than held", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "data-analysis", true);
+    const script = scriptedModel(
+      callsTool("run_read_query", { sql: "SELECT id FROM orders", rationale: "the question, in SQL" }),
+      reportOn("Orders were read."),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+      // The report lands on the last turn, which is what puts it inside the reserve.
+      maxTurns: 2,
+    });
+
+    const events = await eventsOf(b.store, run.runId);
+    expect(events.find((event) => event.kind === "call-held")).toBeUndefined();
+    expect(events.map((event) => event.kind)).toContain("report-composed");
+  });
+
   test("the notice is sent once, so a model that ignores it still reports", async () => {
     // The one-shot matters: without it a model that never presents would have every
     // report intercepted and the run would spend its turns rather than ending.
@@ -4295,6 +5969,10 @@ describe("a run that would report an answer it never presented", () => {
     const script = scriptedModel(
       callsTool("inspect_schema", { schema: "public" }),
       reportOn("The schema was inspected."),
+      // One more than before: the report is now held with the read-first sentence, which
+      // buys the turn this entry answers. What the run must still never hear is the
+      // PRESENT sentence, and that is what the assertion below pins.
+      answersProse("done"),
       answersProse("done"),
     );
 
@@ -4311,12 +5989,73 @@ describe("a run that would report an answer it never presented", () => {
       events.some((event) => event.kind === "tool-completed" && event.artifact.operationId === "sql.query.read"),
     ).toBe(true);
     const sent = script.turns.flatMap((turn) => JSON.stringify(turn.body.messages ?? []));
+    // Still never the PRESENT sentence: there is nothing here it could present. What it IS
+    // told now is the other thing, and the only possible one - go and read something of your
+    // own - which the test below pins.
     expect(sent.some((messages) => messages.includes("This run answers by PRESENTING"))).toBe(false);
-    // Nor anything else. A sentence for exactly this shape was written and measured on the
-    // three models that reach it — a catalog-only read, every statement refused, no call at all
-    // — and none recovered, so it was deleted rather than kept switched off.
-    // And the report it did compose was composed, not intercepted.
-    expect(events.map((event) => event.kind)).toContain("report-composed");
+    // Its report IS held now, by the read-first sentence, and this script ignores the offer:
+    // the model narrates twice and the run ends with no report. That is the SAME verdict the
+    // run earned before the sentence existed - it composed a report and scored `no-answer` -
+    // so nothing that used to pass stops passing; what changed is that a model willing to take
+    // the offer now has one. The test below is the same run taking it.
+    const held = events.find((event) => event.kind === "call-held");
+    expect(held?.tool).toBe("compose_report");
+    expect(held?.reason).toContain("run_read_query");
+  });
+
+  /*
+    The shortfall with no sentence, and it costs a whole cell.
+
+    `no-answer` is the one shortfall this drive never speaks. Four others have an arm in
+    `shortfallNotice` — no-table-profile, no-reading, no-plan-comparison, no-plan-evidence —
+    and a data-analysis run that reports without an answer falls through all of them. The
+    `present-before-report` hold does not reach it either, correctly: that one is withheld from
+    a run holding nothing presentable, because telling a run to present what it cannot present
+    is the mistake the two tests above exist to prevent.
+
+    So the run is told nothing at all. Measured on `mistral-small3.2:24b`, a 24B model at 25/30
+    whose analyze cell reads 0/5 across SIX rolls, naked and levered alike, every run the same
+    four events: three `inspect_schema` calls, a report resting on the inventory, `no-answer`.
+    It never drafts a read because nothing ever says the answer has to be one.
+
+    What it needs is the third sentence, and it is the one that is actually possible: run a read
+    of your own, present that, then report. Held like every other preview notice, because
+    `compose_report` ends the run and a message after it arrives too late.
+  */
+  test("a run that read nothing of its own is told to read, not to present what it cannot", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "data-analysis", true);
+    const script = scriptedModel(
+      callsTool("inspect_schema", { schema: "public" }),
+      reportOn("The schema was inspected."),
+      callsTool("run_read_query", { sql: "SELECT id FROM orders", rationale: "the question, in SQL" }),
+      presentsRead(),
+      reportOn("Orders were read."),
+      reportOn("Orders were read."),
+    );
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    const events = await eventsOf(b.store, run.runId);
+    const held = events.find((event) => event.kind === "call-held");
+    expect(held?.tool).toBe("compose_report");
+    expect(held?.reason).toContain("run_read_query");
+    // The point of the held turn, and the thing this arm is for: the run goes and DRAFTS a
+    // read of its own, which it had not done in any of the six measured rolls. The ordering
+    // is the assertion - the draft comes after the hold, so it is the sentence that bought it.
+    const kinds = events.map((event) => event.kind);
+    expect(kinds).toContain("statement-drafted");
+    expect(kinds.indexOf("call-held")).toBeLessThan(kinds.indexOf("statement-drafted"));
+    // And the tool is still in the run's hands when it is called: a narrowed set here would
+    // have answered the read with "there is no such tool".
+    expect(
+      events.some((event) => event.kind === "tool-completed" && event.artifact.operationId === "sql.query.read"),
+    ).toBe(true);
+    expect(result.stopReason).toBe("report-composed");
   });
 });
 
@@ -4423,8 +6162,8 @@ describe("the handover an answer records comes from the run's own setting", () =
   part without consulting `part.invalid` (src/lib/agent/investigation.ts:1042), and it
   keeps only `role: "assistant"` response messages, discarding the SDK's error result
   (src/lib/agent/investigation.ts:1069). Hardening the first to
-  `part.invalid !== true` — the shape `capability-probe.ts:279` already uses, so it is
-  a natural edit rather than a hypothetical one — deletes #406's entire behaviour
+  `part.invalid !== true` (the shape `capability-probe.ts:296` already uses, so it is
+  a natural edit rather than a hypothetical one) deletes #406's entire behaviour
   gain: the call is dropped, the turn looks like "the model stopped", and the run is
   scored with no answer and nothing on the ledger saying why.
 
@@ -4551,7 +6290,7 @@ describe("a presentation the model serialized reaches the tool through the SDK",
   #414's own bound, and the one invariant whose whole point is that this change did NOT
   widen agent mode.
 
-  Grounding reached the twelve type-ids the read-only profile refuses, because the schema
+  Grounding reached every type-id the read-only profile refuses, because the schema
   capture asks for `agent-operations` — a profile whose acquisition does not require
   `queryReadOnly`. Agent mode's TOOLS are unchanged: `inspect_schema` and
   `run_read_query` compose SQL and acquire `agent-read-only`, which those engines cannot
@@ -4569,7 +6308,7 @@ describe("agent mode is no wider than it was, on an engine grounding now reaches
 
   test("a schema workflow is grounded and still refused at its first read", async () => {
     // The acquisition the CAPTURE makes is granted — it asks for `agent-operations`,
-    // and MongoDB serves it. Every acquisition after it is the tool path asking for
+    // and Redis serves it. Every acquisition after it is the tool path asking for
     // `agent-read-only`, which is what `factory.ts` refuses on a provider with no
     // `queryReadOnly`. One fixture, both real behaviours, in the order a live run meets
     // them.
@@ -4579,7 +6318,7 @@ describe("agent mode is no wider than it was, on an engine grounding now reaches
       acquireFails: () =>
         ++acquisitions > 1
           ? new ExecutionProfileError(
-              'Provider type "mongodb" has no database-native read-only execution profile',
+              'Provider type "redis" implements no read-only statement path (queryReadOnly)',
               "PROFILE_UNSUPPORTED_BY_PROVIDER",
             )
           : undefined,
@@ -4588,7 +6327,7 @@ describe("agent mode is no wider than it was, on an engine grounding now reaches
     const script = scriptedModel(
       // `run_read_query` rather than `inspect_schema`: both are refused, but for
       // different reasons and only this one reaches the profile. `inspect_schema`
-      // composes a catalog statement per dialect and there is none for MongoDB, so it
+      // composes a catalog statement per dialect and there is none for Redis, so it
       // is refused before a provider is asked for. The statement tool is where a
       // schema-workflow agent run really meets the engine limit.
       callsTool("run_read_query", { sql: "SELECT 1", rationale: "size the collection" }),
@@ -4600,8 +6339,8 @@ describe("agent mode is no wider than it was, on an engine grounding now reaches
         model: await modelOver(script.fetch),
         resources: {
           ...b.resources,
-          connection: { ...CONNECTION, type: "mongodb" },
-          capabilities: { ...CAPABILITIES, queryLanguage: "json", declaresForeignKeys: false },
+          connection: { ...CONNECTION, type: "redis" },
+          capabilities: { ...OBJECT_CAPABILITIES, queryLanguage: "json", declaresForeignKeys: false },
         },
       }),
     ).rejects.toThrow(ExecutionProfileError);
@@ -4706,7 +6445,10 @@ describe("a run that will not record what it read is narrowed to what would fini
   test("a run that took no readings is not narrowed, because it has nothing to report yet", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b);
-    const script = scriptedModel(answersProse("I will not be reading anything today."));
+    const script = scriptedModel(
+      answersProse("I will not be reading anything today."),
+      answersProse("I will not be reading anything today."),
+    );
 
     const result = await runInvestigation(run.runId, {
       service: b.service,
@@ -4807,6 +6549,45 @@ describe("a run that will not record what it read is narrowed to what would fini
     });
 
     expect(namedIn(script, 12).sort()).toEqual(["compose_report", "present_answer"]);
+  });
+
+  /*
+    The tool a narrowed analysis must NOT lose, and the loop that losing it creates.
+
+    Narrowing keeps the instruments a surface's verdict still needs, and for data-analysis that
+    was read as `present_answer` alone. It is the right pair only for a run that has something to
+    present. A run whose every call was `inspect_schema` has nothing: `present_answer` refuses a
+    catalog artifact, because the statement behind one is the SERVER's. So narrowing hands such a
+    run two tools, one of which is `compose_report` and the other of which cannot be used, and
+    takes away the only tool that could still change the outcome.
+
+    Measured on `mistral-small3.2:24b`, whose analyze cell reads 0/5 across nine rolls. The
+    ledger is the same every time, and the last line is the one that matters:
+
+      inspect_schema x3 -> report-reminder (narrows) -> compose_report -> held: "call
+      run_read_query" -> "I need to run a query that sums the salary amounts ... Let's draft and
+      run that query." -> stops.
+
+    The model understood the sentence exactly and could not act on it, because the reminder had
+    already taken `run_read_query` away. Being told to call a tool one no longer holds is the
+    #350/#356 defect; here the drive was doing it to itself.
+
+    Kept only while nothing presentable exists, so the narrowing still closes on a run that has
+    read and is merely reading again — which is the loop it was written for.
+  */
+  test("an analysis that has read nothing of its own keeps the tool that would read", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent", "data-analysis");
+    const inspects = () => callsTool("inspect_schema", { schema: "public" });
+    const script = scriptedModel(...Array.from({ length: 13 }, inspects), answersProse("still reading"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch),
+      resources: b.resources,
+    });
+
+    expect(namedIn(script, 12).sort()).toEqual(["compose_report", "present_answer", "run_read_query"]);
   });
 
   test("an instrument a narrowed run has already used three times is dropped too", async () => {
@@ -5043,11 +6824,18 @@ describe("a run is told to report only when it holds something to report from", 
       Naming what would have worked is the move that carried this whole effort — it is what
       the worked example does, and what the citable-id list does. A closed set is the cheapest
       case of it: the values are in the schema, and the refusal already had them in hand.
+
+      The INPUT here changed on 2026-09-20 and the rule did not. It used to omit `change` beside a
+      `CREATE INDEX` statement, which no longer reaches this refusal: `readDisplacedRecommendation`
+      reads the kind off the statement, because 121 refusals in one sweep were models that had
+      written the SQL and could not label it. What still reaches it — and what this now sends — is
+      a statement whose kind cannot be read at all, beside a label that is not in the set. There
+      the server has nothing to correct from, and naming the two values is the whole remedy.
     */
     const b = boot(freshDataDir());
     const run = await startRun(b, "agent", "query-optimization");
     const script = scriptedModel(
-      callsTool("recommend_change", { statement: "CREATE INDEX ON salary (dept_no)" }),
+      callsTool("recommend_change", { change: "reindex", statement: "VACUUM salary" }),
       answersProse("understood"),
       answersProse("understood"),
     );
@@ -5081,17 +6869,19 @@ describe("a model that thinks instead of answering is told not to", () => {
     A REQUEST FIELD, not a word in the prompt: nothing is spliced into what Studio says to a
     model, and no cell's measured wording moves.
   */
-  test.each(["ollama", "openai"] as const)(
+  test.each(["ollama", "custom"] as const)(
     "the field reaches a model configured as %s, because the adapter is the same one",
     async (provider) => {
       /*
-        BOTH providers, and ollama first, because that is where this broke. The options were
-        keyed by the provider's own name; the scripted model is `openai` by default, so a
-        single-provider test passed while every real ollama run sent nothing and timed out.
+        BOTH chat-wire providers, and ollama first, because that is where this broke. The
+        options were keyed by the provider's own name; the scripted model was `openai` by
+        default then, so a single-provider test passed while every real ollama run sent
+        nothing and timed out. The `openai` kind speaks the Responses API now, and its own
+        tests are in the describe that follows this one's sibling.
       */
       const b = boot(freshDataDir());
       const run = await startRun(b, "planning");
-      const script = scriptedModel(answersProse("```sqlite\nSELECT 1\n```"));
+      const script = scriptedModel(answersProse("```sqlite\nSELECT 1\n```"), answersProse("```sqlite\nSELECT 1\n```"));
 
       await runInvestigation(run.runId, {
         service: b.service,
@@ -5108,7 +6898,7 @@ describe("a model that thinks instead of answering is told not to", () => {
     // cells it had already won.
     const b = boot(freshDataDir());
     const run = await startRun(b, "planning");
-    const script = scriptedModel(answersProse("```sqlite\nSELECT 1\n```"));
+    const script = scriptedModel(answersProse("```sqlite\nSELECT 1\n```"), answersProse("```sqlite\nSELECT 1\n```"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -5134,7 +6924,7 @@ describe("a model that thinks instead of answering is told not to", () => {
       */
       const b = boot(freshDataDir());
       const run = await startRun(b, "agent", undefined, undefined, protocol);
-      const script = scriptedModel(answersProse("nothing to add"));
+      const script = scriptedModel(answersProse("nothing to add"), answersProse("nothing to add"));
 
       await runInvestigation(run.runId, {
         service: b.service,
@@ -5170,7 +6960,7 @@ describe("a model that thinks instead of CALLING is told not to, on its agent tu
       // indistinguishable from a planning turn at the gate.
       const b = boot(freshDataDir());
       const run = await startRun(b, "agent", undefined, undefined, protocol);
-      const script = scriptedModel(answersProse("nothing to add"));
+      const script = scriptedModel(answersProse("nothing to add"), answersProse("nothing to add"));
 
       await runInvestigation(run.runId, {
         service: b.service,
@@ -5187,7 +6977,7 @@ describe("a model that thinks instead of CALLING is told not to, on its agent tu
     // plan one and must not acquire the agent one by association.
     const b = boot(freshDataDir());
     const run = await startRun(b, "agent");
-    const script = scriptedModel(answersProse("nothing to add"));
+    const script = scriptedModel(answersProse("nothing to add"), answersProse("nothing to add"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -5201,7 +6991,7 @@ describe("a model that thinks instead of CALLING is told not to, on its agent tu
   test("a model nobody measured is left thinking on both", async () => {
     const b = boot(freshDataDir());
     const run = await startRun(b, "agent");
-    const script = scriptedModel(answersProse("nothing to add"));
+    const script = scriptedModel(answersProse("nothing to add"), answersProse("nothing to add"));
 
     await runInvestigation(run.runId, {
       service: b.service,
@@ -5210,5 +7000,289 @@ describe("a model that thinks instead of CALLING is told not to, on its agent tu
     });
 
     expect(script.turns[0]?.body?.reasoning_effort).toBeUndefined();
+  });
+});
+
+describe("an openai run speaks the Responses API, statelessly", () => {
+  /*
+    The `openai` kind left Chat Completions because GPT-6 tool calling lives on the Responses
+    API. Two things only a run can show: every turn is sent `store: false` with the configured
+    effort, and the encrypted reasoning a stateless turn returns is replayed in the next one,
+    because the loop builds its transcript from the SDK's own assistant messages and
+    `neutraliseAssistantMessages` passes reasoning parts through untouched.
+  */
+  const LUNA = "gpt-6-luna";
+
+  test("a planning turn is sent store: false and LLM_MODEL_EFFORT, on /responses", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "planning");
+    const script = scriptedModel(
+      () => responsesTextStream("```sqlite\nSELECT 1\n```"),
+      () => responsesTextStream("```sqlite\nSELECT 1\n```"),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", LUNA, "openai", "low"),
+      resources: b.resources,
+    });
+
+    expect(script.turns[0]?.body.store).toBe(false);
+    expect(script.turns[0]?.body.reasoning).toEqual({ effort: "low" });
+    expect(script.turns[0]?.body.include).toEqual(["reasoning.encrypted_content"]);
+  });
+
+  test("an agent turn's encrypted reasoning is replayed with the next turn, and the run completes", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b);
+    const script = scriptedModel(
+      () =>
+        responsesToolCallStream(
+          "run_read_query",
+          JSON.stringify({ sql: "SELECT id FROM orders", rationale: "size the table" }),
+          { reasoning: { id: "rs_turn_1", encryptedContent: "ENCRYPTED-TURN-1" } },
+        ),
+      (turn) =>
+        responsesToolCallStream(
+          "compose_report",
+          JSON.stringify({
+            claims: [
+              {
+                claim: "The orders report scans the whole table.",
+                // The Responses API carries the transcript as `input`, not `messages`.
+                evidence: [{ source: "artifact", correlationId: correlationIdIn(JSON.stringify(turn.body.input)) }],
+              },
+            ],
+          }),
+          { callId: "call_report", reasoning: { id: "rs_turn_2", encryptedContent: "ENCRYPTED-TURN-2" } },
+        ),
+    );
+
+    const result = await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", LUNA, "openai"),
+      resources: b.resources,
+    });
+
+    expect(result.status).toBe("succeeded");
+    expect(result.stopReason).toBe("report-composed");
+    const second = script.turns[1]?.body;
+    expect(second?.store).toBe(false);
+    expect(second?.input).toContainEqual(
+      expect.objectContaining({ type: "reasoning", id: "rs_turn_1", encrypted_content: "ENCRYPTED-TURN-1" }),
+    );
+    // The call it reasoned towards, and the loop's own answer to it, follow it in order.
+    expect(second?.input).toContainEqual(expect.objectContaining({ type: "function_call", call_id: "call_1" }));
+    expect(second?.input).toContainEqual(expect.objectContaining({ type: "function_call_output", call_id: "call_1" }));
+  });
+
+  test("an effort the model does not take fails the turn with the SDK's own reason, not a run at another effort", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "planning");
+    const script = scriptedModel(() => responsesTextStream("```sqlite\nSELECT 1\n```"));
+
+    const drive = runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", "gpt-6.1-sol", "openai", "none"),
+      resources: b.resources,
+    });
+
+    // Raised as the configuration error it is, which the drive reports; the answer the SDK got
+    // at its own default effort is never read.
+    await expect(drive).rejects.toThrow(
+      'LLM_MODEL_EFFORT "none" was refused for the model "gpt-6.1-sol" (openai): gpt-6.1-sol only supports the following reasoning efforts: low, medium, high, xhigh, max.',
+    );
+    await expect(drive).rejects.toBeInstanceOf(LLMConfigError);
+    expect(script.turns).toHaveLength(1);
+  });
+
+  test("with no explicit effort a profile's quiet switch still reaches the openai kind, and a drop is raised", async () => {
+    // `gemma4:12b` is measured needing quiet on its agent turns. Served under the openai kind it
+    // is not a model the SDK knows to reason, so the SDK drops the field, and that is raised
+    // rather than the turn running with the thinking its profile was measured needing off.
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "agent");
+    const script = scriptedModel(() => responsesTextStream("nothing to add"));
+
+    const drive = runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", "gemma4:12b", "openai"),
+      resources: b.resources,
+    });
+
+    await expect(drive).rejects.toThrow("The reasoning effort this model's profile asks for was refused");
+    expect(script.turns[0]?.body.store).toBe(false);
+  });
+});
+
+describe("a run sends sampling only where the SDK honours it", () => {
+  const LUNA = "gpt-6-luna";
+
+  /** Collects every warning the SDK's logger is handed, so a drop on the wire can be told from a logged one. */
+  function captureSdkWarnings(): { logged: unknown[]; restore: () => void } {
+    const scope = globalThis as typeof globalThis & { AI_SDK_LOG_WARNINGS?: unknown };
+    const previous = scope.AI_SDK_LOG_WARNINGS;
+    const logged: unknown[] = [];
+    scope.AI_SDK_LOG_WARNINGS = (options: { warnings: unknown[] }) => logged.push(...options.warnings);
+    return { logged, restore: () => (scope.AI_SDK_LOG_WARNINGS = previous) };
+  }
+
+  test("an openai reasoning turn carries no sampling the SDK would drop, and logs no sampling warning", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "planning");
+    const script = scriptedModel(
+      () => responsesTextStream("```sqlite\nSELECT 1\n```"),
+      () => responsesTextStream("```sqlite\nSELECT 1\n```"),
+    );
+    const warnings = captureSdkWarnings();
+
+    try {
+      await runInvestigation(run.runId, {
+        service: b.service,
+        model: await modelOver(script.fetch, "https://api.openai.com/v1", LUNA, "openai"),
+        resources: b.resources,
+      });
+
+      expect(script.turns[0]?.body).not.toHaveProperty("temperature");
+      expect(script.turns[0]?.body).not.toHaveProperty("top_p");
+      expect(warnings.logged).not.toContainEqual(expect.objectContaining({ feature: "temperature" }));
+      expect(warnings.logged).not.toContainEqual(expect.objectContaining({ feature: "topP" }));
+    } finally {
+      warnings.restore();
+    }
+  });
+
+  test("gpt-6-luna at effort none keeps the default sampling on its turns", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "planning");
+    const script = scriptedModel(
+      () => responsesTextStream("```sqlite\nSELECT 1\n```"),
+      () => responsesTextStream("```sqlite\nSELECT 1\n```"),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", LUNA, "openai", "none"),
+      resources: b.resources,
+    });
+
+    expect(script.turns[0]?.body?.temperature).toBe(0);
+    expect(script.turns[0]?.body?.top_p).toBe(1);
+  });
+
+  test("a non-reasoning openai model keeps the default sampling on its turns", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "planning");
+    const script = scriptedModel(
+      () => responsesTextStream("```sqlite\nSELECT 1\n```"),
+      () => responsesTextStream("```sqlite\nSELECT 1\n```"),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", "gpt-4o-mini", "openai"),
+      resources: b.resources,
+    });
+
+    expect(script.turns[0]?.body?.temperature).toBe(0);
+    expect(script.turns[0]?.body?.top_p).toBe(1);
+  });
+
+  test("an ollama turn still carries the default sampling, byte for byte", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "planning");
+    const script = scriptedModel(answersProse("```sqlite\nSELECT 1\n```"), answersProse("```sqlite\nSELECT 1\n```"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://api.openai.com/v1", "some-model-nobody-measured:9b", "ollama"),
+      resources: b.resources,
+    });
+
+    // Key order is the wire byte order: the sampling fields sit where the SDK always put them,
+    // so the filtering decision did not reorder or disturb a single byte of the request.
+    expect(Object.keys(script.turns[0]?.body ?? {})).toEqual([
+      "model",
+      "temperature",
+      "top_p",
+      "messages",
+      "stream",
+      "stream_options",
+    ]);
+    expect(script.turns[0]?.body?.temperature).toBe(0);
+    expect(script.turns[0]?.body?.top_p).toBe(1);
+  });
+
+  test("a custom turn still carries the default sampling, byte for byte", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "planning");
+    const script = scriptedModel(answersProse("```sqlite\nSELECT 1\n```"), answersProse("```sqlite\nSELECT 1\n```"));
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(script.fetch, "https://llm.internal/v1", "mixtral", "custom"),
+      resources: b.resources,
+    });
+
+    expect(Object.keys(script.turns[0]?.body ?? {})).toEqual([
+      "model",
+      "temperature",
+      "top_p",
+      "messages",
+      "stream",
+      "stream_options",
+    ]);
+    expect(script.turns[0]?.body?.temperature).toBe(0);
+    expect(script.turns[0]?.body?.top_p).toBe(1);
+  });
+
+  test("a gemini turn carries the default sampling under Gemini's own field names", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "planning");
+    const script = scriptedModel(
+      () => geminiTextStream("```sqlite\nSELECT 1\n```"),
+      () => geminiTextStream("```sqlite\nSELECT 1\n```"),
+    );
+
+    await runInvestigation(run.runId, {
+      service: b.service,
+      model: await modelOver(
+        script.fetch,
+        "https://generativelanguage.googleapis.com/v1beta",
+        "gemini-2.5-flash",
+        "gemini",
+      ),
+      resources: b.resources,
+    });
+
+    const generationConfig = script.turns[0]?.body.generationConfig as
+      | { temperature?: number; topP?: number }
+      | undefined;
+    expect(generationConfig?.temperature).toBe(0);
+    expect(generationConfig?.topP).toBe(1);
+  });
+
+  test("a turn whose sampling preparation breaks is refused as a config error, before anything is sent", async () => {
+    const b = boot(freshDataDir());
+    const run = await startRun(b, "planning");
+    const script = scriptedModel(() => responsesTextStream("```sqlite\nSELECT 1\n```"));
+    // A model id no other test resolves, so this test owns the cache entry and the spy is reached.
+    const prepare = spyOn(providerRegistry, "openAIResponsesRequestWarnings").mockRejectedValue(
+      new TypeError("prepareRequest broke"),
+    );
+
+    try {
+      await expect(
+        runInvestigation(run.runId, {
+          service: b.service,
+          model: await modelOver(script.fetch, "https://api.openai.com/v1", "gpt-6-luna-prepare-failure", "openai"),
+          resources: b.resources,
+        }),
+      ).rejects.toBeInstanceOf(LLMConfigError);
+      // The preparation is offline and refused before `streamText`, so the turn never reaches the wire.
+      expect(script.turns.length).toBe(0);
+    } finally {
+      prepare.mockRestore();
+    }
   });
 });

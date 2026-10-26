@@ -114,6 +114,7 @@ function getDefaultForm() {
     setName: mock(() => {}),
     host: "localhost",
     setHost: mock(() => {}),
+    settleHost: mock(() => {}),
     port: "5432",
     setPort: mock(() => {}),
     user: "",
@@ -152,6 +153,12 @@ function getDefaultForm() {
     setServiceName: mock(() => {}),
     instanceName: "",
     setInstanceName: mock(() => {}),
+    apiKeyId: "",
+    setApiKeyId: mock(() => {}),
+    apiKeySecret: "",
+    setApiKeySecret: mock(() => {}),
+    saslMechanism: "",
+    setSaslMechanism: mock(() => {}),
     showSSH: false,
     setShowSSH: mock(() => {}),
     sshEnabled: false,
@@ -178,9 +185,9 @@ function getDefaultForm() {
         value: "postgres",
         label: "PostgreSQL",
         icon: () => React.createElement("span", null, "PG"),
-        color: "text-blue-400",
+        color: "text-hue-blue",
       },
-      { value: "mysql", label: "MySQL", icon: () => React.createElement("span", null, "MY"), color: "text-amber-400" },
+      { value: "mysql", label: "MySQL", icon: () => React.createElement("span", null, "MY"), color: "text-hue-amber" },
     ],
     ...mockFormOverrides,
   };
@@ -198,26 +205,56 @@ const MOCK_CONNECTION_FIELDS: Record<string, string[]> = {
   sqlite: ["database"],
   libredb: ["database"],
   duckdb: ["database"],
-  libsql: ["host", "port", "password", "connectionString"],
+  libsql: ["host", "port", "user", "password", "connectionString"],
   druid: ["host", "port", "user", "password"],
-  elasticsearch: ["host", "port", "user", "password"],
+  elasticsearch: ["host", "port", "user", "password", "apiKeyId", "apiKeySecret"],
   opensearch: ["host", "port", "user", "password"],
+  kafka: ["host", "port", "saslMechanism", "user", "password"],
+  etcd: ["host", "port", "user", "password"],
 };
 const mockFields = (type: string): string[] =>
   MOCK_CONNECTION_FIELDS[type] ?? ["host", "port", "user", "password", "database"];
 
+/** The `kafka` entry's declarations, mirrored as ConnectionModal.test.tsx mirrors them (#1088). */
+const MOCK_KAFKA_DECLARATIONS = {
+  fieldLabels: { saslMechanism: "SASL mechanism" },
+  fieldHints: { saslMechanism: "PLAIN and SCRAM require TLS" },
+  fieldOptions: {
+    saslMechanism: [
+      { value: "PLAIN", label: "PLAIN" },
+      { value: "SCRAM-SHA-256", label: "SCRAM-SHA-256" },
+      { value: "SCRAM-SHA-512", label: "SCRAM-SHA-512" },
+    ],
+  },
+  showSshTunnel: false,
+} as const;
+
 mock.module("@/lib/db-ui-config", () => ({
   getDBConfig: (type: string) => ({
     icon: () => null,
-    color: "text-blue-400",
+    color: "text-hue-blue",
     label: type,
     defaultPort: type === "mysql" ? "3306" : type === "mongodb" ? "27017" : "5432",
     showConnectionStringToggle: type === "mongodb",
     connectionFields: mockFields(type),
+    ...(type === "kafka" ? MOCK_KAFKA_DECLARATIONS : {}),
   }),
   takesConnectionField: (type: string, field: string) => mockFields(type).includes(field),
+  // The real rule: false only where an entry declares `showSshTunnel: false`, which Kafka's does.
+  offersSshTunnel: (type: string) => type !== "kafka",
+  offersSslPanel: () => true,
+  // The modal reads its field copy through these; this table declares copy for Kafka alone, so
+  // every other engine reads the modal's own words. See the same pair in ConnectionModal.test.tsx.
+  connectionFieldLabel: (config: { fieldLabels?: Record<string, string> }, field: string, fallback: string) =>
+    config.fieldLabels?.[field] ?? fallback,
+  connectionFieldHint: (config: { fieldHints?: Record<string, string> }, field: string) => config.fieldHints?.[field],
+  connectionFieldPlaceholder: (
+    config: { fieldPlaceholders?: Record<string, string> },
+    field: string,
+    fallback: string,
+  ) => config.fieldPlaceholders?.[field] ?? fallback,
   getDBIcon: () => () => null,
-  getDBColor: () => "text-blue-400",
+  getDBColor: () => "text-hue-blue",
   // See the same note in ConnectionModal.test.tsx: `DB_UI_CONFIG` became an exported
   // binding in #425, so this mock's `{}` now reaches the real `isFileBased` unless the
   // function is mocked here too.
@@ -326,5 +363,17 @@ describe("ConnectionModal (mobile Drawer path)", () => {
 
     const title = getByTestId("drawer-title");
     expect(title.textContent).toBe("Edit Connection");
+  });
+
+  test("the Drawer draws Kafka's SASL select and TLS panel and withholds the SSH toggle, as the Dialog does", () => {
+    mockFormOverrides = { type: "kafka", sshEnabled: true, showSSH: true };
+    const { container, queryByTestId, queryByText } = render(
+      React.createElement(ConnectionModal, createDefaultProps()),
+    );
+
+    expect(queryByTestId("drawer")).not.toBeNull();
+    expect(container.querySelector("#saslMechanism")?.tagName).toBe("SELECT");
+    expect(queryByText("SSL / TLS")).not.toBeNull();
+    expect(queryByText("SSH Tunnel")).toBeNull();
   });
 });

@@ -8,6 +8,8 @@ import {
   engineNames,
   findEngineTable,
   findInstallTable,
+  hasPlainHttpWarning,
+  hasTranslationBanner,
   parseTables,
 } from "../../scripts/readme-check.mjs";
 
@@ -37,8 +39,31 @@ function installTable(commands: string[], indent = ""): string {
 const ENGINES = ["PostgreSQL", "MySQL", "Redis"];
 const COMMANDS = ["docker run -d ghcr.io/libredb/libredb-studio:latest", "sudo snap install libredb-studio"];
 
+/**
+ * The blockquote every README carries under its quickstart. Only its shape matters to the
+ * guard - a blockquote naming the variable - so the fixture text need not match the real one.
+ */
+const WARNING = "> Reaching Studio at anything but localhost or HTTPS needs `AUTH_COOKIE_SECURE=false`.";
+
+/**
+ * The blockquote every localized README carries above its first heading. Only its shape
+ * matters to the guard - a blockquote linking to README.md - so the fixture need not be in
+ * any of the five languages.
+ */
+const BANNER = "> This translation may lag behind the [English version](README.md).";
+
 function readme(engines = ENGINES, commands = COMMANDS, indent = ""): string {
-  return `# Title\n\nprose\n\n${engineTable(engines, indent)}\n\nmore prose\n\n${installTable(commands, indent)}\n`;
+  return `# Title\n\n${BANNER}\n\nprose\n\n${WARNING}\n\n${engineTable(engines, indent)}\n\nmore prose\n\n${installTable(commands, indent)}\n`;
+}
+
+/** The same file with its banner removed, for the exemption and the negative case. */
+function withoutBanner(text: string): string {
+  return text.replace(`${BANNER}\n\n`, "");
+}
+
+/** The same file with its warning blockquote removed, for the negative cases. */
+function withoutWarning(text: string): string {
+  return text.replace(`${WARNING}\n\n`, "");
 }
 
 function runCLI(files: Record<string, string>): { exitCode: number; stdout: string; stderr: string } {
@@ -136,6 +161,70 @@ describe("extraction", () => {
   });
 });
 
+describe("hasPlainHttpWarning", () => {
+  // README.md carried the variable only as a row of its environment table, where a reader
+  // following the quickstart never reaches it, while all five translations carried the
+  // warning as a blockquote right under the quickstart. The blockquote is what the guard
+  // keys on, because it is the one form that survives translation: the heading text is in
+  // Chinese, Japanese, Spanish, Urdu and Hindi, but `AUTH_COOKIE_SECURE` is not.
+  test("accepts a blockquote naming the variable", () => {
+    expect(hasPlainHttpWarning(readme())).toBe(true);
+  });
+
+  test("rejects a file that names the variable only in a table row", () => {
+    const tableOnly = "| `AUTH_COOKIE_SECURE` | no | drops the Secure flag |\n";
+    expect(hasPlainHttpWarning(tableOnly)).toBe(false);
+  });
+
+  test("rejects a file that does not name the variable at all", () => {
+    expect(hasPlainHttpWarning(withoutWarning(readme()))).toBe(false);
+  });
+
+  test("accepts the indented blockquote form", () => {
+    expect(hasPlainHttpWarning("  > set `AUTH_COOKIE_SECURE=false` on a LAN")).toBe(true);
+  });
+
+  test("rejects a blockquote that does not name the variable", () => {
+    expect(hasPlainHttpWarning("> Need Helm, Homebrew, Snap, winget, or deb/rpm?")).toBe(false);
+  });
+});
+
+describe("hasTranslationBanner", () => {
+  // Invariants 1 to 3 cannot see feature lists, counts, dates or measured numbers, so a
+  // localized README can be stale in ways the guard never reports (#1055). The banner is
+  // how the reader learns that. It has to sit above the first heading, because a banner
+  // below the fold warns nobody, and it has to link to README.md, because naming the file
+  // that wins is the whole content of the warning.
+  test("accepts a blockquote above the first heading linking to README.md", () => {
+    expect(hasTranslationBanner(`# Title\n\n${BANNER}\n\n## Quick Start\n\nprose\n`)).toBe(true);
+  });
+
+  test("rejects a banner that sits below the first heading", () => {
+    expect(hasTranslationBanner(`# Title\n\n## Quick Start\n\n${BANNER}\n`)).toBe(false);
+  });
+
+  test("rejects a file with no banner at all", () => {
+    expect(hasTranslationBanner("# Title\n\nprose\n\n## Quick Start\n")).toBe(false);
+  });
+
+  test("rejects a blockquote that does not link to README.md", () => {
+    expect(hasTranslationBanner("> Need Helm, Homebrew, Snap, winget, or deb/rpm?\n\n## Quick Start\n")).toBe(false);
+  });
+
+  test("accepts the RTL span form README_ur.md uses", () => {
+    const rtl = '> <span dir="rtl">aa [bb](README.md) cc</span>';
+    expect(hasTranslationBanner(`# Title\n\n${rtl}\n\n## Quick Start\n`)).toBe(true);
+  });
+
+  test("accepts a file that has no heading at all", () => {
+    expect(hasTranslationBanner(`# Title\n\n${BANNER}\n`)).toBe(true);
+  });
+
+  test("rejects a prose line that links to README.md without the blockquote", () => {
+    expect(hasTranslationBanner("See the [English version](README.md).\n\n## Quick Start\n")).toBe(false);
+  });
+});
+
 describe("checkReadmes", () => {
   const canonical = readme();
 
@@ -169,7 +258,7 @@ describe("checkReadmes", () => {
 
   test("rejects a localized command that only appears in README.md's Notes column", () => {
     const withNotes =
-      `# Title\n\n${engineTable(ENGINES)}\n\n` +
+      `# Title\n\n${WARNING}\n\n${engineTable(ENGINES)}\n\n` +
       "| Channel | Command | Notes |\n| :--- | :--- | :--- |\n" +
       `| **Docker** | \`${COMMANDS[0]}\` | run \`brew update\` first |\n`;
     const localized = readme(ENGINES, [COMMANDS[0], "brew update"]);
@@ -200,6 +289,51 @@ describe("checkReadmes", () => {
     const localized = `# Title\n\n${engineTable(ENGINES)}\n`;
     const violations = checkReadmes({ canonical, localized: [{ name: "README_zh.md", text: localized }] });
     expect(violations[0]).toContain("install table");
+  });
+
+  test("reports README.md when it is the file missing the plain-HTTP warning", () => {
+    // The direction that actually shipped: every translation warned and the canonical
+    // file did not, so the guard has to check the canonical side too.
+    const violations = checkReadmes({
+      canonical: withoutWarning(canonical),
+      localized: [{ name: "README_zh.md", text: readme() }],
+    });
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("README.md");
+    expect(violations[0]).toContain("AUTH_COOKIE_SECURE");
+  });
+
+  test("reports a localized file missing its translation-lag banner", () => {
+    const localized = withoutBanner(readme());
+    const violations = checkReadmes({ canonical, localized: [{ name: "README_zh.md", text: localized }] });
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("README_zh.md");
+    expect(violations[0]).toContain("translation-lag banner");
+  });
+
+  test("exempts README.md from the banner: it is the file the banner points at", () => {
+    const violations = checkReadmes({
+      canonical: withoutBanner(canonical),
+      localized: [{ name: "README_zh.md", text: readme() }],
+    });
+    expect(violations).toEqual([]);
+  });
+
+  test("reports a localized file missing the plain-HTTP warning", () => {
+    const violations = checkReadmes({
+      canonical,
+      localized: [{ name: "README_ja.md", text: withoutWarning(readme()) }],
+    });
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("README_ja.md");
+  });
+
+  test("a file missing both the warning and an engine reports both", () => {
+    const localized = withoutWarning(readme(["PostgreSQL", "MySQL"]));
+    const violations = checkReadmes({ canonical, localized: [{ name: "README_zh.md", text: localized }] });
+    expect(violations).toHaveLength(2);
+    expect(violations.some((v) => v.includes("Redis"))).toBe(true);
+    expect(violations.some((v) => v.includes("AUTH_COOKIE_SECURE"))).toBe(true);
   });
 });
 

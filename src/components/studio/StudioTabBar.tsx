@@ -1,12 +1,68 @@
 "use client";
 
-import React, { type Dispatch, type SetStateAction } from "react";
+import React, { useEffect, type Dispatch, type SetStateAction } from "react";
 import type { QueryTab } from "@/lib/types";
+import type { StudioTabSummary } from "@/hooks/use-tab-summaries";
+import { SHORTCUTS, matchesShortcut, shortcutLabel } from "@/lib/keyboard-shortcuts";
 import { cn } from "@/lib/utils";
-import { FileBraces, Hash, Plus, X } from "lucide-react";
+import { FileBraces, FileCode, Hash, Plus, X } from "lucide-react";
+
+/**
+ * Which icon a tab draws, in ONE place because the bar draws it in TWO (#789 Phase 2).
+ *
+ * The rename input and the tab button each render the icon beside the name, and the ladder
+ * used to be written out at both sites. A third arm added to one of them and not the other is
+ * a drift nothing would report, so the ladder is a function and the two sites call it.
+ *
+ * The SOURCE arm is first and it wins over the dialect. A Source tab holds no query, so its
+ * `type` is the neutral `"sql"` on a SQL connection and whatever `resolveTabType` answered on
+ * a document connection; without this arm a Source tab on MongoDB, Redis, Prometheus, Kafka or etcd
+ * would take the document icon and be indistinguishable from a query tab in the one place a reader
+ * picks a tab from. Nothing errors if the arm is missing, which is exactly why it is tested.
+ *
+ * The last arm means "a query language that is not SQL", not "JSON": Redis and LibreDB commands
+ * take it, and so do PromQL (#1085), Kafka's read request (#1088), an etcdctl command (#1089) and Cypher,
+ * decided rather than defaulted and pinned in `tests/components/studio/StudioTabBar.test.tsx`.
+ */
+function tabIcon(tab: StudioTabSummary): React.JSX.Element {
+  // The ELEMENT rather than the component, so nothing here assigns a component to a local
+  // inside a render: `react(static-components)` is an error in this repository's oxlint
+  // configuration, and the three returns also keep the size and the stroke in one place.
+  if (tab.isSource) return <FileCode strokeWidth={1.5} className="w-3 h-3" />;
+  if (tab.type === "sql") return <Hash strokeWidth={1.5} className="w-3 h-3" />;
+  return <FileBraces strokeWidth={1.5} className="w-3 h-3" />;
+}
+
+/**
+ * Whether this tab holds source text the reader has changed and not applied (#789 Phase 3).
+ *
+ * READ THROUGH `tab.source`, so an ordinary query tab has no field that could carry it and the
+ * strip cannot mark one by accident. The pane writes `dirty` onto `SourceTabState` only when the
+ * buffer's dirtiness FLIPS, so this costs one render per transition rather than one per keystroke.
+ */
+function hasUnsavedEdit(tab: StudioTabSummary): boolean {
+  return tab.dirty;
+}
+
+/**
+ * The tab's ACCESSIBLE NAME, which is its visible label plus the mark when there is one.
+ *
+ * WCAG 2.5.3, Label in Name: the accessible name has to CONTAIN the visible label. The dot beside
+ * the icon is the only visible statement that a tab the reader is not looking at holds an unsaved
+ * edit, and a dot is not text, so the same fact is put in the name. Replacing the name with
+ * "unsaved edit" would satisfy nothing: a speech-input user could no longer say the tab's own name
+ * to reach it, and a screen-reader user would not be told WHICH object the mark is about.
+ *
+ * `undefined` and not the bare name for a tab with no mark, so the accessible name keeps coming
+ * from the visible text in the ordinary case. An `aria-label` that duplicates the visible label is
+ * a second copy of the same string that can drift from it under a rename.
+ */
+function tabAccessibleName(tab: StudioTabSummary): string | undefined {
+  return hasUnsavedEdit(tab) ? `${tab.name} (unsaved edit)` : undefined;
+}
 
 interface StudioTabBarProps {
-  tabs: QueryTab[];
+  tabs: ReadonlyArray<StudioTabSummary>;
   activeTabId: string;
   editingTabId: string | null;
   editingTabName: string;
@@ -18,7 +74,7 @@ interface StudioTabBarProps {
   onAddTab: () => void;
 }
 
-export function StudioTabBar({
+export const StudioTabBar = React.memo(function StudioTabBar({
   tabs,
   activeTabId,
   editingTabId,
@@ -50,6 +106,21 @@ export function StudioTabBar({
     e.preventDefault();
   };
 
+  // The "+" button's keyboard twin (#745): register on `document` so it also
+  // works while Monaco owns focus (Monaco uses a hidden textarea). Only the
+  // tab rename input is excluded so the shortcut does not interrupt renaming.
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!matchesShortcut(event, SHORTCUTS.newTab)) return;
+      const target = event.target;
+      if (target instanceof HTMLInputElement && target.getAttribute("aria-label")?.startsWith("Rename ")) return;
+      event.preventDefault();
+      onAddTab();
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onAddTab]);
+
   return (
     <div
       role="tablist"
@@ -66,17 +137,13 @@ export function StudioTabBar({
           className={cn(
             "h-8 flex items-center px-3 gap-2 rounded-t-md transition-all cursor-pointer min-w-[120px] max-w-[200px] group relative border-t-2",
             activeTabId === tab.id
-              ? "bg-overlay text-fg border-blue-500"
+              ? "bg-overlay text-fg border-brand-tint"
               : "text-fg-muted hover:bg-fill border-transparent",
           )}
         >
           {editingTabId === tab.id ? (
             <>
-              {tab.type === "sql" ? (
-                <Hash strokeWidth={1.5} className="w-3 h-3" />
-              ) : (
-                <FileBraces strokeWidth={1.5} className="w-3 h-3" />
-              )}
+              {tabIcon(tab)}
               <input
                 autoFocus
                 aria-label={`Rename ${tab.name}`}
@@ -102,7 +169,7 @@ export function StudioTabBar({
                   }, 0);
                 }}
                 onClick={(e) => e.stopPropagation()}
-                className="text-xs font-medium bg-transparent border-b border-blue-500 outline-none w-full text-fg"
+                className="text-xs font-medium bg-transparent border-b border-brand-tint outline-none w-full text-fg"
               />
             </>
           ) : (
@@ -111,6 +178,7 @@ export function StudioTabBar({
               role="tab"
               data-tab-id={tab.id}
               aria-selected={activeTabId === tab.id}
+              aria-label={tabAccessibleName(tab)}
               tabIndex={activeTabId === tab.id ? 0 : -1}
               onClick={() => onSetActiveTabId(tab.id)}
               onKeyDown={(e) => handleTabKeyDown(e, index)}
@@ -120,10 +188,18 @@ export function StudioTabBar({
               }}
               className="flex items-center gap-2 flex-1 min-w-0 h-full text-left cursor-pointer"
             >
-              {tab.type === "sql" ? (
-                <Hash strokeWidth={1.5} className="w-3 h-3" />
-              ) : (
-                <FileBraces strokeWidth={1.5} className="w-3 h-3" />
+              {tabIcon(tab)}
+              {hasUnsavedEdit(tab) && (
+                /*
+                 * ARIA-HIDDEN, because the same fact is already in the tab's accessible name
+                 * above. Left in the tree it would be announced as a second, wordless node
+                 * inside the tab, and a decorative shape has nothing to say twice.
+                 */
+                <span
+                  aria-hidden="true"
+                  data-testid="tab-dirty-dot"
+                  className="h-1.5 w-1.5 shrink-0 rounded-full bg-brand-tint"
+                />
               )}
               <span className="text-xs truncate font-medium">{tab.name}</span>
             </button>
@@ -151,6 +227,7 @@ export function StudioTabBar({
       <button
         type="button"
         aria-label="New tab"
+        title={`New Query Tab (${shortcutLabel(SHORTCUTS.newTab)})`}
         className="text-fg-muted cursor-pointer hover:text-fg-bright mx-2"
         onClick={onAddTab}
       >
@@ -158,4 +235,4 @@ export function StudioTabBar({
       </button>
     </div>
   );
-}
+});

@@ -3,6 +3,8 @@ import { createDatabaseProvider } from "@/lib/db";
 import { createErrorResponse } from "@/lib/api/errors";
 import { resolveConnection } from "@/lib/seed/resolve-connection";
 import { guardRoute } from "@/lib/api/require-session";
+import { editorExecutionContext } from "@/lib/api/execution-context";
+import { supportsQueryCancel } from "@/lib/db/query-cancel";
 
 export const dynamic = "force-dynamic";
 
@@ -40,11 +42,15 @@ export async function POST(req: NextRequest) {
 
     // No `withOneShotTunnel` here, unlike test-connection and schema-snapshot (#457):
     // this route never calls connect(). Capabilities and labels are type-driven and read
-    // off the constructed provider without a socket, so there is nothing to tunnel.
-    const provider = await createDatabaseProvider(connection);
+    // off the constructed provider without a socket, so there is nothing to tunnel. The
+    // execution context is passed for consistency with the other routes (non-admin DuckDB file access); it changes
+    // nothing, because the posture only affects a handle this route never opens.
+    const provider = await createDatabaseProvider(connection, {}, editorExecutionContext(guard.session, connection));
 
     return NextResponse.json({
-      capabilities: provider.getCapabilities(),
+      // `supportsQueryCancel` is read off the provider's surface rather than declared by
+      // it: it is the cancel route's own check, so the two cannot disagree (#1364).
+      capabilities: { ...provider.getCapabilities(), supportsQueryCancel: supportsQueryCancel(provider) },
       labels: provider.getLabels(),
     });
   } catch (error) {

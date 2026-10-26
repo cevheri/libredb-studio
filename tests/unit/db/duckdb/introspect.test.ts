@@ -32,10 +32,10 @@ import {
   readHealth,
   readIndexStats,
   readOverview,
-  readSchema,
   readStorageStats,
   readTableBytes,
   readTableStats,
+  withFileSizes,
 } from "@/lib/db/providers/sql/duckdb/introspect";
 import { CACHE_HIT_RATIO_UNAVAILABLE } from "@/lib/monitoring-cache-ratio";
 
@@ -68,6 +68,11 @@ function stubClient(
   return {
     path: "/tmp/stub.duckdb",
     readOnly: false,
+    // No introspection reader ends a transaction, so a stub that answered anything
+    // else here would be describing a call these tests never make.
+    async endOpenTransaction(): Promise<boolean> {
+      throw new Error("endOpenTransaction is not part of the introspection surface");
+    },
     async run(sql: string): Promise<DuckDBStatementResult> {
       seen.push(sql);
       const failure = failOn.find((match) => sql.includes(match));
@@ -189,291 +194,6 @@ describe("introspection SQL", () => {
 // ============================================================================
 // Schema
 // ============================================================================
-
-describe("readSchema", () => {
-  test("attaches columns, primary keys, foreign keys and indexes to their objects", async () => {
-    const client = stubClient([
-      ["duckdb_tables()", TABLE_ROWS],
-      ["duckdb_views()", [{ schema_name: "main", view_name: "customer_totals" }]],
-      ["duckdb_columns()", COLUMN_ROWS],
-      [
-        "duckdb_constraints()",
-        [
-          {
-            schema_name: "main",
-            table_name: "customers",
-            constraint_type: "PRIMARY KEY",
-            constraint_column_names: ["id"],
-            referenced_table: null,
-            referenced_column_names: [],
-          },
-          {
-            schema_name: "analytics",
-            table_name: "events",
-            constraint_type: "FOREIGN KEY",
-            constraint_column_names: ["customer_id"],
-            referenced_table: "customers",
-            referenced_column_names: ["id"],
-          },
-        ],
-      ],
-      [
-        "duckdb_indexes()",
-        [
-          {
-            schema_name: "main",
-            table_name: "customers",
-            index_name: "idx_customers_email",
-            is_unique: true,
-            is_primary: false,
-            index_columns: ["email"],
-          },
-        ],
-      ],
-      [
-        COUNTS_MATCH,
-        [
-          { schema_name: "analytics", table_name: "events", row_count: "2" },
-          { schema_name: "main", table_name: "customers", row_count: "5" },
-        ],
-      ],
-    ]);
-
-    const schema = await readSchema(client);
-
-    expect(schema.map((entry) => entry.name)).toEqual(["analytics.events", "customers", "customer_totals"]);
-
-    const customers = schema.find((entry) => entry.name === "customers");
-    expect(customers?.rowCount).toBe(5);
-    expect(customers?.columns).toEqual([
-      { name: "id", type: "INTEGER", nullable: false, isPrimary: true },
-      { name: "signed_up_at", type: "TIMESTAMP", nullable: true, isPrimary: false, defaultValue: "now()" },
-    ]);
-    expect(customers?.indexes).toEqual([{ name: "idx_customers_email", columns: ["email"], unique: true }]);
-
-    // The target is spelled exactly as the tree node it refers to. DuckDB refuses a
-    // foreign key across schemas ("Binder Error: Creating foreign keys across different
-    // schemas or catalogs is not supported", measured), so the referenced table is
-    // necessarily in the constraint's own schema - and an unqualified `customers` here
-    // would link the ER diagram to the SAME-NAMED table in `main`.
-    const events = schema.find((entry) => entry.name === "analytics.events");
-    expect(events?.foreignKeys).toEqual([
-      { columnName: "customer_id", referencedTable: "analytics.customers", referencedColumn: "id" },
-    ]);
-  });
-
-  test("a foreign key in the default schema keeps the bare name the tree node carries", async () => {
-    const client = stubClient([
-      ["duckdb_tables()", [{ schema_name: "main", table_name: "orders", estimated_size: "1" }]],
-      ["duckdb_views()", []],
-      ["duckdb_columns()", []],
-      [
-        "duckdb_constraints()",
-        [
-          {
-            schema_name: "main",
-            table_name: "orders",
-            constraint_type: "FOREIGN KEY",
-            constraint_column_names: ["customer_id"],
-            referenced_table: "customers",
-            referenced_column_names: ["id"],
-          },
-        ],
-      ],
-    ]);
-
-    const [orders] = await readSchema(client);
-
-    expect(orders.foreignKeys).toEqual([
-      { columnName: "customer_id", referencedTable: "customers", referencedColumn: "id" },
-    ]);
-  });
-
-  test("a view is listed with its columns and no row count", async () => {
-    // `duckdb_views()` publishes no cardinality, and counting one would mean running it.
-    const client = stubClient([
-      ["duckdb_tables()", []],
-      ["duckdb_views()", [{ schema_name: "main", view_name: "customer_totals" }]],
-      ["duckdb_columns()", COLUMN_ROWS],
-    ]);
-
-    const [view] = await readSchema(client);
-
-    expect(view.name).toBe("customer_totals");
-    expect(view.rowCount).toBeUndefined();
-    expect(view.columns).toEqual([{ name: "revenue", type: "DECIMAL(38,2)", nullable: true, isPrimary: false }]);
-    expect(view.indexes).toEqual([]);
-  });
-
-  test("a composite foreign key becomes one entry per column pair", async () => {
-    const client = stubClient([
-      ["duckdb_tables()", [{ schema_name: "main", table_name: "child", estimated_size: "0" }]],
-      ["duckdb_views()", []],
-      ["duckdb_columns()", []],
-      [
-        "duckdb_constraints()",
-        [
-          {
-            schema_name: "main",
-            table_name: "child",
-            constraint_type: "FOREIGN KEY",
-            constraint_column_names: ["a", "b"],
-            referenced_table: "parent",
-            referenced_column_names: ["x", "y"],
-          },
-        ],
-      ],
-    ]);
-
-    const [child] = await readSchema(client);
-
-    expect(child.foreignKeys).toEqual([
-      { columnName: "a", referencedTable: "parent", referencedColumn: "x" },
-      { columnName: "b", referencedTable: "parent", referencedColumn: "y" },
-    ]);
-  });
-
-  test("a foreign key DuckDB published no target for degrades to empty strings, not a crash", async () => {
-    const client = stubClient([
-      ["duckdb_tables()", [{ schema_name: "main", table_name: "child", estimated_size: "0" }]],
-      ["duckdb_views()", []],
-      ["duckdb_columns()", []],
-      [
-        "duckdb_constraints()",
-        [
-          {
-            schema_name: "main",
-            table_name: "child",
-            constraint_type: "FOREIGN KEY",
-            constraint_column_names: ["a"],
-            referenced_table: null,
-            referenced_column_names: [],
-          },
-        ],
-      ],
-    ]);
-
-    const [child] = await readSchema(client);
-
-    expect(child.foreignKeys).toEqual([{ columnName: "a", referencedTable: "", referencedColumn: "" }]);
-  });
-
-  test("the row count is COUNTED, never taken from estimated_size", async () => {
-    // Measured on DuckDB v1.5.5: after deleting 19M of a table's 20M rows,
-    // `duckdb_tables().estimated_size` answered 1,076,480 where `count(*)` answered
-    // 1,000,000 - and a CHECKPOINT did not move it. It is a row-group estimate, so it is
-    // never published as `rowCount`.
-    const client = stubClient([
-      ["duckdb_tables()", [{ schema_name: "main", table_name: "big", estimated_size: "1076480" }]],
-      ["duckdb_views()", []],
-      ["duckdb_columns()", []],
-      [COUNTS_MATCH, [{ schema_name: "main", table_name: "big", row_count: "1000000" }]],
-    ]);
-
-    const [table] = await readSchema(client);
-
-    expect(table.rowCount).toBe(1000000);
-  });
-
-  test("every table is counted in ONE statement, and the names are quoted both ways", async () => {
-    // Measured: 41 tables including a 20M-row one counted in 8.8 ms, and 1000 tables in
-    // 240 ms, as a single UNION ALL - DuckDB answers count(*) from row-group metadata.
-    // A per-table statement would be the sweep this provider exists without.
-    const seen: string[] = [];
-    const client = stubClient(
-      [
-        [
-          "duckdb_tables()",
-          [
-            { schema_name: "main", table_name: "we'ird-name", estimated_size: "1" },
-            { schema_name: "an'alytics", table_name: 'we"ird', estimated_size: "1" },
-          ],
-        ],
-        ["duckdb_views()", []],
-        ["duckdb_columns()", []],
-      ],
-      seen,
-    );
-
-    await readSchema(client);
-
-    const counting = seen.filter((sql) => sql.includes(COUNTS_MATCH));
-    expect(counting).toHaveLength(1);
-    // The name travels twice in each arm and the two spellings are different: a
-    // single-quoted literal for the label, a double-quoted identifier for the read.
-    expect(counting[0]).toContain(`SELECT 'main' AS schema_name, 'we''ird-name' AS table_name`);
-    expect(counting[0]).toContain(`FROM "main"."we'ird-name"`);
-    expect(counting[0]).toContain(`SELECT 'an''alytics' AS schema_name, 'we"ird' AS table_name`);
-    expect(counting[0]).toContain(`FROM "an'alytics"."we""ird"`);
-    expect(counting[0]).toContain(" UNION ALL ");
-  });
-
-  test("a catalog with no tables issues no counting statement at all", async () => {
-    const seen: string[] = [];
-    const client = stubClient([["duckdb_views()", [{ schema_name: "main", view_name: "v" }]]], seen);
-
-    await readSchema(client);
-
-    expect(seen.filter((sql) => sql.includes(COUNTS_MATCH))).toEqual([]);
-  });
-
-  test("a table the count read could not answer for carries NO row count rather than a wrong one", async () => {
-    // `TableSchema.rowCount` is optional, and this repo publishes nothing rather than a
-    // number it cannot make true - the rule the Cassandra provider follows.
-    const client = stubClient(
-      [
-        ["duckdb_tables()", [{ schema_name: "main", table_name: "t", estimated_size: "5" }]],
-        ["duckdb_views()", []],
-        ["duckdb_columns()", []],
-      ],
-      [],
-      [COUNTS_MATCH],
-    );
-
-    const [table] = await readSchema(client);
-
-    expect(table).toEqual({ name: "t", columns: [], indexes: [], foreignKeys: [] });
-    expect("rowCount" in table).toBe(false);
-  });
-
-  test("a count row DuckDB answered unreadably is absent rather than zero", async () => {
-    const client = stubClient([
-      ["duckdb_tables()", [{ schema_name: "main", table_name: "t", estimated_size: "5" }]],
-      ["duckdb_views()", []],
-      ["duckdb_columns()", []],
-      [COUNTS_MATCH, [{ schema_name: "main", table_name: "t", row_count: null }]],
-    ]);
-
-    const [table] = await readSchema(client);
-
-    expect("rowCount" in table).toBe(false);
-  });
-
-  test("an index whose column list DuckDB left NULL is listed with no columns", async () => {
-    const client = stubClient([
-      ["duckdb_tables()", [{ schema_name: "main", table_name: "t", estimated_size: "0" }]],
-      ["duckdb_views()", []],
-      ["duckdb_columns()", []],
-      [
-        "duckdb_indexes()",
-        [
-          {
-            schema_name: "main",
-            table_name: "t",
-            index_name: "idx",
-            is_unique: false,
-            is_primary: false,
-            index_columns: null,
-          },
-        ],
-      ],
-    ]);
-
-    const [table] = await readSchema(client);
-
-    expect(table.indexes).toEqual([{ name: "idx", columns: [], unique: false }]);
-  });
-});
 
 // ============================================================================
 // Sizes
@@ -672,6 +392,52 @@ describe("readOverview", () => {
     expect(overview.tableCount).toBe(0);
     expect(overview.indexCount).toBe(0);
     expect(overview.version).toBe("DuckDB unknown");
+  });
+});
+
+/**
+ * A file database before its first checkpoint (#1449): measured on v1.5.5 with 1,000 rows,
+ * `pragma_database_size()` answered "0 bytes" over a 12,288-byte main file and a
+ * 32,083-byte `.wal`.
+ */
+const WAL_ONLY_SIZE_ROW = { ...DB_SIZE_ROW, database_size: "0 bytes", wal_size: "31.3 KiB" };
+const WAL_ONLY_FILES = { mainBytes: 12288, walBytes: 32083 };
+
+describe("withFileSizes (#1449)", () => {
+  test("an engine 0 over a file database becomes the main file plus its .wal", () => {
+    expect(withFileSizes({ databaseSizeBytes: 0, blockSize: 262144 }, WAL_ONLY_FILES)).toEqual({
+      databaseSizeBytes: 44371,
+      blockSize: 262144,
+    });
+  });
+
+  test("a .wal that does not exist adds nothing", () => {
+    expect(withFileSizes({ databaseSizeBytes: 0 }, { mainBytes: 12288, walBytes: undefined })).toEqual({
+      databaseSizeBytes: 12288,
+    });
+  });
+
+  test("a size the engine measured is kept as it is", () => {
+    expect(withFileSizes({ databaseSizeBytes: 2097152 }, WAL_ONLY_FILES)).toEqual({ databaseSizeBytes: 2097152 });
+  });
+
+  test("with no file to measure, the engine's answer stands", () => {
+    expect(withFileSizes({ databaseSizeBytes: 0 }, undefined)).toEqual({ databaseSizeBytes: 0 });
+    expect(withFileSizes({ databaseSizeBytes: 0 }, { mainBytes: undefined, walBytes: 4096 })).toEqual({
+      databaseSizeBytes: 0,
+    });
+  });
+
+  test("the overview and health read the file sizes where the engine answered 0", async () => {
+    const client = stubClient([
+      ["current_database() AS catalog_name", [{ catalog_name: "warehouse", version: "v1.5.5" }]],
+      ["pragma_database_size()", [WAL_ONLY_SIZE_ROW]],
+      ["AS table_count", [{ table_count: "1", index_count: "0" }]],
+    ]);
+
+    const overview = await readOverview(client, WAL_ONLY_FILES);
+    expect(overview.databaseSizeBytes).toBe(44371);
+    expect((await readHealth(client, WAL_ONLY_FILES)).databaseSize).toBe(overview.databaseSize);
   });
 });
 
@@ -880,6 +646,39 @@ describe("readStorageStats", () => {
         walSizeBytes: 4096,
       },
     ]);
+  });
+
+  test("a .wal on disk gets a row of its own, named for the WAL tile (#1449)", async () => {
+    const client = stubClient([
+      ["pragma_database_size()", [WAL_ONLY_SIZE_ROW]],
+      ["duckdb_databases()", [{ path: "/tmp/libredb-duckdb/warehouse.duckdb" }]],
+      ["duckdb_temporary_files()", []],
+    ]);
+
+    const [main, wal] = await readStorageStats(client, WAL_ONLY_FILES);
+
+    // The main file's own bytes rather than the engine's 0; the .wal is not added twice.
+    expect(main.sizeBytes).toBe(12288);
+    expect(wal).toEqual({
+      name: "WAL",
+      location: "/tmp/libredb-duckdb/warehouse.duckdb.wal",
+      size: "31.33 KB",
+      sizeBytes: 32083,
+      walSize: "31.33 KB",
+      walSizeBytes: 32083,
+    });
+  });
+
+  test("a checkpointed file with no .wal lists no WAL row", async () => {
+    const client = stubClient([
+      ["pragma_database_size()", [DB_SIZE_ROW]],
+      ["duckdb_databases()", [{ path: "/tmp/libredb-duckdb/warehouse.duckdb" }]],
+      ["duckdb_temporary_files()", []],
+    ]);
+
+    const stats = await readStorageStats(client, { mainBytes: 2097152, walBytes: undefined });
+
+    expect(stats.map((row) => row.name)).toEqual(["Main Database"]);
   });
 
   test("an in-memory database reports the memory it measured, never a zero-byte file", async () => {

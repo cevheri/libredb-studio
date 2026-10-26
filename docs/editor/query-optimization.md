@@ -6,6 +6,7 @@ LibreDB Studio includes enterprise-grade query optimization features to prevent 
 
 - [Query Pagination System](#query-pagination-system)
 - [Silent Auto-Limiting](#silent-auto-limiting)
+- [Where the page size comes from](#where-the-page-size-comes-from)
 - [Destructive-Statement Confirmation](#destructive-statement-confirmation)
 - [Load More Functionality](#load-more-functionality)
 - [Result-Level Signals](#result-level-signals)
@@ -25,14 +26,15 @@ All SELECT queries are automatically paginated to prevent browser freezes when d
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `DEFAULT_QUERY_LIMIT` | 500 | Default rows per page |
+| `DEFAULT_QUERY_LIMIT` | 500 | Rows per page when the caller asks for no particular size |
+| `PREVIEW_PAGE_SIZE` | 50 | Rows a tree click asks for, sent as the `limit` execution option (`src/hooks/use-tab-manager.ts`) |
 | `MAX_UNLIMITED_ROWS` | 100,000 | Maximum rows for "Load All" |
 
 ### How It Works
 
 1. User executes a SELECT query
-2. System automatically adds `LIMIT 500` if no LIMIT exists (an `OFFSET` clause is only appended when the offset is greater than 0). The clause is inserted at the end of the statement itself, before any trailing comment or `;` — see [Where the bound is placed](#where-the-bound-is-placed)
-3. If user already specified a LIMIT, it's preserved (no override)
+2. System automatically adds `LIMIT <page size>` if no LIMIT exists (an `OFFSET` clause is only appended when the offset is greater than 0). The clause is inserted at the end of the statement itself, before any trailing comment or `;` — see [Where the bound is placed](#where-the-bound-is-placed)
+3. If user already specified a LIMIT, it's preserved (no override) — and the requested offset is discarded with it, which is why no further page is offered for such a statement
 4. Results display with pagination metadata
 
 ---
@@ -52,14 +54,23 @@ Instead of showing warning popups for large datasets, LibreDB Studio silently li
 When auto-limiting is applied:
 
 ```
-┌─────────────────────────────────────────────────────┐
-│ Results   500 rows  │  AUTO-LIMITED  │  Load More  │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ 50 rows • load 50 more   4 columns   AUTO-LIMITED   ORDER NOT GUARANTEED     │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
+
+Everything the grid says about the bound is in the one stats strip above the table, and nothing is
+added below it: the strip is there whether or not a further page exists, so the table does not move
+when one does.
 
 - **AUTO-LIMITED badge** - Shows when the system added a LIMIT
 - **Row count** - Displays actual returned rows
-- **Load More button** - Appears when more data is available
+- **Ordering notice** - `ORDER NOT GUARANTEED`, beside the badge, only where a Load More is offered
+  and the statement carries no outer `ORDER BY`; the full sentence is on its `title` and in an
+  `sr-only` span — see [Row order across pages](#row-order-across-pages)
+- **Load More control** - The `load n more` button folded into the row count, where the text
+  `(more available)` used to sit. It appears when more data is available AND the provider can serve
+  it, and its label names the page size it will fetch
 
 ### Query Limiter Utility
 
@@ -76,6 +87,7 @@ const info = analyzeQuery('SELECT * FROM users WHERE active = true');
 const result = applyQueryLimit('SELECT * FROM users', 500, 0);
 // Returns: { sql: 'SELECT * FROM users LIMIT 500', wasLimited: true, ... }
 // (OFFSET is only appended when offset > 0, e.g. applyQueryLimit(sql, 500, 500) -> '... LIMIT 500 OFFSET 500')
+// A limit or offset that is not a non-negative safe integer (isRowBound) throws a QueryError
 ```
 
 ### Supported Query Types
@@ -135,6 +147,12 @@ not a name, or an `AS` with no body after it — is re-read as an expression tha
 supported dialect accepts such text, so what the server receives is a rejected statement either way
 rather than a partly limited write.
 
+A `SELECT` over a CTE body that writes is typed by that write, so it is not bounded.
+A body writes when its first word, after `AS`, an optional `[NOT] MATERIALIZED` and the opening parenthesis, is `INSERT`, `UPDATE`, `DELETE`, `MERGE` or `UPSERT`, or when it is a nested `WITH` whose own list writes or whose main query, bare or parenthesised, opens with one of those; `readCteBodyWrite` in `src/lib/sql/operative-keyword.ts` reads it.
+PostgreSQL runs such a body exactly once and always to completion, however few of its rows the outer `SELECT` reads (manual 7.8.4), so a bound made `WITH d AS (DELETE … RETURNING *) SELECT * FROM d` pageable and every next page re-ran the `DELETE` in full.
+CockroachDB documents the same for its CTEs and also takes an `UPSERT` body, which the union cannot name, so that statement is typed `OTHER`, as `MERGE` is.
+Only the first word of each body counts, so a read-only body that merely mentions a write word (`FROM delete_queue`, `WHERE action = 'delete'`, a comment or a string) keeps its bound.
+
 ### Which dialect the readers are reading
 
 Every reader above answers from characters alone, and a few characters mean different things in
@@ -145,21 +163,33 @@ the keyword that types the statement.
 The dialect was always available at the callers: every provider knows its own `type`, the
 multi-statement route resolves its provider before it asks, and both client-side execution paths hold
 the active connection. It is now passed down (`src/lib/sql/grammar.ts`), and **exactly one place**
-maps a database type to grammar facts — the readers receive the resolved record and never see a type
-id, so no reader can grow a dialect test of its own.
+maps a database type to grammar facts: the registry in `src/lib/db/sql-grammar/`, whose row for each
+type is the grammar module beside that engine's provider. The readers receive the resolved record and
+never see a type id, so no reader can grow a dialect test of its own.
 
 | Character | Established reading | Dialects |
 |-----------|--------------------|----------|
 | `#` | opens a line comment | MySQL, MariaDB, ClickHouse (which also has `#!`), OpenSearch |
-| `#` | ordinary code — a jsonb/geometric operator, an identifier character, a temp-table name, a bind-variable prefix, or a character the parser simply refuses | PostgreSQL, Oracle, SQL Server, SQLite, libSQL, DuckDB, Elasticsearch, Trino |
+| `#` | ordinary code: a jsonb/geometric operator, an identifier character, a temp-table name, a bind-variable prefix, or a character the parser simply refuses | PostgreSQL, Oracle, Db2 LUW, SQL Server, SQLite, libSQL, DuckDB, Elasticsearch, Trino, Databend, Apache Spark |
 | `q'…'` | a string literal (alternate quoting): the delimiter after the tag opens the body and its partner followed by `'` closes it, so the body carries apostrophes unescaped — `[ ] { } ( ) < >` pair up, any other character closes with itself, either letter case of the tag, and `nq'…'` is the same form for the national character set | Oracle only |
 | `q'…'` | not a form at all — a name followed by an ordinary string, which is what those characters are there | everything else, including the default |
 | `[…]` | a quoted **name**: everything between the brackets is the identifier (`SELECT [a--b] FROM t` selects a column called `a--b`) and the run does not nest. The doubled `]` this reading honours is SQL Server's escape — SQLite stops at the first `]` and has none, so `[a]]b]` reads as one name where SQLite reads `[a]` and then junk, which it rejects either way | SQL Server, SQLite, libSQL, OpenSearch |
-| `[…]` | an **array literal or subscript**: it nests (`[[1,2],[3,4]]`), nothing inside it is escaped, and a literal inside it is a literal (`m['a]b']`) | ClickHouse, PostgreSQL, DuckDB, Trino |
-| `/* … /* … */ … */` | one **nesting** comment: a `/*` inside a comment opens another and the run continues until the depth returns to zero, so a region that already contains comments can be commented out. A run short of a closer is undeterminable rather than closed early | PostgreSQL, SQL Server, ClickHouse, DuckDB |
-| `/* … /* … */ … */` | a **flat** comment: the first `*/` ends it, and everything after that is the statement's own code | MySQL, MariaDB, SQLite, libSQL, Oracle, and the default |
-| `//` | opens a **line comment**, ending at the newline like `--` | Apache Cassandra (and its relatives), ClickHouse |
+| `[…]` | an **array literal or subscript**: it nests (`[[1,2],[3,4]]`), nothing inside it is escaped, and a literal inside it is a literal (`m['a]b']`) | ClickHouse, PostgreSQL, DuckDB, Trino, Databend, Apache Spark |
+| `/* … /* … */ … */` | one **nesting** comment: a `/*` inside a comment opens another and the run continues until the depth returns to zero, so a region that already contains comments can be commented out. A run short of a closer is undeterminable rather than closed early | PostgreSQL, Db2 LUW, SQL Server, ClickHouse, DuckDB, Apache Spark |
+| `/* … /* … */ … */` | a **flat** comment: the first `*/` ends it, and everything after that is the statement's own code | MySQL, MariaDB, SQLite, libSQL, Oracle, Databend, and the default |
+| `//` | opens a **line comment**, ending at the newline like `--` (on Apache Spark, which has no `//` comment, a `--` comment also ends at a lone carriage return and continues past a backslash before a line feed) | Apache Cassandra (and its relatives), ClickHouse |
 | `//` | **ordinary code** — an operator the parser refuses (`operator does not exist: integer // integer` on PostgreSQL 18), or a character it rejects outright | everything else, including the default |
+| `r'…'` | a **raw string**: it takes no escapes and ends at the first quote of its kind | Apache Spark |
+| `/*+ … */` | an **optimizer hint**: `/*+` is code, and inside a comment it opens no level | Apache Spark |
+| `SET` / `RESET` of a session key | **asks for confirmation** when a `SET` assigns `spark.sql.variable.substitute`, `spark.sql.defaultCatalog` or a `spark.sql.catalog.` key (`=` after the key), when a `RESET` names one of them, and when a `RESET` names no key, which restores every key | Apache Spark |
+| `\` before a line feed in a `--` comment | a backslash right before a line feed continues a `--` comment onto the next line, and one before CR LF does not | Apache Spark |
+| a carriage return in a `--` comment | a lone carriage return ends a `--` comment, and a CR LF pair ends it once | Apache Spark |
+
+A lone carriage return in a line comment is the one character here no grammar row can settle, because engines differ on it and one connection type can reach servers that disagree.
+Measured live, it ends a `--` comment on PostgreSQL 17.6, YugabyteDB 2025.2, SQL Server 2022 CU21, Apache Cassandra 5.0.6 and DuckDB, and it is comment text on MySQL 8.4.6 and CockroachDB v26.2.5, which connects as `postgres`.
+So the code after it is a statement's tail, or a second statement, on one server and comment text on another, and Studio treats such a text as ambiguous on every SQL dialect (`hasLoneCarriageReturnInLineComment` in `src/lib/sql/spans.ts`).
+The confirmation gate asks about it and names the lone carriage return, the agent and MCP guard refuses it as `DIALECT_AMBIGUOUS_TEXT`, Explain does not count it as one statement, and the row limiter leaves it unbounded with `wasLimited: false`.
+A CR LF pair is an ordinary line end, and a carriage return inside a literal or a block comment is not counted.
 
 Each row was established from an authoritative source: the engine's own documentation, or its
 driver's own tokenizer under `node_modules` (node-oracledb accepts `#` inside an identifier; the
@@ -176,44 +206,44 @@ A rule that could **not** be established is not guessed from a neighbouring dial
 at the compatibility default below, and it is listed here rather than left implicit. The default is per
 **fact**, not per dialect: a dialect whose `#` rule is known can still be undecided about its brackets.
 
-**MongoDB and Redis are the two types whose query text is not SQL at all** — `NON_SQL_DIALECTS` in
-`src/lib/sql/grammar.ts` holds exactly those two, which is what `readsSqlText()` reports on. Their
-providers never reach these readers on the query path, and the confirmation gate — which reads whatever
-is in the editor — asks `readsSqlText()` before applying any span-based rule to their text, so a JSON
-document or a Redis command is not judged by a SQL reader that cannot parse it.
+**MongoDB, Firestore, Redis, Prometheus, InfluxDB (InfluxQL), Kafka, MQTT, RabbitMQ, etcd, Neo4j, Milvus, Qdrant, Oxia, S3-compatible object storage, Kubernetes, OPC UA, MTConnect, Modbus, NETCONF, SNMP and Sparkplug B are the twenty-one types whose query text is not SQL at all**: `readsSqlText: false`, declared in each engine's grammar module in the registry in `src/lib/db/sql-grammar/`, holds exactly those twenty-one, which is what `readsSqlText()` reports on.
+Their providers never reach these readers on the query path, and the confirmation gate, which reads whatever is in the editor, asks `readsSqlText()` before applying any span-based rule to their text, so a JSON document, a Redis command, a PromQL expression, an InfluxQL statement, a Kafka read request, an etcdctl command, a Cypher statement, a Milvus request, a Qdrant request, an `oxia client` read command, an AWS CLI read command, a kubectl statement, a NETCONF read request, a Sparkplug read request or an SNMP walk is not judged by a SQL reader that cannot parse it.
 
-Nor is the gate's SQL keyword reading applied to it. Those two types have a vocabulary of their own in
-`src/lib/db/destructive-commands.ts`: one table per type of the destructive operations the provider can
-actually dispatch (`deleteOne`/`deleteMany`/`updateOne`/`updateMany` and the `$out`/`$merge` pipeline
-stages for MongoDB; `DEL`, `FLUSHALL`, `SET`, `CONFIG SET` and the rest for Redis), and the gate reduces
-the buffer the way the provider would — one JSON document, or Redis's first blank-line-delimited block —
-before looking a name up in it. Text it cannot read as a command at all is not treated as safe: mongosh
-syntax, a half-typed document or a broken JSON command body **asks**. Before that table existed the
-answer for both types was a bare `false`, so a `FLUSHALL` and a `deleteMany` ran with no confirmation
-while a `DELETE FROM` on every SQL engine asked. The embedded LibreDB is not in that set — its text is
-read as SQL, and its undecided grammar facts are rows in the table below.
+The gate's SQL keyword test still reads MongoDB and Redis text first, as a backstop, which on Redis also asks about a read whose arguments include `update` and then `set` (`docs/BACKLOG.md` U43).
+Beyond it, each type whose text is not SQL has a row of its own in `NON_SQL_DESTRUCTIVE_VOCABULARY` in `src/lib/db/destructive-commands.ts`, and a test holds that table to the set `readsSqlText()` reports on.
+The MongoDB and Redis rows name the destructive operations the provider can actually dispatch (`deleteOne`/`deleteMany`/`updateOne`/`updateMany` and the `$out`/`$merge` pipeline stages for MongoDB; `DEL`, `FLUSHALL`, `SET`, `CONFIG SET` and the rest for Redis), and the gate reduces the buffer the way the provider would, to one JSON document or, for Redis, to the one command the provider's own `readRedisCommandText()` reads (each line is a command, and a second one is refused in the editor before anything is sent), before looking a name up in it.
+Text it cannot read as a command at all is not treated as safe: mongosh syntax, a half-typed document or a broken JSON command body **asks**.
+Before that table existed the answer for both types was a bare `false`, so a `FLUSHALL` and a `deleteMany` ran with no confirmation while a `DELETE FROM` on every SQL engine asked.
+The Prometheus and Kafka rows name no operation, the etcd row names what `guard.ts` classifies, the Neo4j row is a fourth that names no operation and decides alone, and each of the four is the gate's whole answer, the rows the keyword test does not read in front of: PromQL has no statement that writes, its editor text only ever reaches `POST /api/v1/query`, and a metric may legally be named `update`, `delete` or `drop`, which the keyword test read as a write; a Kafka read request only reads, and a topic may be named any of those too; etcd's text is read by `guard.ts` over `commands.ts`, the provider's own parser, so a key named `update` or `drop` is data and never a SQL keyword; and Neo4j's provider refuses every write before it is sent - its read policy denies every word that writes and its statement gate classifies the statement through `EXPLAIN`, failing closed - so there is no write left that an operation name would have to catch.
+The InfluxDB (InfluxQL) row is read by the InfluxQL policy the provider runs (`src/lib/db/providers/timeseries/influxdb/influxql-policy.ts`), so what asks and what runs are one reading: an allowed statement only reads, so nothing asks, and what the policy refuses the editor refuses before anything is sent.
+InfluxDB 3 (SQL) is not in that set: its text is SQL, read under `DATAFUSION_GRAMMAR`, the grammar of its module in the registry.
+The Oxia row names no operation and, like the etcd row, is the gate's whole answer: Oxia's text is read by `guard.ts` over `commands.ts`, the provider's own parser, so a key named `update` or `drop` is data and never a SQL keyword.
+The S3 row names no operation and, like the Oxia row, is the gate's whole answer: S3's text is read by `console/guard.ts` over `console/commands.ts`, the provider's own parser, so a key named `delete` or `drop` is data and never a SQL keyword, and a command is never posted for an AI safety analysis, because it names buckets and keys.
+The Kubernetes row names no operation and, like the S3 row, is the gate's whole answer: kubectl text is read by `console/guard.ts` over `console/commands.ts`, the provider's own parser, so an object named `delete` or `drop` is data and never a SQL keyword, and a statement is never posted for an AI safety analysis, because it names namespaces and objects.
+The embedded LibreDB is not in that set: its text is read as SQL, and its undecided grammar facts are rows in the table below.
 
 | Fact | Undecided, so left at the default | Established, and it happens to equal the default |
 |------|-----------------------------------|--------------------------------------------------|
 | `#` | Couchbase, Druid, the embedded LibreDB provider | — |
 | `q'…'` | nobody | everything except Oracle: the form is Oracle's alone, so "not a literal" is the correct reading for the rest |
-| `[…]` | MySQL, Oracle, Elasticsearch, Couchbase, Druid, LibreDB | SQL Server, SQLite, libSQL and OpenSearch, whose rule the default already applied |
-| `/* … */` nesting | Couchbase, Druid, LibreDB | MySQL, SQLite, libSQL, Oracle, Elasticsearch, OpenSearch and Trino, whose flat rule the default already applied — each established from its own source rather than assumed to agree |
-| `//` | Elasticsearch, OpenSearch, Couchbase, Druid, LibreDB | PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, SQL Server and Trino, each refused on a live server: `SELECT 1 // note` is an error there, so "not a comment" is the reading the default already applied |
+| `[…]` | MySQL, Oracle, Db2 LUW, Elasticsearch, Couchbase, Druid, LibreDB | SQL Server, SQLite, libSQL and OpenSearch, whose rule the default already applied |
+| `/* … */` nesting | Couchbase, Druid, LibreDB | MySQL, SQLite, libSQL, Oracle, Elasticsearch, OpenSearch, Trino and Databend, whose flat rule the default already applied — each established from its own source rather than assumed to agree |
+| `//` | Elasticsearch, OpenSearch, Couchbase, Druid, LibreDB | PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, Db2 LUW, SQL Server and Trino, each refused on a live server: `SELECT 1 // note` is an error there, so "not a comment" is the reading the default already applied; Databend, whose lexer has `//` as an operator token; Apache Spark, whose lexer reads `/` as division |
 
-The distinction is visible in `src/lib/sql/grammar.ts` too: an established fact is written out in that
-dialect's row, an undecided one is written `DEFAULT_SQL_GRAMMAR.<fact>`.
+The distinction is visible in each engine's grammar module too: an established fact is written out
+in that dialect's grammar constant, an undecided one is written `DEFAULT_SQL_GRAMMAR.<fact>`, and an
+engine with no fact established at all names `DEFAULT_SQL_GRAMMAR` itself.
 
 The bracket row is the one where a default costs something, and PostgreSQL is why it is worth
 establishing rather than accepting: left at the name reading, a nested array or a subscript key
 containing a `]` lost its bound there — and, since #297, also asked for confirmation, because the same
 undeterminable run is text the safety gate cannot read. A prompt on everyday syntax teaches operators
 to click the gate away, which costs more than the missed bound, so the rule was established from the
-manual (4.2.3 Subscripts, 4.2.12 Array Constructors). MySQL and Oracle stay undecided: `[` is not a
-name quote in either, but neither has a subscript rule to read it under instead, and reading one
+manual (4.2.3 Subscripts, 4.2.12 Array Constructors). MySQL, Oracle and Db2 LUW stay undecided: `[` is not a
+name quote in any of them (`SELECT 1 AS [a] FROM SYSIBM.SYSDUMMY1` is SQLCODE -104 on Db2 12.1), but none has a subscript rule to read it under instead, and reading one
 engine's rule off another's is what this channel exists to stop. The direction there is safe — a run
 the name reading cannot close is reported as undeterminable, an undeterminable end is never cut, so
-the cost is an unbounded read and never a misplaced clause — and those two dialects do not write
+the cost is an unbounded read and never a misplaced clause — and those three dialects do not write
 bracket runs in everyday SQL. See
 [Text the reading cannot resolve asks, and says so](#text-the-reading-cannot-resolve-asks-and-says-so).
 
@@ -275,6 +305,65 @@ is emitted exactly as it was before this rule existed.
 Appending after the trivia instead put the bound **inside** a trailing line comment: the engine ran
 the statement unbounded while the badge reported it as capped, and the re-appended `;` ended up
 inside the comment as well.
+
+#### An error that names the bound
+
+The engine parses the statement Studio sends, bound included, so a syntax error in the user's text can be
+reported at the bound: `SELECT * FROM D_PARENT WHERE` is sent as `SELECT * FROM D_PARENT WHERE LIMIT 501`, and
+Snowflake reads `LIMIT` as a column and answers `syntax error line 1 at position 35 unexpected '501'`.
+When an engine's syntax error points at a word or number of the clause Studio added (`LIMIT`, `TOP`,
+`OFFSET` or the count, spelt as Studio wrote it), `POST /api/db/query`, `POST /api/db/multi-query` (the
+script's bounded last statement) and `POST /api/db/transaction` add one sentence after the engine's
+message, once, keeping its class and status:
+
+`Studio added the clause LIMIT 501 to this statement to bound its rows, so a position or token this error names may be in that clause rather than in your text.`
+
+The sentence is plain text, since the results panel shows an error message as written. Only the shapes in
+which an engine names the token it stopped at count: `at or near "LIMIT"` (PostgreSQL), `near 'LIMIT 501'`
+(MySQL, the quoted rest of the statement must start with the clause), `near "LIMIT"` (SQLite),
+`near 'TOP'` and `near the keyword 'TOP'` (SQL Server), `unexpected '501'` (Snowflake) and
+`failed at position 38 (501)` (ClickHouse). An error that merely contains the word or the number gets no
+sentence: PostgreSQL's `column "limit" does not exist` or `invalid input syntax for type integer: "foo 501"`,
+MySQL's `Unknown column 'limit'`, ClickHouse's list of expected tokens or a message quoting the statement
+sent. An engine that reports the clause in another shape (Oracle's `ORA-00933`, for one) gets none either; a
+missing sentence leaves the engine's message as it was, while a wrong one would blame the clause for an
+error in the user's text.
+
+The engine's own message is never rewritten, and its positions are not remapped: they count the text that was sent.
+
+#### Clauses that must follow the bound
+
+Some dialects have a clause that is written **after** the row bound and refused before it
+(#1398). The dialect grammar declares them: `AS OF [AT LEAST] <t>` for Materialize's
+`postgres` route, `ALLOW FILTERING`, `BYPASS CACHE` and `USING TIMEOUT <duration>` for the
+`cassandra` type-id (Apache Cassandra and ScyllaDB), `FORMAT <name>` for Databend, `FOR UPDATE [NOWAIT | WAIT <n>]` for Snowflake and `OFFSET n` for Apache Spark.
+The bound is placed **before** the declared run, which is re-attached verbatim:
+
+| Statement | Emitted SQL |
+|-----------|-------------|
+| `SELECT * FROM ui_mv AS OF AT LEAST 0` (Materialize) | `SELECT * FROM ui_mv LIMIT 500 AS OF AT LEAST 0` |
+| `SELECT * FROM t BYPASS CACHE` (ScyllaDB) | `SELECT * FROM t LIMIT 500 BYPASS CACHE` |
+| `SELECT * FROM t USING TIMEOUT 5s` (ScyllaDB) | `SELECT * FROM t LIMIT 500 USING TIMEOUT 5s` |
+| `SELECT * FROM t ALLOW FILTERING` (CQL) | `SELECT * FROM t LIMIT 500 ALLOW FILTERING` |
+| `SELECT number FROM numbers(10) FORMAT CSV` (Databend) | `SELECT number FROM numbers(10) LIMIT 500 FORMAT CSV` |
+| `SELECT * FROM t ORDER BY a OFFSET 10` (Apache Spark) | `SELECT * FROM t ORDER BY a LIMIT 500 OFFSET 10` |
+| `SELECT * FROM t -- note` ⏎ `ALLOW FILTERING` (CQL) | `SELECT * FROM t LIMIT 500 -- note` ⏎ `ALLOW FILTERING` |
+
+A comment the writer put between the code and the clause stays between the bound and
+the clause, its own closing newline kept, so the bound is written in code rather than
+inside the comment - and a commented-out bound behind one (`-- LIMIT 5` ⏎
+`ALLOW FILTERING`) does not answer for the statement.
+
+The same reading answers "is this statement already bounded": `LIMIT 10 BYPASS CACHE` is an
+existing bound followed by a declared clause, so it is detected, honoured and never doubled. On
+the old path it read as unbounded — the bound was not at the end — and a second one was appended,
+which the engine refuses.
+
+A dialect with no declared clause keeps today's answer for its words: the bound is appended after
+them and the engine refuses the statement, which it refused before the bound was there too. The
+clause patterns accept word-runs, a number, a single-quoted literal or one bare token as the
+argument, so a clause-shaped run inside a literal (`… WHERE note = 'BYPASS CACHE'`) and an alias
+followed by statement text (`SELECT a AS of FROM t`) do not read as the clause.
 
 The same reading of the end answers "is this statement already bounded". The `LIMIT n`,
 `FETCH FIRST n ROWS ONLY` and `OFFSET n` probes are anchored at the end of the **statement**
@@ -340,7 +429,8 @@ trailing comment can reach — and it now declines whenever such a statement men
 `FETCH` at all, blunt on purpose, since a page cannot be ruled out from text nothing can read (#293).
 
 Providers that append a clause of their own follow the same rule: Oracle's `FETCH FIRST` and
-`OFFSET … FETCH NEXT`, and MSSQL's `OFFSET … FETCH NEXT` pagination branch. MSSQL's `SELECT TOP n`
+`OFFSET … FETCH NEXT`, Db2's `FETCH FIRST n ROWS ONLY` or `OFFSET m ROWS FETCH NEXT n ROWS ONLY` past
+the first page, and MSSQL's `OFFSET … FETCH NEXT` pagination branch. MSSQL's `SELECT TOP n`
 splices into the head, which no trailing comment can reach, so it keeps bounding a statement whose end
 may not be cut — with the one exception above. MSSQL also recognises a page form of its own that the
 shared probes above do not, `OFFSET n ROWS` with no `FETCH` tail; it is read in that provider, because
@@ -376,6 +466,66 @@ honest there and the confirmation gate is what must see it. Callers pass the con
 (this route, and the editor's multi-statement decision); a call that names none keeps the
 compatibility grammar, the same stated default the rest of `src/lib/sql` applies.
 
+#### Procedural bodies, separator lines and batches (#1312)
+
+A `;` that is code is not always the end of what the engine receives. The grammar's `script` facts
+say where it is not, and the splitter reads them:
+
+| Dialect | Body that holds its `;` | Separator line | One request carries |
+|---------|-------------------------|----------------|---------------------|
+| Oracle | a PL/SQL unit: an anonymous block (`DECLARE` or `BEGIN` first) and `CREATE [OR REPLACE] PROCEDURE`, `FUNCTION`, `PACKAGE [BODY]`, `TRIGGER`, `TYPE BODY`, read to its matching `END`; the `;` after that `END` stays in the text, because Oracle refuses the unit without it | `/` alone on a line (SQL*Plus) | one statement |
+| SQL Server | none needed: the batch holds every body | `GO` alone on a line (sqlcmd, SSMS) | the whole batch between `GO` lines |
+| SQLite, libSQL | `CREATE [TEMP] TRIGGER … BEGIN … END`; a bare `BEGIN` is still a transaction | none | one statement |
+| every other dialect | none: PostgreSQL's routine bodies are `$$` literals the span reader already holds | none | one statement |
+
+Inside a body, `CASE … END` closes a frame and `END IF` / `END LOOP` are skipped, and a declaration
+section shares its block's `END`. A compound trigger's section holds its timing points
+(`BEFORE STATEMENT IS BEGIN … END BEFORE STATEMENT;`) to its own last `END`, a `<<label>>` before a
+block is read past, and a call spec (`AS LANGUAGE …`, `AS EXTERNAL …`, `AS MLE MODULE …`) has no body,
+so the `;` after it ends it. A unit whose frames still never close runs to the next `/` line or the end
+of the input: one statement too long, never a fragment stored INVALID. `GO 5`, sqlcmd's repeat count, is
+not a separator; it reaches the server, which refuses it (measured on SQL Server 2025 RTM-CU9: `Incorrect syntax near 'GO'.`).
+
+Two shapes the reader does not model, both recorded rather than guessed at: an unquoted, unqualified column named
+`end` inside a SQLite trigger body closes the body early (quote it, as `"end"`), and an Oracle
+`WITH FUNCTION` read is not a unit and is still cut at its inner `;`.
+
+Measured in the end-to-end pass of 2026-10-03/04 before these facts existed: Oracle 26ai Free stored a
+procedure cut at its inner `;` INVALID (PLS-00103) while this route reported its first fragment
+`success`, SQLite and libSQL refused a trigger as incomplete input, and SQL Server 2025 answered
+`Must declare the scalar variable "@x"` for `DECLARE @x INT = 5; SELECT @x * 2`, because each fragment
+was its own request on a pooled connection.
+
+When the script's last unit is a T-SQL batch of several statements, its last statement is bounded
+when it is a read and spliced back in place, so `SELECT 1; SELECT * FROM big` is bounded as it was when
+the two were separate requests. The exception is a batch that is a module definition: its first
+statement is `CREATE`, `ALTER` or `CREATE OR ALTER` of a procedure, function, trigger or view, which
+T-SQL requires first in its batch, and everything after it is the body the server stores, where a
+`TOP` would change the procedure rather than the result; that batch is sent as written. SQL Server's
+provider carries every result set of a batch, and the route shows the last one with rows, the same rule
+it applies across a script's statements. A batch's earlier result sets are not sent back one by one,
+which costs nothing the grid showed before: it shows one result, and `statements[i]` is now the
+batch. Across a `GO`, a `#temp` table survives only if the next batch borrows the same pooled
+connection, which nothing guarantees (`docs/BACKLOG.md` D92).
+
+"Run the statement at the cursor" runs a whole body (a PL/SQL unit, a SQLite trigger, a T-SQL module
+batch), but in a T-SQL batch that is a run of statements it still runs only the caret's own statement,
+so a caret on a `SELECT` never sends the `DELETE` written after it. A script whose statements share a
+`DECLARE @x` is run by selecting it, or by running the whole editor.
+
+The confirmation gate keeps reading the `;`-statements inside a body, and reads INTO a statement led
+by a control-flow word (`BEGIN`, `DECLARE`, `IF`, `ELSE`, `ELSIF`, `THEN`, `WHILE`, `LOOP`, `FOR`,
+`EXCEPTION`, `WHEN`) or a `<<label>>`: there it looks for every dangerous keyword anywhere in the
+statement's code, so `BEGIN DELETE FROM emp; END;`, `BEGIN IF c THEN DELETE FROM emp; END IF; END;` and
+T-SQL's `IF @@ROWCOUNT > 0 DELETE FROM t` ask. Dynamic SQL in such a block (`EXECUTE IMMEDIATE`,
+`DBMS_SQL`) asks whatever its text says, because the text is a literal the gate cannot read into, so
+`BEGIN EXECUTE IMMEDIATE 'DROP TABLE t PURGE'; END;` asks. Two shapes that only look like a write are
+skipped: a T-SQL variable (`@alter`, `@delete`) and a cursor's `FOR UPDATE` lock clause. Before
+procedural bodies were read, Oracle refused the
+fragment `BEGIN DELETE FROM emp` and nothing ran; now the whole block runs, so the gate has to read
+into it. What a procedure call does (`EXEC sp_cleanup`, `BEGIN p; END;`) is the server's, and it does
+not ask, as before. MySQL, Db2 and Trino compound statements are not read yet (`docs/BACKLOG.md` S7).
+
 Last-only is that route's own policy, and it leaves a hole this section does not close: a non-final
 `SELECT` runs exactly as written, and its **entire** result set travels back in `statements[i].rows`.
 That is also what the grid displays whenever the final statement returns no rows of its own
@@ -389,6 +539,40 @@ on its own to page through it.
 
 ---
 
+## Where the page size comes from
+
+The bound a statement runs under is an **execution option**, never text the product wrote into the
+statement for you.
+
+It was not always. `generateTableQuery` used to emit the tree click's preview cap as SQL —
+`SELECT * FROM t LIMIT 50`, `FETCH FIRST 50 ROWS ONLY` on Oracle, `SELECT TOP 50` on SQL Server — and
+that is what disengaged pagination end to end (#816). A statement carrying its own bound is returned
+**untouched** by the limiter, which discards the requested offset with it, while `prepareQuery` still
+reports the caller's default as the `limit`. Measured on PostgreSQL, asking for offset 50:
+
+```
+in : SELECT * FROM public.orders LIMIT 50;
+out: SELECT * FROM public.orders LIMIT 50;              wasLimited=false appliedOffset=0
+in : SELECT * FROM public.orders;
+out: SELECT * FROM public.orders LIMIT 500 OFFSET 50;   wasLimited=true  appliedOffset=50
+```
+
+Nothing downstream could tell a cap the product generated from a bound the user typed, because both
+were text in the same string, and any rule that read intent out of the text would be a guess. So the
+ambiguity was removed at the source:
+
+| Statement | Where its bound lives | Page two |
+|-----------|----------------------|----------|
+| A tree click's preview | `options.limit = 50`, sent with the request | Offered, if the provider can serve it |
+| A statement the user ran with no bound | `options.limit = 500` (the route's default) | Offered, if the provider can serve it |
+| A statement the user wrote `LIMIT n` into | the text, and it is left alone | Not offered: the bound is the user's, and it is hard |
+| A statement the limiter declined to rewrite | nowhere; it runs unbounded | Not offered: there is no bound to advance |
+
+The generated preview statement is therefore something you can copy out of the editor and run
+elsewhere unchanged — which it is worth knowing means every row, with no cap, when you do.
+
+---
+
 ## Destructive-Statement Confirmation
 
 Before a destructive statement runs, studio opens a confirmation dialog carrying an AI risk
@@ -397,10 +581,14 @@ same reading the auto-limiter uses, so the two cannot disagree about where a sta
 
 | Statement | Confirmation |
 |-----------|--------------|
-| `DELETE` / `DROP` / `TRUNCATE` / `ALTER` / `GRANT` / `REVOKE` / `UPDATE` | Yes |
+| `DELETE` / `DROP` / `TRUNCATE` / `ALTER` / `GRANT` / `REVOKE` / `UPDATE` / `MERGE` | Yes |
+| A PostgreSQL `DO` block (`DO $$ … $$`, `DO '…'`, `DO LANGUAGE …`), whatever its body does, since the gate does not read the body | Yes |
+| The `DO` of `ON CONFLICT DO NOTHING` or `CREATE RULE … DO INSTEAD`, which a word follows | No |
 | Any of those behind a comment (`-- note`, `/* note */`, MySQL's `# note`, several stacked) | Yes |
 | A `WITH` whose CTE list precedes one (`WITH x AS (…) DELETE FROM …`) | Yes |
-| A `WITH` whose CTE list *contains* an `UPDATE … SET` (PostgreSQL's data-modifying CTE) | Yes |
+| A CTE body that opens with `INSERT`, `DELETE` or `MERGE`, or with `WITH` operated by one of those (`AS (`, `AS MATERIALIZED (`, `AS NOT MATERIALIZED (`; the `WITH` need not lead the statement), or whose code contains `UPDATE … SET` (PostgreSQL's data-modifying CTE; CockroachDB shares the grammar) | Yes |
+| A `WITH` that only names `merge`, `delete` or `insert` as a column or a CTE | No |
+| `EXPLAIN ANALYZE` or `EXPLAIN (ANALYZE, …)` of a statement that asks, on PostgreSQL (CockroachDB shares the grammar). `ANALYZE` set to a boolean false (`false`, `off`, `no`, `0` and their prefixes) or an integer 0 (`0x0`, `0b0`, `0o0`, `0_0`), and a plain `EXPLAIN`, only plan. `0x1`, `0b1`, `0o1` and `0_1` execute | Yes, the same answer as the explained statement |
 | A statement carrying a run the reader cannot resolve (`SELECT '\';` and anything after it, an unterminated comment, literal, name or array) | Yes, and the dialog says why |
 | Any of those behind a **nested** comment (`/* a /* b */ c */ DROP TABLE users`), on a dialect that nests — PostgreSQL, SQL Server, ClickHouse | Yes: the comment is read whole, so the statement's own keyword is the one that answers |
 | The same text on a dialect that does **not** nest — MySQL, MariaDB, SQLite, Oracle | No, because there the comment closed at the first `*/` and what follows it is text the engine rejects outright |
@@ -422,12 +610,42 @@ Writing a note above a destructive statement is ordinary, and it is exactly wher
 matters most.
 
 One probe stays deliberately unanchored: a statement whose code contains `UPDATE` followed by
-`SET` asks for confirmation whatever its own keyword is. PostgreSQL's data-modifying CTE is
+`SET` asks for confirmation whatever its own keyword is, except an `EXPLAIN` that will not execute
+it (below). PostgreSQL's data-modifying CTE is
 *operated* by its `SELECT` — which is the honest answer, and the one the limiter needs so it does
 not bound the rows a write commits — so anchoring this probe too would take the last check away
 from a statement that really does write. It reads the statement's **code** rather than its text
 (`src/lib/sql/words.ts`), so unlike the pattern before it, a read that merely quotes
 `'UPDATE t SET x = 1'` or mentions it in a comment no longer prompts.
+
+`DELETE`, `MERGE` and `INSERT` are the other three words of that set (`DATA_MODIFYING` in
+`src/lib/explain/select-prefix.ts`). They are non-reserved in PostgreSQL, so a column or a CTE may
+be named one of them. They count as the first word of a CTE body — right after `AS (`,
+`AS MATERIALIZED (` or `AS NOT MATERIALIZED (`, with strings and comments skipped — or, when that
+body opens with `WITH`, as the keyword that operates it. The statement need not lead with `WITH`.
+So `WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d` asks, and so do the `MERGE … DELETE` and
+`INSERT` forms, including a `MATERIALIZED` hint, a body of
+`WITH x AS (WITH y AS (SELECT 1) DELETE FROM t RETURNING *) SELECT * FROM x` and its `INSERT` twin,
+`(WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d)`, and
+`CREATE TABLE t2 AS WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d`.
+`WITH a AS (SELECT merge FROM audit) SELECT * FROM a` does not. CockroachDB connections are the
+`postgres` type-id and share that grammar, so they ask for the same bodies. A word that only appears
+in a string or a comment does not ask. An unclosed list that leads with `WITH` still does not: the
+shape cannot be typed, and no dialect accepts the text.
+
+On PostgreSQL, `EXPLAIN ANALYZE` executes the statement it explains. Typed into the editor, it used to
+be read as an `EXPLAIN`, which is not a dangerous keyword, so `EXPLAIN ANALYZE DELETE FROM users`
+deleted the rows with no confirmation (#1863). The gate strips a leading run of `ANALYZE`, `ANALYSE`
+and `VERBOSE`, or a parenthesised option list, and when `ANALYZE` is enabled asks about the remaining
+statement the way it would on its own — including a data-modifying CTE written under the `EXPLAIN`.
+`ANALYZE` with no value is on; `true`, `on` and `1` are on. A value is off only when the whole of it
+is a boolean false (`false`, `off`, `no`, `0` and their accepted prefixes) or an integer literal of
+value 0, so `0x0`, `0b0`, `0o0` and `0_0` plan while `0x1`, `0b1`, `0o1` and `0_1` execute. Anything
+else is on. A plain
+`EXPLAIN`, `EXPLAIN VERBOSE`, or `ANALYZE` set off only plans, so it does not ask, and an `UPDATE … SET`
+inside that plan does not either. A word inside a string or a comment is not an option and is not the
+statement. CockroachDB connections are the `postgres` type-id and share the grammar, so they ask too.
+The grammar fact is `explainExecutesWithAnalyze`, absent on every other row.
 
 ### Text the reading cannot resolve asks, and says so
 
@@ -448,12 +666,15 @@ was invisible to the reading. It now asks instead of executing.
 
 The accepted cost, pinned by tests rather than left to be discovered, in two classes:
 
-- **A closing quote behind an odd backslash run** is reported undeterminable whatever the dialect, and
+- **A closing quote behind an odd backslash run** is reported undeterminable on most rows, and
   this is the most frequent prompt the rule buys: it covers a literal ending in a backslash (a Windows
   path) *and* `\'` as an escaped apostrophe — which is MySQL's own escape, so an everyday MySQL read
-  such as `… WHERE name = 'O\'Brien'` asks on every execute. Naming the dialect does not narrow this
-  one, because whether `\` escapes is deliberately not a fact the grammar record carries yet (fixtures
-  across this milestone rest on the undeterminable reading). What does *not* happen is a prompt
+  such as `… WHERE name = 'O\'Brien'` asks on every execute.
+  Naming a shipped dialect narrows this one only where the dialect has one fixed reading: the grammar record carries the fact as `backslashAlwaysEscapes`, and most rows declare it false, MySQL included because `NO_BACKSLASH_ESCAPES` in `sql_mode` changes its reading per session.
+  Databend's, BigQuery's, Snowflake's and Apache Spark's rows declare it true, because their lexers escape with a backslash and no setting turns that off, so there `'it\'s'` is one closed literal and a backslash before a line feed leaves the literal open.
+  Snowflake's row also declares `doubleQuoteBackslashEscapes` false, because a backslash inside `"..."` is part of the name there, so `"a\"` is one closed name.
+  Apache Spark's row leaves `doubleQuoteBackslashEscapes` absent, because Spark's lexer pairs a backslash with the next character in both `'...'` and `"..."`.
+  What does *not* happen is a prompt
   for a statement that merely contains a backslash — `SELECT 'a\nb' FROM t`, `… LIKE 'a\_b'` and
   `'C:\\Users\\me'` all resolve and run without one.
 - **A bracketed run a dialect at the default bracket reading cannot close.** `[…]` is read as SQL
@@ -487,23 +708,34 @@ own grammar (#295) and unresolvable only to a reader without it — and it lifts
 cannot read at all: Oracle's `q'{it's}'` (#292). It does nothing for the first class, per that
 bullet.
 
-Two gaps are known and pinned by tests rather than claimed closed:
+One gap is known and pinned by tests rather than claimed closed:
 
-- **Only `UPDATE … SET` is looked for inside a read.** A write hidden in a CTE *body* under any
-  other keyword (`WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone`) does not prompt.
-  Widening the probe to `DELETE`/`INSERT`/`MERGE` would also make every read whose code names one
-  of them prompt, so the asymmetry is inherited from the vocabulary above rather than chosen here.
 - **A statement whose shape cannot be TYPED** — an unclosed CTE list such as
   `WITH t AS (DELETE FROM x` — does not prompt. This is the boundary of the rule above rather than
   an exception to it: every character was read, and what they spell is an incomplete statement
   rather than a run hiding what is written inside it. No dialect accepts the text, so the server
-  rejects it; and the keyword inside the unclosed list is a CTE-body write, which the gap above
-  already does not prompt for even when the list closes. Pinned by
+  rejects it. The same keyword inside a list that *does* close asks (#1862); this one does not,
+  because the list cannot be crossed and the probe refuses to guess. Pinned by
   `tests/components/QuerySafetyDialog.test.tsx` ("does not prompt when the statement's shape cannot
   be typed") so the boundary stays a decision — the shipped rule keys on unresolvable *runs*, and
   widening it to every statement the reader cannot type would prompt for an empty editor.
 
-A third gap sat beside them and is closed (S1). A multi-statement script used to be read as one
+A data-modifying CTE that `DELETE`s, `MERGE`s or `INSERT`s used to be a second gap beside that one:
+only `UPDATE … SET` was looked for inside a read, so
+`WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone` ran with no confirmation. Widening the
+unanchored pair to those words would have made every read whose code names one of them prompt, and
+counting the word anywhere in the CTE list would prompt for a column or CTE named `merge`, `delete`
+or `insert`. The three count as the first word of a CTE body whose list can be typed, or as the
+keyword that operates a body opening with `WITH`. A `WITH` that is not the statement's first word is
+read the same way. That gap is closed (#1862).
+
+`EXPLAIN ANALYZE` of a write was the same kind of gap: the operative keyword is `EXPLAIN`, so a
+`DELETE` or `DROP` under it never asked, while `EXPLAIN (ANALYZE) UPDATE … SET` asked only because
+the unanchored pair happened to see the `UPDATE`. The explained statement is what runs, so the gate
+reads it as its own statement when `ANALYZE` is on, and stays silent when `ANALYZE` is off or absent
+(#1863). Pinned by `tests/components/QuerySafetyDialog.test.tsx`.
+
+Another gap sat beside them and is closed (S1). A multi-statement script used to be read as one
 statement, so `SELECT 1; DROP TABLE users` did not prompt — its first keyword is the `SELECT` —
 while `SELECT 1; UPDATE t SET x = 1` did, because the unanchored probe happened to find it. The gate
 now splits the editor text with the same splitter and the same grammar the runner uses, and asks
@@ -513,8 +745,9 @@ in a Mongo document or a Redis command separates nothing, so a fragment cut ther
 run").
 
 Four runs bypass the gate on purpose, all on the standalone path
-(`src/hooks/use-query-execution.ts`): an EXPLAIN run (see below), a Load-More page of a result the
-user already has, a playground run (rolled back rather than committed), and anything carrying
+(`src/hooks/use-query-execution.ts`): an EXPLAIN run built by the Explain button (see below —
+`EXPLAIN ANALYZE` typed in the editor is an ordinary run and reaches the gate), a Load-More page of a
+result the user already has, a playground run (rolled back rather than committed), and anything carrying
 `skipSafety` — which is the dialog's own "Execute Anyway" button and the inline row editor, whose
 `UPDATE` comes from a grid edit the user has already confirmed. The embedded adapter
 (`src/workspace/hooks/use-query-adapter.ts`) has only the force-execute bypass, so every other
@@ -524,31 +757,58 @@ query a host application runs through it reaches the gate.
 
 ## Load More Functionality
 
+### When the control appears
+
+Three things must all hold, and `ResultsGrid` checks them as one predicate so the control and the
+ordering notice beside it cannot disagree:
+
+| Condition | Where it comes from | Why |
+|-----------|--------------------|-----|
+| `supportsResultPagination === true` | the connection's `ProviderCapabilities` | Sixteen providers cannot serve page two. Cassandra and Elasticsearch throw on a positive offset; MongoDB, Redis, LibreDB, Prometheus, InfluxDB (InfluxQL), Kafka, MQTT, RabbitMQ, etcd, Neo4j, Milvus, Qdrant, Oxia and S3-compatible object storage answer it with page one. An absent flag reads as unsupported |
+| `pagination.hasMore` | `POST /api/db/query` | Requires the limiter's `PreparedQuery.wasLimited` as well as a row past the page — see below |
+| the surface supplies `onLoadMore` | `BottomPanel` | A result hydrated from an agent run has no statement of its own to page |
+
 ### User Flow
 
-1. Execute query → 500 rows displayed
-2. Click "Load More" → Next 500 rows appended
+1. Execute query → one page displayed, 50 rows from a tree click and 500 from a hand-run statement
+2. Click `load n more`, in the stats strip beside the row count → the next page, of the same size,
+   appended
 3. Repeat until all data loaded or satisfied
+
+The control's label names the size it will fetch, read from `pagination.limit`, because the two page
+sizes are not interchangeable: a 50-row preview offering "Load More (500 rows)" is a promise the
+click does not keep. While a page is in flight the control is disabled and reads `Loading...`, so a
+second click cannot ask for the same offset twice.
+
+The control sits in the stats strip rather than in a bar of its own below the table. A footer that
+came and went with `hasMore` moved the grid by its own height between queries, and it said a second
+time what the row count beside it already said.
 
 ### API Request
 
 ```typescript
-// Initial query
+// Initial query — a tree click, which asks for the preview page size
 POST /api/db/query
 {
   "connection": {...},
   "sql": "SELECT * FROM orders",
-  "options": { "limit": 500, "offset": 0 }
+  "options": { "limit": 50, "offset": 0 }
 }
 
-// Load More
+// Load More — the SAME page size, read back off the first page's pagination
 POST /api/db/query
 {
   "connection": {...},
   "sql": "SELECT * FROM orders",
-  "options": { "limit": 500, "offset": 500 }
+  "options": { "limit": 50, "offset": 50 }
 }
 ```
+
+The `sql` of the second request is the statement that produced the rows already on screen -
+`QueryTab.resultQuery` - not whatever is in the editor now. The buffer is rewritten on every
+keystroke, and a run takes the editor's *effective* query, which may be only a selection of
+it; paging the buffer appended another table's rows under these columns and left the tab
+holding rows from two tables while naming one.
 
 ### Response Format
 
@@ -556,17 +816,46 @@ POST /api/db/query
 {
   "rows": [...],
   "fields": ["id", "name", ...],
-  "rowCount": 500,
+  "rowCount": 50,
   "executionTime": 45,
   "pagination": {
-    "limit": 500,
+    "limit": 50,
     "offset": 0,
-    "hasMore": true,        // More rows available
-    "totalReturned": 500,
-    "wasLimited": true      // System added LIMIT
+    "hasMore": true,        // wasLimited AND a row past the page came back
+    "totalReturned": 50,
+    "wasLimited": true      // a row past our injected bound came back (#1440), or the provider cut its result
   }
 }
 ```
+
+The response's `wasLimited` is false for a short result under an injected cap.
+It becomes true when a further page exists: the statement that runs asks for `limit + 1` rows, the extra row is never answered, and its arrival is the proof (#1440). A page that ends exactly full is the last page and reports `hasMore: false`.
+Query and transaction responses follow the same rule.
+
+`hasMore` is `wasLimited && rows.length > limit` over the probed statement, with `wasLimited` read from the limiter alone, and the first half is load-bearing.
+A provider that bounds its own result reports that bound on the response's `wasLimited` too (#1085, section 5.4), and it never sets `hasMore`.
+We can only
+offer page two of a bound this layer applied, because only then do we know how to advance it. A
+statement returned untouched — one carrying the user's own `LIMIT 50`, or a ClickHouse query whose
+trailing `FORMAT`/`SETTINGS` clause the limiter declines to cut into — runs identically at every
+offset, so a Load More over it would append the rows already on screen.
+
+### Row order across pages
+
+Studio does not inject, require or suggest an `ORDER BY` in order to paginate. On a table of millions
+of rows a sort can be fatal, and paying for it is the user's call.
+
+With an `ORDER BY`, pages are stable. Without one, rows may repeat or be skipped between pages. That
+is accepted rather than prevented, and it is not an error — but it is also not allowed to look like
+the ordered case: where a Load More is offered and the statement carries no outer `ORDER BY`, the
+stats bar says so once, beside the AUTO-LIMITED badge. Whether the statement orders its result is read
+by `src/lib/sql/result-order.ts`, under the connection's own grammar, so an `ORDER BY` inside a
+literal, a comment, a subquery or a window function's `OVER (…)` does not count as one.
+
+SQL Server deserves a note. Page one is `SELECT TOP n` and page two is `OFFSET … FETCH NEXT` with an
+injected `ORDER BY (SELECT NULL)`, which exists only because T-SQL requires an `ORDER BY` before
+`OFFSET` and promises nothing about order. Two structurally different statements, so an unordered
+SQL Server query overlaps more readily than an unordered PostgreSQL one. Accepted under the same rule.
 
 ### Load All Option
 
@@ -627,13 +916,37 @@ for renders exactly as it did before.
 
 Every SELECT query automatically runs EXPLAIN in the background (parallel execution). This provides instant performance insights without user action.
 
+The background plan is always the **estimate**: it plans the statement and never executes it, because
+the run beside it already is the execution. On PostgreSQL that is `EXPLAIN (FORMAT JSON)`; the
+**Explain** button asks for `analyze` instead and gets `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`, which
+runs the statement to report actual rows and timings. Until #1311 the background request built the
+ANALYZE form too, so every SELECT ran twice: measured on PostgreSQL 18.6, one RUN of
+`SELECT nextval('my_seq')` advanced the sequence by two, and on Citus and TimescaleDB
+`create_distributed_table` / `create_hypertable` did their work in the hidden request before the
+user's own call failed as "already distributed". An estimated plan shows the planner's rows
+(`~250.0K rows`) and cost on each node and says "not executed" in the header, instead of zero rows in
+zero time.
+
+The background plan is asked for **one statement only**. A run of several statements (for example
+`SELECT 1 AS a; INSERT ...`) gets no plan, the **Explain** button refuses one with "Only a single
+statement can be explained", and `POST /api/db/query` refuses an explain request of more than one
+statement with a 400: an EXPLAIN prefixes one statement, so the rest of the text would run as
+statements of their own (measured on Materialize, AlloyDB Omni and Cloudberry: the INSERT was applied
+twice).
+
+The plan request carries a `queryId` of its own, and **Cancel** cancels it on the server together
+with the run. Closing an editor tab whose statement is still running cancels it the same way, run and
+plan, since the tab's Cancel button goes with it. That cancel raises no toast of its own, so the close's
+**Undo** toast stays the one on top to click; Undo brings back the tab's text, not the run (standalone
+app; the embedded package's host owns its runs).
+
 ### Supported Databases
 
-| Database | EXPLAIN Format |
-|----------|---------------|
-| PostgreSQL | `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` |
-| MySQL | `EXPLAIN FORMAT=JSON` |
-| SQLite | `EXPLAIN QUERY PLAN` (tree, no cost/timing metrics) |
+| Database | Background plan (estimate) | Explain button (analyze) |
+|----------|---------------|---------------|
+| PostgreSQL | `EXPLAIN (FORMAT JSON)` | `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` |
+| MySQL | `EXPLAIN FORMAT=JSON` | `EXPLAIN FORMAT=JSON` |
+| SQLite | `EXPLAIN QUERY PLAN` (tree, no cost/timing metrics) | `EXPLAIN QUERY PLAN` |
 
 ### Non-SELECT Statements
 
@@ -643,7 +956,7 @@ be explained" — an explain run never falls back to running the original statem
 because it deliberately bypasses the dangerous-query confirmation dialog.
 
 Because it bypasses that dialog, the classification is the *only* screen on this path, and on
-PostgreSQL the wrapper is `EXPLAIN (ANALYZE, …)` — which **runs** what it explains. So the PostgreSQL
+PostgreSQL the Explain button's wrapper is `EXPLAIN (ANALYZE, …)`, which **runs** what it explains. So the PostgreSQL
 and ClickHouse strategies read the statement under their own dialect's grammar rather than the shared
 default (#300): block comments nest in both, and a flat reading of
 `/* a /* b */ SELECT 1 */ DELETE FROM users` reports `SELECT` as the leading keyword while PostgreSQL
@@ -664,7 +977,7 @@ User executes: SELECT * FROM orders WHERE status = 'pending'
 │                                                              │
 │  ┌──────────────────┐      ┌──────────────────────────────┐ │
 │  │   Main Query     │      │   Background EXPLAIN          │ │
-│  │   (with LIMIT)   │      │   (no LIMIT, ANALYZE)         │ │
+│  │   (with LIMIT)   │      │   (estimate, never executes)  │ │
 │  └────────┬─────────┘      └────────────┬─────────────────┘ │
 │           │                              │                   │
 │           ▼                              ▼                   │
@@ -752,11 +1065,22 @@ Interactive, collapsible execution plan with:
 src/
 ├── lib/db/utils/
 │   └── query-limiter.ts      # Query parsing and LIMIT injection
+├── lib/sql/
+│   └── result-order.ts       # Whether a statement orders its OWN result
+├── lib/query-generators.ts   # The tree click's statement — no row bound of its own
+├── lib/results/
+│   └── append-page.ts        # appendResultPage: the Load More append rule (standalone hook; type-only imports so the VS Code webview can share it)
+├── hooks/
+│   ├── use-tab-manager.ts    # PREVIEW_PAGE_SIZE, sent as an execution option
+│   └── use-query-execution.ts # currentOffset, Load More (standalone)
+├── workspace/hooks/
+│   └── use-query-adapter.ts  # The same, for the embedded shell
 ├── app/api/db/
-│   └── query/route.ts        # Query API with pagination
+│   └── query/route.ts        # Query API with pagination; hasMore requires wasLimited
 ├── components/
 │   ├── Studio.tsx            # Query execution orchestration
-│   ├── ResultsGrid.tsx       # Results display with Load More
+│   ├── ResultsGrid.tsx       # Results display; the one predicate behind Load More
+│   ├── results-grid/StatsBar.tsx  # AUTO-LIMITED badge, ordering notice, Load More control
 │   └── VisualExplain.tsx     # EXPLAIN visualization
 └── lib/types.ts              # QueryPagination interface
 ```
@@ -810,8 +1134,9 @@ interface QueryResult {
 interface QueryTab {
   id: string;
   name: string;
-  query: string;
+  query: string;                         // the editor buffer, rewritten on every keystroke
   result: QueryResult | null;
+  resultQuery?: string;                  // the statement that produced `result`, as it was sent
   explainPlan?: any;
   currentOffset?: number;
   isLoadingMore?: boolean;

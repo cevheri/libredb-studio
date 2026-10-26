@@ -29,16 +29,6 @@ import type { DatabaseType } from "@/lib/types";
  *
  * Adding `queryReadOnly` to any provider, adding a provider, or adding a `DatabaseType`
  * therefore fails this file until `AGENT_EXECUTION_ENGINES` is updated to match.
- *
- * ONE id escapes the prototype measurement: `mongodb`. Importing
- * `providers/document/mongodb.ts` pulls `mongodb` -> `bson`, which calls
- * `node:v8 isBuildingSnapshot` at import time; Bun answers
- * `NotImplementedError: node:v8 isBuildingSnapshot is not yet implemented in Bun`
- * (measured with bun 1.3.14). For that id the file falls back to a conservative source
- * scan: the module must not mention `queryReadOnly` at all, and its base class
- * (`BaseDatabaseProvider` in `src/lib/db/base-provider.ts`, which imports no driver) must
- * not carry one either. Any mention fails the test rather than being interpreted, so the
- * fallback can only be too strict.
  */
 
 const repoRoot = join(import.meta.dir, "..", "..", "..", "..");
@@ -47,11 +37,13 @@ const factorySource = readFileSync(join(repoRoot, "src", "lib", "db", "factory.t
 
 /** Every member of the `DatabaseType` union, parsed from its declaration in `src/lib/types.ts`. */
 function parseDatabaseTypes(): DatabaseType[] {
-  const declaration = /export type DatabaseType =([\s\S]*?);\n/.exec(typesSource);
+  // The declaration ends at the semicolon after a quoted arm, not at the first `;` at a line end: a
+  // comment inside the union may end its line with one (the neo4j arm's does), which cut the parse short.
+  const declaration = /export type DatabaseType =([\s\S]*?")\s*;\n/.exec(typesSource);
   if (!declaration) throw new Error("could not locate the DatabaseType declaration in src/lib/types.ts");
-  const ids = [...declaration[1].matchAll(/^\s*\|\s*"([a-z]+)"/gm)].map((match) => match[1] as DatabaseType);
+  const ids = [...declaration[1].matchAll(/^\s*\|\s*"([a-z0-9]+)"/gm)].map((match) => match[1] as DatabaseType);
   if (ids.length === 0) throw new Error("parsed no ids out of the DatabaseType declaration");
-  // A union arm whose id the `[a-z]+` class cannot spell (a digit, a hyphen) would be
+  // A union arm whose id the `[a-z0-9]+` class cannot spell (a hyphen, an underscore) would be
   // dropped SILENTLY, and the factory scan below would drop it in the same way, so the
   // parity test would still pass and the new engine would go unmeasured. Counting the
   // arms independently of their spelling makes that a hard failure instead.
@@ -71,7 +63,7 @@ function parseFactoryDispatch(): Map<DatabaseType, { exportName: string; specifi
   // `case "` boundary makes such a case fail to parse, which the union-parity test below
   // then reports as a missing id.
   const cases = factorySource.matchAll(
-    /case "([a-z]+)": \{(?:(?!case ")[\s\S])*?const \{ (\w+) \} = await import\("(\.[^"]+)"\)/g,
+    /case "([a-z0-9]+)": \{(?:(?!case ")[\s\S])*?const \{ (\w+) \} = await import\("(\.[^"]+)"\)/g,
   );
   for (const [, id, exportName, specifier] of cases) {
     dispatch.set(id as DatabaseType, { exportName, specifier });
@@ -83,22 +75,20 @@ function parseFactoryDispatch(): Map<DatabaseType, { exportName: string; specifi
 const databaseTypes = parseDatabaseTypes();
 const dispatch = parseFactoryDispatch();
 
-/** The one id whose module cannot be imported under Bun - see the file header. */
-const UNIMPORTABLE: DatabaseType = "mongodb";
-
+/**
+ * mongodb is measured like every other engine now: its module imports under the Bun this
+ * suite runs on, and #1614 gave its provider a `queryReadOnly` of its own. The source-scan
+ * branch this replaced existed because the module could not be imported under Bun 1.3.14
+ * (`bson` reached `node:v8 isBuildingSnapshot`), and its conservative fallback - "no mention
+ * of the method at all" - was only ever able to be too strict. The import has been verified
+ * to work under the current Bun (`bun -e` against the module, 2026-10-15); if it ever fails
+ * again, the failure is loud right here, and the honest fix is to re-measure, not to fold
+ * back to a scan that cannot see a method it was written to assume absent.
+ */
 async function hasReadOnlyPath(type: DatabaseType): Promise<boolean> {
   const entry = dispatch.get(type);
   if (!entry) throw new Error(`no createProvider case for "${type}"`);
   const modulePath = join(repoRoot, "src", "lib", "db", entry.specifier);
-
-  if (type === UNIMPORTABLE) {
-    const source = readFileSync(`${modulePath}.ts`, "utf8");
-    expect({ id: type, mentionsQueryReadOnly: source.includes("queryReadOnly") }).toEqual({
-      id: type,
-      mentionsQueryReadOnly: false,
-    });
-    return false;
-  }
 
   const imported = (await import(modulePath)) as Record<string, unknown>;
   const exported = imported[entry.exportName];
@@ -128,6 +118,12 @@ describe("AGENT_EXECUTION_ENGINES", () => {
     const results = await Promise.all(databaseTypes.map(hasReadOnlyPath));
     const measured = databaseTypes.filter((_, index) => results[index]);
     expect(measured.sort()).toEqual([...AGENT_EXECUTION_ENGINES].sort());
+  });
+
+  test("firestore offers no read-only statement path, so agent mode does not execute on it (Firestore spec 7)", async () => {
+    expect(databaseTypes).toContain("firestore");
+    expect(await hasReadOnlyPath("firestore")).toBe(false);
+    expect(AGENT_EXECUTION_ENGINES).not.toContain("firestore");
   });
 });
 

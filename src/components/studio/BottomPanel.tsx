@@ -1,9 +1,12 @@
 "use client";
 
+import type { CsvDelimiter } from "@/lib/export/csv";
+
 import React, { useMemo } from "react";
-import type { DatabaseConnection, QueryTab, TableSchema, QueryResult } from "@/lib/types";
+import type { DatabaseConnection, QueryResult } from "@/lib/types";
+import type { DetailedObject } from "@/lib/db/detailed-object";
 import type { ProviderMetadata } from "@/hooks/use-provider-metadata";
-import type { MaskingConfig } from "@/lib/data-masking";
+import { detectSensitiveColumnsFromConfig, type MaskingConfig } from "@/lib/data-masking";
 import type { AgentArtifactHydration } from "@/components/agent/hydration";
 import type { CellChange } from "@/components/ResultsGrid";
 import { ResultsGrid } from "@/components/ResultsGrid";
@@ -12,9 +15,11 @@ import { SavedQueries } from "@/components/SavedQueries";
 import { ChunkBoundary, ViewLoading } from "@/components/LazyView";
 import { lazyRetry } from "@/lib/lazy";
 import { describeExportScope } from "@/lib/export/scope";
+import { pageOfferFor } from "@/components/results-grid/page-offer";
 import type { ResultExportFormat } from "@/lib/export/result-export";
 
 import { resolveExplainPlan } from "@/lib/explain";
+import { hasGraphValues } from "@/lib/db/graph/result-graph";
 import { cn } from "@/lib/utils";
 import {
   ChartColumn,
@@ -26,7 +31,9 @@ import {
   GitCompare,
   LayoutDashboard,
   LayoutGrid,
+  Network,
   Terminal,
+  TriangleAlert,
   X,
   Zap,
 } from "lucide-react";
@@ -34,14 +41,45 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Button } from "@/components/ui/button";
 import { storage } from "@/lib/storage";
+import { offersSqlExport } from "@/lib/db/types";
+
+/**
+ * Every form a result can leave this panel in, in the order the menu offers them.
+ *
+ * ONE list, read by both destinations (#701). The file items and the clipboard items
+ * are the same formats by construction rather than by two lists that agree today: the
+ * drift between two spellings of one list is what put the delimiter options out of
+ * step with the writers before.
+ */
+export type ResultFormatEntry = {
+  readonly format: ResultExportFormat;
+  readonly label: string;
+  readonly csvDelimiter?: CsvDelimiter;
+};
+
+export const RESULT_FORMATS: readonly ResultFormatEntry[] = [
+  { format: "csv", label: "CSV" },
+  { format: "csv", label: "CSV (semicolon)", csvDelimiter: ";" },
+  { format: "csv", label: "CSV (tab)", csvDelimiter: "\t" },
+  { format: "json", label: "JSON" },
+  { format: "markdown", label: "Markdown" },
+  { format: "html", label: "HTML" },
+  { format: "sql-insert", label: "SQL INSERT" },
+  { format: "sql-ddl", label: "DDL (CREATE TABLE)" },
+];
+
+/** The two formats that write a SQL table, offered only where the dialect says they apply (`offersSqlExport`, BACKLOG U69). */
+const SQL_TABLE_FORMATS: ReadonlySet<ResultExportFormat> = new Set<ResultExportFormat>(["sql-insert", "sql-ddl"]);
 
 export type BottomPanelMode =
   | "results"
+  | "graph"
   | "explain"
   | "history"
   | "saved"
@@ -87,6 +125,11 @@ const DataCharts = React.lazy(
 );
 const SchemaDiff = React.lazy(
   lazyRetry(() => import("@/components/SchemaDiff").then((m) => ({ default: m.SchemaDiff }))),
+);
+// The canvas library itself is a further dynamic import inside the view, so this
+// chunk is the view's own code and the library arrives only once the tab is opened.
+const GraphView = React.lazy(
+  lazyRetry(() => import("@/components/results-graph/GraphView").then((m) => ({ default: m.GraphView }))),
 );
 
 // The saved-chart dashboard. Its data is read on mount, not its module — the module
@@ -138,8 +181,18 @@ function ChartDashboard({ result }: { result: QueryResult | null }) {
 interface BottomPanelProps {
   mode: BottomPanelMode;
   onSetMode: (mode: BottomPanelMode) => void;
-  currentTab: QueryTab;
-  schema: TableSchema[];
+  // What the panel draws of the tab, and nothing else (X5). The panel used to be handed
+  // the whole `QueryTab`, whose identity changes on every keystroke because
+  // `onContentChange` rewrites the query into the tab; these are the fields it reads.
+  result: QueryResult | null;
+  explainPlan: unknown;
+  // The statement the explain view pairs with its plan. The shells hand it only while that
+  // view is open: anywhere else it would be a prop that changes on every keystroke and
+  // re-renders this memoized panel for a view that is not on screen (X5).
+  explainQuery?: string;
+  resultQuery: string | undefined;
+  runError: string | undefined;
+  schema: readonly DetailedObject[];
   schemaContext: string;
   activeConnection: DatabaseConnection | null;
   metadata: ProviderMetadata | null;
@@ -166,7 +219,25 @@ interface BottomPanelProps {
   // The second argument is the artifact the rows on screen came from, or null when
   // they are the tab's own: the export writes what it is GIVEN rather than reading the
   // tab back, which is what lets the menu stay open over a hydrated result (B34).
-  onExportResults: (format: ResultExportFormat, hydrated: AgentArtifactHydration | null) => void;
+  onExportResults: (
+    format: ResultExportFormat,
+    hydrated: AgentArtifactHydration | null,
+    csvDelimiter?: CsvDelimiter,
+  ) => void;
+  /**
+   * The same rows, in the same formats, onto the clipboard instead of into a file
+   * (#701).
+   *
+   * Its own prop rather than a destination argument on the one above, because the two
+   * do not end the same way: a download either starts or the browser says so, while a
+   * clipboard write can be refused — no secure context, no permission, an unfocused
+   * document — and the shell has to report that outcome once it has one.
+   */
+  onCopyResults: (
+    format: ResultExportFormat,
+    hydrated: AgentArtifactHydration | null,
+    csvDelimiter?: CsvDelimiter,
+  ) => void;
   /**
    * A result an agent run stored, shown in the surface that already renders that
    * kind of result (#329 T11). Optional so every other caller — the embedded shell
@@ -176,10 +247,14 @@ interface BottomPanelProps {
   onDismissAgentArtifact?: () => void;
 }
 
-export function BottomPanel({
-  mode,
+export const BottomPanel = React.memo(function BottomPanel({
+  mode: requestedMode,
   onSetMode,
-  currentTab,
+  result,
+  explainPlan,
+  explainQuery,
+  resultQuery,
+  runError,
   schema,
   schemaContext,
   activeConnection,
@@ -199,10 +274,20 @@ export function BottomPanel({
   onLoadMore,
   isLoadingMore,
   onExportResults,
+  onCopyResults,
   agentArtifact = null,
   onDismissAgentArtifact,
 }: BottomPanelProps) {
-  const explainInput = useMemo(() => resolveExplainPlan(currentTab.explainPlan), [currentTab.explainPlan]);
+  const explainInput = useMemo(() => resolveExplainPlan(explainPlan), [explainPlan]);
+  /*
+    The Graph tab is offered by the result's shape, not by the engine: only a result
+    that holds a node, a relationship or a path at any depth has anything to draw.
+    The mode is shell state and outlives the result it was chosen for (switching to a
+    tab whose result has none keeps it), so it is read as Results until a graph is
+    back, rather than leaving the panel on a tab the strip no longer shows.
+  */
+  const offersGraph = useMemo(() => hasGraphValues(result?.rows ?? [], result?.fields ?? []), [result]);
+  const mode = requestedMode === "graph" && !offersGraph ? "results" : requestedMode;
 
   /*
     An agent artifact is shown in ONE surface — the one the RUN's own record names,
@@ -237,75 +322,128 @@ export function BottomPanel({
     ((mode === "results" && hydratedResult !== null) ||
       (mode === "explain" && hydratedPlan !== null) ||
       (mode === "charts" && hydratedChart !== null));
-  const displayedResult = hydratedResult ?? currentTab.result;
+  const displayedResult = hydratedResult ?? result;
   /**
    * What an export must be attributed to: the artifact when the run's rows are the
    * ones on screen, null when they are the tab's own. Only the results surface has an
    * export, so this is the grid's artifact and no other's.
    */
   const exportArtifact = mode === "results" && hydratedResult !== null ? agentArtifact : null;
+  /**
+   * The next-page offer these rows carry, which is what the grid gates its control on.
+   *
+   * Computed here as well as in `ResultsGrid` because two surfaces speak about the same
+   * offer and must not disagree: the export dialog's "load them first" names an action
+   * only this offer makes available. Both call `pageOfferFor`, so there is one definition
+   * of the condition and not two (#816).
+   */
+  const gridPageOffer = pageOfferFor(
+    displayedResult?.pagination,
+    metadata?.capabilities.supportsResultPagination,
+    hydratedHere ? undefined : onLoadMore,
+  );
   // How much of the result an export would write — the count the button carries and
   // the shortfall the menu states. Derived here so both read the same numbers.
-  const exportScope = describeExportScope(displayedResult ?? { rows: [] });
+  const exportScope = describeExportScope(displayedResult ?? { rows: [] }, gridPageOffer !== undefined);
+  /**
+   * The columns an export writes masked: the same detection the file builder applies, so the
+   * menu says exactly what the file will hold (#1433). Empty when masking is off or no column
+   * of this result matches a pattern, and then nothing is claimed.
+   */
+  const maskedColumns =
+    maskingEnabled && displayedResult
+      ? [...detectSensitiveColumnsFromConfig(displayedResult.fields, maskingConfig).keys()]
+      : [];
+  // One list for both menus, filtered once, so the file items and the clipboard items cannot disagree (#701).
+  // SQL INSERT is withheld while a column is masked: its mask text would be written as the
+  // column's VALUE, and replaying the file would store it or be refused by a typed column (#1433).
+  const resultFormats = (
+    offersSqlExport(metadata?.capabilities)
+      ? RESULT_FORMATS
+      : RESULT_FORMATS.filter((entry) => !SQL_TABLE_FORMATS.has(entry.format))
+  ).filter((entry) => !(maskedColumns.length > 0 && entry.format === "sql-insert"));
+
+  /**
+   * Hands one format entry to whichever destination the user chose.
+   *
+   * The delimiter is passed only where the entry carries one, rather than as an
+   * explicit `undefined`: "CSV" means the writer's own default, and a call that spells
+   * the absence out is a different call for the same choice.
+   */
+  const runResultFormat = (
+    run: (format: ResultExportFormat, hydrated: AgentArtifactHydration | null, csvDelimiter?: CsvDelimiter) => void,
+    entry: (typeof RESULT_FORMATS)[number],
+  ) => {
+    if (entry.csvDelimiter === undefined) run(entry.format, exportArtifact);
+    else run(entry.format, exportArtifact, entry.csvDelimiter);
+  };
 
   const tabs: { key: BottomPanelMode; label: string; icon: React.ReactNode; activeClass: string }[] = [
     {
       key: "results",
       label: "Results",
       icon: <LayoutGrid strokeWidth={1.5} className="w-3 h-3" />,
-      activeClass: "text-blue-400 border-blue-500 bg-fill",
+      activeClass: "text-hue-blue border-hue-blue-tint bg-fill",
+    },
+    {
+      key: "graph",
+      label: "Graph",
+      icon: <Network strokeWidth={1.5} className="w-3 h-3" />,
+      activeClass: "text-hue-green border-hue-green-tint bg-fill",
     },
     {
       key: "explain",
       label: "Explain",
       icon: <Zap strokeWidth={1.5} className="w-3 h-3" />,
-      activeClass: "text-amber-400 border-amber-500 bg-fill",
+      activeClass: "text-hue-amber border-hue-amber-tint bg-fill",
     },
     {
       key: "history",
       label: "History",
       icon: <Clock strokeWidth={1.5} className="w-3 h-3" />,
-      activeClass: "text-emerald-400 border-emerald-500 bg-fill",
+      activeClass: "text-hue-emerald border-hue-emerald-tint bg-fill",
     },
     {
       key: "saved",
       label: "Saved",
       icon: <Bookmark strokeWidth={1.5} className="w-3 h-3" />,
-      activeClass: "text-purple-400 border-purple-500 bg-fill",
+      activeClass: "text-hue-purple border-hue-purple-tint bg-fill",
     },
     {
       key: "charts",
       label: "Charts",
       icon: <ChartColumn strokeWidth={1.5} className="w-3 h-3" />,
-      activeClass: "text-cyan-400 border-cyan-500 bg-fill",
+      activeClass: "text-hue-cyan border-hue-cyan-tint bg-fill",
     },
     {
       key: "pivot",
       label: "Pivot",
       icon: <Columns3 strokeWidth={1.5} className="w-3 h-3" />,
-      activeClass: "text-orange-400 border-orange-500 bg-fill",
+      activeClass: "text-hue-orange border-hue-orange-tint bg-fill",
     },
     {
       key: "docs",
       label: "Docs",
       icon: <FileText strokeWidth={1.5} className="w-3 h-3" />,
-      activeClass: "text-teal-400 border-teal-500 bg-fill",
+      activeClass: "text-hue-teal border-hue-teal-tint bg-fill",
     },
     {
       key: "schemadiff",
       label: "Diff",
       icon: <GitCompare strokeWidth={1.5} className="w-3 h-3" />,
-      activeClass: "text-rose-400 border-rose-500 bg-fill",
+      activeClass: "text-hue-rose border-hue-rose-tint bg-fill",
     },
     {
       key: "dashboard",
       label: "Dashboard",
       icon: <LayoutDashboard strokeWidth={1.5} className="w-3 h-3" />,
-      activeClass: "text-indigo-400 border-indigo-500 bg-fill",
+      activeClass: "text-hue-indigo border-hue-indigo-tint bg-fill",
     },
   ];
 
-  const visibleTabs = metadata?.capabilities.explainFormat ? tabs : tabs.filter((tab) => tab.key !== "explain");
+  const explainTabs = metadata?.capabilities.explainFormat ? tabs : tabs.filter((tab) => tab.key !== "explain");
+  // The Graph tab is offered only for a result that holds a graph value (U72); every other tab is unaffected.
+  const visibleTabs = offersGraph ? explainTabs : explainTabs.filter((tab) => tab.key !== "graph");
 
   return (
     /*
@@ -372,42 +510,51 @@ export function BottomPanel({
                 <div data-testid="export-scope" className="px-2 py-1.5 text-xs text-fg-muted max-w-[15rem]">
                   {exportScope.summary}
                   {exportScope.shortfall !== null && (
-                    <span className="block mt-1 text-amber-400/80">{exportScope.shortfall}</span>
+                    <span className="block mt-1 text-warning/80">{exportScope.shortfall}</span>
                   )}
                 </div>
                 {exportArtifact !== null && (
                   // Stated before the formats, because it changes what the file IS:
                   // these are a run's rows, and the name will say so.
-                  <div data-testid="export-provenance" className="px-2 pb-1.5 text-xs text-blue-300/90">
+                  <div data-testid="export-provenance" className="px-2 pb-1.5 text-xs text-hue-blue-alt/90">
                     Saved as agent run <span className="font-mono text-[0.625rem]">{exportArtifact.runId}</span>&apos;s
                     own file.
                   </div>
                 )}
+                {maskedColumns.length > 0 && (
+                  // Said once for both destinations: the file and the clipboard write the
+                  // same masked text, and nothing in the file itself says so.
+                  <div data-testid="export-masked" className="px-2 pb-1.5 text-xs text-warning/80 max-w-[15rem]">
+                    Masked columns ({maskedColumns.join(", ")}) are exported and copied masked. SQL INSERT is not
+                    offered, as it would store the mask as data.
+                  </div>
+                )}
                 <DropdownMenuSeparator className="bg-hairline" />
-                <DropdownMenuItem
-                  onClick={() => onExportResults("csv", exportArtifact)}
-                  className="text-xs cursor-pointer"
-                >
-                  Export as CSV
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={() => onExportResults("json", exportArtifact)}
-                  className="text-xs cursor-pointer"
-                >
-                  Export as JSON
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={() => onExportResults("sql-insert", exportArtifact)}
-                  className="text-xs cursor-pointer"
-                >
-                  Export as SQL INSERT
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={() => onExportResults("sql-ddl", exportArtifact)}
-                  className="text-xs cursor-pointer"
-                >
-                  Export as DDL (CREATE TABLE)
-                </DropdownMenuItem>
+                {resultFormats.map((entry) => (
+                  <DropdownMenuItem
+                    key={`export-${entry.label}`}
+                    onClick={() => runResultFormat(onExportResults, entry)}
+                    className="text-xs cursor-pointer"
+                  >
+                    Export as {entry.label}
+                  </DropdownMenuItem>
+                ))}
+                <DropdownMenuSeparator className="bg-hairline" />
+                {/*
+                  Below the scope line and below the files, because it is the same rows
+                  under the same shortfall: a paste reads even more like a complete
+                  answer than a file does, having no name to carry a caveat.
+                */}
+                <DropdownMenuLabel className="text-xs font-normal text-fg-muted">To clipboard</DropdownMenuLabel>
+                {resultFormats.map((entry) => (
+                  <DropdownMenuItem
+                    key={`copy-${entry.label}`}
+                    onClick={() => runResultFormat(onCopyResults, entry)}
+                    className="text-xs cursor-pointer"
+                  >
+                    Copy as {entry.label}
+                  </DropdownMenuItem>
+                ))}
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
@@ -421,9 +568,9 @@ export function BottomPanel({
       {hydratedHere && agentArtifact !== null && (
         <div
           data-testid="agent-provenance"
-          className="flex items-center justify-between gap-2 px-3 py-1 border-b border-blue-500/20 bg-blue-500/5"
+          className="flex items-center justify-between gap-2 px-3 py-1 border-b border-hue-blue-tint/20 bg-hue-blue-tint/5"
         >
-          <span className="text-xs text-blue-300/90">
+          <span className="text-xs text-hue-blue-alt/90">
             Stored by agent run <span className="font-mono text-[0.625rem]">{agentArtifact.runId}</span> via{" "}
             <span className="font-mono text-[0.625rem]">{agentArtifact.operationId}</span>{" "}
             {/* The audit correlation id: what joins these rows to the audit line for
@@ -445,20 +592,38 @@ export function BottomPanel({
       <div className="flex-1 overflow-hidden relative">
         {/* One pair of boundaries for the whole switch: only one view is ever mounted,
             so the fallback is what the user sees while a split chunk is in flight and
-            the error boundary is what they see when it never arrives. */}
-        <ChunkBoundary label="This view">
+            the error boundary is what they see when it never arrives or a view throws.
+            The boundary outlives every result, mode and tab, so it is reset by what it
+            shows: one result a view cannot draw must not fail every later one. The docs
+            and diff views draw the schema and the connection, so those reset it too. */}
+        <ChunkBoundary
+          label="This view"
+          resetKeys={[mode, result, agentArtifact, explainPlan, schema, activeConnection]}
+        >
           <React.Suspense fallback={<ViewLoading label="Loading the panel" />}>
             {mode === "pivot" ? (
               <PivotTable
-                result={currentTab.result}
+                result={result}
                 onLoadQuery={(q) => {
                   onLoadQuery(q);
                   onSetMode("results");
                 }}
                 databaseType={activeConnection?.type}
+                // Only where the engine says it reads SQL: on a JSON engine the generated statement
+                // replaces the reader's own request with something that cannot run.
+                offersGeneratedSql={
+                  metadata?.capabilities.queryLanguage === undefined
+                    ? undefined
+                    : metadata.capabilities.queryLanguage === "sql"
+                }
               />
             ) : mode === "docs" ? (
-              <DatabaseDocs schema={schema} schemaContext={schemaContext} databaseType={activeConnection?.type} />
+              <DatabaseDocs
+                schema={schema}
+                schemaContext={schemaContext}
+                databaseType={activeConnection?.type}
+                capabilities={metadata?.capabilities}
+              />
             ) : mode === "history" ? (
               <QueryHistory
                 refreshTrigger={historyKey}
@@ -478,11 +643,18 @@ export function BottomPanel({
                 }}
               />
             ) : mode === "charts" ? (
-              <DataCharts result={hydratedChart ?? currentTab.result} spec={hydratedChartSpec} />
+              <DataCharts result={hydratedChart ?? result} spec={hydratedChartSpec} />
+            ) : mode === "graph" && result ? (
+              <GraphView
+                result={result}
+                maskingEnabled={maskingEnabled}
+                userRole={userRole}
+                maskingConfig={maskingConfig}
+              />
             ) : mode === "schemadiff" ? (
               <SchemaDiff schema={schema} connection={activeConnection} />
             ) : mode === "dashboard" ? (
-              <ChartDashboard result={currentTab.result} />
+              <ChartDashboard result={result} />
             ) : mode === "explain" ? (
               <VisualExplain
                 plan={hydratedPlan ?? explainInput}
@@ -493,7 +665,7 @@ export function BottomPanel({
               explanation of a statement that never produced it; with no query the view
               says so itself instead.
             */
-                query={hydratedPlan === null ? currentTab.query : undefined}
+                query={hydratedPlan === null ? explainQuery : undefined}
                 schemaContext={schemaContext}
                 databaseType={activeConnection?.type}
                 onLoadQuery={(q) => {
@@ -502,20 +674,93 @@ export function BottomPanel({
                 }}
               />
             ) : displayedResult ? (
-              <ResultsGrid
-                result={displayedResult}
-                onLoadMore={hydratedHere ? undefined : onLoadMore}
-                isLoadingMore={isLoadingMore}
-                maskingEnabled={maskingEnabled}
-                onToggleMasking={onToggleMasking}
-                userRole={userRole}
-                maskingConfig={maskingConfig}
-                editingEnabled={hydratedHere ? false : editingEnabled}
-                pendingChanges={pendingChanges}
-                onCellChange={onCellChange}
-                onApplyChanges={onApplyChanges}
-                onDiscardChanges={onDiscardChanges}
-              />
+              <div className="h-full flex flex-col">
+                {/*
+                  A result AND a run error on the same tab is a script that stopped on a failing
+                  statement (#1385): the earlier statements' rows stay, the failure stands above
+                  them, and a grid with no rows is left out because its "The operation was
+                  successful" would contradict the banner. A hydrated result is another run's.
+                */}
+                {runError !== undefined && !hydratedHere && (
+                  <div
+                    role="alert"
+                    // The same token swap as the failure block below, for the same measurement: the
+                    // text is the engine's own sentence and `--destructive` is a surface red.
+                    className="shrink-0 px-3 py-2 border-b border-danger/30 bg-danger/10 text-danger"
+                    data-testid="script-failure"
+                  >
+                    <p className="text-xs font-medium">The script stopped at a failing statement.</p>
+                    <p
+                      className="mt-1 break-words whitespace-pre-wrap font-mono text-xs"
+                      data-testid="script-failure-message"
+                    >
+                      {runError}
+                    </p>
+                  </div>
+                )}
+                {(runError === undefined || hydratedHere || displayedResult.rows.length > 0) && (
+                  <div className="flex-1 min-h-0">
+                    <ResultsGrid
+                      result={displayedResult}
+                      onLoadMore={hydratedHere ? undefined : onLoadMore}
+                      isLoadingMore={isLoadingMore}
+                      supportsResultPagination={metadata?.capabilities.supportsResultPagination}
+                      // The statement these ROWS came from, for the ordering notice. Withheld
+                      // for a hydrated result for the same reason `onLoadMore` is: those rows
+                      // are an agent run's, and the tab's own statement did not produce them.
+                      resultQuery={hydratedHere ? undefined : resultQuery}
+                      databaseType={activeConnection?.type}
+                      maskingEnabled={maskingEnabled}
+                      onToggleMasking={onToggleMasking}
+                      userRole={userRole}
+                      maskingConfig={maskingConfig}
+                      editingEnabled={hydratedHere ? false : editingEnabled}
+                      inlineEditRefusedColumns={metadata?.capabilities.inlineEditRefusedColumns}
+                      maskingExemptColumns={metadata?.capabilities.maskingExemptColumns}
+                      pendingChanges={pendingChanges}
+                      onCellChange={onCellChange}
+                      onApplyChanges={onApplyChanges}
+                      onDiscardChanges={onDiscardChanges}
+                    />
+                  </div>
+                )}
+              </div>
+            ) : runError !== undefined ? (
+              /*
+                The tab's last run failed, and its failure stands where its rows would.
+                After the grid, so a hydrated result keeps its precedence, and before the
+                empty state, which would read as "nothing ran". Rendered here rather than
+                left to the toast: the embedded shell mounts no Toaster, so in that product
+                this block is the only failure signal there is.
+              */
+              <div
+                role="alert"
+                className="h-full flex flex-col items-center justify-center px-3 text-center bg-surface"
+                data-testid="run-failure"
+              >
+                {/*
+                  `danger` RATHER THAN `destructive`, and that is a contrast measurement, not taste:
+                  in the dark theme `--destructive` is `#7f1d1d`, a SURFACE red, and this block drew
+                  the whole failure in it at 1.98:1 against the panel - the engine's own sentence,
+                  which is the only thing a reader has when a query is refused, was effectively
+                  unreadable. `--studio-danger` is the foreground red the rest of the product uses
+                  for the same job (#ff6467 in dark, 6.85:1 here; #9f0712 in light). Measured in a
+                  browser on an OPC UA refusal, which is the engine whose request shape is stated
+                  nowhere else.
+                */}
+                <TriangleAlert aria-hidden="true" strokeWidth={1.5} className="mb-2 h-8 w-8 text-danger opacity-50" />
+                <p className="text-xs font-medium text-danger">The query failed.</p>
+                {/*
+                  Left-aligned inside the centred block: an engine's message can span lines with a caret under
+                  the failing name, and centring each line on its own moves the caret off its column.
+                */}
+                <p
+                  className="mt-1 max-w-xl break-words whitespace-pre-wrap text-left font-mono text-xs text-danger"
+                  data-testid="run-failure-message"
+                >
+                  {runError}
+                </p>
+              </div>
             ) : (
               <div className="h-full flex flex-col items-center justify-center opacity-20 bg-surface">
                 <Terminal strokeWidth={1.5} className="w-12 h-12 mb-4" />
@@ -528,4 +773,4 @@ export function BottomPanel({
       </div>
     </div>
   );
-}
+});

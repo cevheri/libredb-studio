@@ -1,5 +1,5 @@
 import React from "react";
-import { TableSchema } from "@/lib/types";
+import type { DetailedObject } from "@/lib/db/detailed-object";
 import type { ProviderMetadata } from "@/hooks/use-provider-metadata";
 import {
   Search,
@@ -7,15 +7,25 @@ import {
   Play,
   ChevronRight,
   Funnel,
+  Hash,
   EllipsisVertical,
   Copy,
   Trash2,
   Code,
   ChartColumn,
   WandSparkles,
+  Wrench,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { maintenanceControl } from "@/lib/db/types";
+import { offersTestDataGeneration } from "@/lib/db/object-kinds";
+import {
+  declaredEntityOperations,
+  maintenanceControl,
+  offersCodeGeneration,
+  offersColumnProfiling,
+  offersCountQuery,
+} from "@/lib/db/types";
+import { formatRowCount, formatRowCountTitle } from "@/lib/db/utils/pool-manager";
 import { cn } from "@/lib/utils";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -37,7 +47,7 @@ import { writeToClipboard } from "@/components/copy-button";
 import { ColumnList } from "./ColumnList";
 
 interface TableItemProps {
-  table: TableSchema;
+  table: DetailedObject;
   isExpanded: boolean;
   onToggle: () => void;
   // `labels` is itself optional on ProviderMetadata, so the indexed access already
@@ -45,17 +55,26 @@ interface TableItemProps {
   labels?: NonNullable<ProviderMetadata["labels"]>;
   capabilities?: ProviderMetadata["capabilities"];
   isAdmin: boolean;
-  onTableClick?: (tableName: string) => void;
-  onGenerateSelect?: (tableName: string) => void;
-  onProfileTable?: (tableName: string) => void;
-  onGenerateCode?: (tableName: string) => void;
-  onGenerateTestData?: (tableName: string) => void;
-  onOpenMaintenance?: (tab?: "global" | "tables" | "sessions", table?: string) => void;
+  onTableClick?: (path: readonly string[]) => void;
+  onGenerateSelect?: (path: readonly string[]) => void;
+  onGenerateCount?: (path: readonly string[]) => void;
+  // ADDRESSES, one element per segment, the same shape `onTableClick` above already takes:
+  // the shell resolves the object by path, because a label is not unique (#789, Task 35).
+  onProfileTable?: (path: readonly string[]) => void;
+  onGenerateCode?: (path: readonly string[]) => void;
+  onGenerateTestData?: (path: readonly string[]) => void;
+  onOpenMaintenance?: (tab?: "global" | "tables" | "sessions", path?: readonly string[]) => void;
 }
 
 type TableItemCallbacks = Pick<
   TableItemProps,
-  "onTableClick" | "onGenerateSelect" | "onProfileTable" | "onGenerateCode" | "onGenerateTestData" | "onOpenMaintenance"
+  | "onTableClick"
+  | "onGenerateSelect"
+  | "onGenerateCount"
+  | "onProfileTable"
+  | "onGenerateCode"
+  | "onGenerateTestData"
+  | "onOpenMaintenance"
 >;
 
 /**
@@ -64,7 +83,7 @@ type TableItemCallbacks = Pick<
  * travels as one object rather than as a positional list.
  */
 interface MenuItemsContext {
-  table: TableSchema;
+  table: DetailedObject;
   labels: TableItemProps["labels"];
   capabilities: TableItemProps["capabilities"];
   isAdmin: boolean;
@@ -85,11 +104,25 @@ function renderMenuItems({
   Separator,
 }: MenuItemsContext): React.ReactNode {
   // Rows that are derived groupings are not addressable objects: a Redis `user:*`
-  // row is this server's summary of a key prefix, so profiling it and inserting
-  // rows into it have no target and the provider answers 400 (#427). Gate on the
-  // declared capability, never on connection.type. Absent capabilities read as
-  // "ordinary objects", matching the flag's own docblock.
+  // row is this server's summary of a key prefix, so profiling it has no target and
+  // the provider answers 400 (#427). Gate on the declared capability, never on
+  // connection.type. Absent capabilities read as "ordinary objects", matching the
+  // flag's own docblock; the gates below are what refuse capabilities that are unknown.
   const rowsAreAddressable = capabilities?.tablesAreDerivedGroupings !== true;
+
+  // The three row actions ask exactly what the desktop tree asks in
+  // `src/components/object-tree/row-actions.ts`, so the two menus cannot disagree about
+  // what a provider declared (#1085, decision D-M). Profile needs a language
+  // `POST /api/db/profile` can profile as well as an addressable row. Generate Code needs a
+  // language whose columns model a stored record. Generate Test Data writes rows, so it asks
+  // `offersTestDataGeneration`: the row's KIND accepts row writes, and the engine declares
+  // `supportsTestDataGeneration` (#1468). This menu used to ask only the grouping flag for it,
+  // which offered the generator on every view and on every engine the tree withholds it from. Unknown
+  // capabilities offer none of the three: `/api/db/provider-meta` answers with nothing both
+  // while it is in flight and when it failed.
+  const offersProfile = rowsAreAddressable && offersColumnProfiling(capabilities);
+  const offersCode = offersCodeGeneration(capabilities);
+  const offersTestData = capabilities !== undefined && offersTestDataGeneration(capabilities, table.kind);
 
   // The SAME question the monitoring Tables tab and the admin Operations tab ask, so
   // that three surfaces cannot disagree about what a provider declared (#496). Gating
@@ -102,44 +135,62 @@ function renderMenuItems({
   // The vacuum item follows `vacuumActionOperation`, not the literal `vacuum`: four
   // providers point that wording at an operation that is not a vacuum, and it is the
   // operation - not the label - whose targeting decides whether a table can be named.
-  const analyzeControl = maintenanceControl(capabilities, "analyze", "perEntity");
-  const vacuumControl = maintenanceControl(capabilities, labels?.vacuumActionOperation ?? "vacuum", "perEntity");
+  // The row's kind too, as the desktop tree asks it: Db2's RUNSTATS runs on a table, not a view (#786).
+  const analyzeControl = maintenanceControl(capabilities, "analyze", "perEntity", table.kind);
+  const vacuumControl = maintenanceControl(
+    capabilities,
+    labels?.vacuumActionOperation ?? "vacuum",
+    "perEntity",
+    table.kind,
+  );
+  // Every declared operation outside `MaintenanceType` that runs on one row, in declaration order (spec 3.11): the
+  // same list the desktop tree's row menu reads, so the two menus cannot disagree.
+  const entityOperations = declaredEntityOperations(capabilities, table.kind);
 
   return (
     <>
-      <Item onClick={() => callbacks.onTableClick?.(table.name)}>
-        <Play strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-green-500" />
+      <Item onClick={() => callbacks.onTableClick?.(table.path)}>
+        <Play strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-hue-green" />
         {labels?.selectAction || "Select Top 50"}
       </Item>
-      <Item onClick={() => callbacks.onGenerateSelect?.(table.name)}>
-        <Funnel strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-blue-500" />
+      <Item onClick={() => callbacks.onGenerateSelect?.(table.path)}>
+        <Funnel strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-hue-blue" />
         {labels?.generateAction || "Generate Query"}
       </Item>
+      {callbacks.onGenerateCount !== undefined && offersCountQuery(capabilities) && (
+        <Item onClick={() => callbacks.onGenerateCount?.(table.path)}>
+          <Hash strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-hue-blue" />
+          {"Generate Count Query"}
+        </Item>
+      )}
       <Item onClick={() => copyToClipboard(table.name, `${labels?.entityName || "Table"} name`)}>
         <Copy strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-muted-foreground" />
         {"Copy Name"}
       </Item>
-      {/* Generate Code stays visible everywhere — it names the row, it does not
-          address it — so this separator is unconditional (#427). */}
-      <Separator />
-      {rowsAreAddressable && (
-        <Item onClick={() => callbacks.onProfileTable?.(table.name)}>
-          <ChartColumn strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-cyan-500" />
+      {/* One rule heads the three row actions below, so it is drawn only when one of them is:
+          a PromQL row, or a menu whose capabilities are still unknown, offers none, and a rule
+          with nothing after it would end the menu on a line (#1085). */}
+      {(offersProfile || offersCode || offersTestData) && <Separator />}
+      {offersProfile && (
+        <Item onClick={() => callbacks.onProfileTable?.(table.path)}>
+          <ChartColumn strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-hue-cyan" />
           {"Profile Table"}
         </Item>
       )}
-      <Item onClick={() => callbacks.onGenerateCode?.(table.name)}>
-        <Code strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-purple-500" />
-        {"Generate Code"}
-      </Item>
-      {rowsAreAddressable && (
-        <Item onClick={() => callbacks.onGenerateTestData?.(table.name)}>
-          <WandSparkles strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-amber-500" />
+      {offersCode && (
+        <Item onClick={() => callbacks.onGenerateCode?.(table.path)}>
+          <Code strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-hue-purple" />
+          {"Generate Code"}
+        </Item>
+      )}
+      {offersTestData && (
+        <Item onClick={() => callbacks.onGenerateTestData?.(table.path)}>
+          <WandSparkles strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-hue-amber" />
           {"Generate Test Data"}
         </Item>
       )}
       {/* A PER-ROW maintenance action needs an addressable row AND an engine with
-          maintenance to run: both items call `onOpenMaintenance("tables", table.name)`,
+          maintenance to run: both items call `onOpenMaintenance("tables", table.path)`,
           and for a derived grouping there is no such object to name — which is exactly
           the dead end #427 reported for Redis "Key Info".
 
@@ -158,7 +209,7 @@ function renderMenuItems({
 
           What this gate CANNOT answer is the rest of U22: both items are deep links, and the
           destination renders a per-table control only for a ROW it has statistics for. Nothing
-          here knows whether one will arrive: `TableSchema.rowCount` and `.size` are optional and
+          here knows whether one will arrive: `DetailedObject.rowCount` and `.size` are optional and
           come from the schema read, not from the monitoring statistics the destination lists, and
           no declared capability says whether an engine publishes per-table figures - so
           withholding the link would need a new capability flag this repo does not want. The
@@ -168,23 +219,31 @@ function renderMenuItems({
           src/components/monitoring/tabs/TablesTab.tsx for the /monitoring panel. Each is the only
           reader that knows whether a row turned up, and its answer is testable against what
           actually renders rather than against what was declared. */}
-      {isAdmin && rowsAreAddressable && (analyzeControl.offered || vacuumControl.offered) && (
-        <>
-          <Separator />
-          {analyzeControl.offered && (
-            <Item onClick={() => callbacks.onOpenMaintenance?.("tables", table.name)}>
-              <Search strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-amber-500" />
-              {analyzeControl.label ?? labels?.analyzeAction ?? "Analyze Table"}
-            </Item>
-          )}
-          {vacuumControl.offered && (
-            <Item onClick={() => callbacks.onOpenMaintenance?.("tables", table.name)}>
-              <Trash2 strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-blue-400" />
-              {vacuumControl.label ?? labels?.vacuumAction ?? "Vacuum Table"}
-            </Item>
-          )}
-        </>
-      )}
+      {isAdmin &&
+        rowsAreAddressable &&
+        (analyzeControl.offered || vacuumControl.offered || entityOperations.length > 0) && (
+          <>
+            <Separator />
+            {analyzeControl.offered && (
+              <Item onClick={() => callbacks.onOpenMaintenance?.("tables", table.path)}>
+                <Search strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-hue-amber" />
+                {analyzeControl.label ?? labels?.analyzeAction ?? "Analyze Table"}
+              </Item>
+            )}
+            {vacuumControl.offered && (
+              <Item onClick={() => callbacks.onOpenMaintenance?.("tables", table.path)}>
+                <Trash2 strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-hue-blue" />
+                {vacuumControl.label ?? labels?.vacuumAction ?? "Vacuum Table"}
+              </Item>
+            )}
+            {entityOperations.map((operation) => (
+              <Item key={operation.type} onClick={() => callbacks.onOpenMaintenance?.("tables", table.path)}>
+                <Wrench strokeWidth={1.5} className="w-3.5 h-3.5 mr-2 text-brand" />
+                {operation.label}
+              </Item>
+            ))}
+          </>
+        )}
     </>
   );
 }
@@ -198,6 +257,7 @@ export const TableItem = React.memo(function TableItem({
   isAdmin,
   onTableClick,
   onGenerateSelect,
+  onGenerateCount,
   onProfileTable,
   onGenerateCode,
   onGenerateTestData,
@@ -217,12 +277,14 @@ export const TableItem = React.memo(function TableItem({
   const callbacks = {
     onTableClick,
     onGenerateSelect,
+    onGenerateCount,
     onProfileTable,
     onGenerateCode,
     onGenerateTestData,
     onOpenMaintenance,
   };
 
+  const actionsLabel = `Actions for ${table.name}`;
   return (
     <div className="group flex flex-col">
       <ContextMenu>
@@ -246,7 +308,7 @@ export const TableItem = React.memo(function TableItem({
               <TableIcon
                 className={cn(
                   "w-3.5 h-3.5 shrink-0 transition-colors",
-                  isExpanded ? "text-blue-400" : "text-muted-foreground group-hover:text-foreground",
+                  isExpanded ? "text-brand" : "text-muted-foreground group-hover:text-foreground",
                 )}
               />
 
@@ -260,16 +322,25 @@ export const TableItem = React.memo(function TableItem({
               </span>
             </button>
 
-            <div className="shrink-0 relative w-8 h-6 flex items-center justify-center">
+            <div
+              title={table.rowCount === undefined ? undefined : formatRowCountTitle(table.rowCount)}
+              // Stacked where hover swaps them, side by side where the button is always shown.
+              className="shrink-0 relative w-8 h-6 flex items-center justify-center [@media(hover:none)]:w-auto [@media(hover:none)]:gap-1"
+            >
               {table.rowCount !== undefined && (
-                <span className="absolute inset-0 flex items-center justify-center text-[0.625rem] font-mono text-muted-foreground/70 whitespace-nowrap opacity-100 group-hover:opacity-0 transition-opacity pointer-events-none">
-                  {table.rowCount >= 1000 ? `${(table.rowCount / 1000).toFixed(1)}k` : table.rowCount}
+                <span
+                  title={formatRowCountTitle(table.rowCount)}
+                  className="absolute inset-0 flex items-center justify-center text-[0.625rem] font-mono text-muted-foreground/70 whitespace-nowrap opacity-100 group-hover:opacity-0 transition-opacity pointer-events-none [@media(hover:none)]:static"
+                >
+                  {formatRowCount(table.rowCount)}
                 </span>
               )}
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <button
-                    className="absolute inset-0 w-full h-full opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 focus-within:opacity-100 transition-opacity hover:bg-accent flex items-center justify-center"
+                    aria-label={actionsLabel}
+                    title={actionsLabel}
+                    className="absolute inset-0 w-full h-full opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 [@media(hover:none)]:static [@media(hover:none)]:w-6 focus-within:opacity-100 transition-opacity hover:bg-accent flex items-center justify-center"
                     onClick={(e) => e.stopPropagation()}
                   >
                     <EllipsisVertical
@@ -317,7 +388,11 @@ export const TableItem = React.memo(function TableItem({
             transition={{ duration: 0.2 }}
             className="overflow-hidden"
           >
-            <ColumnList columns={table.columns} indexes={table.indexes} />
+            <ColumnList
+              columns={table.columns}
+              indexes={table.indexes}
+              exclusionConstraints={table.exclusionConstraints}
+            />
           </motion.div>
         )}
       </AnimatePresence>

@@ -6,10 +6,14 @@ metadata:
     capabilities: Basic Install
     categories: Database, Developer Tools
     containerImage: ghcr.io/libredb/libredb-studio-operator:0.0.0
-    description: Open-source web-based SQL IDE for sixteen engines - PostgreSQL, MySQL,
-      Oracle, SQL Server, SQLite, DuckDB, MongoDB, Redis, Couchbase, ClickHouse, Apache
-      Druid, Elasticsearch, OpenSearch, Apache Trino, Apache Cassandra and libSQL
-      - with AI-powered query assistance.
+    description: Open-source web-based SQL IDE for forty-one engines - PostgreSQL,
+      MySQL, Oracle, Db2 LUW, SQL Server, SQLite, DuckDB, MongoDB, Redis, Couchbase,
+      Firestore, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, BigQuery,
+      Snowflake, Apache Spark, Apache Cassandra, libSQL, Prometheus, Apache Kafka,
+      MQTT, RabbitMQ, etcd, Neo4j, Milvus, Qdrant, InfluxDB, InfluxDB 3, Oxia, Databend,
+      S3-compatible object storage, Kubernetes, OPC UA, MTConnect, Modbus, NETCONF,
+      SNMP and Sparkplug B - with AI-powered query assistance.
+    olm.skipRange: '>=0.0.0 <0.0.0'
     repository: https://github.com/libredb/libredb-studio
     support: LibreDB
   labels:
@@ -23,16 +27,18 @@ spec:
   customresourcedefinitions:
     owned:
     - description: A LibreDB Studio instance managed by the operator. The spec mirrors
-        the Helm chart values; every field left unset falls back to the chart defaults.
+        the Helm chart values except extraObjects, which the operator refuses; every
+        field left unset falls back to the chart defaults.
       displayName: LibreDB Studio
       kind: LibreDBStudio
       name: libredbstudios.studio.libredb.org
       version: v1alpha1
   description: |
     LibreDB Studio is an open-source, web-based SQL IDE. Query PostgreSQL,
-    MySQL, Oracle, SQL Server, SQLite, libSQL, DuckDB, MongoDB, Redis, Couchbase,
-    ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino and Apache
-    Cassandra from the browser —
+    MySQL, Oracle, Db2 LUW, SQL Server, SQLite, libSQL, DuckDB, MongoDB, Redis, Couchbase,
+    Firestore, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Trino, BigQuery, Snowflake, Apache Spark,
+    Apache Cassandra, Prometheus, Apache Kafka, MQTT, RabbitMQ, etcd, Neo4j, Milvus, Qdrant, InfluxDB,
+    InfluxDB 3, Oxia, Databend, S3-compatible object storage, Kubernetes, OPC UA, MTConnect, Modbus, NETCONF, SNMP and Sparkplug B from the browser,
     with AI-powered query assistance (natural-language-to-SQL, explain, fix),
     an ERD viewer, schema diff and a data profiler. No desktop client required.
 
@@ -74,6 +80,7 @@ spec:
   - mongodb
   - redis
   - oracle
+  - db2
   - sql-server
   - sqlite
   - couchbase
@@ -86,6 +93,20 @@ spec:
   - libsql
   - turso
   - duckdb
+  - prometheus
+  - promql
+  - kafka
+  - etcd
+  - neo4j
+  - cypher
+  - milvus
+  - qdrant
+  - influxdb
+  - influxql
+  - influxdb3
+  - oxia
+  - databend
+  - kubernetes
   links:
   - name: Website
     url: https://libredb.org

@@ -2,15 +2,18 @@
 
 import React, { useEffect, useState, type RefObject } from "react";
 import { Info, Play } from "lucide-react";
+import type { AgentStatementLanguageId } from "@/lib/agent/agent-manifest";
 import { AGENT_HANDOVER_BUDGET } from "@/lib/agent/execution-policy";
 import { autoExecuteTerms } from "@/lib/agent/posture";
+import { executionUiFor } from "@/lib/db/execution-ui";
 import type { AgentRunWorkflowType } from "@/lib/agent/types";
 import type { DatabaseType } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /**
- * The consent step (§2.6 of `docs/AGENT_ANALYST_DESIGN.md`, and §"Why the consent step is
- * placed there"), lifted out of `AgentRail.tsx` unchanged in what it decides.
+ * The consent step (see the "Auto-execute: when the run runs the answer in your editor"
+ * section of `docs/AGENT_GUIDE.md`, and its "Three things about that step" discussion),
+ * lifted out of `AgentRail.tsx` unchanged in what it decides.
  *
  * It replaced the pre-start checkbox entirely. That checkbox rendered wherever the workflow
  * happened to be `data-analysis`, which is a state the user could leave without the tick
@@ -54,6 +57,12 @@ export interface ConsentCardProps {
    * costs, and the sentence that says so has to stay with the run it is true of.
    */
   readonly engine: DatabaseType | null;
+  /**
+   * The statement language the rail offered this hand-over in, resolved when the step was
+   * raised. The terms and the chips are that language's own: a card that assumed one would
+   * bound SQL's editor run on an engine whose answer never reaches the editor.
+   */
+  readonly language: AgentStatementLanguageId;
   /** The hand-over decision. OFF is the default, and the caller owns the state. */
   readonly autoExecute: boolean;
   readonly onAutoExecuteChange: (next: boolean) => void;
@@ -74,10 +83,20 @@ export interface ConsentCardProps {
   readonly regionRef: RefObject<HTMLElement | null>;
 }
 
+interface HandoverChip {
+  readonly text: string;
+  readonly tone: "neutral" | "warn";
+}
+
 /**
- * What the editor hand-over costs, in chips, and every figure read from the budget the
- * server enforces rather than typed here. #425's lesson is that a typed figure outlives the
- * value it described; these are the same numbers `AGENT_HANDOVER_BUDGET` hands the replay.
+ * What the editor hand-over costs, in chips, per language, and keyed rather than compared, like
+ * the terms they label, with every figure read from the budget the server enforces rather than
+ * typed here. #425's lesson is that a typed figure outlives the value it described; these are
+ * the same numbers `AGENT_HANDOVER_BUDGET` hands the replay.
+ *
+ * Only SQL hands an answer over, and replays it in the same database-enforced read-only
+ * session the run's own read used. A kubectl or MongoDB answer is never run in the editor, as
+ * their terms say, so there is no editor run to bound and no chip to show.
  *
  * "no time limit" is the word for the ceiling, not for an absent field: the plumbing cannot
  * express an absent timeout, so `AGENT_HANDOVER_BUDGET` carries PostgreSQL's own 32-bit
@@ -85,25 +104,22 @@ export interface ConsentCardProps {
  * "no" is the part of the promise that does not hold literally. The terms popover carries
  * that full claim; the chip is its label, and sits beside it.
  */
-const handoverChips = (): readonly { readonly text: string; readonly tone: "neutral" | "warn" }[] => [
-  { text: "same read-only session", tone: "neutral" },
-  { text: `${AGENT_HANDOVER_BUDGET.maxResultRows} rows`, tone: "neutral" },
-  { text: "no time limit", tone: "warn" },
-];
-
-/**
- * The one sentence that is true of SQLite and of nothing else, in the words the budget meter
- * already uses for the same fact: SQLite does not preempt a statement over its timeout, so
- * the editor's missing time limit is a different promise there than it is on PostgreSQL.
- */
-const SQLITE_COST =
-  "On SQLite a read is not interrupted when it runs long: it blocks other writers and this application until it finishes.";
+const HANDOVER_CHIPS: Readonly<Record<AgentStatementLanguageId, readonly HandoverChip[]>> = {
+  sql: [
+    { text: "same read-only session", tone: "neutral" },
+    { text: `${AGENT_HANDOVER_BUDGET.maxResultRows} rows`, tone: "neutral" },
+    { text: "no time limit", tone: "warn" },
+  ],
+  kubectl: [],
+  mongo: [],
+};
 
 export function ConsentCard({
   workflowType,
   workflowLabel,
   connectionName,
   engine,
+  language,
   autoExecute,
   onAutoExecuteChange,
   onOpen,
@@ -111,7 +127,7 @@ export function ConsentCard({
   regionRef,
 }: ConsentCardProps): React.JSX.Element {
   const [termsOpen, setTermsOpen] = useState(false);
-  const isSqlite = engine === "sqlite";
+  const consentDeadline = executionUiFor(engine ?? undefined).consentDeadline;
 
   /*
     Raised, therefore announced. Mount is the moment the step appears, and focusing the
@@ -129,7 +145,7 @@ export function ConsentCard({
       aria-labelledby="agent-consent-workflow"
       aria-describedby="agent-consent-terms"
       data-testid="agent-consent"
-      className="mt-2 rounded border border-blue-400/30 bg-blue-500/5 p-2 space-y-1 focus:outline-none focus:ring-1 focus:ring-blue-400/50"
+      className="mt-2 rounded border border-brand/30 bg-brand-tint/5 p-2 space-y-1 focus:outline-none focus:ring-1 focus:ring-brand/50"
     >
       {/*
         The default, first. The pill says what the run is with the box untouched, which is
@@ -143,7 +159,7 @@ export function ConsentCard({
         Start this run
         <span
           data-testid="agent-consent-pill"
-          className="rounded px-1 py-px text-[0.625rem] normal-case tracking-normal bg-emerald-500/10 text-emerald-400/90"
+          className="rounded px-1 py-px text-[0.625rem] normal-case tracking-normal bg-success-tint/10 text-success/90"
         >
           read-only
         </span>
@@ -207,7 +223,7 @@ export function ConsentCard({
               : "sr-only",
           )}
         >
-          {autoExecuteTerms(workflowType)}
+          {autoExecuteTerms(workflowType, language)}
         </p>
         {/*
           The bounds of what was ticked, and only once it is ticked: with the box off there
@@ -217,18 +233,18 @@ export function ConsentCard({
         {autoExecute && (
           <div data-testid="agent-consent-bounds" className="ml-5 flex flex-wrap items-center gap-1">
             {[
-              ...handoverChips(),
+              ...HANDOVER_CHIPS[language],
               /*
                 The SQLite chip is the label of the sentence below it, not a second opinion:
                 the two are adjacent, so nothing can show the compressed form alone.
               */
-              ...(isSqlite ? ([{ text: "SQLite: not interruptible", tone: "warn" }] as const) : []),
+              ...(consentDeadline === null ? [] : [{ text: consentDeadline.chip, tone: "warn" as const }]),
             ].map((chip) => (
               <span
                 key={chip.text}
                 className={cn(
                   "rounded px-1 py-px text-[0.625rem] bg-fill",
-                  chip.tone === "warn" ? "text-amber-400/90" : "text-fg-tertiary",
+                  chip.tone === "warn" ? "text-warning/90" : "text-fg-tertiary",
                 )}
               >
                 {chip.text}
@@ -244,9 +260,9 @@ export function ConsentCard({
           Ungated by the tick, because it is true of the run either way — the tick only
           decides whether a second, unbounded read joins the run's own.
         */}
-        {isSqlite && (
-          <p data-testid="agent-auto-execute-sqlite" className="ml-5 text-[0.625rem] text-amber-400/70">
-            {SQLITE_COST}
+        {consentDeadline !== null && (
+          <p data-testid="agent-auto-execute-sqlite" className="ml-5 text-[0.625rem] text-warning/70">
+            {consentDeadline.sentence}
           </p>
         )}
       </div>
@@ -255,7 +271,7 @@ export function ConsentCard({
           type="button"
           data-testid="agent-consent-open"
           onClick={onOpen}
-          className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-blue-500/15 text-blue-300 hover:bg-blue-500/25 transition-colors"
+          className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-brand-tint/15 text-brand-bright hover:bg-brand-tint/25 transition-colors"
         >
           <Play strokeWidth={1.5} className="w-3 h-3" aria-hidden="true" />
           Start run

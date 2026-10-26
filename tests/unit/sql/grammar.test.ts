@@ -368,10 +368,10 @@ describe("hashRunIsAmbiguous", () => {
  * `MODIFIED_COLUMN_COVERAGE`): a `Record<DatabaseType, …>` the compiler refuses to
  * accept until the new id is listed.
  *
- * Neither table in `grammar.ts` can enforce this on its own - `SQL_GRAMMARS` is a
- * `Partial<Record<…>>` because "absent" is a meaningful answer, and the non-SQL set
- * is a set. So a provider added without touching that file silently inherits the
- * compatibility grammar and is silently declared to write SQL, and nothing fails.
+ * When this table was written, neither table in `grammar.ts` could enforce this on its own - `SQL_GRAMMARS` was a
+ * `Partial<Record<…>>` because "absent" was a meaningful answer, and the non-SQL set
+ * was a set. So a provider added without touching that file silently inherited the
+ * compatibility grammar and was silently declared to write SQL, and nothing failed.
  * Deciding is mandatory; deciding "leave it at the default" is a fine decision.
  */
 const GRAMMAR_COVERAGE: Record<DatabaseType, "established" | "default"> = {
@@ -385,10 +385,13 @@ const GRAMMAR_COVERAGE: Record<DatabaseType, "established" | "default"> = {
   // Five facts probed 2026-08-27 against DuckDB v1.5.5 through `@duckdb/node-api`,
   // and NOT inherited from either neighbour: the SQLite row's `[…]` reading is wrong
   // here (a list literal, not a name quote) and the PostgreSQL object is not shared
-  // even though the five values coincide. See DUCKDB_GRAMMAR in `grammar.ts` for the
+  // even though the five values coincide. See DUCKDB_GRAMMAR in `providers/sql/duckdb/sql-grammar.ts` for the
   // statement behind each one.
   duckdb: "established",
   oracle: "established",
+  // Probed 2026-10-03 on Db2 LUW 12.1.0.0 through db2-node 1.0.22 (#786); see the db2 block above
+  // and DB2_GRAMMAR in `providers/sql/db2/sql-grammar.ts` for the statement behind each fact.
+  db2: "established",
   mssql: "established",
   clickhouse: "established",
   // Established by live probe rather than from a document: their SQL surface is an
@@ -418,7 +421,285 @@ const GRAMMAR_COVERAGE: Record<DatabaseType, "established" | "default"> = {
   // Not SQL at all - see SQL_TEXT_COVERAGE below.
   mongodb: "default",
   redis: "default",
+  // PromQL, not SQL (#1085): no SQL grammar is established for it, and none is read.
+  prometheus: "default",
+  // A JSON read request, not SQL (#1088): no SQL grammar is established for it, and none is read.
+  kafka: "default",
+  // An etcdctl command, not SQL (#1089): no SQL grammar is established for it, and none is read.
+  etcd: "default",
+  // Cypher, not SQL: the graph lexer reads it, so no SQL grammar is established for it, and none is read.
+  neo4j: "default",
+  // A Milvus console request, not SQL (vector-family spec 5.4): no SQL grammar is established for it, and none is read.
+  milvus: "default",
+  // A Qdrant console request, not SQL (vector-family spec 6.4): no SQL grammar is established for it, and none is read.
+  qdrant: "default",
+  // InfluxQL, not SQL: the provider's own lexer reads it, so no SQL grammar is established for it, and none is read.
+  influxdb: "default",
+  // Five facts probed on InfluxDB 3.12.0 Core through `POST /api/v3/query_sql`, the route the provider
+  // sends on; see the influxdb3 block below and DATAFUSION_GRAMMAR in `influxdb3-sql-grammar.ts` for the statement
+  // behind each one.
+  influxdb3: "established",
+  // One `oxia client` read command, not SQL (SB2-4.3): no SQL grammar is established for it, and none is read.
+  oxia: "default",
+  // Read off Databend's own lexer (`token.rs`) and parser, and the trailing clause measured on the pinned image (L3);
+  // see the databend block below and DATABEND_GRAMMAR in `providers/sql/databend/sql-grammar.ts` for the source behind each fact.
+  databend: "established",
+  bigquery: "established",
+  // The Snowflake grammar row lands with the gate and the explain format, which flip this to established.
+  snowflake: "established",
+  spark: "established",
+  s3: "default",
+  // One kubectl statement, not SQL: no SQL grammar is established for it, and none is read.
+  kubernetes: "default",
+  mqtt: "default",
+  firestore: "default",
+  rabbitmq: "default",
+  // One JSON read request naming node ids, not SQL: no SQL grammar is established for it (#1677).
+  opcua: "default",
+  // One request line in a URL grammar, not SQL: no SQL grammar is established for it (#1722).
+  mtconnect: "default",
+  // One JSON read request, not SQL: no SQL grammar is established for it (#1723).
+  modbus: "default",
+  netconf: "default",
+  snmp: "default",
+  // One JSON read request, not SQL: no SQL grammar is established for it (#1720).
+  sparkplug: "default",
 };
+
+/**
+ * Db2 LUW, every fact probed 2026-10-03 on DB2/LINUXX8664 12.1.0.0 through db2-node 1.0.22, the
+ * driver the provider uses (#786). Each statement below answered as quoted.
+ */
+describe("db2", () => {
+  const grammar = resolveSqlGrammar("db2");
+
+  test("`#` is code: the rest of the line is not hidden", () => {
+    // `SELECT 1 AS a FROM SYSIBM.SYSDUMMY1 # note` and `SELECT 1 # 2 AS a FROM SYSIBM.SYSDUMMY1`
+    // are both SQLCODE -104, an unexpected token at the `#`.
+    expect(grammar.hash).toBe("code");
+  });
+
+  test("block comments nest", () => {
+    // `SELECT 1 AS a /* a /* b */ FROM SYSIBM.SYSDUMMY1 */ FROM SYSIBM.SYSDUMMY1` answers the
+    // row, and `SELECT 1 AS a /* a /* b */ FROM SYSIBM.SYSDUMMY1` is SQLCODE -104: the inner `*/`
+    // did not close the run.
+    expect(grammar.blockComment).toBe("nesting");
+  });
+
+  test("`q'…'` and `//` are not in the grammar", () => {
+    // `SELECT q'[x]' AS a FROM SYSIBM.SYSDUMMY1` and `SELECT 1 AS a FROM SYSIBM.SYSDUMMY1 // note`
+    // are both SQLCODE -104.
+    expect(grammar.alternateQuoting).toBe(false);
+    expect(grammar.doubleSlashComment).toBe(false);
+  });
+
+  test("`[…]` is left at the compatibility default", () => {
+    // `SELECT 1 AS [a] FROM SYSIBM.SYSDUMMY1` is SQLCODE -104, so it is no name quote, but SQL PL
+    // writes an array element as `a[1]` and no subscript reading was established for plain SQL.
+    expect(grammar.bracket).toBe(DEFAULT_SQL_GRAMMAR.bracket);
+  });
+});
+
+/**
+ * Apache DataFusion as InfluxDB 3.12.0 Core parses it, every fact probed through
+ * `POST /api/v3/query_sql` with `{"db":"home","q":<text>,"format":"jsonl"}`, the body the provider
+ * sends, and re-run 2026-10-04. Each statement below answered as quoted.
+ */
+describe("influxdb3", () => {
+  const grammar = resolveSqlGrammar("influxdb3");
+
+  test("`#` is code: the rest of the line is not hidden", () => {
+    // `SELECT 1 AS x # c` is HTTP 400, `ParserError("Expected: end of statement, found: # at Line: 1,
+    // Column: 15")`.
+    expect(grammar.hash).toBe("code");
+  });
+
+  test("`[…]` is a subscript and an array literal, never a name quote", () => {
+    // `SELECT [1,2][1] AS x` answers `{"x":1}`; `SELECT [[1,2],[3,4]][2][1] AS x` answers `{"x":3}`,
+    // so the run nests; `SELECT ['a]b'][1] AS x` answers `{"x":"a]b"}`, so a literal inside it is a
+    // literal; `SELECT [room] FROM home` answers an array column named `make_array(home.room)`, so
+    // the brackets were read through to an expression.
+    expect(grammar.bracket).toBe("subscript");
+  });
+
+  test("block comments nest", () => {
+    // `SELECT 1 /* a /* b */ c */ AS x` answers `{"x":1}`: the inner `*/` did not close the run.
+    expect(grammar.blockComment).toBe("nesting");
+  });
+
+  test("`q'…'` is not in the grammar", () => {
+    // `SELECT q'[x]' AS x` is HTTP 400, `ParserError("Expected: end of statement, found: AS at Line: 1,
+    // Column: 15")`.
+    expect(grammar.alternateQuoting).toBe(false);
+  });
+
+  test("`//` is not a comment", () => {
+    // `SELECT 1 AS x // c` is HTTP 400, `ParserError("Expected: end of statement, found: // at Line: 1,
+    // Column: 15")`.
+    expect(grammar.doubleSlashComment).toBe(false);
+  });
+});
+
+/**
+ * Databend, every fact read off its own lexer (`src/query/ast/src/parser/token.rs`) and parser, with the trailing
+ * clause measured on the pinned image (probe L3): there is no driver package to ask, and the lexer is the source the
+ * server itself runs.
+ */
+describe("databend", () => {
+  const grammar = resolveSqlGrammar("databend");
+
+  test("is a row of its own, not the compatibility default", () => {
+    expect(grammar).not.toBe(DEFAULT_SQL_GRAMMAR);
+  });
+
+  test("`#` is code: the lexer has `#`, `#>`, `#>>` and `#-` as operator tokens and no `#` comment", () => {
+    expect(grammar.hash).toBe("code");
+  });
+
+  test("`[…]` is a subscript and an array literal, never a name quote", () => {
+    // `[` and `]` are plain tokens; names are quoted with `"` or a backtick.
+    expect(grammar.bracket).toBe("subscript");
+  });
+
+  test("block comments do not nest: `lex_comment_block` stops at the first `*/`", () => {
+    expect(grammar.blockComment).toBe("flat");
+  });
+
+  test("`q'…'` and `//` are not in the grammar: `//` is an operator token", () => {
+    expect(grammar.alternateQuoting).toBe(false);
+    expect(grammar.doubleSlashComment).toBe(false);
+  });
+
+  test("a backslash always escapes inside `'…'` and `\"…\"`", () => {
+    // `'([^'\\]|\\.|'')*'` and its `"` twin, under every dialect setting.
+    expect(grammar.backslashAlwaysEscapes).toBe(true);
+  });
+
+  test("a script keeps the default: bodies are `$$` literals", () => {
+    expect(grammar.script).toBe(DEFAULT_SQL_GRAMMAR.script);
+  });
+
+  test("a trailing `FORMAT <name>` follows the row bound", () => {
+    // L3: `SELECT 1 FORMAT JSON LIMIT 5` is 1005 "unexpected `LIMIT`", and `SELECT 1 LIMIT 5 FORMAT JSON` succeeds.
+    expect(grammar.trailingLimitClauses).toHaveLength(1);
+    const [format] = grammar.trailingLimitClauses;
+    expect(format.test("SELECT number FROM numbers(10) FORMAT TabSeparated")).toBe(true);
+    expect(format.test("SELECT 1 format csv ")).toBe(true);
+    expect(format.test("SELECT * FROM (SELECT 1 FORMAT JSON) t")).toBe(false);
+    expect(format.test("SELECT note FROM t WHERE note = 'FORMAT CSV'")).toBe(false);
+    expect(format.test("SELECT format FROM t")).toBe(false);
+  });
+});
+
+/**
+ * How a script is cut (#1312). Each non-default row was measured in the end-to-end pass of
+ * 2026-10-03/04 before the fact existed, the cost quoted beside it.
+ */
+describe("script", () => {
+  test("Oracle reads PL/SQL units and SQL*Plus's `/` line, one statement per request", () => {
+    // A procedure cut at its inner `;` was stored INVALID (PLS-00103) on 26ai Free 23.26.3.
+    expect(resolveSqlGrammar("oracle").script).toEqual({ blocks: "pl-sql", separatorLine: "/", unit: "statement" });
+  });
+
+  test("SQL Server sends the batch between GO lines as one request", () => {
+    // `DECLARE @x INT = 5; SELECT @x * 2` as two requests was `Must declare the scalar
+    // variable "@x"` on 2025 RTM-CU9.
+    // A MERGE keeps its `;`, which the server requires (Msg 10713, SF-046).
+    expect(resolveSqlGrammar("mssql").script).toEqual({
+      blocks: "none",
+      separatorLine: "GO",
+      unit: "batch",
+      terminatedStatements: ["MERGE"],
+    });
+  });
+
+  test.each<DatabaseType>(["sqlite", "libsql"])("%s reads a trigger body", (type) => {
+    // A trigger cut at its inner `;` was "incomplete input" on SQLite 3.50.4 and "unexpected
+    // end of input" on sqld 0.24.33.
+    expect(resolveSqlGrammar(type).script).toEqual({ blocks: "trigger-body", separatorLine: null, unit: "statement" });
+  });
+
+  test.each<DatabaseType>(["postgres", "mysql", "db2", "duckdb", "clickhouse", "trino", "cassandra", "influxdb3"])(
+    "%s keeps the default: every code `;` ends a statement",
+    (type) => {
+      expect(resolveSqlGrammar(type).script).toBe(DEFAULT_SQL_GRAMMAR.script);
+    },
+  );
+});
+
+// Whether `\\` escapes inside every `'…'` and `"…"`. Databend is the one row that declares
+// it: its lexer escapes with `\\.` in both quotes and no setting turns that off. MySQL is
+// the dialect that escapes by default, and `NO_BACKSLASH_ESCAPES` in `sql_mode` turns that
+// off per session, so its row cannot state it for every connection.
+describe("backslashAlwaysEscapes", () => {
+  test("the compatibility default does not read a backslash as an escape", () => {
+    expect(DEFAULT_SQL_GRAMMAR.backslashAlwaysEscapes).toBe(false);
+  });
+
+  test.each(["databend", "bigquery", "snowflake", "spark"] as const)("%s declares true", (type) => {
+    expect(resolveSqlGrammar(type).backslashAlwaysEscapes).toBe(true);
+  });
+
+  test.each(
+    (Object.keys(GRAMMAR_COVERAGE) as DatabaseType[]).filter(
+      (type) => type !== "databend" && type !== "bigquery" && type !== "snowflake" && type !== "spark",
+    ),
+  )("%s declares false", (type) => {
+    expect(resolveSqlGrammar(type).backslashAlwaysEscapes).toBe(false);
+  });
+});
+
+// Two opt-outs from readings every other row shares: whether `$tag$ … $tag$` is a string (`dollarTags`, absent means
+// true) and what a backslash means inside `"…"` (`doubleQuoteBackslashEscapes`, absent means the reading
+// `backslashAlwaysEscapes` gives both quotes).
+describe("dollarTags and doubleQuoteBackslashEscapes", () => {
+  test("the compatibility default declares neither", () => {
+    expect(DEFAULT_SQL_GRAMMAR.dollarTags).toBeUndefined();
+    expect(DEFAULT_SQL_GRAMMAR.doubleQuoteBackslashEscapes).toBeUndefined();
+  });
+
+  test("snowflake declares both false", () => {
+    expect(resolveSqlGrammar("snowflake").dollarTags).toBe(false);
+    expect(resolveSqlGrammar("snowflake").doubleQuoteBackslashEscapes).toBe(false);
+  });
+
+  test.each((Object.keys(GRAMMAR_COVERAGE) as DatabaseType[]).filter((type) => type !== "snowflake"))(
+    "%s declares neither",
+    (type) => {
+      expect(resolveSqlGrammar(type).dollarTags).toBeUndefined();
+      expect(resolveSqlGrammar(type).doubleQuoteBackslashEscapes).toBeUndefined();
+    },
+  );
+});
+
+// Four facts only Spark's lexer has, each absent (false) on every other row: raw strings (`rawStrings`), optimizer
+// hints lexed as code (`hintsAreCode`), a `--` comment a backslash continues (`lineCommentBackslashContinues`) and one
+// a lone carriage return ends (`lineCommentEndsAtCarriageReturn`).
+describe("the reader facts only Spark's row declares", () => {
+  test("the compatibility default declares none of the four", () => {
+    expect(DEFAULT_SQL_GRAMMAR.rawStrings).toBeUndefined();
+    expect(DEFAULT_SQL_GRAMMAR.hintsAreCode).toBeUndefined();
+    expect(DEFAULT_SQL_GRAMMAR.lineCommentBackslashContinues).toBeUndefined();
+    expect(DEFAULT_SQL_GRAMMAR.lineCommentEndsAtCarriageReturn).toBeUndefined();
+  });
+
+  test.each((Object.keys(GRAMMAR_COVERAGE) as DatabaseType[]).filter((type) => type !== "spark"))(
+    "%s declares none of the four",
+    (type) => {
+      expect(resolveSqlGrammar(type).rawStrings).toBeUndefined();
+      expect(resolveSqlGrammar(type).hintsAreCode).toBeUndefined();
+      expect(resolveSqlGrammar(type).lineCommentBackslashContinues).toBeUndefined();
+      expect(resolveSqlGrammar(type).lineCommentEndsAtCarriageReturn).toBeUndefined();
+    },
+  );
+
+  test("spark declares all four", () => {
+    expect(resolveSqlGrammar("spark").rawStrings).toBe(true);
+    expect(resolveSqlGrammar("spark").hintsAreCode).toBe(true);
+    expect(resolveSqlGrammar("spark").lineCommentBackslashContinues).toBe(true);
+    expect(resolveSqlGrammar("spark").lineCommentEndsAtCarriageReturn).toBe(true);
+  });
+});
 
 describe("every database type has a recorded grammar decision", () => {
   test.each(Object.entries(GRAMMAR_COVERAGE))("%s is %s", (type, expected) => {
@@ -437,6 +718,8 @@ const SQL_TEXT_COVERAGE: Record<DatabaseType, boolean> = {
   // SQLBaseProvider and hands the text to `runAndReadAll`.
   duckdb: true,
   oracle: true,
+  // SQL, and the statement text IS what the editor sends to the driver (#786).
+  db2: true,
   mssql: true,
   clickhouse: true,
   couchbase: true,
@@ -462,6 +745,55 @@ const SQL_TEXT_COVERAGE: Record<DatabaseType, boolean> = {
   cassandra: true,
   mongodb: false,
   redis: false,
+  // A PromQL expression is not SQL text: its strings escape with a backslash, which a SQL span
+  // reader cannot follow (#1085).
+  prometheus: false,
+  // A Kafka read request is one JSON object, not SQL text: its strings escape with a backslash,
+  // which a SQL span reader cannot follow either (#1088).
+  kafka: false,
+  // An etcdctl command line is not SQL text: `commands.ts` reads its words by the shell's rules and a txn
+  // body by etcdctl's, neither of which a SQL span reader follows (#1089).
+  etcd: false,
+  // A Cypher statement is not SQL text: its strings escape with a backslash, `//` opens a comment and a
+  // backtick quotes a name, none of which a SQL span reader follows (Neo4j spec 5.5).
+  neo4j: false,
+  // A Milvus console request is a route line and one JSON body, not SQL text: its strings escape with a backslash,
+  // which a SQL span reader cannot follow (vector-family spec 5.4).
+  milvus: false,
+  // A Qdrant console request is a request line and one JSON body, not SQL text: its strings escape with a
+  // backslash and `//` opens a comment, which a SQL span reader cannot follow (vector-family spec 6.4).
+  qdrant: false,
+  // An InfluxQL statement is not SQL text: its strings escape with a backslash, `/.../` is a regex where the parser
+  // asks for one, and a `--` comment ends at a lone `\r`, none of which a SQL span reader follows (SPEC 5.7).
+  influxdb: false,
+  // SQL under the DataFusion grammar row: the provider extends SQLBaseProvider, so the SQL gate reads its text.
+  influxdb3: true,
+  // An `oxia client` read command is words split by POSIX shell rules, not SQL text: its quoting is the shell's,
+  // which a SQL span reader would report as unreadable (SB2-4.3).
+  oxia: false,
+  // SQL, and the statement text IS what the editor sends to `POST /v1/query`; the provider extends SQLBaseProvider.
+  databend: true,
+  bigquery: true,
+  // SQL, and the statement text IS what the provider submits; it extends SQLBaseProvider.
+  snowflake: true,
+  spark: true,
+  // AWS CLI words split by POSIX shell rules, not SQL text.
+  s3: false,
+  // A kubectl statement is words split by POSIX shell rules, not SQL text.
+  kubernetes: false,
+  mqtt: false,
+  // A JavaScript-shaped query chain, not SQL text.
+  firestore: false,
+  rabbitmq: false,
+  // A read request is a JSON document, not SQL text.
+  opcua: false,
+  // A request line is a URL, not SQL text.
+  mtconnect: false,
+  // A read request is JSON, not SQL text.
+  modbus: false,
+  netconf: false,
+  snmp: false,
+  sparkplug: false,
 };
 
 describe("readsSqlText", () => {
@@ -476,5 +808,16 @@ describe("readsSqlText", () => {
     // the SQL checks off.
     expect(readsSqlText()).toBe(true);
     expect(readsSqlText("not-a-database" as DatabaseType)).toBe(true);
+  });
+
+  // A host calling from plain JavaScript can pass a value that is not a string but converts to a non-SQL type id.
+  // Such a value was never a member of the non-SQL set, so it reads as SQL, while `resolveSqlGrammar` keeps the row
+  // its property key names.
+  test.each<[string, unknown]>([
+    ["a String object", new String("mongodb")],
+    ["an array", ["mongodb"]],
+    ["an object with toString", { toString: () => "redis" }],
+  ])("%s naming a non-SQL type is read as SQL", (_label, value) => {
+    expect(readsSqlText(value as DatabaseType)).toBe(true);
   });
 });

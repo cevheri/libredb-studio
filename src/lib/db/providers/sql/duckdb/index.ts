@@ -25,6 +25,17 @@
  *   for. What closes it is a SECOND engine option, `enable_external_access: 'false'`,
  *   passed beside `access_mode` when the read-only handle is opened (`client.ts`); the
  *   statement guard below is the layer above it, not the boundary.
+ * - **File access is decided per requester and per connection on the editor handle,
+ *   independently of `access_mode` (non-admin DuckDB file access).** `enable_external_access: 'false'` closes every
+ *   statement-level file route on a WRITABLE handle too, but for the database's own files and the
+ *   handle's private temp directory (`client.ts`), with the database still writable
+ *   (measured). Every non-admin role opens that denied posture and keeps its writes, and so does
+ *   every role on a seed a non-admin role can use, because that record is one handle for all of
+ *   them; an admin on an inline connection or an admin-only seed keeps full reach. The posture
+ *   reaches the provider through `ProviderExecutionContext.allowExternalFileAccess`, derived
+ *   server-side by `editorExecutionContext`; `getOrCreateProvider` keys the handle cache by it.
+ *   The statement denylist below is NOT added to this editor path: the engine option is the
+ *   boundary, as it is for the agent profile.
  * - **No statement router.** `SQLBaseProvider.isReadOnlyQuery` types a statement by its
  *   leading keyword, and DuckDB has four row-producing forms that keyword set does not
  *   know (`FROM tbl`, `CALL`, `SUMMARIZE`, `PIVOT`). Rather than extend a router this
@@ -39,15 +50,23 @@
  * panels are honest empties carrying a DuckDB-specific label.
  */
 
+import { isReservedStoragePath } from "@/lib/data-dir";
 import { SQLBaseProvider } from "../sql-base";
 import {
   type ActiveSessionDetails,
+  type Container,
   type DatabaseConnection,
+  type DatabaseObject,
   type DatabaseOverview,
   type HealthInfo,
   type IndexStats,
+  type KindCount,
   type MaintenanceResult,
   type MaintenanceType,
+  type ObjectDetail,
+  type ObjectDetailBatch,
+  type ObjectSourceDocument,
+  type OpenQueryTransactionOutcome,
   type PerformanceMetrics,
   type ProviderCapabilities,
   type ProviderExecutionContext,
@@ -57,9 +76,16 @@ import {
   type ReadOnlyStatementBudget,
   type SlowQueryStats,
   type StorageStats,
-  type TableSchema,
   type TableStats,
 } from "../../../types";
+import {
+  applySourceBound,
+  callerBoundTruncationReason,
+  containerDepth,
+  declaredKinds,
+  findKind,
+  requireSourceKind,
+} from "../../../object-kinds";
 import {
   DatabaseConfigError,
   DatabaseError,
@@ -73,27 +99,68 @@ import { resolveSqlGrammar } from "@/lib/sql/grammar";
 import { readLeadingKeyword } from "@/lib/sql/leading-keyword";
 import { findCodeWord } from "@/lib/sql/words";
 import { hasUnterminatedSpan } from "@/lib/sql/spans";
-import { type DuckDBClient, describeOpenFailure, openDuckDBClient } from "./client";
+import { type DuckDBClient, MEMORY_TARGET, describeOpenFailure, openDuckDBClient } from "./client";
+import { DUCKDB_CREATE_TABLE } from "./create-table";
 import {
+  type DuckDBFileSizes,
   readActiveSessions,
   readHealth,
   readIndexStats,
   readOverview,
-  readSchema,
   readSlowQueries,
   readStorageStats,
   readTableStats,
 } from "./introspect";
-import { toQueryResult } from "./values";
+import {
+  CATALOGS_SQL,
+  type CatalogRow,
+  type ColumnRow,
+  type ForeignKeyRow,
+  type IndexRow,
+  type KindCountRow,
+  OBJECT_COLUMNS_SQL,
+  OBJECT_FOREIGN_KEYS_SQL,
+  OBJECT_INDEXES_SQL,
+  OBJECT_PRIMARY_KEY_SQL,
+  type ObjectRow,
+  type PrimaryKeyRow,
+  SCHEMAS_SQL,
+  type SchemaNameRow,
+  applyKindCounts,
+  bulkColumnsSql,
+  bulkForeignKeysSql,
+  bulkIndexesSql,
+  bulkPrimaryKeySql,
+  bulkTargetSql,
+  containerRead,
+  parentCatalog,
+  groupByObject,
+  objectDetailFromRows,
+  type OfObject,
+  countsSql,
+  listObjectsSql,
+  listedObject,
+  objectRead,
+  type ObjectSourceRow,
+  blankDefinitionReason,
+  blankDefinitionShape,
+  objectSourceColumn,
+  objectSourceForm,
+  objectSourceOrigin,
+  objectSourceSql,
+  seedZeroCounts,
+} from "./objects";
+import { comparePaths } from "@/lib/db/object-path";
+import { readCount, toQueryResult } from "./values";
+import { createMissingDirectories } from "@/lib/db/utils/create-directory";
+import { isUnwritableExistingFile } from "@/lib/db/utils/unwritable-file";
+import { logger } from "@/lib/logger";
 import * as fs from "fs";
 import * as path from "path";
 
 // ============================================================================
 // Constants
 // ============================================================================
-
-/** DuckDB's in-memory target. Accepted wherever a path is, and never touched on disk. */
-const MEMORY_TARGET = ":memory:";
 
 /** DuckDB's default schema; a maintenance target with no schema is resolved into it. */
 const DEFAULT_SCHEMA = "main";
@@ -130,8 +197,42 @@ const QUERY_ERROR_PREFIXES = [
 /** DuckDB's own word for a statement `interrupt()` stopped. */
 const INTERRUPT_PREFIX = "INTERRUPT Error";
 
+/**
+ * DuckDB's own sentence for a write on a database attached read-only, measured on v1.5.5:
+ * `Invalid Input Error: Cannot execute statement of type "INSERT" on database "<name>"
+ * which is attached in read-only mode!`. Matched as a whole from the start, so the same
+ * words echoed inside some other error (a cast of a string literal, say) are not read as
+ * it, and the database it names is captured: a refusal on another ATTACHed database is
+ * not about the editor's file.
+ */
+const READ_ONLY_REFUSAL =
+  /^Invalid Input Error: Cannot execute statement of type "[^"]+" on database "([^"]+)" which is attached in read-only mode!/;
+
 /** The lock message; shared with `client.ts`'s open-time diagnosis. */
 const LOCK_CONFLICT_MARKER = "conflicting lock is held";
+
+/**
+ * How the engine opens every refusal `enable_external_access: 'false'` raises, measured on
+ * v1.5.5-r.5: a file read or write ("Cannot access file"), `INSTALL` and `CREATE SECRET`
+ * ("Cannot access directory"), `LOAD` and `SET temp_directory`.
+ */
+const PERMISSION_REFUSAL_PREFIX = "Permission Error:";
+
+/**
+ * The reason put in front of such a refusal on an editor handle opened with file access denied (the
+ * non-admin DuckDB file-access change). The engine says only that file system operations are "disabled
+ * by configuration", which reads like a server fault to the user and tells the operator nothing about
+ * why, so the handle's posture is named the way the read-only reason is for an unwritable file
+ * (#1405).
+ *
+ * It is worded around the HANDLE, not Studio's roles alone, because the handle opens denied in three
+ * cases: a non-admin role, every role on a connection a non-admin role can use, and a library embedder
+ * of `@libredb/studio/providers` that built the provider without passing
+ * `{ allowExternalFileAccess: true }` (fail closed). The last caller has no admin/non-admin model, so
+ * the opt-in is named rather than a role policy it cannot act on.
+ */
+const FILE_ACCESS_DENIED_REASON =
+  "File and network access is off on this DuckDB connection: the handle was opened with external access denied, which Studio does for every role but admin and for any connection a non-admin role can use, and which an embedder overrides by passing { allowExternalFileAccess: true }";
 
 export function mapDuckDBError(error: unknown, sql?: string): Error {
   if (error instanceof DatabaseError || error instanceof ExecutionProfileError) return error;
@@ -253,6 +354,18 @@ const READ_ONLY_FORBIDDEN_WORDS: ReadonlyArray<{ word: string; reason: string }>
 ];
 
 /**
+ * A file's size in bytes, or `undefined` when it cannot be stat'd - a `.wal` does not
+ * exist at all after a checkpoint, which is an absent file rather than an empty one.
+ */
+function fileSizeOrUndefined(file: string): number | undefined {
+  try {
+    return fs.statSync(file).size;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Refuse a named form before the engine is asked - the belt, not the boundary.
  *
  * The engine owns both halves of the boundary and neither is delegated here:
@@ -299,9 +412,25 @@ export function assertReadOnlyStatementIsBounded(sql: string): void {
 
 export class DuckDBProvider extends SQLBaseProvider {
   private client: DuckDBClient | null = null;
+  /**
+   * The editor's file and its catalog name, when it was opened read-only because this
+   * process cannot write it (#1405). The name is what DuckDB's refusal quotes.
+   */
+  private unwritableFile: { path: string; catalog: string } | null = null;
 
   /** True when this instance was opened under the agent read-only profile. */
   private readonly readOnlyProfile: boolean;
+
+  /**
+   * True when the editor handle must open with `enable_external_access: 'false'` (non-admin DuckDB file access):
+   * the posture for every role but admin, and for an admin too on a seed a non-admin role can
+   * use (one writer per file). Derived once in the constructor from the
+   * server-injected execution context and NEVER from `config` or `ProviderOptions`, both of
+   * which are caller-supplied. Absent means deny (fail closed). The agent read-only profile
+   * already closes file access through `readOnly`, so this stays false there and does not
+   * double up.
+   */
+  private readonly denyExternalAccess: boolean;
 
   /**
    * Client-supplied query tokens currently in flight, so `cancelQuery` can tell "I
@@ -316,8 +445,13 @@ export class DuckDBProvider extends SQLBaseProvider {
     super(config, options);
     // Server-injected only (see ProviderExecutionContext): the shared editor path
     // builds providers from caller-supplied ProviderOptions, which has no route to
-    // this flag in either direction.
+    // these flags in either direction.
     this.readOnlyProfile = execution.readOnly === true;
+    // Deny the editor handle's file and network reach unless the server-derived posture
+    // allowed it. `readOnly` already closes file access and keeps precedence, so an agent handle
+    // does not also carry this (it would be redundant). Absent allowExternalFileAccess is
+    // deny, which is the fail-closed polarity: a forged or missing context sandboxes.
+    this.denyExternalAccess = execution.readOnly !== true && execution.allowExternalFileAccess !== true;
     this.validate();
   }
 
@@ -334,6 +468,13 @@ export class DuckDBProvider extends SQLBaseProvider {
       supportsExplain: true,
       explainFormat: "duckdb-json",
       supportsInlineRowEdit: true,
+      // The Create Table form's grammar: a sequence-backed key, because DuckDB has no `SERIAL`,
+      // identity or `AUTOINCREMENT`. Reasons on the constant and in `docs/providers/duckdb.md`.
+      createTable: DUCKDB_CREATE_TABLE,
+      // The Generate Test Data dialog's multi-row `INSERT INTO ... VALUES` (#1468).
+      supportsTestDataGeneration: true,
+      // `LIMIT n OFFSET m`, applied by the shared limiter in `SQLBaseProvider.prepareQuery`.
+      supportsResultPagination: true,
       // DuckDB HAS transactions - `BEGIN`/`COMMIT` are accepted - but this provider
       // holds no session for one, so POST /api/db/transaction refuses the call and the
       // controls stay hidden. Same position as sqlite.ts.
@@ -342,6 +483,11 @@ export class DuckDBProvider extends SQLBaseProvider {
       // so a second Studio handle on it is not a lesser handle - it is no handle at
       // all. See `findOpenSingleWriterProvider` (BACKLOG D3, B49).
       singleWriterFile: true,
+      // This provider reads `ProviderExecutionContext.allowExternalFileAccess` and opens its editor
+      // handle under that posture (the non-admin DuckDB file-access change). The cache key and the
+      // single-writer borrow split DuckDB handles by posture because of it, through
+      // `READS_FILE_ACCESS_POSTURE`, never a `connection.type` branch.
+      readsFileAccessPosture: true,
       // Declared explicitly rather than left to `query-generators.ts`'s port
       // heuristics: `defaultPort: null` is shared with sqlite, and two engines behind
       // one null port is the collision that forced this field for the search engines.
@@ -361,6 +507,96 @@ export class DuckDBProvider extends SQLBaseProvider {
         analyze: { label: "Analyze Table", perEntity: true, global: true },
         optimize: { label: "Checkpoint Database", perEntity: false, global: true },
       },
+      // TWO levels, and both are real (#789). `ATTACH '<file>' AS warehouse` puts a
+      // second whole catalog in the same session and a three-part name reaches into it,
+      // so a DuckDB connection holds databases holding schemas - the outer level is not
+      // the connection's own file restated. The engine's own word for the outer one is
+      // "database" (`duckdb_databases()`, `ATTACH ... AS`), which is what the label says.
+      containerLevels: [
+        { id: "catalog", label: "Database", labelPlural: "Databases" },
+        { id: "schema", label: "Schema", labelPlural: "Schemas" },
+      ],
+      // A database alone is an address as well as a database and a schema, so every depth up to the
+      // declaration is accepted and a longer path is refused (`acceptedContainerShapes()`, #1147).
+      containerPathShapes: "prefixes",
+      // Four kinds, one `duckdb_*` table function behind each (`objects.ts`).
+      //
+      // NO trigger and NO stored procedure, because DuckDB has neither: `CREATE TRIGGER`
+      // and `CREATE PROCEDURE` are both parser errors on v1.5.5. A declared kind draws a
+      // folder, and a folder for something the engine cannot have is a lie its zero badge
+      // makes look like a fact.
+      //
+      // No `index` kind either: `duckdb_indexes()` is keyed by `table_oid` and an index
+      // cannot exist without a table, so it belongs in `describeObject`'s output, where it
+      // is. And no materialized view: DuckDB has no such object.
+      //
+      // A SECRET is deliberately absent and is the one omission worth stating rather than
+      // leaving implicit. `duckdb_secrets()` is real, but a secret lives outside the
+      // catalog hierarchy entirely - it has no `database_name` and no `schema_name`, so
+      // there is no container in this model it could hang under. Recorded in
+      // `docs/providers/duckdb.md` as out of Phase 1's scope.
+      //
+      // EVERY declared kind carries `hasSource` (#789), and all four are `sql`. DuckDB
+      // publishes a definition text for each of them and no fifth kind is declared, so
+      // the "declares nothing" half of this engine's row in #789 is empty. `sql` is the
+      // honest id rather than a compromise: DuckDB's dialect is PostgreSQL-shaped, the
+      // installed monaco-editor 0.57.0 registers no DuckDB id, and the text the engine
+      // publishes is ordinary SQL. The `macro` text is the only `partial` form ON THIS
+      // ENGINE, not in the fleet: the #789 design names PostgreSQL `view` and
+      // `materialized_view` and Couchbase `function` as producers of the same arm, and
+      // `postgres.ts` already answers it. `objects.ts` records why a macro is one.
+      //
+      // `hasColumns` is narrower than `hasSource` and is the declaration the object tree's
+      // twisty reads (#789): `describeObject` answers three empty arrays for every kind whose
+      // role is not `relation` (`describeObject` below), so only `table` and `view` can answer a
+      // column here. `macro` and `sequence` declare nothing, which makes their rows leaves, and
+      // that is the measured answer rather than a transcription: a macro's parameters are Phase
+      // 2's job and a DuckDB sequence publishes no column at all.
+      objectKinds: [
+        {
+          id: "table",
+          role: "relation",
+          label: "Table",
+          labelPlural: "Tables",
+          acceptsRowWrites: true,
+          hasSource: true,
+          hasColumns: true,
+          sourceLanguage: "sql",
+        },
+        // No `acceptsRowWrites` on a view. Measured on v1.5.5: `INSERT INTO <view>`
+        // answers `Catalog Error: <view> is not an table`, so a view is never an import
+        // or inline-edit target here - not even the single-table case PostgreSQL takes.
+        {
+          id: "view",
+          role: "relation",
+          label: "View",
+          labelPlural: "Views",
+          hasSource: true,
+          hasColumns: true,
+          sourceLanguage: "sql",
+        },
+        // ONE kind for both macro forms. A scalar macro (`AS <expression>`) and a table
+        // macro (`AS TABLE <select>`) are `function_type` 'macro' and 'table_macro', and
+        // both are something a person wrote with CREATE MACRO. There is no
+        // `duckdb_macros()`: `duckdb_functions()` filtered on `function_type` is the only
+        // route, and `information_schema` has no `.routines` on this engine.
+        {
+          id: "macro",
+          role: "routine",
+          label: "Macro",
+          labelPlural: "Macros",
+          hasSource: true,
+          sourceLanguage: "sql",
+        },
+        {
+          id: "sequence",
+          role: "config",
+          label: "Sequence",
+          labelPlural: "Sequences",
+          hasSource: true,
+          sourceLanguage: "sql",
+        },
+      ],
     };
   }
 
@@ -434,7 +670,14 @@ export class DuckDBProvider extends SQLBaseProvider {
       throw new DatabaseConfigError("Invalid database path: NUL bytes are not allowed", "duckdb");
     }
 
-    return path.resolve(configured);
+    const resolved = path.resolve(configured);
+    if (isReservedStoragePath(resolved)) {
+      throw new DatabaseConfigError(
+        "This path is reserved for the server's own storage and cannot be opened as a connection",
+        "duckdb",
+      );
+    }
+    return resolved;
   }
 
   public async connect(): Promise<void> {
@@ -450,11 +693,38 @@ export class DuckDBProvider extends SQLBaseProvider {
       }
 
       if (dbPath !== MEMORY_TARGET) {
-        const dir = path.dirname(dbPath);
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        // One level at a time: Node's recursive mkdir never returns for a folder under /proc.
+        // A refused folder is the open failure it causes, so it reads like every other one.
+        try {
+          createMissingDirectories(path.dirname(dbPath));
+        } catch (error) {
+          throw describeOpenFailure(error, dbPath, false);
+        }
       }
 
-      this.client = await openDuckDBClient(dbPath, { readOnly: false });
+      // An existing file this process cannot write, or whose directory it cannot write, is
+      // opened read-only rather than left to fail (#1404): a read-write open of an
+      // unwritable file answers "Permission denied" and reads nothing at all, and one in an
+      // unwritable directory fails its first commit on the `.wal` it cannot create.
+      const unwritableFile = isUnwritableExistingFile(dbPath);
+      // The denied editor posture rides on `denyExternalAccess`: a writable handle with
+      // `enable_external_access: 'false'`, composed with `access_mode: 'READ_ONLY'` when the
+      // file is also unwritable. A full-reach editor passes neither (non-admin DuckDB file access).
+      this.client = await openDuckDBClient(dbPath, {
+        readOnly: false,
+        unwritableFile,
+        denyExternalAccess: this.denyExternalAccess,
+      });
+      // Set on every open, never carried over from an earlier handle on this provider.
+      this.unwritableFile = null;
+      // Logged once the open succeeded, so a file refused at open is not announced as opened.
+      if (unwritableFile) {
+        const [{ name }] = (await this.client.run("SELECT current_database() AS name")).rows as { name: string }[];
+        this.unwritableFile = { path: dbPath, catalog: name };
+        logger.info(`[DuckDB] Opened ${dbPath} read-only: this process cannot write the file or its directory`, {
+          provider: "duckdb",
+        });
+      }
       this.setConnected(true);
     } catch (error) {
       this.setError(error instanceof Error ? error : new Error(String(error)));
@@ -489,10 +759,17 @@ export class DuckDBProvider extends SQLBaseProvider {
 
   public async disconnect(): Promise<void> {
     if (this.client) {
-      this.client.close();
-      this.client = null;
-      this.runningQueryIds.clear();
-      this.setConnected(false);
+      try {
+        this.client.close();
+      } finally {
+        // Cleared whatever close() raised. It closes the engine handle before it removes the private
+        // temp directory, so a removal that fails (EACCES, or EBUSY on Windows) must not leave this
+        // provider marked connected on a closed client: connect() would return early on it and the
+        // handle could never be reopened. The error still reaches the caller.
+        this.client = null;
+        this.runningQueryIds.clear();
+        this.setConnected(false);
+      }
     }
   }
 
@@ -519,7 +796,24 @@ export class DuckDBProvider extends SQLBaseProvider {
           try {
             return await this.client!.run(sql, params);
           } catch (error) {
-            throw mapDuckDBError(error, sql);
+            const mapped = mapDuckDBError(error, sql);
+            // The engine's refusal names the read-only mode but not why the editor is in
+            // it, so the reason is put in front of it (#1405), as the SQLite provider does,
+            // and only when the refused database is the editor's own file.
+            const refusedCatalog = READ_ONLY_REFUSAL.exec(mapped.message)?.[1];
+            if (this.unwritableFile !== null && refusedCatalog === this.unwritableFile.catalog) {
+              throw new QueryError(
+                `DuckDB database ${this.unwritableFile.path} is open read-only because this process cannot write the file or its directory: ${mapped.message}`,
+                "duckdb",
+                sql,
+              );
+            }
+            // The same for the file-access posture (non-admin DuckDB file access): only on a handle opened with file
+            // access denied, and only for the engine's permission refusals.
+            if (this.denyExternalAccess && mapped.message.startsWith(PERMISSION_REFUSAL_PREFIX)) {
+              throw new QueryError(`${FILE_ACCESS_DENIED_REASON}: ${mapped.message}`, "duckdb", sql);
+            }
+            throw mapped;
           }
         });
 
@@ -528,6 +822,42 @@ export class DuckDBProvider extends SQLBaseProvider {
         if (queryId) this.runningQueryIds.delete(queryId);
       }
     });
+  }
+
+  /**
+   * End a transaction a statement left open on this connection (D71).
+   *
+   * DuckDB holds ONE connection here (see `DuckDBClient`), so a transaction a script
+   * opened and did not finish stays open on the handle every later request borrows:
+   * `getOrCreateProvider` caches this provider per `connection.id` for the whole process.
+   * Measured 2026-09-13 through the product's own routes on v1.5.5, the loss was SILENT —
+   * the next user's INSERT answered HTTP 200 and read its own row back, and a later
+   * ROLLBACK discarded it with no error at any point.
+   *
+   * The ask and the act are one call because on this engine they cannot be separated:
+   * v1.5.5 publishes no transaction-state reading, so the engine's refusal of the
+   * ROLLBACK is the answer. `client.endOpenTransaction()` carries that measurement and
+   * raises anything that is not that refusal.
+   *
+   * THE `scope` PARAMETER IS DECLARED ON THE INTERFACE AND IGNORED HERE, deliberately (D87). It
+   * exists so a provider that borrows a DIFFERENT pooled client per call can name the one the
+   * caller's own statements ran on; this provider holds ONE connection for its whole life, so
+   * there is no other client to name. A signature that took it and did nothing with it would only
+   * suggest the question had been considered per call, which it has not.
+   *
+   * WHAT THAT DOES NOT MEAN: that the transaction ended here is the caller's own. One connection shared by every
+   * request on this stored connection is what makes another request's transaction REACHABLE, not
+   * what puts it out of reach - the paragraph above measures that sharing from the other side. The
+   * act here is an unconditional `ROLLBACK` whose refusal is the reading, and a refusal cannot say
+   * WHOSE transaction it found, so a request whose own statements left nothing open still discards
+   * a concurrent request's. That is the D87 shape on a single connection and it is NOT closed:
+   * closing it needs the transaction owned by a scope rather than by a client, which is a design
+   * change and not a parameter.
+   */
+  public async endOpenQueryTransaction(): Promise<OpenQueryTransactionOutcome> {
+    this.ensureConnected();
+
+    return (await this.client!.endOpenTransaction()) ? "rolled-back" : "none";
   }
 
   /**
@@ -637,23 +967,417 @@ export class DuckDBProvider extends SQLBaseProvider {
   // Schema
   // ==========================================================================
 
-  public async getSchema(): Promise<TableSchema[]> {
+  // ==========================================================================
+  // The object surface (#789)
+  // ==========================================================================
+
+  /** One catalog read, with DuckDB's own refusal mapped and quoting the statement it sent. */
+  private async runObjectRows<T>(sql: string, params?: readonly (string | number)[]): Promise<T[]> {
+    try {
+      const result = params === undefined ? await this.client!.run(sql) : await this.client!.run(sql, [...params]);
+      return result.rows as unknown as T[];
+    } catch (error) {
+      throw mapDuckDBError(error, sql);
+    }
+  }
+
+  /**
+   * The containers at `parent`: the catalogs this connection can address, or one
+   * catalog's schemas.
+   *
+   * The top level is `duckdb_databases()` and not "the file this connection named", which
+   * is the whole point of the level: `ATTACH` puts another database in the same session
+   * and a three-part name reaches into it, so a DuckDB connection routinely holds more
+   * than one catalog. `system` and `temp` are excluded by the engine's own `internal`
+   * flag - see `CATALOGS_SQL`.
+   *
+   * The nested read binds the CALLER's catalog. It is a bound string here rather than a
+   * three-part name, so the failure a bad implementation gets is an empty folder rather
+   * than a syntax error: a provider that read `current_database()` instead would answer
+   * the connected catalog's schemas under every ATTACHed database and look healthy.
+   *
+   * Below the last declared level the answer is `[]` rather than a refusal, because
+   * "nothing nests under a schema" is a true statement about DuckDB and not a caller
+   * mistake. The depth is `containerDepth()` for the reason standing ruling 5g gives.
+   */
+  public async listContainers(parent?: readonly string[]): Promise<Container[]> {
     this.ensureConnected();
-    return readSchema(this.client!);
+    const capabilities = this.getCapabilities();
+    const parentPath = parent ?? [];
+    // `Container.level` is the index into `containerLevels`, so a container listed under a
+    // parent of depth d sits at level d. Derived from the parent rather than written twice
+    // as a literal 0 and 1.
+    const level = parentPath.length;
+
+    if (level === 0) {
+      const rows = await this.runObjectRows<CatalogRow>(CATALOGS_SQL);
+      return rows.map((row) => ({
+        path: [row.database_name],
+        name: row.database_name,
+        level,
+        isSessionDefault: row.is_session_default === true,
+      }));
+    }
+    if (level >= containerDepth(capabilities)) return [];
+
+    const catalog = parentCatalog(capabilities, parentPath);
+    const rows = await this.runObjectRows<SchemaNameRow>(SCHEMAS_SQL, [catalog]);
+    return rows.map((row) => ({
+      path: [...parentPath, row.schema_name],
+      name: row.schema_name,
+      level,
+      // Marked at THIS level too, not only at the catalog. Standing ruling 5a2 (#789):
+      // first paint walks the chain to the session default at the DEEPEST declared level,
+      // so a two-level engine that marked only its catalogs would open a database and
+      // stop there, having read no counts at all. Only the session's own catalog carries
+      // a marked schema - `current_schema()` names a schema in `current_database()` - so
+      // an ATTACHed catalog answers false for every row, which is the truth.
+      isSessionDefault: row.is_session_default === true,
+    }));
+  }
+
+  /**
+   * How many objects of each declared kind one container holds, in one round trip.
+   *
+   * Three outcomes, and `KindCount` keeps all three apart. A kind the statement answered
+   * for carries its count. A kind it did not carries `{ count: 0 }`, because it was seeded
+   * before the read. A kind whose read was refused carries DuckDB's own sentence, so the
+   * object browser can say why a folder has no number instead of showing a zero nobody
+   * measured.
+   *
+   * A catalog-level count is the whole catalog and a schema-level one is that schema, and
+   * on this engine the first really is the sum of the second over the schemas
+   * `listContainers` lists: every DuckDB object of every declared kind belongs to a schema,
+   * so there is no base-less row of the sort an Oracle or SQL Server trigger has.
+   *
+   * The statement is built BEFORE the try. A kind declared with no catalog function behind
+   * it is a DECLARATION defect, and reporting it as `{ unavailable }` would render it as
+   * the engine refusing a read.
+   */
+  public async countObjects(container: readonly string[]): Promise<Record<string, KindCount>> {
+    this.ensureConnected();
+    const capabilities = this.getCapabilities();
+    const read = containerRead(capabilities, container);
+    const declared = declaredKinds(capabilities);
+    const counts = seedZeroCounts(declared);
+    const sql = countsSql(declared, read.bySchema);
+
+    try {
+      const rows = await this.runObjectRows<KindCountRow>(sql, read.binds);
+      applyKindCounts(counts, rows, readCount);
+      return counts;
+    } catch (error) {
+      // A refused read is never 0. "Out of Memory Error: failed to allocate data of size
+      // 32.0 KiB" and "this schema holds no tables" are different facts, and `KindCount`
+      // is the type that keeps them apart, so the object browser can say WHY a folder has
+      // no number instead of showing a zero nobody measured. DuckDB's sentence is carried
+      // verbatim: `mapDuckDBError` has already given it this product's typing, and the
+      // text a person reads here is the engine's own.
+      const reason = error instanceof Error ? error.message : String(error);
+      return Object.fromEntries(declared.map((kind) => [kind.id, { unavailable: reason } as KindCount]));
+    }
+  }
+
+  /**
+   * The objects of one kind in one container, names only.
+   *
+   * Ordering is done here rather than with an `ORDER BY`, so one rule covers all four
+   * kinds: four `ORDER BY` clauses are four chances to disagree, and a code-point sort over
+   * the produced PATH is what keeps a catalog-level listing grouped by schema.
+   */
+  public async listObjects(container: readonly string[], kind: string): Promise<DatabaseObject[]> {
+    this.ensureConnected();
+    const capabilities = this.getCapabilities();
+    const read = containerRead(capabilities, container);
+    // Two questions, asked in order, and only the DECLARATION answers the first. Deciding
+    // "is this kind declared" from whether a statement exists would make the two methods
+    // disagree, and would report "declares no object kind" about a kind `objectKinds` does
+    // declare.
+    if (findKind(capabilities, kind) === undefined) {
+      throw new QueryError(`DuckDB declares no object kind "${kind}"`, "duckdb");
+    }
+    const rows = await this.runObjectRows<ObjectRow>(listObjectsSql(kind, read.bySchema), read.binds);
+    return rows
+      .map((row) => listedObject(capabilities, read.catalog, kind, row))
+      .sort((left, right) => comparePaths(left.path, right.path));
+  }
+
+  /**
+   * Columns, indexes and foreign keys for one object of one KIND.
+   *
+   * The kind decides everything and nothing here reads the name to work out what it is
+   * holding. Only the two relation kinds have any of the three, so a macro and a sequence
+   * answer three empty arrays without a round trip - a true fact about those kinds rather
+   * than a failed read, and a macro's parameters are Phase 2's job.
+   *
+   * Without the kind the same answer would come out by accident, and on this engine that
+   * accident is reachable rather than theoretical. Measured on DuckDB v1.5.5, a table, a
+   * sequence and a macro can all be called `overlap` in one schema
+   * (`CREATE SEQUENCE overlap` and `CREATE MACRO overlap(x)` both succeed while the table
+   * exists; only `CREATE VIEW overlap` is refused), so a read keyed on the name alone would
+   * hand the sequence the table's columns.
+   */
+  public async describeObject(path: readonly string[], kind: string): Promise<ObjectDetail> {
+    this.ensureConnected();
+    const capabilities = this.getCapabilities();
+    const spec = findKind(capabilities, kind);
+    if (spec === undefined) {
+      throw new QueryError(`DuckDB declares no object kind "${kind}"`, "duckdb");
+    }
+
+    const read = objectRead(capabilities, spec, path);
+
+    if (spec.role !== "relation") {
+      return { path: [...path], columns: [], indexes: [], foreignKeys: [] };
+    }
+
+    const columnRows = await this.runObjectRows<ColumnRow>(OBJECT_COLUMNS_SQL, read.binds);
+    if (columnRows.length === 0) {
+      // Measured: `CREATE TABLE t ()` is `Parser Error: Table must have at least one
+      // column!` and a view over an empty selection list is a parser error too, so a
+      // relation with no column row is a relation that is not there. Answering
+      // `{ columns: [] }` would render a dropped table as a table with no columns.
+      throw new QueryError(`No column row for ${path.join(".")}`, "duckdb", OBJECT_COLUMNS_SQL);
+    }
+    const primaryKeyRows = await this.runObjectRows<PrimaryKeyRow>(OBJECT_PRIMARY_KEY_SQL, read.binds);
+    const foreignKeyRows = await this.runObjectRows<ForeignKeyRow>(OBJECT_FOREIGN_KEYS_SQL, read.binds);
+    const indexRows = await this.runObjectRows<IndexRow>(OBJECT_INDEXES_SQL, read.binds);
+
+    return objectDetailFromRows(path, read.schema, {
+      columns: columnRows,
+      primaryKey: primaryKeyRows,
+      foreignKeys: foreignKeyRows,
+      indexes: indexRows,
+    });
+  }
+
+  /**
+   * Columns, indexes and foreign keys for EVERY object of one kind in one container (#789).
+   *
+   * FIVE round trips for a whole folder, constant in the number of objects: the target read
+   * plus the four detail reads, each of which is `describeObject()`'s own statement with the
+   * schema-and-name pair replaced by a join against the target. The caller's alternative was
+   * one `describeObject` per object, which is four statements each.
+   *
+   * The four guards are asked in the same order the reference implementation asks them, and
+   * each one is a different fact:
+   *   1. a kind this engine does not declare RAISES, naming the engine and the kind. An
+   *      empty batch would be a claim about the container; an undeclared kind is a fact
+   *      about DuckDB.
+   *   2. the container path is resolved by `containerRead`, the same reader `listObjects`
+   *      uses, so both the depth and the segment-to-level mapping come from the declaration
+   *      (standing ruling 5g).
+   *   3. a `limit` that is not a positive whole number raises rather than clamping: a 0
+   *      would answer nothing while reporting a truncation nobody asked for.
+   *   4. a kind with no columns answers `{ details: [] }` with NO round trip. On DuckDB that
+   *      is `macro` and `sequence` - measured, `duckdb_columns()` holds no row for either -
+   *      which is the same fact `describeObject` answers as three empty arrays.
+   *
+   * The bound is the CALLER's. `limit + 1` reaches the target's `LIMIT`, the extra object is
+   * dropped and `truncated` carries the caller's own limit; an unbounded call can never
+   * report truncation, and nothing here caps the columns of an object.
+   *
+   * A CATALOG-level container spans every schema under it, so the target carries the SCHEMA
+   * of each object and the paths are built from the row rather than from the container -
+   * `listedObject` again, the same rule `listObjects` builds its paths with.
+   */
+  public async describeObjects(container: readonly string[], kind: string, limit?: number): Promise<ObjectDetailBatch> {
+    this.ensureConnected();
+    const capabilities = this.getCapabilities();
+    const spec = findKind(capabilities, kind);
+    if (spec === undefined) {
+      throw new QueryError(`DuckDB declares no object kind "${kind}"`, "duckdb");
+    }
+    const read = containerRead(capabilities, container);
+    if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+      throw new QueryError(
+        `A DuckDB bulk column read limit must be a positive whole number, received ${limit}`,
+        "duckdb",
+      );
+    }
+    if (spec.role !== "relation") return { details: [] };
+
+    const bounded = limit !== undefined;
+    const binds = bounded ? [...read.binds, limit + 1] : read.binds;
+    const of = (row: { schema_name: string; table_name: string }): string =>
+      `${row.schema_name}\u0000${row.table_name}`;
+
+    const targets = await this.runObjectRows<ObjectRow>(bulkTargetSql(kind, read.bySchema, bounded), binds);
+    const truncated = bounded && targets.length > limit;
+    // The extra object the `limit + 1` bound brought back is dropped here, so its rows in
+    // the four maps below are simply never read.
+    const described = truncated ? targets.slice(0, limit) : targets;
+
+    const columns = groupByObject(
+      await this.runObjectRows<OfObject<ColumnRow>>(bulkColumnsSql(kind, read.bySchema, bounded), binds),
+      of,
+    );
+    const primaryKey = groupByObject(
+      await this.runObjectRows<OfObject<PrimaryKeyRow>>(bulkPrimaryKeySql(kind, read.bySchema, bounded), binds),
+      of,
+    );
+    const foreignKeys = groupByObject(
+      await this.runObjectRows<OfObject<ForeignKeyRow>>(bulkForeignKeysSql(kind, read.bySchema, bounded), binds),
+      of,
+    );
+    const indexes = groupByObject(
+      await this.runObjectRows<OfObject<IndexRow>>(bulkIndexesSql(kind, read.bySchema, bounded), binds),
+      of,
+    );
+
+    const details = described
+      .map((row) => {
+        const key = of({ schema_name: row.schema_name, table_name: row.name });
+        return objectDetailFromRows(listedObject(capabilities, read.catalog, kind, row).path, row.schema_name, {
+          columns: columns.get(key) ?? [],
+          primaryKey: primaryKey.get(key) ?? [],
+          foreignKeys: foreignKeys.get(key) ?? [],
+          indexes: indexes.get(key) ?? [],
+        });
+      })
+      .sort((left, right) => comparePaths(left.path, right.path));
+
+    return truncated ? { details, truncated: { limit, reason: callerBoundTruncationReason(limit) } } : { details };
+  }
+
+  /**
+   * One object's definition text, as DuckDB rebuilds it from its own catalog (#789).
+   *
+   * EVERY DECLARED KIND CAN ANSWER, and no kind here declares nothing: `duckdb_tables()`,
+   * `duckdb_views()` and `duckdb_sequences()` each publish a `sql` column and
+   * `duckdb_functions()` publishes `macro_definition`, so this engine's row in #789 has an
+   * empty "declares nothing" half.
+   *
+   * `origin` IS `regenerated` FOR ALL FOUR, and that is measured rather than assumed.
+   * `CREATE TABLE main.customers (id INTEGER PRIMARY KEY, name VARCHAR NOT NULL, note
+   * VARCHAR DEFAULT 'none')` reads back as `CREATE TABLE customers(id INTEGER PRIMARY KEY,
+   * "name" VARCHAR NOT NULL, note VARCHAR DEFAULT('none'));` on v1.5.5: the schema
+   * qualification is gone, `name` is quoted, the default is parenthesised, and on the
+   * neighbouring table an inline `REFERENCES` comes back as a table-level `FOREIGN KEY`
+   * clause. None of that is the author's bytes. SQLite is the engine where `stored` has a
+   * producer; claiming it here would make the caption's distinction decoration.
+   *
+   * `form` IS PER KIND AND THE MACRO IS THE EXCEPTION, deliberately. A table, a view and a
+   * sequence each answer a statement ending in `;` that runs as given, so they are
+   * `complete`. A macro answers a BODY - `(x + 1)` for a scalar macro, `SELECT * FROM
+   * analytics.events LIMIT n` for a table macro - because DuckDB publishes no `CREATE
+   * MACRO` statement anywhere, so it is `partial` and the Source caption says what that
+   * means. Assembling a statement out of `parameters` would show a user something the
+   * engine never published, which they might copy and run; Phase 3 assembles, per the rule
+   * that the provider builds the statement and core never does. `objects.ts` carries the
+   * whole argument beside the record that decides it.
+   *
+   * NO REFUSAL IS REACHABLE HERE, and it is a measured CANNOT rather than an omission.
+   * Measured on v1.5.5: zero `duckdb_tables()` rows, zero of 47 `duckdb_views()` rows, zero
+   * `duckdb_sequences()` rows and zero of 136 macros carry a NULL or whitespace-only text,
+   * and even `CREATE MACRO no_body() AS NULL` publishes the four characters `NULL`. The
+   * blank arm exists anyway, because an empty definition must never reach an editor as a
+   * definition, and it says which SHAPE produced it, one sentence per arm of
+   * `blankDefinitionShape()` in `objects.ts`, which is the list. That measurement reaches
+   * only the two shapes that are facts about the ROW, a NULL and a text holding no
+   * non-whitespace character. The other two are facts about the READ, a reply carrying no
+   * such column at all and the driver handing that column back as something other than a
+   * text, and no scan of the engine's own rows could have observed either of those.
+   *
+   * ABSENCE RAISES, and on this engine it is the ONLY failure the read has. A missing name
+   * answers ZERO ROWS rather than a row carrying nothing, and no rows says nothing of that
+   * name is there under that kind, which is a different fact from "the definition cannot be
+   * read". The message names the object AND its container, because on a two-level engine
+   * the same name in the neighbouring catalog is a real object and the caller needs to know
+   * which one was looked for.
+   *
+   * THE KIND IS A REQUIRED ARGUMENT AND THIS ENGINE IS ONE OF THE THREE REASONS IT IS.
+   * Measured on v1.5.5 and held by `docker/duckdb-init/01-object-fixture.sql`: a table, a
+   * sequence and a macro can all be called `overlap` in one schema, so a read keyed on the
+   * path alone answers one of the three at random.
+   *
+   * NOTHING HERE IS POSITIONAL (standing ruling 5g). The three binds and the container
+   * names in the message all come from `objectRead()`, the same reader `describeObject`
+   * uses, so the Source tab and the detail pane cannot disagree about what a path
+   * addresses. A declaration with its two levels SWAPPED is driven all the way to a bound
+   * value in this provider's suite, which is what a declaration that merely matches the
+   * real one cannot do.
+   */
+  public async readObjectSource(path: readonly string[], kind: string, limit?: number): Promise<ObjectSourceDocument> {
+    this.ensureConnected();
+    const capabilities = this.getCapabilities();
+    const spec = requireSourceKind(capabilities, kind, { displayName: "DuckDB", type: "duckdb" });
+
+    const read = objectRead(capabilities, spec, path);
+    const sql = objectSourceSql(kind);
+    const rows = await this.runObjectRows<ObjectSourceRow>(sql, read.binds);
+    const row = rows[0];
+    if (row === undefined) {
+      throw new QueryError(`No DuckDB ${kind} named ${read.name} in ${read.catalog}.${read.schema}`, "duckdb", sql);
+    }
+
+    const definition = row.definition;
+    if (typeof definition !== "string" || definition.trim() === "") {
+      return {
+        path: [...path],
+        kind,
+        parts: [
+          {
+            id: "definition",
+            label: "Definition",
+            unavailable: blankDefinitionReason(
+              blankDefinitionShape(row),
+              kind,
+              objectSourceColumn(kind),
+              read.name,
+              typeof definition,
+            ),
+          },
+        ],
+      };
+    }
+
+    const bounded = applySourceBound(definition, limit);
+    return {
+      path: [...path],
+      kind,
+      parts: [
+        {
+          id: "definition",
+          label: "Definition",
+          text: bounded.text,
+          language: spec.sourceLanguage,
+          form: objectSourceForm(kind),
+          // Both read off the per-kind record in `objects.ts`, beside the statement they
+          // describe. `origin` was a literal here until the #789 fix round, which made the
+          // two halves of one per-kind fact live in two places: a fifth kind whose text
+          // really were stored bytes would have been declared with its column and its form
+          // and silently kept this literal.
+          origin: objectSourceOrigin(kind),
+          ...(bounded.truncated === undefined ? {} : { truncated: bounded.truncated }),
+        },
+      ],
+    };
   }
 
   // ==========================================================================
   // Health & monitoring
   // ==========================================================================
 
+  /**
+   * The database's files as the filesystem measures them, for the readings that fall back
+   * to them when the engine answers 0 (#1449, see `withFileSizes`). `undefined` for an
+   * in-memory database, which has no file.
+   */
+  private readFileSizes(): DuckDBFileSizes | undefined {
+    const dbPath = this.getDatabasePath();
+    if (dbPath === MEMORY_TARGET) return undefined;
+    return { mainBytes: fileSizeOrUndefined(dbPath), walBytes: fileSizeOrUndefined(`${dbPath}.wal`) };
+  }
+
   public async getHealth(): Promise<HealthInfo> {
     this.ensureConnected();
-    return readHealth(this.client!);
+    return readHealth(this.client!, this.readFileSizes());
   }
 
   public async getOverview(): Promise<DatabaseOverview> {
     this.ensureConnected();
-    return readOverview(this.client!);
+    return readOverview(this.client!, this.readFileSizes());
   }
 
   /**
@@ -696,7 +1420,7 @@ export class DuckDBProvider extends SQLBaseProvider {
 
   public async getStorageStats(): Promise<StorageStats[]> {
     this.ensureConnected();
-    return readStorageStats(this.client!);
+    return readStorageStats(this.client!, this.readFileSizes());
   }
 
   // ==========================================================================
@@ -708,7 +1432,12 @@ export class DuckDBProvider extends SQLBaseProvider {
    * resolved into `main`, DuckDB's default schema; `schema.table` is quoted part by
    * part. Mirrors `postgres.ts`'s `qualifyMaintenanceTarget`.
    */
-  private qualifyMaintenanceTarget(target: string): string {
+  private qualifyMaintenanceTarget(target: string, container?: string): string {
+    // A caller-supplied container is authoritative: `main` is only the fallback for a name
+    // that arrives without one, and a container can itself contain a dot.
+    if (container) {
+      return this.escapeIdentifier(container) + "." + this.escapeIdentifier(target);
+    }
     if (target.includes(".")) {
       return target
         .split(".")
@@ -718,11 +1447,11 @@ export class DuckDBProvider extends SQLBaseProvider {
     return `${this.escapeIdentifier(DEFAULT_SCHEMA)}.${this.escapeIdentifier(target)}`;
   }
 
-  public async runMaintenance(type: MaintenanceType, target?: string): Promise<MaintenanceResult> {
+  public async runMaintenance(type: MaintenanceType, target?: string, container?: string): Promise<MaintenanceResult> {
     this.ensureConnected();
 
     const { result, executionTime } = await this.measureExecution(async () => {
-      const qualified = target ? this.qualifyMaintenanceTarget(target) : "";
+      const qualified = target ? this.qualifyMaintenanceTarget(target, container) : "";
       let sql = "";
 
       switch (type) {

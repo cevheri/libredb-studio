@@ -1,7 +1,19 @@
 "use client";
 
+import { appFetch } from "@/lib/config/base-path";
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Bot, ChevronDown, ChevronRight, LoaderCircle, PencilLine, Play, Square, TriangleAlert, X } from "lucide-react";
+import {
+  Bot,
+  ChevronDown,
+  ChevronRight,
+  History,
+  LoaderCircle,
+  PencilLine,
+  Play,
+  Square,
+  TriangleAlert,
+  X,
+} from "lucide-react";
 import { CopyButton } from "@/components/copy-button";
 import { renderProse } from "@/components/rich-text";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
@@ -9,12 +21,13 @@ import type { AgentRunConnection } from "@/hooks/use-connection-payload";
 import { isMobileViewport, useIsMobile } from "@/hooks/use-mobile";
 import { describeAgentCapability } from "@/lib/agent/capability-labels";
 /*
-  The list the SERVER gates a profiled acquisition on, read here for one presentation:
-  an engine outside it cannot execute an agent run's statement, and saying so before
-  Start is pressed is cheaper for the user than a run that ends `engine-unsupported`.
-  It gates nothing — the refusal is the factory's, and this is a notice about it.
+  The record the SERVER decides availability from, read here for two presentations: an
+  engine with no statement language cannot execute an agent run's statement, and saying
+  so before Start is pressed is cheaper for the user than a refused start; and a workflow
+  variant says whether its answer may be handed over. It gates nothing: the refusal is
+  the route's, and this is a notice about it.
 */
-import { AGENT_EXECUTION_ENGINES } from "@/lib/agent/engine-support";
+import { AGENT_STATEMENT_LANGUAGE, type AgentStatementLanguageId, agentVariant } from "@/lib/agent/agent-manifest";
 import {
   AGENT_MAX_OBJECTIVE_LENGTH,
   AGENT_REPORT_RESERVE_MS,
@@ -29,7 +42,6 @@ import {
 */
 import { agentPosture } from "@/lib/agent/posture";
 import {
-  AGENT_WORKFLOW_PRESENTS_ANSWER,
   DEFAULT_AGENT_WORKFLOW_TYPE,
   type AgentChartSpec,
   type AgentRunMode,
@@ -38,6 +50,7 @@ import {
   type AgentRunWorkflowType,
   type AgentThreadContext,
 } from "@/lib/agent/types";
+import { AGENT_TERMINAL_STATUSES } from "@/lib/agent/types";
 /*
   Type-only, and deliberately so: `workflow-classifier.ts` imports the AI SDK and the
   model adapter, so a value import would pull the server's model stack into this
@@ -48,6 +61,7 @@ import { getDBConfig } from "@/lib/db-ui-config";
 import type { DatabaseType } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { AnswerCard, answerCardState } from "./AnswerCard";
+import { AgentHistory } from "./AgentHistory";
 import { ConsentCard } from "./ConsentCard";
 /*
   The pieces the answer card renders too, in the module they moved to when it was split
@@ -55,14 +69,15 @@ import { ConsentCard } from "./ConsentCard";
   live here. Same components, same comments, same accessible names — see
   `rail-parts.tsx` for why a second copy was not the answer.
 */
-import { guardReading, guardSummaryLine, HydrationControls, InfoNote, LIVE_STATUSES, QuotedBlock } from "./rail-parts";
+import { guardReading, guardSummaryLine, HydrationControls, InfoNote, OPEN_STATUSES, QuotedBlock } from "./rail-parts";
 import { SafetyStrip } from "./SafetyStrip";
 import {
   type AgentBudgetGauge,
   type AgentPlanStatementView,
   type AgentTimelineItem,
   type AgentTimelineTone,
-  describeFailureReason,
+  connectionRefusalSentence,
+  describeRunFailure,
 } from "./timeline";
 import type { AgentPrefillRequest } from "./use-agent-prefill";
 import { useAgentRun, type AgentStartRefusalCode } from "./use-agent-run";
@@ -105,6 +120,11 @@ export interface AgentRailProps {
    */
   readonly connectionId: AgentRunConnection | null;
   readonly connectionName: string | null;
+  /**
+   * The database a run reads on a server-level connection, the connection's active one (#1530).
+   * Undefined on every other connection, which names its own.
+   */
+  readonly catalog?: string;
   /** Below `md` only: whether the sheet presentation is open. */
   readonly sheetOpen?: boolean;
   readonly onSheetOpenChange?: (open: boolean) => void;
@@ -164,9 +184,9 @@ export interface AgentRailProps {
 
 const TONE_CLASSES: Readonly<Record<AgentTimelineTone, string>> = {
   neutral: "bg-fg-subtle",
-  progress: "bg-blue-400",
-  refused: "bg-amber-400",
-  done: "bg-emerald-400",
+  progress: "bg-brand",
+  refused: "bg-warning",
+  done: "bg-success",
 };
 
 const MODE_LABELS: Readonly<Record<AgentRunMode, string>> = {
@@ -241,6 +261,12 @@ interface AgentDecidedStart {
    * would destroy the open run for a replacement that is never opened.
    */
   readonly replacesOpenRun: boolean;
+}
+
+/** A start held at the consent step, with the statement language its hand-over was offered in. */
+interface AgentHeldStart extends AgentDecidedStart {
+  /** What `handOverLanguage` answered when the step was raised: the step states this language's terms. */
+  readonly language: AgentStatementLanguageId;
 }
 
 /**
@@ -540,7 +566,7 @@ function PlanStatementCard({ draft }: { readonly draft: AgentPlanStatementView }
       data-read-only={!draft.guardApplicable ? "unexamined" : draft.readOnly ? "true" : "false"}
       className={cn(
         "mt-1 ml-3.5 rounded border p-1.5",
-        draft.readOnly ? "border-hairline-strong" : "border-amber-400/50 bg-amber-500/5",
+        draft.readOnly ? "border-hairline-strong" : "border-warning/50 bg-warning-tint/5",
       )}
     >
       {/*
@@ -550,7 +576,7 @@ function PlanStatementCard({ draft }: { readonly draft: AgentPlanStatementView }
       */}
       <p
         data-testid="agent-plan-statement-summary"
-        className={cn("text-[0.625rem]", guardReading(draft) === "checked" ? "text-fg-muted" : "text-amber-300")}
+        className={cn("text-[0.625rem]", guardReading(draft) === "checked" ? "text-fg-muted" : "text-warning-bright")}
       >
         {guardSummaryLine(draft)} The statement, what the name check found and what applying it would and would not
         establish are in the answer at the top of this rail.
@@ -666,7 +692,7 @@ function TimelineEntryBody({
         (item.planRefusal === true ? (
           <section
             data-testid="agent-plan-refusal"
-            className="mt-1 ml-3.5 rounded border border-amber-400/40 bg-amber-500/5 p-1.5"
+            className="mt-1 ml-3.5 rounded border border-warning/40 bg-warning-tint/5 p-1.5"
           >
             {/*
               Says only that the run could not draft, never WHY — the two reasons
@@ -678,7 +704,7 @@ function TimelineEntryBody({
               because there was no inventory at all. The earlier wording named "the schema it read",
               which on the second path is a reading that never happened.
             */}
-            <p className="text-[0.625rem] text-amber-300">
+            <p className="text-[0.625rem] text-warning-bright">
               This run drafted no statement. What it says is missing, and what it needs from you, are in its own words
               below.
             </p>
@@ -716,11 +742,7 @@ function TimelineEntryBody({
       {declinedHandovers
         .filter((declined) => declined.id === item.id)
         .map((declined) => (
-          <p
-            key={declined.id}
-            data-testid="agent-handover-declined"
-            className="mt-0.5 pl-3.5 text-xs text-amber-400/80"
-          >
+          <p key={declined.id} data-testid="agent-handover-declined" className="mt-0.5 pl-3.5 text-xs text-warning/80">
             It was not run: this run was opened on {declined.openedOn ?? "another connection"} and your editor has moved
             to a different one since. The answer would have arrived in a tab that is connected somewhere else, so
             nothing was executed. The statement is below — take it yourself if you want it on the connection you are on
@@ -799,9 +821,10 @@ function ChangeWorkflowButton({
   );
 }
 
-export function AgentRail({
+export const AgentRail = React.memo(function AgentRail({
   connectionId: connection,
   connectionName,
+  catalog,
   connectionType = null,
   sheetOpen = false,
   onSheetOpenChange,
@@ -835,7 +858,7 @@ export function AgentRail({
    * `src/lib/agent/types.ts`'s invariant intact: every widening decision is made by the
    * request that opens the run, and no later request may widen it.
    */
-  const [pendingStart, setPendingStart] = useState<AgentDecidedStart | null>(null);
+  const [pendingStart, setPendingStart] = useState<AgentHeldStart | null>(null);
   /** The consent step's own tick, reset every time that step is entered. */
   const [autoExecute, setAutoExecute] = useState(false);
   /**
@@ -886,6 +909,8 @@ export function AgentRail({
   const [connectionDropped, setConnectionDropped] = useState(false);
   /** An ask that arrived while the user was typing, waiting for them to take it. */
   const [offeredObjective, setOfferedObjective] = useState<string | null>(null);
+  /** Whether the run-history panel is open under the header. */
+  const [historyOpen, setHistoryOpen] = useState(false);
   const run = useAgentRun();
 
   /*
@@ -1093,7 +1118,10 @@ export function AgentRail({
 
     Agent mode and a workflow that is offered `present_answer` are the server's own
     rule: a run with no such tool has nothing to hand over, and the route refuses the
-    setting outright.
+    setting outright. It is read off the workflow's variant for the connection's
+    statement language, so an engine with no language has no variant and is offered
+    nothing. A host that names no engine reads the SQL variant, which is what every host
+    passing no type has always been offered.
 
     `onRunStatement` is the HOST's half, and it was missing (#373 review). It is an
     optional public prop, so an embedding host may have no way to run a statement at
@@ -1102,9 +1130,21 @@ export function AgentRail({
     the user it had run on their connection. A control that promises what this host
     cannot perform is not offered, which is the rule the stop control and the hydration
     affordances already follow.
+
+    It answers with the LANGUAGE rather than a yes, because the consent step states that
+    language's terms: a card that assumed SQL would promise SQL's read-only session on an
+    engine that has none. `canHandOver` is the yes.
   */
-  const canHandOver = (candidate: AgentRunWorkflowType): boolean =>
-    mode === "agent" && AGENT_WORKFLOW_PRESENTS_ANSWER[candidate] && onRunStatement !== undefined;
+  const handOverLanguage = (candidate: AgentRunWorkflowType): AgentStatementLanguageId | null => {
+    const language = connectionType === null ? "sql" : AGENT_STATEMENT_LANGUAGE[connectionType];
+    const offered =
+      mode === "agent" &&
+      language !== null &&
+      agentVariant(language, candidate)?.canAutoExecute === true &&
+      onRunStatement !== undefined;
+    return offered ? language : null;
+  };
+  const canHandOver = (candidate: AgentRunWorkflowType): boolean => handOverLanguage(candidate) !== null;
 
   /**
    * The connection this run was opened on, kept for as long as the rail follows it.
@@ -1209,7 +1249,7 @@ export function AgentRail({
     */
     const continueTarget = decided.replacesOpenRun
       ? run.thread?.steps.at(-1)?.runId
-      : run.runId !== null && !LIVE_STATUSES.has(run.timeline.status)
+      : run.runId !== null && AGENT_TERMINAL_STATUSES.has(run.timeline.status)
         ? run.runId
         : undefined;
     // Two reasons the rail withholds an id it has, and it OWNS both sentences: the
@@ -1253,6 +1293,7 @@ export function AgentRail({
       autoExecute: handover,
       objective: decided.objective,
       connectionId: decided.connection.id,
+      ...(catalog === undefined ? {} : { catalog }),
       // Sent only when this run genuinely continues the last one; the route refuses
       // anything else, and nothing later may change which run this one was told about.
       ...(previousRunId === undefined ? {} : { previousRunId }),
@@ -1279,12 +1320,12 @@ export function AgentRail({
    * reintroduced in front of the same button. An abort lands in the `catch` below, so
    * it reaches the fallback every other failure reaches.
    */
-  const classifyObjective = async (text: string): Promise<AgentWorkflowClassification> => {
+  const classifyObjective = async (text: string, onConnection: string): Promise<AgentWorkflowClassification> => {
     try {
-      const res = await fetch("/api/agent/classify", {
+      const res = await appFetch("/api/agent/classify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ objective: text }),
+        body: JSON.stringify({ objective: text, connectionId: onConnection }),
         signal: AbortSignal.timeout(CLASSIFY_REQUEST_TIMEOUT_MS),
       });
       const body = (await res.json()) as { workflowType?: unknown; outcome?: unknown };
@@ -1300,17 +1341,21 @@ export function AgentRail({
   /*
     The one step between a decided workflow and an open run.
 
-    It exists for exactly one workflow and one mode, and `canHandOver` is what says so:
+    It exists for exactly one workflow and one mode, and `handOverLanguage` is what says so:
     `data-analysis` is the only workflow offered `present_answer`, agent mode is the
     only mode with tools at all, and a host with no runner cannot perform the hand-over
     whatever the run decides. Everything else opens uninterrupted, because there is
     nothing to consent TO — a checkbox offered where the tool is not is the mismatch
     `AGENT_WORKFLOW_PRESENTS_ANSWER` was written to end, and it shipped once already.
+
+    The language it answers is held with the start, and the step states that language's
+    terms.
   */
   const hold = (decided: AgentDecidedStart): void => {
-    if (canHandOver(decided.workflowType)) {
+    const language = handOverLanguage(decided.workflowType);
+    if (language !== null) {
       setAutoExecute(false);
-      setPendingStart(decided);
+      setPendingStart({ ...decided, language });
       return;
     }
     void beginRun({ ...decided, autoExecute: false });
@@ -1347,7 +1392,8 @@ export function AgentRail({
     }
 
     setClassifying(true);
-    const classification = await classifyObjective(asked);
+    // The connection the run is opened on, so the objective is classified in that engine's own terms.
+    const classification = await classifyObjective(asked, connection.id);
     setClassifying(false);
     hold({
       workflowType: classification.workflowType,
@@ -1437,7 +1483,7 @@ export function AgentRail({
    * long as this holds — the same window the stop control is offered in, because both
    * are asking about a run the server still has open.
    */
-  const runOpen = run.runId !== null && LIVE_STATUSES.has(run.timeline.status);
+  const runOpen = run.runId !== null && OPEN_STATUSES.has(run.timeline.status);
 
   /** Whether the objective is a box to type in or a line saying what was asked. */
   const objectiveEditable = !runOpen || editingObjective;
@@ -1569,6 +1615,12 @@ export function AgentRail({
     A host with no `onShowArtifact` is left alone and nothing is recorded as delivered,
     so nothing claims a result was shown; a host that gains the callback later still
     gets the answer.
+
+    A resumed run can compose a SECOND report, and both entries carry `isAnswer`, so a
+    host receives each answer as it arrives — two deliveries for one run, not one.
+    Noted rather than deduplicated: a second composition is a second statement from
+    the model, and folding the two together would be the rail deciding which answer
+    the user meant.
   */
   const shownAnswerRunId = useRef<string | null>(null);
   const shownAnswers = useRef<Set<string>>(new Set());
@@ -1592,32 +1644,31 @@ export function AgentRail({
   }, [run.runId, run.timeline.items, onShowArtifact]);
 
   /*
-    Stopping is the only control offered, and the two that are absent are absent
-    because the service cannot honour them rather than because they are unfinished:
-
-      - There is no PAUSE anywhere in `AgentRunService`. A run holds a database
-        connection and a budget while it is running, and "hold all of that
-        indefinitely" is not a capability this milestone built.
-      - RESUME exists (`POST /api/agent/drive`) but is authenticated by a
-        server-minted, single-purpose credential a browser never holds — it is the
-        seam for a machine producer (`docs/BACKLOG.md` B9), not a user control.
-
-    Neither is rendered even as a disabled button: a disabled control reads as a
-    capability that happens to be unavailable right now, which would be a claim
-    about this build that is not true.
+    Pause and resume are offered only where the service can honour them: pause on a
+    live, running run and resume on a paused one. Neither is rendered as a disabled
+    button — a disabled control reads as a capability that happens to be unavailable
+    right now, which would be a claim about this build that is not true — so the two
+    controls appear and disappear with the run's status rather than standing in for
+    a capability the service cannot honour.
   */
   const canStop =
-    run.runId !== null && LIVE_STATUSES.has(run.timeline.status) && !run.timeline.stopRequested && !run.isStopping;
+    run.runId !== null && OPEN_STATUSES.has(run.timeline.status) && !run.timeline.stopRequested && !run.isStopping;
+  // Pause and resume are offered only where the service can honour them: pause on
+  // a live, running run; resume on a paused one.
+  const canPause =
+    run.runId !== null && run.timeline.status === "running" && !run.timeline.stopRequested && !run.isStopping;
+  const canResume = run.runId !== null && run.timeline.status === "paused";
 
   /*
     A verdict about the model is a verdict about ONE mode (#331 T4).
 
-    `admitAgentModel` returns `allowed` for planning on its first line: the mode is
-    toolless by contract, so tool calling is not among the capabilities it needs and it
-    is never probed. A refusal is therefore only ever true of the mode it was raised
-    for, and showing it above another mode would be the rail stating something the
-    server did not — most visibly right after the user takes the way out this state
-    itself points at.
+    `admitAgentModel` never probes planning: the mode is toolless by contract, so tool
+    calling is not among the capabilities it needs. (It still builds the model, and an
+    `LLM_MODEL_EFFORT` the model refuses answers 503 in either mode, which is a
+    configuration error and not a verdict.) A capability refusal is therefore only ever
+    true of the mode it was raised for, and showing it above another mode would be the
+    rail stating something the server did not, most visibly right after the user takes
+    the way out this state itself points at.
 
     Scoped here rather than cleared in the hook: the hook reports what the server said,
     and which of it applies to the surface's current selection is the surface's
@@ -1655,16 +1706,18 @@ export function AgentRail({
     scoped to the run that recorded it — so the run id is bound here rather than
     threaded through every item.
 
-    It is offered only while the run is LIVE, and that is the same rule the stop
-    control follows rather than a caution: a run's stored rows live in this process
-    and are released the moment the run ends (`releaseExecutionRun`), so on a finished
-    run every one of these controls could only answer "no longer held". The note in
-    the report section is what explains the absence; applying a drafted statement is
-    unaffected, because the ledger keeps the statement for as long as the timeline.
+    It is offered only while the run is OPEN — queued, running or paused — and that is
+    the same rule the stop control follows rather than a caution: a run's stored rows
+    live in this process and are released the moment the run ends
+    (`releaseExecutionRun`), so on a finished run every one of these controls could only
+    answer "no longer held". A paused run still holds its rows (B83), so the control is
+    still offered. The note in the report section is what explains the absence; applying
+    a drafted statement is unaffected, because the ledger keeps the statement for as long
+    as the timeline.
   */
   const activeRunId = run.runId;
   const showArtifact =
-    onShowArtifact === undefined || activeRunId === null || !LIVE_STATUSES.has(run.timeline.status)
+    onShowArtifact === undefined || activeRunId === null || !OPEN_STATUSES.has(run.timeline.status)
       ? undefined
       : (correlationId: string, chartSpec: AgentChartSpec | undefined) =>
           // The key is absent rather than undefined when there is no chart: the
@@ -1760,9 +1813,11 @@ export function AgentRail({
     the other arrangement would have bought.
   */
   useEffect(() => {
-    const live = run.runId === null || LIVE_STATUSES.has(run.timeline.status);
-    timelineLive.current = live;
-    if (live) {
+    // OPEN, not LIVE: a paused run is still following its own end, so it must not
+    // spend the once-per-run answer reveal the way a finished run does.
+    const open = run.runId === null || OPEN_STATUSES.has(run.timeline.status);
+    timelineLive.current = open;
+    if (open) {
       pinToNewest();
       return;
     }
@@ -1832,6 +1887,10 @@ export function AgentRail({
   */
   const handoverConsented = runOpen ? openedWithHandover : pendingStart !== null && autoExecute;
   const describedMode = runOpen ? run.timeline.mode : mode;
+  // Only for the connection the refused run was opened on: a connection the shell has moved to since has not been
+  // refused, and its strip goes back to what its engine does.
+  const refusedHere =
+    run.openedOn !== null && run.openedOn === connectionId ? connectionRefusalSentence(run.timeline) : null;
   const selectionPosture = agentPosture({
     mode,
     engine: connectionType,
@@ -1839,6 +1898,7 @@ export function AgentRail({
     // The standing step's tick, and OFF otherwise: nothing has been consented to for a
     // run that is not being opened, and the next step's tick starts unticked.
     handover: pendingStart !== null && autoExecute,
+    refusedHere,
   });
 
   /*
@@ -1857,7 +1917,7 @@ export function AgentRail({
     state, which is what is true.
   */
   const engineUnsupported =
-    mode === "agent" && connectionType !== null && !AGENT_EXECUTION_ENGINES.includes(connectionType);
+    mode === "agent" && connectionType !== null && AGENT_STATEMENT_LANGUAGE[connectionType] === null;
 
   /*
     Whether the amber card above is ALREADY saying what the refused start would say, which
@@ -1918,6 +1978,9 @@ export function AgentRail({
        entry can carry `planStatementRecorded` for a card that is showing something else.
   */
   const answerState = answerCardState(run.timeline);
+  // The card's failure note and this line read the same fallback, so a run the loop ended on a
+  // model timeout is not explained on one and unexplained on the other (#1461).
+  const failureSentence = describeRunFailure(run.timeline);
   const answerItem = run.timeline.items.find((item) => item.isAnswer === true);
   const cardedAnswerId = answerState === "report" ? answerItem?.id : undefined;
   /*
@@ -1963,7 +2026,7 @@ export function AgentRail({
     <div className="flex flex-col h-full min-h-0 bg-surface text-fg">
       <div className="flex items-center justify-between gap-2 px-3 h-9 border-b border-hairline shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          <Bot strokeWidth={1.5} className="w-3.5 h-3.5 text-blue-400" />
+          <Bot strokeWidth={1.5} className="w-3.5 h-3.5 text-brand" />
           <span className="text-xs font-medium text-fg-secondary">Agent</span>
           {connectionName !== null && <span className="text-xs text-fg-subtle truncate">on {connectionName}</span>}
         </div>
@@ -1973,6 +2036,25 @@ export function AgentRail({
           full label, so the grouping adds nothing a screen reader needs.
         */}
         <div className="flex items-center gap-1">
+          {/*
+            The run-history seam: a toggle that unfolds the finished conversations
+            below the header. It is beside the mode toggle rather than inside the
+            scroll area, because it is a view of the whole panel and not a choice
+            about the run being started.
+          */}
+          <button
+            type="button"
+            data-testid="agent-history-toggle"
+            aria-label="Run history"
+            aria-pressed={historyOpen}
+            onClick={() => setHistoryOpen((open) => !open)}
+            className={cn(
+              "p-1 rounded transition-colors",
+              historyOpen ? "text-brand-bright bg-brand-tint/15" : "text-fg-tertiary hover:bg-fill hover:text-fg",
+            )}
+          >
+            <History strokeWidth={1.5} className="w-3.5 h-3.5" />
+          </button>
           {(Object.keys(MODE_LABELS) as AgentRunMode[]).map((candidate) => (
             <button
               key={candidate}
@@ -1986,7 +2068,7 @@ export function AgentRail({
               onClick={() => setMode(candidate)}
               className={cn(
                 "px-2 py-0.5 rounded text-xs font-normal transition-colors disabled:opacity-40 disabled:hover:bg-transparent",
-                mode === candidate ? "bg-blue-500/15 text-blue-300" : "text-fg-muted hover:bg-fill",
+                mode === candidate ? "bg-brand-tint/15 text-brand-bright" : "text-fg-muted hover:bg-fill",
               )}
             >
               {MODE_LABELS[candidate]}
@@ -2010,6 +2092,12 @@ export function AgentRail({
         )}
       </div>
 
+      {historyOpen && (
+        <div className="shrink-0 border-b border-hairline max-h-72 overflow-y-auto">
+          <AgentHistory />
+        </div>
+      )}
+
       {/*
         The standing reading of what the open run executes — or of what pressing Start
         would, when there is none — under the header and above everything else, because it
@@ -2022,6 +2110,7 @@ export function AgentRail({
         engine={connectionType}
         engineLabel={engineLabel}
         handover={handoverConsented}
+        refusedHere={refusedHere}
       />
 
       <div className="p-3 border-b border-hairline shrink-0">
@@ -2048,7 +2137,7 @@ export function AgentRail({
               onChange={(e) => setObjective(e.target.value)}
               maxLength={AGENT_MAX_OBJECTIVE_LENGTH}
               rows={3}
-              className="mt-1 w-full resize-none rounded bg-sunken border border-hairline-strong px-2 py-1.5 text-xs text-fg placeholder:text-fg-subtle focus:outline-none focus:border-blue-500/40"
+              className="mt-1 w-full resize-none rounded bg-sunken border border-hairline-strong px-2 py-1.5 text-xs text-fg placeholder:text-fg-subtle focus:outline-none focus:border-brand-tint/40"
               placeholder="Why is checkout slow?"
             />
           </>
@@ -2124,7 +2213,7 @@ export function AgentRail({
                 prefilledObjective.current = offeredObjective;
                 setOfferedObjective(null);
               }}
-              className="ml-1 px-1 py-0.5 rounded text-[0.625rem] text-blue-300 hover:bg-fill transition-colors"
+              className="ml-1 px-1 py-0.5 rounded text-[0.625rem] text-brand-bright hover:bg-fill transition-colors"
             >
               Replace
             </button>
@@ -2136,7 +2225,7 @@ export function AgentRail({
 
           It is offered in BOTH modes and all five are still here: toollessness decides
           which TOOLS a run gets, not what the run is about, and the server frames the
-          objective by workflow in either mode (`WORKFLOW_OBJECTIVES`). What changed is
+          objective by workflow in either mode (each variant's `objective`). What changed is
           only who decides and when — the row used to sit ABOVE the objective, asking
           the user to classify a question they had not written yet.
 
@@ -2189,7 +2278,9 @@ export function AgentRail({
                       onClick={() => setWorkflowChoice(candidate)}
                       className={cn(
                         "px-2 py-0.5 rounded text-xs font-normal transition-colors disabled:opacity-40 disabled:hover:bg-transparent",
-                        workflowChoice === candidate ? "bg-blue-500/15 text-blue-300" : "text-fg-muted hover:bg-fill",
+                        workflowChoice === candidate
+                          ? "bg-brand-tint/15 text-brand-bright"
+                          : "text-fg-muted hover:bg-fill",
                       )}
                     >
                       {candidate === "automatic" ? "Automatic" : WORKFLOW_LABELS[candidate]}
@@ -2216,16 +2307,12 @@ export function AgentRail({
         */}
         {connectionId === null &&
           (connection?.reason === "seed-config-unreadable" ? (
-            <p
-              data-testid="agent-seed-config-unreadable"
-              data-tone="warning"
-              className="mt-2 text-xs text-amber-400/80"
-            >
+            <p data-testid="agent-seed-config-unreadable" data-tone="warning" className="mt-2 text-xs text-warning/80">
               The server could not read its own connection configuration, so it cannot resolve a connection for a run.
               This is not a problem with {connectionName ?? "this connection"} — the server log says what failed.
             </p>
           ) : (
-            <p data-testid="agent-unresolvable-connection" className="mt-2 text-xs text-amber-400/80">
+            <p data-testid="agent-unresolvable-connection" className="mt-2 text-xs text-warning/80">
               {connectionName ?? "This connection"} cannot be rebuilt on the server: its settings live in this browser.
               A run re-resolves its connection there after a restart, so it can only investigate a connection the server
               holds too.
@@ -2238,9 +2325,9 @@ export function AgentRail({
           starting another run. The words come from the same map the timeline entry
           uses, so the two can never disagree.
         */}
-        {run.timeline.failureReason !== null && (
-          <p data-testid="agent-failure-reason" className="mt-2 text-[0.625rem] text-rose-300">
-            {describeFailureReason(run.timeline.failureReason)}
+        {failureSentence !== null && (
+          <p data-testid="agent-failure-reason" className="mt-2 text-[0.625rem] text-hue-rose-alt">
+            {failureSentence}
           </p>
         )}
 
@@ -2273,6 +2360,7 @@ export function AgentRail({
             workflowLabel={WORKFLOW_LABELS[pendingStart.workflowType]}
             connectionName={pendingStart.connection.name}
             engine={pendingStart.connection.type}
+            language={pendingStart.language}
             autoExecute={autoExecute}
             onAutoExecuteChange={setAutoExecute}
             onOpen={() => {
@@ -2336,7 +2424,7 @@ export function AgentRail({
               evicted, so an offer this rail cannot keep would be worse than the notice.
             */}
             {interruptedThread !== null && (
-              <p data-testid="agent-thread-ended" className="text-amber-400/80">
+              <p data-testid="agent-thread-ended" className="text-warning/80">
                 {`The conversation this browser was in (${interruptedThread.steps} question${
                   interruptedThread.steps === 1 ? "" : "s"
                 }, ${interruptedThread.threadId}) ended when the page reloaded. Your next question starts a new one.`}
@@ -2350,7 +2438,7 @@ export function AgentRail({
                     type="button"
                     data-testid="agent-thread-new"
                     onClick={() => setStartFresh(true)}
-                    className="ml-1 px-1 py-0.5 rounded text-[0.625rem] text-blue-300 hover:bg-fill transition-colors"
+                    className="ml-1 px-1 py-0.5 rounded text-[0.625rem] text-brand-bright hover:bg-fill transition-colors"
                   >
                     new conversation
                   </button>
@@ -2367,19 +2455,19 @@ export function AgentRail({
               </>
             )}
             {startFresh && (
-              <p data-testid="agent-thread-fresh-pending" className="mt-1 text-blue-300/90">
+              <p data-testid="agent-thread-fresh-pending" className="mt-1 text-brand-bright/90">
                 Your next question will start a new conversation.
                 <button
                   type="button"
                   onClick={() => setStartFresh(false)}
-                  className="ml-1 px-1 py-0.5 rounded text-[0.625rem] text-blue-300 hover:bg-fill transition-colors"
+                  className="ml-1 px-1 py-0.5 rounded text-[0.625rem] text-brand-bright hover:bg-fill transition-colors"
                 >
                   keep it
                 </button>
               </p>
             )}
             {declineNotice !== null && (
-              <p data-testid="agent-thread-notice" className="mt-1 text-amber-400/80">
+              <p data-testid="agent-thread-notice" className="mt-1 text-warning/80">
                 {declineNotice}
               </p>
             )}
@@ -2396,7 +2484,7 @@ export function AgentRail({
                   aria-expanded={changeOpen}
                   aria-controls="agent-change-workflow"
                   onClick={() => setChangeOpen((open) => !open)}
-                  className="ml-1 px-1 py-0.5 rounded text-[0.625rem] text-blue-300 hover:bg-fill transition-colors"
+                  className="ml-1 px-1 py-0.5 rounded text-[0.625rem] text-brand-bright hover:bg-fill transition-colors"
                 >
                   change
                 </button>
@@ -2434,7 +2522,7 @@ export function AgentRail({
               nothing, and why that is the safe answer.
             */}
             {replaceFailed && (
-              <p role="alert" data-testid="agent-change-failed" className="mt-1 text-amber-400/80">
+              <p role="alert" data-testid="agent-change-failed" className="mt-1 text-warning/80">
                 This run was not stopped, so nothing new was opened: it is still going and still spending its budget.
                 The line above is what the server answered. Ask again, or use Stop and start a new run once it has
                 ended.
@@ -2447,7 +2535,7 @@ export function AgentRail({
           Agent mode on an engine that has no read-only statement path (item 5).
 
           The facts are the posture's, so this card invents nothing: the engines that DO
-          have one are named from `AGENT_EXECUTION_ENGINES` rather than typed, the two
+          have one are named from the posture's own list rather than typed, the two
           ways forward are the two that are actually open — plan mode drafts here, and the
           operations workflow sends no statement at all — and no run would open at all.
           (It used to say the run would END `engine-unsupported` before its first
@@ -2462,16 +2550,16 @@ export function AgentRail({
         {engineUnsupported && (
           <div
             data-testid="agent-engine-unsupported-notice"
-            className="mt-2 rounded border border-amber-400/40 bg-amber-500/5 p-2 space-y-1"
+            className="mt-2 rounded border border-warning/40 bg-warning-tint/5 p-2 space-y-1"
           >
-            <p className="flex items-start gap-1 text-xs text-amber-300">
+            <p className="flex items-start gap-1 text-xs text-warning-bright">
               <TriangleAlert strokeWidth={1.5} className="mt-px w-3 h-3 shrink-0" aria-hidden="true" />
               {selectionPosture.title}
             </p>
             <p
               id={ENGINE_UNSUPPORTED_REASON_ID}
               data-testid="agent-engine-unsupported-reason"
-              className="text-[0.625rem] text-amber-300/90"
+              className="text-[0.625rem] text-warning-bright/90"
             >
               {selectionPosture.body}
             </p>
@@ -2479,7 +2567,7 @@ export function AgentRail({
               type="button"
               data-testid="agent-engine-unsupported-plan"
               onClick={() => setMode("planning")}
-              className="px-1.5 py-0.5 rounded text-[0.625rem] text-blue-300 hover:bg-fill transition-colors"
+              className="px-1.5 py-0.5 rounded text-[0.625rem] text-brand-bright hover:bg-fill transition-colors"
             >
               Switch to Plan
             </button>
@@ -2497,12 +2585,32 @@ export function AgentRail({
             </span>
           )}
           <div className="flex items-center gap-1">
+            {canPause && (
+              <button
+                type="button"
+                data-testid="agent-pause"
+                onClick={() => void run.pause()}
+                className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-brand-tint/15 text-brand-bright hover:bg-brand-tint/25 transition-colors"
+              >
+                Pause
+              </button>
+            )}
+            {canResume && (
+              <button
+                type="button"
+                data-testid="agent-resume"
+                onClick={() => void run.resume()}
+                className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-brand-tint/15 text-brand-bright hover:bg-brand-tint/25 transition-colors"
+              >
+                Resume
+              </button>
+            )}
             {canStop && (
               <button
                 type="button"
                 data-testid="agent-stop"
                 onClick={() => void run.cancel()}
-                className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-amber-500/15 text-amber-300 hover:bg-amber-500/25 transition-colors"
+                className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-warning-tint/15 text-warning-bright hover:bg-warning-tint/25 transition-colors"
               >
                 <Square strokeWidth={1.5} className="w-3 h-3" />
                 Stop
@@ -2514,7 +2622,7 @@ export function AgentRail({
               data-testid="agent-start"
               disabled={!canStart}
               onClick={() => void handleStart()}
-              className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-blue-500/15 text-blue-300 hover:bg-blue-500/25 disabled:opacity-40 disabled:hover:bg-blue-500/15 transition-colors"
+              className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-brand-tint/15 text-brand-bright hover:bg-brand-tint/25 disabled:opacity-40 disabled:hover:bg-brand-tint/15 transition-colors"
             >
               {run.isBusy || classifying ? (
                 <LoaderCircle strokeWidth={1.5} className="w-3 h-3 animate-spin" />
@@ -2587,14 +2695,17 @@ export function AgentRail({
           <div
             role="alert"
             data-testid="agent-model-refusal"
-            className="mt-2 p-2 rounded border border-red-500/30 bg-red-500/5 space-y-1"
+            className="mt-2 p-2 rounded border border-danger-tint/30 bg-danger-tint/5 space-y-1"
           >
-            <p className="text-xs text-red-300">This model cannot drive an agent run.</p>
+            <p className="text-xs text-danger-bright">This model cannot drive an agent run.</p>
             {modelRefusal.missing.length > 0 && (
               <div data-testid="agent-model-refusal-missing" className="flex flex-wrap items-center gap-1">
                 <span className="text-[0.625rem] text-fg-tertiary">The probe could not establish:</span>
                 {modelRefusal.missing.map((capability) => (
-                  <span key={capability} className="px-1 py-0.5 rounded bg-red-500/10 text-[0.625rem] text-red-200/90">
+                  <span
+                    key={capability}
+                    className="px-1 py-0.5 rounded bg-danger-tint/10 text-[0.625rem] text-danger-bright/90"
+                  >
                     {describeAgentCapability(capability)}
                   </span>
                 ))}
@@ -2616,7 +2727,7 @@ export function AgentRail({
                 type="button"
                 data-testid="agent-model-refusal-use-planning"
                 onClick={() => setMode("planning")}
-                className="px-1.5 py-0.5 rounded text-[0.625rem] text-blue-300 hover:bg-fill transition-colors"
+                className="px-1.5 py-0.5 rounded text-[0.625rem] text-brand-bright hover:bg-fill transition-colors"
               >
                 Switch to Plan mode
               </button>
@@ -2628,7 +2739,7 @@ export function AgentRail({
           <p
             role="alert"
             data-testid="agent-error"
-            className="mt-2 text-xs text-red-400"
+            className="mt-2 text-xs text-danger"
             /*
               "The notice above" is a positional claim, and a positional claim is false for
               a reader who is not looking at the panel. Set on exactly the branch where the
@@ -2701,7 +2812,7 @@ export function AgentRail({
                 <div className="mt-1 h-0.5 rounded-full bg-fill">
                   <div
                     data-testid={`agent-budget-${gauge.id}-bar`}
-                    className="h-full rounded-full bg-blue-400/60"
+                    className="h-full rounded-full bg-brand/60"
                     style={{ width: `${gaugeFraction(gauge)}%` }}
                   />
                 </div>
@@ -2709,18 +2820,21 @@ export function AgentRail({
             ))}
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-0.5 text-[0.625rem] text-fg-subtle">
             {/*
-              What the measured figures above are: a floor, per drive. The claim qualifies
-              the gauges, so it sits with them.
+              What the measured figures above are: a floor, and cumulative across the run's
+              drives rather than per drive (#999). The claim qualifies the gauges, so it sits
+              with them.
             */}
             <span className="inline-flex items-center gap-0.5">
               What is counted
               <InfoNote title="What these figures count" testId="agent-budget-spend">
                 <span data-testid="agent-budget-caveats" className="block">
-                  Every ceiling is per drive, so a run resumed after a restart starts each of them again and these
-                  totals can read past a single drive&apos;s ceiling. What is counted comes from the run&apos;s ledger,
-                  which records less than the server charges: the schema capture&apos;s catalog reads are not itemized,
-                  and a completed read reports the engine&apos;s own elapsed time rather than the span the budget was
-                  charged. So a spend shown here is a floor, never a ceiling.
+                  A resumed run continues its spend rather than starting again: the statement and database-time ceilings
+                  are folded from this run&apos;s own ledger, and the run deadline is wall clock from the moment the run
+                  opened, so time it spends paused or between drives is spent against it. Repair attempts are the
+                  exception and are counted per drive. What is counted comes from the run&apos;s ledger, which records
+                  less than the server charges: the schema capture&apos;s catalog reads are not itemized, and a
+                  completed read reports the engine&apos;s own elapsed time rather than the span the budget was charged.
+                  So a spend shown here is a floor, never a ceiling.
                   {/*
                     The one remaining gap in the database-time figure, and it is per RUN
                     rather than a standing claim (#512). A failed
@@ -2738,7 +2852,7 @@ export function AgentRail({
                       charged statements, so that spend is not in the figure above.
                     </>
                   )}{" "}
-                  On SQLite a statement over its timeout is refused once it returns, not interrupted while it runs.
+                  On SQLite a statement over its timeout is now killed mid-flight, not refused only once it returns.
                 </span>
               </InfoNote>
             </span>
@@ -2801,8 +2915,9 @@ export function AgentRail({
           No `capabilities`: this rail is given a connection id and a type, not a provider
           descriptor, and there is no fetch here to get one — every test in this suite
           counts the requests this component makes. The card's fallback is the honest one
-          for that state: it tints from what the LEDGER says the guard could read, and
-          answers "unknown" rather than SQL where nothing said.
+          for that state: it tints from the language the LEDGER recorded with the draft
+          (#1089), and in a ledger written before that, from what the guard could read,
+          answering "unknown" rather than SQL where nothing said.
 
           The run's grounding is not passed either, and deliberately: the card reads the
           capture off this same timeline. It used to be a second prop beside it, and a
@@ -2956,4 +3071,4 @@ export function AgentRail({
       {content}
     </div>
   );
-}
+});

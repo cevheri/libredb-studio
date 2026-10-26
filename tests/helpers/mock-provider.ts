@@ -1,6 +1,10 @@
 import { mock } from "bun:test";
 import type {
+  Container,
+  DatabaseObject,
   DatabaseProvider,
+  KindCount,
+  ObjectDetailBatch,
   HealthInfo,
   MaintenanceResult,
   MonitoringData,
@@ -8,6 +12,7 @@ import type {
   PerformanceMetrics,
   SlowQueryStats,
   ActiveSessionDetails,
+  CreateTableSpec,
   TableStats,
   IndexStats,
   StorageStats,
@@ -15,8 +20,7 @@ import type {
   ProviderCapabilities,
   ProviderLabels,
 } from "@/lib/db/types";
-import type { QueryResult, TableSchema, DatabaseConnection } from "@/lib/types";
-import { mockSchema } from "../fixtures/schemas";
+import type { QueryResult, DatabaseConnection } from "@/lib/types";
 import { mockSelectResult } from "../fixtures/query-results";
 
 const defaultHealthInfo: HealthInfo = {
@@ -54,11 +58,22 @@ const defaultMonitoringData: MonitoringData = {
   activeSessions: [],
 };
 
+/**
+ * A minimal valid Create Table grammar for fixtures whose test reaches a create gate (#1822). Not any engine's: a test
+ * that asserts an engine's emitted SQL imports that engine's own constant instead.
+ */
+export const TEST_CREATE_TABLE_SPEC: CreateTableSpec = {
+  autoIncrement: { clause: "INTEGER PRIMARY KEY" },
+  columnConstraints: true,
+  keyType: "INTEGER",
+  types: ["INTEGER", "TEXT"],
+};
+
 const defaultCapabilities: ProviderCapabilities = {
   queryLanguage: "sql",
   supportsExplain: true,
   supportsExternalQueryLimiting: true,
-  supportsCreateTable: true,
+  createTable: TEST_CREATE_TABLE_SPEC,
   supportsInlineRowEdit: true,
   supportsMaintenance: true,
   maintenanceOperations: ["vacuum", "analyze", "reindex"],
@@ -90,7 +105,10 @@ export interface MockProviderOverrides {
   config?: DatabaseConnection;
   connected?: boolean;
   queryResult?: QueryResult;
-  schema?: TableSchema[];
+  containers?: Container[];
+  counts?: Record<string, KindCount>;
+  objects?: DatabaseObject[];
+  objectDetails?: ObjectDetailBatch;
   health?: HealthInfo;
   monitoring?: MonitoringData;
   capabilities?: Partial<ProviderCapabilities>;
@@ -128,8 +146,11 @@ export function createMockProvider(overrides: MockProviderOverrides = {}): Datab
     }),
     isConnected: mock(() => connected),
     query: mock(async () => overrides.queryResult ?? mockSelectResult),
-    getSchema: mock(async () => overrides.schema ?? mockSchema),
-    getTables: mock(async () => (overrides.schema ?? mockSchema).map((t) => t.name)),
+    listContainers: mock(async () => overrides.containers ?? []),
+    countObjects: mock(async () => overrides.counts ?? {}),
+    listObjects: mock(async () => overrides.objects ?? []),
+    describeObject: mock(async (path: readonly string[]) => ({ path, columns: [], indexes: [], foreignKeys: [] })),
+    describeObjects: mock(async () => overrides.objectDetails ?? { details: [] }),
     getHealth: mock(async () => overrides.health ?? defaultHealthInfo),
     getMonitoringData: mock(async () => overrides.monitoring ?? defaultMonitoringData),
     getOverview: mock(async () => overrides.overview ?? defaultOverview),

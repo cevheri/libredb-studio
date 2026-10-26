@@ -3,7 +3,8 @@ import "../helpers/mock-sonner";
 import "../helpers/mock-navigation";
 
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, render, renderHook, waitFor } from "@testing-library/react";
+import React from "react";
 import { mockGlobalFetch, restoreGlobalFetch } from "../helpers/mock-fetch";
 
 import { useProviderMetadata } from "@/hooks/use-provider-metadata";
@@ -28,7 +29,6 @@ const mockMetadata: ProviderMetadata = {
     queryLanguage: "sql",
     supportsExplain: true,
     supportsExternalQueryLimiting: true,
-    supportsCreateTable: true,
     supportsInlineRowEdit: true,
     supportsMaintenance: true,
     maintenanceOperations: [],
@@ -206,6 +206,31 @@ describe("useProviderMetadata", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  test("reads the declaration again when an edit changes where the same connection reaches", async () => {
+    const connection = makeConnection();
+    const fetchMock = mockGlobalFetch({
+      "/api/db/provider-meta": { ok: true, status: 200, json: mockMetadata },
+    });
+
+    const { result, rerender } = renderHook(({ conn }) => useProviderMetadata(conn), {
+      initialProps: { conn: connection },
+    });
+    await waitFor(() => {
+      expect(result.current.metadata).not.toBeNull();
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // The same id, edited to reach another host: a declaration may depend on any field that decides where a read
+    // goes, so the old one is not kept for the new settings, not even for the render the edit lands on.
+    rerender({ conn: makeConnection({ host: "replica.internal" }) });
+    expect(result.current.metadata).toBeNull();
+
+    await waitFor(() => {
+      expect(result.current.metadata).not.toBeNull();
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   test("resets metadata when connection becomes null", async () => {
     const connection = makeConnection();
     mockGlobalFetch({
@@ -279,6 +304,72 @@ describe("useProviderMetadata", () => {
     await waitFor(() => {
       expect(result.current.metadata).not.toBeNull();
     });
+  });
+
+  // A React state update made from an effect commits one render later than the prop
+  // change that triggered it. Between those two renders, a consumer that reads this
+  // hook's `metadata` alongside the `connection` prop directly (as `Sidebar` does for
+  // `ObjectTree`) sees the NEW connection paired with the PREVIOUS one's capabilities -
+  // and `useTreeNodes` derives the shape of its very first read from `capabilities`
+  // alone, so that one committed render is enough to send a read built for the wrong
+  // engine (#846). This asserts on what a CHILD actually gets rendered with, not on
+  // `result.current` after the effects settle - `renderHook`/`waitFor` only observe
+  // state once React has already caught up, which is exactly the render this bug lives
+  // in and disappears from.
+  test("a rendered child never sees one connection's id paired with another's capabilities (#846)", async () => {
+    const first = makeConnection();
+    const second = makeConnection({ id: "conn-2", type: "clickhouse" });
+    const secondMetadata: ProviderMetadata = {
+      ...mockMetadata,
+      capabilities: { ...mockMetadata.capabilities, supportsInlineRowEdit: false },
+    };
+
+    let call = 0;
+    globalThis.fetch = mock(async () => {
+      call += 1;
+      const body = call === 1 ? mockMetadata : secondMetadata;
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+
+    const observed: Array<{ connectionId: string; supportsInlineRowEdit: boolean | undefined }> = [];
+
+    function Probe({
+      connectionId,
+      metadata,
+    }: {
+      connectionId: string;
+      metadata: ProviderMetadata | null;
+    }): React.JSX.Element | null {
+      observed.push({ connectionId, supportsInlineRowEdit: metadata?.capabilities.supportsInlineRowEdit });
+      return null;
+    }
+
+    function Consumer({ connection }: { connection: DatabaseConnection }): React.JSX.Element {
+      const { metadata } = useProviderMetadata(connection);
+      return React.createElement(Probe, { connectionId: connection.id, metadata });
+    }
+
+    const { rerender } = render(React.createElement(Consumer, { connection: first }));
+
+    await waitFor(() => {
+      expect(observed.some((entry) => entry.connectionId === "conn-1" && entry.supportsInlineRowEdit === true)).toBe(
+        true,
+      );
+    });
+
+    rerender(React.createElement(Consumer, { connection: second }));
+
+    await waitFor(() => {
+      expect(observed.some((entry) => entry.connectionId === "conn-2" && entry.supportsInlineRowEdit === false)).toBe(
+        true,
+      );
+    });
+
+    // The gate a "conn-2" render offered must never have come from "conn-1"'s answer.
+    const mismatched = observed.filter(
+      (entry) => entry.connectionId === "conn-2" && entry.supportsInlineRowEdit === true,
+    );
+    expect(mismatched).toEqual([]);
   });
 
   test("ignores a response that arrives after its connection was replaced", async () => {
@@ -379,5 +470,132 @@ describe("useProviderMetadata", () => {
     const body = JSON.parse(options?.body as string);
     expect(body.connection?.id).toBe("conn-1");
     expect(body.connectionId).toBeUndefined();
+  });
+});
+
+// =============================================================================
+// A failed read is a fact the reader is owed (#789)
+// =============================================================================
+//
+// Absence used to be the only thing a failure produced: the hook logged a warning, set the
+// metadata to null, and the sidebar renders its pending spinner whenever metadata is absent.
+// A reader whose provider-meta read failed then watched "Reading the connection..." for ever,
+// with no message and nothing to retry. This epic's rule everywhere else is that a refusal is
+// shown in the engine's own words rather than as an absence.
+describe("useProviderMetadata reporting a failed read", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    restoreGlobalFetch();
+  });
+
+  test("reports the route's own sentence when the read is refused", async () => {
+    mockGlobalFetch({
+      "/api/db/provider-meta": {
+        ok: false,
+        status: 502,
+        json: { error: "The MySQL server is not reachable from this host" },
+      },
+    });
+
+    const { result } = renderHook(() => useProviderMetadata(makeConnection()));
+
+    await waitFor(() => {
+      expect(result.current.error).not.toBeNull();
+    });
+    expect(result.current.error).toBe("The MySQL server is not reachable from this host");
+    expect(result.current.metadata).toBeNull();
+    expect(result.current.isLoading).toBe(false);
+  });
+
+  test("falls back to the status when the body names no error", async () => {
+    mockGlobalFetch({
+      "/api/db/provider-meta": { ok: false, status: 503, json: {} },
+    });
+
+    const { result } = renderHook(() => useProviderMetadata(makeConnection()));
+
+    await waitFor(() => {
+      expect(result.current.error).not.toBeNull();
+    });
+    expect(result.current.error).toBe("The connection could not be read (HTTP 503)");
+  });
+
+  test("a successful read carries no error", async () => {
+    mockGlobalFetch({
+      "/api/db/provider-meta": { ok: true, status: 200, json: mockMetadata },
+    });
+
+    const { result } = renderHook(() => useProviderMetadata(makeConnection()));
+
+    await waitFor(() => {
+      expect(result.current.metadata).not.toBeNull();
+    });
+    expect(result.current.error).toBeNull();
+  });
+
+  test("retry reads the same connection again and clears the error on success", async () => {
+    let attempts = 0;
+    const fetchMock = mockGlobalFetch({
+      "/api/db/provider-meta": () => {
+        attempts += 1;
+        return attempts === 1
+          ? { ok: false, status: 500, json: { error: "Connection refused" } }
+          : { ok: true, status: 200, json: mockMetadata };
+      },
+    });
+
+    const { result } = renderHook(() => useProviderMetadata(makeConnection()));
+
+    await waitFor(() => {
+      expect(result.current.error).toBe("Connection refused");
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    act(() => result.current.retry());
+
+    await waitFor(() => {
+      expect(result.current.metadata).not.toBeNull();
+    });
+    expect(result.current.error).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  test("a failure for the connection left behind is not reported under the new one", async () => {
+    let releaseFirst: (() => void) | null = null;
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let calls = 0;
+
+    mockGlobalFetch({
+      "/api/db/provider-meta": async () => {
+        calls += 1;
+        if (calls === 1) {
+          await gate;
+          return { ok: false, status: 500, json: { error: "Connection refused" } };
+        }
+        return { ok: true, status: 200, json: mockMetadata };
+      },
+    });
+
+    const { result, rerender } = renderHook(({ conn }) => useProviderMetadata(conn), {
+      initialProps: { conn: makeConnection({ id: "conn-a" }) },
+    });
+
+    rerender({ conn: makeConnection({ id: "conn-b" }) });
+
+    await waitFor(() => {
+      expect(result.current.metadata).not.toBeNull();
+    });
+
+    await act(async () => {
+      releaseFirst?.();
+      await Promise.resolve();
+    });
+
+    expect(result.current.error).toBeNull();
   });
 });

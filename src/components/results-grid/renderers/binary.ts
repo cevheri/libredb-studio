@@ -3,7 +3,7 @@ import type { ValueRenderer } from "./types";
 
 // Monospaced, because hex is read by position: a reader comparing two values, or
 // counting to an offset, needs the digits to line up.
-const BINARY_CLASS = "text-cyan-400/80 font-mono";
+const BINARY_CLASS = "text-hue-cyan/80 font-mono";
 
 // `classifyValue` selects this renderer with the same `asBytes` check, so a
 // non-binary value cannot arrive here; the fallback exists so the narrowing is
@@ -19,5 +19,11 @@ export const binaryRenderer: ValueRenderer = {
     // The whole value, not the cell's preview: the sheet is where a reader goes to
     // copy the bytes out, and it is the form the export writes.
     return { text: binaryText(asBytes(value) ?? NO_BYTES), className: BINARY_CLASS, preserveWhitespace: false };
+  },
+  renderCopy(value) {
+    // The whole value again, for Copy Cell, which used to copy the cell's preview:
+    // the first 32 bytes and a size, 77 characters for a 100-byte value, which no
+    // reader could paste back as the value.
+    return binaryText(asBytes(value) ?? NO_BYTES);
   },
 };

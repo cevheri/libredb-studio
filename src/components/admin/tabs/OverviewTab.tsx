@@ -1,12 +1,16 @@
 "use client";
 
+import { appFetch, withBasePath } from "@/lib/config/base-path";
+import { adminSectionPath } from "@/lib/admin-sections";
 import { useEffect, useMemo, useState, useCallback } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { storage } from "@/lib/storage";
 import { useAllConnections } from "@/hooks/use-all-connections";
-import { getDBIcon, getDBColor } from "@/lib/db-ui-config";
+import { getDBIcon, getDBColor, getDBConfig } from "@/lib/db-ui-config";
+import { EXTERNAL_DATABASE_TYPES } from "@/lib/db/compatibility";
+import { formatBytes } from "@/lib/db/utils/pool-manager";
 import {
   type DatabaseType,
   type DatabaseConnection,
@@ -40,7 +44,7 @@ import Link from "next/link";
 import type { FleetHealthItem } from "@/app/api/admin/fleet-health/route";
 import type { AuditEvent } from "@/lib/audit";
 import { useEffectiveTheme } from "@/hooks/use-effective-theme";
-import { chartTooltipStyle } from "@/lib/charts/palette";
+import { chartTheme, chartTooltipStyle } from "@/lib/charts/palette";
 
 // ─── Animation Variants ─────────────────────────────────────────────────────
 
@@ -88,6 +92,9 @@ const GAUGE_COLORS = {
   warning: "#f59e0b",
   critical: "#ef4444",
 };
+
+// A gauge with nothing to measure: not the failure red of a 0, and not a verdict either way.
+const NEUTRAL_GAUGE_COLOR = "#71717a"; // zinc-500, the theme's fg-muted, which reads on both grounds
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -193,6 +200,9 @@ export function OverviewTab({ user }: OverviewTabProps) {
   // once per mount. A bare read during render would be impure and would mint a new array
   // identity on every pass, invalidating every memo below it.
   const [history] = useState<QueryHistoryItem[]>(() => storage.getHistory());
+  // The clock is read once, at mount, alongside the history it measures: a clock read is
+  // impure, so the day buckets below take it as an input instead of reading it in render.
+  const [now] = useState(() => new Date());
   const [fleetHealth, setFleetHealth] = useState<FleetHealthItem[]>([]);
   const [fleetLoading, setFleetLoading] = useState(false);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
@@ -204,7 +214,7 @@ export function OverviewTab({ user }: OverviewTabProps) {
 
   // Fetch audit events for activity feed
   useEffect(() => {
-    fetch("/api/admin/audit?limit=10")
+    appFetch("/api/admin/audit?limit=10")
       .then((r) => r.json())
       .then((d) => setAuditEvents(d.events || []))
       .catch(() => {});
@@ -231,7 +241,7 @@ export function OverviewTab({ user }: OverviewTabProps) {
     async function load() {
       setFleetLoading(true);
       try {
-        const res = await fetch("/api/admin/fleet-health", {
+        const res = await appFetch("/api/admin/fleet-health", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ connections: targets }),
@@ -263,10 +273,10 @@ export function OverviewTab({ user }: OverviewTabProps) {
     const total = history.length;
     const successful = history.filter((h) => h.status === "success").length;
     const failed = total - successful;
-    const successRate = total > 0 ? Math.round((successful / total) * 100) : 0;
+    // null, not 0: with no queries there is nothing to divide, and 0 reads as every query failing.
+    const successRate = total > 0 ? Math.round((successful / total) * 100) : null;
     const avgTime = total > 0 ? Math.round(history.reduce((sum, h) => sum + h.executionTime, 0) / total) : 0;
 
-    const now = new Date();
     const byDay: { day: string; success: number; fail: number }[] = [];
     for (let i = 6; i >= 0; i--) {
       const dayStart = startOfDay(subDays(now, i));
@@ -283,51 +293,52 @@ export function OverviewTab({ user }: OverviewTabProps) {
     }
 
     return { total, successful, failed, successRate, avgTime, byDay };
-  }, [history]);
+  }, [history, now]);
 
+  // A `not-checked` row was sent nothing (its provider resumes billed compute), so it is neither
+  // healthy nor unhealthy and stays out of the score's denominator. A fleet of only such rows has
+  // no score: null, read as N/A, since 0% would rate it critical.
   const healthScore = useMemo(() => {
     if (fleetHealth.length === 0) return 0;
-    const healthy = fleetHealth.filter((h) => h.status === "healthy").length;
-    return Math.round((healthy / fleetHealth.length) * 100);
+    const checked = fleetHealth.filter((h) => h.status !== "not-checked");
+    if (checked.length === 0) return null;
+    const healthy = checked.filter((h) => h.status === "healthy").length;
+    return Math.round((healthy / checked.length) * 100);
   }, [fleetHealth]);
 
   const todayQueries = useMemo(() => {
-    const todayStart = startOfDay(new Date()).getTime();
+    const todayStart = startOfDay(now).getTime();
     return history.filter((h) => new Date(h.executedAt).getTime() >= todayStart).length;
-  }, [history]);
+  }, [history, now]);
 
   const yesterdayQueries = useMemo(() => {
-    const now = new Date();
     const yesterdayStart = startOfDay(subDays(now, 1)).getTime();
     const todayStart = startOfDay(now).getTime();
     return history.filter((h) => {
       const t = new Date(h.executedAt).getTime();
       return t >= yesterdayStart && t < todayStart;
     }).length;
-  }, [history]);
+  }, [history, now]);
 
   const avgLatency = useMemo(() => {
-    const healthy = fleetHealth.filter((h) => h.status !== "error");
-    if (healthy.length === 0) return 0;
+    const healthy = fleetHealth.filter((h) => h.status !== "error" && h.status !== "not-checked");
+    // null, not 0: no reachable connection means nothing was timed, and 0 ms would rate as excellent.
+    if (healthy.length === 0) return null;
     return Math.round(healthy.reduce((sum, h) => sum + h.latencyMs, 0) / healthy.length);
   }, [fleetHealth]);
 
-  const totalDBSize = useMemo(() => {
+  // Sums the provider's own byte figure instead of re-parsing `databaseSize`'s display string,
+  // which had no "tb" branch and silently counted a 1 TB database as 1 byte. A connection with no
+  // byte figure (provider doesn't publish one, or the connection errored) is excluded from the
+  // sum rather than treated as zero, and the count says so instead of the total going quiet.
+  const { totalDBSize, dbSizeExcluded } = useMemo(() => {
     let totalBytes = 0;
+    let excluded = 0;
     for (const item of fleetHealth) {
-      if (!item.databaseSize) continue;
-      const s = item.databaseSize.toLowerCase();
-      const num = parseFloat(s);
-      if (isNaN(num)) continue;
-      if (s.includes("gb")) totalBytes += num * 1024 * 1024 * 1024;
-      else if (s.includes("mb")) totalBytes += num * 1024 * 1024;
-      else if (s.includes("kb")) totalBytes += num * 1024;
-      else totalBytes += num;
+      if (typeof item.databaseSizeBytes === "number") totalBytes += item.databaseSizeBytes;
+      else excluded++;
     }
-    if (totalBytes === 0) return "0";
-    if (totalBytes >= 1024 * 1024 * 1024) return `${(totalBytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-    if (totalBytes >= 1024 * 1024) return `${(totalBytes / (1024 * 1024)).toFixed(0)} MB`;
-    return `${(totalBytes / 1024).toFixed(0)} KB`;
+    return { totalDBSize: formatBytes(totalBytes), dbSizeExcluded: excluded };
   }, [fleetHealth]);
 
   // Activity feed: merge audit events + recent history
@@ -380,6 +391,7 @@ export function OverviewTab({ user }: OverviewTabProps) {
         todayQueries={todayQueries}
         yesterdayQueries={yesterdayQueries}
         totalDBSize={totalDBSize}
+        dbSizeExcluded={dbSizeExcluded}
         user={user}
         fleetLoading={fleetLoading}
         onRefresh={refreshFleetHealth}
@@ -416,40 +428,67 @@ function HeroStatusBanner({
   todayQueries,
   yesterdayQueries,
   totalDBSize,
+  dbSizeExcluded,
   user,
   fleetLoading,
   onRefresh,
 }: {
-  healthScore: number;
+  healthScore: number | null;
   fleetHealth: FleetHealthItem[];
   connections: DatabaseConnection[];
-  queryStats: { total: number; successRate: number; avgTime: number };
+  queryStats: { total: number; successRate: number | null; avgTime: number };
   todayQueries: number;
   yesterdayQueries: number;
   totalDBSize: string;
+  dbSizeExcluded: number;
   user: AdminUser | null;
   fleetLoading: boolean;
   onRefresh: () => void;
 }) {
-  const animatedScore = useAnimatedCounter(healthScore);
+  const animatedScore = useAnimatedCounter(healthScore ?? 0);
   const animatedConns = useAnimatedCounter(connections.length);
   const animatedQueries = useAnimatedCounter(queryStats.total);
   const animatedToday = useAnimatedCounter(todayQueries);
 
-  const gaugeColor = getGaugeColor(healthScore);
-  const gaugeData = [{ value: healthScore, fill: gaugeColor }];
+  // The unfilled part of the gauge, which is the ring the filled arc is read against.
+  // It was 4% white, so on a light panel there was nothing there and the score read as an
+  // arc floating on its own. Recharts writes `background.fill` straight onto the element
+  // and cannot resolve a CSS token, so the palette is handed to it — the same reason
+  // `chartTooltipStyle` exists a few lines down. `grid` is the palette's recessive line:
+  // it orients without competing, which is exactly what a gauge track is for.
+  const gaugeTrack = chartTheme(useEffectiveTheme()).grid;
+
+  const gaugeColor = healthScore === null ? NEUTRAL_GAUGE_COLOR : getGaugeColor(healthScore);
+  const gaugeData = [{ value: healthScore ?? 0, fill: gaugeColor }];
 
   const healthyCount = fleetHealth.filter((h) => h.status === "healthy").length;
   const degradedCount = fleetHealth.filter((h) => h.status === "degraded").length;
   const errorCount = fleetHealth.filter((h) => h.status === "error").length;
+  const notCheckedCount = fleetHealth.filter((h) => h.status === "not-checked").length;
 
-  const statusText =
-    errorCount > 0 ? "Attention Required" : degradedCount > 0 ? "Degraded Performance" : "All Systems Operational";
+  // No score means every row was `not-checked`: nothing was asked, so the line claims nothing
+  // either way and carries no success styling.
+  const unchecked = healthScore === null;
 
-  const statusColor = errorCount > 0 ? "text-red-400" : degradedCount > 0 ? "text-amber-400" : "text-emerald-400";
+  const statusText = unchecked
+    ? "Not checked"
+    : errorCount > 0
+      ? "Attention Required"
+      : degradedCount > 0
+        ? "Degraded Performance"
+        : "All Systems Operational";
 
-  const statusGlow =
-    errorCount > 0
+  const statusColor = unchecked
+    ? "text-fg-muted"
+    : errorCount > 0
+      ? "text-danger"
+      : degradedCount > 0
+        ? "text-warning"
+        : "text-success";
+
+  const statusGlow = unchecked
+    ? ""
+    : errorCount > 0
       ? "shadow-[0_0_20px_rgba(239,68,68,0.15)]"
       : degradedCount > 0
         ? "shadow-[0_0_20px_rgba(245,158,11,0.15)]"
@@ -463,8 +502,8 @@ function HeroStatusBanner({
         className={`relative overflow-hidden rounded-2xl border border-hairline bg-gradient-to-br from-panel via-surface to-panel p-6 ${statusGlow}`}
       >
         {/* Decorative blur orbs */}
-        <div className="absolute top-0 left-1/4 w-64 h-64 bg-blue-500/5 rounded-full blur-3xl pointer-events-none" />
-        <div className="absolute bottom-0 right-1/4 w-48 h-48 bg-emerald-500/5 rounded-full blur-3xl pointer-events-none" />
+        <div className="absolute top-0 left-1/4 w-64 h-64 bg-brand-tint/5 rounded-full blur-3xl pointer-events-none" />
+        <div className="absolute bottom-0 right-1/4 w-48 h-48 bg-success-tint/5 rounded-full blur-3xl pointer-events-none" />
 
         <div className="relative flex flex-col md:flex-row gap-6 items-center">
           {/*
@@ -487,7 +526,7 @@ function HeroStatusBanner({
                   startAngle={90}
                   endAngle={-270}
                 >
-                  <RadialBar dataKey="value" cornerRadius={6} background={{ fill: "rgba(255,255,255,0.04)" }} />
+                  <RadialBar dataKey="value" cornerRadius={6} background={{ fill: gaugeTrack }} />
                 </RadialBarChart>
               </ResponsiveContainer>
             </div>
@@ -495,18 +534,18 @@ function HeroStatusBanner({
                 so the badge's strip does not pull the reading off centre. */}
             <div className="absolute inset-x-0 top-0 h-[160px] flex flex-col items-center justify-center">
               <span className="text-3xl font-bold tabular-nums" style={{ color: gaugeColor }}>
-                {animatedScore}%
+                {healthScore === null ? "N/A" : `${animatedScore}%`}
               </span>
               <span className="text-xs text-fg-muted uppercase tracking-wider">Health</span>
             </div>
             {/* LIVE badge — in the padding below the ring, clear of the stroke. */}
             <div className="absolute bottom-0 left-1/2 -translate-x-1/2 flex items-center gap-1.5">
               <motion.div
-                className="w-2 h-2 rounded-full bg-emerald-500"
+                className="w-2 h-2 rounded-full bg-success-tint"
                 animate={{ scale: [1, 1.05, 1], opacity: [0.7, 1, 0.7] }}
                 transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
               />
-              <span className="text-[0.625rem] font-bold text-emerald-400 uppercase tracking-widest">Live</span>
+              <span className="text-[0.625rem] font-bold text-success uppercase tracking-widest">Live</span>
             </div>
           </div>
 
@@ -518,18 +557,23 @@ function HeroStatusBanner({
                 <span className={`text-sm font-bold ${statusColor}`}>{statusText}</span>
                 <div className="flex gap-1.5 text-xs">
                   {healthyCount > 0 && (
-                    <Badge variant="outline" className="border-emerald-500/30 text-emerald-400 h-5 text-[0.625rem]">
+                    <Badge variant="outline" className="border-success-tint/30 text-success h-5 text-[0.625rem]">
                       {healthyCount} healthy
                     </Badge>
                   )}
                   {degradedCount > 0 && (
-                    <Badge variant="outline" className="border-amber-500/30 text-amber-400 h-5 text-[0.625rem]">
+                    <Badge variant="outline" className="border-warning-tint/30 text-warning h-5 text-[0.625rem]">
                       {degradedCount} degraded
                     </Badge>
                   )}
                   {errorCount > 0 && (
-                    <Badge variant="outline" className="border-red-500/30 text-red-400 h-5 text-[0.625rem]">
-                      {errorCount} error
+                    <Badge variant="outline" className="border-danger-tint/30 text-danger h-5 text-[0.625rem]">
+                      {errorCount} error{errorCount === 1 ? "" : "s"}
+                    </Badge>
+                  )}
+                  {notCheckedCount > 0 && (
+                    <Badge variant="outline" className="border-hairline-strong text-fg-muted h-5 text-[0.625rem]">
+                      {notCheckedCount} not checked
                     </Badge>
                   )}
                 </div>
@@ -555,21 +599,21 @@ function HeroStatusBanner({
 
             {/* Counter Cards */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-              <CounterCard icon={Link2} label="Connections" value={animatedConns} suffix="" color="text-blue-400" />
+              <CounterCard icon={Link2} label="Connections" value={animatedConns} suffix="" color="text-hue-blue" />
               <CounterCard
                 icon={Zap}
                 label="Total Queries"
                 value={animatedQueries}
                 suffix=""
-                color="text-purple-400"
+                color="text-hue-purple"
                 formatValue={formatNumber}
               />
               <CounterCard
                 icon={HardDrive}
                 label="DB Size"
                 value={totalDBSize}
-                suffix=""
-                color="text-emerald-400"
+                suffix={dbSizeExcluded > 0 ? `(${dbSizeExcluded} excluded)` : ""}
+                color="text-hue-emerald"
                 isString
               />
               <CounterCard
@@ -577,7 +621,7 @@ function HeroStatusBanner({
                 label="Today"
                 value={animatedToday}
                 suffix=""
-                color="text-amber-400"
+                color="text-hue-amber"
                 trend={queryTrend}
               />
             </div>
@@ -620,7 +664,7 @@ function CounterCard({
         {suffix && <span className="text-xs text-fg-muted">{suffix}</span>}
       </div>
       {trend !== undefined && trend !== 0 && (
-        <div className={`flex items-center gap-0.5 mt-1 text-xs ${trend > 0 ? "text-emerald-400" : "text-red-400"}`}>
+        <div className={`flex items-center gap-0.5 mt-1 text-xs ${trend > 0 ? "text-success" : "text-danger"}`}>
           {trend > 0 ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
           <span>
             {trend > 0 ? "+" : ""}
@@ -649,24 +693,32 @@ function FleetHealthSection({
     switch (status) {
       case "healthy":
         return {
-          dot: "bg-emerald-500",
-          border: "border-emerald-500/20 hover:border-emerald-500/40",
+          dot: "bg-success-tint",
+          border: "border-success-tint/20 hover:border-success-tint/40",
           glow: "hover:shadow-[0_0_30px_rgba(16,185,129,0.08)]",
           gradient: "from-emerald-500/60 via-emerald-400/40",
           latencyColor: "#10b981",
         };
       case "degraded":
         return {
-          dot: "bg-amber-500",
-          border: "border-amber-500/20 hover:border-amber-500/40",
+          dot: "bg-warning-tint",
+          border: "border-warning-tint/20 hover:border-warning-tint/40",
           glow: "hover:shadow-[0_0_30px_rgba(245,158,11,0.08)]",
           gradient: "from-amber-500/60 via-amber-400/40",
           latencyColor: "#f59e0b",
         };
+      case "not-checked":
+        return {
+          dot: "bg-fg-subtle",
+          border: "border-hairline hover:border-hairline-strong",
+          glow: "",
+          gradient: "from-transparent via-transparent",
+          latencyColor: "transparent",
+        };
       default:
         return {
-          dot: "bg-red-500",
-          border: "border-red-500/20 hover:border-red-500/40",
+          dot: "bg-danger-tint",
+          border: "border-danger-tint/20 hover:border-danger-tint/40",
           glow: "hover:shadow-[0_0_30px_rgba(239,68,68,0.08)]",
           gradient: "from-red-500/60 via-red-400/40",
           latencyColor: "#ef4444",
@@ -677,7 +729,7 @@ function FleetHealthSection({
   return (
     <motion.div variants={itemVariants}>
       <div className="flex items-center gap-2 mb-3">
-        <Radio className="h-4 w-4 text-blue-400" />
+        <Radio className="h-4 w-4 text-brand" />
         <h2 className="text-sm font-bold text-fg-secondary">Fleet Status</h2>
         <span className="text-xs text-fg-subtle">
           {fleetHealth.length} endpoint{fleetHealth.length !== 1 ? "s" : ""}
@@ -710,7 +762,7 @@ function FleetHealthSection({
             return (
               <motion.a
                 key={item.connectionId}
-                href="/admin/monitoring"
+                href={withBasePath("/admin/monitoring")}
                 variants={itemVariants}
                 whileHover={{ scale: 1.02, y: -2 }}
                 className={`group relative rounded-xl border-2 ${colors.border} bg-panel p-4 transition-all duration-200 hover:bg-fill ${colors.glow} cursor-pointer block overflow-hidden`}
@@ -761,7 +813,11 @@ function FleetHealthSection({
 
                 <div className="flex items-center gap-3 text-xs text-fg-muted">
                   <span className="font-mono text-fg-tertiary">
-                    {item.status === "error" ? "timeout" : `${item.latencyMs}ms`}
+                    {item.status === "error"
+                      ? "timeout"
+                      : item.status === "not-checked"
+                        ? "not checked"
+                        : `${item.latencyMs}ms`}
                   </span>
                   {item.databaseSize && (
                     <>
@@ -777,7 +833,12 @@ function FleetHealthSection({
                   )}
                 </div>
 
-                {item.error && <div className="text-red-400 text-xs truncate mt-1.5">{item.error}</div>}
+                {item.error && <div className="text-danger text-xs truncate mt-1.5">{item.error}</div>}
+                {item.status === "not-checked" && (
+                  <div className="text-fg-muted text-xs mt-1.5">
+                    Not checked: this connection resumes billed compute, so Studio does not poll it.
+                  </div>
+                )}
               </motion.a>
             );
           })}
@@ -796,33 +857,40 @@ function KeyMetricsSection({
   todayQueries,
   yesterdayQueries,
 }: {
-  queryStats: { total: number; successRate: number; avgTime: number };
-  healthScore: number;
-  avgLatency: number;
+  queryStats: { total: number; successRate: number | null; avgTime: number };
+  healthScore: number | null;
+  avgLatency: number | null;
   todayQueries: number;
   yesterdayQueries: number;
 }) {
   return (
     <motion.div variants={itemVariants}>
       <div className="flex items-center gap-2 mb-3">
-        <Gauge className="h-4 w-4 text-blue-400" />
+        <Gauge className="h-4 w-4 text-brand" />
         <h2 className="text-sm font-bold text-fg-secondary">Key Metrics</h2>
       </div>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <MetricGauge
           label="Query Success"
-          value={queryStats.successRate}
-          unit="%"
-          color={getGaugeColor(queryStats.successRate)}
+          value={queryStats.successRate ?? 0}
+          displayValue={queryStats.successRate === null ? "N/A" : undefined}
+          unit={queryStats.successRate === null ? "" : "%"}
+          color={queryStats.successRate === null ? NEUTRAL_GAUGE_COLOR : getGaugeColor(queryStats.successRate)}
         />
-        <MetricGauge label="Fleet Health" value={healthScore} unit="%" color={getGaugeColor(healthScore)} />
+        <MetricGauge
+          label="Fleet Health"
+          value={healthScore ?? 0}
+          displayValue={healthScore === null ? "N/A" : undefined}
+          unit={healthScore === null ? "" : "%"}
+          color={healthScore === null ? NEUTRAL_GAUGE_COLOR : getGaugeColor(healthScore)}
+        />
         <MetricGauge
           label="Avg Response"
-          value={Math.min(avgLatency, 500)}
-          displayValue={`${avgLatency}`}
-          unit="ms"
+          value={Math.min(avgLatency ?? 0, 500)}
+          displayValue={avgLatency === null ? "N/A" : `${avgLatency}`}
+          unit={avgLatency === null ? "" : "ms"}
           maxValue={500}
-          color={getGaugeColorReverse(avgLatency)}
+          color={avgLatency === null ? NEUTRAL_GAUGE_COLOR : getGaugeColorReverse(avgLatency)}
         />
         <MetricBigNumber
           label="Total Queries"
@@ -853,6 +921,8 @@ function MetricGauge({
   const pct = Math.round((value / maxValue) * 100);
   const animatedValue = useAnimatedCounter(value);
   const gaugeData = [{ value: pct, fill: color }];
+  // See `HeroStatusBanner`: the track has to come from the palette, not from a fixed white.
+  const gaugeTrack = chartTheme(useEffectiveTheme()).grid;
 
   return (
     <div className="rounded-xl border border-hairline bg-fill-subtle p-4 flex flex-col items-center">
@@ -866,7 +936,7 @@ function MetricGauge({
             startAngle={90}
             endAngle={-270}
           >
-            <RadialBar dataKey="value" cornerRadius={4} background={{ fill: "rgba(255,255,255,0.03)" }} />
+            <RadialBar dataKey="value" cornerRadius={4} background={{ fill: gaugeTrack }} />
           </RadialBarChart>
         </ResponsiveContainer>
         <div className="absolute inset-0 flex flex-col items-center justify-center">
@@ -896,13 +966,13 @@ function MetricBigNumber({
 
   return (
     <div className="rounded-xl border border-hairline bg-fill-subtle p-4 flex flex-col items-center justify-center">
-      <div className="p-2 rounded-lg bg-purple-500/10 mb-2">
-        <Icon className="w-5 h-5 text-purple-400" />
+      <div className="p-2 rounded-lg bg-hue-purple-tint/10 mb-2">
+        <Icon className="w-5 h-5 text-hue-purple" />
       </div>
       <span className="text-3xl font-bold text-fg tabular-nums">{formatNumber(animatedValue)}</span>
       <span className="text-xs text-fg-muted mt-1 uppercase tracking-wider">{label}</span>
       {trend !== 0 && (
-        <div className={`flex items-center gap-0.5 mt-1.5 text-xs ${trend > 0 ? "text-emerald-400" : "text-red-400"}`}>
+        <div className={`flex items-center gap-0.5 mt-1.5 text-xs ${trend > 0 ? "text-success" : "text-danger"}`}>
           {trend > 0 ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
           <span>
             {trend > 0 ? "+" : ""}
@@ -931,7 +1001,7 @@ function AnalyticsSection({
         {/* Gradient AreaChart */}
         <div className="rounded-xl border border-hairline bg-panel p-5">
           <h3 className="text-sm font-bold text-fg-secondary mb-4 flex items-center gap-2">
-            <Activity className="h-4 w-4 text-blue-400" />
+            <Activity className="h-4 w-4 text-brand" />
             Query Volume (7 days)
           </h3>
           {queryStats.total === 0 ? (
@@ -987,12 +1057,29 @@ function AnalyticsSection({
 
         {/* Recent Activity Feed */}
         <div className="rounded-xl border border-hairline bg-panel p-5">
-          <h3 className="text-sm font-bold text-fg-secondary mb-4 flex items-center gap-2">
-            <Clock className="h-4 w-4 text-blue-400" />
-            Recent Activity
-          </h3>
+          <div className="mb-4 flex items-center justify-between gap-2">
+            <h3 className="text-sm font-bold text-fg-secondary flex items-center gap-2">
+              <Clock className="h-4 w-4 text-brand" />
+              Recent Activity
+            </h3>
+            {/* Unconditional: the preview cannot show proxy-recorded boundary denials, so the
+                Audit tab's scope disclosure must stay one click away in every feed state. */}
+            <Link
+              href={adminSectionPath("audit")}
+              data-testid="overview-audit-link"
+              className="inline-flex items-center gap-1 text-xs text-fg-subtle hover:text-fg-tertiary transition-colors"
+            >
+              Audit
+              <ArrowRight className="h-3 w-3" aria-hidden="true" />
+            </Link>
+          </div>
           {activityFeed.length === 0 ? (
-            <div className="flex items-center justify-center py-8 text-sm text-fg-subtle">No recent activity.</div>
+            <div
+              data-testid="overview-recent-activity-empty"
+              className="flex items-center justify-center py-8 text-sm text-fg-subtle"
+            >
+              No recent activity here. The Audit tab explains what this feed does not capture.
+            </div>
           ) : (
             <div className="max-h-[260px] overflow-y-auto editor-scrollbar space-y-1">
               <AnimatePresence>
@@ -1018,9 +1105,9 @@ function AnalyticsSection({
                     </div>
                     <div className="flex items-center gap-1.5 flex-shrink-0">
                       {item.status === "success" ? (
-                        <CircleCheck className="w-3 h-3 text-emerald-500" />
+                        <CircleCheck className="w-3 h-3 text-success" />
                       ) : (
-                        <CircleX className="w-3 h-3 text-red-500" />
+                        <CircleX className="w-3 h-3 text-danger" />
                       )}
                       <span className="text-xs text-fg-subtle whitespace-nowrap">{formatRelativeTime(item.time)}</span>
                     </div>
@@ -1045,8 +1132,8 @@ function QuickActionsSection() {
       icon: Wrench,
       href: "/admin/operations",
       gradient: "from-blue-500/20 to-cyan-500/20",
-      iconColor: "text-blue-400",
-      borderColor: "hover:border-blue-500/30",
+      iconColor: "text-hue-blue",
+      borderColor: "hover:border-hue-blue-tint/30",
     },
     {
       label: "Security & Masking",
@@ -1054,8 +1141,8 @@ function QuickActionsSection() {
       icon: Shield,
       href: "/admin/security",
       gradient: "from-emerald-500/20 to-teal-500/20",
-      iconColor: "text-emerald-400",
-      borderColor: "hover:border-emerald-500/30",
+      iconColor: "text-hue-emerald",
+      borderColor: "hover:border-hue-emerald-tint/30",
     },
     {
       label: "Real-time Monitoring",
@@ -1063,22 +1150,22 @@ function QuickActionsSection() {
       icon: Activity,
       href: "/admin/monitoring",
       gradient: "from-purple-500/20 to-pink-500/20",
-      iconColor: "text-purple-400",
-      borderColor: "hover:border-purple-500/30",
+      iconColor: "text-hue-purple",
+      borderColor: "hover:border-hue-purple-tint/30",
     },
   ];
 
   return (
     <motion.div variants={itemVariants}>
       <div className="flex items-center gap-2 mb-3">
-        <Sparkles className="h-4 w-4 text-blue-400" />
+        <Sparkles className="h-4 w-4 text-brand" />
         <h2 className="text-sm font-bold text-fg-secondary">Quick Actions</h2>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         {actions.map((action) => (
           <motion.a
             key={action.label}
-            href={action.href}
+            href={withBasePath(action.href)}
             whileHover={{ scale: 1.02, y: -4 }}
             className={`group relative rounded-xl border border-hairline ${action.borderColor} bg-panel p-5 transition-all duration-200 cursor-pointer block overflow-hidden hover:shadow-[0_0_30px_rgba(59,130,246,0.06)]`}
           >
@@ -1107,12 +1194,31 @@ function QuickActionsSection() {
 
 // ─── Empty State ─────────────────────────────────────────────────────────────
 
+// Keeps the card's second line short: name a handful of engines, not the whole catalog.
+// Picked by hand rather than sliced off registry order, so the seven shown span the product's
+// range (relational, document, key-value, wide-column, search, analytics) instead of reading
+// as "six flavours of SQL" — every id here must still be in EXTERNAL_DATABASE_TYPES.
+export const DB_TYPES_PREVIEW: readonly DatabaseType[] = [
+  "postgres",
+  "mysql",
+  "mongodb",
+  "redis",
+  "cassandra",
+  "elasticsearch",
+  "clickhouse",
+];
+
 function EmptyState() {
+  const previewEngineLabels = DB_TYPES_PREVIEW.map((type) => getDBConfig(type).label);
+  const hiddenEngineCount = EXTERNAL_DATABASE_TYPES.length - DB_TYPES_PREVIEW.length;
+  const dbTypesDescription =
+    previewEngineLabels.join(", ") + (hiddenEngineCount > 0 ? `, +${hiddenEngineCount} more` : "");
+
   const features = [
     {
       icon: Database,
-      label: "7 DB Types",
-      description: "PostgreSQL, MySQL, SQLite, MongoDB, Redis, Oracle, MSSQL",
+      label: `${EXTERNAL_DATABASE_TYPES.length} DB Types`,
+      description: dbTypesDescription,
     },
     {
       icon: Sparkles,
@@ -1130,12 +1236,12 @@ function EmptyState() {
     <div className="relative min-h-[70vh] flex flex-col items-center justify-center px-4">
       {/* Animated breathing orbs */}
       <motion.div
-        className="absolute top-1/4 left-1/3 w-72 h-72 bg-blue-500/5 rounded-full blur-3xl pointer-events-none"
+        className="absolute top-1/4 left-1/3 w-72 h-72 bg-brand-tint/5 rounded-full blur-3xl pointer-events-none"
         animate={{ scale: [1, 1.2, 1], opacity: [0.3, 0.5, 0.3] }}
         transition={{ duration: 8, repeat: Infinity, ease: "easeInOut" }}
       />
       <motion.div
-        className="absolute bottom-1/4 right-1/3 w-56 h-56 bg-emerald-500/5 rounded-full blur-3xl pointer-events-none"
+        className="absolute bottom-1/4 right-1/3 w-56 h-56 bg-success-tint/5 rounded-full blur-3xl pointer-events-none"
         animate={{ scale: [1.2, 1, 1.2], opacity: [0.3, 0.5, 0.3] }}
         transition={{ duration: 8, repeat: Infinity, ease: "easeInOut", delay: 2 }}
       />
@@ -1148,7 +1254,7 @@ function EmptyState() {
       >
         {/* Database icon with pulse glow */}
         <motion.div variants={itemVariants} className="relative mb-6">
-          <div className="absolute inset-0 w-20 h-20 bg-blue-500/20 rounded-full blur-xl" />
+          <div className="absolute inset-0 w-20 h-20 bg-brand-tint/20 rounded-full blur-xl" />
           <motion.div
             className="relative p-5 rounded-2xl border border-hairline-strong bg-panel"
             animate={{
@@ -1160,7 +1266,7 @@ function EmptyState() {
             }}
             transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
           >
-            <Database className="w-10 h-10 text-blue-400" />
+            <Database className="w-10 h-10 text-brand" />
           </motion.div>
         </motion.div>
 
@@ -1182,8 +1288,8 @@ function EmptyState() {
               variants={itemVariants}
               className="rounded-xl border border-hairline bg-fill-subtle p-4 text-center"
             >
-              <div className="p-2 rounded-lg bg-blue-500/10 w-fit mx-auto mb-2">
-                <f.icon className="w-5 h-5 text-blue-400" />
+              <div className="p-2 rounded-lg bg-brand-tint/10 w-fit mx-auto mb-2">
+                <f.icon className="w-5 h-5 text-brand" />
               </div>
               <div className="text-sm font-bold text-fg mb-1">{f.label}</div>
               <div className="text-xs text-fg-muted">{f.description}</div>
@@ -1195,7 +1301,7 @@ function EmptyState() {
         <motion.div variants={itemVariants}>
           <Button
             asChild
-            className="bg-blue-600 hover:bg-blue-500 text-white px-6 py-2.5 shadow-[0_0_30px_rgba(59,130,246,0.3)] hover:shadow-[0_0_40px_rgba(59,130,246,0.4)] transition-all"
+            className="bg-brand-solid hover:bg-brand-solid-hover text-white px-6 py-2.5 shadow-[0_0_30px_rgba(59,130,246,0.3)] hover:shadow-[0_0_40px_rgba(59,130,246,0.4)] transition-all"
           >
             <Link href="/">Connect Your First Database</Link>
           </Button>

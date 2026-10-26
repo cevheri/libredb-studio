@@ -22,7 +22,10 @@ class MockLLMError extends Error {
   }
 }
 class MockLLMConfigError extends MockLLMError {
-  constructor(msg: string) {
+  constructor(
+    msg: string,
+    public readonly reason?: "missing_credentials",
+  ) {
     super(msg);
     this.name = "LLMConfigError";
   }
@@ -54,7 +57,7 @@ class MockLLMStreamError extends MockLLMError {
 
 // ─── Mock @/lib/llm BEFORE importing the route ─────────────────────────────
 
-const mockStream = mock(async () => createMockStream());
+const mockStream = mock<(options: { signal?: AbortSignal }) => Promise<ReadableStream>>(async () => createMockStream());
 const mockProvider = { stream: mockStream };
 const mockCreateLLMProvider = mock(async () => mockProvider);
 
@@ -74,6 +77,14 @@ mock.module("@/lib/llm/types", () => ({
   LLMRateLimitError: MockLLMRateLimitError,
   LLMSafetyError: MockLLMSafetyError,
   LLMStreamError: MockLLMStreamError,
+  /*
+    Same whole-module mock requirement: `errors.ts` imports `isContextLengthError`
+    and route handlers import `MAX_SCHEMA_CONTEXT_CHARS`.
+  */
+  isContextLengthError: (error: unknown): boolean =>
+    (error instanceof MockLLMStreamError || error instanceof Error) &&
+    error.message.includes("exceeds the available context size"),
+  MAX_SCHEMA_CONTEXT_CHARS: 30_000,
 }));
 
 const mockGetSession = mock(
@@ -82,11 +93,28 @@ const mockGetSession = mock(
 
 mock.module("@/lib/auth", () => ({
   getSession: mockGetSession,
+  readSession: mock(async () => {
+    const s = await mockGetSession();
+    return s ? { kind: "authenticated", session: s } : { kind: "anonymous" };
+  }),
   signJWT: mock(async () => "mock-token"),
   verifyJWT: mock(async () => null),
   login: mock(async () => {}),
   logout: mock(async () => {}),
 }));
+
+// The route's deadline, shortened so a test can outlast it. The real value is pinned in
+// tests/unit/llm/query-safety-timeouts.test.ts.
+mock.module("@/lib/llm/query-safety", () => ({ QUERY_SAFETY_ROUTE_TIMEOUT_MS: 50 }));
+
+/** A model that never answers: the stream call settles only when its signal aborts. */
+function hangUntilAborted(options: { signal?: AbortSignal }): Promise<ReadableStream> {
+  return new Promise((_resolve, reject) => {
+    // fetch rejects at once for a signal that is already aborted, and so does this stand-in.
+    if (options.signal?.aborted) reject(new MockLLMStreamError("This operation was aborted"));
+    options.signal?.addEventListener("abort", () => reject(new MockLLMStreamError("This operation was aborted")));
+  });
+}
 
 // ─── Import route handler AFTER mocking ─────────────────────────────────────
 
@@ -148,6 +176,20 @@ describe("POST /api/ai/query-safety", () => {
 
     const res = await POST(req as never);
     expect(res.status).toBe(503);
+    expect((await parseResponseJSON<{ code: string }>(res)).code).toBe("LLM_CONFIG");
+  });
+
+  test("missing credentials reach the client as LLM_UNCONFIGURED", async () => {
+    mockCreateLLMProvider.mockImplementation(async () => {
+      throw new MockLLMConfigError("API key is required", "missing_credentials");
+    });
+    const req = createMockRequest("/api/ai/query-safety", {
+      method: "POST",
+      body: { query: "DELETE FROM users" },
+    });
+    const res = await POST(req as never);
+    expect(res.status).toBe(503);
+    expect((await parseResponseJSON<{ code: string }>(res)).code).toBe("LLM_UNCONFIGURED");
   });
 
   test("returns 401 on LLMAuthError", async () => {
@@ -221,5 +263,55 @@ describe("POST /api/ai/query-safety", () => {
 
     const data = await parseResponseJSON<{ error: string }>(res);
     expect(data.error).toBe("Unexpected");
+  });
+
+  // A model that is slow, busy or hung used to hold this request open for as long as it took, with no
+  // bound at all; the dialog in front of it waited the same way.
+  test("a model that does not answer ends in a 504 at the route's deadline", async () => {
+    mockStream.mockImplementation(hangUntilAborted);
+    const req = createMockRequest("/api/ai/query-safety", {
+      method: "POST",
+      body: { query: "UPDATE users SET role = 'admin'" },
+    });
+
+    const res = await POST(req as never);
+    expect(res.status).toBe(504);
+    const data = await parseResponseJSON<{ error: string; code: string }>(res);
+    expect(data.code).toBe("TIMEOUT_ERROR");
+    expect(data.error).toBe("The AI safety analysis did not finish in time.");
+  });
+
+  test("the provider is handed a signal that the deadline aborts", async () => {
+    let seen: AbortSignal | undefined;
+    mockStream.mockImplementation(async (options: { signal?: AbortSignal }) => {
+      seen = options.signal;
+      return createMockStream();
+    });
+    const req = createMockRequest("/api/ai/query-safety", {
+      method: "POST",
+      body: { query: "DELETE FROM users" },
+    });
+
+    const res = await POST(req as never);
+    expect(res.status).toBe(200);
+    expect(seen?.aborted).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(seen?.aborted).toBe(true);
+  });
+
+  test("a caller that goes away aborts the provider's request too, and is not reported as a timeout", async () => {
+    mockStream.mockImplementation(hangUntilAborted);
+    const caller = new AbortController();
+    const req = new Request("http://localhost:3000/api/ai/query-safety", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ query: "DELETE FROM users" }),
+      signal: caller.signal,
+    });
+
+    const pending = POST(req as never);
+    caller.abort();
+    const res = await pending;
+    expect(res.status).not.toBe(504);
   });
 });

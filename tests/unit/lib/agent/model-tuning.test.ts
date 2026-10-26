@@ -24,6 +24,7 @@ import { BASELINE_NOTICES } from "@/lib/agent/models/notices";
 import {
   DEFAULT_PLAN_STATEMENT_RETRIES,
   DEFAULT_PRESENT_REMINDER_LIMIT,
+  DEFAULT_COMPARE_HOLD_LIMIT,
   DEFAULT_VERDICT_HOLD_LIMIT,
   DEFAULT_REFUSAL_EXAMPLES,
   DEFAULT_REPORT_REMINDER_LIMIT,
@@ -68,6 +69,7 @@ const document = (overrides: Record<string, unknown> = {}): Record<string, unkno
       planStatementRetries: 0,
       presentReminderLimit: 1,
       verdictHoldLimit: 2,
+      compareHoldLimit: 1,
       retryEmptyTurn: false,
       retryUnreadStop: false,
       suppressPlanReasoning: false,
@@ -90,10 +92,22 @@ afterEach(() => {
   resetTuning();
 });
 
+/**
+ * How many models the shipped document holds, derived rather than typed.
+ *
+ * It was written as the literal 35 in three places, and every one of them had to be edited by hand
+ * the moment a model landed - which is a test failing for arithmetic rather than for a defect.
+ * Derived here, the assertions keep the meaning they were written for (an operator document that
+ * cannot be read must leave the SHIPPED roster standing, whole) without pinning a number that is
+ * expected to grow. `model-roster-docs.test.ts` is what guards the count itself, against the
+ * sentences in `docs/llms/`.
+ */
+const SHIPPED_MODELS = Object.keys(parseTuning(bundled, "roster").models).length;
+
 describe("the document Studio ships with", () => {
   test("passes its own contract", () => {
     const tuning = parseTuning(bundled, "test");
-    expect(Object.keys(tuning.models)).toHaveLength(22);
+    expect(Object.keys(tuning.models)).toHaveLength(SHIPPED_MODELS);
   });
 
   test("argues for every value it changed", () => {
@@ -122,6 +136,7 @@ describe("the document Studio ships with", () => {
       planStatementRetries: DEFAULT_PLAN_STATEMENT_RETRIES,
       presentReminderLimit: DEFAULT_PRESENT_REMINDER_LIMIT,
       verdictHoldLimit: DEFAULT_VERDICT_HOLD_LIMIT,
+      compareHoldLimit: DEFAULT_COMPARE_HOLD_LIMIT,
       retryEmptyTurn: DEFAULT_RETRY_EMPTY_TURN,
       retryUnreadStop: DEFAULT_RETRY_UNREAD_STOP,
       suppressPlanReasoning: DEFAULT_SUPPRESS_PLAN_REASONING,
@@ -237,6 +252,41 @@ describe("what a document from outside Studio is held to instead", () => {
     resetTuning();
     expect(ceilingFor("gemma4:26b")).toBe(DEFAULT_UNREPORTED_CALL_CEILING);
     expect(retriesEmptyTurn("gemma4:26b")).toBe(true);
+  });
+
+  test("an entry may state temperature without topP, suitable for Claude/Anthropic endpoints", () => {
+    const tempOnly = {
+      models: [{ id: "claude-haiku-4-5", measured: "temperature 0 only", settings: { sampling: { temperature: 0 } } }],
+    };
+    const tuning = parseOperatorTuning(document(tempOnly), "test");
+    expect(tuning.models["claude-haiku-4-5"]).toEqual({
+      measured: "temperature 0 only",
+      sampling: { temperature: 0 },
+    });
+  });
+
+  test("an entry may state topP without temperature", () => {
+    const topPOnly = {
+      models: [{ id: "custom-model:7b", measured: "topP 0.9 only", settings: { sampling: { topP: 0.9 } } }],
+    };
+    const tuning = parseOperatorTuning(document(topPOnly), "test");
+    expect(tuning.models["custom-model:7b"]).toEqual({
+      measured: "topP 0.9 only",
+      sampling: { topP: 0.9 },
+    });
+  });
+
+  test("an entry may state an empty sampling object for adaptive-thinking models", () => {
+    const emptySampling = {
+      models: [
+        { id: "claude-sonnet-5", measured: "adaptive thinking; no sampling params", settings: { sampling: {} } },
+      ],
+    };
+    const tuning = parseOperatorTuning(document(emptySampling), "test");
+    expect(tuning.models["claude-sonnet-5"]).toEqual({
+      measured: "adaptive thinking; no sampling params",
+      sampling: {},
+    });
   });
 
   test("a key this Studio does not implement is reported rather than refusing the document", () => {
@@ -563,7 +613,7 @@ describe("a document an operator supplies", () => {
     process.env[ENV] = writeDocument("{ not json");
     resetTuning();
     expect(ceilingFor("gemma4:26b")).toBe(10);
-    expect(Object.keys(activeTuning().models)).toHaveLength(22);
+    expect(Object.keys(activeTuning().models)).toHaveLength(SHIPPED_MODELS);
   });
 
   test("reports that it ignored a document, naming the file and the reason", () => {
@@ -717,13 +767,13 @@ describe("a document an operator supplies", () => {
   test("is ignored when it breaks the contract, not partially applied", () => {
     process.env[ENV] = writeDocument(document({ schemaVersion: 99 }));
     resetTuning();
-    expect(Object.keys(activeTuning().models)).toHaveLength(22);
+    expect(Object.keys(activeTuning().models)).toHaveLength(SHIPPED_MODELS);
   });
 
   test("is ignored when the file is not there at all", () => {
     process.env[ENV] = "/nonexistent/models.json";
     resetTuning();
-    expect(Object.keys(activeTuning().models)).toHaveLength(22);
+    expect(Object.keys(activeTuning().models)).toHaveLength(SHIPPED_MODELS);
   });
 
   test("an unset or blank variable is simply no operator document", () => {
@@ -731,7 +781,7 @@ describe("a document an operator supplies", () => {
     // reading it as a path would warn on every boot of an install that configured nothing.
     process.env[ENV] = "   ";
     resetTuning();
-    expect(Object.keys(activeTuning().models)).toHaveLength(22);
+    expect(Object.keys(activeTuning().models)).toHaveLength(SHIPPED_MODELS);
   });
 
   test("is read once, so a run cannot see the table change under it", () => {

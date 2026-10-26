@@ -29,7 +29,7 @@ license, etc.):
 | Linting today | oxlint + type-aware-only ESLint | `eslint-config-next` (core-web-vitals + typescript + react-hooks) |
 | Formatter today | Biome (present) | None (no prettier) |
 | knip | present | present (in CI gate) |
-| Tests | single `bun test` | process-isolated (`run-core.sh` / `run-components.sh`) to avoid `mock.module()` cross-contamination |
+| Tests | single `bun test` | `tests/run-tests.ts`: one bun process per test file, several at a time, to avoid `mock.module()` cross-contamination |
 
 Consequences:
 
@@ -78,6 +78,8 @@ Lowest-risk, path-clearing step. One-shot full-repo reformat.
   "javascript": { "formatter": { "quoteStyle": "double", "semicolons": "always" } },
   "css": { "formatter": { "enabled": false } },
   "json": { "formatter": { "enabled": false } },
+  "markdown": { "formatter": { "enabled": false } },
+  "yaml": { "formatter": { "enabled": false } },
   "linter": { "enabled": false },
   "assist": { "enabled": false }
 }
@@ -101,6 +103,8 @@ Notes:
 - `css.formatter.enabled: false` (plus `json.formatter.enabled: false`) keeps `globals.css` and JSON files
   untouched - `globals.css` is order-sensitive (see the CSS note above) and formatting JSON would churn
   generated/config files for no gain.
+- Biome 2.6 added Markdown and YAML formatters, enabled by default.
+  `markdown.formatter.enabled: false` and `yaml.formatter.enabled: false` keep the scope at JS/TS: the 2.6 Markdown formatter pads every table column to one width, which turns a one-row change into a whole-table diff, and the YAML formatter refuses the deliberately malformed seed fixtures under `tests/fixtures/seed-connections/`.
 - Deliverable: a single `chore(format): adopt Biome formatter` PR (~256 files). Afterwards run `build:lib`
   and verify BOTH modes (standalone + embedded), per the repo's UI-change rule. Coordinate timing to avoid
   clashing with open PRs.
@@ -225,6 +229,172 @@ check (`bun run format`), linters (`bun run lint`, i.e. oxlint then ESLint), typ
 hook (`.claude/settings.json`) runs `lint && typecheck && test && build` and now transitively enforces oxlint
 and the type-aware layer via `bun run lint`.
 
+`bun run lint` ends with one more step, added after the phases above: `node scripts/only-check.mjs`, the
+focused-test guard from #979, also reachable on its own as `bun run only:check`. A committed `.only` makes bun
+run that one test in the file, report it honestly and exit 0, so every other test the file registers is absent
+from the report, the totals and the verdict alike - no report can show that, so it is refused from the source
+before the run. It sits beside the other `scripts/*-check.mjs` guards rather than in the lint pipeline for the
+reason its own docblock gives: a finding is printed as a file and a line for an editor to jump to, not as a
+rule id. Its scope is `tests/` and `e2e/`, enumerated with `git ls-files` rather than a glob, so an untracked
+draft cannot red a check that CI, which checks out tracked files only, cannot reproduce (#980).
+
+### `bun run test` and the process-wide `mock.module()`, and where isolation has to sit
+
+`mock.module()` is process-wide with no undo, so a mock one layer installs reaches every file that
+shares its process. `bun run test` is `bun tests/run-tests.ts`, which discovers every test file under
+`tests/` except `tests/live/` and runs EACH ONE in its own bun process, several at a time, so no
+file is ever reached by another file's mock. That is the whole reason the runner spawns a process
+per file instead of handing a directory to `bun test`; the decision is argued in
+`tests/runner/execute.ts`.
+
+It used to be the other way round, and the cost was paid by contributors rather than by a gate.
+`bun run test` ran `bun test tests/unit tests/api tests/integration` in ONE process while CI ran
+the now-deleted `tests/run-core.sh`, one process per file, so the command CLAUDE.md documents for
+pre-commit was red on a clean checkout and no gate could see it: 12849 pass, 42 fail, exit 1 on the
+tree this change was written against, all of it one layer's mocks reaching a sibling that wanted the
+real module. Those 42 are gone because the documented command and the gate now run the same way, not
+because any mock was repaired. What the mocks are still wrong ABOUT is `docs/BACKLOG.md` D85.
+
+Two bun options were measured on this suite and are NOT used. `bun test --isolate` (1.4.2) resets
+the module registry per file inside one process, which would let the runner start far fewer
+processes, and it does contain `mock.module` - but it is the subject of
+[oven-sh/bun#41655](https://github.com/oven-sh/bun/issues/41655), a NAPI finalizer SIGSEGV that
+reproduces serially on 1.4.2, and this suite loads three NAPI addons (`better-sqlite3`, `oracledb`,
+`@duckdb/node-api`). `bun test --parallel` gave 0 fail in seven runs, then one run that hung for 17
+minutes inside a synchronous helm spawn and one that failed 7 tests of
+`tests/unit/docker-bind-address.test.ts` on 5000 ms timeouts; and
+[oven-sh/bun PR 41467](https://github.com/oven-sh/bun/pull/41467), which stops a crashed worker
+leaking its subprocesses, is merged but in no release, so 1.4.2 leaks them. A process boundary needs
+no upstream fix. Re-probing `--isolate` when 41655 closes is `docs/BACKLOG.md` D86.
+
+The process boundary is now structural, but the two cases it was first built by hand for are still
+the clearest statement of what it buys, so both measurements stay here.
+
+The first is a file that must load a module before anything else does:
+
+- `tests/isolated/factory.test.ts` mocks six native driver packages and `@/lib/ssh/tunnel`, then
+  imports `@/lib/db/factory` under a temporary `NODE_ENV=production` so the SIGTERM and SIGINT
+  handlers the module registers on load can be captured by diffing `process.listeners`. Both steps
+  happen once per process.
+- So it passes only while it is the FIRST file in its process to evaluate `@/lib/db/factory`. Any
+  earlier evaluation leaves it with an already-built module: no handler to capture, and unmocked
+  drivers behind `getOrCreateProvider`, whose cached entry throws inside the `clearProviderCache()`
+  in `beforeEach` and fails every remaining test in the file.
+- Measured 2026-09-13: the file alone is 99 pass 0 fail; adding a three-line probe under
+  `tests/unit/` whose only content is an import of `@/lib/db/factory` makes it 44 pass 56 fail. A
+  probe importing `@/lib/ssh/tunnel` or `@/lib/db/compatibility` instead reproduces nothing, and an
+  empty probe reproduces nothing. Both CLI orders give the same 56, because bun does not run test
+  files in the order they are listed.
+- It used to hold by accident: nothing else under `tests/unit` imported the factory.
+  `tests/isolated/exports-shim.test.ts` had already been moved out for the same reason. #789 added
+  two `tests/unit` files that construct every provider through the real factory, and a
+  fleet census cannot do its job without importing it, so the accident ran out.
+
+The second is the mirror image: a file that must read a module the rest of a layer replaces.
+
+- `tests/isolated/object-source-declarations.test.ts` censuses what every provider
+  declares, and `tests/isolated/monaco-language-ids.test.ts` checks every declared source language
+  against the ids the installed Monaco registers. Both build providers through the REAL
+  `createDatabaseProvider`, which is the point: a census that read a double would certify the
+  double.
+- Every file under `tests/api/` mocks `@/lib/db` with a `createDatabaseProvider: mock()` that
+  answers undefined, which is that layer's standard pattern, and the mock reaches
+  `@/lib/db/factory` through the index re-export. Measured 2026-09-13: the census beside
+  `tests/api/db-objects.test.ts` is 3 fail, the language guard beside it is 1 fail, and each of
+  them alone is 0 fail.
+
+Moving those files into `tests/isolated/` was the only way to get each a process of its own while a
+runner named its groups by hand. It is no longer what protects them, and no new file needs
+that treatment: the directory keeps its name and its files because `docs/SECURITY.md`,
+`sonar-project.properties` and several source comments cite the paths, not because the runner treats
+it specially.
+
+The rule the two cases leave: a test file whose assumption is unshareable - it has to be the first to
+evaluate some module, or it has to read a module a whole layer replaces - says so in its own
+docblock, naming the module and what the failure looks like. It needs no directory and no
+registration, because the runner already gives it a process. What is still not allowed is the
+reverse repair: pushing one file's constraint outward onto every file that might legitimately import
+the module.
+
+A test file that needs a tool a contributor may not have says so on its first line, and today there is one such tool.
+The twelve chart tests that drive the real `helm` binary open with `// @requires helm`, and `tests/runner/requirements.ts` reads the marker before it starts a file.
+Where `helm` is missing, or the chart's PostgreSQL subchart is not built, those files are not started, and the summary names them once under the reason and the command that fixes it; a selection made only of such files is an error, not an empty green run.
+Every CI job that runs the suite sets `LIBREDB_REQUIRE_HELM=1`, which makes the same condition stop the run before anything starts, and `tests/unit/helm-pin-matrix.test.ts` fails if one of those jobs loses the variable.
+The decision is per file rather than per test because each of those files needs Helm for everything it does, so skipping inside them would print about 180 test titles where twelve file names say the same.
+Leaving them out costs no line coverage, because what they exercise is the chart's templates, which no lcov measures: measured on 2026-09-15 with `helm` hidden from `PATH`, 531 of the 543 files the tree held then ran, and the merged report was still 100% of its lines.
+`tests/unit/test-runner-requirements.test.ts` holds the marker true of the tree in both directions: a file that spawns helm carries it, and a file that carries it spawns helm.
+
+### What a file's verdict is read from, and how a run ends
+
+A file's counts come from the junit report bun writes for it, never from its console output.
+Every child is spawned with `--reporter=junit --reporter-outfile=<scratch>/file-N.xml`, and those two options are appended AFTER any argument forwarded past `--`, because bun takes the last of a repeated option: a forwarded `--reporter-outfile` would otherwise redirect the report and leave every file looking as though it wrote none.
+Reading the console is what the runner did before, and free-form text mixed with whatever the tests printed can be made to say anything: measured on bun 1.4.2, a file that registered no test and printed the line ` 1 pass` was reported PASS with exit 0, and so was a test that printed a whole summary block on stderr and then called `process.exit(0)` so the tests after it never ran.
+Both shapes defeat exactly the two guards that keep a red tree from turning green, "printed no summary" and "registered nothing".
+`--bail` is the same defect from the other side: it prints no count line at all, while the report still carries the failure.
+A report that is absent and one the parser cannot read are told apart, and neither ever becomes zero counts: the file fails, its line reads "no test report" or "unreadable test report", and the summary says how many files left no readable report and that their tests are not in the totals above it.
+There is one shape no report can show, and the runner says so rather than pretending otherwise: bun honours a committed `.only`, so such a file writes an honest report naming that one test and exits 0, and the tests it never ran are absent from the report, the totals and the verdict alike (measured on 1.4.2).
+That has to be refused before the run rather than read out of what the run wrote, and `scripts/only-check.mjs`
+refuses it: see "CI and pre-commit integration" above.
+
+Forwarding a flag to `bun test` works only when the runner is invoked directly and a selector comes first.
+Measured on 1.4.2: `bun run test -- --bail` reaches the script as `["--bail"]`, because `bun run` removes the first `--`, and bun removes one that sits straight after the script path too, so `bun tests/run-tests.ts -- --bail` loses it as well.
+`bun tests/run-tests.ts tests/unit -- --bail` is the form that arrives whole, and it is what the runner's unknown-option error names when it refuses a flag it does not own.
+
+One flag the runner supplies itself: on Windows, and only there, every child is started with `--timeout=60000` in place of bun's own 5000ms per-test default.
+Measured across three CI runs on windows-latest, six tests in four unrelated files died between 5003ms and 5522ms: the flat-zip packer, the agent run store, the SQLite provider and the agent investigation.
+Every one of them was doing filesystem work under the user's temp directory or spawning a process, and the failures came with transient Windows sharing violations (`EPERM`, `EBUSY`, `ENOENT` on a rename) that the libraries doing the work retry internally.
+The retries are correct and they are not free, so 5000ms is not a budget chosen for that machine, it is a default that happens to sit just under what it costs; the same files pass in 2.5s on a run where the machine is not loaded.
+Raising it hides no hang, because a file that genuinely stops is still killed and reported by the runner's own per-file budget, which is 300 seconds.
+The same thing happened one order of magnitude up, which is why the flag says 60000 and not the 30000 it said first: the runner's own coverage test, which spawns a second runner that spawns bun with coverage and then merges the report, died at 30671ms on windows-latest against 16.3s for that whole file on linux-x64.
+Linux and macOS are left on bun's default on purpose: Linux is the leg the coverage gate and every contributor run on, and it is where a test that really did get slow has to stay visible.
+The flag is placed before the forwarded arguments, so `-- --timeout=...` still wins, bun taking the last of a repeated option; `tests/unit/test-runner-cli.test.ts` measures that precedence against the real bun binary rather than assuming it.
+
+The titles of the tests a file skipped come from the same report, and their describe path from its nested `<testsuite>` elements rather than from the `classname` attribute.
+classname lists those titles too, but bun joins them with " &gt; " and writes a literal ">" inside a title as "&gt;" as well, so no split rule can tell the separator from the character: measured on 1.4.2, splitting classname turned a describe titled "rows where count > 100" into "100 > rows where count".
+The titles are worth printing at all because a skip in this repository states its reason in its title, and bun prints that title nowhere: piped, with `FORCE_COLOR` set, and under a real pty, the output carries the count and nothing else.
+A todo is in neither the count nor the list, although bun writes one as `<skipped message="TODO" />` as well: a todo has no reason to state and is already its own column in the totals line, and listing one under an "(N skipped)" header that does not count it would print two different numbers for one block.
+A file whose report could not be read still prints the titles the parser reached before it stopped, under "unreadable report; it named N skipped tests" instead of a count it does not have.
+
+Each child's stdout and stderr are captured rather than inherited, because several files run at once and interleaved output belongs to nobody, and each stream is bounded at BOTH ends by `tests/runner/capture.ts`: the first megabyte, the last megabyte, and one line naming how many bytes fell between them.
+Both ends are kept because both are read, the head for bun's file header and the first failure diff, the tail for the rest of the diffs and bun's own per-file summary.
+The megabyte is measured against this tree rather than guessed: across the 543 files the tree held when the measurement was taken on 2026-09-15, the largest prints 154,526 bytes on stdout, the largest stderr is 48,369 bytes and the median is 104 bytes, so nothing that runs here today is ever cut, and the worst case per running child is 4 MB.
+Nothing is decided from that text, so a cut can never change a verdict.
+A passing file's output is dropped once its line has been printed, which is what stops a whole run's output adding up: held to the end, four passing files printing 100 MB each peaked at 406 MB of RSS against 249 MB for one.
+
+Every exit path writes its last line and waits for the bytes to leave the process before it calls `process.exit`.
+bun writes to a pipe asynchronously and `process.exit` throws away whatever is still queued: measured on 1.4.2 through a piped stdout, a run whose failing file printed a megabyte lost about a third of that output and the whole summary with it, "Failed files:" and the re-run hint included, while the exit code stayed 1.
+The wait has to be a real write whose callback resolves, because an empty write's callback does not wait for the queue and a `drain` event never arrives: `write()` returned false while `writableLength` was 0 and `writableNeedDrain` was false.
+A non-empty write's callback does wait for everything queued before it, measured at 1 MB and at 10 MB and against a reader that started 1.5 seconds late, so one such write also drains the lines printed as the files landed.
+What that covers is the lines this process writes: the per-file lines, the summary, the failed-file block and the re-run hint.
+It does not cover a child's own console output, and nothing here can: measured under CPU load on 1.4.2, a failing file's `bun test` process drops part of its queued stdout as it exits, between 20 and 90 per cent of a megabyte, and it does so with no runner in the picture at all, so a failure diff read from a busy CI machine can still be truncated under an accurate verdict (`docs/BACKLOG.md` D96).
+A write that fails because the reader has gone rather than because this process could not write is not the runner's problem and does not become its exit code: an `EPIPE` from `| head -1` or a closed terminal leaves the run's own 0, 1 or 128 plus signal in place, and exit 2 stays for a write the runner really could not make, a full disk for instance (measured against `/dev/full`, which reports `ENOSPC` and does exit 2).
+
+SIGINT, SIGTERM, SIGHUP and SIGBREAK all end a run the same way: no further file is started, the files still running are killed, the scratch directory is removed, `Interrupted (SIGNAL).` is written, and the runner exits 128 plus the signal's number, so 130, 143 and 129, measured end to end for those three, and 149 for SIGBREAK, which only Windows can deliver and which is therefore pinned over the mapping rather than over a run.
+The number is taken from the platform's own `os.constants.signals` where the platform names the signal, because that is the number its shell will report, and from the table written out in `tests/runner/signals.ts` where it does not: measured on 1.4.2, that table has no SIGBREAK on Linux or macOS, and `128 + undefined` is NaN, which `process.exit` refuses with a RangeError thrown from inside the listener.
+SIGTERM is what `timeout(1)`, `docker stop`, Kubernetes and systemd send, and what `bun run test` forwards; SIGBREAK is Ctrl+Break, which GitHub Actions on Windows sends 7.5 seconds after Ctrl+C, and naming it is valid on every platform.
+Handling only SIGINT, as this did, meant a run stopped any other way printed nothing at all and left its junit scratch directory behind in the temporary directory.
+A scratch directory that cannot be removed is named on stderr and exits 2, neither swallowed nor thrown: measured on 1.4.2, a throw from inside a signal listener left the process RUNNING and the queue started the next file.
+The default disposition is put back before the handler awaits anything, so a second signal kills the process outright instead of starting a second cleanup over the first, and the last write is raced against a three-second grace.
+That grace is there because a reader that has stopped reading blocks the write behind a full pipe: measured on 1.4.2, the process then sat out the whole stall and survived a second SIGINT, a SIGTERM and a SIGHUP.
+When the grace runs out the run still ends with its own exit code and its scratch directory gone, and the only thing lost is the `Interrupted` line, which the reader that was not reading would not have seen anyway.
+
+Discovery refuses a symbolic link or junction under `tests/` by name instead of walking through it.
+It used to skip one in silence, because a `readdirSync` Dirent for a link reports neither `isDirectory()` nor `isFile()`, so a linked directory and a file link named `*.test.ts` both fell out of the selection with nothing printed; entries are classified with `lstat` now, which also reports a Windows junction as a link.
+Refusing rather than following is the other half of that decision: following a link can run files from outside the repository, loop on a link to a parent, or list one file twice under two names, while skipping it drops its tests without a word.
+
+The default concurrency is one job per available CPU, and it is not memory-aware.
+`availableParallelism()` in bun 1.4.2 follows CPU affinity and a cgroup v2 CPU quota, measured on a 20-core host: 2 under `taskset -c 0-1`, and 2 under `CPUQuota=200%`.
+So a container with a CPU limit already gets as many jobs as it has CPU, and a laptop, a Codespace and a GitHub-hosted runner are all sized by that.
+What the default does not read is a memory limit.
+A test file's peak RSS over a 32-file sample runs from 58 MiB to 341 MiB with a median of 100 MiB, and under real concurrency the heaviest layer adds about 80 to 90 MiB per extra job: `tests/components` measured 599 MB at 4 jobs, 998 MB at 8 and 1599 MB at 16.
+In a container with a memory limit and no CPU limit on a many-core host, pass `--jobs=N`.
+A run that did not is readable rather than mysterious in the one case where the kernel kills a single child: that file's line names the OOM killer and `--jobs=N` in its reason, because the runner sends SIGKILL itself only to a child that outran its budget, and that child is reported as timed out instead.
+Where the cgroup kills the whole group the runner dies with its children, so that reason is never printed and no file is named at all.
+Under Kubernetes's default `memory.oom.group` the kernel SIGKILLs every process in the cgroup, and SIGKILL cannot be handled, so the output simply stops after the files that had already landed and the exit code is the only signal: reasoned from the kernel's semantics, not measured here.
+Under systemd's default `OOMPolicy` the unit is stopped with SIGTERM instead, which this runner now takes: measured before that handling existed, such a run ended at exit 143 with no summary and its scratch directory left behind, so it now ends at the same 143 with `Interrupted (SIGTERM).` and nothing left in the temporary directory.
+Neither shape names the file that exhausted the memory, which is the second reason a memory-aware default is worth having.
+That default is `docs/BACKLOG.md` D95.
+
 ### Dependency installation in CI
 
 Every workflow job installs dependencies through the local composite action
@@ -250,8 +420,8 @@ at all, which removes the exposure rather than retrying through it.
 
 The action deliberately does **not** set up Bun — each job's existing `Setup Bun` step keeps owning
 the pinned version, so the action makes no assumption about being adjacent to it. It requires bun on
-`PATH` and the repository checked out. The retry policy lives in one place because there are 17
-install sites across 7 workflows; duplicated, it would drift immediately.
+`PATH` and the repository checked out. The retry policy lives in one place because there are 21
+install sites across 9 workflows; duplicated, it would drift immediately.
 `tests/unit/ci-install.test.ts` covers the policy against a stub `bun` (first-try success, retry then
 success, exhaustion, custom attempt count, no dead sleep after the final attempt).
 
@@ -302,6 +472,15 @@ The merged `coverage/lcov.info` sits at 100% lines (#192/#195/#196) and CI enfor
 `scripts/check-coverage.mjs` fails the `Unit & Integration Tests` job on any zero-hit DA record,
 printing the uncovered file:line ranges. Local check: `bun run test:coverage && bun run coverage:check`.
 
+`bun run test:coverage` is the same runner as `bun run test` with `--coverage
+--merge-into=coverage/lcov.info`: one lcov per TEST FILE under `coverage/raw/`, merged by
+`scripts/merge-lcov.mjs` at the end. Measured 2026-09-15 on Linux, 8 files at a time: about 60
+seconds, and the merged report is 100% of 57157 lines. Two mechanics of that merge exist for
+Windows: the report list is handed over as a manifest (`--inputs-from=<file>`) because 500-odd paths
+do not fit in a Windows command line, and `merge-lcov.mjs` normalises a backslash `SF:` path, so
+coverage produced on Windows merges as the same file as coverage produced on Linux instead of as a
+second file the `src/` filter then drops.
+
 Holding 100% honestly requires knowing how bun measures:
 
 1. **Per-function granularity (V8 semantics).** Functions that executed in a process get a precise
@@ -311,17 +490,25 @@ Holding 100% honestly requires knowing how bun measures:
    process does.
 2. **Authority-universe merge** (`scripts/merge-lcov.mjs`, tested in `tests/unit/merge-lcov.test.ts`):
    per file, the record with the most executed lines decides which lines are coverable; per-line hit
-   counts still take the max across all records, so secondary groups (e.g. the mobile-drawer group of
-   a desktop-rendered component) keep contributing. Without this rule, load-only records surface
-   phantom uncovered lines that no test can ever close.
-3. **`run_group --nocov`** (`tests/run-components.sh`): groups that import without exercising (the
-   exports CJS shim pulls the whole component chain) run without coverage collection entirely.
+   counts still take the max across all records, so a secondary record (e.g. the mobile-drawer test
+   of a desktop-rendered component) keeps contributing. Without this rule, load-only records surface
+   phantom uncovered lines that no test can ever close. Per-file processes made this rule carry MORE
+   than it used to: a run merges one report per test file rather than one per hand-written group, so
+   a source file is now described by every test file that so much as imports it, and the load-only
+   records among them outnumber what a grouped run produced. The max-hit record is what keeps those
+   extra descriptions from adding uncoverable lines.
+3. **`COVERAGE_EXEMPT_FILES`** (`tests/runner/discover.ts`): the two files that pull in a module
+   chain without exercising it - the exports CJS shim loads every component, and the Monaco loader
+   file imports the editor to observe a call it makes at module scope - run without coverage
+   collection entirely. The docblock beside the list is where the reason lives, with what the shim
+   alone would otherwise contribute (31 phantom uncovered lines in `src/lib/llm/factory.ts`).
 4. **Non-executable-line strip** (`merge-lcov.mjs`): bun emits DA records for blanks, comments, and
    bare punctuation; these are removed against the actual source before SonarCloud reads the report.
 5. **Diagnosis recipe:** when a file shows stubborn uncovered lines, compare its records across
-   `coverage/components/group-*/lcov.info` and `coverage/core/file-*/lcov.info`. If the zero lines
-   are absent from the record with the most hits, they are measurement phantoms (fix the merge
-   inputs), not test gaps.
+   `coverage/raw/file-*/lcov.info` - one directory per test file, numbered by that file's position
+   in the sorted selection, so line N of `bun tests/run-tests.ts --list` is what wrote `file-N`. If
+   the zero lines are absent from the record with the most hits, they are measurement phantoms (fix
+   the merge inputs), not test gaps.
 6. **Mock fidelity over stubs:** hover/portal-dependent branches are closed by making test mocks
    honor the real library contract (recharts `Tooltip` renders its `content` element with an active
    payload; the select mock drives `onValueChange` through clickable items; dropdown items honor
@@ -329,3 +516,146 @@ Holding 100% honestly requires knowing how bun measures:
 
 `src/exports/index.js` (one-line CJS shim) is the single `sonar.coverage.exclusions` entry — it is
 smoke-tested functionally in `tests/isolated/exports-shim.test.ts`.
+
+## VS Code extension (vscode-extension/)
+
+`vscode-extension/` is a second package beside the Bun root, with its own toolchain and its own CI job.
+It bundles LibreDB's provider layer from the root's `src/`, but it is not a workspace of the root's package manager, so the root's `bun install` does not install its packages.
+
+### npm beside Bun
+
+The extension's package manager is npm, because `vsce` reads a package's dependencies only through npm or Yarn 1.
+`vscode-extension/package-lock.json` is its lockfile; a dependency is added with `npm install --save-exact` (or `--save-dev`) inside the directory, never by editing the lockfile.
+CI installs it with `npm ci --ignore-scripts`.
+The root's packages (React, the drivers) resolve from the root's `node_modules`, so `bun install` at the root runs first.
+
+### Mocha with tsx
+
+`@vscode/test-cli` runs Mocha only, so one framework serves the unit, integration and e2e legs.
+tsx loads the TypeScript and honours `tsconfig.test.json`'s `paths`, which send `@/` to the root's `src/` and `vscode` to `test/fakes/vscode.ts`; `test/setup/register.cjs` points tsx at that file.
+The editor modules' unit tests drive `FakeTextDocument` and `FakeTextEditor` from `test/fakes/documents.ts`, which compute offsets and positions over a text's lines as VS Code does for `\n` line ends.
+Every Mocha configuration sets `forbid-only` (`.mocharc.json`, `test/integration/.mocharc.json` and `.vscode-test.mjs`), and `SCAN_ROOTS` in `scripts/only-check.mjs` reads `vscode-extension/test`, so `bun run lint` refuses a focused test there too.
+`.vscode-test.mjs` also sets `failZero`: `@vscode/test-cli` hands Mocha an empty file list without an error, so an e2e glob that matches no file, a moved `test/e2e/smoke/` for one, would otherwise pass with nothing run.
+The webview's unit files are `.tsx` and register happy-dom per file, through `useDom()` in `test/setup/dom.ts` at the top of a `describe` block, so no host or backend test ever sees a DOM global.
+`tsconfig.test.json` sends `sonner` and `@/components/copy-button` to the webview's shims, so the unit leg renders `ResultsGrid` against what the bundle carries.
+React and `@testing-library/react` resolve from the root's install.
+
+### The extension's own 100% gate
+
+c8 measures the unit leg only (`.c8rc.json`: `all: true` over `src/**`), and the root's `scripts/check-coverage.mjs` holds `coverage/lcov.info` to 100% lines: `npm run test:unit && npm run coverage:check`.
+The root gate, Sonar and Codecov never see these lines, because `scripts/merge-lcov.mjs` keeps the root's `src/` records only.
+The gate is line-granular: a callback written on the line that registers it counts as covered once the registration runs, so its test alone holds it.
+A callback whose behaviour the gate must hold keeps its body on its own line, as `startBackend` in `src/backend/start.ts` does for its `disconnect` listener; without the case that closes the channel, the gate names that line.
+
+### The five legs
+
+- Unit: `npm run test:unit`, on Node 24, against the fake `vscode`.
+- Integration: `npm run test:integration` forks the built child from `LIBREDB_BACKEND_RUNTIME=node` (the job's Node) or `LIBREDB_BACKEND_RUNTIME=vscode` (the pinned stable binary of `test/vscode-versions.json`, downloaded into `.vscode-test/` and run in Node mode with `ELECTRON_RUN_AS_NODE=1`), so a child that works on Node but not on VS Code's own runtime fails here (P5).
+  `test/integration/backend-child.test.ts` runs against PostgreSQL, SQL Server, MySQL and MongoDB containers that `test/integration/containers.ts` starts from the images and environment of the same services in `database-compose.yml`, so the leg and the dev stack cannot drift.
+  Each container is capped for a shared machine (`ENGINE_LIMITS`: 1 CPU and `512m` for PostgreSQL, 1 CPU and `1g` for MySQL and MongoDB, 2 CPUs and `2g` for SQL Server, whose `MSSQL_MEMORY_LIMIT_MB=1536` keeps it inside that cap), publishes its port on `127.0.0.1` only, and carries the label `org.libredb.vscode-extension.integration=<pid>-<epoch ms>`.
+  The leg waits up to 180 s for each port, then for a `connection/test` through the child that succeeds, retried every second, because SQL Server opens its port before it accepts a login.
+  It removes each container by its id in `after`, never by label or name, since another checkout's run may be live on the same machine; a killed run's leftovers are listed with `docker ps --filter label=org.libredb.vscode-extension.integration` and removed by hand.
+  A local run therefore needs Docker on the machine.
+- E2e: `npm run test:e2e` runs `@vscode/test-cli` on the floor and stable builds of `test/vscode-versions.json`, under `xvfb-run -a` on Linux.
+  The build machine has no Xvfb, so the leg runs locally in a `node:24-bookworm` container that installs `xvfb` and VS Code's libraries and runs `xvfb-run -a npm run test:e2e` as the image's `node` user.
+  Mount the checkout at a short path such as `/w`: VS Code listens on a socket under `.vscode-test/user-data/`, and a socket path over the 107-byte Unix limit fails with `listen EINVAL`.
+  `test/e2e/backend-lifecycle.test.ts` starts PostgreSQL through Docker, so the local e2e container also runs with `--network host` and `-v /var/run/docker.sock:/var/run/docker.sock` and installs `docker.io` beside `xvfb`; the smoke subset needs no Docker access.
+  The `node` user reaches the socket through a group with the socket's group id, created in the container and passed to `runuser -G`, as the command below does.
+  The leg runs a second configuration per build, `vscode-<version>-workspace`, which opens `test/e2e-workspace/fixture` so the connections setting can be checked against a workspace value.
+  That configuration also runs `test/e2e-workspace/connections.test.ts`, which drives the connection commands through scripted quick inputs against PostgreSQL in Docker: it and `backend-lifecycle.test.ts` each need a host whose extension has started no child yet, and Add Connection leaves the extension's own child running.
+  The smoke subset runs neither the workspace configuration nor any file that needs Docker.
+  `@vscode/test-electron` starts every host with `--disable-workspace-trust`, so the leg sees a trusted workspace only.
+  `activate` exports nothing, so a test reaches what the extension created through `test/e2e/tree-capture.ts`, which wraps `vscode.window.createTreeView` before the extension activates and keeps the Connections view it captured on `globalThis`.
+  The editor cases read the same way through `test/e2e/host-capture.ts`, which wraps `vscode.window.createStatusBarItem`, `vscode.window.createOutputChannel` and `vscode.commands.executeCommand` before the extension activates and keeps every `setContext` call, the LibreDB log's lines and the connection status bar item on `globalThis`.
+  The same file also wraps `vscode.window.registerWebviewViewProvider` for the Results view, so `test/e2e/results-view.test.ts` and `test/e2e/smoke/results-view.test.ts` read each resolve, every message the host posts, every message the real webview sends and the view's description, and hand the host a message as the webview would.
+  `test/e2e/first-run.test.ts` drives the first-run flow once per engine against PostgreSQL, SQL Server, MySQL and MongoDB in Docker: the empty view, Add Connection through the real quick inputs, New Query and Run, the tree down to a table's columns, Select Rows to the Results view, Load More and Cancel.
+  It does not repeat the cases that already pass in `test/e2e/editors.test.ts` and `test/e2e/results-view.test.ts`.
+  The coexistence subset, `LIBREDB_E2E_SUBSET=coexistence`, runs `test/e2e-coexistence/coexistence.test.ts` alone, with `ms-mssql.mssql` installed beside LibreDB.
+  `configurationsFor` in `.vscode-test.mjs` gives it one `vscode-<version>-coexistence` configuration per build, whose `--extensions-dir` is `COEXISTENCE_EXTENSIONS_DIR` (`.vscode-test/extensions-coexistence`): `@vscode/test-cli` installs every `installExtensions` entry into the shared `.vscode-test/extensions`, so mssql installed there would load into every other e2e host.
+  `scripts/coexistence-extensions.mjs` installs the pinned `COEXISTENCE_EXTENSIONS` into that directory from the Marketplace before `vscode-test` starts, and installs nothing outside the subset.
+  mssql declares an extension pack of four more extensions, so `COEXISTENCE_EXTENSIONS` pins each of them beside mssql in the same install call, and `listingViolations` fails the run when the directory then lists anything but that pinned set.
+  Because it downloads from the Marketplace, the subset runs in the daily workflow and by hand, never in the pull request job.
+- Smoke: the e2e leg with `LIBREDB_E2E_SUBSET=smoke`, on macOS and Windows, with no Xvfb and no database.
+  The smoke subset runs `test/e2e/smoke/tree-root.test.ts`, which needs no Docker; the full leg also runs `test/e2e/connections-tree.test.ts`, which does.
+- Browser: `npm run test:browser` runs the results webview in Chromium with Playwright, after `npm run build`.
+  `@playwright/test` is pinned to the root's version, because `npm run` finds only the package's own binaries, and the same version shares the root's Chromium.
+  Its `playwright.config.mjs` starts no server: `test/browser/harness.ts` serves `dist/webview/` through `renderResultsHtml` with `page.route` and a fake `acquireVsCodeApi`, so the bundle runs under the view's real CSP.
+  It sets `forbidOnly`, and it does not count toward coverage.
+
+Beside the legs, `npm run test:vsix` runs `scripts/vsix-install-check.mjs` after `npm run package`: it installs the packed VSIX with the stable build's CLI into a scratch extensions and user data directory and reads `--list-extensions --show-versions`, because the e2e leg runs `dist/` from the development path, which proves the files and not the package.
+
+The local e2e run, from the checkout's root after `npm run build` in `vscode-extension/`:
+
+```bash
+docker run --rm --network host -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/w" -w /w/vscode-extension node:24-bookworm bash -euc '
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends xvfb xauth libasound2 libgbm1 libgtk-3-0 libnss3 libxkbfile1 libsecret-1-0 docker.io >/dev/null
+  gid=$(stat -c %g /var/run/docker.sock)
+  getent group "$gid" >/dev/null || groupadd -g "$gid" hostdocker
+  runuser -u node -G "$(getent group "$gid" | cut -d: -f1)" -- env HOME=/tmp/e2e-home xvfb-run -a npm run test:e2e'
+```
+
+`LIBREDB_VSCODE_VERSION` replaces the pinned builds of the integration and e2e legs with one version, which the Insiders run sets to `insiders`.
+
+### Bundles and notices
+
+`vscode-jsonrpc` 9.0.3 is the bundles' one runtime package: the host bundle's metafile check refuses any other `node_modules` input, and `test/unit/manifest.test.ts` holds it as the package's only dependency.
+`CHILD_EXTERNALS` in `scripts/bundle-checks.mjs` names what the child bundle leaves to a runtime `require`: the drivers of the engines outside v0 (`bun:sqlite`, `@duckdb/*`, `db2-node`, `oracledb`), `cpu-features`, `proper-lockfile` and any `*.node` path.
+`OPTIONAL_REQUIRES` names the nine packages the bundled drivers require inside their own `try` and do not install (`pg-native` from `pg`, `cardinal` from `mysql2`, `kerberos` from `mongodb` and `cassandra-driver`, and six more from `mongodb`), each with the packages allowed to require it.
+The child's metafile check accepts such an import only as a `require()` from inside a package its entry names, so the same name required from anywhere else fails the build.
+`renderNotices` in `scripts/notices.mjs` writes `THIRD_PARTY_NOTICES.txt` from every package that contributed an input to a bundle, and refuses a package whose licence it cannot place.
+A package passes with an id on `LICENSE_ALLOWLIST` (`Unlicense` among them), with an `OR` expression one of whose plain ids is on the list, or with npm's legacy `licenses` array when every type in it is on the list; an expression with `AND` or `WITH` stays refused.
+A package that ships no licence file takes its text from `third-party-licenses/<name>@<version>.txt`, whose first line, `Source: <URL>`, names where the text was copied from; a version bump finds no file and fails the build until the text is checked again.
+`LICENSE_OVERRIDES` records, by exact `name@version`, the reviewed licence of a package whose `package.json` names none, and where that licence is stated.
+A dependency bump that trips one of these rules is a reviewed change to that rule, never a widened pass.
+
+### The webview bundle
+
+The Results webview is built from LibreDB's source, not from the published package: `src/webview/main.tsx` is one IIFE for the browser at `es2022`, `dist/webview/results.js`.
+Three module shims replace what cannot run in a webview, listed in `WEBVIEW_SHIMS` in `scripts/webview-shims.mjs`: `sonner` inserts an un-nonced `<style>` the CSP blocks, so each toast posts `notify` to the host instead; `@/components/copy-button` would write the clipboard itself, so its `writeToClipboard` asks the host to; and `@/lib/storage` throws, since the view keeps its state through `getState` and `setState`.
+React, `react-dom` and `get-nonce` come in one copy each from the root's install, and the extension never declares them: a second copy would put two Reacts in the bundle.
+`webviewViolations` in `scripts/bundle-checks.mjs` holds the metafile to that boundary inside `esbuild.mjs`, as the host's and the child's checks are held, and its unit test reads fixture metafiles, so the unit leg never reads `dist/`.
+
+The stylesheet, `dist/webview/results.css`, is built by `@tailwindcss/cli`, pinned to the root's `tailwindcss`, from `src/webview/results.css`.
+Its `@source` list is explicit, and `sourceCoverageViolations` in `scripts/webview-css.mjs` fails the build when a bundled file under `src/components/` lies under none of them.
+`src/webview/vscode-bridge.css` maps LibreDB's tokens onto the `--vscode-*` variables every webview receives, so one mapping serves every theme.
+`tailwindcss` is in the notices, because its preflight is compiled into the stylesheet.
+
+### The engine logos
+
+The build first bundles `scripts/engine-icons.tsx` into `out/scripts/` and runs it, before it bundles the extension.
+The script writes `media/engines/**`, a light and a dark logo per engine and `index.json` with each engine's label, from `DB_UI_CONFIG` with the root's React and `react-dom/server`, so `npm run build` needs the root's `bun install` first.
+It fails the build unless `DB_UI_CONFIG` and `SHIPPED_DATABASE_TYPES` hold the same set of types.
+`media/engines/` is a build artifact that `vscode-extension/.gitignore` ignores and every build writes again, while the activity bar icon `media/libredb.svg` is committed.
+The build also writes the 128 by 128 Marketplace icon `media/icon.png` from the brand mark `public/logo.svg` through `scripts/marketplace-icon.mjs`, and `vscode-extension/.gitignore` ignores it too.
+
+### How the root tools cover the directory
+
+- The root `tsc` excludes `vscode-extension` (`tsconfig.json` `exclude`); `npm run typecheck` checks it in its own job, where Mocha's globals and the `vscode` types exist.
+- Biome formats `vscode-extension/**` minus `dist`, `out`, `dist-vsix`, `.vscode-test` and `coverage` (`biome.json` `files.includes`).
+- oxlint (`.oxlintrc.json` `ignorePatterns`) and ESLint (`globalIgnores` in `eslint.config.mjs`) lint it minus the same five build paths.
+  `vscode-extension/test/setup/register.cjs` is the repository's first `.cjs` file, so the ESLint block that tunes eslint-config-next's rules names eslint-config-next's own files pattern.
+- knip has a `vscode-extension` workspace in `knip.json` beside the root's `workspaces["."]`.
+  Its entries list neither bundle entry nor `esbuild.mjs`, which knip finds without them (it reports them as redundant entry patterns, `src/webview/main.tsx` among them); an export of the fake `vscode` module that only the code under test reaches, through `tsconfig.test.json`'s alias, which knip does not read, carries `@public` (today `window`).
+  Its `project` and test entries take `.tsx` as well as `.ts`.
+  The workspace turns knip's Playwright plugin off and names `test/browser/**/*.spec.ts` as an entry instead: the plugin loads `playwright.config.mjs`, which requires the extension's `@playwright/test` after knip has loaded the root's, and Playwright refuses a second copy.
+  It ignores exactly `get-nonce`, `@radix-ui/react-use-layout-effect` and `sharp`.
+  The webview and its tests import the first two from the root's install on purpose; declaring them in the extension would install a second copy beside React's.
+  `scripts/marketplace-icon.mjs` renders the Marketplace icon through the root's `sharp`, the copy Next.js installs as its optional dependency, so the build reads one brand source with one renderer.
+  The required `Lint, Typecheck and Build` job installs the extension's packages with `npm ci --ignore-scripts` before knip: measured on a clone with only the root installed, knip otherwise reports `c8`, `mocha` and `vscode-test` as unlisted binaries and `c8` and `@vscode/test-cli` as unused dependencies.
+  Its `actions/setup-node` step gives that install npm's cache, keyed on `vscode-extension/package-lock.json`, and runs the job's Node tools on Node 24.
+  Biome, oxlint, ESLint and the root `tsc` pass there without them.
+
+### The CI job
+
+`.github/workflows/vscode-extension.yml` is a reusable workflow that `ci.yml` calls as the `vscode-extension` job.
+Its Linux job runs the typecheck, the build with its metafile checks, the unit leg and its gate, the browser leg, both integration runtimes, the e2e leg, `npm run package` and `npm run test:vsix`, and uploads the VSIX, failing when there is none; its smoke job runs on `macos-latest` and `windows-latest`.
+`.github/workflows/vscode-extension-release.yml` calls the same file as its `gates` job on a pushed `vscode-extension-*` tag, so a release passes the gates a pull request does; its release runbook is in `docs/DISTRIBUTION.md`, "VS Code extension (Marketplace)".
+The browser leg's Chromium comes from `bunx playwright install --with-deps chromium` at the repository root, because the job does not run in Playwright's image; the root's Playwright is the extension's version, so the extension's own Playwright finds that browser.
+The smoke and Insiders runs have no browser leg: the webview is the same bytes on every OS and VS Code build.
+It caches Bun's packages through `.github/actions/bun-install`, npm's through `actions/setup-node` keyed on `vscode-extension/package-lock.json`, and the VS Code builds through `actions/cache` keyed on `vscode-extension/test/vscode-versions.json`.
+The VS Code cache holds `.vscode-test/vscode-*` only: the e2e leg's profile in `.vscode-test/user-data` and `.vscode-test/extensions` stays out of it, so no run starts from a profile an earlier run left, and a fork's pull request restores none.
+`.github/workflows/vscode-extension-insiders.yml` runs the build, the `vscode` integration runtime and the e2e leg against VS Code Insiders daily and on demand, so an Electron or Node bump shows up before stable ships it; `test/vscode-versions.json` is bumped by hand.
+Its `coexistence` job runs the coexistence subset on the pinned builds on the same schedule.
+Dependabot watches `vscode-extension/` through its own `npm` entry, with `@types/vscode` held at the `engines.vscode` floor.
+The job is not a required check until the owner adds it to `main`'s branch protection.

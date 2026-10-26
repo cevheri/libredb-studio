@@ -28,7 +28,16 @@ import * as path from "path";
  * repeat, which is the case that actually happened, not a determined one.
  */
 
-const SRC = path.join(process.cwd(), "src");
+// Anchored to this file rather than to process.cwd(), so the scan is correct whoever launches it.
+const ROOT = path.resolve(import.meta.dir, "../..");
+const SRC = path.join(ROOT, "src");
+
+/**
+ * The one place an absolute path becomes a rule key. path.relative hands back the platform
+ * separator, so on Windows this would be "src\\lib\\db\\index.ts": the EXEMPT table is keyed
+ * with forward slashes and would stop matching, reporting exempt files as violations.
+ */
+const repoRelative = (full: string): string => path.relative(ROOT, full).split(path.sep).join("/");
 
 /** Import specifiers that resolve to the factory. */
 const FACTORY_SPECIFIERS = ["@/lib/db/factory", "@/lib/db"] as const;
@@ -162,7 +171,7 @@ describe("SSH tunnel discipline (#457)", () => {
   test("every connecting caller of createDatabaseProvider tunnels", () => {
     const violations = walk(SRC)
       .map((full) => {
-        const relPath = path.relative(process.cwd(), full);
+        const relPath = repoRelative(full);
         return analyseTunnelDiscipline(relPath, fs.readFileSync(full, "utf8"));
       })
       .filter((v): v is Violation => v !== null);
@@ -170,15 +179,23 @@ describe("SSH tunnel discipline (#457)", () => {
     expect(violations.map((v) => `${v.file}: ${v.reason}`)).toEqual([]);
   });
 
-  test("the rule actually reaches the two routes it exists for", () => {
+  test("the rule actually reaches the route it exists for", () => {
     // Guards against the scan silently covering nothing - a rename, a moved route or a
     // changed import specifier would otherwise leave this suite green and blind.
-    const scanned = walk(SRC).map((full) => path.relative(process.cwd(), full));
-    expect(scanned).toContain("src/app/api/db/test-connection/route.ts");
-    expect(scanned).toContain("src/app/api/db/schema-snapshot/route.ts");
+    //
+    // ONE route, where there were two: `/api/db/schema-snapshot` built its own provider
+    // outside both caches and so had to open its own tunnel, and it is deleted with the
+    // flat schema reading it read (#789). Its consumer reads `/api/db/objects/inventory`,
+    // which goes through `getOrCreateProvider` and is tunnelled by the factory.
+    //
+    // The remaining one builds through `testConnection` (`src/lib/api/test-connection.ts`), which
+    // `/api/db/test-connection` and the VS Code extension's `connection/test` share, so the scan
+    // reads the core, where the build and its tunnel now are.
+    const scanned = walk(SRC).map(repoRelative);
+    expect(scanned).toContain("src/lib/api/test-connection.ts");
 
-    for (const route of ["src/app/api/db/test-connection/route.ts", "src/app/api/db/schema-snapshot/route.ts"]) {
-      const source = fs.readFileSync(path.join(process.cwd(), route), "utf8");
+    for (const route of ["src/lib/api/test-connection.ts"]) {
+      const source = fs.readFileSync(path.join(ROOT, route), "utf8");
       // Compliant today, and provably in scope: strip the scope and the rule bites.
       expect(analyseTunnelDiscipline(route, source)).toBeNull();
       expect(analyseTunnelDiscipline(route, source.replace(/withOneShotTunnel/g, "somethingElse"))).not.toBeNull();
@@ -189,7 +206,7 @@ describe("SSH tunnel discipline (#457)", () => {
     // A stale exemption is a hole nobody can see. If a file moves, the entry must move
     // with it or be deleted.
     for (const file of Object.keys(EXEMPT)) {
-      expect(fs.existsSync(path.join(process.cwd(), file))).toBe(true);
+      expect(fs.existsSync(path.join(ROOT, file))).toBe(true);
     }
   });
 });

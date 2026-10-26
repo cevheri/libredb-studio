@@ -26,13 +26,17 @@ interface PackageManifest {
   peerDependencies?: Record<string, string>;
 }
 
+// Anchored to this file, not to process.cwd(): this read happens at module scope, so a runner
+// that launched the file from anywhere but the repository root would kill it before a test ran.
+const ROOT = path.resolve(import.meta.dir, "../..");
+
 const manifest: PackageManifest = JSON.parse(
-  fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8"),
+  fs.readFileSync(path.join(ROOT, "package.json"), "utf8"),
 ) as PackageManifest;
 
-/** Exact versions ratified by the owner when the runtime spike closed. */
+/** Exact versions ratified by the owner when the runtime spike closed; `ai` was raised on 2026-10-19 with the providers below. */
 const RATIFIED_RUNTIME: Readonly<Record<string, string>> = {
-  ai: "7.0.59",
+  ai: "7.0.143",
   workflow: "4.8.1",
   "@workflow/world-local": "4.2.4",
   "@workflow/world-postgres": "4.3.3",
@@ -40,14 +44,15 @@ const RATIFIED_RUNTIME: Readonly<Record<string, string>> = {
 
 /**
  * Exact versions of the three model providers the owner ratified separately, on
- * 2026-08-11, after planning had already run. They sit on the same
+ * 2026-08-11, after planning had already run, and raised with `ai` on 2026-10-19
+ * when the owner asked for the AI SDK upgrade. They sit on the same
  * `@ai-sdk/provider` + `@ai-sdk/provider-utils` pair the pinned `ai` release
  * resolves, which is the evidence the decision was taken on.
  */
 const RATIFIED_MODEL_PROVIDERS: Readonly<Record<string, string>> = {
-  "@ai-sdk/openai": "4.0.37",
-  "@ai-sdk/google": "4.0.40",
-  "@ai-sdk/anthropic": "4.0.37",
+  "@ai-sdk/openai": "4.0.96",
+  "@ai-sdk/google": "4.0.99",
+  "@ai-sdk/anthropic": "4.0.82",
 };
 
 /** Every field npm installs on a consumer of the published package. */
@@ -137,15 +142,20 @@ describe("the knip ignore list stays bounded", () => {
    * would also owe `src/lib/llm/factory.ts` a chat provider (`docs/BACKLOG.md` B2).
    * `@workflow/world-postgres` is expected to stay, because the runtime
    * resolves it by module specifier from `WORKFLOW_TARGET_WORLD` and no static
-   * import of it will ever exist. Naming the survivors rather than the whole
+   * import of it will ever exist. `ajv` is outside the agent runtime and is
+   * expected to stay too: nothing imports it, and it is declared only so that
+   * bun hoists ajv 8 for `@platformatic/kafka`'s `ajv-draft-04` (the reason is
+   * in package.json's `//dependencies` note, and
+   * `tests/unit/db/kafka/dependency-resolution.test.ts` holds the layout).
+   * Naming the survivors rather than the whole
    * ratified set is what stops a wired-in package from quietly returning to the
    * list, which would hide it from the unused-dependency check for good.
    */
-  const ALLOWED_IGNORED_DEPENDENCIES = new Set(["tailwindcss", "@workflow/world-postgres", "@ai-sdk/anthropic"]);
+  const ALLOWED_IGNORED_DEPENDENCIES = new Set(["tailwindcss", "@workflow/world-postgres", "@ai-sdk/anthropic", "ajv"]);
 
-  test("ignores no dependency beyond tailwindcss and the ratified runtime", () => {
+  test("ignores no dependency beyond tailwindcss, the ratified runtime and ajv", () => {
     const knip: { ignoreDependencies?: string[] } = JSON.parse(
-      fs.readFileSync(path.join(process.cwd(), "knip.json"), "utf8"),
+      fs.readFileSync(path.join(ROOT, "knip.json"), "utf8"),
     ) as { ignoreDependencies?: string[] };
     // A subset assertion, deliberately: removing an entry once the run loop
     // imports the package is the desired direction of travel, and an equality

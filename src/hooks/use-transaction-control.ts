@@ -1,17 +1,40 @@
 "use client";
 
+import { appFetch } from "@/lib/config/base-path";
 import { useState, useCallback } from "react";
 import type { DatabaseConnection } from "@/lib/types";
 import { useToast } from "@/hooks/use-toast";
-import { buildConnectionPayload } from "./use-connection-payload";
+import { ApiErrorCode } from "@/lib/api/error-codes";
+import { NO_ACTIVE_TRANSACTION } from "@/lib/db/errors";
+import { buildConnectionPayload, catalogField } from "./use-connection-payload";
+
+/**
+ * Whether a refused answer of `POST /api/db/transaction` says the transaction the editor holds is gone: a 409
+ * TRANSACTION_CREDENTIAL_CHANGED, after which Studio rolled it back because the caller's access changed
+ * (docs/GOVERNANCE.md#per-user-providers), or a 400 QUERY_ERROR whose sentence is `NO_ACTIVE_TRANSACTION`, which the
+ * provider answers after it rolled the transaction back on its own five-minute timer and the route answers under
+ * governance for a caller who owns no transaction there. Any other refusal leaves the transaction open on the server,
+ * so the editor keeps it.
+ */
+export function transactionGone(answer: { code?: unknown; error?: unknown }): boolean {
+  return (
+    answer.code === ApiErrorCode.TRANSACTION_CREDENTIAL_CHANGED ||
+    (answer.code === ApiErrorCode.QUERY_ERROR && answer.error === NO_ACTIVE_TRANSACTION)
+  );
+}
 
 interface UseTransactionControlParams {
   activeConnection: DatabaseConnection | null;
+  /** A server-level connection's active database (#1530), locked while a transaction is open. */
+  catalog?: string;
 }
 
-export function useTransactionControl({ activeConnection }: UseTransactionControlParams) {
+export function useTransactionControl({ activeConnection, catalog }: UseTransactionControlParams) {
   const [transactionActive, setTransactionActive] = useState(false);
   const [playgroundMode, setPlaygroundMode] = useState(false);
+  // The server answered BEGIN without reporting any transaction state (`stateReported: false`
+  // from the route), so nothing Studio reads can confirm what a ROLLBACK discarded.
+  const [stateUnreported, setStateUnreported] = useState(false);
   const { toast } = useToast();
 
   const handleTransaction = useCallback(
@@ -19,46 +42,72 @@ export function useTransactionControl({ activeConnection }: UseTransactionContro
       if (!activeConnection) return;
 
       try {
-        const res = await fetch("/api/db/transaction", {
+        const res = await appFetch("/api/db/transaction", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             ...buildConnectionPayload(activeConnection),
+            ...catalogField(catalog),
             action,
           }),
         });
 
         const data = await res.json();
         if (!res.ok) {
+          if (transactionGone(data)) setTransactionActive(false);
           toast({ title: "Transaction Error", description: data.error, variant: "destructive" });
           return;
         }
 
         if (action === "begin") {
+          const unreported = data.stateReported === false;
           setTransactionActive(true);
+          setStateUnreported(unreported);
           toast({
             title: "Transaction Started",
-            description: "BEGIN — all queries will run in this transaction until you COMMIT or ROLLBACK.",
+            description: unreported
+              ? "BEGIN sent. This server does not report transaction state, so Studio cannot verify that the transaction is open or notice a statement that ends it. Queries run on this connection until you COMMIT or ROLLBACK."
+              : "BEGIN — all queries will run in this transaction until you COMMIT or ROLLBACK.",
           });
         } else if (action === "commit") {
           setTransactionActive(false);
-          toast({ title: "Transaction Committed", description: "All changes have been saved." });
+          toast(
+            stateUnreported
+              ? {
+                  title: "Commit Sent",
+                  description: "This server does not report transaction state, so Studio cannot verify what was saved.",
+                }
+              : { title: "Transaction Committed", description: "All changes have been saved." },
+          );
         } else if (action === "rollback") {
           setTransactionActive(false);
-          toast({ title: "Transaction Rolled Back", description: "All changes have been discarded." });
+          toast(
+            stateUnreported
+              ? {
+                  title: "Rollback Sent",
+                  description:
+                    "This server does not report transaction state, so Studio cannot verify what was discarded.",
+                }
+              : { title: "Transaction Rolled Back", description: "All changes have been discarded." },
+          );
         }
       } catch (error) {
         const msg = error instanceof Error ? error.message : "Unknown error";
         toast({ title: "Transaction Error", description: msg, variant: "destructive" });
       }
     },
-    [activeConnection, toast],
+    [activeConnection, toast, stateUnreported, catalog],
   );
 
   const resetTransactionState = useCallback(() => {
     setTransactionActive(false);
     setPlaygroundMode(false);
+    setStateUnreported(false);
   }, []);
+
+  // The server ended the transaction itself (a COMMIT typed in it, or a statement the engine
+  // commits implicitly), so there is nothing left for COMMIT or ROLLBACK to act on.
+  const markTransactionEnded = useCallback(() => setTransactionActive(false), []);
 
   return {
     transactionActive,
@@ -66,5 +115,6 @@ export function useTransactionControl({ activeConnection }: UseTransactionContro
     setPlaygroundMode,
     handleTransaction,
     resetTransactionState,
+    markTransactionEnded,
   };
 }

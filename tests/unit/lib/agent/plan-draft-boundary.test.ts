@@ -24,7 +24,11 @@ import * as path from "node:path";
  * instead of a browser.
  */
 
-const SOURCE = fs.readFileSync(path.join(process.cwd(), "src/lib/agent/plan-draft.ts"), "utf8");
+// Anchored to this file, not to process.cwd(): this read happens at module scope, so a runner
+// that launched the file from anywhere but the repository root would kill it before a test ran.
+const ROOT = path.resolve(import.meta.dir, "../../../..");
+
+const SOURCE = fs.readFileSync(path.join(ROOT, "src/lib/agent/plan-draft.ts"), "utf8");
 
 /** Every module specifier the file imports, type-only imports included. */
 const specifiers = (source: string): readonly string[] =>
@@ -86,12 +90,15 @@ describe("the plan-draft reader stays reachable from a browser", () => {
       code, and one shape yielded a runnable bare `DROP` fragment — so it now reads through
       `spans.ts` under a `grammar.ts` record. Zero is therefore replaced by the CLOSURE, computed
       here rather than named at one level: every module reachable from the splitter must be one of
-      these two readers, whose own only reach is a TYPE-ONLY import of the shared type module. That
+      these readers, whose own only reach is a TYPE-ONLY import of the shared type module. That
       is checked below, so a value import appearing anywhere in the closure fails this test rather
-      than a browser.
+      than a browser. `./words` joined it with #1312: a procedural body is found by its code
+      words, and that reader reaches nothing but the other two. `./operative-keyword` and the
+      `./leading-keyword` it reads joined it with SF-046: a T-SQL MERGE keeps its `;`, and the
+      statement is a MERGE by its operative keyword; both reach only the readers above.
     */
     const read = (specifier: string) =>
-      fs.readFileSync(path.join(process.cwd(), "src/lib/sql", `${specifier.replace("./", "")}.ts`), "utf8");
+      fs.readFileSync(path.join(ROOT, "src/lib/sql", `${specifier.replace("./", "")}.ts`), "utf8");
 
     const closure = new Set<string>();
     const pending = ["./statement-splitter"];
@@ -104,10 +111,56 @@ describe("the plan-draft reader stays reachable from a browser", () => {
       }
     }
 
-    expect([...closure].sort()).toEqual(["./grammar", "./spans", "@/lib/types"]);
-    // The one non-relative member, and it is erased at build time: a VALUE import of the shared
-    // type module would pull the whole type barrel into the browser bundle.
+    expect([...closure].sort()).toEqual([
+      "./grammar",
+      "./leading-keyword",
+      "./operative-keyword",
+      "./spans",
+      "./words",
+      "@/lib/db/sql-grammar",
+      "@/lib/types",
+    ]);
+    // The non-relative members. The type module is erased at build time: a VALUE import of it
+    // would pull the whole type barrel into the browser bundle. The shared grammar constants are
+    // a leaf whose only import is that same kind of erased, type-only one.
     expect(read("./grammar")).toContain('import type { DatabaseType } from "@/lib/types"');
+    const shared = fs.readFileSync(path.join(ROOT, "src/lib/db/sql-grammar/shared.ts"), "utf8");
+    expect(specifiers(shared)).toEqual(["./types"]);
+    expect(shared).toContain('import type { SqlGrammar } from "./types"');
+
+    // The SQL grammar registry joined the closure when `grammar.ts` started reading each engine's row from it
+    // (engine contract spec 5.3). Its own closure is walked here, re-exports included and type-only lines left out:
+    // every module it reaches is the registry, an engine's `sql-grammar` module, or one of the two leaves an engine
+    // module may import, and those leaves import nothing at all.
+    const valueSpecifiers = (source: string): readonly string[] =>
+      [...source.matchAll(/^(?:import|export)\s(?!type\s)[^;]*?from\s+"([^"]+)"/gm)].map((match) => match[1]);
+    const resolve = (specifier: string, from: string): string => {
+      const base = specifier.startsWith("@/")
+        ? `src/${specifier.slice(2)}`
+        : path.posix.join(path.posix.dirname(from), specifier);
+      return fs.existsSync(path.join(ROOT, `${base}.ts`)) ? `${base}.ts` : `${base}/index.ts`;
+    };
+    const LEAVES = new Set(["src/lib/is-record.ts", "src/lib/db/providers/keyvalue/redis-command-text.ts"]);
+    const registry = new Set<string>();
+    const walk = ["src/lib/db/sql-grammar/index.ts"];
+    while (walk.length > 0) {
+      const file = walk.pop() as string;
+      if (registry.has(file)) continue;
+      registry.add(file);
+      const source = fs.readFileSync(path.join(ROOT, file), "utf8");
+      for (const specifier of valueSpecifiers(source)) walk.push(resolve(specifier, file));
+    }
+    const outside = [...registry].filter(
+      (file) =>
+        !file.startsWith("src/lib/db/sql-grammar/") &&
+        !(file.startsWith("src/lib/db/providers/") && /(?:^|[/-])sql-grammar\.ts$/.test(file)) &&
+        !LEAVES.has(file),
+    );
+    expect(outside).toEqual([]);
+    expect(registry.size).toBeGreaterThan(42);
+    for (const leaf of LEAVES) {
+      expect(valueSpecifiers(fs.readFileSync(path.join(ROOT, leaf), "utf8"))).toEqual([]);
+    }
   });
 
   test("it does not reach the statement guard, which is where zod enters", () => {
@@ -127,7 +180,7 @@ describe("the plan-draft reader stays reachable from a browser", () => {
   test("the validation half still holds the guard, so the split moved the reader and not the rule", () => {
     // The other direction of the same boundary: had the guard simply been dropped, this
     // test file would pass while the drafted statement stopped being classified at all.
-    const validation = fs.readFileSync(path.join(process.cwd(), "src/lib/agent/plan-statement.ts"), "utf8");
+    const validation = fs.readFileSync(path.join(ROOT, "src/lib/agent/plan-statement.ts"), "utf8");
 
     expect(validation).toContain("@/lib/db/operations/statement-guard");
   });

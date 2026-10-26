@@ -33,10 +33,12 @@ const mockBuffer = {
     id: `evt-${Date.now()}`,
     timestamp: new Date().toISOString(),
   })),
-  getRecent: mock((count: number) => mockEvents.slice(-count)),
-  filter: mock((opts: { type?: string }) => {
-    if (opts.type) return mockEvents.filter((e) => e.type === opts.type);
-    return mockEvents;
+  // Mirrors the real buffer: newest first, `limit` keeps the newest matches.
+  getRecent: mock((count: number) => [...mockEvents].reverse().slice(0, count)),
+  filter: mock((opts: { type?: string; limit?: number }) => {
+    const matches = opts.type ? mockEvents.filter((e) => e.type === opts.type) : mockEvents;
+    const newest = [...matches].reverse();
+    return opts.limit === undefined ? newest : newest.slice(0, opts.limit);
   }),
   getAll: mock(() => mockEvents),
   size: mockEvents.length,
@@ -55,6 +57,10 @@ const mockEmitAuditEvent = mock((_event: Record<string, unknown>) => {});
 // ─── Mock @/lib/auth BEFORE importing the route ─────────────────────────────
 mock.module("@/lib/auth", () => ({
   getSession: mockGetSession,
+  readSession: mock(async () => {
+    const s = await mockGetSession();
+    return s ? { kind: "authenticated", session: s } : { kind: "anonymous" };
+  }),
   signJWT: mock(async () => "mock-token"),
   verifyJWT: mock(async () => null),
   login: mock(async () => {}),
@@ -111,10 +117,10 @@ describe("/api/admin/audit", () => {
       const req = createMockRequest("/api/admin/audit");
 
       const res = await GET(req);
-      const data = await parseResponseJSON<{ error: string }>(res);
+      const data = await parseResponseJSON<{ error: string; code?: string }>(res);
 
       expect(res.status).toBe(403);
-      expect(data.error).toContain("Unauthorized");
+      expect(data).toEqual({ error: "Unauthorized. Admin access required.", code: "ADMIN_REQUIRED" });
     });
 
     // Threat: a role denial that leaves no trace. An authenticated caller probing for a role it
@@ -151,15 +157,16 @@ describe("/api/admin/audit", () => {
       clearRateLimitState();
     });
 
-    // This route has no guardRoute in front of it, so its 403 covers both "no session" and "wrong
-    // role". Only the latter is a ROLE denial; recording insufficient_role for an anonymous caller
-    // would both misname the reason and let an unauthenticated caller flood the trail for free.
-    test("an absent session emits nothing", async () => {
+    // This route has no guardRoute in front of it. An absent session is not a ROLE denial: it answers 401 AUTH_REQUIRED,
+    // so a client signs in again rather than reading "not permitted", and records nothing, since recording
+    // insufficient_role for an anonymous caller would both misname the reason and let it flood the trail for free.
+    test("an absent session answers 401 AUTH_REQUIRED and emits nothing", async () => {
       mockGetSession.mockResolvedValueOnce(null);
 
       const res = await GET(createMockRequest("/api/admin/audit"));
 
-      expect(res.status).toBe(403);
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: "Authentication required", code: "AUTH_REQUIRED" });
       expect(mockEmitAuditEvent).not.toHaveBeenCalled();
     });
 
@@ -183,6 +190,20 @@ describe("/api/admin/audit", () => {
       expect(res.status).toBe(200);
       expect(mockBuffer.filter).toHaveBeenCalled();
       expect(data.events).toBeArray();
+    });
+
+    test("both paths answer newest first and honour limit", async () => {
+      const unfiltered = await parseResponseJSON<{ events: AuditEvent[] }>(
+        await GET(createMockRequest("/api/admin/audit?limit=1")),
+      );
+      expect(unfiltered.events).toEqual([mockEvents[mockEvents.length - 1]]);
+
+      const filtered = await parseResponseJSON<{ events: AuditEvent[] }>(
+        await GET(createMockRequest("/api/admin/audit?type=query_execution&limit=1")),
+      );
+      expect(filtered.events).toHaveLength(1);
+      expect(filtered.events[0]).toEqual([...mockEvents].reverse().find((e) => e.type === "query_execution")!);
+      expect(mockBuffer.filter).toHaveBeenCalledWith({ type: "query_execution", limit: 1 });
     });
 
     test("returns 500 when buffer read fails", async () => {
@@ -237,10 +258,19 @@ describe("/api/admin/audit", () => {
       });
 
       const res = await POST(req);
-      const data = await parseResponseJSON<{ error: string }>(res);
+      const data = await parseResponseJSON<{ error: string; code?: string }>(res);
 
       expect(res.status).toBe(403);
-      expect(data.error).toContain("Unauthorized");
+      expect(data).toEqual({ error: "Unauthorized. Admin access required.", code: "ADMIN_REQUIRED" });
+    });
+
+    test("an absent session answers 401 AUTH_REQUIRED on POST", async () => {
+      mockGetSession.mockResolvedValueOnce(null);
+
+      const res = await POST(createMockRequest("/api/admin/audit", { method: "POST", body: {} }));
+
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: "Authentication required", code: "AUTH_REQUIRED" });
     });
 
     test("non-admin denial emits permission_denied with reason insufficient_role", async () => {

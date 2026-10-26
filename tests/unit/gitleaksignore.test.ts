@@ -32,8 +32,46 @@ const FINGERPRINT = /^[0-9a-f]{40}:[^:\s]+:[a-z0-9-]+:[0-9]+$/;
 const contentLines = lines.map((l) => l.trim()).filter((l) => l.length > 0 && !l.startsWith("#"));
 
 describe(".gitleaksignore", () => {
-  test("has fingerprint entries - the sweep found 24 fabricated matches to classify", () => {
-    expect(contentLines).toHaveLength(24);
+  test("has fingerprint entries - 24 from the sweep, plus #708's ApiKey fixture, plus 2 added since, plus the S3 squash commit's 16", () => {
+    // 24 came out of the 2026-08-09 full-history sweep. The 3 added since are
+    // #708's fabricated ApiKey-header test pair, plus one placeholder JWT
+    // secret written twice into the release runbook's smoke phase in 2ff08e3a,
+    // removed from the working tree in the commit that added those lines -
+    // history keeps the commit, so the findings stay. A fingerprint whose commit
+    // only a squash-merged branch held goes once the squash lands, because no
+    // ref reaches that commit any more: the server-text test's four went with
+    // #1247.
+    //
+    // The S3 provider's squash commit 11717b7e (#1654) adds 16: list cursors
+    // the scanner decodes from base64 (the MinIO, RustFS and Silo capture sets
+    // plus the console tests' tokens) and one published SigV4 test vector. The
+    // branch's own 34 went when that squash landed, the same way.
+    //
+    // The 8 after them are the cursors of the MinIO, MinIO region, RustFS and
+    // Silo capture sets re-recorded under the reworded blocked-host sentence;
+    // they name a branch commit and move onto the squash commit once it lands.
+    //
+    // The Firestore branch's 2, on its commit 6ec99b39, went when its squash 60f691d2 (#1695) landed: the branch
+    // rewrote both lines before the merge, so the squash commit carries neither and needs no fingerprint.
+    //
+    // PR #1629's 8, the same cursors as its merge commit f298310f re-presented
+    // them, went when its squash f447c9b7 landed: no ref reaches that merge any
+    // more, and the squash commit does not touch the capture sets.
+    //
+    // The governance squash commit 173d9679 (#1785) adds 27. 5 are the CFRG HPKE
+    // test vector of the lsb1 suite, checked in unchanged: its shared secret, key
+    // schedule context, secret, key and exporter secret are published test values.
+    // 21 are the fixed ephemeral private keys of the lsb1 test vectors, one per
+    // vector: each is the SHA-256 of a published label marked test only, so anyone
+    // can derive it. The last is the placeholder password of the fixture DDL's unit
+    // test, a sequential hex filler the test only compares DDL text with. The
+    // branch's own 54 went when that squash landed: each value was fingerprinted
+    // once on the commit that added it and once on the merge that re-presented it.
+    //
+    // This number is the point of the test: a suppression is a decision someone
+    // has to make on purpose, so both a line silently dropped and a line
+    // silently added land here as a failing diff rather than as nothing.
+    expect(contentLines).toHaveLength(78);
   });
 
   test("every non-comment, non-blank line is a well-formed fingerprint", () => {

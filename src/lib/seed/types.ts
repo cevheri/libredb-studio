@@ -1,5 +1,10 @@
 import { z } from "zod";
-import type { DatabaseConnection } from "@/lib/types";
+import { CONNECTION_STRING_ACCEPTED, MCP_EXPOSABLE, READ_ONLY_ENFORCED } from "@/lib/db/compatibility";
+import type { DatabaseConnection, DatabaseType } from "@/lib/types";
+import { readOnlySeedRefusal } from "@/lib/db/credential-warnings";
+import { SEED_ONLY_FIELDS, type SeedOnlyFields } from "@/lib/db/connection-fields";
+import { isCredentialReference } from "./credential-resolver";
+import { connectionStringFor } from "@/lib/db/connection-string";
 
 // SSLMode matches the union in src/lib/types.ts — NO 'prefer'. Kept in step BY HAND: a zod
 // enum is a value, so a mode missing here is not a compile error, it is a seed file the
@@ -18,8 +23,62 @@ const SSLConfigSchema = z
 
 const ConnectionEnvironmentSchema = z.enum(["production", "staging", "development", "local", "other"]);
 
-// Allowed roles in current iteration (matches JWT role: 'admin' | 'user' + wildcard)
-const AllowedRoleSchema = z.enum(["*", "admin", "user"]);
+// Allowed roles: standard roles ('*', 'admin', 'user') or custom roles from OIDC role claim
+const CONTROL_CHAR_REGEX = /[\x00-\x1f\x7f-\x9f]/;
+
+const AllowedRoleSchema = z
+  .string()
+  .min(1, "Role cannot be empty")
+  .max(64, "Role name must not exceed 64 characters")
+  .refine((r) => Buffer.byteLength(r, "utf8") <= 64, "Role name must not exceed 64 bytes in UTF-8")
+  .refine((r) => r.trim() === r, "Role name cannot have leading or trailing whitespace")
+  .refine((r) => !CONTROL_CHAR_REGEX.test(r), "Role name cannot contain control characters");
+
+/**
+ * One issue per present field of every "each" row, then one issue per "set" row with any field present, at the first
+ * present field. The "each" pass runs first so the OPC UA issues keep their place before the API-key issue.
+ */
+function refuseSeedOnlyFields(conn: { readonly type: DatabaseType }, ctx: z.RefinementCtx): void {
+  const rows = Object.entries(SEED_ONLY_FIELDS).filter(
+    (entry): entry is [string, SeedOnlyFields] => entry[1] !== null && entry[0] !== conn.type,
+  );
+  const fields = conn as Readonly<Record<string, unknown>>;
+  for (const [, row] of rows) {
+    if (row.kind !== "each") continue;
+    for (const field of row.fields) {
+      if (fields[field] === undefined) continue;
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: row.refusal(field), path: [field] });
+    }
+  }
+  for (const [, row] of rows) {
+    if (row.kind !== "set") continue;
+    const present = row.fields.find((field) => fields[field] !== undefined);
+    if (present === undefined) continue;
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: row.refusal(present), path: [present] });
+  }
+}
+
+/**
+ * The load's refusal of an MCP opt-in on an engine MCP is not offered for (#1089). Read from the record
+ * it is handed, `MCP_EXPOSABLE` in `SeedConnectionSchema`, never a type-id branch, so an engine is
+ * admitted by its own entry. Refused rather than stripped, because a stripped opt-in would load a file
+ * that asks for something the product will not do. A factory over the record, the way
+ * `offersReadOnlyToggle` takes its engine's answer, so the refusal is tested before any shipped engine
+ * answers false.
+ */
+export function refuseMcpWhereNotOffered(exposable: Readonly<Record<DatabaseType, boolean>>) {
+  return (conn: { type: DatabaseType; mcp?: boolean }, ctx: z.RefinementCtx): void => {
+    if (conn.mcp !== true || exposable[conn.type]) return;
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `mcp is not offered for ${conn.type}: the product does not expose this engine to MCP clients. Remove mcp from this connection.`,
+      path: ["mcp"],
+    });
+  };
+}
+
+/** A provider sentence as a load refusal: the "Nothing was sent." ending is a connect's, not a file's. */
+const atLoad = (sentence: string): string => sentence.replace(/ Nothing was sent\.$/, "");
 
 // Kept in step with DatabaseType in src/lib/types.ts BY HAND: a zod enum is a value,
 // so a type-id missing here is not a compile error - it is a seed file the server
@@ -31,6 +90,7 @@ const SeedDatabaseType = z.enum([
   "mongodb",
   "redis",
   "oracle",
+  "db2",
   "mssql",
   "libredb",
   "couchbase",
@@ -42,49 +102,269 @@ const SeedDatabaseType = z.enum([
   "cassandra",
   "libsql",
   "duckdb",
+  "prometheus",
+  "kafka",
+  "etcd",
+  "neo4j",
+  "milvus",
+  "qdrant",
+  "influxdb",
+  "influxdb3",
+  "oxia",
+  "databend",
+  "bigquery",
+  "snowflake",
+  "spark",
+  "s3",
+  "kubernetes",
+  "mqtt",
+  "firestore",
+  "rabbitmq",
+  "opcua",
+  "mtconnect",
+  "modbus",
+  "netconf",
+  "snmp",
+  "sparkplug",
 ]);
 
 export const SeedDefaultsSchema = z.object({
   managed: z.boolean().optional(),
   environment: ConnectionEnvironmentSchema.optional(),
   ssl: SSLConfigSchema,
+  // Refused rather than stripped (#246): a default would opt every later connection in to MCP.
+  mcp: z
+    .never({
+      error:
+        "mcp is set per connection and never in defaults: add mcp: true to each seed connection an MCP client may use",
+    })
+    .optional(),
+  // Refused rather than stripped (#1089), like mcp: a default is merged only after the file is parsed,
+  // past the refusal of an engine whose provider does not enforce the mode, so a merged default would
+  // reach engines that ignore it.
+  readOnly: z
+    .never({
+      error:
+        "readOnly is set per connection and never in defaults: add readOnly: true to each seed connection that must refuse writes",
+    })
+    .optional(),
 });
 
-export const SeedConnectionSchema = z.object({
-  id: z
-    .string()
-    .min(1)
-    .max(64)
-    .regex(/^[a-z0-9-]+$/, "ID must be lowercase alphanumeric with hyphens"),
-  name: z.string().min(1).max(128),
-  type: SeedDatabaseType,
-  host: z.string().optional(),
-  port: z.number().int().min(1).max(65535).optional(),
-  database: z.string().optional(),
-  user: z.string().optional(),
-  password: z.string().optional(),
-  connectionString: z.string().optional(),
-  environment: ConnectionEnvironmentSchema.optional(),
-  group: z.string().max(64).optional(),
-  color: z
-    .string()
-    .regex(/^#[0-9A-Fa-f]{6}$/)
-    .optional(),
-  roles: z.array(AllowedRoleSchema).min(1, "At least one role is required"),
-  managed: z.boolean().optional(),
-  ssl: SSLConfigSchema,
-  serviceName: z.string().optional(),
-  instanceName: z.string().optional(),
-  // Cassandra only, and REQUIRED by that driver rather than optional to it: a seeded
-  // Cassandra connection without it cannot open at all. Optional here because the
-  // other thirteen type-ids have no use for the field; the provider is what refuses a
-  // connection that omits it.
-  localDataCenter: z.string().optional(),
-  // MongoDB only: the database its credentials live in (`admin` in the ordinary
-  // deployment). Optional because the driver falls back to the database being opened,
-  // which is right only when the two are the same.
-  authSource: z.string().optional(),
-});
+export const SeedConnectionSchema = z
+  .object({
+    id: z
+      .string()
+      .min(1)
+      .max(64)
+      .regex(/^[a-z0-9-]+$/, "ID must be lowercase alphanumeric with hyphens"),
+    name: z.string().min(1).max(128),
+    type: SeedDatabaseType,
+    host: z.string().optional(),
+    port: z.number().int().min(1).max(65535).optional(),
+    database: z.string().optional(),
+    user: z.string().optional(),
+    password: z.string().optional(),
+    connectionString: z.string().optional(),
+    environment: ConnectionEnvironmentSchema.optional(),
+    group: z.string().max(64).optional(),
+    color: z
+      .string()
+      .regex(/^#[0-9A-Fa-f]{6}$/)
+      .optional(),
+    roles: z.array(AllowedRoleSchema).min(1, "At least one role is required"),
+    managed: z.boolean().optional(),
+    ssl: SSLConfigSchema,
+    serviceName: z.string().optional(),
+    instanceName: z.string().optional(),
+    // Cassandra only, and REQUIRED by that driver rather than optional to it: a seeded
+    // Cassandra connection without it cannot open at all. Optional here because the
+    // other type-ids have no use for the field; the provider is what refuses a
+    // connection that omits it.
+    localDataCenter: z.string().optional(),
+    // MongoDB only: the database its credentials live in (`admin` in the ordinary
+    // deployment). Optional because the driver falls back to the database being opened,
+    // which is right only when the two are the same.
+    authSource: z.string().optional(),
+    // Elasticsearch only (#708): an API key pair, preferred over user/password when both
+    // are set. Same silent-strip risk as every field on this schema - see the note below.
+    // The refine below is the type gate: without it an OpenSearch seed that carries the
+    // pair validates, is copied through, and the transport would have dropped it with
+    // no error. Refuse at parse instead.
+    apiKeyId: z.string().optional(),
+    apiKeySecret: z.string().optional(),
+    // Kafka only (#1088): which SASL mechanism checks `user` and `password`, absent meaning none.
+    // Declared, because zod strips an undeclared key and a seeded SCRAM connection would then reach
+    // the provider as a credential with no mechanism, which it refuses. Kept in step with the union
+    // on DatabaseConnection by hand, as the SSL modes above are. A mechanism names no credential
+    // and no address, so it is not a field a `${ENV}` or `${vault:...}` reference is resolved in
+    // (RESOLVABLE_FIELDS in credential-resolver.ts), and the file is validated before anything is
+    // resolved: this enum refuses a reference here at load, naming the field. No type refine: the
+    // field is inert on every other engine, and nothing falls back silently when it is absent.
+    saslMechanism: z.enum(["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"]).optional(),
+    schema: z.string().optional(),
+    // Read no catalog when this connection opens (#765). Declarable in the seed file
+    // because the deployment that ships a 40,000-object owner is the one that knows, and
+    // a managed connection is read-only in the UI, so nobody could tick the box there.
+    // Unlike the maps in `secret-fields.ts` and `use-connection-payload.ts`, this
+    // schema fails SILENTLY when a field is missing: zod strips an unknown key, so a seed
+    // file setting it would round-trip as `undefined` with no error anywhere.
+    skipObjectScan: z.boolean().optional(),
+    // Visible to MCP clients (#246). Per connection and never a default, because a file-wide
+    // default would turn the opt-in into an opt-out for every connection the file later gains.
+    // Declared for the reason skipObjectScan is: zod strips an undeclared key silently, and a seed
+    // file's opt-in would validate and vanish. src/lib/seed/connection-filter.ts copies it.
+    mcp: z.boolean().optional(),
+    // Refuse every write on this connection (#1089). Declared for the reason skipObjectScan is: zod
+    // strips an undeclared key silently, and a seed file's read-only mode would validate and vanish,
+    // leaving a connection that writes. A literal boolean, never a reference: it names no credential
+    // and no address, so it is not in RESOLVABLE_FIELDS, and a `${ENV}` here fails this type at load,
+    // naming the field. Accepted only on an engine whose provider enforces it (the second refine
+    // below), and only on a managed seed (SeedConfigSchema).
+    readOnly: z.boolean().optional(),
+    // Db2 (#786), both InfluxDB types and Oxia: accept that a connection with no TLS sends its password or token in
+    // cleartext, which the provider otherwise refuses. Declared for the reason skipObjectScan is: zod strips an
+    // undeclared key silently, and a seed file's consent would validate and vanish, leaving a
+    // connection the provider refuses with a message naming a field the file did set.
+    allowInsecureAuth: z.boolean().optional(),
+    // Oxia only (O6): an address list the provider parses and refuses entry by entry; resolvable as `host` is
+    // (`RESOLVABLE_FIELDS`).
+    dataServers: z.string().optional(),
+    // Databend and Snowflake: the warehouse statements run on, a compute name rather than a credential. Declared
+    // for the reason skipObjectScan is: zod strips an undeclared key silently, and a seeded Databend Cloud connection
+    // would lose the warehouse Cloud refuses to run without, a Snowflake one the warehouse it names over the user's
+    // default.
+    warehouse: z.string().optional(),
+    // BigQuery only: the job location; absent, the provider detects it.
+    location: z.string().optional(),
+    // Snowflake only: the sign-in method. A string rather than an enum of `keypair` and `pat`, unlike saslMechanism,
+    // because it is resolvable (`RESOLVABLE_FIELDS`) and the file is validated before anything is resolved, so an enum
+    // would refuse a `${ENV}` reference here; the provider refuses any value other than `keypair` and `pat`.
+    authMethod: z.string().optional(),
+    // Snowflake only: the PEM private key's contents and the passphrase of an encrypted key, both secrets and both
+    // resolvable, so a deployment keeps them in its environment or Vault. Declared for the reason skipObjectScan is:
+    // zod strips an undeclared key silently, and a seeded key-pair connection would be refused for a key the file did
+    // name.
+    privateKey: z.string().optional(),
+    privateKeyPassphrase: z.string().optional(),
+    // Snowflake only: the role every statement runs as, which the provider requires. Declared for the reason
+    // skipObjectScan is.
+    role: z.string().optional(),
+    // S3-compatible object storage only: the signing region. Declared for the reason skipObjectScan is: zod strips an
+    // undeclared key silently, and a seeded connection to a server with a region of its own would be refused for a
+    // region the file did name.
+    region: z.string().optional(),
+    // Kubernetes: the API path (also RabbitMQ's Path prefix), the namespaces the tree lists and the TLS server name,
+    // the last two Kubernetes only. Declared for the reason skipObjectScan is: zod strips an undeclared key silently, and
+    // a seeded connection behind a Rancher proxy or a reverse proxy would reach the proxy's own API with no word.
+    apiPath: z.string().optional(),
+    namespaces: z.string().optional(),
+    tlsServerName: z.string().optional(),
+    // An AMQP 0-9-1 port, digits as a string; read by no engine yet. Declared for the reason skipObjectScan is: zod
+    // strips an undeclared key silently. A string, not a number, as the connection field is; resolvable as `host` is.
+    amqpPort: z.string().optional(),
+    /*
+     * OPC UA only (#1677): the security mode the connection asks the server for, and the SHA-256
+     * thumbprint the server's certificate must present.
+     *
+     * DECLARED BECAUSE THE PIN IS THE PROVIDER'S WHOLE SAFETY PROPERTY AND ZOD WOULD HAVE DROPPED
+     * IT IN SILENCE, the way it would drop `skipObjectScan`. Measured before this was declared: a
+     * seed file naming `securityMode: SignAndEncrypt` and a thumbprint parsed, validated, and
+     * reached the provider with neither field - an UNPINNED connection, dialled with the library's
+     * default, which trusts a server on first sight. An operator who seeded a pinned plant
+     * connection would have been given the one thing the mode exists to prevent, with no warning.
+     *
+     * The mode is an enum rather than a string, for the reason `saslMechanism` is: it names no
+     * credential and no address, so it is not resolved from `${ENV}` or `${vault:...}`
+     * (RESOLVABLE_FIELDS), and this enum refuses a reference here at load, naming the field. The
+     * thumbprint is a literal 64 hexadecimal characters, case-insensitive and separators removed by
+     * the provider, and it is not a secret: it is published by the server it names.
+     */
+    securityMode: z.enum(["None", "Sign", "SignAndEncrypt"]).optional(),
+    serverCertificateThumbprint: z.string().optional(),
+    // And the three OPC UA fields the dialog has no box for: why, at SEED_ONLY_FIELDS.opcua in src/lib/db/connection-fields.ts.
+    securityPolicyUri: z.string().optional(),
+    clientCertificatePath: z.string().optional(),
+    clientPrivateKeyPath: z.string().optional(),
+  })
+  // A field only one engine's provider reads, refused at load on every other type: why, at that engine's row of
+  // SEED_ONLY_FIELDS in src/lib/db/connection-fields.ts.
+  .superRefine(refuseSeedOnlyFields)
+  // The type's own checks before any socket (SF-038), from the validateSeed of its row in CONNECTION_STRING, so an entry
+  // that can never open is refused with the file, by name, instead of loading and failing only when it is opened. A
+  // type without one is not checked here. The message names the connection and the field, never the value, since a
+  // refused account URL may carry a token.
+  .superRefine((conn, ctx) => {
+    for (const { field, sentence } of connectionStringFor(conn.type).validateSeed?.(conn, isCredentialReference) ??
+      []) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Seed connection "${conn.id}": ${field} is refused: ${atLoad(sentence)}`,
+        path: [field],
+      });
+    }
+  })
+  // An MCP opt-in on an engine MCP is not offered for (#1089), read from MCP_EXPOSABLE.
+  .superRefine(refuseMcpWhereNotOffered(MCP_EXPOSABLE))
+  // A read-only mode the engine's provider ignores would be a promise nobody keeps: the seed would be
+  // listed as read-only and still write (#1089). Read from READ_ONLY_ENFORCED, never a type-id branch,
+  // so an engine is admitted by its own declaration.
+  .superRefine((conn, ctx) => {
+    if (conn.readOnly !== true || READ_ONLY_ENFORCED[conn.type]) return;
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `readOnly is not offered for ${conn.type}: its provider does not enforce a read-only mode, so the connection would be listed as read-only and still write. Remove readOnly from this connection, or connect with a database role that cannot write.`,
+      path: ["readOnly"],
+    });
+  })
+  // A read-only seed whose credential its type declares unsafe to rely on (src/lib/db/credential-warnings.ts): a
+  // published default pair, or no secret where the type accepts none, so the mode would promise a boundary the
+  // server does not keep. The file shows only literals, so a pair with a `${ENV}` or `${vault:...}` reference in
+  // either field passes here and the type's provider checks the resolved value before it dials, while a password
+  // the file leaves absent or empty is refused whatever the user is: load refuses what the file shows; resolution
+  // refuses the rest. Read from the declared record, never a type-id branch. The message names the connection and
+  // the field, never the value.
+  .superRefine((conn, ctx) => {
+    if (conn.readOnly !== true) return;
+    if (isCredentialReference(conn.password)) return;
+    const userIsReference = isCredentialReference(conn.user);
+    if (userIsReference && (conn.password ?? "") !== "") return;
+    const refusal = readOnlySeedRefusal(conn.type, {
+      user: userIsReference ? undefined : conn.user,
+      password: conn.password,
+    });
+    if (refusal === undefined) return;
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `Seed connection "${conn.id}": ${refusal} readOnly: true is refused with this credential, because the mode would promise a boundary the server does not keep. Give this connection a credential of its own, or remove readOnly.`,
+      path: ["password"],
+    });
+  })
+  // A connection string the type's provider does not read (Spec A section 7): the provider would drop it in
+  // silence and open whatever the other fields say, so the seed would be listed as one database and reach
+  // another, or none. Read from CONNECTION_STRING_ACCEPTED, never a type-id branch. Any set value counts, a
+  // reference included, because the file is validated before anything is resolved. The message names the
+  // connection and the type, never the value.
+  .superRefine((conn, ctx) => {
+    if (conn.connectionString === undefined || CONNECTION_STRING_ACCEPTED[conn.type]) return;
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `Seed connection "${conn.id}" sets connectionString, which the ${conn.type} provider does not read: move the value into host, port, user, password and database`,
+      path: ["connectionString"],
+    });
+  });
+
+/**
+ * The load's refusal of a read-only seed that is not managed (#1089). An editable seed is copied into
+ * the browser of every user its roles admit, with its password and TLS client key
+ * (`GET /api/connections/managed`), and the sidebar's Duplicate turns that copy into a connection of
+ * the user's own, which `resolveConnection` returns verbatim and whose readOnly the user can clear, so
+ * the mode would bind nobody. It names `defaults.managed` when the value came from there, because that
+ * is the line to change.
+ */
+function unmanagedReadOnlyMessage(fromDefaults: boolean): string {
+  const managed = fromDefaults ? "managed: false from defaults.managed" : "managed: false";
+  return `readOnly: true needs a managed connection, and this one has ${managed}: an unmanaged seed is copied into the browser of every user its roles admit, with its password and TLS client key, and Duplicate turns that copy into a connection of the user's own whose readOnly can be cleared. Set managed: true on this connection, or remove readOnly.`;
+}
 
 export const SeedConfigSchema = z
   .object({
@@ -92,8 +372,38 @@ export const SeedConfigSchema = z
     defaults: SeedDefaultsSchema.optional(),
     connections: z.array(SeedConnectionSchema).min(1, "At least one connection is required"),
   })
-  .refine((cfg) => new Set(cfg.connections.map((c) => c.id)).size === cfg.connections.length, {
-    message: "Connection IDs must be unique",
+  // One issue per repeated id, at the path of its first repeat, so the error names the id. A seed id is a name, not
+  // a value, so naming it is allowed.
+  .superRefine((cfg, ctx) => {
+    const seen = new Set<string>();
+    const reported = new Set<string>();
+    cfg.connections.forEach((conn, index) => {
+      if (!seen.has(conn.id)) {
+        seen.add(conn.id);
+        return;
+      }
+      if (reported.has(conn.id)) return;
+      reported.add(conn.id);
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Connection id "${conn.id}" is declared more than once`,
+        path: ["connections", index, "id"],
+      });
+    });
+  })
+  // Here and not on SeedConnectionSchema, because `defaults.managed` is merged only after parsing
+  // (connection-filter.ts): the effective value is the connection's own, else the default, else true,
+  // the precedence mergeDefaults and filterByRoles apply.
+  .superRefine((cfg, ctx) => {
+    cfg.connections.forEach((conn, index) => {
+      if (conn.readOnly !== true) return;
+      if ((conn.managed ?? cfg.defaults?.managed ?? true) === true) return;
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: unmanagedReadOnlyMessage(conn.managed === undefined),
+        path: ["connections", index, "readOnly"],
+      });
+    });
   });
 
 export type SeedConnection = z.infer<typeof SeedConnectionSchema>;
@@ -104,4 +414,19 @@ export interface ManagedConnection extends DatabaseConnection {
   managed: boolean;
   roles: string[];
   seedId: string;
+  /** Visible to MCP clients (#246); absent on the built-in samples, which never opt in. */
+  mcp?: boolean;
+  /**
+   * Set in code after the role filter, by the discovery source on every discovered connection and, for an
+   * operator entry, by src/lib/seed/index.ts when the operator loader's fill read it as literal (every
+   * file-like entry while SEED_LITERAL_VALUES is on); never read from a file;
+   * stripped by GET /api/connections/managed. A connection carrying it is used with its values as
+   * written: no `${NAME}` or `${vault:...}` in it is resolved.
+   */
+  literal?: true;
+  /**
+   * Under governance only, set by GET /api/connections/managed from the grant level the record was resolved for: "read"
+   * when statements run under the connection's read credential. Never read from a file.
+   */
+  access?: "read" | "write";
 }

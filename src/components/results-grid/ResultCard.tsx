@@ -4,7 +4,8 @@ import React, { useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { Hash, ChevronRight, Lock } from "lucide-react";
 import { type MaskingPattern, maskValueByPattern } from "@/lib/data-masking";
-import { formatCellValue } from "./utils";
+import type { VectorColumn } from "@/lib/db/vector/types";
+import { formatCellValue, renderContextFor } from "./utils";
 
 export interface ResultCardProps {
   row: Record<string, unknown>;
@@ -15,6 +16,8 @@ export interface ResultCardProps {
   onSelect: () => void;
   maskingActive?: boolean;
   sensitiveColumns?: Map<string, MaskingPattern>;
+  /** The result's vector columns (`QueryResult.vectorColumns`), so a preview field of one draws as a vector cell. */
+  vectorColumns?: Readonly<Record<string, VectorColumn>>;
 }
 
 export function ResultCard({
@@ -26,6 +29,7 @@ export function ResultCard({
   onSelect,
   maskingActive,
   sensitiveColumns,
+  vectorColumns,
 }: ResultCardProps) {
   const primaryValue: unknown = row[primaryColumn];
   const idValue: unknown = idColumn ? row[idColumn] : null;
@@ -35,8 +39,11 @@ export function ResultCard({
     if (maskingActive && sensitiveColumns?.has(primaryColumn) && primaryValue != null) {
       return maskValueByPattern(primaryValue, sensitiveColumns.get(primaryColumn)!);
     }
-    return primaryValue != null ? String(primaryValue) : `Row ${index + 1}`;
-  }, [maskingActive, sensitiveColumns, primaryColumn, primaryValue, index]);
+    if (primaryValue == null) return `Row ${index + 1}`;
+    // A declared vector column draws as the grid draws it, not as the comma-joined text of its elements.
+    const context = renderContextFor(vectorColumns, primaryColumn);
+    return context === undefined ? String(primaryValue) : formatCellValue(primaryValue, context).display;
+  }, [maskingActive, sensitiveColumns, primaryColumn, primaryValue, index, vectorColumns]);
 
   // Show first 4 fields (excluding primary and id)
   const previewFields = fields.filter((f) => f !== primaryColumn && f !== idColumn).slice(0, 4);
@@ -49,8 +56,8 @@ export function ResultCard({
     >
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2 flex-1 min-w-0">
-          <div className="w-8 h-8 rounded-lg bg-blue-500/10 flex items-center justify-center shrink-0">
-            <Hash strokeWidth={1.5} className="w-3.5 h-3.5 text-blue-400" />
+          <div className="w-8 h-8 rounded-lg bg-brand-tint/10 flex items-center justify-center shrink-0">
+            <Hash strokeWidth={1.5} className="w-3.5 h-3.5 text-brand" />
           </div>
           <div className="min-w-0 flex-1">
             <p
@@ -71,14 +78,15 @@ export function ResultCard({
         {previewFields.map((field) => {
           const pattern = sensitiveColumns?.get(field);
           const isMasked = maskingActive && pattern && row[field] != null && row[field] !== undefined;
-          const displayValue = isMasked ? maskValueByPattern(row[field], pattern) : formatCellValue(row[field]).display;
-          const className = isMasked ? "text-fg-muted italic" : formatCellValue(row[field]).className;
+          const formatted = formatCellValue(row[field], renderContextFor(vectorColumns, field));
+          const displayValue = isMasked ? maskValueByPattern(row[field], pattern) : formatted.display;
+          const className = isMasked ? "text-fg-muted italic" : formatted.className;
 
           return (
             <div key={field} className="flex items-center justify-between text-xs">
               <span className="text-fg-muted truncate mr-2">
                 {field}
-                {isMasked && <Lock strokeWidth={1.5} className="w-2.5 h-2.5 inline ml-1 text-purple-400" />}
+                {isMasked && <Lock strokeWidth={1.5} className="w-2.5 h-2.5 inline ml-1 text-hue-purple" />}
               </span>
               <span className={cn("truncate max-w-[60%] text-right font-mono", className)}>{displayValue}</span>
             </div>

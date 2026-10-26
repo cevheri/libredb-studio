@@ -7,7 +7,6 @@ function makeCaps(overrides: Partial<ProviderCapabilities> = {}): ProviderCapabi
     queryLanguage: "sql",
     supportsExplain: true,
     supportsExternalQueryLimiting: true,
-    supportsCreateTable: true,
     supportsInlineRowEdit: true,
     supportsMaintenance: true,
     maintenanceOperations: [],
@@ -35,6 +34,57 @@ describe("resolveTabType", () => {
     expect(resolveTabType(makeCaps({ queryLanguage: "json", queryDialect: "redis" }))).toBe("redis");
   });
 
+  test("Prometheus (queryLanguage promql, no dialect) gets a promql tab, not the SQL fallback (#1085)", () => {
+    expect(resolveTabType(makeCaps({ queryLanguage: "promql" }))).toBe("promql");
+  });
+
+  test("Kafka gets a kafka tab, not the MongoDB one its queryLanguage json would give (#1088)", () => {
+    // The dialect is read before the language: a Kafka read request is JSON of this product's own
+    // schema, never a MongoDB document.
+    expect(resolveTabType(makeCaps({ queryLanguage: "json", queryDialect: "kafka" }))).toBe("kafka");
+    // The control: the same declaration with the dialect removed is MongoDB's.
+    expect(resolveTabType(makeCaps({ queryLanguage: "json" }))).toBe("mongodb");
+  });
+
+  test("etcd gets an etcd tab, not the MongoDB one its queryLanguage json would give (#1089)", () => {
+    // An etcdctl command line is no MongoDB document either, so the dialect rung sits above the json rung.
+    expect(resolveTabType(makeCaps({ queryLanguage: "json", queryDialect: "etcd" }))).toBe("etcd");
+    // The control: the same declaration with the dialect removed is MongoDB's.
+    expect(resolveTabType(makeCaps({ queryLanguage: "json" }))).toBe("mongodb");
+  });
+
+  test("Milvus gets a milvus tab, not the MongoDB one its queryLanguage json would give (vector-family spec 5.7)", () => {
+    expect(resolveTabType(makeCaps({ queryLanguage: "json", queryDialect: "milvus" }))).toBe("milvus");
+    // The control: the same declaration with the dialect removed is MongoDB's.
+    expect(resolveTabType(makeCaps({ queryLanguage: "json" }))).toBe("mongodb");
+  });
+
+  test("Qdrant gets a qdrant tab, not the MongoDB one its queryLanguage json would give (vector-family spec 6.7)", () => {
+    expect(resolveTabType(makeCaps({ queryLanguage: "json", queryDialect: "qdrant" }))).toBe("qdrant");
+    // The control: the same declaration with the dialect removed is MongoDB's.
+    expect(resolveTabType(makeCaps({ queryLanguage: "json" }))).toBe("mongodb");
+  });
+
+  test("Oxia gets an oxia tab, not the MongoDB one its queryLanguage json would give (SB2-4.4)", () => {
+    expect(resolveTabType(makeCaps({ queryLanguage: "json", queryDialect: "oxia" }))).toBe("oxia");
+  });
+
+  test("S3 gets an s3 tab, not the MongoDB one its queryLanguage json would give", () => {
+    expect(resolveTabType(makeCaps({ queryLanguage: "json", queryDialect: "s3" }))).toBe("s3");
+  });
+
+  test("Firestore gets a firestore tab, not the MongoDB one its queryLanguage json would give", () => {
+    expect(resolveTabType(makeCaps({ queryLanguage: "json", queryDialect: "firestore" }))).toBe("firestore");
+  });
+
+  test("Neo4j (queryLanguage cypher, no dialect) gets a cypher tab, not the SQL fallback (Neo4j spec 6.5)", () => {
+    expect(resolveTabType(makeCaps({ queryLanguage: "cypher" }))).toBe("cypher");
+  });
+
+  test("InfluxDB (queryLanguage influxql, no dialect) gets an influxql tab, not the SQL fallback (InfluxDB spec 6.7)", () => {
+    expect(resolveTabType(makeCaps({ queryLanguage: "influxql" }))).toBe("influxql");
+  });
+
   test("missing capabilities fall back to sql", () => {
     expect(resolveTabType(undefined)).toBe("sql");
     expect(resolveTabType(null)).toBe("sql");
@@ -47,5 +97,56 @@ describe("editorLanguageForTabType", () => {
     expect(editorLanguageForTabType("mongodb")).toBe("json");
     expect(editorLanguageForTabType("libredb")).toBe("libredb");
     expect(editorLanguageForTabType("redis")).toBe("redis");
+    expect(editorLanguageForTabType("promql")).toBe("promql");
+    expect(editorLanguageForTabType("kafka")).toBe("json");
+    expect(editorLanguageForTabType("etcd")).toBe("etcd");
+    expect(editorLanguageForTabType("cypher")).toBe("graph-cypher");
+    expect(editorLanguageForTabType("influxql")).toBe("influxql");
+  });
+
+  test("a Kafka tab renders in Monaco's built-in json mode, and no language of its own (#1088)", () => {
+    // Its read request is JSON, so it takes the mode a MongoDB tab takes rather than the SQL
+    // fallback, and no Monaco language is registered for it (#1088, section 3.3).
+    expect(editorLanguageForTabType(resolveTabType(makeCaps({ queryLanguage: "json", queryDialect: "kafka" })))).toBe(
+      "json",
+    );
+  });
+
+  test("an etcd tab renders in the etcd language this repository registers over the provider's lexer (#1089)", () => {
+    expect(editorLanguageForTabType(resolveTabType(makeCaps({ queryLanguage: "json", queryDialect: "etcd" })))).toBe(
+      "etcd",
+    );
+  });
+
+  test("a milvus tab renders in the milvus console language, restored with no capabilities (vector-family spec 3.8)", () => {
+    expect(editorLanguageForTabType("milvus")).toBe("milvus");
+    expect(editorLanguageForTabType(resolveTabType(makeCaps({ queryLanguage: "json", queryDialect: "milvus" })))).toBe(
+      "milvus",
+    );
+  });
+
+  test("a qdrant tab renders in the qdrant console language, restored with no capabilities (vector-family spec 3.8)", () => {
+    expect(editorLanguageForTabType("qdrant")).toBe("qdrant");
+    expect(editorLanguageForTabType(resolveTabType(makeCaps({ queryLanguage: "json", queryDialect: "qdrant" })))).toBe(
+      "qdrant",
+    );
+  });
+
+  test("an oxia tab renders in the oxia language, restored with no capabilities (SB2-4.6)", () => {
+    expect(editorLanguageForTabType("oxia")).toBe("oxia");
+    expect(editorLanguageForTabType(resolveTabType(makeCaps({ queryLanguage: "json", queryDialect: "oxia" })))).toBe(
+      "oxia",
+    );
+  });
+
+  test("an s3 tab renders in the s3 language, restored with no capabilities", () => {
+    expect(editorLanguageForTabType("s3")).toBe("s3");
+    expect(editorLanguageForTabType(resolveTabType(makeCaps({ queryLanguage: "json", queryDialect: "s3" })))).toBe(
+      "s3",
+    );
+  });
+
+  test("a firestore tab renders in the firestore language, restored with no capabilities", () => {
+    expect(editorLanguageForTabType("firestore")).toBe("firestore");
   });
 });

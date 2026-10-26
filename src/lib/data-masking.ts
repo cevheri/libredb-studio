@@ -4,6 +4,8 @@
  * Supports configurable patterns, RBAC, per-cell reveal, and persistence.
  */
 
+import { numberedRepeatBase } from "@/lib/db/utils/result-fields";
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export type MaskType = "email" | "phone" | "card" | "ssn" | "full" | "partial" | "ip" | "date" | "financial" | "custom";
@@ -26,86 +28,6 @@ export interface MaskingConfig {
     user: { canToggle: boolean; canReveal: boolean };
   };
 }
-
-/** Legacy interface kept for backward compat (DataProfiler uses it) */
-export interface MaskingRule {
-  pattern: RegExp;
-  label: string;
-  mask: (value: string) => string;
-}
-
-// ─── Built-in Masking Rules (legacy, used by detectSensitiveColumns) ─────────
-
-const MASKING_RULES: MaskingRule[] = [
-  {
-    pattern: /^(email|e_mail|user_email|customer_email|contact_email)$/i,
-    label: "Email",
-    mask: (v) => {
-      const parts = v.split("@");
-      if (parts.length !== 2) return "***@***.***";
-      const name = parts[0];
-      const domain = parts[1];
-      return `${name[0]}${"*".repeat(Math.max(name.length - 1, 2))}@${domain[0]}${"*".repeat(Math.max(domain.length - 1, 2))}`;
-    },
-  },
-  {
-    pattern: /^(password|passwd|pass|pwd|secret|user_password|hashed_password|password_hash|hash)$/i,
-    label: "Password",
-    mask: () => "********",
-  },
-  {
-    pattern: /^(ssn|social_security|social_security_number|national_id|national_number)$/i,
-    label: "SSN",
-    mask: (v) => `***-**-${v.slice(-4).padStart(4, "*")}`,
-  },
-  {
-    pattern: /^(credit_card|card_number|cc_number|card_num|pan|credit_card_number)$/i,
-    label: "Credit Card",
-    mask: (v) => `****-****-****-${v.replace(/\D/g, "").slice(-4).padStart(4, "*")}`,
-  },
-  {
-    pattern: /^(phone|phone_number|mobile|cell|telephone|tel|contact_phone)$/i,
-    label: "Phone",
-    mask: (v) => {
-      const digits = v.replace(/\D/g, "");
-      if (digits.length < 4) return "***";
-      return `${"*".repeat(digits.length - 4)}${digits.slice(-4)}`;
-    },
-  },
-  {
-    pattern:
-      /^(token|access_token|refresh_token|api_key|apikey|api_secret|secret_key|auth_token|bearer_token|session_token)$/i,
-    label: "Token/Key",
-    mask: (v) => `${v.slice(0, 4)}${"*".repeat(Math.max(v.length - 8, 4))}${v.slice(-4)}`,
-  },
-  {
-    pattern: /^(address|street|street_address|home_address|billing_address|shipping_address)$/i,
-    label: "Address",
-    mask: () => "*** **** ***",
-  },
-  {
-    pattern: /^(ip|ip_address|client_ip|remote_ip|source_ip)$/i,
-    label: "IP Address",
-    mask: (v) => {
-      const parts = v.split(".");
-      if (parts.length === 4) return `${parts[0]}.***.***.${parts[3]}`;
-      return "***";
-    },
-  },
-  {
-    pattern: /^(salary|income|balance|amount|wage|compensation|net_pay|gross_pay|revenue)$/i,
-    label: "Financial",
-    mask: () => "***,***.**",
-  },
-  {
-    pattern: /^(birth|dob|date_of_birth|birthdate|birth_date|birthday)$/i,
-    label: "Birthdate",
-    mask: (v) => {
-      if (v.length >= 4) return `****-**-${v.slice(-2)}`;
-      return "****-**-**";
-    },
-  },
-];
 
 // ─── Default Masking Config ──────────────────────────────────────────────────
 
@@ -236,9 +158,11 @@ const MASK_FUNCTIONS: Record<MaskType, (value: string, customMask?: string) => s
   email: (v) => {
     const parts = v.split("@");
     if (parts.length !== 2) return "***@***.***";
-    const name = parts[0];
-    const domain = parts[1];
-    return `${name[0]}${"*".repeat(Math.max(name.length - 1, 2))}@${domain[0]}${"*".repeat(Math.max(domain.length - 1, 2))}`;
+    const [name, domain] = parts;
+    if (!name || !domain) return "***@***.***";
+    const nameChars = Array.from(name);
+    const domainChars = Array.from(domain);
+    return `${nameChars[0]}${"*".repeat(Math.max(nameChars.length - 1, 2))}@${domainChars[0]}${"*".repeat(Math.max(domainChars.length - 1, 2))}`;
   },
   phone: (v) => {
     const digits = v.replace(/\D/g, "");
@@ -249,17 +173,21 @@ const MASK_FUNCTIONS: Record<MaskType, (value: string, customMask?: string) => s
   ssn: (v) => `***-**-${v.slice(-4).padStart(4, "*")}`,
   full: () => "********",
   partial: (v) => {
-    if (v.length <= 8) return "*".repeat(v.length);
-    return `${v.slice(0, 4)}${"*".repeat(Math.max(v.length - 8, 4))}${v.slice(-4)}`;
+    const chars = Array.from(v);
+    if (chars.length <= 8) return "*".repeat(chars.length);
+    const show = Math.min(4, Math.floor(chars.length / 8));
+    const hidden = Math.max(chars.length - 2 * show, 4);
+    return `${chars.slice(0, show).join("")}${"*".repeat(hidden)}${chars.slice(-show).join("")}`;
   },
   ip: (v) => {
     const parts = v.split(".");
     if (parts.length === 4) return `${parts[0]}.***.***.${parts[3]}`;
     return "***";
   },
+  // Keeps the day of an ISO date, with or without a time after it; anything else is masked whole.
   date: (v) => {
-    if (v.length >= 4) return `****-**-${v.slice(-2)}`;
-    return "****-**-**";
+    const day = /^\d{4}-\d{2}-(\d{2})(?!\d)/.exec(v.trim())?.[1];
+    return day ? `****-**-${day}` : "****-**-**";
   },
   financial: () => "***,***.**",
   custom: (_v, customMask) => customMask || "***",
@@ -274,20 +202,35 @@ export function maskByType(value: string, pattern: MaskingPattern): string {
 
 // ─── Config-based Detection ──────────────────────────────────────────────────
 
+/**
+ * A field name and every name it may repeat: a result numbers a repeated column `name (2)`
+ * (`uniqueFieldNames`), so `email (2)` carries an email and must be matched as `email` too.
+ * The base is tried even when it is not in the result (the graph asks one name at a time), and
+ * an alias that merely looks numbered is masked like its base, which is the safe direction.
+ */
+function namesToMatch(field: string): string[] {
+  const names = [field];
+  for (let base = numberedRepeatBase(field); base !== null; base = numberedRepeatBase(base)) names.push(base);
+  return names;
+}
+
 export function detectSensitiveColumnsFromConfig(fields: string[], config: MaskingConfig): Map<string, MaskingPattern> {
   const sensitiveMap = new Map<string, MaskingPattern>();
 
   const enabledPatterns = config.patterns.filter((p) => p.enabled);
 
   for (const field of fields) {
+    const names = namesToMatch(field);
     for (const pattern of enabledPatterns) {
-      const matched = pattern.columnPatterns.some((cp) => {
-        try {
-          return new RegExp(`^${cp}$`, "i").test(field);
-        } catch {
-          return cp.toLowerCase() === field.toLowerCase();
-        }
-      });
+      const matched = pattern.columnPatterns.some((cp) =>
+        names.some((name) => {
+          try {
+            return new RegExp(`^${cp}$`, "i").test(name);
+          } catch {
+            return cp.toLowerCase() === name.toLowerCase();
+          }
+        }),
+      );
       if (matched) {
         sensitiveMap.set(field, pattern);
         break;
@@ -298,39 +241,11 @@ export function detectSensitiveColumnsFromConfig(fields: string[], config: Maski
   return sensitiveMap;
 }
 
-// ─── Legacy Detection (backward compat — DataProfiler) ──────────────────────
-
-export function detectSensitiveColumns(fields: string[]): Map<string, MaskingRule> {
-  const sensitiveMap = new Map<string, MaskingRule>();
-
-  for (const field of fields) {
-    for (const rule of MASKING_RULES) {
-      if (rule.pattern.test(field)) {
-        sensitiveMap.set(field, rule);
-        break;
-      }
-    }
-  }
-
-  return sensitiveMap;
-}
-
 // ─── Mask Value Helpers ──────────────────────────────────────────────────────
-
-export function maskValue(value: unknown, rule: MaskingRule): string {
-  if (value === null || value === undefined) return "NULL";
-  return rule.mask(String(value));
-}
 
 export function maskValueByPattern(value: unknown, pattern: MaskingPattern): string {
   if (value === null || value === undefined) return "NULL";
   return maskByType(String(value), pattern);
-}
-
-// ─── Has Sensitive Columns ───────────────────────────────────────────────────
-
-export function hasSensitiveColumns(fields: string[]): boolean {
-  return fields.some((field) => MASKING_RULES.some((rule) => rule.pattern.test(field)));
 }
 
 // ─── Bulk Masking Utility ────────────────────────────────────────────────────
@@ -374,6 +289,16 @@ export function canToggleMasking(role: string | undefined, config: MaskingConfig
 export function canReveal(role: string | undefined, config: MaskingConfig): boolean {
   if (!role || role === "user") return config.roleSettings.user.canReveal;
   return config.roleSettings.admin.canReveal;
+}
+
+/**
+ * Whether a result surface masks right now: the role and config allow it, and the
+ * shell's switch (or, with none, the config's own flag) has it on. The grid, the
+ * graph and the Data Profiler all read this, so they can never disagree about one
+ * column (#1421).
+ */
+export function maskingInForce(role: string | undefined, config: MaskingConfig, enabled: boolean | undefined): boolean {
+  return shouldMask(role, config) && (enabled ?? config.enabled);
 }
 
 // ─── Config Persistence ──────────────────────────────────────────────────────

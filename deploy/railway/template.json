@@ -1,14 +1,14 @@
 {
   "$comment": "Reviewable serialization of the LibreDB Studio Railway template. Railway does not ingest this file directly — the marketplace template is built in Railway's template editor (Workspace -> Templates -> New Template, at https://railway.com/workspace/templates). This file is the single source of truth for what to enter there (see PUBLISH.md) and what a future API automation would consume. Mirrors deploy/caprover/libredb-studio.yml.",
   "name": "LibreDB Studio",
-  "description": "Open-source web-based SQL IDE. Query sixteen engines - PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, SQL Server, MongoDB, Redis, Couchbase, ClickHouse, Druid, Elasticsearch, OpenSearch, Apache Trino & Apache Cassandra - from your browser, with optional read-only AI on your own model key.",
+  "description": "Open-source web-based SQL IDE. Query forty-one engines - PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Redis, Couchbase, Firestore, ClickHouse, Druid, Elasticsearch, OpenSearch, Trino, Databend, BigQuery, Snowflake, Apache Spark, Apache Cassandra, Prometheus, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Apache Kafka, etcd, Neo4j, Milvus, Qdrant, Oxia, S3-compatible object storage, Kubernetes, MQTT, RabbitMQ, OPC UA, MTConnect, Modbus, NETCONF, SNMP and Sparkplug B - from your browser, with optional read-only AI on your own model key.",
   "tags": ["database", "sql", "ide", "postgres", "mysql", "mongodb", "redis"],
   "services": [
     {
       "name": "libredb-studio",
       "icon": "https://raw.githubusercontent.com/libredb/libredb-studio/main/deploy/railway/libredb-studio.png",
       "source": {
-        "image": "ghcr.io/libredb/libredb-studio:0.9.22"
+        "image": "ghcr.io/libredb/libredb-studio:1.1.0"
       },
       "networking": {
         "public": true,
@@ -42,9 +42,9 @@
       "variableDescriptions": {
         "JWT_SECRET": "Secret key used to sign login session tokens. Auto-generated — keep it.",
         "ADMIN_EMAIL": "Login email for the ADMIN account (full access incl. maintenance tools).",
-        "ADMIN_PASSWORD": "Password for the admin account. Auto-generated; find it in Variables after deploy.",
+        "ADMIN_PASSWORD": "Password for the admin account. Auto-generated; find it in Variables after deploy. It seeds the account once, while the server store is still empty; changing it later takes effect only once ADMIN_PASSWORD_RESET=true is set with the new value already in place, see the README.",
         "USER_EMAIL": "Login email for the standard, query-only account.",
-        "USER_PASSWORD": "Password for the standard user. Auto-generated; find it in Variables after deploy.",
+        "USER_PASSWORD": "Password for the standard user. Auto-generated; find it in Variables after deploy. Seeds the account once, with no reset flag and no warning: change it under Admin → Accounts in Studio.",
         "NEXT_PUBLIC_AUTH_PROVIDER": "Auth mode: 'local' (email/password). Set 'oidc' for SSO (needs the OIDC_* optional vars).",
         "STORAGE_PROVIDER": "Server-side storage for saved connections & settings: 'local' (browser only) | 'sqlite' (file on the volume) | 'postgres' (multi-node). Keep 'sqlite'.",
         "STORAGE_SQLITE_PATH": "SQLite file path on the mounted volume (/app/data). Keep the default.",
@@ -55,13 +55,16 @@
         "LLM_API_KEY": { "example": "AIza... / sk-...", "description": "API key for the chosen AI provider (Gemini/OpenAI). Not needed for a local Ollama." },
         "LLM_MODEL": { "example": "gemini-2.5-flash", "description": "AI model name; provider default used if empty (e.g. gpt-4o-mini, llama3.1)." },
         "LLM_API_URL": { "example": "http://host:11434/v1", "description": "Base URL for ollama/custom AI providers only. Not needed for gemini/openai." },
+        "LLM_MODEL_EFFORT": { "example": "low", "description": "Reasoning effort for the openai provider only: none | minimal | low | medium | high | xhigh | max. Which values a model takes is the model's own. Omit for the model's default." },
         "OIDC_ISSUER": { "example": "https://tenant.auth0.com", "description": "OIDC issuer URL for SSO. Required when NEXT_PUBLIC_AUTH_PROVIDER=oidc." },
         "OIDC_CLIENT_ID": { "example": "", "description": "OIDC application client ID (SSO)." },
         "OIDC_CLIENT_SECRET": { "example": "", "description": "OIDC application client secret (SSO)." },
         "OIDC_SCOPE": { "example": "openid profile email", "description": "OIDC scopes. Defaults to 'openid profile email' if empty." },
         "OIDC_ROLE_CLAIM": { "example": "realm_access.roles", "description": "Claim path holding user roles, used for admin mapping." },
         "OIDC_ADMIN_ROLES": { "example": "admin", "description": "Comma-separated role values mapped to admin. Defaults to 'admin'." },
-        "STORAGE_POSTGRES_URL": { "example": "postgresql://user:pass@host:5432/db", "description": "PostgreSQL URL for multi-node storage. Also set STORAGE_PROVIDER=postgres." }
+        "STORAGE_POSTGRES_URL": { "example": "postgresql://user:pass@host:5432/db", "description": "PostgreSQL URL for multi-node storage. Also set STORAGE_PROVIDER=postgres." },
+        "ADMIN_TOTP_SECRET": { "example": "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", "description": "Optional second factor for the admin account, as a base32 shared secret. It must be at least 128 bits or the app refuses every login with 503; generate one with: openssl rand 20 | base32. Leave it unset for password-only sign-in." },
+        "ADMIN_PASSWORD_RESET": { "example": "true", "description": "Set it to true for one redeploy to make the stored admin password match ADMIN_PASSWORD, then remove it. Set the new password first, in this or an earlier redeploy. It also clears that account's passkeys, ends its other sessions, and sets its second factor from ADMIN_TOTP_SECRET, or clears the factor when that variable is unset." }
       },
       "$note": "variables = pre-configured (entered with defaults). optionalVariables = mark each as OPTIONAL in the editor so deployers can fill them only if needed (empty non-optional vars become REQUIRED in Railway). Volumes are attached via right-click on the canvas, not the Settings panel."
     }

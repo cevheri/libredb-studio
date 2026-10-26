@@ -1,3 +1,4 @@
+// @requires helm
 /**
  * Regression test for issue #136: the documented minimal Helm install
  * (only secrets.jwtSecret + secrets.adminPassword) must render cleanly -
@@ -10,6 +11,7 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { parseAllDocuments } from "yaml";
+import { howItFailed } from "../helpers/spawn-outcome";
 
 const CHART_DIR = join(import.meta.dir, "../../charts/libredb-studio");
 
@@ -44,7 +46,7 @@ function renderChart(extraArgs: string[] = []): { secret: RenderedManifest; depl
     stderr: "pipe",
   });
   if (run.exitCode !== 0) {
-    throw new Error(`helm template failed (exit ${run.exitCode}): ${run.stderr.toString()}`);
+    throw new Error(`helm template ${howItFailed(run)}: ${run.stderr.toString()}`);
   }
   const docs = parseAllDocuments(run.stdout.toString()).map((doc) => doc.toJSON() as RenderedManifest);
   const secret = docs.find(

@@ -1,10 +1,15 @@
 /**
  * The accuracy gate for outward-facing marketplace copy.
  *
- * These four files are submissions to somebody else's catalog: Railway, DigitalOcean,
- * SUSE PCSC and Azure Partner Center. Nobody in this repo reviews them again once they
- * are mailed, so the only thing standing between a corrected claim and its return is a
- * test. A previous revision replaced a false natural-language-to-SQL claim with two new
+ * These seven files are copy submitted to somebody else's catalog: Railway,
+ * DigitalOcean, SUSE PCSC (the canonical wording and the size-limited page body cut from
+ * it), Azure Partner Center, the AWS Marketplace Management Portal, and the app-readme
+ * overlay Rancher renders. Nobody in this repo reviews them again once they are
+ * submitted - the first six by mail, the last by a pull request against
+ * `rancher/partner-charts`, where no test here can reach the copy that ships - so the only
+ * thing standing between a corrected claim and its return is a test.
+ *
+ * A previous revision replaced a false natural-language-to-SQL claim with two new
  * ones - "AI query explanation on any connection" (true on 7 of the 14 engines) and
  * "never executes what it recommends" (the consented hand-over runs exactly the
  * recommended statement) - which is why the gate is phrase-level rather than a review
@@ -20,8 +25,9 @@
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative, sep } from "node:path";
 import { DB_UI_CONFIG, getDBConfig } from "@/lib/db-ui-config";
+import { EXTERNAL_DATABASE_TYPES } from "@/lib/db/compatibility";
 import type { DatabaseType } from "@/lib/types";
 
 const REPO_ROOT = join(import.meta.dir, "../..");
@@ -32,6 +38,9 @@ const LISTINGS = {
   digitalocean: "deploy/digitalocean/assets/description-long.md",
   rancher: "deploy/rancher/CATALOG_LISTING.md",
   azure: "deploy/azure/listing/listing-fields.md",
+  aws: "deploy/aws/listing/listing-fields.md",
+  rancherAppReadme: "deploy/rancher/app-readme.md",
+  rancherPcsc: "deploy/rancher/pcsc-listing.html",
 } as const;
 
 /**
@@ -43,6 +52,10 @@ const LISTINGS = {
  */
 function submittedCopy(path: string): string {
   const content = readFileSync(join(REPO_ROOT, path), "utf8");
+  // The PCSC page body is HTML, and every sentence splitter below reads line and bullet
+  // boundaries. A list item is a boundary on the rendered page, so it is one here too;
+  // without it a bullet ending in an engine name runs into the next bullet's claim.
+  if (path === LISTINGS.rancherPcsc) return content.replace(/<\/?(?:ul|li)>/g, "\n\n");
   if (path !== LISTINGS.rancher) return content;
   const from = content.indexOf("## Short description");
   const to = content.indexOf("## Outstanding corrections");
@@ -71,19 +84,28 @@ function typeIdOf(file: string): string {
 }
 
 /**
- * The engines whose provider declares a plan format. The match is anchored to the start
- * of the line so the several comment lines that discuss a MISSING `explainFormat` (the
- * search provider explains at length why it declares none) are not read as declarations.
+ * A provider file that declares a plan format, in either of the two forms one is written
+ * in. Both alternatives are anchored to the start of a line so the several comment lines
+ * that discuss a MISSING `explainFormat` (the search provider explains at length why it
+ * declares none) are not read as declarations.
+ *
+ * The second alternative is the MEASURED form. MySQL serves every MySQL-wire relative and
+ * they do not share one EXPLAIN grammar, so its provider probes the server at connect and
+ * spreads the result in rather than writing a literal (#574). It returns a plan on every
+ * engine measured, so a listing may name it; a literal-only match read it as plan-less.
  */
+const DECLARES_EXPLAIN_FORMAT = /^\s*explainFormat:\s*"|^\s*\.\.\..*\bexplainFormat: this\./m;
+
+/** The engines whose provider declares a plan format. */
 const explainCapable: DatabaseType[] = providerFiles(PROVIDER_ROOT)
-  .filter((file) => /^\s*explainFormat:\s*"/m.test(readFileSync(file, "utf8")))
+  .filter((file) => DECLARES_EXPLAIN_FORMAT.test(readFileSync(file, "utf8")))
   .map(typeIdOf)
   .filter((id): id is DatabaseType => id in DB_UI_CONFIG)
   .sort();
 
 /**
  * The engines a listing may NOT name in an explain sentence. `libredb` is excluded from
- * both sides: it is the embedded engine, not one of the fourteen a listing counts, and
+ * both sides: it is the embedded engine, not one of the engines a listing counts, and
  * its label is a substring of the product name in every one of these files.
  */
 const explainIncapable = (Object.keys(DB_UI_CONFIG) as DatabaseType[])
@@ -114,6 +136,15 @@ describe("the explanation claim names only engines that return a plan", () => {
     }
   });
 
+  test("Databend declares its plan format in its directory's index.ts, so it counts as capable", () => {
+    // `providers/sql/databend/index.ts` reads as `databend`; its sibling modules name no type-id DB_UI_CONFIG has.
+    expect(explainCapable).toContain("databend");
+  });
+
+  test("Snowflake declares its plan format in its directory's index.ts, so a listing's explain claim names it", () => {
+    expect(explainCapable).toContain("snowflake");
+  });
+
   for (const [name, path] of Object.entries(LISTINGS)) {
     test(`${name} scopes its explanation claim to those engines`, () => {
       const content = submittedCopy(path);
@@ -134,6 +165,38 @@ describe("the explanation claim names only engines that return a plan", () => {
   }
 });
 
+describe("no listing says the agent runs in a read-only session", () => {
+  for (const [name, path] of Object.entries(LISTINGS)) {
+    test(`${name} does not put SQL Server in a read-only session`, () => {
+      // True of PostgreSQL, SQLite and DuckDB, false of SQL Server, which has no read-only
+      // transaction and no session-level read-only switch (docs/providers/mssql.md). The
+      // gate in CATALOG_LISTING.md bans the phrase by name; "never writes" is the
+      // engine-independent sentence to use.
+      expect(submittedCopy(path)).not.toMatch(/read-only session/i);
+    });
+  }
+});
+
+/**
+ * The copy the boundary ban reads: every listing, and the Azure offer's HTML description, which is submitted beside
+ * its listing fields and which once said the database itself enforced the boundary twice in one sentence.
+ */
+const BOUNDARY_COPY = { ...LISTINGS, azureDescription: "deploy/azure/listing/description.html" } as const;
+
+describe("no listing says the database itself refuses the agent's writes", () => {
+  for (const [name, path] of Object.entries(BOUNDARY_COPY)) {
+    test(`${name} states the boundary without making it the database's`, () => {
+      // True of the SQL engines and false of the others agent mode executes on: on Kubernetes Studio's request
+      // allowlist and the identity's RBAC bound a run, and on MongoDB the connection's user does, proven at open,
+      // behind Studio's command fence (docs/AGENT.md). "Under the read-only boundary documented for each engine"
+      // stays true as the list grows. The listings wrap their lines, so a phrase split by a line break is matched too.
+      expect(submittedCopy(path).replace(/\s+/g, " ")).not.toMatch(
+        /the database itself (enforces|proved)|the database, not the IDE/i,
+      );
+    });
+  }
+});
+
 describe("no listing claims the agent never runs what it recommends", () => {
   for (const [name, path] of Object.entries(LISTINGS)) {
     test(`${name} keeps the drafts/recommends distinction`, () => {
@@ -144,6 +207,161 @@ describe("no listing claims the agent never runs what it recommends", () => {
       expect(submittedCopy(path)).not.toMatch(/\bwhat it recommends\b|\bnothing it recommends\b/i);
     });
   }
+});
+
+/**
+ * A provider file that declares inline row editing, anchored to the start of a line for
+ * the same reason `DECLARES_EXPLAIN_FORMAT` is.
+ */
+const DECLARES_INLINE_ROW_EDIT = /^\s*supportsInlineRowEdit:\s*true/m;
+
+/** The engines whose provider declares inline row editing. */
+const editable: DatabaseType[] = providerFiles(PROVIDER_ROOT)
+  .filter((file) => DECLARES_INLINE_ROW_EDIT.test(readFileSync(file, "utf8")))
+  .map(typeIdOf)
+  .filter((id): id is DatabaseType => id in DB_UI_CONFIG)
+  .sort();
+
+/**
+ * The engines a data-management claim may NOT name. Taken as the complement of the `true`
+ * declarations rather than by scanning for the `false` ones: `providers/sql/search/index.ts`
+ * serves TWO type-ids and its path reads as neither, so scanning the false side would leave
+ * Elasticsearch and OpenSearch out of the set a listing is checked against.
+ *
+ * `supportsInlineRowEdit` defaults to true in `base-provider.ts`, so a provider declaring
+ * nothing lands here even though it can edit. That direction is deliberate: its cost is a
+ * failing gate somebody reads, where the other direction's cost is an overclaim standing in
+ * somebody else's catalog, which is the thing this file exists to prevent.
+ */
+const notEditable = EXTERNAL_DATABASE_TYPES.filter((type) => !editable.includes(type)).sort();
+
+/**
+ * The sentences claiming the product MANAGES data, which is the one phrase
+ * `deploy/rancher/CATALOG_LISTING.md` singles out by name: browsing and querying reach
+ * every engine, editing does not, so "manage data across ..." must never be written over
+ * the whole list.
+ *
+ * Only that phrase, not "editing data": the canonical long description opens an editing
+ * sentence with "Editing data follows the engine rather than the IDE" and then names the
+ * engines that CANNOT edit, one reason each, which is the nuance the gate asks for rather
+ * than the overclaim it forbids.
+ */
+function manageDataClaims(content: string): string[] {
+  return content
+    .replace(/\n(?![\n\-*|>])/g, " ")
+    .split(/(?<=\.)\s+|\n/)
+    .filter((sentence) => /manag(?:e|es|ing)\s+(?:your\s+)?data/i.test(sentence));
+}
+
+/** The engines a manage-data sentence names that cannot edit. */
+function overclaimed(claim: string): DatabaseType[] {
+  return notEditable.filter((type) => claim.includes(getDBConfig(type).label));
+}
+
+describe("no listing claims data management on an engine that cannot edit", () => {
+  test("the derived editable set is a real, non-trivial subset", () => {
+    // A regex that matched nothing would make every assertion below vacuous, and one that
+    // matched every provider would make the complement empty.
+    expect(editable.length).toBeGreaterThan(0);
+    expect(notEditable.length).toBeGreaterThan(0);
+    for (const type of ["postgres", "mysql", "sqlite"]) {
+      expect(editable).toContain(type as DatabaseType);
+    }
+    for (const type of ["mongodb", "redis", "elasticsearch", "opensearch"]) {
+      expect(notEditable).toContain(type as DatabaseType);
+    }
+  });
+
+  test("the checker rejects the sentence that reached rancher/partner-charts#1168", () => {
+    // The submitted wording, verbatim. The two gates above passed on it: the count was
+    // right and it made no explanation claim, so nothing here read the verb. It named
+    // nine engines that report the editing controls as unsupported.
+    const submitted =
+      "Browse schemas, run queries and manage data across sixteen engines: PostgreSQL, MySQL, " +
+      "Oracle, SQL Server, SQLite, libSQL, DuckDB, MongoDB, Redis, Couchbase, ClickHouse, " +
+      "Apache Druid, Elasticsearch, OpenSearch, Apache Trino and Apache Cassandra.";
+    const claims = manageDataClaims(submitted);
+    expect(claims).toHaveLength(1);
+    // The nine it named, by id. Pinned rather than read from `notEditable`, which grows with every
+    // engine that ships unable to edit: Prometheus (#1085) is in that set and was never in this
+    // sentence, which predates it.
+    expect(overclaimed(claims[0])).toEqual([
+      "cassandra",
+      "clickhouse",
+      "couchbase",
+      "druid",
+      "elasticsearch",
+      "mongodb",
+      "opensearch",
+      "redis",
+      "trino",
+    ]);
+    expect(notEditable).toContain("prometheus");
+  });
+
+  test("an editing sentence that names what cannot edit is left alone", () => {
+    // The canonical form. It names the engines that cannot edit ON PURPOSE, and the phrase
+    // gate must not read that as the claim it bans.
+    expect(
+      manageDataClaims(
+        "Editing data follows the engine rather than the IDE: inline row editing on PostgreSQL, and Elasticsearch SQL has no mutation in its grammar at all.",
+      ),
+    ).toEqual([]);
+  });
+
+  for (const [name, path] of Object.entries(LISTINGS)) {
+    test(`${name} claims no data management it cannot deliver`, () => {
+      for (const claim of manageDataClaims(submittedCopy(path))) {
+        expect(overclaimed(claim)).toEqual([]);
+      }
+    });
+  }
+});
+
+/**
+ * The storage mode the chart actually installs with, read from the chart rather than
+ * restated here. The overlay is copy about THIS chart, so its "by default" sentences are
+ * checkable against `values.yaml` in a way the other five listings' are not: the Azure and
+ * DigitalOcean images configure SQLite themselves, and a chart-derived rule applied to them
+ * would fail true copy.
+ */
+const STORAGE_MODES = ["local", "sqlite", "postgres"];
+
+const CHART_STORAGE_DEFAULT = ((): string => {
+  const values = readFileSync(join(REPO_ROOT, "charts/libredb-studio/values.yaml"), "utf8");
+  const declared = /^\s*storageProvider:\s*"([a-z]+)"/m.exec(values)?.[1];
+  // Thrown rather than defaulted. A chart whose default cannot be read is a chart this
+  // gate cannot check, and a fallback would turn that into a passing test.
+  if (!declared) {
+    throw new Error("charts/libredb-studio/values.yaml: config.storageProvider is unreadable");
+  }
+  return declared;
+})();
+
+/** The storage mode a sentence calls the default, if it names one. */
+function storageDefaultsClaimed(copy: string): string[] {
+  return STORAGE_MODES.filter((mode) => new RegExp(`${mode}[^.]*\\bby default\\b`, "i").test(copy));
+}
+
+describe("the Rancher overlay names no storage default the chart does not set", () => {
+  test("the chart's default is one of the modes, and the checker sees a wrong one", () => {
+    // Without both halves the assertion below passes on a chart default nothing recognises
+    // and on a checker that matches nothing.
+    expect(STORAGE_MODES).toContain(CHART_STORAGE_DEFAULT);
+    // The sentence that reached rancher/partner-charts#1168, verbatim. `values.yaml` sets
+    // `config.storageProvider: "local"`; the copy promoted the SQLite mode to the default.
+    expect(
+      storageDefaultsClaimed(
+        "Runs entirely on your own infrastructure with SQLite storage by default, so no external database is required to operate the IDE itself.",
+      ),
+    ).toEqual(["sqlite"]);
+  });
+
+  test("the submitted overlay claims only the chart's default, if any", () => {
+    for (const mode of storageDefaultsClaimed(submittedCopy(LISTINGS.rancherAppReadme))) {
+      expect(mode).toBe(CHART_STORAGE_DEFAULT);
+    }
+  });
 });
 
 describe("the Druid write claim matches the provider documentation", () => {
@@ -185,4 +403,106 @@ describe("the Rancher file's own accuracy gate audits against the corrected clai
     expect(gate).toContain("no `UPDATE`, no `DELETE` and no `CREATE TABLE`");
     expect(gate).toContain("MSQ task engine");
   });
+});
+
+/**
+ * The buyer-facing copy of every channel whose provisioning writes `AUTH_COOKIE_SECURE=false`
+ * unconditionally, keyed to the script that writes it.
+ *
+ * Both entries ship the same shape: a bare VM with no name of its own, reached over plain
+ * HTTP at `:3000`, where the browser would otherwise discard the Secure cookie and login
+ * would loop while every health probe passed. The override is the only thing that makes
+ * login work there, and its cost is that the session cookie travels in cleartext - which is
+ * a fact about the product the buyer is entitled to read BEFORE deploying, not after.
+ *
+ * `usage-instructions.md` and not `listing-fields.md` for AWS: the disclosure lives in the
+ * usage instructions, and that file was in no gate at all, so it could have been deleted
+ * without a single test turning red.
+ */
+const PLAIN_HTTP_CHANNELS = {
+  digitalocean: {
+    provisioner: "deploy/digitalocean/droplet/files/var/lib/cloud/scripts/per-instance/99-libredb-first-boot.sh",
+    copy: LISTINGS.digitalocean,
+  },
+  aws: {
+    provisioner: "deploy/aws/ami/files/usr/local/sbin/libredb-firstboot",
+    copy: "deploy/aws/listing/usage-instructions.md",
+  },
+} as const;
+
+/**
+ * A provisioning script that writes the override UNCONDITIONALLY, which is what obliges the
+ * channel to disclose it.
+ *
+ * Anchored to the start of a line, with the `printf` form AWS uses admitted. That anchor is
+ * the whole discriminator: Azure writes the same assignment guarded by
+ * `if [ "$SITE_ADDRESS" = ":80" ]`, so its line starts with `if` and it is correctly left
+ * out - its plain-HTTP mode is opt-in and its README documents it where the operator picks
+ * the mode. A reformat that moved Azure's assignment to its own line would pull it INTO the
+ * set and fail this gate, which is the safe direction: the fix is then to disclose it or to
+ * record the exemption here, and neither is silent.
+ */
+const WRITES_OVERRIDE_UNCONDITIONALLY = /^[ \t]*(?:printf ')?AUTH_COOKIE_SECURE=false/m;
+
+/** Every shell script under `deploy/`, at any depth, extensionless ones included. */
+function deployScripts(dir: string): string[] {
+  return readdirSync(dir).flatMap((entry) => {
+    const full = join(dir, entry);
+    if (statSync(full).isDirectory()) return deployScripts(full);
+    return /\.(sh|bash)$/.test(entry) || !entry.includes(".") ? [full] : [];
+  });
+}
+
+/**
+ * A repo-relative path with POSIX separators, so the discovered set reads the same on
+ * Windows, where `join` produces `\` and the mapped paths below would never match.
+ */
+const repoRelative = (full: string): string => relative(REPO_ROOT, full).split(sep).join("/");
+
+/** The provisioners that write the override, as repo-relative paths. */
+const plainHttpProvisioners: string[] = deployScripts(join(REPO_ROOT, "deploy"))
+  .filter((file) => WRITES_OVERRIDE_UNCONDITIONALLY.test(readFileSync(file, "utf8")))
+  .map(repoRelative)
+  .sort();
+
+describe("every plain-HTTP channel discloses the cleartext cookie in its listing", () => {
+  test("the discovered provisioner set is real and matches the mapped channels", () => {
+    // Without this the two assertions below could both pass on an empty discovery: a regex
+    // that matched nothing would make the completeness check vacuous, and a map read
+    // straight from the same regex would agree with itself.
+    expect(plainHttpProvisioners.length).toBeGreaterThan(0);
+    expect(plainHttpProvisioners).toEqual(
+      Object.values(PLAIN_HTTP_CHANNELS)
+        .map((c) => c.provisioner)
+        .sort(),
+    );
+  });
+
+  test("the regex reads Azure's guarded write as conditional, not unconditional", () => {
+    // The distinction the whole gate rests on, pinned against both real forms rather than
+    // against a sentence about them.
+    expect(
+      WRITES_OVERRIDE_UNCONDITIONALLY.test(
+        `if [ "$SITE_ADDRESS" = ":80" ]; then printf 'AUTH_COOKIE_SECURE=false\\n'; fi`,
+      ),
+    ).toBe(false);
+    expect(WRITES_OVERRIDE_UNCONDITIONALLY.test("    printf 'AUTH_COOKIE_SECURE=false\\n'")).toBe(true);
+    expect(WRITES_OVERRIDE_UNCONDITIONALLY.test("AUTH_COOKIE_SECURE=false")).toBe(true);
+  });
+
+  for (const [name, channel] of Object.entries(PLAIN_HTTP_CHANNELS)) {
+    test(`${name} still writes the override, so the disclosure is still owed`, () => {
+      // Binds the two halves. A channel that gains TLS and drops the override should fail
+      // here and have its disclosure revisited, rather than keep a warning that is no
+      // longer true.
+      expect(readFileSync(join(REPO_ROOT, channel.provisioner), "utf8")).toMatch(WRITES_OVERRIDE_UNCONDITIONALLY);
+    });
+
+    test(`${name} discloses it in the copy the buyer reads`, () => {
+      const copy = submittedCopy(channel.copy);
+      expect(copy).toContain("AUTH_COOKIE_SECURE");
+      // Naming the variable is not the disclosure: the buyer has to be told what it costs.
+      expect(copy).toMatch(/cleartext|unencrypted|not encrypted/i);
+    });
+  }
 });

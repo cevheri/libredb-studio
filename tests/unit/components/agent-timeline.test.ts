@@ -14,14 +14,16 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { foldLedgerEntries, parseLedgerLine } from "@/components/agent/timeline";
+import { connectionRefusalSentence, foldLedgerEntries, parseLedgerLine } from "@/components/agent/timeline";
 import { AGENT_MAX_REPAIR_ATTEMPTS, AGENT_WORKFLOW_BUDGETS } from "@/lib/agent/execution-policy";
 import { PLAN_NO_STATEMENT_MARKER } from "@/lib/agent/plan-draft";
-import type { AgentLedgerEntry } from "@/lib/agent/run-store";
+import { nextStatus, type AgentLedgerEntry } from "@/lib/agent/run-store";
 import {
   DEFAULT_AGENT_WORKFLOW_READING,
   DEFAULT_AGENT_WORKFLOW_SOURCE,
   DEFAULT_AGENT_WORKFLOW_TYPE,
+  type AgentRunFailureReason,
+  type AgentRunStatus,
 } from "@/lib/agent/types";
 
 const OPENED: AgentLedgerEntry = {
@@ -37,6 +39,32 @@ const OPENED: AgentLedgerEntry = {
 function event(event: AgentLedgerEntry & { kind: "event" }): AgentLedgerEntry {
   return event;
 }
+
+describe("the two status folds agree", () => {
+  test("run-store's nextStatus and the timeline fold answer the same status at every prefix", () => {
+    const entries: readonly AgentLedgerEntry[] = [
+      OPENED,
+      event({ kind: "event", event: { kind: "run-started", atMs: 2, mode: "agent" } }),
+      event({ kind: "event", event: { kind: "run-paused", atMs: 3 } }),
+      event({ kind: "event", event: { kind: "run-resumed", atMs: 4 } }),
+      event({
+        kind: "event",
+        event: { kind: "run-finished", atMs: 5, status: "succeeded", stopReason: "model-stopped" },
+      }),
+    ];
+
+    // Compared at EVERY prefix, not only after `run-finished`: both folds take the
+    // status from that event unconditionally, so a paused disagreement would be
+    // invisible if the check waited for the end. The run-paused arm is a prefix of
+    // its own, and this is what makes it load-bearing.
+    let status: AgentRunStatus = "queued";
+    for (let i = 0; i < entries.length; i += 1) {
+      const entry = entries[i];
+      if (entry.kind === "event") status = nextStatus(status, entry.event);
+      expect(foldLedgerEntries(entries.slice(0, i + 1)).status, `prefix ${i}`).toBe(status);
+    }
+  });
+});
 
 describe("parseLedgerLine", () => {
   test("reads a run-opened header", () => {
@@ -131,6 +159,25 @@ describe("foldLedgerEntries", () => {
     expect(finished.items.at(-1)?.tone).toBe("refused");
   });
 
+  test("a paused run folds to paused, and a resumed one back to running", () => {
+    const paused = foldLedgerEntries([
+      OPENED,
+      event({ kind: "event", event: { kind: "run-started", atMs: 2, mode: "agent" } }),
+      event({ kind: "event", event: { kind: "run-paused", atMs: 3 } }),
+    ]);
+    expect(paused.status).toBe("paused");
+    expect(paused.items.at(-1)?.headline).toBe("Paused");
+
+    const resumed = foldLedgerEntries([
+      OPENED,
+      event({ kind: "event", event: { kind: "run-started", atMs: 2, mode: "agent" } }),
+      event({ kind: "event", event: { kind: "run-paused", atMs: 3 } }),
+      event({ kind: "event", event: { kind: "run-resumed", atMs: 4 } }),
+    ]);
+    expect(resumed.status).toBe("running");
+    expect(resumed.items.at(-1)?.headline).toBe("Resumed");
+  });
+
   test("a run that failed before it could start carries why, in the entry's own words", () => {
     // The reason is the difference between a rail that says "failed" and one a user
     // can act on: an unconfigured model provider and a transient fault look
@@ -176,11 +223,62 @@ describe("foldLedgerEntries", () => {
 
     const detail = view.items.at(-1)?.detail ?? "";
     expect(detail).toBe(
-      "This connection's agent credential cannot be used: check that both the agent user and password are set, that the password still decrypts under the current secret key, and that no connection string is set beside it.",
+      "This connection's agent credential cannot be used: check that it is complete (an agent user and password, or where the database takes one, an agent token alone), that the password still decrypts under the current secret key, and that no connection string is set beside it.",
     );
     // The whole point of the second reason: the sentence must not send the reader
     // after their engine, which is not what refused the run.
     expect(detail).not.toContain("engine");
+  });
+
+  /*
+    Every reason against the sentence the rail shows for it, total over the reason union, so a reason added to
+    `AgentRunFailureReason` does not compile here until its sentence is pinned. The four profile refusals each name
+    their own repair: a user holding too much, a user lacking a privilege, a server that enforces nothing, and a
+    target the profile is not measured against. One sentence for two of them could only ever give one repair.
+  */
+  const FAILURE_SENTENCE_OF = {
+    "model-unavailable": "The model provider is not configured or could not be reached.",
+    "model-rate-limited": "The model provider is limiting this key's requests. Waiting a minute usually clears it.",
+    "model-unauthorized": "The model provider rejected the configured credentials.",
+    "engine-unsupported": "The agent cannot run on this database engine: it offers no read-only execution profile.",
+    "agent-credential-unusable":
+      "This connection's agent credential cannot be used: check that it is complete (an agent user and password, or where the database takes one, an agent token alone), that the password still decrypts under the current secret key, and that no connection string is set beside it.",
+    "agent-principal-refused":
+      "The database user this run would execute as holds privileges the read-only boundary cannot contain, so the profile refused it. Connect as a user holding only read privileges.",
+    "agent-principal-underprivileged":
+      "The database user this run would execute as lacks a privilege the read-only path needs, so the profile refused it. Grant it that privilege, or connect as a user that holds it.",
+    "server-authorization-off":
+      "This database server does not enforce authorization, so no user's read-only boundary holds there and agent mode cannot run. Turn on the server's authorization (on MongoDB, security.authorization) and connect as a read-only user.",
+    "profile-target-unsupported":
+      "Agent mode runs on this engine, but not against this server or target: a compatible server whose read-only enforcement is not measured, such as FerretDB on the MongoDB wire or Percona on the MySQL wire, or an in-memory database. Plan mode and the operations workflow still work.",
+    "connection-unresolvable": "This run's database connection no longer resolves on the server.",
+    internal: "The server could not carry this run. The reason is in the server log.",
+  } as const satisfies Record<AgentRunFailureReason, string>;
+
+  const failureDetail = (reason: AgentRunFailureReason): string =>
+    foldLedgerEntries([
+      OPENED,
+      event({ kind: "event", event: { kind: "run-finished", atMs: 9, status: "failed", reason } }),
+    ]).items.at(-1)?.detail ?? "";
+
+  test.each(Object.entries(FAILURE_SENTENCE_OF) as [AgentRunFailureReason, string][])(
+    "a run that failed %s says so in its own sentence",
+    (reason, sentence) => {
+      expect(failureDetail(reason)).toBe(sentence);
+    },
+  );
+
+  test("no sentence a MongoDB run can reach names an agent credential or the plan that admits a statement", () => {
+    // A run opens on a seed id and no seed declares an agent credential (B85), so a MongoDB run cannot reach the
+    // credential reason, and every other sentence must give advice it can follow: no credential field and no
+    // SQL Server SHOWPLAN step, neither of which a MongoDB connection has.
+    const reachable = (Object.keys(FAILURE_SENTENCE_OF) as AgentRunFailureReason[]).filter(
+      (reason) => reason !== "agent-credential-unusable",
+    );
+    for (const reason of reachable) {
+      expect(failureDetail(reason), reason).not.toContain("agent credential");
+      expect(failureDetail(reason), reason).not.toContain("plan that admits");
+    }
   });
 
   /*
@@ -505,6 +603,32 @@ describe("foldLedgerEntries", () => {
     });
 
     /*
+      The language the server resolved from the run's capabilities when it recorded the draft
+      (#1089). The rail renders the card with no capabilities, so this is the one fact that tints
+      an etcd draft in etcd's accent rather than the neutral one, and the fold carries it as
+      recorded. A ledger written before the field existed carries none, and the fold adds none.
+    */
+    test("the card is handed the editor language the server recorded with the draft", () => {
+      const item = drafted(
+        event({
+          kind: "event",
+          event: {
+            kind: "plan-statement-drafted",
+            atMs: 8,
+            sql: "get /config/ --prefix",
+            dialect: "etcd",
+            language: "etcd",
+            readOnly: false,
+            guardApplicable: false,
+            identifiers: { kind: "not-applicable" },
+          },
+        }),
+      );
+
+      expect(item?.planStatement?.language).toBe("etcd");
+    });
+
+    /*
       Item 7: the statement itself has to REACH the surface, or the card cannot show
       it. The fold carries the ledger's own record — the text, the guard's verdict and
       what the identifier check found — rather than a rendering of it, because the
@@ -792,6 +916,16 @@ describe("foldLedgerEntries", () => {
     expect(view.items.at(-1)?.detail).toBe("The model provider is not configured or could not be reached.");
   });
 
+  test("a run the loop ended on a model timeout keeps its stop reason beside a null failure reason (#1461)", () => {
+    const view = foldLedgerEntries([
+      OPENED,
+      event({ kind: "event", event: { kind: "run-finished", atMs: 9, status: "failed", stopReason: "model-timeout" } }),
+    ]);
+
+    expect(view.failureReason).toBeNull();
+    expect(view.stopReason).toBe("model-timeout");
+  });
+
   test("an ending with no reason claims none", () => {
     // Most endings need none: succeeded, cancelled, and a loop that stopped on its
     // own terms are fully described by the status. A default sentence here would
@@ -802,6 +936,7 @@ describe("foldLedgerEntries", () => {
     ]);
 
     expect(view.failureReason).toBeNull();
+    expect(view.stopReason).toBeNull();
     expect(view.items.at(-1)?.detail).toBeUndefined();
   });
 
@@ -1289,6 +1424,34 @@ describe("foldLedgerEntries", () => {
 
     expect(view.items[0].headline).toBe("Approval required");
     expect(view.items[0].detail).toBe("sql.plan.analyze");
+  });
+
+  test("a call refused before the database says so, with the tool's own reason, and counts no statement", () => {
+    const view = foldLedgerEntries([
+      OPENED,
+      event({ kind: "event", event: { kind: "tool-invoked", atMs: 8, stepId: "s1", tool: "run_read_query" } }),
+      event({
+        kind: "event",
+        event: {
+          kind: "tool-refused",
+          atMs: 9,
+          stepId: "s1",
+          refusal: {
+            class: "not-sent",
+            reasonCode: "STATEMENT_NOT_ADMITTED",
+            detail: 'An aggregate takes no "filter". Nothing was sent.',
+          },
+        },
+      }),
+    ]);
+
+    const refused = view.items.find((item) => item.tone === "refused");
+    expect(refused?.headline).toBe("Refused before the database");
+    expect(refused?.detail).toBe('An aggregate takes no "filter". Nothing was sent.');
+    expect(refused?.quoted).toBeUndefined();
+    // Nothing reached a database, so neither a statement nor a repair attempt is counted for it.
+    expect(view.budget.find((meter) => meter.id === "statements")?.used).toBe(0);
+    expect(view.budget.find((meter) => meter.id === "repairs")?.used).toBe(0);
   });
 
   test("an engine error carries the engine's own text as quoted content", () => {
@@ -1867,13 +2030,13 @@ describe("foldLedgerEntries — the budget meter", () => {
    * tell it apart from an interruption, so the fold declines to guess.
    */
   /**
-   * A ceiling is per drive (`docs/BACKLOG.md` B6) while the ledger spans every
-   * drive, so a resumed run legitimately folds to more than one drive's allowance.
-   * The fold does NOT clamp it: clamping would hide that a run has cost more than
-   * its ceiling suggests, which is the direction that misleads. The rail's caveat
-   * is what says so, and this pins the behaviour that caveat describes.
+   * The fold reports what the ledger holds and does NOT clamp it to a ceiling:
+   * clamping would hide that a run has cost more than its ceiling suggests, which
+   * is the direction that misleads. What the tracker enforces and what the ledger
+   * records are measured differently (the rail's caveat says so), so the two can
+   * disagree, and this pins which of them the fold answers with.
    */
-  test("a run resumed past a per-drive ceiling folds to what it actually spent", () => {
+  test("a run whose ledger holds more than a ceiling folds to what it actually spent", () => {
     const failed = (stepId: string): AgentLedgerEntry =>
       event({
         kind: "event",
@@ -2362,6 +2525,211 @@ describe("a recommendation reads as a proposal, never as something that happened
   });
 });
 
+describe("a resources recommendation folds", () => {
+  test("it has an entry and offers nothing to the editor", () => {
+    const view = foldLedgerEntries([
+      OPENED,
+      event({
+        kind: "event",
+        event: {
+          kind: "recommendation",
+          atMs: 6,
+          change: "resources",
+          namespace: "shop",
+          ownerKind: "Deployment",
+          ownerName: "web",
+          container: "web",
+          current: { requests: { cpu: "500m", memory: "256Mi" }, limits: { cpu: "1", memory: "512Mi" } },
+          proposed: { requests: { cpu: "150m", memory: "128Mi" }, limits: { cpu: "500m", memory: "256Mi" } },
+          rationale: "The container uses a third of its request.",
+          evidence: [{ source: "artifact", correlationId: "u1" }],
+        },
+      } as AgentLedgerEntry & { kind: "event" }),
+    ]);
+
+    expect(view.items).toHaveLength(2);
+    expect(view.items[1]).toMatchObject({
+      tone: "progress",
+      headline: "Resources recommended",
+      detail: "The container uses a third of its request. Not applied: nothing here changes the cluster.",
+      quoted:
+        "Deployment/web, container web: requests cpu 500m, memory 256Mi to cpu 150m, memory 128Mi; limits cpu 1, memory 512Mi to cpu 500m, memory 256Mi",
+    });
+    expect(view.items[1]?.applySql).toBeUndefined();
+  });
+
+  /*
+    The document-index card (issue #1614): no statement to hand the editor, because the editor's command envelope
+    creates no index. What it quotes is the mongosh helper, which names the index itself: the createIndexes command
+    with no `name` in its index spec is refused by the server (FailedToParse, measured on 9.0.4 and 7.0.43). The names
+    are JSON-quoted and read through getCollection, so a collection named with a dot or a dash pastes as written.
+  */
+  /** A document-index card, with the fields given; a rationale of null is a card that states none, as one may. */
+  const documentIndex = ({
+    rationale = "The plan reads a COLLSCAN on a filtered customer.",
+    ...fields
+  }: {
+    readonly database?: string;
+    readonly options?: Record<string, unknown>;
+    readonly rationale?: string | null;
+  }) =>
+    foldLedgerEntries([
+      OPENED,
+      event({
+        kind: "event",
+        event: {
+          kind: "recommendation",
+          atMs: 6,
+          change: "document-index",
+          collection: "orders",
+          keys: { customer: 1, status: -1 },
+          ...fields,
+          ...(rationale === null ? {} : { rationale }),
+          evidence: [{ source: "artifact", correlationId: "p1" }],
+        },
+      } as AgentLedgerEntry & { kind: "event" }),
+    ]);
+
+  test("a document index is data the user applies in their own tool, never an editor statement", () => {
+    const view = documentIndex({ database: "app" });
+
+    expect(view.items).toHaveLength(2);
+    expect(view.items[1]).toMatchObject({
+      tone: "progress",
+      headline: "Index recommended",
+      detail: "The plan reads a COLLSCAN on a filtered customer. Not applied: nothing here runs this statement.",
+    });
+    expect(view.items[1]?.quoted).toBe(
+      'db.getSiblingDB("app").getCollection("orders").createIndex({"customer":1,"status":-1})',
+    );
+    expect(view.items[1]?.applySql).toBeUndefined();
+  });
+
+  test("a document index's options follow its keys, and the database is named only where the run knew it", () => {
+    expect(documentIndex({ database: "app", options: { unique: true } }).items[1]?.quoted).toBe(
+      'db.getSiblingDB("app").getCollection("orders").createIndex({"customer":1,"status":-1}, {"unique":true})',
+    );
+    expect(documentIndex({}).items[1]?.quoted).toBe(
+      'db.getCollection("orders").createIndex({"customer":1,"status":-1})',
+    );
+    expect(documentIndex({ options: { unique: true } }).items[1]?.quoted).toBe(
+      'db.getCollection("orders").createIndex({"customer":1,"status":-1}, {"unique":true})',
+    );
+  });
+
+  test("a document index stating no rationale reads as the caveat alone, never as an undefined one", () => {
+    // The card's schema leaves the rationale optional, where the statement card's requires one.
+    expect(documentIndex({ database: "app", rationale: null }).items[1]?.detail).toBe(
+      "Not applied: nothing here runs this statement.",
+    );
+  });
+
+  test("a side with nothing set reads as unset, and a half-set side names the missing half", () => {
+    const view = foldLedgerEntries([
+      OPENED,
+      event({
+        kind: "event",
+        event: {
+          kind: "recommendation",
+          atMs: 6,
+          change: "resources",
+          namespace: "shop",
+          ownerKind: "StatefulSet",
+          ownerName: "db",
+          container: "postgres",
+          current: { requests: {}, limits: {} },
+          proposed: { requests: { cpu: "250m" }, limits: { memory: "1Gi" } },
+          rationale: "The container has no requests at all.",
+          evidence: [{ source: "artifact", correlationId: "u1" }],
+        },
+      } as AgentLedgerEntry & { kind: "event" }),
+    ]);
+
+    expect(view.items[1]?.quoted).toBe(
+      "StatefulSet/db, container postgres: requests unset to cpu 250m, memory unset; limits unset to cpu unset, memory 1Gi",
+    );
+    expect(view.items[1]?.applySql).toBeUndefined();
+  });
+});
+
+describe("a cluster usage reading folds", () => {
+  test("a usage reading, a cluster without usage metrics and its refusal each have an entry", () => {
+    const view = foldLedgerEntries([
+      OPENED,
+      event({
+        kind: "event",
+        event: {
+          kind: "usage-read",
+          atMs: 7,
+          artifact: {
+            correlationId: "corr-usage",
+            runId: "run-1",
+            operationId: "cluster.usage.read",
+            summary: { rowCount: 3, columnNames: ["pod"], elapsedMs: 9 },
+          },
+          namespace: "shop",
+        },
+      }),
+      event({ kind: "event", event: { kind: "usage-unavailable", atMs: 8, namespace: "web" } }),
+      event({
+        kind: "event",
+        event: {
+          kind: "tool-refused",
+          atMs: 9,
+          stepId: "s1",
+          refusal: { class: "reading-refused", reasonCode: "METRICS_UNAVAILABLE" },
+        },
+      }),
+    ]);
+
+    expect(view.items[1]).toMatchObject({
+      tone: "progress",
+      headline: "Read container usage in shop",
+      detail: "3 container(s), against their requests and limits.",
+      artifactId: "corr-usage",
+    });
+    expect(view.items[1]?.applySql).toBeUndefined();
+    expect(view.items[2]).toMatchObject({
+      tone: "neutral",
+      headline: "No usage metrics",
+      detail: "This cluster serves no metrics.k8s.io, so usage could not be read: install metrics-server.",
+    });
+    expect(view.items[2]?.artifactId).toBeUndefined();
+    expect(view.items[3]?.headline).toBe("This cluster serves no usage metrics");
+    expect(view.items[3]?.detail).toBe("METRICS_UNAVAILABLE");
+  });
+});
+
+describe("a workload profile folds", () => {
+  test("a workload profile has an entry naming its namespace and citing its artifact", () => {
+    const view = foldLedgerEntries([
+      OPENED,
+      event({
+        kind: "event",
+        event: {
+          kind: "workloads-profiled",
+          atMs: 7,
+          artifact: {
+            correlationId: "corr-profile",
+            runId: "run-1",
+            operationId: "cluster.workloads.read",
+            summary: { rowCount: 5, columnNames: ["kind"], elapsedMs: 9 },
+          },
+          namespace: "shop",
+        },
+      }),
+    ]);
+
+    expect(view.items[1]).toMatchObject({
+      tone: "progress",
+      headline: "Profiled the workloads of shop",
+      detail: "5 workload(s).",
+      artifactId: "corr-profile",
+    });
+    expect(view.items[1]?.applySql).toBeUndefined();
+  });
+});
+
 describe("a table profile reads as counts and findings, never as values", () => {
   const profiled = (findings: readonly { code: string; column: string; detail: string }[]): AgentLedgerEntry =>
     event({
@@ -2465,6 +2833,41 @@ describe("an ending says whether the run ANSWERED, not only how it stopped (B24)
     expect(view.items[1]?.detail).toContain("before-and-after plan comparison");
   });
 
+  test("a resource-efficiency shortfall names usage, and a cluster without metrics names metrics-server", () => {
+    const said = (code: "no-usage-reading" | "no-usage-evidence" | "no-usage-metrics") =>
+      foldLedgerEntries([
+        OPENED,
+        finished(
+          "succeeded",
+          { outcome: "unanswered", verifier: "agent-query-optimization-kubectl.1", unmet: [code] },
+          "report-composed",
+        ),
+      ]).items[1]?.detail;
+
+    expect(said("no-usage-reading")).toContain(
+      "No usage was read, so how the containers use their requests was never established.",
+    );
+    expect(said("no-usage-evidence")).toContain("The report rests on no usage reading of this run.");
+    expect(said("no-usage-metrics")).toContain(
+      "This cluster serves no usage metrics: install metrics-server to measure usage.",
+    );
+  });
+
+  test("a cluster-health shortfall says the namespace's health was never established", () => {
+    const view = foldLedgerEntries([
+      OPENED,
+      finished(
+        "succeeded",
+        { outcome: "unanswered", verifier: "agent-database-assessment-kubectl.1", unmet: ["no-workload-profile"] },
+        "report-composed",
+      ),
+    ]);
+
+    expect(view.items[1]?.detail).toContain(
+      "No workloads were profiled, so the namespace's health was never established.",
+    );
+  });
+
   test("every shortfall has words, so none reaches a user as a raw code", () => {
     for (const code of [
       "no-report",
@@ -2476,6 +2879,10 @@ describe("an ending says whether the run ANSWERED, not only how it stopped (B24)
       "no-table-profile",
       "no-reading",
       "no-answer",
+      "no-usage-reading",
+      "no-usage-evidence",
+      "no-usage-metrics",
+      "no-workload-profile",
       "cancelled",
     ]) {
       const view = foldLedgerEntries([
@@ -2986,7 +3393,9 @@ describe("an answer reads as the app's decision, with the model's caption quoted
     test.each([
       "report-reminder",
       "plan-statement",
+      "turn-cut-off",
       "report-reserve",
+      "usage-bar",
       "unread-stop",
       // The three delivered as a tool result (B51). They reach a reader through the
       // `call-held` entry, so these ids only render here for a ledger written by a build
@@ -3025,5 +3434,31 @@ describe("an answer reads as the app's decision, with the model's caption quoted
 
     expect(view.items[1]?.detail).not.toContain("net_total");
     expect(view.items[1]?.detail).not.toContain("region");
+  });
+});
+
+describe("a refusal of the connection itself", () => {
+  const ended = (reason: string) =>
+    foldLedgerEntries([
+      OPENED,
+      event({ kind: "event", event: { kind: "run-finished", atMs: 5, status: "failed", reason } as never }),
+    ]);
+
+  test("is named for the five reasons a run on that connection meets again until it is changed", () => {
+    for (const reason of [
+      "agent-credential-unusable",
+      "agent-principal-refused",
+      "agent-principal-underprivileged",
+      "server-authorization-off",
+      "profile-target-unsupported",
+    ]) {
+      expect(connectionRefusalSentence(ended(reason)), reason).not.toBeNull();
+    }
+    expect(connectionRefusalSentence(ended("agent-principal-refused"))).toContain("holds privileges");
+  });
+
+  test("is not every failure, and not a run with none", () => {
+    expect(connectionRefusalSentence(ended("model-unavailable"))).toBeNull();
+    expect(connectionRefusalSentence(foldLedgerEntries([OPENED]))).toBeNull();
   });
 });

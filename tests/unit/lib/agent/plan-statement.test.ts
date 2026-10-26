@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { PLAN_NO_STATEMENT_MARKER, readPlanStatement } from "@/lib/agent/plan-draft";
 import { readStatementTables, validatePlanStatement } from "@/lib/agent/plan-statement";
-import type { TableSchema } from "@/lib/types";
+import { languageServer } from "@/lib/agent/languages/server";
+import type { AgentInventory } from "@/lib/agent/types";
 
 /**
  * The statement a plan run drafted, made a fact rather than a parse (the plan-mode
@@ -25,13 +26,48 @@ import type { TableSchema } from "@/lib/types";
  *     not: an unknown table is recorded, a write is marked, and neither is blocked.
  */
 
-const INVENTORY: readonly TableSchema[] = [
-  { name: "public.film", columns: [], indexes: [] },
-  { name: "public.actor", columns: [], indexes: [] },
-];
+/**
+ * A PostgreSQL capture, spelled the way `context-snapshot.ts` spells one: the kinds the
+ * engine declared, and one entry per object listed under them. `film_ratings` is a view,
+ * which a PostgreSQL inventory really does carry beside its tables.
+ */
+const INVENTORY: AgentInventory = {
+  objects: [
+    { name: "public.film", kind: "table", columns: [], indexes: [] },
+    { name: "public.actor", kind: "table", columns: [], indexes: [] },
+    { name: "public.film_ratings", kind: "view", columns: [], indexes: [] },
+  ],
+  kinds: [
+    { id: "table", role: "relation", label: "Table", labelPlural: "Tables" },
+    { id: "view", role: "relation", label: "View", labelPlural: "Views" },
+  ],
+};
+
+/**
+ * A DUCKDB capture, and the engine matters here rather than being a second flavour of the
+ * same fixture.
+ *
+ * DuckDB is one of the three engines an agent run executes on, it declares a `macro` kind
+ * with `role: "routine"`, and `duckdb/objects.ts` lists macros by their bare
+ * `function_name` from `duckdb_functions()`. So a macro's inventory entry is
+ * `main.order_total` and NOT PostgreSQL's overload form `order_total(integer)` - which is
+ * exactly why this fixture is spelled DuckDB's way. A check written against the
+ * PostgreSQL spelling passes whether it filters or not, because no bare name a statement
+ * could write ever matches a name carrying an argument list.
+ */
+const DUCKDB_INVENTORY: AgentInventory = {
+  objects: [
+    { name: "main.orders", kind: "table", columns: [], indexes: [] },
+    { name: "main.order_total", kind: "macro", columns: [], indexes: [] },
+  ],
+  kinds: [
+    { id: "table", role: "relation", label: "Table", labelPlural: "Tables" },
+    { id: "macro", role: "routine", label: "Macro", labelPlural: "Macros" },
+  ],
+};
 
 /** SQLite's inventory carries bare names, which is why matching cannot be strict. */
-const SQLITE_INVENTORY: readonly TableSchema[] = [{ name: "film", columns: [], indexes: [] }];
+const SQLITE_INVENTORY: AgentInventory = { objects: [{ name: "film", columns: [], indexes: [] }] };
 
 describe("the drafted statement is read out of the closing prose", () => {
   test("a fenced block tagged with the engine is the statement", () => {
@@ -216,6 +252,89 @@ describe("the drafted statement is read out of the closing prose", () => {
   });
 
   /*
+    #1085. `promql` is a language tag, and it still names one engine: every PromQL server this
+    product reaches, VictoriaMetrics included, connects through the `prometheus` type-id. So a
+    PromQL block on any other connection is the `mysql` case above, and a monitoring question
+    invites exactly that shape: the exporter metric first, then the SQL that answers the question.
+    Read as naming no engine, the PromQL was filed as this run's PostgreSQL statement.
+  */
+  test("a PromQL block is not the deliverable of a run on another engine", () => {
+    const promql = ["```promql", "pg_replication_lag_seconds > 30", "```"].join("\n");
+    const sql = ["```postgres", "SELECT client_addr, replay_lag FROM pg_stat_replication;", "```"].join("\n");
+
+    expect(readPlanStatement(promql, "postgres")).toEqual({ kind: "absent" });
+    expect(readPlanStatement([promql, "", sql].join("\n"), "postgres")).toEqual({
+      kind: "statement",
+      sql: "SELECT client_addr, replay_lag FROM pg_stat_replication;",
+      tag: "postgres",
+    });
+  });
+
+  test("a PromQL block is still the deliverable of a Prometheus run", () => {
+    const expression = "sum by (job) (rate(prometheus_http_requests_total[5m]))";
+    const promql = ["```promql", expression, "```"].join("\n");
+
+    expect(readPlanStatement(promql, "prometheus")).toEqual({ kind: "statement", sql: expression, tag: "promql" });
+    // With no connection to contradict, a named engine rejects nothing, the rule every tag follows.
+    expect(readPlanStatement(promql)).toEqual({ kind: "statement", sql: expression, tag: "promql" });
+  });
+
+  /*
+    Neo4j spec 6.4. `cypher` is a language tag, and it still names one engine while `neo4j` is the only
+    type-id that runs Cypher: the `promql` case. Read as naming no engine, a Cypher block on a PostgreSQL
+    run was filed as that run's statement.
+  */
+  test("a Cypher block is the deliverable of a Neo4j run, and of no other engine's", () => {
+    const statement = "MATCH (n:Person) RETURN n";
+    const cypher = ["```cypher", statement, "```"].join("\n");
+
+    expect(readPlanStatement(cypher, "postgres")).toEqual({ kind: "absent" });
+    expect(readPlanStatement(cypher, "neo4j")).toEqual({ kind: "statement", sql: statement, tag: "cypher" });
+  });
+
+  /*
+    InfluxDB spec 6.5. `influxql` is a language tag that names one engine, `influxdb` (the `promql` rule): its
+    block is the deliverable of an InfluxDB run and of no other engine's, and an InfluxDB 3 run, whose language
+    is DataFusion SQL, is another engine.
+  */
+  test("an InfluxQL block is the deliverable of an InfluxDB run, and of no other engine's", () => {
+    const statement = 'SELECT * FROM "home".."cpu" WHERE time > now() - 1h';
+    const influxql = ["```influxql", statement, "```"].join("\n");
+    const influxdb = ["```influxdb", statement, "```"].join("\n");
+
+    expect(readPlanStatement(influxql, "postgres")).toEqual({ kind: "absent" });
+    expect(readPlanStatement(influxql, "influxdb3")).toEqual({ kind: "absent" });
+    expect(readPlanStatement(influxql, "influxdb")).toEqual({ kind: "statement", sql: statement, tag: "influxql" });
+    expect(readPlanStatement(influxdb, "influxdb")).toEqual({ kind: "statement", sql: statement, tag: "influxdb" });
+    expect(readPlanStatement(influxdb, "influxdb3")).toEqual({ kind: "absent" });
+  });
+
+  /*
+    #1088. The planning contract asks for a block tagged with the connection's type-id, so a Kafka
+    run fences its read request as ```kafka, and that block is its deliverable. It names one engine
+    like any type-id, so on another connection it is the `mysql` case above.
+  */
+  test("a read request fenced as kafka is the deliverable of a Kafka run, and of no other engine's", () => {
+    const request = '{"topic": "orders", "from": "latest", "limit": 50}';
+    const kafka = ["```kafka", request, "```"].join("\n");
+
+    expect(readPlanStatement(kafka, "kafka")).toEqual({ kind: "statement", sql: request, tag: "kafka" });
+    expect(readPlanStatement(kafka, "mongodb")).toEqual({ kind: "absent" });
+  });
+
+  /*
+    #1089. An etcd run fences its command as ```etcd, the connection's type-id, and that block is its
+    deliverable; the shell tags a model might write instead name no engine (fence-tags.ts).
+  */
+  test("a command fenced as etcd is the deliverable of an etcd run, and of no other engine's", () => {
+    const command = "get /app/config/ --prefix --limit=50";
+    const etcd = ["```etcd", command, "```"].join("\n");
+
+    expect(readPlanStatement(etcd, "etcd")).toEqual({ kind: "statement", sql: command, tag: "etcd" });
+    expect(readPlanStatement(etcd, "redis")).toEqual({ kind: "absent" });
+  });
+
+  /*
     A run that refused and also pasted an illustrative block has not drafted a
     deliverable, and offering that block to the editor as the answer would be exactly
     the mislabelling this event exists to prevent.
@@ -389,6 +508,48 @@ describe("a drafted statement is validated before anything offers it", () => {
   });
 
   /*
+    The inventory a run reasons over is no longer a list of tables (#789): a PostgreSQL
+    capture carries the schema's views, sequences and functions under the kind the engine
+    declared for each. Only what a statement can NAME may answer this check, and the gate
+    is the declared ROLE.
+
+    `readStatementTables` already drops `FROM order_total(1)`, because a name followed by an
+    open parenthesis in a table position is a function call, so what reaches here is a bare
+    `FROM order_total` - which DuckDB cannot resolve to that macro at all.
+    Affirming it as inventoried is the #414 class in one sentence: the run is told the
+    object it named exists, in the words the model will read as "this will run".
+  */
+  test("a name the inventory holds only as a MACRO is reported, because a bare name cannot address one", () => {
+    const validation = validatePlanStatement("SELECT * FROM order_total", DUCKDB_INVENTORY, "sql");
+
+    expect(validation.identifiers).toEqual({ kind: "checked", unknownTables: ["order_total"] });
+  });
+
+  test("the table beside it in the same DuckDB inventory is still found, so the filter narrows and does not empty", () => {
+    expect(validatePlanStatement("SELECT * FROM orders", DUCKDB_INVENTORY, "sql").identifiers).toEqual({
+      kind: "checked",
+      unknownTables: [],
+    });
+  });
+
+  test("a VIEW is not reported, because its declared role is relation and a statement may select from it", () => {
+    expect(validatePlanStatement("SELECT * FROM film_ratings", INVENTORY, "sql").identifiers).toEqual({
+      kind: "checked",
+      unknownTables: [],
+    });
+  });
+
+  test("an inventory recorded before kinds existed still answers for every entry it holds", () => {
+    // The transitional case, and it is the reason absence is KEPT: a ledger written before
+    // #789 declares no kinds, and reporting every table in it as unknown would be a false
+    // alarm on every resumed run.
+    expect(validatePlanStatement("SELECT * FROM film", SQLITE_INVENTORY, "sql").identifiers).toEqual({
+      kind: "checked",
+      unknownTables: [],
+    });
+  });
+
+  /*
     A run with no inventory validated NOTHING, and says so. Reporting an empty
     unknown-table list here would claim every table checked out against an inventory
     that was never read — the precision this repository keeps being caught claiming.
@@ -478,6 +639,78 @@ describe("an engine whose statements are not SQL is not judged by a SQL reader (
     expect(validation.guardApplicable).toBe(true);
     expect(validation.readOnly).toBe(false);
     expect(validation.guardViolation).toBe("NON_READ_STATEMENT");
+  });
+
+  test("a PromQL draft is declined the same way: the reader speaks SQL and nothing else (#1085)", () => {
+    const PROMQL = "sum by (job) (rate(prometheus_http_requests_total[5m]))";
+
+    expect(validatePlanStatement(PROMQL, INVENTORY, "promql")).toEqual({
+      readOnly: false,
+      guardApplicable: false,
+      identifiers: { kind: "not-applicable" },
+    });
+    expect(validatePlanStatement(PROMQL, null, "promql").identifiers).toEqual({ kind: "not-applicable" });
+    // The control: the same text on a SQL engine is judged, and the guard objects to it.
+    expect(validatePlanStatement(PROMQL, INVENTORY, "sql").guardViolation).toBe("NON_READ_STATEMENT");
+  });
+
+  test("a Cypher draft is declined the same way: the reader speaks SQL and nothing else (Neo4j spec 6.5)", () => {
+    // Correct as a fall-through: `language !== "sql"` declines every language the guard cannot read.
+    const CYPHER = "MATCH (n:`Person`) RETURN n LIMIT 100";
+
+    expect(validatePlanStatement(CYPHER, INVENTORY, "cypher")).toEqual({
+      readOnly: false,
+      guardApplicable: false,
+      identifiers: { kind: "not-applicable" },
+    });
+    expect(validatePlanStatement(CYPHER, null, "cypher").identifiers).toEqual({ kind: "not-applicable" });
+  });
+
+  test("an InfluxQL draft is declined the same way: the reader speaks SQL and nothing else (InfluxDB spec 6.5)", () => {
+    // Correct as a fall-through (`plan-statement.ts`, `language !== "sql"`): the draft meets the InfluxQL read
+    // policy when the user runs it. A regex holding `\/` is the text the SQL guard would misread.
+    const INFLUXQL = 'SELECT mean("temp") FROM "home".."cpu" WHERE "room" =~ /kitchen\\/a/ AND time > now() - 1h';
+
+    expect(validatePlanStatement(INFLUXQL, INVENTORY, "influxql")).toEqual({
+      readOnly: false,
+      guardApplicable: false,
+      identifiers: { kind: "not-applicable" },
+    });
+    expect(validatePlanStatement(INFLUXQL, null, "influxql").identifiers).toEqual({ kind: "not-applicable" });
+  });
+
+  test("a Kafka read request is declined the same way: it is JSON, and the reader speaks SQL (#1088)", () => {
+    // Kafka declares `queryLanguage: "json"`, and its dialect never reaches this guard: the language
+    // alone answers not-applicable, which is correct for a read request as it is for MongoDB's JSON.
+    const REQUEST = '{"topic": "orders", "partition": 0, "from": {"offset": "120"}, "limit": 50}';
+
+    expect(validatePlanStatement(REQUEST, INVENTORY, "json")).toEqual({
+      readOnly: false,
+      guardApplicable: false,
+      identifiers: { kind: "not-applicable" },
+    });
+    expect(validatePlanStatement(REQUEST, null, "json").identifiers).toEqual({ kind: "not-applicable" });
+    // The control: the same text on a SQL engine is judged, and the guard objects to it. It finds no
+    // operative keyword in a JSON object, so its objection is that there is no statement at all.
+    expect(validatePlanStatement(REQUEST, INVENTORY, "sql")).toMatchObject({
+      guardApplicable: true,
+      guardViolation: "NO_STATEMENT",
+    });
+  });
+
+  test("an etcd command is declined the same way: it is no SQL, and the reader speaks SQL (#1089)", () => {
+    // etcd declares `queryLanguage: "json"`, so the language alone answers not-applicable, whatever the
+    // command's words: a key named like a SQL verb is read by nothing here.
+    const COMMAND = "get /delete/from/users --prefix --limit=50";
+
+    expect(validatePlanStatement(COMMAND, INVENTORY, "json")).toEqual({
+      readOnly: false,
+      guardApplicable: false,
+      identifiers: { kind: "not-applicable" },
+    });
+    expect(validatePlanStatement(COMMAND, null, "json").identifiers).toEqual({ kind: "not-applicable" });
+    // The control: the same text on a SQL engine is judged.
+    expect(validatePlanStatement(COMMAND, INVENTORY, "sql").guardApplicable).toBe(true);
   });
 });
 
@@ -620,5 +853,55 @@ describe("an unfenced statement ends where the SQL ends, not where the prose lea
 
     if (draft.kind !== "statement") throw new Error("expected a statement");
     expect(draft.sql).toBe("SELECT 1\nstill part of it");
+  });
+});
+
+/*
+  A MongoDB draft IS readable for its names, because it is one JSON command whose collections sit in known keys. Three
+  of ten live plan drafts on 2026-10-17 named `"collection": "shop.orders"`, which the editor reads as a collection
+  that does not exist and answers with no rows, under a card that said the names were "not checked".
+*/
+describe("a MongoDB draft's collections are checked against the inventory by their own names", () => {
+  const MONGO_DRAFT_IDENTIFIERS = languageServer("mongo").planDraftIdentifiers;
+  const MONGO_INVENTORY: AgentInventory = {
+    objects: [
+      { name: "shop.orders", path: ["shop", "orders"], kind: "collection", columns: [], indexes: [] },
+      { name: "shop.customers", path: ["shop", "customers"], kind: "collection", columns: [], indexes: [] },
+    ],
+    kinds: [{ id: "collection", role: "relation", label: "Collection", labelPlural: "Collections" }],
+  };
+
+  test("a qualified spelling and an invented name are unknown, the bare names are not, and the guard still declines", () => {
+    const draft = JSON.stringify({
+      collection: "shop.orders",
+      operation: "aggregate",
+      pipeline: [{ $lookup: { from: "customers" } }, { $unionWith: "invoices" }],
+    });
+    expect(validatePlanStatement(draft, MONGO_INVENTORY, "json", MONGO_DRAFT_IDENTIFIERS)).toEqual({
+      readOnly: false,
+      guardApplicable: false,
+      identifiers: { kind: "checked", unknownTables: ["shop.orders", "invoices"] },
+    });
+    expect(
+      validatePlanStatement(
+        '{"collection": "orders", "operation": "count"}',
+        MONGO_INVENTORY,
+        "json",
+        MONGO_DRAFT_IDENTIFIERS,
+      ).identifiers,
+    ).toEqual({ kind: "checked", unknownTables: [] });
+  });
+
+  test("with no inventory nothing is checked, and a draft that is not JSON is one no reader here can open", () => {
+    expect(
+      validatePlanStatement('{"collection": "orders"}', null, "json", MONGO_DRAFT_IDENTIFIERS).identifiers,
+    ).toEqual({
+      kind: "no-inventory",
+    });
+    expect(
+      validatePlanStatement("db.orders.find({})", MONGO_INVENTORY, "json", MONGO_DRAFT_IDENTIFIERS).identifiers,
+    ).toEqual({
+      kind: "not-applicable",
+    });
   });
 });

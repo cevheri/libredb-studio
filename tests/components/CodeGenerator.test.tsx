@@ -6,7 +6,7 @@ import React from "react";
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { CodeGenerator } from "@/components/CodeGenerator";
-import type { TableSchema } from "@/lib/types";
+import type { DetailedObject } from "@/lib/db/detailed-object";
 
 // The insecure-context harness, as in tests/components/copy-button.test.tsx: an absent
 // `navigator.clipboard` is what plain HTTP off loopback actually hands the page, and an
@@ -22,8 +22,10 @@ function setExecCommand(execCommand: ((command: string) => boolean) | undefined)
   Object.defineProperty(globalThis.document, "execCommand", { value: execCommand, configurable: true });
 }
 
-const schema: TableSchema = {
+const schema: DetailedObject = {
   name: "users",
+  kind: "table",
+  path: ["users"],
   indexes: [],
   columns: [
     { name: "id", type: "SERIAL", nullable: false, isPrimary: true },
@@ -31,6 +33,25 @@ const schema: TableSchema = {
     { name: "age", type: "INTEGER", nullable: true, isPrimary: false },
     { name: "is_active", type: "BOOLEAN", nullable: false, isPrimary: false },
     { name: "created_at", type: "TIMESTAMP", nullable: true, isPrimary: false },
+  ],
+};
+
+/**
+ * A MySQL/MariaDB reading, as the provider now reports one (#1033): `type` is the type AS
+ * DECLARED and `baseType` is the family. Every mapper here decides on a type FAMILY, and a
+ * declared type is not one - `int unsigned` is no more `int` to a `===` than `int(11)` is,
+ * and an `ENUM` carries its values, so a substring test for `int` matches a column of two
+ * words that mean neither.
+ */
+const declaredTypeSchema: DetailedObject = {
+  name: "lentest",
+  kind: "table",
+  path: ["lentest"],
+  indexes: [],
+  columns: [
+    { name: "id", type: "int unsigned", baseType: "int", nullable: false, isPrimary: true },
+    { name: "note", type: "varchar(20)", baseType: "varchar", nullable: true, isPrimary: false },
+    { name: "status", type: "enum('int','text')", baseType: "enum", nullable: true, isPrimary: false },
   ],
 };
 
@@ -45,14 +66,14 @@ describe("CodeGenerator", () => {
 
   test("does not render when isOpen is false", () => {
     const { container } = render(
-      <CodeGenerator isOpen={false} onClose={mock(() => {})} tableName="users" tableSchema={schema} />,
+      <CodeGenerator isOpen={false} onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={schema} />,
     );
     expect(container.textContent).toBe("");
   });
 
   test("renders TypeScript interface by default", () => {
     const { queryByText, container } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={schema} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={schema} />,
     );
     expect(queryByText("Code Generator")).not.toBeNull();
     expect(container.textContent).toContain("export interface User");
@@ -62,7 +83,7 @@ describe("CodeGenerator", () => {
 
   test("switches language via dropdown", () => {
     const { queryByText, container } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={schema} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={schema} />,
     );
     fireEvent.click(queryByText("TypeScript Interface")!);
     fireEvent.click(queryByText("Go Struct")!);
@@ -76,7 +97,7 @@ describe("CodeGenerator", () => {
     setClipboard({ writeText });
 
     const { getByTestId } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={schema} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={schema} />,
     );
     fireEvent.click(getByTestId("code-generator-copy"));
     expect(writeText).toHaveBeenCalledTimes(1);
@@ -89,7 +110,7 @@ describe("CodeGenerator", () => {
     setExecCommand(() => false);
 
     const { getByTestId } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={schema} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={schema} />,
     );
     fireEvent.click(getByTestId("code-generator-copy"));
 
@@ -99,44 +120,55 @@ describe("CodeGenerator", () => {
 
   test("close button fires onClose", () => {
     const onClose = mock(() => {});
-    const { container } = render(<CodeGenerator isOpen onClose={onClose} tableName="users" tableSchema={schema} />);
+    const { container } = render(
+      <CodeGenerator isOpen onClose={onClose} tablePath={["app", "users"]} tableSchema={schema} />,
+    );
     const closeBtn = container.querySelector("button");
     fireEvent.click(closeBtn!);
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  test("shows table name in header", () => {
+  test("names the object by its ADDRESS, so two objects sharing a label read differently", () => {
+    // The header used to render the bare label, which is the same string for the `orders`
+    // in `app` and the one in `dbo` (#789, Task 35).
     const { queryAllByText } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="orders" tableSchema={schema} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["shop", "dbo", "orders"]} tableSchema={schema} />,
     );
-    // Table name appears in header and footer
-    expect(queryAllByText("orders").length).toBeGreaterThanOrEqual(1);
+    // The address appears in the header and again in the footer.
+    expect(queryAllByText("shop.dbo.orders").length).toBeGreaterThanOrEqual(1);
+    expect(queryAllByText("orders")).toHaveLength(0);
   });
 
   test("shows database type when provided", () => {
     const { queryByText } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={schema} databaseType="postgres" />,
+      <CodeGenerator
+        isOpen
+        onClose={mock(() => {})}
+        tablePath={["app", "users"]}
+        tableSchema={schema}
+        databaseType="postgres"
+      />,
     );
     expect(queryByText("postgres")).not.toBeNull();
   });
 
   test("does not show database type badge when not provided", () => {
     const { queryByText } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={schema} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={schema} />,
     );
     expect(queryByText("postgres")).toBeNull();
   });
 
   test("shows no schema message when tableSchema is null", () => {
     const { container } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={null} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={null} />,
     );
     expect(container.textContent).toContain("No schema available");
   });
 
   test("switches to Zod schema", () => {
     const { queryByText, container } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={schema} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={schema} />,
     );
     fireEvent.click(queryByText("TypeScript Interface")!);
     fireEvent.click(queryByText("Zod Schema")!);
@@ -145,7 +177,7 @@ describe("CodeGenerator", () => {
 
   test("switches to Prisma model", () => {
     const { queryByText, container } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={schema} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={schema} />,
     );
     fireEvent.click(queryByText("TypeScript Interface")!);
     fireEvent.click(queryByText("Prisma Model")!);
@@ -154,7 +186,7 @@ describe("CodeGenerator", () => {
 
   test("switches to Python dataclass", () => {
     const { queryByText, container } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={schema} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={schema} />,
     );
     fireEvent.click(queryByText("TypeScript Interface")!);
     fireEvent.click(queryByText("Python Dataclass")!);
@@ -164,16 +196,69 @@ describe("CodeGenerator", () => {
 
   test("switches to Java POJO", () => {
     const { queryByText, container } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={schema} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={schema} />,
     );
     fireEvent.click(queryByText("TypeScript Interface")!);
     fireEvent.click(queryByText("Java POJO")!);
     expect(container.textContent).toContain("public class User");
   });
 
+  test("maps a MySQL column by its type FAMILY, not its declaration (#1033)", () => {
+    // Prisma, Go and Java all test the family with `===`, so a declared `int unsigned` fell
+    // through every numeric arm to the string default the moment the provider stopped
+    // reporting the family in `type`.
+    for (const [language, want] of [
+      ["Prisma Model", "Int"],
+      ["Go Struct", "int"],
+      ["Java POJO", "Integer"],
+    ] as const) {
+      const { queryByText, container, unmount } = render(
+        <CodeGenerator
+          isOpen
+          onClose={mock(() => {})}
+          tablePath={["app", "lentest"]}
+          tableSchema={declaredTypeSchema}
+        />,
+      );
+      fireEvent.click(queryByText("TypeScript Interface")!);
+      fireEvent.click(queryByText(language)!);
+      expect(container.textContent).toContain(want);
+      unmount();
+    }
+  });
+
+  test("an ENUM's VALUES are not a type family (#1033)", () => {
+    // The other direction, and the reason the substring mappers are not safe either:
+    // `enum('int','text')` contains the four characters `int`, and the TypeScript, Zod and
+    // Python mappers all test `t.includes("int")`, so the declared type alone types this
+    // column as a number. One assertion per substring mapper, so reverting any ONE of them
+    // to the declaration fails here.
+    for (const [language, want] of [
+      ["TypeScript Interface", "status: string | null;"],
+      ["Zod Schema", "status: z.string().nullable(),"],
+      ["Python Dataclass", "status: Optional[str]"],
+    ] as const) {
+      const { queryByText, container, unmount } = render(
+        <CodeGenerator
+          isOpen
+          onClose={mock(() => {})}
+          tablePath={["app", "lentest"]}
+          tableSchema={declaredTypeSchema}
+        />,
+      );
+      // TypeScript is the default; the other two are picked from the dropdown.
+      if (language !== "TypeScript Interface") {
+        fireEvent.click(queryByText("TypeScript Interface")!);
+        fireEvent.click(queryByText(language)!);
+      }
+      expect(container.textContent).toContain(want);
+      unmount();
+    }
+  });
+
   test("footer shows column count and format", () => {
     const { queryByText } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={schema} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={schema} />,
     );
     expect(queryByText(/5 columns/)).not.toBeNull();
     expect(queryByText(/ts format/)).not.toBeNull();
@@ -181,7 +266,7 @@ describe("CodeGenerator", () => {
 
   test("footer format changes with language", () => {
     const { queryByText } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={schema} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={schema} />,
     );
     fireEvent.click(queryByText("TypeScript Interface")!);
     fireEvent.click(queryByText("Go Struct")!);
@@ -195,7 +280,7 @@ describe("CodeGenerator", () => {
     setClipboard({ writeText });
 
     const { getByTestId } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={schema} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={schema} />,
     );
     fireEvent.click(getByTestId("code-generator-copy"));
     await waitFor(() => expect(getByTestId("code-generator-copy").textContent).toContain("Copied"));
@@ -203,7 +288,7 @@ describe("CodeGenerator", () => {
 
   test("dropdown closes after selecting language", () => {
     const { queryByText, queryAllByText } = render(
-      <CodeGenerator isOpen onClose={mock(() => {})} tableName="users" tableSchema={schema} />,
+      <CodeGenerator isOpen onClose={mock(() => {})} tablePath={["app", "users"]} tableSchema={schema} />,
     );
     // Open dropdown
     fireEvent.click(queryByText("TypeScript Interface")!);
@@ -215,5 +300,46 @@ describe("CodeGenerator", () => {
     const pythonItems = queryAllByText("Python Dataclass");
     // After closing, the dropdown items are gone
     expect(pythonItems.length).toBe(0);
+  });
+
+  test("Escape closes the code generator", () => {
+    const onClose = mock(() => {});
+    render(<CodeGenerator isOpen onClose={onClose} tablePath={["app", "users"]} tableSchema={schema} />);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  test("a key other than Escape leaves the code generator open", () => {
+    const onClose = mock(() => {});
+    render(<CodeGenerator isOpen onClose={onClose} tablePath={["app", "users"]} tableSchema={schema} />);
+
+    fireEvent.keyDown(document, { key: "Enter" });
+
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  test("a handled Escape does not close the code generator underneath", () => {
+    const onClose = mock(() => {});
+    render(<CodeGenerator isOpen onClose={onClose} tablePath={["app", "users"]} tableSchema={schema} />);
+    const event = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    event.preventDefault();
+
+    document.dispatchEvent(event);
+
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  test("removes the Escape listener when the code generator closes", () => {
+    const onClose = mock(() => {});
+    const { rerender } = render(
+      <CodeGenerator isOpen onClose={onClose} tablePath={["app", "users"]} tableSchema={schema} />,
+    );
+
+    rerender(<CodeGenerator isOpen={false} onClose={onClose} tablePath={["app", "users"]} tableSchema={schema} />);
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(onClose).not.toHaveBeenCalled();
   });
 });

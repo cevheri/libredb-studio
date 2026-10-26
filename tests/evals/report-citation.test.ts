@@ -19,7 +19,7 @@ import {
  * What this CAN hold still is the property a live model depends on and no prose
  * assertion covers: **the object the server puts in front of the model is one the
  * server will then accept.** Four things have to agree for that — `evidenceSchema`,
- * the tool descriptions, `AGENT_RULES`, and the handover text a completed step and a
+ * the tool descriptions, `agentRules`, and the handover text a completed step and a
  * captured snapshot write — and they are in three files. The model here copies what
  * it was offered and nothing else, so if any of the four drifts, the run stops
  * answering here instead of in production.
@@ -110,14 +110,15 @@ describe("a run can cite using only what it was shown", () => {
   test("a planning run is offered no citation, because it can produce none", async () => {
     const offered: unknown[][] = [];
     const run = await open({ mode: "planning" });
-    await run.drive([
-      (turn) => {
-        offered.push(offeredCitationsIn(turn));
-        return answersProse("First, read the plan of the report query.")(turn);
-      },
-    ]);
+    const prose = (turn: Parameters<typeof offeredCitationsIn>[0]) => {
+      offered.push(offeredCitationsIn(turn));
+      return answersProse("First, read the plan of the report query.")(turn);
+    };
+    // Two turns, because a grounded plan run that named no statement is now asked for one — and
+    // the offer is checked on BOTH, which is stronger than checking the first alone.
+    await run.drive([prose, prose]);
 
-    expect(offered).toEqual([[]]);
+    expect(offered).toEqual([[], []]);
   });
 
   test("the placeholder in the rules is not mistaken for a real id", async () => {
@@ -132,6 +133,7 @@ describe("a run can cite using only what it was shown", () => {
         prompts.push(promptText(turn));
         return answersProse("nothing to do")(turn);
       },
+      answersProse("nothing to do"),
     ]);
 
     expect(prompts[0]).toContain('{"source":"artifact","correlationId":"<');

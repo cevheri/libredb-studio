@@ -15,6 +15,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { ClickHouseHttpTransport } from "@/lib/db/providers/sql/clickhouse/http-transport";
 import { CLICKHOUSE_UNKNOWN_ERROR_NAME, ClickHouseTransportError } from "@/lib/db/providers/sql/clickhouse/transport";
+import { ConnectionError, DatabaseConfigError } from "@/lib/db/errors";
 import type { DatabaseConnection, DatabaseType } from "@/lib/db/types";
 
 // ============================================================================
@@ -39,11 +40,11 @@ function summaryHeader(overrides: Record<string, string> = {}): string {
   return JSON.stringify({ read_rows: "2", written_rows: "2", elapsed_ns: "58781261", ...overrides });
 }
 
-/** Headers a JSON-format 200 really carries. */
+/** Headers a JSONCompact-format 200 really carries. */
 function jsonHeaders(overrides: Record<string, string> = {}): Record<string, string> {
   return {
     "content-type": "application/json; charset=UTF-8",
-    "x-clickhouse-format": "JSON",
+    "x-clickhouse-format": "JSONCompact",
     "x-clickhouse-summary": summaryHeader(),
     ...overrides,
   };
@@ -63,7 +64,7 @@ const SELECT_BODY = JSON.stringify({
     { name: "id", type: "Int32" },
     { name: "big", type: "UInt64" },
   ],
-  data: [{ id: 1, big: "18446744073709551615" }],
+  data: [[1, "18446744073709551615"]],
   rows: 1,
   rows_before_limit_at_least: 2,
   statistics: { elapsed: 0.001164102, rows_read: 2, bytes_read: 12 },
@@ -146,10 +147,13 @@ describe("ClickHouseHttpTransport request", () => {
     expect(lastUrl().pathname).toBe("/");
   });
 
-  test("asks for the JSON envelope through default_format", async () => {
+  // JSONCompact rather than JSON: a row is an array of values in `meta` order, so two
+  // columns of one name keep both values (see "reads a column the server names
+  // twice by position" below).
+  test("asks for the JSONCompact envelope through default_format", async () => {
     await makeTransport().query("SELECT 1");
 
-    expect(lastParam("default_format")).toBe("JSON");
+    expect(lastParam("default_format")).toBe("JSONCompact");
   });
 
   // Spec 2.1: without this, `SELECT toUInt64(18446744073709551615)` arrives as an
@@ -158,6 +162,68 @@ describe("ClickHouseHttpTransport request", () => {
     await makeTransport().query("SELECT toUInt64(18446744073709551615)");
 
     expect(lastParam("output_format_json_quote_64bit_integers")).toBe("1");
+  });
+
+  // The 64-bit setting does not cover Decimal: measured on 26.9.9.28, a
+  // Decimal(38,10) holding 12345678901234567890.1234567891 arrives as that
+  // unquoted number under it, and JSON.parse turns it into 12345678901234567000.
+  test("always quotes decimals so JSON.parse cannot round them", async () => {
+    await makeTransport().query("SELECT toDecimal128('12345678901234567890.1234567891', 10)");
+
+    expect(lastParam("output_format_json_quote_decimals")).toBe("1");
+  });
+
+  // Without this a Float's inf, -inf and nan arrive as `null` (measured on 26.9.18.11).
+  test("always quotes non-finite floats so they do not arrive as null", async () => {
+    await makeTransport().query("SELECT inf");
+
+    expect(lastParam("output_format_json_quote_denormals")).toBe("1");
+  });
+
+  test("reads a quoted non-finite float as its word only where the declared type is a float", async () => {
+    handler = () =>
+      respond(
+        JSON.stringify({
+          meta: [
+            { name: "f", type: "Float64" },
+            { name: "s", type: "String" },
+            { name: "a", type: "Array(Float32)" },
+            { name: "e", type: "Tuple(Enum8('a,b' = 1), Float64)" },
+            { name: "x", type: "Array(Float64)" },
+            { name: "p", type: "Tuple(Float64)" },
+            { name: "q", type: "Tuple(a Float64)" },
+            { name: "m", type: "Map(String, Float64)" },
+          ],
+          data: [
+            [
+              "-inf",
+              "-inf",
+              ["nan", 2],
+              ["a,b", "inf"],
+              "not an array",
+              ["inf", "extra"],
+              { a: "nan", b: "inf" },
+              ["inf"],
+            ],
+          ],
+        }),
+        { headers: jsonHeaders() },
+      );
+
+    const result = await makeTransport().query("SELECT 1");
+
+    expect(result.rows).toEqual([
+      {
+        f: "-Infinity",
+        s: "-inf",
+        a: ["NaN", 2],
+        e: ["a,b", "Infinity"],
+        x: "not an array",
+        p: ["Infinity", "extra"],
+        q: { a: "NaN", b: "inf" },
+        m: ["inf"],
+      },
+    ]);
   });
 
   test("sends the connection's database as a URL parameter", async () => {
@@ -236,11 +302,19 @@ describe("ClickHouseHttpTransport request", () => {
   // the format through settings would silently turn every result into raw text.
   test("does not let a setting hijack the response format", async () => {
     await makeTransport().query("SELECT 1", {
-      settings: { default_format: "TSV", output_format_json_quote_64bit_integers: 0, database: "other" },
+      settings: {
+        default_format: "TSV",
+        output_format_json_quote_64bit_integers: 0,
+        output_format_json_quote_decimals: 0,
+        output_format_json_quote_denormals: 0,
+        database: "other",
+      },
     });
 
-    expect(lastParam("default_format")).toBe("JSON");
+    expect(lastParam("default_format")).toBe("JSONCompact");
     expect(lastParam("output_format_json_quote_64bit_integers")).toBe("1");
+    expect(lastParam("output_format_json_quote_decimals")).toBe("1");
+    expect(lastParam("output_format_json_quote_denormals")).toBe("1");
     expect(lastParam("database")).toBe("demo");
   });
 
@@ -314,6 +388,82 @@ describe("ClickHouseHttpTransport endpoint", () => {
 
     expect(lastUrl().origin).toBe("http://[::1]:18123");
   });
+
+  // A host is spliced into nothing: one that would rewrite the URL around it is
+  // refused before the transport exists, so no request can carry the credential.
+  test.each(["evil.example/steal?", "user@evil.example", "db#x", "db\\evil", "db%2f", "db evil"])(
+    "refuses the host %p before any request is sent",
+    (host) => {
+      expect(() => makeTransport({ host })).toThrow(DatabaseConfigError);
+      expect(calls).toHaveLength(0);
+    },
+  );
+
+  test.each([0, 65536, 1.5, "8123abc"])("refuses the port %p before any request is sent", (port) => {
+    expect(() => makeTransport({ port: port as number })).toThrow(DatabaseConfigError);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("builds the URL without the query parameters reaching the path", async () => {
+    await makeTransport().query("SELECT 1", { database: "a/b?c#d" });
+
+    expect(lastUrl().pathname).toBe("/");
+    expect(lastParam("database")).toBe("a/b?c#d");
+  });
+});
+
+describe("ClickHouseHttpTransport redirects", () => {
+  test("asks fetch not to follow a redirect", async () => {
+    await makeTransport().query("SELECT 1");
+
+    expect(lastCall().init?.redirect).toBe("manual");
+  });
+
+  test("refuses a 3xx response with a ConnectionError naming only the target origin", async () => {
+    handler = () => respond("", { status: 302, headers: { location: "https://evil.example:9443/steal?token=SECRET" } });
+
+    const error = await makeTransport()
+      .query("SELECT 1")
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ConnectionError);
+    expect((error as Error).message).toContain("HTTP 302");
+    expect((error as Error).message).toContain("https://evil.example:9443");
+    expect((error as Error).message).not.toContain("SECRET");
+    expect(calls).toHaveLength(1);
+  });
+
+  // The runtime's own fetch, against two real sockets: the redirect target must
+  // never see a request, and above all never the Authorization header.
+  test("does not follow a real redirect to another server", async () => {
+    globalThis.fetch = originalFetch;
+    const reached: string[] = [];
+    const target = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(request) {
+        reached.push(request.headers.get("authorization") ?? "");
+        return new Response("");
+      },
+    });
+    const redirecting = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () => new Response("", { status: 307, headers: { location: `http://127.0.0.1:${target.port}/` } }),
+    });
+
+    try {
+      const error = await makeTransport({ port: redirecting.port })
+        .query("SELECT 1")
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ConnectionError);
+      expect(reached).toEqual([]);
+    } finally {
+      await redirecting.stop(true);
+      await target.stop(true);
+    }
+  });
 });
 
 // ============================================================================
@@ -378,7 +528,8 @@ describe("ClickHouseHttpTransport JSON results", () => {
   });
 
   test("reports no elapsed time rather than a guess when neither source has one", async () => {
-    handler = () => respond(JSON.stringify({ meta: [], data: [] }), { headers: { "x-clickhouse-format": "JSON" } });
+    handler = () =>
+      respond(JSON.stringify({ meta: [], data: [] }), { headers: { "x-clickhouse-format": "JSONCompact" } });
 
     const result = await makeTransport().query("SELECT 1");
 
@@ -400,12 +551,67 @@ describe("ClickHouseHttpTransport JSON results", () => {
     ]);
   });
 
-  test("describes nothing when the envelope carries no meta", async () => {
-    handler = () => respond(JSON.stringify({ data: [{ x: 1 }] }), { headers: jsonHeaders() });
+  // Live, 26.7.1.1315: the engine qualifies a joined column itself (`b.x`), and that
+  // name can collide with a column already called `b.x`, so `meta` names it twice
+  // with two different values. A JSON object row keeps only the last of them; the
+  // JSONCompact row keeps both, by position.
+  test("reads a column the server names twice by position, numbering the repeat", async () => {
+    handler = () =>
+      respond(
+        JSON.stringify({
+          meta: [
+            { name: "x", type: "UInt8" },
+            { name: "b.x", type: "UInt8" },
+            { name: "b.x", type: "UInt16" },
+          ],
+          data: [[1, 2, 3]],
+          rows: 1,
+        }),
+        { headers: jsonHeaders() },
+      );
+
+    const result = await makeTransport().query("SELECT a.x, b.x, 3 AS `b.x` FROM (SELECT 1 AS x) a, (SELECT 2 AS x) b");
+
+    expect(result.fieldNames).toEqual(["x", "b.x", "b.x (2)"]);
+    expect(result.rows).toEqual([{ x: 1, "b.x": 2, "b.x (2)": 3 }]);
+    expect(result.columnTypes).toEqual({ x: "UInt8", "b.x": "UInt8", "b.x (2)": "UInt16" });
+  });
+
+  test("refuses a row whose value count differs from the declared columns", async () => {
+    handler = () =>
+      respond(JSON.stringify({ meta: [{ name: "x", type: "UInt8" }], data: [[1, 2]] }), { headers: jsonHeaders() });
+
+    const error = await captureError(() => makeTransport().query("SELECT 1"));
+
+    expect(error.code).toBe(0);
+    expect(error.message).toBe("ClickHouse answered a row of 2 values for 1 declared columns");
+  });
+
+  test("refuses a row that is not an array of values", async () => {
+    handler = () =>
+      respond(JSON.stringify({ meta: [{ name: "x", type: "UInt8" }], data: [{ x: 1 }] }), { headers: jsonHeaders() });
+
+    const error = await captureError(() => makeTransport().query("SELECT 1"));
+
+    expect(error.message).toBe("ClickHouse answered a row that is not an array of values");
+  });
+
+  // Without `meta` a positional row cannot be named, so the rows are refused rather
+  // than shown under no column at all.
+  test("refuses rows when the envelope carries no meta", async () => {
+    handler = () => respond(JSON.stringify({ data: [[1]] }), { headers: jsonHeaders() });
+
+    const error = await captureError(() => makeTransport().query("SELECT 1"));
+
+    expect(error.message).toBe("ClickHouse answered a row of 1 values for 0 declared columns");
+  });
+
+  test("describes nothing when the envelope carries neither meta nor rows", async () => {
+    handler = () => respond(JSON.stringify({ data: [] }), { headers: jsonHeaders() });
 
     const result = await makeTransport().query("SELECT 1");
 
-    expect(result.rows).toEqual([{ x: 1 }]);
+    expect(result.rows).toEqual([]);
     expect(result.fieldNames).toBeNull();
     expect(result.columnTypes).toBeNull();
   });
@@ -494,7 +700,9 @@ describe("ClickHouseHttpTransport non-JSON formats", () => {
     expect(result.executionTimeMs).toBeCloseTo(58.781261, 6);
   });
 
-  test.each(["TSV", "CSV", "JSONEachRow", "Pretty"])("does not parse a %s response", async (format) => {
+  // `FORMAT JSON` included: the transport parses only the envelope it asked for, and
+  // a JSON object row would lose a value under a repeated name.
+  test.each(["TSV", "CSV", "JSON", "JSONEachRow", "Pretty"])("does not parse a %s response", async (format) => {
     handler = () => respond("payload", { headers: { "x-clickhouse-format": format } });
 
     expect((await makeTransport().query(`SELECT 1 FORMAT ${format}`)).rawText).toBe("payload");
@@ -578,7 +786,7 @@ describe("ClickHouseHttpTransport failures", () => {
       respond(
         JSON.stringify({
           meta: [{ name: "query", type: "String" }],
-          data: [{ query: "Code: 62. DB::Exception: Syntax error (SYNTAX_ERROR)" }],
+          data: [["Code: 62. DB::Exception: Syntax error (SYNTAX_ERROR)"]],
         }),
         { headers: jsonHeaders() },
       );
@@ -731,7 +939,7 @@ const MIDSTREAM_MESSAGE =
 function midstreamBody(tag: string = MIDSTREAM_TAG, message: string = MIDSTREAM_MESSAGE): string {
   return [
     '{\n\t"meta":\n\t[\n\t\t{ "name": "number", "type": "UInt64" }\n\t],\n\n\t"data":\n\t[',
-    '\t\t{ "number": 180999 }',
+    '\t\t["180999"],',
     "__exception__",
     tag,
     message,
@@ -764,7 +972,7 @@ describe("ClickHouseHttpTransport mid-stream exceptions", () => {
     // `SELECT '__exception__' AS x` is a legal statement. Only the per-request
     // tag distinguishes a real trailer from user data that happens to say this.
     handler = () =>
-      respond(JSON.stringify({ meta: [{ name: "x", type: "String" }], data: [{ x: "__exception__" }] }), {
+      respond(JSON.stringify({ meta: [{ name: "x", type: "String" }], data: [["__exception__"]] }), {
         headers: midstreamHeaders(),
       });
 
@@ -924,6 +1132,27 @@ describe("ClickHouseHttpTransport transport failures", () => {
     expect(error.code).toBe(0);
     expect(error.name).toBe(CLICKHOUSE_UNKNOWN_ERROR_NAME);
     expect(error.message).toBe("ClickHouse request failed: fetch failed");
+  });
+
+  // #1431: the reason Node keeps in `cause`, and Bun on the error itself, reaches the message.
+  test("a refused connection names the refusal and the address, on Node and on Bun", async () => {
+    handler = () => {
+      throw new TypeError("fetch failed", {
+        cause: { code: "ECONNREFUSED", address: "127.0.0.1", port: 18123 },
+      });
+    };
+    expect((await captureError(() => makeTransport().query("SELECT 1"))).message).toBe(
+      "ClickHouse request failed: connection refused at 127.0.0.1:18123",
+    );
+
+    handler = () => {
+      throw Object.assign(new TypeError("Unable to connect. Is the computer able to access the url?"), {
+        code: "ConnectionRefused",
+      });
+    };
+    expect((await captureError(() => makeTransport().query("SELECT 1"))).message).toBe(
+      "ClickHouse request failed: connection refused at 127.0.0.1:18123",
+    );
   });
 
   test("normalizes an aborted request", async () => {

@@ -1,7 +1,7 @@
 /**
  * Apache Cassandra Database Provider (issue #424, Phase 4)
  *
- * CQL over the native protocol through `cassandra-driver` 4.9.0, with every
+ * CQL over the native protocol through `cassandra-driver` 4.10.0, with every
  * statement, catalog read and metric going through the `CassandraTransport` seam -
  * so this file names no driver class and `seam-guard.test.ts` fails the build if it
  * starts to. The driver lives in `driver-transport.ts`; the catalog and
@@ -23,8 +23,10 @@
  *   after the first can be requested, and asking is REFUSED rather than answered
  *   with page one.
  * - `ALLOW FILTERING` IS THE LAST CLAUSE. `… LIMIT 3 ALLOW FILTERING` returns rows;
- *   `… ALLOW FILTERING LIMIT 3` is a syntax error. The shared limiter appends, so the
- *   two clauses are transposed.
+ *   `… ALLOW FILTERING LIMIT 3` is a syntax error. The clause is declared in the
+ *   grammar as one that must FOLLOW the row bound, so the shared limiter places the
+ *   bound before it (#1398); ScyllaDB's `BYPASS CACHE` and `USING TIMEOUT`, which
+ *   share this type-id, come from the same declaration.
  * - A LINE COMMENT NEEDS A NEWLINE TO CLOSE IT. `SELECT … LIMIT 3 -- note` with
  *   nothing after it is "line 1:45 mismatched character '<EOF>' expecting set null",
  *   and `-- note\n` returns rows. `sql.trim()` inside the shared limiter drops that
@@ -39,9 +41,10 @@
  * - THERE IS NO CANCELLATION, so `cancelQuery` is deliberately NOT implemented. The
  *   native protocol has no cancellation frame, CQL has no `KILL`, and the driver's own
  *   client publishes no cancel, abort or kill method (checked against its API
- *   surface). Both routes detect the method by name (`"cancelQuery" in provider`), so
+ *   surface). Both routes detect the method by presence (`supportsQueryCancel`), so
  *   its ABSENCE is what makes them answer "cancellation is not supported for this
- *   database type" - which is true - rather than reporting a cancellation that failed.
+ *   database type" - which is true - rather than reporting a cancellation that failed,
+ *   and what makes the editor's control read "Stop waiting" here (#1364).
  *   `search/index.ts` declined the same method for the same reason (#424 Phase 1).
  *   The only bound on a running statement is the client-side `readTimeout`, after
  *   which this client stops WAITING and the coordinator carries on.
@@ -54,12 +57,18 @@ import { SQLBaseProvider } from "../sql-base";
 import { AuthenticationError, ConnectionError, DatabaseConfigError, QueryError, TimeoutError } from "@/lib/db/errors";
 import {
   type ActiveSessionDetails,
+  type Container,
   type DatabaseConnection,
+  type DatabaseObject,
   type DatabaseOverview,
   type HealthInfo,
+  type KindCount,
   type IndexStats,
   type MaintenanceResult,
   type MaintenanceType,
+  type ObjectDetail,
+  type ObjectDetailBatch,
+  type ObjectSourceDocument,
   type PerformanceMetrics,
   type PreparedQuery,
   type ProviderCapabilities,
@@ -69,7 +78,6 @@ import {
   type QueryResult,
   type SlowQueryStats,
   type StorageStats,
-  type TableSchema,
   type TableStats,
 } from "@/lib/db/types";
 import { analyzeQuery } from "@/lib/db/utils/query-limiter";
@@ -87,10 +95,20 @@ import {
   getHealth as readHealth,
   getOverview as readOverview,
   getPerformanceMetrics as readPerformanceMetrics,
-  getSchema as readSchema,
   getSlowQueries as readSlowQueries,
   readServerFacts,
 } from "./introspect";
+import {
+  CASSANDRA_CONTAINER_LEVELS,
+  CASSANDRA_OBJECT_KINDS,
+  countObjects as readObjectCounts,
+  describeObject as readObjectDetail,
+  describeObjects as readObjectDetails,
+  readObjectSource as readSource,
+  listContainers as readContainers,
+  readEngineKeyspaces,
+  listObjects as readObjects,
+} from "./objects";
 import { CassandraTransportError, type CassandraTransport } from "./transport";
 
 // ============================================================================
@@ -105,18 +123,6 @@ import { CassandraTransportError, type CassandraTransport } from "./transport";
  * catalog after one is a cost for nothing. `INSERT` is absent for the same reason.
  */
 const SCHEMA_REFRESH_PATTERN = "\\b(CREATE|DROP|ALTER)\\b";
-
-/**
- * `ALLOW FILTERING` at the very end of a statement, followed by the bound the shared
- * limiter just appended.
- *
- * The inner whitespace is captured rather than normalised, so transposing the two
- * clauses does not silently reformat the user's own statement. This only ever runs on
- * a statement the limiter REWROTE, so the `LIMIT n` it matches is always the appended
- * one: a statement carrying its own bound is returned untouched before this is
- * reached, and CQL has no subquery for a second `ALLOW FILTERING` to hide in.
- */
-const APPENDED_AFTER_ALLOW_FILTERING = /\bALLOW(\s+)FILTERING\s+(LIMIT\s+\d+)/i;
 
 // ============================================================================
 // Pure helpers
@@ -187,6 +193,7 @@ export class CassandraProvider extends SQLBaseProvider {
    * connection object never carries the previous server's answer.
    */
   private facts: CassandraServerFacts | null;
+  private engineKeyspaces: readonly string[] = [];
 
   /**
    * The transport is injectable, and this is the only production-visible seam: the
@@ -219,15 +226,17 @@ export class CassandraProvider extends SQLBaseProvider {
       supportsExplain: false,
       supportsExternalQueryLimiting: true,
       // In the grammar - `CREATE TABLE probe.t (id int PRIMARY KEY, name text)` works
-      // - but what `CreateTableModal` EMITS is not: its default column is `id SERIAL
-      // PRIMARY KEY` ("Unknown type probe.serial"), its type list offers
+      // - but what `CreateTableModal` EMITS is not: its default column is an
+      // auto-increment primary key, a thing CQL has no spelling of at all (measured as
+      // `id SERIAL PRIMARY KEY`, "Unknown type probe.serial"; #648 made that spelling
+      // per-engine and added no CQL row, and PostgreSQL's identity clause is not CQL
+      // either), its type list offers
       // `VARCHAR(255)` and `DECIMAL(10,2)` (both syntax errors, CQL types carry no
       // length) and `INTEGER` and `JSONB` (both "Unknown type"), and its NOT NULL,
       // UNIQUE and DEFAULT options are each "no viable alternative at input" - none
       // of the three exists in a CQL column definition. A control that can only
-      // produce invalid input is not a supported capability; DDL typed into the
-      // editor works normally.
-      supportsCreateTable: false,
+      // produce invalid input is not a supported capability, so this provider
+      // declares no `createTable`; DDL typed into the editor works normally.
       // Not a missing feature but a missing GUARANTEE. The inline editor builds
       // `UPDATE <table> SET <col> = <val> WHERE <pk> = <val>` against one column it
       // guessed from the result fields (`id` or `*_id`), and CQL requires the WHOLE
@@ -237,6 +246,11 @@ export class CassandraProvider extends SQLBaseProvider {
       // real table - is "Some partition key parts are missing: id". Editing a key
       // column is refused outright ("PRIMARY KEY part id found in SET part").
       supportsInlineRowEdit: false,
+      supportsTestDataGeneration: false,
+      // CQL has no `OFFSET` clause. `prepareQuery` below THROWS on any positive offset
+      // rather than answering a page request with page one, and this flag is what keeps
+      // the editor from provoking that refusal in the first place (#816).
+      supportsResultPagination: false,
       // CQL has no transaction; BATCH is not one.
       supportsTransactions: false,
       // There is no referential constraint in the model at all: `ALTER TABLE … ADD
@@ -264,7 +278,21 @@ export class CassandraProvider extends SQLBaseProvider {
       // `statementTerminator` is absent for the same reason: measured, `SELECT id FROM
       // probe.customers WHERE id = 1;` returns the row, so the `;` the generators
       // already emit is valid CQL.
+      // Two shapes the shared SQL generators write that CQL has no grammar for (#1410), both
+      // measured on 5.0.9 and ScyllaDB 2026.3.2. A predicate names a column, so Generate
+      // Query's `WHERE 1=1` is "no viable alternative at input '1'"; and an INSERT carries one
+      // row, so the import's `VALUES (...), (...)` is "mismatched input ',' expecting EOF".
+      supportsConstantPredicate: false,
+      supportsMultiRowInsert: false,
       schemaRefreshPattern: SCHEMA_REFRESH_PATTERN,
+      // One level and seven kinds, every one of them measured against a live 5.0.9
+      // holding the committed fixture. The declaration and the four methods that read
+      // it live in `objects.ts`, which carries the measurements (issue #789).
+      containerLevels: CASSANDRA_CONTAINER_LEVELS,
+      // Only the declared depth is an address: a partial path would leave a level unbound and
+      // answer an empty folder. Read through `acceptedContainerShapes()` (#1147).
+      containerPathShapes: "exact",
+      objectKinds: CASSANDRA_OBJECT_KINDS,
     };
   }
 
@@ -312,8 +340,13 @@ export class CassandraProvider extends SQLBaseProvider {
    *    the editor appends it to what it already shows - duplicate rows presented as
    *    new ones, which is a wrong ANSWER. `search/index.ts` refuses Elasticsearch's
    *    identical gap the same way.
-   * 2. `ALLOW FILTERING` must stay the last clause, so the appended bound is moved in
-   *    front of it. Measured both ways: `… LIMIT 3 ALLOW FILTERING` returns rows,
+   * 2. `ALLOW FILTERING` - like ScyllaDB's `BYPASS CACHE` and `USING TIMEOUT` - is
+   *    declared in the grammar as a clause that must FOLLOW the row bound, and the
+   *    shared limiter places the bound before it (#1398). This provider used to
+   *    transpose the two clauses itself after the fact, which also failed to read
+   *    `… LIMIT 3 ALLOW FILTERING` as an existing bound and emitted
+   *    `LIMIT 3 LIMIT 500 ALLOW FILTERING`; both halves now come from the one
+   *    declaration. Measured both ways: `… LIMIT 3 ALLOW FILTERING` returns rows,
    *    `… ALLOW FILTERING LIMIT 3` is "line 1:60 mismatched input 'LIMIT' expecting
    *    EOF".
    * 3. A statement that would END inside a line comment is left alone. The limiter
@@ -351,10 +384,7 @@ export class CassandraProvider extends SQLBaseProvider {
     const grammar = resolveSqlGrammar(this.type);
     if (endsInsideLineComment(prepared.query, grammar)) return { ...prepared, query, wasLimited: false };
 
-    return {
-      ...prepared,
-      query: prepared.query.replace(APPENDED_AFTER_ALLOW_FILTERING, "$2 ALLOW$1FILTERING"),
-    };
+    return prepared;
   }
 
   // ==========================================================================
@@ -407,6 +437,9 @@ export class CassandraProvider extends SQLBaseProvider {
       // reads key their degradation on instead of the wording of a refusal. It never
       // throws, so it cannot turn a working connection into a failed one.
       this.facts = await readServerFacts(transport);
+      // Which keyspaces this engine owns beyond Cassandra's, which the keyspace tree hides
+      // (#1428). One more statement per connection, and a refusal answers none.
+      this.engineKeyspaces = await readEngineKeyspaces(transport);
     } catch (error) {
       // `connect()` opens a pool with sockets and reconnection timers behind it, and
       // the identity read runs AFTER that - so a probe that fails leaks the pool
@@ -426,6 +459,7 @@ export class CassandraProvider extends SQLBaseProvider {
     const transport = this.transport;
     this.transport = null;
     this.facts = null;
+    this.engineKeyspaces = [];
     if (transport !== null) await transport.close();
     this.setConnected(false);
   }
@@ -486,13 +520,18 @@ export class CassandraProvider extends SQLBaseProvider {
   }
 
   /**
-   * The keyspace every catalog read resolves against.
+   * The keyspace every FLAT catalog read resolves against.
    *
    * The connection's `database` field, exactly as a PostgreSQL connection pins one
-   * database and a Trino connection pins one catalog. A connection that names none
-   * has no tree to show: measured, an unqualified table name then answers "No
+   * database and a Trino connection pins one catalog. A connection that names none has
+   * no flat table list to show: measured, an unqualified table name then answers "No
    * keyspace has been specified. USE a keyspace, or explicitly specify
    * keyspace.tablename".
+   *
+   * That is a statement about `getSchema()` and the two other readers below, not about
+   * the connection. `listContainers` deliberately does not come through here (#789): a
+   * keyspace-less connection is legal and connectable, and the container tree is how
+   * somebody picks a keyspace when the connection pins none.
    */
   private requireKeyspace(): string {
     const keyspace = this.config.database;
@@ -607,19 +646,65 @@ export class CassandraProvider extends SQLBaseProvider {
   // Schema
   // ==========================================================================
 
+  // ==========================================================================
+  // Object surface (issue #789)
+  // ==========================================================================
+
   /**
-   * The tables and materialized views of the pinned keyspace.
+   * The four methods are thin on purpose: each one resolves the transport, hands
+   * `objects.ts` the DECLARATION rather than a hardcoded shape, and maps a transport
+   * fault the way every other catalog read here does.
    *
-   * `getSchemaList` and `getSchemaRelations` are deliberately NOT implemented. The
-   * split exists so a slow relationship read cannot block the table list, and here
-   * the relationships come from the same three-statement read as the columns: there
-   * are no foreign keys to fetch, and the secondary-index list is one row per index
-   * in the whole keyspace.
+   * `getCapabilities()` is called rather than read from a field, so a test that swaps a
+   * two-level declaration in reaches the same derivation the real one does - which is
+   * how standing ruling 5g's positional-index class is pinned on a one-level engine.
+   *
+   * `listContainers` deliberately does NOT call `requireKeyspace()`, unlike `getSchema()`
+   * beside it. `validate()` requires a host and a data centre and not a keyspace, so a
+   * keyspace-less connection is legal and connectable, and it is exactly the connection a
+   * container tree exists to serve: the tree is what lets somebody pick a keyspace when
+   * the connection pins none. The session default is then simply absent, and the
+   * comparison in `objects.ts` answers false for every keyspace because no keyspace can
+   * be named "". The old guard is a `getSchema()`-era rule, where it was right: a flat
+   * table list has no keyspace to read without one.
    */
-  public async getSchema(): Promise<TableSchema[]> {
+  public async listContainers(parent?: readonly string[]): Promise<Container[]> {
     const transport = this.requireTransport();
-    const keyspace = this.requireKeyspace();
-    return this.guarded(() => readSchema(transport, keyspace));
+    return this.guarded(() => readContainers(transport, this.config.database ?? "", this.engineKeyspaces, parent));
+  }
+
+  public async countObjects(container: readonly string[]): Promise<Record<string, KindCount>> {
+    const transport = this.requireTransport();
+    return this.guarded(() => readObjectCounts(transport, this.getCapabilities(), container));
+  }
+
+  public async listObjects(container: readonly string[], kind: string): Promise<DatabaseObject[]> {
+    const transport = this.requireTransport();
+    return this.guarded(() => readObjects(transport, this.getCapabilities(), container, kind));
+  }
+
+  public async describeObject(path: readonly string[], kind: string): Promise<ObjectDetail> {
+    const transport = this.requireTransport();
+    return this.guarded(() => readObjectDetail(transport, this.getCapabilities(), path, kind));
+  }
+  public async describeObjects(container: readonly string[], kind: string, limit?: number): Promise<ObjectDetailBatch> {
+    const transport = this.requireTransport();
+    return this.guarded(() => readObjectDetails(transport, this.getCapabilities(), container, kind, limit));
+  }
+
+  /**
+   * One object's definition text, through the server's own `DESCRIBE` (#789).
+   *
+   * Guarded exactly like the five above, and that is load-bearing here rather than uniform:
+   * an absence on this engine is the SERVER refusing the statement, so the raise a caller
+   * sees is `mapCassandraError`'s `invalid` arm carrying Cassandra's own sentence unprefixed
+   * ("Table 'no_such_table' not found in keyspace 'probe'", measured). Inventing a sentence
+   * here would replace a message that names both the object and the kind it was looked for
+   * under with one that names less.
+   */
+  public async readObjectSource(path: readonly string[], kind: string, limit?: number): Promise<ObjectSourceDocument> {
+    const transport = this.requireTransport();
+    return this.guarded(() => readSource(transport, this.getCapabilities(), path, kind, limit));
   }
 
   // ==========================================================================

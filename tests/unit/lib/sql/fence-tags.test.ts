@@ -21,6 +21,7 @@ describe("fenceTagEngine", () => {
       "mongodb",
       "redis",
       "oracle",
+      "db2",
       "mssql",
       "libredb",
       "couchbase",
@@ -29,9 +30,47 @@ describe("fenceTagEngine", () => {
       "trino",
       "cassandra",
       "duckdb",
+      "prometheus",
+      "kafka",
+      "etcd",
+      "neo4j",
+      "milvus",
+      "qdrant",
+      "influxdb",
+      "influxdb3",
+      "oxia",
+      "databend",
+      "s3",
+      "firestore",
+      "spark",
     ] satisfies DatabaseType[];
 
     for (const engine of engines) expect(fenceTagEngine(engine)).toBe(engine);
+  });
+
+  test("etcd has no alias: the shell tags name no engine, and etcdctl is not registered (#1089)", () => {
+    // `null` is fenceTagEngine's "names no engine", the answer an untagged fence and `sql` get.
+    for (const tag of ["sh", "bash", "shell", "etcdctl"]) expect(fenceTagEngine(tag)).toBeNull();
+    expect(fenceTagEngine("etcd")).toBe("etcd");
+  });
+
+  test("db2 has no alias: `sqlpl` and `ibmdb2` name no engine (#786)", () => {
+    // Only the type-id itself is read as naming Db2; `sqlpl` is a language, not the product.
+    expect(fenceTagEngine("db2")).toBe("db2");
+    expect(fenceTagEngine("sqlpl")).toBeNull();
+    expect(fenceTagEngine("ibmdb2")).toBeNull();
+  });
+
+  test("s3 has no alias: aws, sh, bash and shell name no engine", () => {
+    // `aws` names every AWS service, and the shell tags name no engine.
+    for (const tag of ["aws", "sh", "bash", "shell"]) expect(fenceTagEngine(tag)).toBeNull();
+    expect(fenceTagEngine("s3")).toBe("s3");
+  });
+
+  test("firestore has no alias: firebase, js and javascript name no engine", () => {
+    // `firebase` names a platform of many products, and `js` and `javascript` name a language.
+    for (const tag of ["firebase", "js", "javascript"]) expect(fenceTagEngine(tag)).toBeNull();
+    expect(fenceTagEngine("firestore")).toBe("firestore");
   });
 
   test("an alias names the engine it is an alias for", () => {
@@ -91,5 +130,72 @@ describe("fenceTagEngine", () => {
     // The product name is the tag that DOES name the engine, and the canonical-engine
     // walk above asserts it.
     expect(isQueryFenceTag("cassandra")).toBe(true);
+  });
+
+  test("cypher is a language tag that still names one engine, because one type-id runs Cypher", () => {
+    // The `promql` rule (Neo4j spec 6.4): Cypher is a language, and while `neo4j` is the only type-id
+    // that runs it, a ```cypher block on any other connection was written for another engine. Naming
+    // none would let it pass on PostgreSQL as the run's deliverable. A second graph type-id is the
+    // moment to revisit this.
+    expect(fenceTagEngine("cypher")).toBe("neo4j");
+    // Naming an engine does not stop the block holding a query, so the editor is still offered it.
+    expect(isQueryFenceTag("cypher")).toBe(true);
+    // The control: the canonical tag names the same engine, so the two spellings cannot disagree.
+    expect(isQueryFenceTag("neo4j")).toBe(true);
+    expect(fenceTagEngine("neo4j")).toBe("neo4j");
+  });
+
+  test("milvus has no alias: json, http and rest name other things, so none of them names Milvus (vector-family spec 5.7)", () => {
+    for (const tag of ["json", "http", "rest"]) expect(fenceTagEngine(tag)).not.toBe("milvus");
+    expect(fenceTagEngine("milvus")).toBe("milvus");
+    expect(isQueryFenceTag("milvus")).toBe(true);
+  });
+
+  test("qdrant has no alias: json, http and rest name other things, so none of them names Qdrant (vector-family spec 6.7)", () => {
+    for (const tag of ["json", "http", "rest"]) expect(fenceTagEngine(tag)).not.toBe("qdrant");
+    expect(fenceTagEngine("qdrant")).toBe("qdrant");
+    expect(isQueryFenceTag("qdrant")).toBe(true);
+  });
+
+  test("influxql names influxdb, the only type-id that runs InfluxQL; flux names nothing and is no query tag", () => {
+    // The `promql` rule: InfluxQL is a language, and `influxdb3` runs SQL, so a ```influxql block on
+    // any other connection was written for another engine.
+    expect(fenceTagEngine("influxql")).toBe("influxdb");
+    expect(isQueryFenceTag("influxql")).toBe(true);
+    // No type-id runs Flux (I3): an alias would make a Flux block look runnable on `influxdb`.
+    expect(fenceTagEngine("flux")).toBeNull();
+    expect(isQueryFenceTag("flux")).toBe(false);
+    // `influxdb3` has no alias: its blocks are DataFusion SQL, and `sql` names no engine.
+    expect(fenceTagEngine("influxdb3")).toBe("influxdb3");
+    expect(isQueryFenceTag("influxdb3")).toBe(true);
+    expect(fenceTagEngine("sql")).toBeNull();
+  });
+
+  test("oxia has no alias: `oxia` already names the engine and its CLI, and the shell tags name no engine (O14)", () => {
+    for (const tag of ["sh", "bash", "shell", "oxia-client"]) expect(fenceTagEngine(tag)).toBeNull();
+    expect(fenceTagEngine("oxia")).toBe("oxia");
+    expect(isQueryFenceTag("oxia")).toBe(true);
+  });
+
+  test("databend has no alias: a Databend block is Databend's SQL, and `sql` names no engine", () => {
+    // Before the `databend` type-id a Databend server was a MySQL-wire relative; a ```databend block now names its own
+    // engine, never `mysql`.
+    expect(fenceTagEngine("databend")).toBe("databend");
+    expect(isQueryFenceTag("databend")).toBe(true);
+    expect(fenceTagEngine("sql")).toBeNull();
+  });
+
+  test("promql is a language tag that still names one engine, because one type-id runs PromQL", () => {
+    // An alias names the type-id a block's text runs on, not a product: `mariadb` names `mysql`
+    // and `turso` names `libsql`. Every PromQL server this product reaches, VictoriaMetrics
+    // included, connects through `prometheus` (#1085), so a ```promql block on any other
+    // connection was written for another engine. Naming none would let it pass there as the run's
+    // deliverable, the `mysql`-on-PostgreSQL case `fenceTagEngine` exists to catch.
+    expect(fenceTagEngine("promql")).toBe("prometheus");
+    // Naming an engine does not stop the block holding a query, so the editor is still offered it.
+    expect(isQueryFenceTag("promql")).toBe(true);
+    // The control: the canonical tag names the same engine, so the two spellings cannot disagree.
+    expect(isQueryFenceTag("prometheus")).toBe(true);
+    expect(fenceTagEngine("prometheus")).toBe("prometheus");
   });
 });

@@ -7,6 +7,7 @@ import { render, fireEvent, cleanup } from "@testing-library/react";
 import React from "react";
 
 import { StudioTabBar } from "@/components/studio/StudioTabBar";
+import type { StudioTabSummary } from "@/hooks/use-tab-summaries";
 import type { QueryTab } from "@/lib/types";
 
 // =============================================================================
@@ -17,14 +18,13 @@ afterEach(() => {
   cleanup();
 });
 
-function createTab(overrides: Partial<QueryTab> = {}): QueryTab {
+function createTab(overrides: Partial<StudioTabSummary> = {}): StudioTabSummary {
   return {
     id: "tab-1",
     name: "Query 1",
-    query: "SELECT 1",
-    result: null,
-    isExecuting: false,
     type: "sql",
+    isSource: false,
+    dirty: false,
     ...overrides,
   };
 }
@@ -62,13 +62,13 @@ describe("StudioTabBar", () => {
     expect(queryByText("Query 2")).not.toBeNull();
   });
 
-  test("active tab has blue border and bg styling", () => {
+  test("active tab has the accent border and raised bg styling", () => {
     const props = createDefaultProps({ activeTabId: "tab-1" });
     const { container } = render(<StudioTabBar {...props} />);
     const tabElements = container.querySelectorAll('[class*="border-t-2"]');
-    expect(tabElements[0]?.className).toContain("border-blue-500");
-    // The accent stays a literal blue (it reads on either ground); the tab's own
-    // ground is the elevated surface token, so it follows the theme.
+    expect(tabElements[0]?.className).toContain("border-brand-tint");
+    // Both sides are tokens now (#402): the accent tint reads on either ground,
+    // and the tab's own ground is the elevated surface token.
     expect(tabElements[0]?.className).toContain("bg-overlay");
   });
 
@@ -92,6 +92,93 @@ describe("StudioTabBar", () => {
     const tab2Svgs = tabElements[1]?.querySelectorAll("svg");
     expect(tab1Svgs!.length).toBeGreaterThanOrEqual(1);
     expect(tab2Svgs!.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("a PromQL tab takes the icon every non-SQL query tab takes, and a SQL tab keeps its own (#1085)", () => {
+    // Decided rather than defaulted: the ladder draws `Hash` for SQL and the document braces for
+    // every other query language, Redis and LibreDB commands included, so PromQL joins that arm and
+    // the ladder gains nothing. The Redis tab is the control that the arm is the shared one.
+    const props = createDefaultProps({
+      tabs: [
+        createTab({ id: "tab-1", name: "Query 1", type: "sql" }),
+        createTab({ id: "tab-2", name: "up", type: "promql" }),
+        createTab({ id: "tab-3", name: "session:*", type: "redis" }),
+      ],
+    });
+    const { getAllByRole } = render(<StudioTabBar {...props} />);
+
+    const icons = getAllByRole("tab").map(
+      (tab) => [...(tab.querySelector("svg")?.classList ?? [])].find((name) => name.startsWith("lucide-")) ?? "none",
+    );
+    expect(icons).toEqual(["lucide-hash", "lucide-file-braces", "lucide-file-braces"]);
+  });
+
+  test("an InfluxQL tab takes the icon every non-SQL query tab takes, with no change to the ladder (InfluxDB spec A.11)", () => {
+    // Correct as is: the ladder draws `Hash` for SQL and the document braces for every other query
+    // language. An InfluxDB 3 tab is an SQL tab and keeps the SQL icon, which the first tab stands for.
+    const props = createDefaultProps({
+      tabs: [
+        createTab({ id: "tab-1", name: "cpu", type: "sql" }),
+        createTab({ id: "tab-2", name: "cpu", type: "influxql" }),
+        createTab({ id: "tab-3", name: "up", type: "promql" }),
+      ],
+    });
+    const { getAllByRole } = render(<StudioTabBar {...props} />);
+
+    const icons = getAllByRole("tab").map(
+      (tab) => [...(tab.querySelector("svg")?.classList ?? [])].find((name) => name.startsWith("lucide-")) ?? "none",
+    );
+    expect(icons).toEqual(["lucide-hash", "lucide-file-braces", "lucide-file-braces"]);
+  });
+
+  test("a Kafka tab takes the icon every non-SQL query tab takes, the same as a MongoDB tab (#1088)", () => {
+    // Correct as is: a read request is JSON, so the tab draws the document braces a MongoDB tab
+    // draws. The SQL tab is the control that the arm is not every tab's.
+    const props = createDefaultProps({
+      tabs: [
+        createTab({ id: "tab-1", name: "Query 1", type: "sql" }),
+        createTab({ id: "tab-2", name: "orders", type: "kafka" }),
+        createTab({ id: "tab-3", name: "Query 3", type: "mongodb" }),
+      ],
+    });
+    const { getAllByRole } = render(<StudioTabBar {...props} />);
+
+    const icons = getAllByRole("tab").map(
+      (tab) => [...(tab.querySelector("svg")?.classList ?? [])].find((name) => name.startsWith("lucide-")) ?? "none",
+    );
+    expect(icons).toEqual(["lucide-hash", "lucide-file-braces", "lucide-file-braces"]);
+  });
+
+  test("an etcd tab takes the icon every non-SQL query tab takes, and a SQL tab keeps its own (#1089)", () => {
+    // Correct as is: the last arm means "a query language that is not SQL", which an etcdctl command is.
+    const props = createDefaultProps({
+      tabs: [
+        createTab({ id: "tab-1", name: "Query 1", type: "sql" }),
+        createTab({ id: "tab-2", name: "/app/config/*", type: "etcd" }),
+      ],
+    });
+    const { getAllByRole } = render(<StudioTabBar {...props} />);
+
+    const icons = getAllByRole("tab").map(
+      (tab) => [...(tab.querySelector("svg")?.classList ?? [])].find((name) => name.startsWith("lucide-")) ?? "none",
+    );
+    expect(icons).toEqual(["lucide-hash", "lucide-file-braces"]);
+  });
+
+  test("a Cypher tab takes the icon every non-SQL query tab takes, and a SQL tab keeps its own (Neo4j spec 6.5)", () => {
+    // Correct as is: the last arm means "a query language that is not SQL", which Cypher is.
+    const props = createDefaultProps({
+      tabs: [
+        createTab({ id: "tab-1", name: "Query 1", type: "sql" }),
+        createTab({ id: "tab-2", name: "(:Person)", type: "cypher" }),
+      ],
+    });
+    const { getAllByRole } = render(<StudioTabBar {...props} />);
+
+    const icons = getAllByRole("tab").map(
+      (tab) => [...(tab.querySelector("svg")?.classList ?? [])].find((name) => name.startsWith("lucide-")) ?? "none",
+    );
+    expect(icons).toEqual(["lucide-hash", "lucide-file-braces"]);
   });
 
   // ── Click → activate tab ──────────────────────────────────────────────
@@ -170,7 +257,7 @@ describe("StudioTabBar", () => {
     const input = container.querySelector("input")!;
     expect(input).not.toBeNull();
     expect(input.value).toBe("Query 1");
-    expect(input.className).toContain("border-blue-500");
+    expect(input.className).toContain("border-brand-tint");
     expect(input.className).toContain("bg-transparent");
   });
 
@@ -298,7 +385,9 @@ describe("StudioTabBar", () => {
     fireEvent.keyDown(input, { key: "Enter" });
 
     expect(capturedFn).not.toBeNull();
-    const result = capturedFn!([tab1, tab2]);
+    // The updater reads only `id` and `name`, so the summaries stand in for the tabs
+    // the real hook would hand it.
+    const result = capturedFn!([tab1, tab2] as unknown as QueryTab[]);
     expect(result[0].name).toBe("Renamed");
     expect(result[1].name).toBe("Query 2");
   });
@@ -322,8 +411,72 @@ describe("StudioTabBar", () => {
     fireEvent.blur(input);
 
     expect(capturedFn).not.toBeNull();
-    const result = capturedFn!([tab1]);
+    const result = capturedFn!([tab1] as unknown as QueryTab[]);
     expect(result[0].name).toBe("Blur Name");
+  });
+
+  // ── New-tab keyboard shortcut (#745) ───────────────────────────────────
+
+  test("real Ctrl+Shift+X browser event opens a new tab", () => {
+    const onAddTab = mock(() => {});
+    const props = createDefaultProps({ onAddTab });
+    render(<StudioTabBar {...props} />);
+    fireEvent.keyDown(document, { key: "X", code: "KeyX", ctrlKey: true, shiftKey: true });
+    expect(onAddTab).toHaveBeenCalledTimes(1);
+  });
+
+  test("real Cmd+Shift+X browser event opens a new tab", () => {
+    const onAddTab = mock(() => {});
+    const props = createDefaultProps({ onAddTab });
+    render(<StudioTabBar {...props} />);
+    fireEvent.keyDown(document, { key: "X", code: "KeyX", metaKey: true, shiftKey: true });
+    expect(onAddTab).toHaveBeenCalledTimes(1);
+  });
+
+  test("shortcut fires only with the full Ctrl/Cmd+Shift+X chord", () => {
+    const onAddTab = mock(() => {});
+    const props = createDefaultProps({ onAddTab });
+    render(<StudioTabBar {...props} />);
+    fireEvent.keyDown(document, { key: "x", code: "KeyX", ctrlKey: true });
+    fireEvent.keyDown(document, { key: "X", code: "KeyX", shiftKey: true });
+    fireEvent.keyDown(document, { key: "x", code: "KeyX" });
+    fireEvent.keyDown(document, { key: "X", code: "KeyX", ctrlKey: true, shiftKey: true, altKey: true });
+    expect(onAddTab).not.toHaveBeenCalled();
+  });
+
+  test("shortcut is ignored while renaming a tab", () => {
+    const onAddTab = mock(() => {});
+    const props = createDefaultProps({ editingTabId: "tab-1", editingTabName: "Query 1", onAddTab });
+    const { container } = render(<StudioTabBar {...props} />);
+    const input = container.querySelector("input")!;
+    fireEvent.keyDown(input, { key: "X", code: "KeyX", ctrlKey: true, shiftKey: true });
+    expect(onAddTab).not.toHaveBeenCalled();
+  });
+
+  test("shortcut remains active from a textarea such as Monaco's hidden input", () => {
+    const onAddTab = mock(() => {});
+    const props = createDefaultProps({ onAddTab });
+    render(<StudioTabBar {...props} />);
+    const textarea = document.createElement("textarea");
+    document.body.appendChild(textarea);
+    fireEvent.keyDown(textarea, { key: "X", code: "KeyX", ctrlKey: true, shiftKey: true });
+    expect(onAddTab).toHaveBeenCalledTimes(1);
+    textarea.remove();
+  });
+
+  test("new tab button title advertises the shortcut", () => {
+    const props = createDefaultProps();
+    const { getByRole } = render(<StudioTabBar {...props} />);
+    expect(getByRole("button", { name: "New tab" }).getAttribute("title")).toBe("New Query Tab (Cmd/Ctrl+Shift+X)");
+  });
+
+  test("shortcut listener is removed when the tab bar unmounts", () => {
+    const onAddTab = mock(() => {});
+    const props = createDefaultProps({ onAddTab });
+    const { unmount } = render(<StudioTabBar {...props} />);
+    unmount();
+    fireEvent.keyDown(document, { key: "X", code: "KeyX", ctrlKey: true, shiftKey: true });
+    expect(onAddTab).not.toHaveBeenCalled();
   });
 
   // ── A11y semantics (#100) ─────────────────────────────────────────────
@@ -416,6 +569,67 @@ describe("StudioTabBar", () => {
       rerender(<StudioTabBar {...createDefaultProps({ tabs: [tab1], activeTabId: "tab-1", onCloseTab })} />);
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(document.activeElement?.getAttribute("data-tab-id")).toBe("tab-1");
+    });
+  });
+
+  // ── The unsaved-edit mark (#789 Phase 3) ────────────────────────────────
+
+  /**
+   * The tab strip is the ONLY place a reader learns that a Source tab they are not looking at
+   * holds an unsaved edit (#789 Phase 3, discussion #778).
+   *
+   * The draft lives in `SourceTabState.dirty`, which the pane writes when the buffer's
+   * dirtiness FLIPS, and nothing else in the shell draws it: the pane itself is one tab, and a
+   * reader who switched away has no other surface saying their text is still there.
+   *
+   * WCAG 2.5.3, Label in Name: the visible label is the tab's name, so the accessible name has
+   * to CONTAIN it rather than replace it. An `aria-label` of "unsaved edit" alone would leave a
+   * speech-input user unable to say the tab's name to reach it, and would leave a screen-reader
+   * user with no idea which object the mark is about.
+   */
+  describe("a Source tab with an unsaved edit", () => {
+    const sourceTab = (dirty: boolean | undefined): StudioTabSummary =>
+      createTab({
+        id: "source:function:app%1Forder_total",
+        name: "Source: app.order_total",
+        isSource: true,
+        dirty: dirty === true,
+      });
+
+    test("the tab bar marks an unsaved edit, and the accessible name CONTAINS the visible label", () => {
+      const props = createDefaultProps({ tabs: [sourceTab(true)], activeTabId: "source:function:app%1Forder_total" });
+      const { container } = render(<StudioTabBar {...props} />);
+
+      const tab = container.querySelector('[role="tab"]');
+      expect(tab?.getAttribute("aria-label")).toBe("Source: app.order_total (unsaved edit)");
+      // The visible label is still there and still the tab's own name, so the accessible name
+      // contains it rather than standing in for it.
+      expect(tab?.textContent).toBe("Source: app.order_total");
+      expect(container.querySelector('[data-testid="tab-dirty-dot"]')?.getAttribute("aria-hidden")).toBe("true");
+    });
+
+    test("a tab with no unsaved edit carries neither", () => {
+      // The control. `dirty` is optional and absent on every tab this repository has ever
+      // persisted, so an implementation that always drew the dot would pass the test above and
+      // mark every tab in the strip.
+      const props = createDefaultProps({
+        tabs: [sourceTab(undefined)],
+        activeTabId: "source:function:app%1Forder_total",
+      });
+      const { container } = render(<StudioTabBar {...props} />);
+
+      const tab = container.querySelector('[role="tab"]');
+      expect(tab?.getAttribute("aria-label")).toBeNull();
+      expect(container.querySelector('[data-testid="tab-dirty-dot"]')).toBeNull();
+    });
+
+    test("an ordinary query tab can never carry the mark, because it holds no source state", () => {
+      // The second control, over the OTHER population: `dirty` is read through `tab.source`, so
+      // a query tab has no field to carry it and the strip cannot mark one by accident.
+      const props = createDefaultProps();
+      const { container } = render(<StudioTabBar {...props} />);
+      expect(container.querySelector('[data-testid="tab-dirty-dot"]')).toBeNull();
+      expect(container.querySelectorAll('[role="tab"][aria-label]')).toHaveLength(0);
     });
   });
 });

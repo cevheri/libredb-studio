@@ -40,6 +40,7 @@ mock.module("@/components/ui/button", () => ({
 
 import { StudioDesktopHeader } from "@/components/studio/StudioDesktopHeader";
 import type { DatabaseConnection } from "@/lib/types";
+import type { ConnectionPulse } from "@/hooks/use-connection-pulse";
 
 // --- Fixtures ---
 const baseConnection: DatabaseConnection = {
@@ -82,7 +83,7 @@ const connectionWithEnvNoColor: DatabaseConnection = {
 
 const defaultProps = {
   activeConnection: baseConnection,
-  connectionPulse: null as "healthy" | "degraded" | "error" | null,
+  connectionPulse: null as ConnectionPulse | null,
   user: { role: "admin" } as { role?: string } | null,
   isAdmin: true,
   onLogout: mock(() => {}),
@@ -171,41 +172,66 @@ describe("StudioDesktopHeader", () => {
       expect(container.querySelector('[title^="Connection:"]')).toBeNull();
     });
 
-    test('renders healthy pulse with "Online" text and green dot', () => {
+    test('renders healthy pulse with "Online" text and a success-token dot', () => {
       const { container } = render(<StudioDesktopHeader {...defaultProps} connectionPulse="healthy" />);
       const pulseContainer = container.querySelector('[title="Connection: healthy"]');
       expect(pulseContainer).toBeTruthy();
 
       const dot = pulseContainer!.querySelector(".rounded-full");
-      expect(dot?.className).toContain("bg-emerald-500");
+      expect(dot?.className).toContain("bg-success-tint");
       expect(dot?.className).toContain("animate-pulse");
 
       // "Online" text in the pulse section
       expect(pulseContainer!.textContent).toContain("Online");
     });
 
-    test('renders degraded pulse with "Slow" text and amber dot', () => {
+    test('renders degraded pulse with "Slow" text and a warning-token dot', () => {
       const { container } = render(<StudioDesktopHeader {...defaultProps} connectionPulse="degraded" />);
       const pulseContainer = container.querySelector('[title="Connection: degraded"]');
       expect(pulseContainer).toBeTruthy();
 
       const dot = pulseContainer!.querySelector(".rounded-full");
-      expect(dot?.className).toContain("bg-amber-500");
+      expect(dot?.className).toContain("bg-warning-tint");
       expect(dot?.className).not.toContain("animate-pulse");
 
       expect(pulseContainer!.textContent).toContain("Slow");
     });
 
-    test('renders error pulse with "Error" text and red dot', () => {
+    test('renders error pulse with "Error" text and a danger-token dot', () => {
       const { container } = render(<StudioDesktopHeader {...defaultProps} connectionPulse="error" />);
       const pulseContainer = container.querySelector('[title="Connection: error"]');
       expect(pulseContainer).toBeTruthy();
 
       const dot = pulseContainer!.querySelector(".rounded-full");
-      expect(dot?.className).toContain("bg-red-500");
+      expect(dot?.className).toContain("bg-danger-tint");
       expect(dot?.className).not.toContain("animate-pulse");
 
       expect(pulseContainer!.textContent).toContain("Error");
+    });
+
+    // A connection Studio sends no background check to (a provider declaring resumesBilledCompute) has not been seen
+    // online, so the line under its name does not say it is, beside a badge that says it was not checked.
+    test('a not-checked connection with no environment shows no "Online" under its name', () => {
+      const { container } = render(<StudioDesktopHeader {...defaultProps} connectionPulse="not-checked" />);
+      const subtitle = container.querySelector("h1")!.closest("div")!.parentElement!.querySelector("p");
+      expect(subtitle?.textContent).not.toContain("Online");
+      expect(container.textContent).toContain("Not checked");
+    });
+
+    test('renders not-checked as "Not checked" with a neutral, unanimated dot', () => {
+      const { container } = render(<StudioDesktopHeader {...defaultProps} connectionPulse="not-checked" />);
+      const pulseContainer = container.querySelector('[title^="Connection: Not checked."]');
+      expect(pulseContainer).toBeTruthy();
+      expect(pulseContainer!.getAttribute("title")).toBe(
+        "Connection: Not checked. Studio sends this connection no background health checks.",
+      );
+
+      const dot = pulseContainer!.querySelector(".rounded-full");
+      expect(dot?.className).toContain("bg-fg-subtle");
+      expect(dot?.className).not.toContain("animate-pulse");
+      expect(dot?.className).not.toContain("bg-success-tint");
+
+      expect(pulseContainer!.textContent).toBe("Not checked");
     });
   });
 
@@ -230,10 +256,34 @@ describe("StudioDesktopHeader", () => {
 
   // ── User Dropdown Menu ──
 
+  test.each([
+    ["anonymous", null, false],
+    ["regular user", { role: "user" }, false],
+    ["admin", { role: "admin" }, true],
+  ] as const)("%s sees settings only in an actionable admin menu item", (_name, user, isAdmin) => {
+    const { container } = render(<StudioDesktopHeader {...defaultProps} user={user} isAdmin={isAdmin} />);
+    const settingsIcons = container.querySelectorAll("svg.lucide-settings");
+    expect(settingsIcons.length).toBe(isAdmin ? 1 : 0);
+    for (const icon of settingsIcons) {
+      const action = icon.closest('[role="menuitem"]');
+      expect(action).not.toBeNull();
+      fireEvent.click(action!);
+      expect(mockRouterPush).toHaveBeenCalledWith("/admin");
+    }
+  });
+
   describe("user dropdown menu", () => {
     test("renders user dropdown when user exists", () => {
       const { container } = render(<StudioDesktopHeader {...defaultProps} />);
       expect(container.querySelector('[data-testid="dropdown-menu"]')).toBeTruthy();
+    });
+
+    test("the user menu trigger is a button named User menu", () => {
+      // The trigger holds only an icon, and it is the only way to reach the MCP screen,
+      // so a screen reader must be able to find it by name.
+      const { getByRole } = render(<StudioDesktopHeader {...defaultProps} />);
+      const trigger = getByRole("button", { name: "User menu" });
+      expect(trigger.closest('[data-testid="dropdown-trigger"]')).toBeTruthy();
     });
 
     test("does not render user dropdown when user is null", () => {
@@ -286,10 +336,22 @@ describe("StudioDesktopHeader", () => {
       expect(onLogout).toHaveBeenCalledTimes(1);
     });
 
-    test("Logout menu item has red styling", () => {
+    test("offers every signed-in user the MCP settings screen", () => {
+      const { getByText } = render(<StudioDesktopHeader {...defaultProps} isAdmin={false} user={{ role: "user" }} />);
+      fireEvent.click(getByText("MCP"));
+      expect(mockRouterPush).toHaveBeenCalledWith("/settings/mcp");
+    });
+
+    test("offers every signed-in user the sign-in security screen", () => {
+      const { getByText } = render(<StudioDesktopHeader {...defaultProps} isAdmin={false} user={{ role: "user" }} />);
+      fireEvent.click(getByText("Sign-in security"));
+      expect(mockRouterPush).toHaveBeenCalledWith("/settings/authenticator");
+    });
+
+    test("Logout menu item has danger-token styling", () => {
       const { getByText } = render(<StudioDesktopHeader {...defaultProps} />);
       const logoutItem = getByText("Logout").closest('[role="menuitem"]');
-      expect(logoutItem?.className).toContain("text-red-400");
+      expect(logoutItem?.className).toContain("text-danger");
     });
   });
 
@@ -390,6 +452,31 @@ describe("StudioDesktopHeader", () => {
       const header = container.querySelector("header");
       expect(header?.className).toContain("hidden");
       expect(header?.className).toContain("md:flex");
+    });
+  });
+
+  describe("the read-only marker (#1089)", () => {
+    test("renders beside the active connection's name, titled with what it refuses", () => {
+      const { getByText } = render(
+        <StudioDesktopHeader {...defaultProps} activeConnection={{ ...baseConnection, readOnly: true }} />,
+      );
+      const marker = getByText("Read-only");
+
+      expect(marker.getAttribute("title")).toBe("Writes, value edits and maintenance are refused on this connection");
+      expect(marker.parentElement?.querySelector("h1")?.textContent).toBe("staging-db");
+    });
+
+    test("renders nothing for a read-write connection or for no connection", () => {
+      const view = render(<StudioDesktopHeader {...defaultProps} />);
+      expect(view.queryByText("Read-only")).toBeNull();
+
+      view.rerender(
+        <StudioDesktopHeader {...defaultProps} activeConnection={{ ...baseConnection, readOnly: false }} />,
+      );
+      expect(view.queryByText("Read-only")).toBeNull();
+
+      view.rerender(<StudioDesktopHeader {...defaultProps} activeConnection={null} />);
+      expect(view.queryByText("Read-only")).toBeNull();
     });
   });
 });

@@ -31,7 +31,14 @@
  *   that publishes no version is not a broken one.
  */
 
+import { endpointUrl, type HttpOrigin, httpOrigin, rejectRedirect } from "@/lib/db/http/endpoint";
+import { DatabaseConfigError } from "@/lib/db/errors";
+import { httpTransportFetch } from "@/lib/db/http/egress-policy";
+import { describeFetchFailure } from "@/lib/db/http/fetch-failure";
 import type { DatabaseConnection } from "@/lib/db/types";
+import { keyRowsByPosition } from "@/lib/db/utils/positional-rows";
+import { uniqueFieldNames } from "@/lib/db/utils/result-fields";
+import { isSQLiteInt64Digits } from "../sqlite-int64";
 import {
   type LibSQLBatchOutcome,
   type LibSQLExecuteOptions,
@@ -141,10 +148,6 @@ function parseJson(text: string): unknown {
   }
 }
 
-function formatHost(host: string): string {
-  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-}
-
 /**
  * An integer the protocol sent as a decimal string, as a number where a double
  * holds it exactly and as that same string where it does not.
@@ -163,10 +166,23 @@ function decodeInteger(raw: unknown): number | string | null {
   return Number.isSafeInteger(parsed) ? parsed : raw;
 }
 
-/** Base64 as bytes. Blobs are the one SQLite type JSON cannot carry directly. */
+/**
+ * Base64 as bytes. Blobs are the one SQLite type JSON cannot carry directly.
+ *
+ * A `Buffer`, not a plain `Uint8Array`, because the rows leave through
+ * `JSON.stringify` on their way to the browser: a plain `Uint8Array` is written as an
+ * object keyed by index (`{"0":222,"1":173,...}`), which the grid showed as JSON and
+ * the SQL export wrote back as quoted text. A `Buffer` IS a `Uint8Array`, and it
+ * serializes to `{"type":"Buffer","data":[...]}`, the form `asBytes` in
+ * `src/lib/export/binary.ts` reads. The SQLite driver seam makes the same choice.
+ *
+ * A small decoded value is a slice of Node's shared Buffer pool, so its `.buffer` is
+ * that pool: a consumer that reaches past the view must honour `byteOffset` and
+ * `byteLength`, or copy the bytes out first.
+ */
 function decodeBlob(raw: unknown): Uint8Array | null {
   if (typeof raw !== "string") return null;
-  return Uint8Array.from(Buffer.from(raw, "base64"));
+  return Buffer.from(raw, "base64");
 }
 
 /**
@@ -199,13 +215,67 @@ function decodeValue(raw: unknown): unknown {
 }
 
 /**
+ * Sending one back
+ * ----------------
+ * `decodeInteger` above is lossy in ONE direction that matters: `9007199254740993`
+ * the integer and `'9007199254740993'` the text both leave this transport as the
+ * same JavaScript string, so a value arriving in a bind carries no clue which it
+ * was. SQLite settles it by the COLUMN's affinity, and only for a column that HAS
+ * one: measured 2026-09-18 against sqld 0.24.33
+ * (`ghcr.io/tursodatabase/libsql-server:v0.24.33`, SQLite 3.45.1), on a row whose
+ * key is 9007199254740993 -
+ *
+ *   column declared   | bound as text | bound as an integer
+ *   INTEGER / NUMERIC |       matches |             matches
+ *   TEXT              |       matches |             matches
+ *   BLOB / undeclared |   NO MATCH    |             matches
+ *
+ * INTEGER and NUMERIC affinity convert the text to a number before comparing and
+ * TEXT affinity converts the integer to text, so those answer the same either way.
+ * A column declared BLOB or declared NOTHING has NO affinity: SQLite compares the
+ * operands as they stand, a text is never equal to an integer, and the row the grid
+ * just read cannot be found again - `UPDATE ... WHERE id = ?` reports 0 rows changed
+ * and the editor tells the user nothing happened. Measured here before the fix:
+ * INTEGER 1 row, TEXT 1 row, BLOB 0 rows, undeclared 0 rows.
+ *
+ * Note what this is NOT: unlike bun:sqlite, the libSQL read side never rounds - the
+ * neighbouring row is never edited on either side of this change. Hrana quotes its
+ * integers, so the damage here is a silent no-op, not a wrong write.
+ *
+ * The affinity is not knowable here - a bind is a value, with no column attached,
+ * and the protocol never names the column an operand belongs to - so the seam
+ * answers the question it CAN answer exactly: it accepts back precisely what it
+ * handed out. `decodeInteger` emits these digits for one input only, a 64-bit
+ * integer outside the safe range, so reading them back as that integer is its exact
+ * inverse and every other string is left alone.
+ *
+ * WHICH strings those are is not restated here: `../sqlite-int64.ts` states it once,
+ * with the full list of shapes that stay text, and the SQLite driver asks the same
+ * function. Restating it in each provider is how the rule drifts - the two copies this
+ * replaced already disagreed in prose about exponent form.
+ *
+ * What that costs, measured and accepted: in a column with NO affinity that
+ * genuinely stores this shape as TEXT, the bind now misses where it used to match.
+ * That is the same ambiguity read from the other end, it cannot be resolved without
+ * the affinity, and the integer reading is the one these digits exist for. A
+ * TEXT-declared column is NOT affected - TEXT affinity converts the bind back to
+ * text - so an ordinary textual key still matches as text.
+ *
+ * This is the same rule `toSQLiteBindValue` applies in `sqlite-driver.ts`, by
+ * design: the two providers hand out the same shape, so they must accept the same
+ * shape back. It is one rule in one file now rather than a rule and its copy -
+ * `tests/unit/db/sqlite-int64.test.ts` fails the build if a provider grows its own.
+ */
+
+/**
  * One JavaScript parameter as a wire value.
  *
  * `bigint` is encoded from its own decimal form rather than through `Number`, for
  * the reason `decodeInteger` states in the other direction. A boolean becomes 1
  * or 0 because that is what SQLite stores - it has no boolean type - and a `Date`
  * becomes an ISO 8601 string because that is the only form SQLite's own date
- * functions read.
+ * functions read. A STRING carrying the digits of a past-2^53 integer goes back as
+ * the integer it was read as, for the reason above; every other string is text.
  */
 function encodeValue(param: unknown): HranaValue {
   if (param === null || param === undefined) return { type: "null" };
@@ -216,39 +286,44 @@ function encodeValue(param: unknown): HranaValue {
   }
   if (param instanceof Uint8Array) return { type: "blob", base64: Buffer.from(param).toString("base64") };
   if (param instanceof Date) return { type: "text", value: param.toISOString() };
+  // Only a real string, never `String(param)` of some other object: the read side
+  // hands out strings and nothing else, so nothing else can be a value it emitted.
+  if (typeof param === "string" && isSQLiteInt64Digits(param)) return { type: "integer", value: param };
   return { type: "text", value: String(param) };
 }
 
-/** The column names and the types the engine declared for them. */
+/**
+ * The column names and the types the engine declared for them.
+ *
+ * The names are the declared ones through `uniqueFieldNames`: a column the engine did not
+ * name is `(No column name)` and a repeated name is numbered `id (2)`, so every column keeps a
+ * key of its own. A positional `column_N` used to stand in for a missing name, and it could
+ * collide with a column the statement itself named `column_1`.
+ */
 function readColumns(cols: unknown): { fieldNames: string[]; columnTypes: Record<string, string> } {
-  const fieldNames: string[] = [];
-  const columnTypes: Record<string, string> = {};
-  if (!Array.isArray(cols)) return { fieldNames, columnTypes };
+  if (!Array.isArray(cols)) return { fieldNames: [], columnTypes: {} };
 
-  for (const [index, raw] of cols.entries()) {
-    const col = (asRecord(raw) ?? {}) as HranaColumn;
-    // A column the engine did not name still occupies a position, so it gets a
-    // positional name rather than being dropped - dropping one would shift every
-    // later value into the wrong key.
-    const name = typeof col.name === "string" && col.name !== "" ? col.name : `column_${index + 1}`;
-    fieldNames.push(name);
-    if (typeof col.decltype === "string" && col.decltype !== "") columnTypes[name] = col.decltype;
-  }
+  const declared = cols.map((raw) => (asRecord(raw) ?? {}) as HranaColumn);
+  const fieldNames = uniqueFieldNames(declared.map((col) => (typeof col.name === "string" ? col.name : "")));
+  // `Object.fromEntries` defines each type as an own property, so a column named `__proto__` keeps its type.
+  const columnTypes: Record<string, string> = Object.fromEntries(
+    declared.flatMap((col, index) =>
+      typeof col.decltype === "string" && col.decltype !== "" ? [[fieldNames[index], col.decltype] as const] : [],
+    ),
+  );
 
   return { fieldNames, columnTypes };
 }
 
-function readRows(rows: unknown, fieldNames: string[]): LibSQLRow[] {
+/**
+ * The rows, keyed by position under `fieldNames`. A row that is not a list, or carries a value
+ * count other than the column count, is refused by `keyRowsByPosition` rather than padded.
+ */
+function readRows(rows: unknown, fieldNames: string[], sql: string): LibSQLRow[] {
   if (!Array.isArray(rows)) return [];
 
-  return rows.map((raw) => {
-    const values = Array.isArray(raw) ? raw : [];
-    const row: LibSQLRow = {};
-    for (const [index, name] of fieldNames.entries()) {
-      row[name] = decodeValue(values[index]);
-    }
-    return row;
-  });
+  const values = rows.map((raw) => (Array.isArray(raw) ? raw.map(decodeValue) : []));
+  return keyRowsByPosition(fieldNames, values, "libsql", sql);
 }
 
 function toNumber(raw: unknown, fallback: number): number {
@@ -263,7 +338,7 @@ function toNumber(raw: unknown, fallback: number): number {
  * than shifting every later result onto the wrong statement - the shape a short
  * answer would otherwise silently produce.
  */
-function readOutcome(raw: unknown): LibSQLBatchOutcome {
+function readOutcome(raw: unknown, sql: string): LibSQLBatchOutcome {
   const step = asRecord(raw);
   if (!step) return { ok: false, error: new LibSQLTransportError(NO_RESULT, 200) };
 
@@ -277,15 +352,15 @@ function readOutcome(raw: unknown): LibSQLBatchOutcome {
     return { ok: false, error: new LibSQLTransportError(message, 200, code) };
   }
 
-  return { ok: true, result: toStatementResult(asRecord(step.response)?.result) };
+  return { ok: true, result: toStatementResult(asRecord(step.response)?.result, sql) };
 }
 
-function toStatementResult(raw: unknown): LibSQLStatementResult {
+function toStatementResult(raw: unknown, sql: string): LibSQLStatementResult {
   const result = (asRecord(raw) ?? {}) as HranaStatementResult;
   const { fieldNames, columnTypes } = readColumns(result.cols);
 
   return {
-    rows: readRows(result.rows, fieldNames),
+    rows: readRows(result.rows, fieldNames, sql),
     fieldNames,
     columnTypes,
     affectedRowCount: toNumber(result.affected_row_count, 0),
@@ -315,6 +390,33 @@ function httpError(status: number, text: string): LibSQLTransportError {
   return new LibSQLTransportError(`libSQL request failed: ${message}`, status, code);
 }
 
+/**
+ * The `Authorization` header a connection's credential makes, or undefined when it has none.
+ *
+ * The scheme follows the connection, never the deployment:
+ *
+ * - A non-empty `user` sends `Basic base64(user:password)`, with an empty password when the connection has
+ *   none. That is the pair sqld checks when it is started with `SQLD_HTTP_AUTH="basic:<base64(user:password)>"`,
+ *   which sqld calls legacy HTTP basic authentication and chooses ahead of any JWT key it was also given.
+ * - Otherwise the password is a TOKEN and goes as `Bearer <password>`: Turso Cloud mints a JWT per database, and
+ *   sqld started with a JWT key checks the same header.
+ * - With neither, no header at all, which is what an unauthenticated local sqld expects: an empty bearer is a
+ *   400 there rather than an anonymous connection.
+ *
+ * A basic-auth sqld would also accept `Bearer <base64(user:password)>`, but only through leniency: its HttpBasic
+ * strategy splits the header at the first space, discards the scheme and accepts any token that CONTAINS the
+ * configured credential. Read from the sqld source (`libsql-server/src/auth/user_auth_strategies/http_basic.rs`,
+ * identical at libsql-server-v0.24.32, v0.24.33 and main), not measured against a live server here. Sending the
+ * scheme the server is configured for keeps that leniency out of the contract.
+ *
+ * The pair is encoded as UTF-8, the charset RFC 7617 names for Basic. Base64 has no character that ends a header
+ * line, so a user or password holding one cannot reach `fetch` as a header it refuses.
+ */
+function authorizationFor(config: DatabaseConnection): string | undefined {
+  if (config.user) return `Basic ${Buffer.from(`${config.user}:${config.password ?? ""}`, "utf8").toString("base64")}`;
+  return config.password ? `Bearer ${config.password}` : undefined;
+}
+
 // ============================================================================
 // Transport
 // ============================================================================
@@ -322,18 +424,14 @@ function httpError(status: number, text: string): LibSQLTransportError {
 export class LibSQLHranaTransport implements LibSQLTransport {
   public readonly kind = "hrana-http" as const;
 
-  private readonly origin: string;
+  private readonly origin: HttpOrigin;
   private readonly authorization: string | undefined;
 
   constructor(config: DatabaseConnection) {
     const secure = config.ssl !== undefined && config.ssl.mode !== "disable";
     const port = config.port ?? (secure ? DEFAULT_TLS_PORT : DEFAULT_PORT);
-    this.origin = `${secure ? "https" : "http"}://${formatHost(config.host ?? DEFAULT_HOST)}:${port}`;
-    // The credential is a token, not a password: libSQL has no user names, and
-    // Turso mints a JWT per database. A connection with no token sends no header,
-    // which is what an unauthenticated local sqld expects - sending an empty
-    // bearer to it is a 400 rather than an anonymous connection.
-    this.authorization = config.password ? `Bearer ${config.password}` : undefined;
+    this.origin = httpOrigin(secure ? "https" : "http", config.host ?? DEFAULT_HOST, port);
+    this.authorization = authorizationFor(config);
   }
 
   public async execute(sql: string, options: LibSQLExecuteOptions = {}): Promise<LibSQLStatementResult> {
@@ -380,19 +478,22 @@ export class LibSQLHranaTransport implements LibSQLTransport {
     // fails the whole call: there is no per-statement answer to hand back.
     if (!Array.isArray(results)) throw new LibSQLTransportError(NOT_AN_ENVELOPE, 200);
 
-    return statements.map((_statement, index) => readOutcome(results[index]));
+    return statements.map((statement, index) => readOutcome(results[index], statement.sql));
   }
 
   public async serverVersion(): Promise<string | null> {
     try {
-      const response = await fetch(`${this.origin}${VERSION_PATH}`, {
+      const response = await httpTransportFetch(endpointUrl(this.origin, VERSION_PATH), {
         method: "GET",
         headers: this.headers(),
+        // Not followed, like every other request: a 3xx is one more "no version".
+        redirect: "manual",
       });
       if (!response.ok) return null;
       const text = (await response.text()).trim();
       return text === "" ? null : text;
-    } catch {
+    } catch (error) {
+      if (error instanceof DatabaseConfigError) throw error;
       // A deployment without the route, and a deployment that could not be
       // reached at all, are both "no version to show" for this call. The version
       // panel's connection has already been established by the time it runs, so a
@@ -413,23 +514,27 @@ export class LibSQLHranaTransport implements LibSQLTransport {
   }
 
   private async send(path: string, body: string, timeoutMs?: number): Promise<string> {
+    const url = endpointUrl(this.origin, path);
     let response: Response;
     try {
-      response = await fetch(`${this.origin}${path}`, {
+      response = await httpTransportFetch(url, {
         method: "POST",
         headers: this.headers(),
         body,
+        // A followed redirect would carry the token to wherever it points.
+        redirect: "manual",
         // A statement that hangs would otherwise hang the request forever: fetch
         // has no default timeout. The signal covers the connect and the read,
         // which a timer wrapped around the promise would not.
         signal: timeoutMs === undefined ? undefined : AbortSignal.timeout(timeoutMs),
       });
     } catch (cause) {
-      const reason = cause instanceof Error ? cause.message : String(cause);
-      throw new LibSQLTransportError(`libSQL request failed: ${reason}`, 0);
+      if (cause instanceof DatabaseConfigError) throw cause;
+      throw new LibSQLTransportError(`libSQL request failed: ${describeFetchFailure(cause, url)}`, 0);
     }
 
     const text = await response.text();
+    rejectRedirect(response, url);
     if (!response.ok) throw httpError(response.status, text);
     return text;
   }

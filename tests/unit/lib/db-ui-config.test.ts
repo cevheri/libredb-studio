@@ -1,9 +1,85 @@
 import { describe, test, expect } from "bun:test";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
-import { getDBConfig, getDBIcon, getDBColor, isFileBased, takesConnectionField } from "@/lib/db-ui-config";
+import {
+  connectionFieldHint,
+  connectionFieldLabel,
+  connectionFieldPlaceholder,
+  connectionFieldRefusal,
+  connectionFieldShown,
+  DATABEND_FIELD_HINTS,
+  DATABEND_FIELD_RULES,
+  DB_UI_CONFIG,
+  getDBConfig,
+  getDBIcon,
+  getDBColor,
+  hostUriSchemes,
+  isFileBased,
+  KUBERNETES_FIELD_HINTS,
+  KUBERNETES_FIELD_RULES,
+  RABBITMQ_FIELD_HINTS,
+  RABBITMQ_FIELD_RULES,
+  offersSshTunnel,
+  offersSslPanel,
+  readOnlyHint,
+  SNOWFLAKE_FIELD_HINTS,
+  SNOWFLAKE_FIELD_RULES,
+  SPARK_FIELD_HINTS,
+  SPARK_FIELD_RULES,
+  S3_FIELD_HINTS,
+  S3_FIELD_RULES,
+  takesConnectionField,
+  type ConnectionField,
+  type DatabaseUIConfig,
+} from "@/lib/db-ui-config";
 import { SHOWCASE_DATABASE_ORDER, SHOWCASE_RANK, listShowcaseDatabases } from "@/lib/db-showcase";
-import type { DatabaseType } from "@/lib/types";
+import { readAmqpPort, readPathPrefix } from "@/lib/db/providers/stream/rabbitmq/connection-options";
+import { AMQP_PORT_SHAPE } from "@/lib/db/providers/stream/rabbitmq/errors";
+import type { DatabaseConnection, DatabaseType } from "@/lib/types";
+import {
+  buildDatabendConnectionOptions,
+  DATABEND_CONNECTION_SENTENCES,
+} from "@/lib/db/providers/sql/databend/connection-options";
+import {
+  buildS3ConnectionOptions,
+  S3_ACCESS_KEY_ID_PATTERN,
+  S3_BUCKET_PATTERN,
+  S3_CONNECTION_SENTENCES,
+  S3_REGION_PATTERN,
+} from "@/lib/db/providers/objectstore/s3/connection-options";
+import {
+  DNS1123_LABEL,
+  KUBERNETES_CONNECTION_SENTENCES,
+  readClusterEndpoint,
+} from "@/lib/db/providers/platform/kubernetes/connection-options";
+import { S3_ACCESS_KEY_ID_MAX_CHARS, S3_ACCESS_KEY_ID_MIN_CHARS } from "@/lib/db/providers/objectstore/s3/constants";
+import {
+  DatabendIcon,
+  FirestoreIcon,
+  InfluxDBIcon,
+  S3Icon,
+  SnowflakeIcon,
+  SparkIcon,
+} from "@/components/icons/db-icons";
+import {
+  snowflakeAccountRefusal,
+  SNOWFLAKE_FIELD_SENTENCES,
+  snowflakeHostHint,
+} from "@/lib/db/providers/sql/snowflake/account-host";
+import { SPARK_FIELD_SENTENCES } from "@/lib/db/providers/sql/spark/connection-options";
+import {
+  SPARK_CATALOG_PATTERN,
+  SPARK_NAMESPACE_PATTERN,
+  SPARK_TOKEN_PATTERN,
+} from "@/lib/db/providers/sql/spark/namespace";
+import { CREDENTIAL_WARNINGS } from "@/lib/db/credential-warnings";
+import { declareHostUri } from "../../helpers/synthetic-host-uri";
+import { providerDirectoryFiles } from "../../helpers/provider-directory-map";
+import {
+  declareCredentialWarnings,
+  SYNTHETIC_NO_SECRET,
+  SYNTHETIC_PAIR,
+} from "../../helpers/synthetic-credential-warnings";
 
 const ROOT = path.resolve(import.meta.dir, "../../..");
 
@@ -14,6 +90,7 @@ const ALL_TYPES: DatabaseType[] = [
   "mongodb",
   "redis",
   "oracle",
+  "db2",
   "mssql",
   "libredb",
   "couchbase",
@@ -25,6 +102,30 @@ const ALL_TYPES: DatabaseType[] = [
   "cassandra",
   "libsql",
   "duckdb",
+  "prometheus",
+  "kafka",
+  "etcd",
+  "neo4j",
+  "milvus",
+  "qdrant",
+  "influxdb",
+  "influxdb3",
+  "oxia",
+  "databend",
+  "bigquery",
+  "snowflake",
+  "spark",
+  "s3",
+  "kubernetes",
+  "mqtt",
+  "firestore",
+  "rabbitmq",
+  "opcua",
+  "mtconnect",
+  "modbus",
+  "netconf",
+  "snmp",
+  "sparkplug",
 ];
 
 describe("db-ui-config", () => {
@@ -98,6 +199,23 @@ describe("db-ui-config", () => {
       expect(getDBConfig("druid").connectionFields).toEqual(["host", "port", "user", "password"]);
     });
 
+    test("modbus offers Host, Port and the register map, and no credential at all", () => {
+      // The real config, not the modal's mirror of it. The modal's own case proves the box is drawn
+      // for an engine that declares the field; this proves the engine declares it. Removing it from
+      // `connectionFields` turns THIS red, which the mirrored case could not do.
+      expect(getDBConfig("modbus").connectionFields).toEqual(["host", "port", "registerMap"]);
+      // Modbus TCP defines no authentication, so a credential box would be a control with nothing
+      // behind it.
+      for (const credential of ["user", "password", "authMethod", "privateKey"]) {
+        expect(getDBConfig("modbus").connectionFields).not.toContain(credential);
+      }
+      // The map is named and explained, because an empty box on an engine with no discovery looks
+      // like a broken connection rather than an unnamed device.
+      expect(getDBConfig("modbus").fieldLabels?.registerMap).toBe("Register map");
+      expect(getDBConfig("modbus").fieldHints?.registerMap).toContain("zero-based PDU address");
+      expect(getDBConfig("modbus").fieldPlaceholders?.registerMap).toContain('"table": "holding_register"');
+    });
+
     test("druid offers no database field, because Druid has exactly one catalog", () => {
       // INFORMATION_SCHEMA.SCHEMATA reports exactly one catalog, always named `druid`
       // (issue #265, live-verified against Druid 37.0.0). A database selector would be
@@ -108,7 +226,7 @@ describe("db-ui-config", () => {
     test("trino exposes its label, coordinator port and connection fields", () => {
       expect(getDBConfig("trino").label).toBe("Trino");
       expect(getDBConfig("trino").defaultPort).toBe("8080");
-      expect(getDBConfig("trino").connectionFields).toEqual(["host", "port", "user", "password", "database"]);
+      expect(getDBConfig("trino").connectionFields).toEqual(["host", "port", "user", "password", "database", "schema"]);
     });
 
     test("trino keeps the database field, because it selects the catalog", () => {
@@ -118,6 +236,26 @@ describe("db-ui-config", () => {
       // PostgreSQL connection pins a database. Without the field every connection would
       // open on whatever the coordinator defaults to, which is nothing.
       expect(getDBConfig("trino").connectionFields).toContain("database");
+    });
+
+    test("elasticsearch offers the API key pair, and OpenSearch does not", () => {
+      // #708. Deleting either half from elasticsearch's list (or adding either to
+      // opensearch's) is the silent loss the maintainer measured: every other suite
+      // stayed green. The form reads this list; the transport refuses the pair on
+      // OpenSearch rather than sending it.
+      expect(getDBConfig("elasticsearch").connectionFields).toEqual([
+        "host",
+        "port",
+        "user",
+        "password",
+        "apiKeyId",
+        "apiKeySecret",
+      ]);
+      expect(getDBConfig("opensearch").connectionFields).toEqual(["host", "port", "user", "password"]);
+      expect(takesConnectionField("elasticsearch", "apiKeyId")).toBe(true);
+      expect(takesConnectionField("elasticsearch", "apiKeySecret")).toBe(true);
+      expect(takesConnectionField("opensearch", "apiKeyId")).toBe(false);
+      expect(takesConnectionField("opensearch", "apiKeySecret")).toBe(false);
     });
 
     test("mongodb asks where the credentials live, alongside the database to open", () => {
@@ -176,6 +314,117 @@ describe("db-ui-config", () => {
       expect(getDBConfig("duckdb").showConnectionStringToggle).toBe(false);
     });
 
+    test("prometheus exposes its label, the API port and the four fields its HTTP API reads", () => {
+      expect(getDBConfig("prometheus").label).toBe("Prometheus");
+      expect(getDBConfig("prometheus").defaultPort).toBe("9090");
+      expect(getDBConfig("prometheus").connectionFields).toEqual(["host", "port", "user", "password"]);
+    });
+
+    test("prometheus offers no Database box, because the server holds one TSDB and nothing to select", () => {
+      // Every read of the HTTP API is addressed to the one TSDB the server holds (#1085 6.1), the
+      // Druid and OpenSearch shape: a selector would be a control with no effect.
+      expect(getDBConfig("prometheus").connectionFields).not.toContain("database");
+      expect(takesConnectionField("prometheus", "database")).toBe(false);
+      // The control: the same entry takes the credential boxes its transport reads.
+      expect(takesConnectionField("prometheus", "user")).toBe(true);
+      expect(takesConnectionField("prometheus", "password")).toBe(true);
+    });
+
+    test("kafka declares saslMechanism as a select with exactly the three mechanisms, no database field and no SSH tunnel", () => {
+      const kafka = DB_UI_CONFIG.kafka;
+      expect(kafka.label).toBe("Apache Kafka");
+      expect(kafka.defaultPort).toBe("9092");
+      expect(kafka.showConnectionStringToggle).toBe(false);
+      expect(kafka.showSshTunnel).toBe(false);
+      expect(kafka.connectionFields).toEqual(["host", "port", "saslMechanism", "user", "password"]);
+      expect(kafka.fieldOptions?.saslMechanism?.map((option) => option.value)).toEqual([
+        "PLAIN",
+        "SCRAM-SHA-256",
+        "SCRAM-SHA-512",
+      ]);
+      // Each mechanism is offered under its own name, the word the broker's configuration uses.
+      expect(kafka.fieldOptions?.saslMechanism?.map((option) => option.label)).toEqual([
+        "PLAIN",
+        "SCRAM-SHA-256",
+        "SCRAM-SHA-512",
+      ]);
+      expect(kafka.fieldLabels?.saslMechanism).toBe("SASL mechanism");
+      expect(kafka.fieldHints?.saslMechanism).toBe("PLAIN and SCRAM require TLS");
+      // The one rule the modal and buildConnection read: false only where an entry declares it.
+      expect(offersSshTunnel("kafka")).toBe(false);
+      expect(offersSshTunnel("postgres")).toBe(true);
+    });
+
+    test("only kafka's, bigquery's, snowflake's, firestore's, rabbitmq's and snmp's connections refuse an SSH tunnel, and only because their entries declare it", () => {
+      // Derived from the declaration rather than typed out: a tunnel forwards one address, and a
+      // Kafka client reaches every broker at the address the broker advertises (docs/providers/kafka.md).
+      // SNMP refuses it for a different reason, and the difference is worth keeping: something WOULD read it,
+      // because `factory.ts` opens a tunnel for any connection that carries one with no test on the engine.
+      // MEASURED: the shared tunnel is a local TCP listener (`src/lib/ssh/tunnel.ts`, `net.createServer` plus
+      // `forwardOut`, and `dgram` appears zero times in it), and this provider sends datagrams. The factory
+      // would rewrite host and port to that TCP endpoint and the reads would go nowhere (#1721).
+      for (const type of ALL_TYPES) {
+        expect({ type, offered: offersSshTunnel(type) }).toEqual({
+          type,
+          offered: getDBConfig(type).showSshTunnel !== false,
+        });
+      }
+      const refusing = ALL_TYPES.filter((type) => !offersSshTunnel(type));
+      expect(refusing.sort()).toEqual(["bigquery", "firestore", "kafka", "rabbitmq", "snmp", "snowflake"]);
+      // A file-based engine still answers true: its panel is hidden by isFileBased instead.
+      expect(offersSshTunnel("sqlite")).toBe(true);
+    });
+
+    test("only bigquery's, snowflake's, firestore's, opcua's, netconf's and snmp's connections withhold the SSL panel, and only because their entries declare it", () => {
+      // BigQuery always speaks HTTPS to googleapis.com with the system trust store, and Snowflake to the account host with
+      // the certificate checked against that name, so an SSL mode is read by nothing.
+      // OPC UA's transport security is its own: a security mode of None, Sign or SignAndEncrypt and a pinned server
+      // certificate, with the client's key pair in the installation's PKI directory. The shared panel's vocabulary
+      // names nothing a server offers, and a reader who chose `require` there was refused with a word this engine
+      // does not know (#1677).
+      // NETCONF is the same shape with one difference worth stating: RFC 6242 carries it over SSH, so the host key pin in
+      // `hostKeyFingerprint` is what secures the dial, and MEASURED, no file under `providers/network/netconf/` read
+      // `sslMode`, `sslCa`, `sslCert`, `sslKey` or `rejectUnauthorized`. The panel was not answered with the wrong word
+      // there; it was read by nothing at all, so a reader who chose `verify-full` was shown no objection and given no
+      // verification (#1722).
+      // SNMP has no session to secure at all: the transport is bare UDP (`createSocket("udp4")`), and MEASURED,
+      // the nineteen files of that provider read `sslMode`, `sslCa`, `sslCert`, `sslKey` and `rejectUnauthorized`
+      // zero times. Its own consent hint says there is no transport security under a v2c datagram, which a panel
+      // offering `verify-full` beside it would contradict; v3's answer is USM, inside the message (#1721).
+      for (const type of ALL_TYPES) {
+        expect({ type, offered: offersSslPanel(type) }).toEqual({
+          type,
+          offered: getDBConfig(type).showSslPanel !== false,
+        });
+      }
+      expect(ALL_TYPES.filter((type) => !offersSslPanel(type)).sort()).toEqual([
+        "bigquery",
+        "firestore",
+        "netconf",
+        "opcua",
+        "snmp",
+        "snowflake",
+      ]);
+    });
+
+    test("a field an engine draws as a select is a field it takes, and the SASL select is drawn exactly where the field is taken", () => {
+      // The dialog renders a select from `fieldOptions` where the engine takes the field, and
+      // buildConnection writes the field on the same condition, so a declaration that named
+      // options for a field the engine does not take, or took the field with no options to
+      // choose from, would draw a control that writes nothing or a select that offers nothing.
+      for (const type of ALL_TYPES) {
+        const config = getDBConfig(type);
+        for (const field of Object.keys(config.fieldOptions ?? {}) as ConnectionField[]) {
+          expect({ type, field, taken: takesConnectionField(type, field) }).toEqual({ type, field, taken: true });
+        }
+        expect({ type, declared: config.fieldOptions?.saslMechanism !== undefined }).toEqual({
+          type,
+          declared: takesConnectionField(type, "saslMechanism"),
+        });
+      }
+      expect(ALL_TYPES.filter((type) => takesConnectionField(type, "saslMechanism"))).toEqual(["kafka"]);
+    });
+
     test("every provider carries a distinct colour class", () => {
       const colors = ALL_TYPES.map((type) => getDBConfig(type).color);
       expect(new Set(colors).size).toBe(colors.length);
@@ -218,6 +467,12 @@ describe("db-ui-config", () => {
       expect(isFileBased("couchbase")).toBe(false);
       expect(isFileBased("clickhouse")).toBe(false);
       expect(isFileBased("druid")).toBe(false);
+      expect(isFileBased("prometheus")).toBe(false);
+      // Not file-based, so the dialog keeps its TLS panel: only the SSH half is withheld.
+      expect(isFileBased("kafka")).toBe(false);
+      expect(isFileBased("influxdb")).toBe(false);
+      expect(isFileBased("influxdb3")).toBe(false);
+      expect(isFileBased("databend")).toBe(false);
     });
   });
 
@@ -265,12 +520,22 @@ describe("db-ui-config", () => {
 
     const providerSource = (type: DatabaseType): string => {
       const base = path.join(ROOT, "src/lib/db/providers", moduleForType(type));
+      // A directory that serves two type-ids declares which of its files each one reads
+      // (tests/helpers/provider-directory-map.ts); any other directory is read whole.
       const files = existsSync(`${base}.ts`)
         ? [`${base}.ts`]
-        : readdirSync(base, { recursive: true, encoding: "utf8" })
+        : (providerDirectoryFiles(base, type) ??
+          readdirSync(base, { recursive: true, encoding: "utf8" })
             .map((entry) => path.join(base, entry))
-            .filter((entry) => entry.endsWith(".ts"));
-      const source = files.map((file) => readFileSync(file, "utf8")).join("\n");
+            .filter((entry) => entry.endsWith(".ts")));
+      // A provider on the shared graph layer reads the connection in the base class it extends
+      // (`src/lib/db/graph/graph-base-provider.ts`), outside its own directory, so every graph-layer
+      // module the provider imports is read with it; without this, Neo4j would be seen reading nothing.
+      const own = files.map((file) => readFileSync(file, "utf8")).join("\n");
+      const shared = [...own.matchAll(/from "@\/lib\/db\/graph\/([^"]+)"/g)].map((match) =>
+        readFileSync(path.join(ROOT, "src/lib/db/graph", `${match[1]}.ts`), "utf8"),
+      );
+      const source = [own, ...shared].join("\n");
       return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
     };
 
@@ -279,11 +544,39 @@ describe("db-ui-config", () => {
       for (const type of ALL_TYPES) expect(providerSource(type).length).toBeGreaterThan(200);
     });
 
+    /**
+     * A field a provider reads only to refuse it, which the dialog therefore must not offer: Qdrant has no user
+     * name, and its provider refuses a non-empty `config.user` naming the field before any socket (vector-family
+     * spec 4.4), pinned in tests/unit/db/qdrant/credential-record.test.ts. InfluxDB 3 has no user name either: its
+     * token is the password, and the connection layer it shares with the InfluxQL type refuses a user on it (InfluxDB
+     * spec A.3). Oxia has no user name either, and its provider refuses a non-empty `config.user` with "Oxia has no
+     * user name: clear User. A bearer token goes under Token." (SB1-4.3) Kubernetes has no user name either: basic
+     * authentication is refused, and its provider refuses a non-empty `config.user` naming the field. RabbitMQ has no
+     * database: virtual hosts are discovered, and its provider refuses a non-empty `config.database` naming the field.
+     * Apache Spark has no user name either: every request uses one fixed Spark Connect user id, and its provider
+     * refuses a non-empty `config.user` naming the field (Apache Spark).
+     * Listed by name, so the read stays visible.
+     */
+    const READ_ONLY_TO_REFUSE: Readonly<Record<"user" | "database", readonly DatabaseType[]>> = {
+      user: ["qdrant", "influxdb3", "oxia", "kubernetes", "spark"],
+      database: ["rabbitmq"],
+    };
+
+    test("every field read only to refuse it is really read and really not offered", () => {
+      for (const [field, types] of Object.entries(READ_ONLY_TO_REFUSE)) {
+        for (const type of types) {
+          expect(new RegExp(`config\\.${field}\\b`).test(providerSource(type))).toBe(true);
+          expect(getDBConfig(type).connectionFields).not.toContain(field);
+        }
+      }
+    });
+
     test.each(["user", "database"] as const)("a provider that reads config.%s is given it", (field) => {
       const diverging = ALL_TYPES.filter(
         (type) =>
+          !READ_ONLY_TO_REFUSE[field].includes(type) &&
           new RegExp(`config\\.${field}\\b`).test(providerSource(type)) !==
-          getDBConfig(type).connectionFields.includes(field),
+            getDBConfig(type).connectionFields.includes(field),
       );
       expect(diverging).toEqual([]);
     });
@@ -296,8 +589,8 @@ describe("db-ui-config", () => {
     */
     describe("takesConnectionField", () => {
       test("answers for the engines whose field set is not the networked default", () => {
-        // libSQL: a token, not a user name; and the database IS the host.
-        expect(takesConnectionField("libsql", "user")).toBe(false);
+        // libSQL: a user for sqld's HTTP Basic auth beside the token box; and the database IS the host.
+        expect(takesConnectionField("libsql", "user")).toBe(true);
         expect(takesConnectionField("libsql", "database")).toBe(false);
         expect(takesConnectionField("libsql", "host")).toBe(true);
         expect(takesConnectionField("libsql", "password")).toBe(true);
@@ -317,7 +610,19 @@ describe("db-ui-config", () => {
       test("agrees with the list it reads, for every type and every field", () => {
         // Derived rather than enumerated: the predicate must not develop an opinion of its
         // own about any engine.
-        const FIELDS = ["host", "port", "user", "password", "database", "connectionString"] as const;
+        const FIELDS = [
+          "host",
+          "port",
+          "user",
+          "password",
+          "database",
+          "connectionString",
+          "apiKeyId",
+          "apiKeySecret",
+          "saslMechanism",
+          "warehouse",
+          "region",
+        ] as const;
         for (const type of ALL_TYPES) {
           for (const field of FIELDS) {
             expect(takesConnectionField(type, field)).toBe(getDBConfig(type).connectionFields.includes(field));
@@ -332,6 +637,882 @@ describe("db-ui-config", () => {
       // case it existed to catch.
       expect(getDBConfig("redis").connectionFields).toContain("user");
     });
+
+    test("libsql names the user, because its transport sends one as HTTP Basic", () => {
+      // Pinned by name for the same reason: the transport reads `config.user` for a server started with
+      // SQLD_HTTP_AUTH, and a list without it would leave that server reachable from the form only through
+      // sqld's lenient header parsing, which is the Redis ACL user again.
+      expect(getDBConfig("libsql").connectionFields).toContain("user");
+    });
+  });
+
+  test("libsql declares when its Username box is filled, and labels and explains its token box", () => {
+    const libsql = getDBConfig("libsql");
+    expect(libsql).toMatchObject({
+      label: "libSQL",
+      defaultPort: "8080",
+      showConnectionStringToggle: true,
+      connectionFields: ["host", "port", "user", "password", "connectionString"],
+    });
+    expect(libsql.fieldHints).toEqual({
+      user: "Only for a self-hosted libSQL server started with SQLD_HTTP_AUTH, which checks a user name and password as HTTP Basic: the Auth Token box then takes the password. Leave it empty for Turso Cloud and for a server that checks tokens.",
+      password:
+        "Turso Cloud mints this per database (`turso db tokens create`). A self-hosted libSQL server started without authentication takes none - leave it empty.",
+    });
+    // The words the dialog chose by type id before the entry declared them (engine contract, row 8).
+    expect(libsql.fieldLabels).toEqual({ password: "Auth Token" });
+  });
+
+  test("db2 declares its label, DRDA port and fields, the consent box's hint and no password hint (#786)", () => {
+    const db2 = getDBConfig("db2");
+    expect(db2).toMatchObject({
+      label: "Db2 LUW",
+      color: "text-hue-purple",
+      defaultPort: "50000",
+      // A `db2://` paste fills the fields, the Oracle precedent, so no toggle is drawn.
+      showConnectionStringToggle: false,
+      // The last is the consent to a cleartext password the provider refuses a connection with no
+      // TLS without (#786), drawn as a checkbox while SSL Mode is disable.
+      connectionFields: ["host", "port", "user", "password", "database", "allowInsecureAuth"],
+    });
+    expect(takesConnectionField("db2", "allowInsecureAuth")).toBe(true);
+    expect(takesConnectionField("postgres", "allowInsecureAuth")).toBe(false);
+    // No password hint: a declared hint is drawn whatever SSL Mode says, so a cleartext warning there
+    // stood under a verify-ca connection on the TLS port too (#1303). The warning is the consent box's,
+    // drawn only while SSL Mode is disable, with the sentence each type declares (InfluxDB spec R4).
+    expect(db2.fieldHints).toEqual({
+      allowInsecureAuth:
+        "With no SSL mode this driver sends the password in cleartext, so the connection is refused unless this is ticked. Choose an SSL mode under SSL / TLS instead wherever the server offers one.",
+    });
+    expect(db2.fieldLabels).toBeUndefined();
+  });
+
+  test("etcd declares the field hints of #1089 6.1, one connection per cluster and no connection string", () => {
+    const etcd = getDBConfig("etcd");
+    expect(etcd).toMatchObject({
+      label: "etcd",
+      defaultPort: "2379",
+      showConnectionStringToggle: false,
+      connectionFields: ["host", "port", "user", "password"],
+    });
+    expect(etcd.showSshTunnel).toBeUndefined();
+    expect(etcd.fieldHints).toEqual({
+      host: "A name or address only. For etcdctl's --endpoints=https://10.0.0.5:2379, type 10.0.0.5 here, 2379 in Port, and choose an SSL mode under SSL / TLS.",
+      user: "Leave User and Password empty to sign in with the client certificate under SSL / TLS (shown in verify-ca and verify-full): etcd uses its Common Name as the user when the server runs with --client-cert-auth. When both are set, etcd uses the password.",
+      password:
+        "etcd receives the password, then a token on every call, so a password needs an SSL mode other than disable, with or without an SSH tunnel.",
+    });
+    expect(etcd.fieldLabels).toBeUndefined();
+  });
+
+  test("neo4j declares the fields of its spec 6.1, the Bolt port, no connection string and the read-only hint", () => {
+    const neo4j = getDBConfig("neo4j");
+    expect(neo4j).toMatchObject({
+      label: "Neo4j",
+      color: "text-hue-fuchsia-alt",
+      defaultPort: "7687",
+      showConnectionStringToggle: false,
+      connectionFields: ["host", "port", "user", "password", "database"],
+    });
+    // The SSL panel and the SSH tunnel are both offered: a bolt:// URI dials the one server it names.
+    expect(neo4j.showSshTunnel).toBeUndefined();
+    expect(offersSshTunnel("neo4j")).toBe(true);
+    expect(neo4j.fieldHints).toEqual({ database: "Leave empty to use the server's home database." });
+    // The Read-only toggle's own sentence: the dialog's default says the mode can be turned off (spec A7).
+    expect(readOnlyHint(neo4j)).toBe(
+      "Neo4j connections are read-only in this version, whether or not this is ticked: this user's write privileges are never used.",
+    );
+    expect(readOnlyHint(DB_UI_CONFIG.etcd)).toBe(
+      "Writes, value edits and maintenance are refused on this connection. You can turn this off here, so on your own connection it is a safety rail, not a permission.",
+    );
+    expect(neo4j.fieldLabels).toBeUndefined();
+    expect(neo4j.fieldOptions).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// Declared connection-field copy (#1085)
+// ============================================================================
+
+/**
+ * Every connection field, as a total record so a field added to `connectionFields` fails to
+ * compile here until it is listed, and the walk below cannot miss it.
+ */
+const FIELD_CHECKLIST: Record<ConnectionField, true> = {
+  host: true,
+  port: true,
+  user: true,
+  password: true,
+  database: true,
+  schema: true,
+  connectionString: true,
+  serviceName: true,
+  instanceName: true,
+  localDataCenter: true,
+  authSource: true,
+  apiKeyId: true,
+  apiKeySecret: true,
+  saslMechanism: true,
+  allowInsecureAuth: true,
+  dataServers: true,
+  warehouse: true,
+  location: true,
+  region: true,
+  apiPath: true,
+  namespaces: true,
+  tlsServerName: true,
+  amqpPort: true,
+  authMethod: true,
+  privateKey: true,
+  privateKeyPassphrase: true,
+  role: true,
+  securityMode: true,
+  serverCertificateThumbprint: true,
+  registerMap: true,
+  hostKeyFingerprint: true,
+};
+const EVERY_FIELD = Object.keys(FIELD_CHECKLIST) as ConnectionField[];
+
+describe("declared connection-field copy (#1085)", () => {
+  const plain = getDBConfig("postgres");
+  /** A synthetic declaration, so the helpers' rule is tested apart from what any shipped entry declares. */
+  const declaring: DatabaseUIConfig = {
+    ...plain,
+    fieldLabels: { password: "Password or token" },
+    fieldHints: { password: "Leave User empty to send this as a bearer token." },
+  };
+
+  test("a declared label replaces the caller's fallback for its field", () => {
+    expect(connectionFieldLabel(declaring, "password", "Password")).toBe("Password or token");
+    // The control: a field the same declaration does not name keeps the caller's word.
+    expect(connectionFieldLabel(declaring, "user", "Username")).toBe("Username");
+  });
+
+  test("with nothing declared, the caller's fallback is the label", () => {
+    expect(connectionFieldLabel(plain, "password", "Password")).toBe("Password");
+  });
+
+  test("a declared hint is answered for its field and no other", () => {
+    expect(connectionFieldHint(declaring, "password")).toBe("Leave User empty to send this as a bearer token.");
+    expect(connectionFieldHint(declaring, "user")).toBeUndefined();
+    expect(connectionFieldHint(plain, "password")).toBeUndefined();
+  });
+
+  test("an empty declaration declares nothing", () => {
+    const empty: DatabaseUIConfig = { ...plain, fieldLabels: {}, fieldHints: {} };
+    expect(connectionFieldLabel(empty, "password", "Password")).toBe("Password");
+    expect(connectionFieldHint(empty, "password")).toBeUndefined();
+  });
+
+  test("qdrant declares its port, no Database box, no User field, API key or JWT, the hints and the Host box addresses (vector-family spec 6.2)", () => {
+    const qdrant = getDBConfig("qdrant");
+    expect(qdrant).toMatchObject({
+      label: "Qdrant",
+      color: "text-hue-rose-alt",
+      defaultPort: "6333",
+      showConnectionStringToggle: false,
+      connectionFields: ["host", "port", "password"],
+    });
+    // The SSL panel and the SSH tunnel are both offered, the tunnel's far end being the TLS identity (vector-family spec 4.4).
+    expect(qdrant.showSshTunnel).toBeUndefined();
+    expect(offersSshTunnel("qdrant")).toBe(true);
+    expect(takesConnectionField("qdrant", "user")).toBe(false);
+    expect(takesConnectionField("qdrant", "database")).toBe(false);
+    expect(qdrant.fieldLabels).toEqual({ password: "API key or JWT" });
+    expect(qdrant.fieldHints).toEqual({
+      host: "A name or address, or a pasted http:// or https:// address such as http://localhost:6333, which is split into Host and Port. Studio dials this REST port only, never Qdrant's gRPC port 6334 or its cluster port 6335.",
+      password:
+        "Qdrant receives the API key or JWT on every request, so a key needs an SSL mode other than disable, unless the host is this machine or an SSH tunnel carries the connection. A read-only or collection-scoped key with an expiry is the safest choice.",
+    });
+    expect(hostUriSchemes("qdrant")).toEqual(["http", "https"]);
+    expect(qdrant.credentialWarnings).toBe(CREDENTIAL_WARNINGS.qdrant);
+  });
+
+  test("oxia declares its label, port, fields, labels, the five hints and the read-only hint (SB3-1.5)", () => {
+    const oxia = getDBConfig("oxia");
+    expect(oxia.label).toBe("Oxia");
+    expect(oxia.color).toBe("text-hue-orange-alt");
+    expect(oxia.defaultPort).toBe("6648");
+    expect(oxia.showConnectionStringToggle).toBe(false);
+    expect(oxia.connectionFields).toEqual(["host", "port", "password", "database", "dataServers", "allowInsecureAuth"]);
+    expect(oxia.fieldLabels).toEqual({ password: "Token", database: "Namespace", dataServers: "Data servers" });
+    expect(oxia.fieldHints).toEqual({
+      host: "A name or address only. For Pulsar's oxia://host:6648/ns, type host here, 6648 in Port and ns in Namespace. If Studio runs in a container, localhost is that container: use host.docker.internal.",
+      password:
+        "An OIDC token, sent as a bearer token on every call; empty for a server without authentication. A token grants read and write on every namespace: Oxia has no authorization. A token needs an SSL mode other than disable, unless the host is this machine or an SSH tunnel carries the connection.",
+      database:
+        "Empty means default, the only namespace of oxia standalone. Names are case sensitive, and a cluster's namespaces are in its coordinator configuration.",
+      dataServers:
+        "Only for a cluster that advertises other addresses: every data server's public address (servers[].public in the coordinator configuration) as host:port, separated by commas or spaces, at most 64. List every server, not only today's leaders. Patterns are not accepted, because the token would follow any address a pattern matches. Leave empty for oxia standalone.",
+      allowInsecureAuth:
+        "Oxia receives the token on every call, so with no SSL mode it crosses the network in cleartext, to the host and to every data server. A token sent without TLS to a host that is not this machine is refused unless this is ticked. Choose an SSL mode under SSL / TLS instead wherever the server offers one.",
+    });
+    expect(oxia.readOnlyHint).toBe(
+      "Oxia connections are read-only in this version, whether or not this is ticked: Studio sends Oxia no write.",
+    );
+    // The Namespace box shows the namespace an empty one means, not the dialog's "db" (ruling R34).
+    expect(oxia.fieldPlaceholders).toEqual({ database: "default" });
+    expect(connectionFieldPlaceholder(oxia, "database", "db")).toBe("default");
+    expect(connectionFieldPlaceholder(oxia, "host", "localhost")).toBe("localhost");
+    expect(connectionFieldPlaceholder(getDBConfig("postgres"), "database", "db")).toBe("db");
+    expect(readOnlyHint(oxia)).toBe(oxia.readOnlyHint ?? "");
+    // No User box, no Host address, no option list and the default SSH tunnel (SB3-1.5).
+    expect(takesConnectionField("oxia", "user")).toBe(false);
+    expect(oxia.hostAcceptsUri).toBeUndefined();
+    expect(oxia.fieldOptions).toBeUndefined();
+    expect(oxia.showSshTunnel).toBeUndefined();
+    expect(offersSshTunnel("oxia")).toBe(true);
+    expect(hostUriSchemes("oxia")).toEqual([]);
+    expect(oxia.credentialWarnings).toBe(CREDENTIAL_WARNINGS.oxia);
+  });
+
+  test("databend declares its label, port, fields, Warehouse, the placeholders, the exported hints and the Host box addresses (design 6.1)", () => {
+    const databend = getDBConfig("databend");
+    expect(databend).toMatchObject({
+      label: "Databend",
+      color: "text-hue-red-alt",
+      // Self-hosted's HTTP handler port. 443 comes from a DSN or an https:// paste, never the SSL mode or a host heuristic.
+      defaultPort: "8000",
+      showConnectionStringToggle: false,
+      connectionFields: ["host", "port", "user", "password", "database", "warehouse", "allowInsecureAuth"],
+    });
+    expect(databend.icon).toBe(DatabendIcon);
+    // The SSL panel and the SSH tunnel are both offered.
+    expect(databend.showSshTunnel).toBeUndefined();
+    expect(offersSshTunnel("databend")).toBe(true);
+    expect(takesConnectionField("databend", "warehouse")).toBe(true);
+    expect(takesConnectionField("postgres", "warehouse")).toBe(false);
+    expect(databend.fieldLabels).toEqual({ warehouse: "Warehouse" });
+    // No User example: the dialog warns against root, so its placeholder may not suggest it (SF-039).
+    expect(databend.fieldPlaceholders).toEqual({ database: "default" });
+    expect(connectionFieldPlaceholder(databend, "user", "user")).toBe("user");
+    expect(connectionFieldPlaceholder(databend, "database", "db")).toBe("default");
+    expect(databend.fieldHints).toBe(DATABEND_FIELD_HINTS);
+    expect(DATABEND_FIELD_HINTS).toEqual({
+      host: "A host name or address, or a pasted https:// address, which is split into Host and Port. Databend Cloud: the host from Connect in the Cloud console, on port 443 with SSL mode verify-system. Self-hosted: the query node, port 8000 unless http_handler_port was changed.",
+      user: "A SQL user. On Databend Cloud: cloudapp, or a user created with CREATE USER; the email you sign in to the Cloud console with is not a SQL user.",
+      database: "The current database for names a statement does not qualify. Empty means default.",
+      warehouse:
+        "Databend Cloud: the warehouse= value of the DSN from Connect. A suspended warehouse resumes on the first statement, opening the connection included, because it reads the object tree, and is billed while it runs; with Warehouse set, Studio sends no background health checks. Self-hosted: leave empty unless your cluster routes requests by warehouse.",
+      allowInsecureAuth:
+        "Ticked, the password crosses the network in cleartext to this host. Databend Cloud never needs this: it serves HTTPS on port 443.",
+    });
+    expect(databend.readOnlyHint).toBeUndefined();
+    expect(databend.fieldOptions).toBeUndefined();
+    expect(hostUriSchemes("databend")).toEqual(["http", "https"]);
+    expect(databend.credentialWarnings).toBe(CREDENTIAL_WARNINGS.databend);
+  });
+
+  test("s3 declares its label, port, fields, labels, placeholders, the exported hints, the rules, the read-only hint and the Host box addresses", () => {
+    const s3 = getDBConfig("s3");
+    expect(s3).toMatchObject({
+      label: "S3-compatible object storage",
+      color: "text-hue-green-alt",
+      // MinIO and RustFS serve on 9000 by default; Garage's 3900 and an https:// paste's 443 are in the Host hint.
+      defaultPort: "9000",
+      showConnectionStringToggle: false,
+      connectionFields: ["host", "port", "user", "password", "database", "region", "allowInsecureAuth"],
+    });
+    expect(s3.icon).toBe(S3Icon);
+    // The SSL panel and the SSH tunnel are both offered: path style addresses one origin, which one forward carries.
+    expect(s3.showSshTunnel).toBeUndefined();
+    expect(offersSshTunnel("s3")).toBe(true);
+    expect(takesConnectionField("s3", "region")).toBe(true);
+    expect(takesConnectionField("databend", "region")).toBe(false);
+    expect(s3.fieldLabels).toEqual({
+      host: "Endpoint host",
+      user: "Access key ID",
+      password: "Secret access key",
+      database: "Bucket",
+      region: "Region",
+      allowInsecureAuth: "Connect without TLS",
+    });
+    expect(s3.fieldPlaceholders).toEqual({ database: "all buckets", region: "us-east-1" });
+    expect(connectionFieldPlaceholder(s3, "region", "the dialog's own example")).toBe("us-east-1");
+    // The User box keeps the dialog's own placeholder.
+    expect(connectionFieldPlaceholder(s3, "user", "user")).toBe("user");
+    expect(s3.fieldHints).toBe(S3_FIELD_HINTS);
+    expect(S3_FIELD_HINTS).toEqual({
+      host: "A host name or address, or a pasted http:// or https:// endpoint such as http://localhost:9000, which is split into Host and Port. The endpoint only: a bucket goes under Bucket, never in the address. MinIO and RustFS serve on port 9000 unless configured otherwise, Garage on 3900. If Studio runs in a container, localhost is that container: use host.docker.internal.",
+      user: "The access key ID. It is stored and shown in the clear, like a user name. Leave both keys empty only for a bucket that allows anonymous reads: Studio then sends unsigned requests, never this server's own cloud credentials.",
+      password:
+        "The secret access key. Studio's server signs every request with it and never sends it to the S3 server. Fill in both keys, or neither.",
+      database:
+        "Optional. With a bucket here, Studio reads only that bucket and never lists the others, which a key limited to one bucket needs. Empty: every bucket this key can list.",
+      region:
+        "The region every request is signed for. Empty means us-east-1, which MinIO accepts unless it was started with a region of its own. Garage: its s3_region setting. AWS: the bucket's region.",
+      allowInsecureAuth:
+        "Ticked, Studio connects to this host over plain HTTP. The secret access key is never sent to this server, but bucket and object names, listings and previewed contents travel in the clear, readable by anyone on the path, and a captured request can be replayed for several minutes. Choose an SSL mode under SSL / TLS, or an SSH tunnel, wherever the server offers one.",
+    });
+    expect(s3.fieldRules).toBe(S3_FIELD_RULES);
+    expect(readOnlyHint(s3)).toBe(
+      "S3-compatible connections are read-only in this version, whether or not this is ticked: Studio sends no write.",
+    );
+    expect(s3.fieldOptions).toBeUndefined();
+    expect(hostUriSchemes("s3")).toEqual(["http", "https"]);
+    expect(s3.credentialWarnings).toBe(CREDENTIAL_WARNINGS.s3);
+  });
+
+  test("milvus declares its port, the Database box, Password or token, the field hints and the Host box addresses (vector-family spec 5.2)", () => {
+    const milvus = getDBConfig("milvus");
+    expect(milvus).toMatchObject({
+      label: "Milvus",
+      color: "text-hue-indigo-alt",
+      defaultPort: "19530",
+      showConnectionStringToggle: false,
+      connectionFields: ["host", "port", "user", "password", "database"],
+    });
+    // The SSL panel and the SSH tunnel are both offered (vector-family spec 5.2).
+    expect(milvus.showSshTunnel).toBeUndefined();
+    expect(offersSshTunnel("milvus")).toBe(true);
+    expect(milvus.fieldLabels).toEqual({ password: "Password or token" });
+    expect(milvus.fieldHints).toEqual({
+      host: "A name or address, or a pasted http:// or https:// address such as a Zilliz Cloud endpoint, which is split into Host and Port. Port 9091 is Milvus's management port, which Studio never dials.",
+      database: "Optional; empty means default. A dbName in a request body overrides it.",
+      user: "Optional. At most 32 characters, starting with a letter. Leave it empty to put a token in Password or token.",
+      password:
+        "Milvus receives the password or token on every call, so a password needs an SSL mode other than disable, unless the host is this machine or an SSH tunnel carries the connection.",
+    });
+    expect(hostUriSchemes("milvus")).toEqual(["http", "https"]);
+    expect(milvus.credentialWarnings).toBe(CREDENTIAL_WARNINGS.milvus);
+  });
+
+  /** The sentences both InfluxDB types share (InfluxDB spec A.3). */
+  const INFLUX_HOST_HINT =
+    "A name or address, or a pasted http:// or https:// address, which is split into Host and Port. InfluxDB Cloud endpoints are https on port 443.";
+  const INFLUX_CONSENT_HINT =
+    "Ticked, the password or token crosses the network in cleartext to this host. On InfluxDB 3 Core every token is an admin token that reaches server-side code. Prefer TLS or an SSH tunnel; SSL mode require sends the token to a server whose certificate is not checked.";
+  const INFLUX_READ_ONLY_HINT =
+    "InfluxDB connections are read-only whether or not this is ticked: Studio sends no write.";
+
+  test("influxdb declares its label, port, fields, Password or token, the hints, the consent hint and the Host box addresses (InfluxDB spec A.3)", () => {
+    const influxdb = getDBConfig("influxdb");
+    expect(influxdb).toMatchObject({
+      label: "InfluxDB (InfluxQL)",
+      color: "text-hue-purple-alt",
+      defaultPort: "8086",
+      showConnectionStringToggle: false,
+      connectionFields: ["host", "port", "user", "password", "database", "allowInsecureAuth"],
+    });
+    expect(influxdb.icon).toBe(InfluxDBIcon);
+    // The SSL panel and the SSH tunnel are both offered.
+    expect(influxdb.showSshTunnel).toBeUndefined();
+    expect(offersSshTunnel("influxdb")).toBe(true);
+    expect(influxdb.fieldLabels).toEqual({ password: "Password or token" });
+    expect(influxdb.fieldHints).toEqual({
+      host: INFLUX_HOST_HINT,
+      password: "1.x: the user's password. 2.x and InfluxDB 3: an API token, with User empty.",
+      database:
+        'A 1.x database, a 2.x bucket, or an InfluxDB 3 database: the default for a run, not a filter. Empty: the only database the credential can list, or name it in the statement as "db".."measurement".',
+      allowInsecureAuth: INFLUX_CONSENT_HINT,
+    });
+    expect(readOnlyHint(influxdb)).toBe(INFLUX_READ_ONLY_HINT);
+    expect(hostUriSchemes("influxdb")).toEqual(["http", "https"]);
+    expect(influxdb.credentialWarnings).toBe(CREDENTIAL_WARNINGS.influxdb);
+  });
+
+  test("influxdb3 declares its label, port, no User field, Token, the hints, the consent hint and the Host box addresses (InfluxDB spec A.3)", () => {
+    const influxdb3 = getDBConfig("influxdb3");
+    expect(influxdb3).toMatchObject({
+      label: "InfluxDB 3 (SQL)",
+      color: "text-hue-violet-alt",
+      defaultPort: "8181",
+      showConnectionStringToggle: false,
+      connectionFields: ["host", "port", "password", "database", "allowInsecureAuth"],
+    });
+    // The same generic mark as the InfluxQL type: one product, two query languages.
+    expect(influxdb3.icon).toBe(InfluxDBIcon);
+    expect(influxdb3.showSshTunnel).toBeUndefined();
+    expect(offersSshTunnel("influxdb3")).toBe(true);
+    expect(takesConnectionField("influxdb3", "user")).toBe(false);
+    expect(influxdb3.fieldLabels).toEqual({ password: "Token" });
+    expect(influxdb3.fieldHints).toEqual({
+      host: INFLUX_HOST_HINT,
+      password:
+        "Empty only for a server started with --without-auth. On InfluxDB 3 Core every token is an admin token.",
+      database:
+        "The one InfluxDB 3 database this connection reads. Empty: the only database the token can list; with more than one, set it here.",
+      allowInsecureAuth: INFLUX_CONSENT_HINT,
+    });
+    expect(readOnlyHint(influxdb3)).toBe(INFLUX_READ_ONLY_HINT);
+    expect(hostUriSchemes("influxdb3")).toEqual(["http", "https"]);
+    expect(influxdb3.credentialWarnings).toBe(CREDENTIAL_WARNINGS.influxdb3);
+  });
+
+  test("every type that takes allowInsecureAuth declares its hint", () => {
+    // The consent box draws the type's own sentence, with no fallback, so a type that takes the field and declares no
+    // hint would draw an empty paragraph under the box (InfluxDB spec R4).
+    const taking = ALL_TYPES.filter((type) => takesConnectionField(type, "allowInsecureAuth"));
+    expect(taking).toEqual(["db2", "influxdb", "influxdb3", "oxia", "databend", "s3", "mqtt", "rabbitmq", "snmp"]);
+    for (const type of taking) {
+      const hint = connectionFieldHint(getDBConfig(type), "allowInsecureAuth");
+      expect({ type, hint: typeof hint, empty: hint?.length === 0 }).toEqual({ type, hint: "string", empty: false });
+    }
+  });
+
+  test("only libsql, mongodb, oracle, db2, mssql, couchbase, trino, cassandra, prometheus, kafka, etcd, neo4j, milvus, qdrant, the two InfluxDB types, oxia, databend, bigquery, snowflake, spark, s3, kubernetes, mqtt, firestore, rabbitmq, opcua, mtconnect and modbus declare field copy, so every other engine draws every label and hint it drew before", () => {
+    const declared = Object.entries(DB_UI_CONFIG)
+      .filter(([, config]) => config.fieldLabels !== undefined || config.fieldHints !== undefined)
+      .map(([type]) => type);
+    expect(declared).toEqual([
+      "libsql",
+      // The labels and hints the dialog chose by type id until these entries declared them (engine contract, row 8).
+      "mongodb",
+      "oracle",
+      "db2",
+      "mssql",
+      "couchbase",
+      "trino",
+      "cassandra",
+      "prometheus",
+      "kafka",
+      "etcd",
+      "neo4j",
+      "milvus",
+      "qdrant",
+      "influxdb",
+      "influxdb3",
+      "oxia",
+      "databend",
+      "bigquery",
+      "snowflake",
+      "spark",
+      "s3",
+      "kubernetes",
+      "mqtt",
+      "firestore",
+      "rabbitmq",
+      // OPC UA relabels Host as the endpoint URL and adds its own two boxes, each with a hint (#1677).
+      "opcua",
+      "mtconnect",
+      // Modbus names and explains its register map: the engine answers no discovery request, so the
+      // document is the only thing that can name a point and the box has to say so (#1723).
+      "modbus",
+      "snmp",
+      "sparkplug",
+    ]);
+    // The control that the walk saw the whole table rather than nothing.
+    expect(Object.keys(DB_UI_CONFIG).sort()).toEqual([...ALL_TYPES].sort());
+    for (const type of ALL_TYPES.filter((candidate) => !declared.includes(candidate))) {
+      for (const field of EVERY_FIELD) {
+        expect(connectionFieldLabel(getDBConfig(type), field, "the dialog's own word")).toBe("the dialog's own word");
+        expect(connectionFieldHint(getDBConfig(type), field)).toBeUndefined();
+      }
+    }
+  });
+
+  test("prometheus declares the password label and hint, because its one password box also carries a bearer token", () => {
+    const config = getDBConfig("prometheus");
+    expect(connectionFieldLabel(config, "password", "Password")).toBe("Password or token");
+    expect(connectionFieldHint(config, "password")).toBe("Leave User empty to send this as a bearer token.");
+    // The hint and the credential refusal both name the field "User", so the label says it too.
+    expect(connectionFieldLabel(config, "user", "Username")).toBe("User");
+    expect(connectionFieldHint(config, "user")).toBeUndefined();
+    // The control: every other field keeps the dialog's own word and draws no hint.
+    for (const field of EVERY_FIELD.filter((candidate) => candidate !== "password" && candidate !== "user")) {
+      expect(connectionFieldLabel(config, field, "the dialog's own word")).toBe("the dialog's own word");
+      expect(connectionFieldHint(config, field)).toBeUndefined();
+    }
+  });
+
+  test("kafka declares the SASL select's label and hint, because the select says TLS is required before the refusal does", () => {
+    const config = getDBConfig("kafka");
+    expect(connectionFieldLabel(config, "saslMechanism", "the dialog's own word")).toBe("SASL mechanism");
+    expect(connectionFieldHint(config, "saslMechanism")).toBe("PLAIN and SCRAM require TLS");
+    // The control: every other field keeps the dialog's own word and draws no hint, so the user
+    // and password boxes read "Username" and "Password" as they do on every networked engine.
+    for (const field of EVERY_FIELD.filter((candidate) => candidate !== "saslMechanism")) {
+      expect(connectionFieldLabel(config, field, "the dialog's own word")).toBe("the dialog's own word");
+      expect(connectionFieldHint(config, field)).toBeUndefined();
+    }
+  });
+});
+
+describe("declared field rules (Databend design 6.3)", () => {
+  const databend = (fields: Partial<DatabaseConnection>): DatabaseConnection => ({
+    id: "c1",
+    name: "Databend",
+    type: "databend",
+    host: "localhost",
+    port: 8000,
+    user: "root",
+    createdAt: new Date(),
+    ...fields,
+  });
+  const LONGEST = "w".repeat(63);
+
+  test("databend declares User required and the Warehouse rule, in the provider's own sentences", () => {
+    const config = getDBConfig("databend");
+    expect(config.fieldRules).toBe(DATABEND_FIELD_RULES);
+    expect(DATABEND_FIELD_RULES.user?.required).toBe(DATABEND_CONNECTION_SENTENCES.userRequired);
+    expect(DATABEND_FIELD_RULES.warehouse?.format?.sentence).toBe(DATABEND_CONNECTION_SENTENCES.warehouse);
+    expect(DATABEND_FIELD_RULES.warehouse?.required).toBeUndefined();
+    // Each sentence names its field first and holds no value, so a refusal never repeats what was typed.
+    expect(DATABEND_FIELD_RULES.user?.required).toStartWith("User ");
+    expect(DATABEND_FIELD_RULES.warehouse?.format?.sentence).toStartWith("Warehouse ");
+  });
+
+  test("RabbitMQ's form rules accept exactly what the provider's rules accept, which the dialog cannot import", () => {
+    const config = getDBConfig("rabbitmq");
+    expect(config.fieldRules).toBe(RABBITMQ_FIELD_RULES);
+    expect(config.fieldHints).toBe(RABBITMQ_FIELD_HINTS);
+    expect(RABBITMQ_FIELD_RULES.amqpPort?.format?.sentence).toBe(AMQP_PORT_SHAPE);
+    expect(RABBITMQ_FIELD_RULES.apiPath?.format?.sentence).toStartWith("Path prefix ");
+    const accepts = (read: (value: string) => unknown, value: string): boolean => {
+      try {
+        read(value);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const ports = ["1", "5672", "5671", "9999", "10000", "59999", "64999", "65499", "65529", "65535"];
+    const notPorts = ["0", "00", "05672", "65536", "65540", "70000", "123456", "-1", "+1", "1e3", " 1", "56 72", "x"];
+    for (const value of [...ports, ...notPorts]) {
+      expect({ value, dialog: RABBITMQ_FIELD_RULES.amqpPort?.format?.pattern.test(value) }).toEqual({
+        value,
+        dialog: accepts(readAmqpPort, value),
+      });
+    }
+    const prefixes = [
+      "/",
+      "/rabbitmq",
+      "/rabbitmq/",
+      "/a/b-c",
+      "/apis",
+      "/v1/api-x",
+      "/.a",
+      "/a..",
+      "/~u:@!$&'()*+,;=",
+      "/A_b.c",
+    ];
+    const notPrefixes = [
+      "rabbitmq",
+      "//",
+      "/a//b",
+      "/rabbitmq//",
+      "/.",
+      "/..",
+      "/a/./b",
+      "/api",
+      "/x/api",
+      "/api/",
+      "/a%2F",
+      "/a?b",
+      "/a#b",
+      "/a b",
+      "/é",
+    ];
+    for (const value of [...prefixes, ...notPrefixes]) {
+      expect({ value, dialog: RABBITMQ_FIELD_RULES.apiPath?.format?.pattern.test(value) }).toEqual({
+        value,
+        dialog: accepts(readPathPrefix, value),
+      });
+    }
+  });
+
+  test("RabbitMQ labels its port as the management port, offers no tunnel, and states its read-only mode", () => {
+    const config = getDBConfig("rabbitmq");
+    expect(config).toMatchObject({
+      label: "RabbitMQ",
+      defaultPort: "15672",
+      color: "text-hue-lime-alt",
+      showSshTunnel: false,
+      showConnectionStringToggle: false,
+      hostAcceptsUri: ["http", "https"],
+    });
+    expect(config.connectionFields).toEqual([
+      "host",
+      "port",
+      "user",
+      "password",
+      "amqpPort",
+      "apiPath",
+      "allowInsecureAuth",
+    ]);
+    expect(connectionFieldLabel(config, "allowInsecureAuth", "x")).toBe("Send the password without TLS");
+    expect(connectionFieldHint(config, "allowInsecureAuth")).toStartWith(
+      "Sends the username and password in clear text to the management API and the AMQP port",
+    );
+    expect(connectionFieldLabel(config, "port", "Port")).toBe("Management port");
+    // The field the provider's sentences call Host, not the dialog's "Host & Instance".
+    expect(connectionFieldLabel(config, "host", "Host & Instance")).toBe("Host");
+    // The shared Host row draws a port label only where one is declared, so no other engine's dialog gains one.
+    // Apache Spark declares a plain Port beside its relabelled Host, Token, Catalog and Namespace.
+    expect(
+      (Object.keys(DB_UI_CONFIG) as DatabaseType[]).filter(
+        (type) => DB_UI_CONFIG[type].fieldLabels?.port !== undefined,
+      ),
+    ).toEqual(["spark", "rabbitmq"]);
+    expect(connectionFieldLabel(config, "amqpPort", "x")).toBe("AMQP port");
+    expect(connectionFieldLabel(config, "apiPath", "x")).toBe("Path prefix");
+    expect(connectionFieldPlaceholder(config, "amqpPort", "5672")).toBe("Empty: browse only");
+    expect(connectionFieldHint(config, "amqpPort")).toBe(
+      "5672, or 5671 with TLS. Only for stream reads; leave empty to browse only. Test Connection checks the management API only; the AMQP port is checked on the first read.",
+    );
+    expect(connectionFieldHint(config, "port")).toBe("15671 with TLS; 443 when a TLS proxy serves the management API");
+    expect(connectionFieldHint(config, "host")).toContain("A path such as /rabbitmq goes in Path prefix.");
+    expect(readOnlyHint(config)).toContain("read-only whether or not this is ticked");
+  });
+
+  test("Kubernetes' form rules are the provider's patterns and sentences, which the dialog cannot import", () => {
+    const rules = getDBConfig("kubernetes").fieldRules;
+    expect(rules).toBe(KUBERNETES_FIELD_RULES);
+    expect(getDBConfig("kubernetes").fieldHints).toBe(KUBERNETES_FIELD_HINTS);
+    expect(KUBERNETES_FIELD_RULES.database?.format?.sentence).toBe(KUBERNETES_CONNECTION_SENTENCES.defaultNamespace);
+    expect(KUBERNETES_FIELD_RULES.namespaces?.format?.sentence).toBe(KUBERNETES_CONNECTION_SENTENCES.namespacesShape);
+    expect(KUBERNETES_FIELD_RULES.database?.format?.pattern.source).toBe(DNS1123_LABEL.source);
+    const kubernetes = (fields: Partial<DatabaseConnection>): DatabaseConnection => ({
+      id: "k",
+      name: "k",
+      type: "kubernetes",
+      host: "api.example",
+      port: 6443,
+      ssl: { mode: "verify-system" },
+      createdAt: new Date(0),
+      ...fields,
+    });
+    const providerSentence = (fields: Partial<DatabaseConnection>): string | undefined => {
+      try {
+        readClusterEndpoint(kubernetes(fields), { queryTimeout: 30_000, appVersion: null });
+        return undefined;
+      } catch (error) {
+        return (error as Error).message;
+      }
+    };
+    // The control that the two copies agree on the values that matter, not only on their spelling.
+    for (const database of ["default", "shop-1", "Shop", "shop_1", "-a", "a".repeat(63), "a".repeat(64)]) {
+      expect(connectionFieldRefusal(getDBConfig("kubernetes"), kubernetes({ database }))).toBe(
+        providerSentence({ database }),
+      );
+    }
+    for (const namespaces of ["default", "default, shop", " default ,shop ", "default Shop", "default,shop_1"]) {
+      expect(connectionFieldRefusal(getDBConfig("kubernetes"), kubernetes({ namespaces }))).toBe(
+        providerSentence({ namespaces }),
+      );
+    }
+  });
+
+  test("the form's warehouse pattern is the provider's, which the dialog cannot import because it is server code", () => {
+    const source = readFileSync(path.join(ROOT, "src/lib/db/providers/sql/databend/connection-options.ts"), "utf8");
+    const declared = /const WAREHOUSE_NAME = \/(.+)\/;/.exec(source);
+    expect(declared?.[1]).toBe(DATABEND_FIELD_RULES.warehouse?.format?.pattern.source);
+    expect(DATABEND_FIELD_RULES.warehouse?.format?.pattern.flags).toBe("");
+    // The control that the two copies agree on the values that matter, not only on their spelling.
+    for (const warehouse of ["small-xy2t", "wh_1", LONGEST, `${LONGEST}w`, "small xy", "wh.1", "wh:1", " wh"]) {
+      const form = connectionFieldRefusal(getDBConfig("databend"), databend({ warehouse }));
+      let provider: string | undefined;
+      try {
+        buildDatabendConnectionOptions(databend({ warehouse }), { queryTimeout: 30_000, appVersion: null });
+      } catch (error) {
+        provider = (error as Error).message;
+      }
+      expect({ warehouse, form }).toEqual({ warehouse, form: provider });
+    }
+  });
+
+  test("connectionFieldRefusal requires User and checks Warehouse, naming the field and never the value", () => {
+    const config = getDBConfig("databend");
+    expect(connectionFieldRefusal(config, databend({ user: "" }))).toBe(DATABEND_CONNECTION_SENTENCES.userRequired);
+    expect(connectionFieldRefusal(config, databend({ user: undefined }))).toBe(
+      DATABEND_CONNECTION_SENTENCES.userRequired,
+    );
+    for (const warehouse of ["small xy", `${LONGEST}w`]) {
+      const refusal = connectionFieldRefusal(config, databend({ warehouse }));
+      expect(refusal).toBe(DATABEND_CONNECTION_SENTENCES.warehouse);
+      expect(refusal).not.toContain(warehouse);
+    }
+    // A valid Warehouse and an absent one pass.
+    expect(connectionFieldRefusal(config, databend({ warehouse: "small-xy2t" }))).toBeUndefined();
+    expect(connectionFieldRefusal(config, databend({ warehouse: LONGEST }))).toBeUndefined();
+    expect(connectionFieldRefusal(config, databend({}))).toBeUndefined();
+    expect(connectionFieldRefusal(config, databend({ warehouse: "" }))).toBeUndefined();
+    // Fields are checked in the dialog's order, so User is named before Warehouse.
+    expect(connectionFieldRefusal(config, databend({ user: "", warehouse: "small xy" }))).toBe(
+      DATABEND_CONNECTION_SENTENCES.userRequired,
+    );
+  });
+
+  test("only databend, snowflake, spark, s3, kubernetes and rabbitmq declare field rules, so no other engine's Test Connection or Save is checked", () => {
+    const declaring = Object.entries(DB_UI_CONFIG)
+      .filter(([, config]) => config.fieldRules !== undefined)
+      .map(([type]) => type);
+    expect(declaring).toEqual(["databend", "snowflake", "spark", "s3", "kubernetes", "rabbitmq"]);
+    for (const type of ALL_TYPES.filter((candidate) => !declaring.includes(candidate))) {
+      expect(
+        connectionFieldRefusal(
+          getDBConfig(type),
+          databend({ type, user: "", warehouse: "small xy", region: "us/east" }),
+        ),
+      ).toBe(undefined);
+    }
+  });
+});
+
+describe("declared field rules", () => {
+  const s3 = (fields: Partial<DatabaseConnection>): DatabaseConnection => ({
+    id: "c1",
+    name: "Objects",
+    type: "s3",
+    host: "localhost",
+    port: 9000,
+    user: "minio-reader",
+    password: "reader-secret-key",
+    createdAt: new Date(),
+    ...fields,
+  });
+  const providerRefusal = (connection: DatabaseConnection): string | undefined => {
+    try {
+      buildS3ConnectionOptions(connection, { executionReadOnly: false, queryTimeout: 30_000 });
+      return undefined;
+    } catch (error) {
+      return (error as Error).message;
+    }
+  };
+  const FORMAT = S3_FIELD_RULES.user?.format?.sentence;
+  const RANGE = S3_FIELD_RULES.user?.charRange?.sentence;
+  const BUCKET = S3_FIELD_RULES.database?.format?.sentence;
+  const REGION = S3_FIELD_RULES.region?.format?.sentence;
+
+  test("the form's S3 patterns and sentences are the provider's, which the dialog cannot import because it is server code", () => {
+    expect(S3_FIELD_RULES.user?.format?.pattern.source).toBe(S3_ACCESS_KEY_ID_PATTERN.source);
+    expect(S3_FIELD_RULES.database?.format?.pattern.source).toBe(S3_BUCKET_PATTERN.source);
+    expect(S3_FIELD_RULES.region?.format?.pattern.source).toBe(S3_REGION_PATTERN.source);
+    for (const rule of [S3_FIELD_RULES.user, S3_FIELD_RULES.database, S3_FIELD_RULES.region]) {
+      expect(rule?.format?.pattern.flags).toBe("");
+      // Blank passes on every field: an empty key pair is unsigned, an empty Bucket pins nothing, an empty Region is
+      // us-east-1.
+      expect(rule?.required).toBeUndefined();
+    }
+    expect(S3_FIELD_RULES.user?.charRange?.min).toBe(S3_ACCESS_KEY_ID_MIN_CHARS);
+    expect(S3_FIELD_RULES.user?.charRange?.max).toBe(S3_ACCESS_KEY_ID_MAX_CHARS);
+    const providerSentences: readonly unknown[] = Object.values(S3_CONNECTION_SENTENCES);
+    for (const sentence of [FORMAT, RANGE, BUCKET, REGION]) expect(providerSentences).toContain(sentence);
+    // Each sentence names its field first and holds no value.
+    expect(FORMAT).toStartWith("Access key ID ");
+    expect(RANGE).toStartWith("Access key ID ");
+    expect(BUCKET).toStartWith("Bucket ");
+    expect(REGION).toStartWith("Region ");
+  });
+
+  test("connectionFieldRefusal checks the access key ID, the bucket and the region, naming the field and never the value", () => {
+    const config = getDBConfig("s3");
+    expect(connectionFieldRefusal(config, s3({ user: "", password: "", database: "", region: "" }))).toBeUndefined();
+    expect(connectionFieldRefusal(config, s3({ user: undefined, password: undefined }))).toBeUndefined();
+    for (const user of ["AKIA EXAMPLE", "a/b", "a,b", "a=b"]) {
+      const refusal = connectionFieldRefusal(config, s3({ user }));
+      expect(refusal).toBe(FORMAT);
+      expect(refusal).not.toContain(user);
+    }
+    expect(connectionFieldRefusal(config, s3({ user: "ab" }))).toBe(RANGE);
+    expect(connectionFieldRefusal(config, s3({ user: "abc" }))).toBeUndefined();
+    expect(connectionFieldRefusal(config, s3({ user: "a".repeat(512) }))).toBeUndefined();
+    expect(connectionFieldRefusal(config, s3({ user: "a".repeat(513) }))).toBe(RANGE);
+    for (const database of [".", "..", "-x", "a/b"]) {
+      expect(connectionFieldRefusal(config, s3({ database }))).toBe(BUCKET);
+    }
+    expect(connectionFieldRefusal(config, s3({ database: "Legacy_Bucket.Name" }))).toBeUndefined();
+    for (const region of [" us-east-1", "us/east"]) {
+      expect(connectionFieldRefusal(config, s3({ region }))).toBe(REGION);
+    }
+    for (const region of ["garage", "auto"]) {
+      expect(connectionFieldRefusal(config, s3({ region }))).toBeUndefined();
+    }
+  });
+
+  // The copies agree on the values a user types or pastes, not only on their spelling.
+  test.each([
+    ["user", "AKIAIOSFODNN7EXAMPLE"],
+    ["user", "abc"],
+    ["user", "a".repeat(512)],
+    ["user", "ab"],
+    ["user", "a".repeat(513)],
+    ["user", "AKIA EXAMPLE"],
+    ["user", "a/b"],
+    ["user", "a,b"],
+    ["user", "a=b"],
+    ["user", "ÅKIA1234"],
+    ["user", "AKIA\u200BEXAMPLE"],
+    ["user", "AKIA1234\n"],
+    ["database", "sales"],
+    ["database", "Legacy_Bucket.Name"],
+    ["database", "b".repeat(255)],
+    ["database", "b".repeat(256)],
+    ["database", "."],
+    ["database", ".."],
+    ["database", "-x"],
+    ["database", "x-"],
+    ["database", "a/b"],
+    ["database", "   "],
+    ["region", "us-east-1"],
+    ["region", "garage"],
+    ["region", "auto"],
+    ["region", "r".repeat(64)],
+    ["region", "r".repeat(65)],
+    ["region", " us-east-1"],
+    ["region", "us/east"],
+    ["region", "us-east-1\n"],
+    ["region", "   "],
+  ] as const)("the form and the provider give one answer for %s %p", (field, value) => {
+    const connection = s3({ [field]: value });
+    expect({ field, value, form: connectionFieldRefusal(getDBConfig("s3"), connection) }).toEqual({
+      field,
+      value,
+      form: providerRefusal(connection),
+    });
+  });
+
+  // With two fields wrong, both name the access key ID first, the dialog's field order and the provider's row order.
+  test("two wrong fields name the access key ID first on both sides", () => {
+    const connection = s3({ user: "a/b", region: "us/east" });
+    expect(connectionFieldRefusal(getDBConfig("s3"), connection)).toBe(FORMAT);
+    expect(providerRefusal(connection)).toBe(FORMAT);
+  });
+});
+
+describe("a declared character range", () => {
+  const FORMAT = "Name must be lower-case letters. Nothing was sent.";
+  const RANGE = "Name holds 3 to 5 characters. Nothing was sent.";
+  const config: DatabaseUIConfig = {
+    ...getDBConfig("postgres"),
+    fieldRules: {
+      user: { format: { pattern: /^[a-z]+$/, sentence: FORMAT }, charRange: { min: 3, max: 5, sentence: RANGE } },
+    },
+  };
+  const named = (user: string | undefined): DatabaseConnection => ({
+    id: "c1",
+    name: "Synthetic",
+    type: "postgres",
+    host: "localhost",
+    port: 5432,
+    user,
+    createdAt: new Date(),
+  });
+
+  test("connectionFieldRefusal checks charRange after format", () => {
+    // Out of range and failing the format: the format sentence, as the provider's format row runs before its range row.
+    expect(connectionFieldRefusal(config, named("AB"))).toBe(FORMAT);
+    expect(connectionFieldRefusal(config, named("ABCDEFG"))).toBe(FORMAT);
+    // Passing the format and outside the range: the range sentence, at either end.
+    expect(connectionFieldRefusal(config, named("ab"))).toBe(RANGE);
+    expect(connectionFieldRefusal(config, named("abcdef"))).toBe(RANGE);
+    // Both ends are inside.
+    expect(connectionFieldRefusal(config, named("abc"))).toBeUndefined();
+    expect(connectionFieldRefusal(config, named("abcde"))).toBeUndefined();
+  });
+
+  test("a blank value never reaches the range, so a blank field still passes", () => {
+    expect(connectionFieldRefusal(config, named(""))).toBeUndefined();
+    expect(connectionFieldRefusal(config, named(undefined))).toBeUndefined();
+  });
+
+  test("a range declared without a format is checked on its own", () => {
+    const rangeOnly: DatabaseUIConfig = {
+      ...config,
+      fieldRules: { user: { charRange: { min: 3, max: 5, sentence: RANGE } } },
+    };
+    expect(connectionFieldRefusal(rangeOnly, named("A B"))).toBeUndefined();
+    expect(connectionFieldRefusal(rangeOnly, named("A"))).toBe(RANGE);
   });
 });
 
@@ -370,15 +1551,85 @@ describe("db-showcase", () => {
         "redis",
         "oracle",
         "mssql",
+        // Right after SQL Server (#786): a mainstream relational engine, read beside Oracle and
+        // SQL Server rather than among the search and analytical engines.
+        "db2",
         "elasticsearch",
         "opensearch",
         "cassandra",
+        // Behind Cassandra and ahead of the analytical stores: the best-known graph database, and the
+        // only one on this page.
+        "neo4j",
         "couchbase",
         "clickhouse",
         "druid",
         "trino",
+        // Behind Trino and ahead of libSQL (#1085): a name every cloud-native evaluator knows,
+        // met as the metrics store beside their databases rather than as one of them.
+        "prometheus",
+        // Directly after Prometheus (InfluxDB spec R28): the two time-series stores read together, one InfluxDB
+        // connection type per query language.
+        "influxdb",
+        "influxdb3",
+        // Behind the time-series stores and ahead of libSQL (#1088), for the same reason: the message log
+        // those teams run beside their databases, met beside them rather than as one of them.
+        "kafka",
+        // Behind Kafka and ahead of libSQL (#1089), for the reason the two before it sit where they do: the store
+        // a Kubernetes control plane keeps its state in, met beside the databases rather than as one of them.
+        "etcd",
+        // Behind etcd and ahead of libSQL (vector-family spec 10.3): the vector databases a team runs beside its
+        // databases, met beside them rather than as one of them, as the three before them are; Milvus first,
+        // the one of the two an evaluator is more likely to have met.
+        "milvus",
+        "qdrant",
+        // Behind Qdrant and ahead of libSQL (SB3-1.2 R19): the store an Apache Pulsar cluster keeps its metadata
+        // in, met beside the databases rather than as one of them.
+        "oxia",
+        // Behind Oxia and ahead of libSQL (design 7.2): the cloud data warehouse a team runs beside its databases,
+        // the newest name on this page, so only libSQL and the embedded store move (the Milvus, Qdrant, Oxia precedent).
+        "databend",
+        // Behind Databend and ahead of libSQL: the object store a team keeps its files in beside its
+        // databases, the newest name on this page, so only libSQL and the embedded store move (the Milvus, Qdrant, Oxia
+        // and Databend precedent).
+        "s3",
+        // Behind S3 and ahead of libSQL: the platform a cloud-native team runs its databases on, met beside the
+        // databases rather than as one of them, and the newest name on this page.
+        "kubernetes",
+        // Behind Kubernetes and ahead of libSQL (#1635): the broker a team runs beside its databases, met beside
+        // them rather than as one of them, and the newest name on this page, so only libSQL and the embedded store
+        // move (the Milvus, Qdrant, Oxia, Databend, S3 and Kubernetes precedent).
+        "mqtt",
+        // Behind MQTT and ahead of libSQL: the cloud data warehouse a team runs beside its databases, so only libSQL
+        // and the embedded store move, as they did for Databend.
+        "bigquery",
+        // Behind BigQuery and ahead of libSQL: the document database a Google Cloud team runs beside its databases,
+        // so only libSQL and the embedded store move, as they did for BigQuery.
+        "firestore",
+        // Behind Firestore and ahead of libSQL (#1656): the message broker a team runs beside its databases, so only
+        // libSQL and the embedded store move, as they did for Firestore.
+        "rabbitmq",
+        // Behind RabbitMQ and ahead of libSQL: the third cloud data warehouse, so only libSQL and the embedded store
+        // move, as they did for RabbitMQ.
+        "snowflake",
+        // Behind Snowflake and ahead of libSQL: the open-source engine a data team runs its lakehouse SQL on, so only
+        // libSQL, the embedded store and OPC UA move.
+        "spark",
         "libsql",
         "libredb",
+        // Last (rank 36), behind the embedded store: an industrial address space is the least recognisable
+        // name on a page of databases, so no existing engine moves for it (#1677).
+        "opcua",
+        "mtconnect",
+        // Last, behind the address space and the agent: a device's registers are named only by a map
+        // the user writes, which is the narrowest name of the three (#1723).
+        "modbus",
+        // network engineers rather than by the readers a page of databases is written for (#1724).
+        "netconf",
+        "snmp",
+        // Last, behind the register map: the name on the box is a specification's rather than a
+        // product's, so a reader scanning the login page is least likely to arrive already knowing
+        // it, and no existing engine moves for it (#1720).
+        "sparkplug",
       ]);
     });
   });
@@ -399,5 +1650,366 @@ describe("db-showcase", () => {
       expect(listShowcaseDatabases()).not.toBe(listShowcaseDatabases());
       expect(listShowcaseDatabases()).toEqual(listShowcaseDatabases());
     });
+  });
+});
+
+describe("Host box addresses and credential warnings", () => {
+  test("only milvus, qdrant, the two InfluxDB types, databend, s3, kubernetes, rabbitmq and mtconnect declare hostAcceptsUri, so every other Host box takes a host alone", () => {
+    expect(ALL_TYPES.filter((type) => hostUriSchemes(type).length > 0)).toEqual([
+      "milvus",
+      "qdrant",
+      "influxdb",
+      "influxdb3",
+      "databend",
+      "s3",
+      "kubernetes",
+      "rabbitmq",
+      "mtconnect",
+    ]);
+  });
+
+  test("hostUriSchemes reads an entry's declaration, and only that entry's", () => {
+    const restore = declareHostUri("etcd", ["http", "https"]);
+    try {
+      expect(hostUriSchemes("etcd")).toEqual(["http", "https"]);
+      expect(hostUriSchemes("postgres")).toEqual([]);
+    } finally {
+      restore();
+    }
+    expect(hostUriSchemes("etcd")).toEqual([]);
+  });
+
+  test("every entry's credentialWarnings is the shared record's own array, never a copy", () => {
+    for (const type of ALL_TYPES) {
+      expect({ type, same: getDBConfig(type).credentialWarnings === CREDENTIAL_WARNINGS[type] }).toEqual({
+        type,
+        same: true,
+      });
+    }
+  });
+
+  test("an entry's credentialWarnings is the shared record's array once a type declares one", () => {
+    const declared = [SYNTHETIC_PAIR, SYNTHETIC_NO_SECRET];
+    const restore = declareCredentialWarnings("etcd", declared);
+    try {
+      expect(getDBConfig("etcd").credentialWarnings).toBe(declared);
+      expect(getDBConfig("etcd").credentialWarnings).toBe(CREDENTIAL_WARNINGS.etcd);
+      expect(getDBConfig("postgres").credentialWarnings).toBeUndefined();
+    } finally {
+      restore();
+    }
+    expect(getDBConfig("etcd").credentialWarnings).toBeUndefined();
+  });
+});
+
+describe("the Snowflake entry", () => {
+  const snowflake = getDBConfig("snowflake");
+  const connection = (fields: Record<string, unknown>): DatabaseConnection =>
+    ({
+      id: "sf",
+      name: "Snowflake",
+      type: "snowflake",
+      host: "myorg-myaccount",
+      user: "studio_svc",
+      role: "STUDIO_RO",
+      privateKey: "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
+      createdAt: new Date(0),
+      ...fields,
+    }) as DatabaseConnection;
+
+  test("declares its icon, hue, fields, labels, the method select, placeholders and hints, and no panel", () => {
+    expect(snowflake).toMatchObject({
+      icon: SnowflakeIcon,
+      color: "text-hue-mist",
+      label: "Snowflake",
+      defaultPort: "",
+      defaultHost: "",
+      showConnectionStringToggle: false,
+      showSshTunnel: false,
+      showSslPanel: false,
+    });
+    expect(snowflake.connectionFields).toEqual([
+      "host",
+      "user",
+      "authMethod",
+      "privateKey",
+      "privateKeyPassphrase",
+      "password",
+      "warehouse",
+      "database",
+      "schema",
+      "role",
+    ]);
+    expect(connectionFieldLabel(snowflake, "host", "Host")).toBe("Account");
+    expect(connectionFieldLabel(snowflake, "password", "Password")).toBe("Access token");
+    expect(snowflake.fieldOptions?.authMethod).toEqual([
+      { value: "keypair", label: "Key pair" },
+      { value: "pat", label: "Programmatic access token" },
+    ]);
+    expect(connectionFieldPlaceholder(snowflake, "privateKey", "")).toBe("-----BEGIN PRIVATE KEY-----");
+    for (const field of ["user", "database", "schema"] as const) {
+      expect(connectionFieldPlaceholder(snowflake, field, "fallback")).toBe("");
+    }
+    expect(snowflake.fieldHints).toBe(SNOWFLAKE_FIELD_HINTS);
+    expect(connectionFieldHint(snowflake, "role")).toBe(
+      "Every statement runs as this role; Studio checks it when it connects.",
+    );
+  });
+
+  test("checks the account, the user and the role in the provider's own sentences", () => {
+    expect(snowflake.fieldRules).toBe(SNOWFLAKE_FIELD_RULES);
+    expect(SNOWFLAKE_FIELD_RULES.host?.check).toBe(snowflakeAccountRefusal);
+    // connect()'s reading, so a padded account passes and an account URL with a path is refused (SF-025).
+    expect(connectionFieldRefusal(snowflake, connection({ host: "  myorg-myaccount " }))).toBeUndefined();
+    expect(
+      connectionFieldRefusal(snowflake, connection({ host: "https://myorg-myaccount.snowflakecomputing.com/console" })),
+    ).toBe(SNOWFLAKE_FIELD_SENTENCES.accountFormat);
+    expect(connectionFieldRefusal(snowflake, connection({}))).toBeUndefined();
+    expect(connectionFieldRefusal(snowflake, connection({ host: "" }))).toBe(SNOWFLAKE_FIELD_SENTENCES.accountEmpty);
+    expect(connectionFieldRefusal(snowflake, connection({ host: "jdbc:snowflake://myorg-myaccount" }))).toBe(
+      SNOWFLAKE_FIELD_SENTENCES.accountFormat,
+    );
+    expect(connectionFieldRefusal(snowflake, connection({ user: "" }))).toBe(SNOWFLAKE_FIELD_SENTENCES.userEmpty);
+    expect(connectionFieldRefusal(snowflake, connection({ role: "" }))).toBe(SNOWFLAKE_FIELD_SENTENCES.roleEmpty);
+  });
+
+  test("refuses each empty required field in the sentence of its own", () => {
+    expect(SNOWFLAKE_FIELD_SENTENCES.accountEmpty).toBe(
+      "Enter Account: an account identifier such as myorg-myaccount, or its URL. Nothing was sent.",
+    );
+    expect(SNOWFLAKE_FIELD_SENTENCES.userEmpty).toBe("Enter the user's login name. Nothing was sent.");
+    expect(SNOWFLAKE_FIELD_SENTENCES.roleEmpty).toBe("Enter the role every statement runs as. Nothing was sent.");
+    expect(SNOWFLAKE_FIELD_SENTENCES.keyEmpty).toBe("Paste the private key for key-pair sign-in. Nothing was sent.");
+    expect(SNOWFLAKE_FIELD_SENTENCES.tokenEmpty).toBe("Enter the programmatic access token. Nothing was sent.");
+    expect(connectionFieldRefusal(snowflake, connection({ host: undefined }))).toBe(
+      "Enter Account: an account identifier such as myorg-myaccount, or its URL. Nothing was sent.",
+    );
+    expect(connectionFieldRefusal(snowflake, connection({ user: undefined }))).toBe(
+      "Enter the user's login name. Nothing was sent.",
+    );
+    expect(connectionFieldRefusal(snowflake, connection({ role: undefined }))).toBe(
+      "Enter the role every statement runs as. Nothing was sent.",
+    );
+    expect(connectionFieldRefusal(snowflake, connection({ privateKey: "" }))).toBe(
+      "Paste the private key for key-pair sign-in. Nothing was sent.",
+    );
+    expect(connectionFieldRefusal(snowflake, connection({ authMethod: "pat", privateKey: undefined }))).toBe(
+      "Enter the programmatic access token. Nothing was sent.",
+    );
+  });
+
+  test("shows the key and the passphrase for a key pair and the token for an access token", () => {
+    expect(snowflake.fieldShownWhen).toEqual({
+      privateKey: { field: "authMethod", equals: "keypair" },
+      privateKeyPassphrase: { field: "authMethod", equals: "keypair" },
+      password: { field: "authMethod", equals: "pat" },
+    });
+    // A field with no condition is always shown.
+    expect(connectionFieldShown(snowflake, "role", {})).toBe(true);
+    expect(connectionFieldShown(snowflake, "privateKey", { authMethod: "keypair" })).toBe(true);
+    expect(connectionFieldShown(snowflake, "privateKeyPassphrase", { authMethod: "keypair" })).toBe(true);
+    expect(connectionFieldShown(snowflake, "password", { authMethod: "keypair" })).toBe(false);
+    expect(connectionFieldShown(snowflake, "password", { authMethod: "pat" })).toBe(true);
+    expect(connectionFieldShown(snowflake, "privateKey", { authMethod: "pat" })).toBe(false);
+    expect(connectionFieldShown(snowflake, "privateKeyPassphrase", { authMethod: "pat" })).toBe(false);
+    // An unset method reads as the select's first option, the key pair.
+    expect(connectionFieldShown(snowflake, "privateKey", {})).toBe(true);
+    expect(connectionFieldShown(snowflake, "password", {})).toBe(false);
+    expect(connectionFieldShown(snowflake, "password", { authMethod: undefined })).toBe(false);
+  });
+
+  test("reads a condition on a field with no options as unmet while that field is unset", () => {
+    const config: DatabaseUIConfig = {
+      ...getDBConfig("postgres"),
+      fieldShownWhen: { schema: { field: "database", equals: "app" } },
+    };
+    expect(connectionFieldShown(config, "schema", {})).toBe(false);
+    expect(connectionFieldShown(config, "schema", { database: "app" })).toBe(true);
+    expect(connectionFieldShown(config, "schema", { database: "other" })).toBe(false);
+    expect(connectionFieldShown(config, "user", {})).toBe(true);
+  });
+
+  test("checks the key only under a key pair and the token only under an access token", () => {
+    // The token's rule is skipped under a key pair, and the key's under an access token.
+    expect(connectionFieldRefusal(snowflake, connection({ authMethod: "keypair", password: "" }))).toBeUndefined();
+    expect(connectionFieldRefusal(snowflake, connection({ password: undefined }))).toBeUndefined();
+    expect(
+      connectionFieldRefusal(snowflake, connection({ authMethod: "pat", privateKey: "", password: "S-TOKEN" })),
+    ).toBeUndefined();
+    expect(connectionFieldRefusal(snowflake, connection({ authMethod: "keypair", privateKey: "" }))).toBe(
+      SNOWFLAKE_FIELD_SENTENCES.keyEmpty,
+    );
+    expect(connectionFieldRefusal(snowflake, connection({ authMethod: "pat", password: "" }))).toBe(
+      SNOWFLAKE_FIELD_SENTENCES.tokenEmpty,
+    );
+    expect(SNOWFLAKE_FIELD_RULES.privateKey).toEqual({ required: SNOWFLAKE_FIELD_SENTENCES.keyEmpty });
+    expect(SNOWFLAKE_FIELD_RULES.password).toEqual({ required: SNOWFLAKE_FIELD_SENTENCES.tokenEmpty });
+  });
+
+  test("derives the host it connects to for the Account hint, and declares the account placeholder", () => {
+    expect(snowflake.hostHint).toBe(snowflakeHostHint);
+    expect(snowflake.hostHint?.("myorg-myacct")).toBe("Studio connects to myorg-myacct.snowflakecomputing.com.");
+    expect(snowflake.hostHint?.("")).toBeUndefined();
+    // The identifier alone, which fits the box; the hint says the URL form (SF-043).
+    expect(connectionFieldPlaceholder(snowflake, "host", "localhost")).toBe("myorg-myaccount");
+  });
+
+  test("only snowflake and opcua take a host without a port, so every other host row keeps its Port box", () => {
+    // Two engines, for two reasons of their own: a Snowflake account host has no port to type, and
+    // OPC UA's Endpoint URL carries its port inside the address, so a second box would ask twice.
+    expect(
+      ALL_TYPES.filter((type) => takesConnectionField(type, "host") && !takesConnectionField(type, "port")),
+    ).toEqual(["snowflake", "opcua"]);
+  });
+
+  test("only snowflake declares a derived host hint, so every other Host box keeps its static hint", () => {
+    expect(
+      Object.entries(DB_UI_CONFIG)
+        .filter(([, config]) => config.hostHint !== undefined)
+        .map(([type]) => type),
+    ).toEqual(["snowflake"]);
+  });
+
+  test("only snowflake declares a field shown while another field holds a value, so every other dialog is unchanged", () => {
+    const declaring = Object.entries(DB_UI_CONFIG)
+      .filter(([, config]) => config.fieldShownWhen !== undefined)
+      .map(([type]) => type);
+    expect(declaring).toEqual(["snowflake"]);
+    for (const type of ALL_TYPES.filter((candidate) => candidate !== "snowflake")) {
+      const config = getDBConfig(type);
+      for (const field of config.connectionFields) {
+        expect(connectionFieldShown(config, field, {})).toBe(true);
+      }
+    }
+  });
+});
+
+describe("the Apache Spark entry", () => {
+  const spark = getDBConfig("spark");
+  const connection = (fields: Record<string, unknown>): DatabaseConnection =>
+    ({
+      id: "spark",
+      name: "Apache Spark",
+      type: "spark",
+      host: "spark.example.internal",
+      port: 15002,
+      createdAt: new Date(0),
+      ...fields,
+    }) as DatabaseConnection;
+
+  test("declares its icon, hue, label, port, fields, labels, placeholders and hints, and offers both panels", () => {
+    expect(spark).toMatchObject({
+      icon: SparkIcon,
+      color: "text-hue-taupe",
+      label: "Apache Spark",
+      defaultPort: "15002",
+      showConnectionStringToggle: false,
+    });
+    // No `showSshTunnel` and no `showSslPanel` key: the SSH tunnel and the SSL / TLS panel are both offered.
+    expect(spark.showSshTunnel).toBeUndefined();
+    expect(spark.showSslPanel).toBeUndefined();
+    // No User box: every request uses one fixed Spark Connect user id, and Token is the credential.
+    expect(spark.connectionFields).toEqual(["host", "port", "password", "database", "schema"]);
+    expect(connectionFieldLabel(spark, "host", "Host & Instance")).toBe("Host");
+    expect(connectionFieldLabel(spark, "port", "fallback")).toBe("Port");
+    expect(connectionFieldLabel(spark, "password", "Password")).toBe("Token");
+    expect(connectionFieldLabel(spark, "database", "Database Name")).toBe("Catalog");
+    expect(connectionFieldLabel(spark, "schema", "Schema")).toBe("Namespace");
+    expect(connectionFieldPlaceholder(spark, "database", "")).toBe("server default (spark_catalog)");
+    expect(connectionFieldPlaceholder(spark, "schema", "")).toBe("catalog default");
+    expect(spark.fieldHints).toBe(SPARK_FIELD_HINTS);
+    expect(connectionFieldHint(spark, "password")).toBe(
+      "The server's spark.connect.authenticate.token (Spark 4.0 and later), sent on every call. Leave it empty for a server without a token. Studio sends a token only over TLS or an SSH tunnel, unless the host is this machine.",
+    );
+    expect(spark.fieldRules).toBe(SPARK_FIELD_RULES);
+  });
+
+  test("its rules refuse an empty Host, a token with a line break, a dotted Catalog and a malformed Namespace, and pass the rest", () => {
+    expect(connectionFieldRefusal(spark, connection({}))).toBeUndefined();
+    expect(connectionFieldRefusal(spark, connection({ host: "" }))).toBe(SPARK_FIELD_RULES.host?.required);
+    expect(connectionFieldRefusal(spark, connection({ password: "abc\ndef" }))).toBe(
+      SPARK_FIELD_RULES.password?.format?.sentence,
+    );
+    expect(connectionFieldRefusal(spark, connection({ password: "s3cr3t-token" }))).toBeUndefined();
+    expect(connectionFieldRefusal(spark, connection({ password: " abc" }))).toBe(
+      "Token takes printable ASCII with no space at either end: a gRPC header cannot carry other characters, and Spark compares the token exactly. Nothing was sent.",
+    );
+    expect(connectionFieldRefusal(spark, connection({ database: "spark_catalog" }))).toBeUndefined();
+    for (const catalog of ["a.b", "x".repeat(256), "tab\there"]) {
+      expect(connectionFieldRefusal(spark, connection({ database: catalog }))).toBe(
+        SPARK_FIELD_RULES.database?.format?.sentence,
+      );
+    }
+    for (const namespace of ["default", "a.b", "`x.y`", "`a``b`.c", "a.b.c.d.e.f.g.h"]) {
+      expect(connectionFieldRefusal(spark, connection({ schema: namespace }))).toBeUndefined();
+    }
+    for (const namespace of ["1a", "a.", ".a", "a..b", "``", "a.b.c.d.e.f.g.h.i", "a b"]) {
+      expect(connectionFieldRefusal(spark, connection({ schema: namespace }))).toBe(
+        SPARK_FIELD_RULES.schema?.format?.sentence,
+      );
+    }
+  });
+
+  test("SPARK_FIELD_RULES holds copies of the provider's patterns and sentences, since the dialog cannot import the provider", () => {
+    expect(Object.keys(SPARK_FIELD_RULES)).toStrictEqual(["host", "password", "database", "schema"]);
+    expect(SPARK_FIELD_RULES.host).toStrictEqual({ required: SPARK_FIELD_SENTENCES.hostEmpty });
+    const copies = [
+      ["password", SPARK_TOKEN_PATTERN, SPARK_FIELD_SENTENCES.tokenCharacters],
+      ["database", SPARK_CATALOG_PATTERN, SPARK_FIELD_SENTENCES.catalogFormat],
+      ["schema", SPARK_NAMESPACE_PATTERN, SPARK_FIELD_SENTENCES.namespaceFormat],
+    ] as const;
+    for (const [field, pattern, sentence] of copies) {
+      // Only a format: a blank Token, Catalog or Namespace is none on the provider's side, so no copy may require it.
+      expect(Object.keys(SPARK_FIELD_RULES[field] ?? {})).toStrictEqual(["format"]);
+      const rule = SPARK_FIELD_RULES[field]?.format;
+      expect(rule?.pattern.source).toBe(pattern.source);
+      expect(rule?.pattern.flags).toBe(pattern.flags);
+      expect(rule?.sentence).toBe(sentence);
+    }
+  });
+});
+
+describe("the Firestore connection form (Firestore spec 4.1)", () => {
+  const config = getDBConfig("firestore");
+
+  test("asks for the project, the database and one credential, with no host, port, SSL panel, tunnel or URI mode", () => {
+    expect(config.label).toBe("Firestore");
+    expect(config.icon).toBe(FirestoreIcon);
+    expect(config.color).toBe("text-hue-lime");
+    expect(config.connectionFields).toEqual(["database", "schema", "password"]);
+    expect(config.defaultPort).toBe("");
+    expect(config.showConnectionStringToggle).toBe(false);
+    expect(offersSshTunnel("firestore")).toBe(false);
+    expect(offersSslPanel("firestore")).toBe(false);
+  });
+
+  test("labels the three fields by what they hold", () => {
+    expect(connectionFieldLabel(config, "database", "Database")).toBe("Project ID");
+    expect(connectionFieldLabel(config, "schema", "Schema")).toBe("Database ID");
+    expect(connectionFieldLabel(config, "password", "Password")).toBe("Service-account key, ADC JSON or access token");
+  });
+
+  test("the credential hint says, in this order: identity and rules, the grant, billing, the token's life, when to leave it empty", () => {
+    const hint = connectionFieldHint(config, "password") ?? "";
+    const positions = [
+      "IAM identity",
+      "Firebase Security Rules do not apply",
+      "roles/datastore.viewer",
+      "billed to the project",
+      "about an hour",
+      "emulator server",
+      "operator-seeded",
+    ].map((phrase) => hint.indexOf(phrase));
+    expect(positions.every((position) => position >= 0)).toBe(true);
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions);
+    expect(connectionFieldHint(config, "database")).toContain("6 to 30 lowercase letters");
+    expect(connectionFieldHint(config, "schema")).toContain("(default)");
+  });
+
+  test("declares a placeholder only for the box that draws one, and says the read-only mode is structural", () => {
+    expect(connectionFieldPlaceholder(config, "database", "")).toBe("my-project");
+    // The dialog draws its own `default` and `***` in these two boxes, so a declared value would be drawn nowhere.
+    expect(config.fieldPlaceholders).toEqual({ database: "my-project" });
+    expect(readOnlyHint(config)).toContain("read-only whether or not this is ticked");
   });
 });

@@ -1,0 +1,31 @@
+# WHY THE MTConnect provider check STEP IS NOT IN THIS FILE ANY MORE.
+#
+# This file used to carry the step itself, staged here because five engines were landing in
+# one round and five sessions editing one workflow would have been that round's merge in
+# miniature. Whoever owned the workflow was to paste it in. MEASURED 19 October 2026: the
+# paste never happened for any of the six engines, so none of the nineteen workflow files
+# mentioned this fixture and the live check ran only by hand.
+#
+# The step now lives in `.github/workflows/ci.yml`, in the `functional-smoke` job, named
+# `MTConnect provider check`. It is not duplicated here on purpose: the pin this fixture runs is held equal to
+# the compose fragment's by a test, and a pin that lives in a third file nobody compares is a
+# third pin. What stays here is the reasoning the step is too short to carry.
+#
+# Where it goes: the `e2e` job, after the functional smoke, in the same shape the RabbitMQ step has.
+# The steps run in order with no `if:`, so a red check here cannot hide the result before it.
+#
+# WHY THE FIXTURE IS TWO CONTAINERS. An MTConnect agent republishes what an adapter tells it: with
+# no adapter it answers every data item UNAVAILABLE and proves nothing. MEASURED against a second
+# agent of this image started alone: /probe answered 200 with 21 data items, 18 of them UNAVAILABLE
+# and 3 carrying a value, while the fixture answers 22 with 14 carrying a value. So CI starts both
+# and waits for both, and the trap removes both and the network between them.
+#
+# THE READY LOOP ASKS ONE QUESTION THAT COVERS BOTH. `/probe` answers before any adapter data
+# arrives, so it cannot be the question. `ConnectionStatus` is ESTABLISHED only once the agent has
+# its adapter, so one request proves the agent is serving AND that the device behind it arrived.
+# It is asked with wget: MEASURED, this image has no curl (`command -v curl` is empty) and
+# `/usr/bin/wget` is there, and the first version of the compose health check ran curl and failed
+# 478 times in a row while the agent served every request.
+#
+# The two image references are database-compose.yml's, and
+# tests/integration/db/mtconnect-provider.test.ts holds this file and that one to the same digest.

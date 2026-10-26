@@ -33,6 +33,20 @@ export function setupMonacoMock() {
           onChange: (e: { target: { value: string } }) => props.onChange?.(e.target.value),
         });
       },
+      // `DiffEditor` is the apply preview's surface (#789 Phase 3). It is here because a double that
+      // omits an export the real module HAS does not degrade, it throws: bun answers
+      // `SyntaxError: Export named 'DiffEditor' not found` and fails the WHOLE FILE, so a suite that
+      // never renders a diff still dies the moment one lands anywhere in its module graph. Measured
+      // 2026-09-14: mounting ApplyPreviewDialog from ObjectSourceView put this import into the pane's
+      // graph and took two component suites down without either of them rendering a diff.
+      DiffEditor: function MockDiffEditor(props: { original?: string; modified?: string; language?: string }) {
+        return React.createElement("div", {
+          "data-testid": "mock-monaco-diff-editor",
+          "data-language": props.language,
+          "data-original": props.original ?? "",
+          "data-modified": props.modified ?? "",
+        });
+      },
       loader: {
         init: mock(() => Promise.resolve()),
         config: mock(() => {}),
@@ -59,7 +73,11 @@ export function setupRechartssMock() {
       Area: () => null,
       Bar: () => null,
       Line: () => null,
-      RadialBar: () => null,
+      // Surfaces `background.fill` for the same reason the Tooltip below surfaces
+      // `contentStyle`: recharts inline-styles the gauge's unfilled track, so there is no
+      // class to assert on and a hardcoded colour is invisible to every test.
+      RadialBar: ({ background }: { background?: { fill?: string } }) =>
+        React.createElement("div", { "data-testid": "mock-radial-bar", "data-track": background?.fill }),
       XAxis: () => null,
       YAxis: () => null,
       CartesianGrid: () => null,

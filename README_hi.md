@@ -1,0 +1,371 @@
+<p align="center">
+  <img src="public/logo.svg" width="200" alt="LibreDB Studio Logo" />
+</p>
+
+<h1 align="center">LibreDB Studio</h1>
+
+<p align="center">
+  <strong>डेटाबेस एडिटर जो आपके laptop पर नहीं, आपके डेटा के क़रीब deploy होता है।</strong>
+</p>
+
+<p align="center">
+  <a href="README.md">English</a> ·
+  <a href="README_zh.md">简体中文</a> ·
+  <a href="README_ja.md">日本語</a> ·
+  <a href="README_es.md">Español</a> ·
+  <a href="README_ur.md">اردو</a> ·
+  <b>हिन्दी</b> ·
+  <a href="README_ko.md">한국어</a> ·
+  <a href="README_pt.md">Português (Brasil)</a> ·
+  <a href="README_ru.md">Русский</a>
+</p>
+
+<p align="center">
+  PostgreSQL प्रोजेक्ट में सूचीबद्ध:
+  <a href="https://www.postgresql.org/about/news/libredb-studio-an-open-source-self-hosted-sql-ide-for-postgresql-in-the-browser-3368/">News</a>
+  ·
+  <a href="https://wiki.postgresql.org/wiki/PostgreSQL_Clients#LibreDB_Studio">PostgreSQL Clients</a>
+  ·
+  <a href="https://www.postgresql.org/download/products/1/#:~:text=LibreDB%20Studio">Software Catalogue</a>
+  ·
+  <a href="https://wiki.postgresql.org/wiki/Community_Guide_to_PostgreSQL_GUI_Tools#LibreDB_Studio">Community Guide to GUI Tools</a>
+</p>
+<p align="center">
+  साथ ही
+  <a href="https://node-oracledb.readthedocs.io/en/latest/user_guide/appendix_b.html#libredb-studio">Oracle</a>,
+  <a href="https://planet.mysql.com/showcase/?search=LibreDB">MySQL</a>,
+  <a href="https://redis.io/docs/latest/develop/tools/#libredb-studio">Redis</a>,
+  <a href="https://valkey.io/participants/#:~:text=LibreDB%20Studio%20connects%20to%20Valkey">Valkey</a>,
+  <a href="https://clickhouse.com/docs/integrations/connectors/tools/gui#libredb-studio">ClickHouse Visual Interfaces</a>,
+  <a href="https://clickhouse.com/docs/integrations/connectors/sql-clients/libredb-studio">ClickHouse SQL Clients</a>,
+  <a href="https://mariadb.com/docs/server/clients-and-utilities/graphical-and-enhanced-clients/libredb-studio">MariaDB Graphical Clients</a>,
+  <a href="https://ecohub.mariadb.org/database-management/libredb-studio">MariaDB Ecosystem Hub</a>,
+  <a href="https://trino.io/ecosystem/client-application#libredb-studio">Trino</a>,
+  <a href="https://docs.yugabyte.com/stable/integrations/tools/libredb-studio/">YugabyteDB</a>,
+  <a href="https://www.tigerdata.com/docs/integrate/query-administration/libredb-studio">TimescaleDB</a>,
+  <a href="https://www.dragonflydb.io/docs/integrations/libredb-studio">DragonflyDB</a>,
+  <a href="https://microsoft.github.io/garnet/docs/welcome/compatibility#gui-tools">Garnet</a>,
+  <a href="https://opensearch.org/community-projects/#:~:text=LibreDB%20Studio">OpenSearch</a>,
+  <a href="https://duckdb.org/docs/preview/guides/sql_editors/libredb_studio">DuckDB</a>,
+  <a href="https://docs.starrocks.io/docs/integrations/IDE_integrations/LibreDB_Studio/">StarRocks</a>,
+  <a href="https://docs.databend.com/guides/connect/sql-clients/libredb-studio">Databend</a>,
+  <a href="https://aiven.io/docs/products/postgresql/howto/connect-libredb-studio">Aiven for PostgreSQL</a>,
+  <a href="https://aiven.io/docs/products/mysql/howto/connect-libredb-studio">Aiven for MySQL</a>,
+  <a href="https://docs.scylladb.com/stable/get-started/gui-clients/libredb-studio.html">ScyllaDB</a>,
+  <a href="https://docs.couchbase.com/server/current/third-party/integrations.html#standalone-query-and-admin-tools">Couchbase</a>,
+  <a href="https://cloudberry.apache.org/docs/ecosystem/sql-clients/libredb-studio/">Apache Cloudberry</a>,
+  <a href="https://doris.apache.org/docs/4.x/connection-integration/data-integration/libredb-studio/">Apache Doris</a>,
+  <a href="https://cwiki.apache.org/confluence/display/KAFKA/Ecosystem#:~:text=LibreDB%20Studio">Apache Kafka</a>,
+  <a href="https://cassandra.apache.org/_/ecosystem.html">Apache Cassandra</a>
+  और
+  <a href="https://druid.apache.org/libraries/#:~:text=LibreDB%20Studio">Apache Druid</a>
+  के आधिकारिक docs में भी सूचीबद्ध
+</p>
+
+<p align="center">
+  <img src="public/screenshots/hero-demo.gif" width="100%" />
+</p>
+
+<p align="center">
+  <a href="https://github.com/libredb/libredb-studio"><img src="https://img.shields.io/github/stars/libredb/libredb-studio?style=social" alt="GitHub stars"></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://sonarcloud.io/project/overview?id=libredb_libredb-studio"><img src="https://sonarcloud.io/api/project_badges/measure?project=libredb_libredb-studio&metric=alert_status" alt="Quality Gate"></a>
+  <a href="https://codecov.io/github/libredb/libredb-studio"><img src="https://codecov.io/github/libredb/libredb-studio/graph/badge.svg?token=VA6CO9R7IH" alt="Coverage"></a>
+  <a href="https://deepwiki.com/libredb/libredb-studio"><img src=".github/assets/deepwiki-badge.svg" alt="Ask DeepWiki"></a>
+  <a href="https://artifacthub.io/packages/helm/libredb-studio/libredb-studio"><img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/libredb-studio" alt="Artifact Hub"></a>
+</p>
+
+<p align="center">
+  <a href="https://nextjs.org/"><img src="https://img.shields.io/badge/Next.js-16-black?logo=next.js" alt="Next.js 16"></a>
+  <a href="https://react.dev/"><img src="https://img.shields.io/badge/React-19-61DAFB?logo=react" alt="React 19"></a>
+  <a href="https://hub.docker.com/r/libredb/libredb-studio?tag=latest"><img src="https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker" alt="Docker Support"></a>
+  <a href="https://artifacthub.io/packages/helm/libredb-studio/libredb-studio"><img src="https://img.shields.io/badge/Kubernetes-Compatible-326CE5?logo=kubernetes" alt="Kubernetes Compatible"></a>
+</p>
+
+<p align="center">
+  <a href="#जल्दी-शुरू-करें"><strong>Quick Start</strong></a> •
+  <a href="README.md#live-test"><strong>Live Demo</strong></a> •
+  <a href="#इंस्टॉल-करने-के-तरीके"><strong>Install Options</strong></a> •
+  <a href="README.md#one-click-deploy"><strong>Deploy Your Own</strong></a>
+</p>
+
+> यह हिन्दी README समुदाय द्वारा किया गया अनुवाद है और अंग्रेज़ी से पीछे हो सकता है। अंतर होने पर [अंग्रेज़ी संस्करण](README.md) मान्य है।
+
+## जल्दी शुरू करें
+
+एक ही command से पूरा SQL IDE चालू करें। न clone करना है, न build:
+
+```bash
+# Docker (सुझाया गया तरीका)
+docker run -p 3000:3000 ghcr.io/libredb/libredb-studio:latest
+
+# या Node.js 24+ के साथ (Docker के बिना)
+npx @libredb/studio
+```
+
+फिर **http://localhost:3000** खोलें। पहली बार चालू होने पर Studio admin password को log में print करता है। किसी config file की ज़रूरत नहीं है।
+
+> अगर browser Studio को localhost या HTTPS के बजाय किसी और पते से खोलता है (जैसे LAN पर `http://192.168.x.x:3000`), तो `AUTH_COOKIE_SECURE=false` भी set करें। वरना health check ठीक दिखेगा, पर login चुपचाप fail होगा और आप बार-बार login page पर लौटते रहेंगे।
+
+Helm, Homebrew, Snap, winget या deb/rpm चाहिए? नीचे [इंस्टॉल करने के तरीके](#इंस्टॉल-करने-के-तरीके) देखें।
+
+## एक और डेटाबेस टूल क्यों
+
+आप किसी managed platform पर चालीस सेकंड के अंदर Postgres बना सकते हैं।
+
+फिर आप देखना चाहते हैं कि उसके अंदर क्या है। तो आप port को public internet पर खोलते हैं, SSH tunnel बनाते हैं, या हर उस machine पर desktop client install करते हैं जिसे उसकी ज़रूरत है। डेटाबेस को चालीस सेकंड लगे, पर उसमें झाँकने की खिड़की बनाने में आपकी पूरी दोपहर चली गई।
+
+अब इसे बड़े पैमाने पर सोचिए। App के लिए Postgres, documents के लिए Mongo, cache के लिए Redis, events के लिए ClickHouse। चार डेटाबेस, चार clients, चार तरह के credentials। सोमवार को एक नया साथी join करता है। पहली line का code लिखने से पहले उसे पता करना पड़ता है कि कौन सा डेटा कहाँ है, wiki और तीन private chats में connection strings ढूँढनी पड़ती हैं, VPN access का इंतज़ार करना पड़ता है, और हर engine के लिए अलग tool install करना पड़ता है।
+
+**डेटाबेस अपनी जगह बदल चुके हैं।** वे Kubernetes में, managed cloud में, और ग्राहक के ऐसे VPC में पहुँच गए हैं जहाँ jump host से होकर ही जाया जा सकता है। **पर उन्हें पढ़ने वाले tools वहीं के वहीं रह गए।** वे आज भी desktop apps हैं: भारी, हर seat का पैसा लेने वाले, पहले install होने वाले, और यह मानकर चलने वाले कि एक ही डेटाबेस है, एक ही laptop है, और एक ही इंसान है जो कभी device नहीं बदलता।
+
+LibreDB Studio दूसरा रास्ता चुनता है: **tool डेटा के पास जाता है, डेटा tool के पास नहीं आता।**
+
+इस बात को गंभीरता से लें, तो यह पसंद-नापसंद नहीं रह जाती। यह एक specification बन जाती है।
+
+- एडिटर browser में चलना चाहिए, क्योंकि डेटा आपकी machine पर नहीं है, और आपके साथी भी नहीं।
+- यह phone पर खुलना चाहिए, क्योंकि जिस incident में एक query चलानी है, वह आपके laptop खोलने का इंतज़ार नहीं करता।
+- इसे infrastructure की तरह deploy होना चाहिए (container, Helm chart, Operator, one-click template), क्योंकि डेटाबेस के पास की हर चीज़ ऐसे ही install होती है।
+- इसे embed किया जा सकना चाहिए, क्योंकि एडिटर की सबसे काम की जगह उसी product के अंदर है जिसने डेटाबेस बनाया।
+- इसमें कुछ भी छिपा या बंद नहीं होना चाहिए। Seat-based licence और feature tiers वाला tool आप अपने हर environment में नहीं रख सकते। **जिस पल SSO के लिए अलग पैसे लगते हैं, वह tool default रूप से deploy करने लायक नहीं रहता।**
+
+> MIT कोई उदारता नहीं है। यह इस architecture की अनिवार्य शर्त है।
+
+## मुख्य क्षमताएँ
+
+### इकतालीस engines, एक interface
+
+PostgreSQL · MySQL · Oracle · Db2 LUW · SQL Server · SQLite · libSQL · DuckDB · MongoDB · Redis · Couchbase · Firestore · ClickHouse · Apache Druid · Elasticsearch · OpenSearch · Trino · BigQuery · Databend · Snowflake · Apache Spark · Apache Cassandra · Prometheus · Apache Kafka · etcd · Neo4j · Milvus · Qdrant · InfluxDB (InfluxQL) · InfluxDB 3 (SQL) · Oxia · S3-compatible object storage · Kubernetes · MQTT · RabbitMQ · OPC UA · MTConnect · Modbus · NETCONF · SNMP · Sparkplug B
+
+सभी SQL engines एक ही schema browser, ER diagram, schema diff और monitoring dashboard इस्तेमाल करते हैं। MongoDB और Redis SQL engines नहीं हैं, इसलिए उनमें ER diagram और schema diff नहीं है। Druid, Elasticsearch, OpenSearch और Trino दोहरे अपवाद हैं: उनके HTTP SQL interface का कोई ऐसा URI रूप नहीं है जिसे यह build पढ़ सके, इसलिए उन्हें सिर्फ़ host/port से configure किया जाता है। साथ ही, generated migration सीधे अपनी सीमा बताता है, बजाय ऐसे engine के लिए DDL बनाने के जिसकी SQL में column बदलने का कोई statement ही नहीं है। Couchbase के schemaless collections पर भी यही लागू है। Search clusters के ER diagram में सिर्फ़ boxes होते हैं, कोई line नहीं: indexes foreign keys declare नहीं करते, और engine के model में declare करने के लिए foreign key होती ही नहीं।
+
+| डेटाबेस | Driver | क्षमताएँ |
+| :--- | :--- | :--- |
+| **PostgreSQL** | `pg` | पूरा SQL IDE, EXPLAIN plans, transactions, query cancel (`pg_cancel_backend`) |
+| **MySQL** | `mysql2` | पूरा SQL IDE, EXPLAIN, transactions, query cancel (`KILL QUERY`) |
+| **Oracle** | `oracledb` (Thin mode) | पूरा SQL IDE, `FETCH FIRST N ROWS` pagination, `V$` monitoring views, `ANALYZE TABLE`, `ALTER INDEX REBUILD`, transactions |
+| **Db2 LUW** | `db2-node` (Rust में लिखा DRDA client, native N-API addon, IBM client की ज़रूरत नहीं) | Db2 for Linux, UNIX and Windows के लिए SQL IDE: tables, views, materialized query tables, aliases, sequences, modules, routines और triggers का schema browser, stored definitions, `FETCH FIRST` / `OFFSET` pagination, हर table पर RUNSTATS और REORG. TLS ज़रूरी है जब तक आप जानबूझकर उसे बंद न करें, क्योंकि उसके बिना driver password को cleartext में भेजता है. Driver कुछ types गलत पढ़ता है (non-ASCII text, 2^53 से बड़ा BIGINT, BOOLEAN, XML, LOBs), इसलिए inline editing, import, EXPLAIN, transactions और cancel बंद हैं; ज्ञात समस्याएँ [`docs/providers/db2.md`](docs/providers/db2.md) में हैं |
+| **SQL Server** | `mssql` (tedious) | पूरा SQL IDE, `TOP N` / `OFFSET FETCH` pagination, `sys.dm_*` DMVs, `UPDATE STATISTICS`, `DBCC CHECKDB`, transactions, Azure SQL की अपने-आप पहचान |
+| **SQLite** | `bun:sqlite` / `node:sqlite` (runtime पर चुना जाता है) | पूरा SQL IDE, file-based या in-memory डेटाबेस |
+| **libSQL** | कोई driver नहीं, सिर्फ़ HTTP (Hrana protocol, `POST /v2/pipeline`, port 8080) | पूरा SQL IDE। एक ही type-id self-hosted libSQL server (`sqld`) और Turso Cloud दोनों से जुड़ता है। यह network पर चलने वाली SQLite dialect है, और `dbstat` से tables और indexes का असली byte size पढ़ता है। Credential password नहीं, auth token है। Maintenance में सिर्फ़ Reindex और integrity check हैं: `VACUUM`, `ANALYZE` और `PRAGMA optimize` server मना कर देता है |
+| **DuckDB** | `@duckdb/node-api` (native N-API addon, हर platform पर लगभग 68 MB bindings) | Local DuckDB file या `:memory:` के लिए पूरा SQL IDE, जो app वाले server पर ही चलता है। `EXPLAIN (FORMAT JSON)` physical plan tree, `duckdb_*` catalog introspection, `pragma_storage_info` block allocation से हर table का असली byte size, और driver के अपने `interrupt()` से query cancel। तीन maintenance operations: `VACUUM`, `ANALYZE` और `CHECKPOINT`। यहाँ `REINDEX` syntax error है, और `PRAGMA integrity_check` व `PRAGMA optimize` मौजूद ही नहीं, इसलिए उनके लिए कोई बटन नहीं है। न slow query log है, न session list: DuckDB दोनों में से कुछ नहीं देता, इसलिए ये panels 0 दिखाने के बजाय साफ़ यही बताते हैं। Database file को एक समय में सिर्फ़ एक OS process खोल सकता है (read-only mode में भी), इसलिए दूसरा Studio instance वह file नहीं खोल सकता जो यह instance पहले से खोले हुए है |
+| **MongoDB** | `mongodb` | JSON query editor, collection operations (find, aggregate, insert, update, delete) |
+| **Couchbase** | कोई driver नहीं, सिर्फ़ HTTP (Query + management REST) | पूरा SQL++ IDE, EXPLAIN, bucket/scope/collection browser, `INFER` से field inference |
+| **Firestore** | कोई driver नहीं, REST (Firestore REST API v1) | केवल पढ़ने के लिए: tree में top-level collections, Keys panel में किसी भी गहराई तक documents और subcollections, Source tab में document का data, और Admin SDK की query chain जिसे Studio parse करता है और कभी JavaScript की तरह नहीं चलाता; `count()`, `sum()`, `average()`, `findNearest` और Query Explain के साथ |
+| **ClickHouse** | कोई driver नहीं, सिर्फ़ HTTP (SQL interface, port 8123) | पूरा SQL IDE, JSON EXPLAIN tree, system tables से schema introspection, `OPTIMIZE TABLE` |
+| **Apache Druid** | कोई driver नहीं, सिर्फ़ HTTP (`POST /druid/v2/sql`) | Read-only SQL IDE, native query EXPLAIN tree, `INFORMATION_SCHEMA` introspection, `sys.*` monitoring |
+| **Elasticsearch** | कोई driver नहीं, सिर्फ़ HTTP (`POST /_sql?format=json`, port 9200) | Read-only SQL IDE, mapping पर आधारित index/field browser, cluster health और हर index के document count व storage size। न EXPLAIN, न maintenance, न slow query या session panels। Elasticsearch SQL में `OFFSET` भी नहीं है, इसलिए results का दूसरा page नहीं माँगा जा सकता |
+| **OpenSearch** | कोई driver नहीं, सिर्फ़ HTTP (`POST /_plugins/_sql`, port 9200) | Elasticsearch वाला ही provider module, वही read-only SQL IDE और browser। यहाँ `LIMIT n OFFSET m` काम करता है, इसलिए pagination भी काम करता है |
+| **Trino** | कोई driver नहीं, सिर्फ़ HTTP (client protocol, `POST /v1/statement`, port 8080) | सभी configured catalogs पर पूरा SQL IDE, connection के fixed catalog की `information_schema` schema tree, `system.runtime` और `jmx` monitoring, `SHOW STATS` से असली row counts, query cancel और `kill_query` maintenance। Trino query engine है और ख़ुद डेटा store नहीं करता, इसलिए कहीं भी primary key, foreign key या index declare नहीं होते: ER diagram में सिर्फ़ boxes हैं, inline editing बंद है, और capacity panel मनगढ़ंत usage के बजाय catalogs की सूची दिखाता है। Fail हुए statements भी HTTP 200 के साथ लौटते हैं। Cluster पर authentication बंद हो तब भी plain HTTP पर password मना कर दिया जाता है |
+| **Databend** | कोई driver नहीं, सिर्फ़ HTTP (Databend का अपना query API, `POST /v1/query`, port 8000) | Self-hosted Databend server या Databend Cloud warehouse पर SQL IDE: tree में catalogs और databases, उनकी tables, views, materialized views और dynamic tables के साथ, text `EXPLAIN` plans, default catalog की `system.*` monitoring, और Sessions panel से `KILL QUERY` के ज़रिए query cancel। हर statement अपने अलग session में चलता है, इसलिए transaction या temporary table उसे खोलने वाले statement के साथ ख़त्म हो जाती है। Databend कोई key declare नहीं करता, इसलिए inline row editing बंद है, और Create Table भी। Plain HTTP पर ऐसे host को password, जो न loopback है न tunnel से, तब तक refuse होता है जब तक connection सहमति न दे। Cloud connection अपना warehouse बताता है, जो पहले statement पर resume होता है और उसी से billing शुरू होती है; connection खोलना भी इसमें गिना जाता है, क्योंकि वह object tree पढ़ता है। Custom CA और client certificates के साथ TLS; SSH tunnel |
+| **BigQuery** | कोई driver नहीं, सिर्फ़ HTTP (BigQuery REST API, `jobs.query`) | SQL (GoogleSQL) IDE: tree में projects, datasets, tables, views और materialized views, statements `jobs.query` के ज़रिए। `EXPLAIN` एक dry run है जो processed bytes बताता है। Service-account key या access-token credentials |
+| **Snowflake** | कोई driver नहीं, सिर्फ़ HTTP (Snowflake SQL API v2) | SQL IDE: tree में databases, schemas, tables, views, streams, tasks, stages और भी बहुत कुछ, हर request में एक statement। `EXPLAIN USING JSON` बिना चलाए compile करता है। Key-pair या programmatic access token से sign-in, हर statement एक ही role के रूप में |
+| **Apache Spark** | `@grpc/grpc-js` और `apache-arrow`, gRPC (Spark Connect, Spark 4.1 और बाद के संस्करण) | SQL IDE: ट्री में कैटलॉग और नेमस्पेस, उनकी टेबल, व्यू और फ़ंक्शन, हर अनुरोध के लिए एक Spark सत्र, `EXPLAIN FORMATTED` बिना चलाए प्लान दिखाता है। टोकन TLS, loopback या SSH टनल पर; एजेंट प्लान मोड |
+| **Apache Cassandra** | `cassandra-driver` (pure JavaScript, कोई native module नहीं) | Native protocol (port 9042) पर CQL IDE, partition key और clustering key चिह्नित करने वाला keyspace browser, `system_views` से overview, uptime और चल रहे statements। Connection में **`localDataCenter` भरना ज़रूरी है**: इसके बिना driver connect करने से मना कर देता है। न EXPLAIN (CQL grammar में यह keyword ही नहीं है), न query cancel (protocol में cancel frame नहीं है), न maintenance (compaction, repair और flush सब `nodetool` के JMX operations हैं)। और **कोई row count या size नहीं दिखाया जाता**: Cassandra सिर्फ़ flush हो चुकी files पर आधारित partition अनुमान (500 rows वाली clustered table 143 पढ़ी गई) और पूरे MiB (19,476 bytes की table `1 MiB` पढ़ी गई) दे सकता है, इसलिए ग़लत संख्या दिखाने से बेहतर है कुछ न दिखाना |
+| **Prometheus** | कोई driver नहीं, सिर्फ़ HTTP (Prometheus HTTP API, port 9090) | PromQL editor जो text को बिना बदले server तक भेजता है, नतीजे grid और chart tab में (`rate(x[5m])[1h:1m]` जैसी step वाली subquery timestamps पर lines के रूप में chart होती है: tab पहली series से खुलता है, Y-Axis menu से और series जोड़ी जा सकती हैं, हर series की एक line, और एक साथ अधिकतम आठ lines बनती हैं, उससे आगे chart "Showing first 8 of N series" दिखाता है; लेकिन chart किसी missing sample को, और numbers के बीच `NaN` या `Inf` को, 0 पर दिखाता है, इसलिए अलग-अलग समय पर scrape होने वाले targets की raw range query झूठे शून्य दिखाती है), metrics browser जिसमें label names columns हैं और metadata source है, rule groups और recording व alerting rules (firing alert tree में चिह्नित), scrape pools और targets (down target tree में चिह्नित), और health, version, uptime व TSDB statistics। Design से read-only: न admin API, न remote write, न EXPLAIN (parse endpoint अभी experimental है), न maintenance। Plain HTTP पर credential मना नहीं होता बल्कि भेज दिया जाता है, इसलिए जिस network पर आपका नियंत्रण न हो वहाँ TLS चालू करें |
+| **Apache Kafka** | `@platformatic/kafka` (pure TypeScript, port 9092) | JSON read request जो topic को partition, offset या timestamp से, सबसे पुराने offset से या नवीनतम messages पढ़ता है; keys, values और headers JSON, text या base64 में decode होते हैं और Confluent format वाला value अपने schema id से चिह्नित होता है; topic browser में partitions और non-default configs (offline या under-replicated topic चिह्नित), दोनों protocols के consumer groups और हर partition का lag, brokers और उनके configs, और health, topic count व disk size। Construction से read-only: न produce, न offset commit, न consumer group में शामिल होना, न topic बनाना। Custom CA और client certificates के साथ TLS, और SASL PLAIN या SCRAM सिर्फ़ TLS पर; SSH tunnel नहीं, क्योंकि brokers तक उनके advertised addresses पर पहुँचा जाता है |
+| **etcd** | `@grpc/grpc-js` (pure JavaScript, gRPC, port 2379) | Editor में etcdctl का subset (`get`, `put`, `del`, `txn`, leases, सीमित `watch`, members, alarms, users और roles); tree में key-prefix groups और Keys panel में हर key; एक key की value उसके revision से guarded एक transaction में edit होती है; admins के लिए compaction, defragmentation और alarm disarm, हर एक connection का नाम type करके confirm होता है। Kubernetes prefix या `compact_rev_key` पर हर write refuse होता है, और Kubernetes secrets तथा protobuf या encrypted values कभी नहीं दिखते। Custom CA के साथ TLS, client certificates (उनका Common Name etcd user) और password sign-in सिर्फ़ TLS पर; SSH tunnel; seed में घोषित read-only mode |
+| **Neo4j** | `neo4j-driver-lite` (pure JavaScript, Bolt, port 7687) | Neo4j 5.26 LTS के लिए editor में read-only Cypher, हर run में एक statement; tree में node labels और relationship types (उनकी properties columns के रूप में), indexes और constraints; grid में nodes, relationships और paths tagged JSON cells के रूप में, 64-bit integers और temporal values बिना precision खोए; Community जो monitoring panels देता है। हर statement पहले उसके tokens पर read policy से, फिर `EXPLAIN` के ज़रिए server के अपने classification से (जिसे allowlisted SHOW form छोड़ देता है) गुज़रता है और READ session में चलता है, इसलिए किसी write को तीनों layers तोड़नी होंगी। EXPLAIN या PROFILE view, maintenance, agent execution और MCP `run_read_query` नहीं; Custom CA के साथ TLS और SSH tunnel; connection string नहीं |
+| **Milvus** | `@grpc/grpc-js` (pure JavaScript, gRPC, port 19530) | Editor में Milvus की अपनी REST v2 requests (एक JSON body के साथ `POST /v2/vectordb/<route>`) से reads, exact counts और हर vector type पर vector search, BM25 और hybrid search सहित; tree में databases और collections, उनके fields, partitions, indexes और load state; dimension के साथ vector cells और पूरी value का copy; admins के लिए preview और confirmation के साथ Load और Release। Studio कोई data नहीं लिखता, server से किसी दूसरी service को call कराने वाली requests refuse करता है, और default `root` password पर warning देता है। Custom CA और client certificates के साथ TLS; password सिर्फ़ TLS पर, loopback पर या SSH tunnel से; seed में घोषित read-only mode |
+| **Qdrant** | कोई नहीं, HTTP (Qdrant का REST API, port 6333) | Editor में Qdrant की अपनी REST requests (एक JSON body के साथ `METHOD /path`), सत्रह read routes: points पढ़ना, scroll, exact counts, facets, और dense, sparse और multivector data पर queries, batches और grouped queries, local BM25 model सहित; tree में collections, उनके vectors, payload indexes और payload keys का sampled view; dimension के साथ vector cells और पूरी value का copy। Studio कुछ नहीं लिखता, local BM25 के सिवा हर inference input refuse करता है, और बिना expiry या manage access वाले JWT पर warning देता है। Custom CA और client certificates के साथ TLS; key सिर्फ़ TLS पर, loopback पर या SSH tunnel से; seed में घोषित read-only mode |
+| **InfluxDB (InfluxQL)** | कोई नहीं, HTTP (InfluxDB का v1 API, port 8086) | Editor में read-only InfluxQL, v1 `/query` API पर InfluxDB 1.x, 2.x और 3 के लिए, हर run में एक `SELECT`, `SHOW` या `EXPLAIN`; tree में databases और measurements, हर measurement के tags और fields उसके columns के रूप में, और grid में 2^53 से बड़े integers और nanosecond timestamps सटीक। Connection में कुछ भी लिखा हो, read-only: 1.x और 2.x पर `DROP DATABASE` से पहले Studio की अपनी read policy ही अकेली रोक है, इसलिए हर दूसरा statement किसी भी request से पहले refuse होता है, और कोई write endpoint नहीं छुआ जाता। User और password, या password field में token; plain HTTP पर ऐसे host को credential, जो न loopback है न tunnel से, तब तक refuse होता है जब तक connection सहमति न दे; InfluxDB 3 server पर `_internal` कभी नहीं पढ़ा जाता |
+| **InfluxDB 3 (SQL)** | कोई नहीं, HTTP (InfluxDB 3 का SQL API, port 8181) | Editor में read-only SQL, InfluxDB 3 Core और Enterprise के लिए; tree में connection के database की tables, उनके columns के साथ। Connection में कुछ भी लिखा हो, read-only: route table किसी write, token, cache या plugin endpoint तक नहीं पहुँचती, और configure endpoints में से सिर्फ़ database listing तक, एक GET, जो statement read keyword से शुरू नहीं होता वह किसी भी request से पहले refuse होता है, और उसके ऊपर server का planner हर write refuse करता है। एक token, कोई user नाम नहीं; plain HTTP पर ऐसे host को token, जो न loopback है न tunnel से, तब तक refuse होता है जब तक connection सहमति न दे; 1.x या 2.x server पर लगाने पर InfluxDB (InfluxQL) चुनने को कहता है |
+| **Oxia** | `@grpc/grpc-js` (pure JavaScript, gRPC, port 6648) | Read-only `oxia client` commands (`get`, `list`, `range-scan`), tree में shards और Keys panel में हर key |
+| **S3-compatible object storage** | none, HTTP (S3 REST API, path style, Studio के अपने SigV4 code से signed; Parquet preview के लिए `hyparquet`) | Read-only AWS CLI read commands (`aws s3 ls`, `aws s3api list-buckets`, `aws s3api head-object`, `aws s3api list-object-versions`) और Studio का अपना `preview`; tree में buckets और Keys panel में folders, एक बार में एक level; object का metadata और text, JSON, CSV और Parquet का capped preview. MinIO, Silo, Garage और RustFS पर verified; AWS S3 और hosted services पर verified नहीं |
+| **Kubernetes** | कोई driver नहीं, सिर्फ़ HTTP (API server का REST API, port 6443) | Read-only: editor में kubectl का subset (`get`, `describe`, `logs`, `top`, `events`, `explain`, `auth can-i`), tree में namespaces और उनके kinds, हर object के YAML view के साथ, और connection dialog में kubeconfig import। Secret values कभी नहीं दिखतीं |
+| **MQTT** | `mqtt-packet` (केवल इसका पार्सर; Studio जो पाँच पैकेट भेजता है, कनेक्शन प्रबंधक और एकतरफ़ा वाल्व Studio का अपना कोड हैं) | बनावट से ही केवल-पढ़ने योग्य: बाहर जाने वाला रास्ता CONNECT, SUBSCRIBE, UNSUBSCRIBE, PINGREQ और DISCONNECT ही लिख सकता है, PUBLISH लिखने वाला कोई फ़ंक्शन मौजूद नहीं है, और CONNECT कोई Will नहीं रखता। Keys पैनल एक ही सब्सक्रिप्शन से टॉपिक ट्री बनाता है और हर पंक्ति के आगे सर्वर द्वारा बताया गया शेष जीवनकाल दिखाता है; टॉपिक खोलने पर उसका पेलोड और मेटाडेटा दिखता है। MQTT में टॉपिक सूचीबद्ध करने का कोई कमांड नहीं है, इसलिए कोई भी पठन स्वयं को पूर्ण नहीं बताता: हर पठन बताता है कि उसने क्या देखा, क्यों रुका, और वह किस नुकसान को सिद्ध कर सकता है। `$share/`, `$queue/` और `$exclusive/` फ़िल्टर SUBSCRIBE भेजने से पहले ही अस्वीकार कर दिए जाते हैं, क्योंकि इनमें से हर एक Studio के साथ सब्सक्राइब किए उपकरणों से संदेश छीन लेता है। Mosquitto, EMQX, HiveMQ CE, NanoMQ और RabbitMQ 4 पर सत्यापित |
+| **RabbitMQ** | कोई नहीं: प्रबंधन HTTP API (पोर्ट 15672) और Studio का अपना AMQP 0-9-1 पठन क्लाइंट (पोर्ट 5672) | संरचना से केवल-पठन: पठन क्लाइंट publish, संदेश निकालना या declare एन्कोड नहीं कर सकता। ट्री में वर्चुअल होस्ट, स्ट्रीम, क्यू और एक्सचेंज; JSON पठन अनुरोध स्ट्रीम के संदेश पढ़ता है, क्यू के कभी नहीं |
+| **OPC UA** | `node-opcua-client` (शुद्ध JavaScript, `opc.tcp`, पोर्ट 4840) | बनावट से ही केवल-पढ़ने योग्य: क्लाइंट की सीम केवल आठ पढ़ने वाली सेवाएँ घोषित करती है (GetEndpoints, CreateSession, ActivateSession, Browse, BrowseNext, Read, HistoryRead और CloseSession), और प्रोवाइडर में Write, Call, HistoryUpdate या कोई सब्सक्रिप्शन कहीं नहीं है। कुंजी पैनल पता-स्थान को एक-एक स्तर पर, प्रति स्तर एक Browse से चलता है; कुंजी एस्केप किया हुआ ब्राउज़ पथ है, क्योंकि BrowseName में ही विभाजक आ सकता है। कोई नोड खुलने पर उसका मान, स्थिति, दोनों समय-चिह्न और समझा गया AccessLevel दिखता है, और कंसोल एक ही JSON अनुरोध से वर्तमान मान या कच्चा इतिहास पढ़ता है। हर सीमा Studio की अपनी है, सर्वर की घोषित सीमा नहीं: मापे गए चार सर्वरों में से दो अपनी घोषित सीमा से कहीं आगे के अनुरोध भी पूरे करते हैं और एक उसे 0 घोषित करता है। मेथड नोड सूची में आता है, कभी नहीं चलाया जाता। Microsoft OPC PLC 2.15.10, open62541 1.5.9, Python asyncua 2.1.0 और Eclipse Milo डेमो पर सत्यापित |
+| **MTConnect** | कोई नहीं: साझा `node:http(s)` transport पर इस repository का अपना client (पोर्ट 5000) | बनावट से ही read-only: request table में नौ routes हैं और हर एक GET है, इसलिए भेजने के लिए कोई PUT, POST या stream नहीं। device एक container है, data item और condition ऐसी relations हैं जिनकी पंक्तियाँ value, timestamp और sequence हैं, और हर asset का XML Source टैब में खुलता है |
+| **Modbus** | कोई नहीं: साझा egress नियम से गुजरते हुए raw socket पर इस repository का अपना client (पोर्ट 502, MODBUS/TCP Security के लिए 802) | बनावट से read-only: encoder केवल चार read function code और device identification बनाता है, कोई function लिखना नहीं बना सकता, और एक valve बाहर जाने वाले हर byte को दोबारा जाँचता है। Modbus में discovery नहीं है, इसलिए tree connection के साथ रखे register map से बनता है, और एक read उस map के नाम दिए points पर एक JSON request है |
+| **NETCONF** | `ssh2` (केवल SSH transport; यह repository socket खोलकर सौंप देता है, और NETCONF का framing, request और session इसके अपने हैं, पोर्ट 830) | बनावट से ही read-only: `requests.ts` पाँच request body बनाता है और उनमें चार पढ़ने वाले हैं, `<get-config>`, `<get>`, `<get-data>` और `<get-schema>`, पाँचवाँ session बंद करता है, और कोई function `<edit-config>`, `<copy-config>`, `<commit>` या `<lock>` नहीं बनाता। datastore एक container है और उसके नीचे YANG module दूसरा, module का पहले स्तर का container या list एक object है, और list entry के key leaf उस object के column हैं |
+| **SNMP** | कोई नहीं: साझा egress नियम से होकर UDP पर इस repository का अपना client (पोर्ट 161) | बनावट से ही read-only: बाहर जाने वाला valve Get, GetNext या GetBulk के अलावा हर PDU को मना करता है, इसलिए कोई Set socket तक पहुँचता ही नहीं। object group एक container है, subtree का walk ही पढ़ना है, और table GetBulk के उत्तरों से बनती है |
+| **Sparkplug B** | कोई नहीं: साझा `node:net` और `node:tls` ट्रांसपोर्ट पर इस रिपॉज़िटरी का अपना सीमित MQTT सत्र (पोर्ट 1883, या SSL / TLS पैनल से 8883) | रचना से ही केवल-पठनीय: एन्कोडर में PUBLISH लिखने वाला कोई फ़ंक्शन नहीं है, और CONNECT कोई will नहीं भेजता, क्योंकि 5.4 एज नोड के मृत्यु प्रमाणपत्र को उसका will मानता है और will सेट करने वाला पाठक अपना सॉकेट टूटने पर एक मृत्यु प्रकाशित कर देता। एक group और एक edge node कंटेनर हैं, और हर metric एक पंक्ति है जिसका मान, समय-चिह्न और परिभाषा उसे घोषित करने वाले जन्म प्रमाणपत्र से आते हैं |
+| **Redis** | `ioredis` | Command editor, key browser, INFO पर आधारित monitoring |
+
+> **Transport security हर engine की अलग सुविधा नहीं, सब पर लागू होने वाली क्षमता है।** SSH tunnel provider के connect होने से पहले ही बन जाता है और connection को local endpoint पर मोड़ देता है, इसलिए यह engine पर निर्भर नहीं: जिस connection में host और port हो, उस पर यह लागू होता है, Kafka connection को छोड़कर: Kafka client हर broker तक उसके advertised address पर पहुँचता है, जिसे एक address forward करने वाला tunnel नहीं ले जा सकता, इसलिए Kafka connection tunnel मना कर देता है। Connection string से भरे गए connections (MongoDB, Couchbase और ClickHouse में यह तरीका है) में host/port नहीं होता, इसलिए वे tunnel से नहीं जाते। SQLite और DuckDB में भी दोनों नहीं होते। SSL/TLS panel अभी PostgreSQL, MySQL, SQL Server, Couchbase, ClickHouse, Druid, Elasticsearch, OpenSearch, Trino, Prometheus और Apache Kafka पर काम करता है। Trino पर यह वैकल्पिक नहीं है, क्योंकि coordinator plain HTTP पर password मना कर देता है। Oracle, MongoDB और Redis इस setting को नज़रअंदाज़ करते हैं, इसलिए इन तीनों में encryption इस पर निर्भर है कि connection string में क्या लिखा है, dialog में क्या चुना है इस पर नहीं।
+
+> Redis इस SQL-oriented interface में एक convention की वजह से फ़िट होता है। `getSchema()` non-blocking `SCAN` से (**कभी भी `KEYS *` से नहीं**) key prefixes को "tables" में बाँटता है, health और metrics `INFO` से आते हैं, और slow queries व sessions `SLOWLOG GET` / `CLIENT LIST` से।
+
+### Professional SQL एडिटर
+
+- **Monaco engine**: वही जो VS Code में है।
+- **Schema-aware autocomplete**: table names, column names, keywords।
+- **Multi-tab workspace**: हर tab की अपनी execution state।
+- **Visual EXPLAIN**: graphical execution plan, ताकि performance की रुकावट दिखे।
+- **Interactive ER diagram**: असली foreign key lines, cardinality labels, MiniMap, table search, PNG/SVG export, ELK.js से अपने-आप layered layout।
+- **Schema diff और migration**: दो connections या दो snapshots की तुलना, जोड़े/हटाए/बदले गए हिस्से अलग रंगों में, और अपने-आप बना migration SQL (PostgreSQL, MySQL, SQLite, Oracle, SQL Server, और ClickHouse के column changes)।
+- **Snapshot timeline**: horizontal timeline। कोई भी दो बिंदु चुनें और schema का बदलाव देखें।
+
+<p align="center">
+  <img src="public/screenshots/erd-diagram.png" alt="ER diagram" width="100%" />
+</p>
+
+### Database Agent (read-only)
+
+एडिटर के बगल वाला Agent panel Studio का मुख्य AI interface है (नीचे दी गई model-assisted features के अलावा)।
+आप एक लक्ष्य लिखते हैं ("किस department में सबसे ज़्यादा लोग हैं?", "यह query धीमी क्यों है?") और Start दबाते हैं।
+यह run connected डेटाबेस के लिए SQL लिखता है, results पढ़ता है, और अंत में एक report देता है, जिसका हर निष्कर्ष
+उस read का हवाला देता है जिस पर वह टिका है।
+
+- **Read-only, और यह गारंटी डेटाबेस ख़ुद देता है**: Agent का हर statement **Agent की अपनी audited pipeline** से गुज़रता है।
+  Driver तक पहुँचने से पहले policy decision, audit event और budget accounting होती है (`executeAuditedOperation`,
+  `src/lib/db/operations/execution.ts:129`)। साथ में read-only execution profile लगता है: PostgreSQL पर read-only
+  transaction, SQLite पर हर statement के साथ दोबारा `PRAGMA query_only`, और DuckDB पर `READ_ONLY` engine handle के ऊपर
+  एक SQL guard, क्योंकि सिर्फ़ वह flag `COPY … TO`, `EXPORT DATABASE` और local files पढ़ने वाले table functions को नहीं रोकता।
+  SQL Server पर किसी भी तरह का read-only transaction होता ही नहीं, इसलिए वहाँ चार परतें हैं: connection खुलते समय यह जाँचा जाता है
+  कि session का principal लिख ही नहीं सकता, फिर optimizer हर statement को चलाए बिना सिर्फ़ compile करके admit करता है,
+  rows की सीमा server पर ही लगती है, और statement एक ऐसे transaction के अंदर चलता है जिसे हमेशा rollback किया जाता है।
+  Writes और DDL डेटाबेस तक पहुँचने से पहले ही मना कर दिए जाते हैं। `EXPLAIN ANALYZE` statement को सच में चलाता है,
+  इसलिए default रूप से बंद है। यह pipeline सिर्फ़ Agent के लिए है: एडिटर में आप जो statements ख़ुद चलाते हैं वे सीधे
+  provider को जाते हैं (`src/app/api/db/query/route.ts:312`), यहाँ की policy से नहीं गुज़रते, और ऐसा audit record नहीं बनाते।
+- **Agent mode सिर्फ़ PostgreSQL, SQLite, DuckDB, SQL Server, MySQL, Kubernetes और MongoDB पर**: read-only profile सिर्फ़ उन providers पर है
+  जिन्होंने इसे implement किया है: `postgres.ts`, `sqlite.ts`, `duckdb/index.ts`, `mssql.ts`, `mysql.ts`, `kubernetes/index.ts` और `mongodb/index.ts`
+  का `queryReadOnly`, और कोई नहीं। हर engine की read-only सीमा अलग है, और वह उस engine के docs में लिखी है।
+  बाक़ी engines पर, statements भेजने वाला Agent-mode workflow शुरू होते ही मना कर दिया जाता है,
+  run बनने से पहले; और जो अनुरोध provider factory तक पहुँच जाए वह `engine-unsupported` के साथ ख़त्म होता है।
+  **Plan** mode हर connection पर खुलता है: वहाँ का model कोई tool इस्तेमाल नहीं करता, आपका कोई statement नहीं चलाता, कुछ लिखता नहीं,
+  और सिर्फ़ एक statement का मसौदा देता है जिसे आप ख़ुद चलाते हैं। उसकी GROUNDING हर engine तक पहुँचती है: PostgreSQL और SQLite पर
+  server ख़ुद catalog statements बनाता है, और बाक़ी हर connection पर उसी connection के provider से schema का ब्यौरा माँगा जाता है,
+  यानी वही read जो sidebar पहले से करता है, जिसके लिए read-only statement path चाहिए ही नहीं। इसलिए दोनों सीमाएँ अलग हैं:
+  Agent mode ऊपर लिखे engines तक सीमित है, GROUNDING सारे engines, और जिस run की reading नाकाम रहे वह tables गढ़ने के बजाय यह साफ़ कह देता है।
+- **तीन workflows**: **Investigate** (सवाल का जवाब), **Optimize** (अनुमानित execution plans की तुलना, index या rewrite का सुझाव),
+  **Assess** (table profiling: सिर्फ़ counts, कभी भी असली values नहीं)।
+- **अपने-आप कुछ नहीं करता**: Agent आपकी जगह run शुरू नहीं करता, एडिटर में नहीं लिखता, और अपने सुझाए statements नहीं चलाता।
+  क्या अपनाना है, यह आपका click तय करता है।
+- **सबूत के बिना कोई निष्कर्ष नहीं**: बिना हवाले का निष्कर्ष दर्ज नहीं हो सकता। Run के अंत में साफ़ "Run answered" या
+  "Run did not answer" लिखा आता है।
+- **सीमाएँ तय हैं, और screen पर दिखती हैं**: हर run में 20 statements, 60 सेकंड database time, एक read में 200 rows, और पूरे run के लिए 5 मिनट।
+- **अपना model इस्तेमाल करें**: Gemini (default), OpenAI, Ollama, या कोई भी OpenAI-compatible endpoint। **Agent** mode के लिए ऐसा
+  model चाहिए जो सच में tool calling करता हो। Ollama पर यह vendor docs से नहीं, एक असली probe से पक्का किया जाता है। **Plan** mode को
+  tools नहीं चाहिए और वह कभी probe नहीं करता (`src/lib/agent/capability-gate.ts:74`), इसलिए Agent mode में मना किया गया model
+  Plan mode में चल सकता है, और panel आपको यही सुझाव देता है।
+- **Model configure नहीं, तो AI नहीं**: जब कोई `LLM_*` configuration नहीं होता, तो panel दिखता ही नहीं और कोई डेटा आपके network से बाहर नहीं जाता।
+  ध्यान दें कि switch key नहीं है: Ollama और custom endpoints बिना key के भी configured model गिने जाते हैं, और तब AI चालू होता है।
+  बाहर क्या-क्या जाता है, यह [`docs/AGENT_DATA_FLOW.md`](docs/AGENT_DATA_FLOW.md) में है।
+
+सिर्फ़ standalone deployment में: embedded `@libredb/studio` package में कोई Agent interface नहीं है।
+Guide: [`docs/AGENT_GUIDE.md`](docs/AGENT_GUIDE.md) ·
+डेटा बाहर जाने की जानकारी: [`docs/AGENT_DATA_FLOW.md`](docs/AGENT_DATA_FLOW.md) ·
+व्यवहार और सीमाएँ: [`docs/AGENT.md`](docs/AGENT.md)
+
+### दूसरी AI features (वैकल्पिक, अपने model के साथ)
+
+- **किसी vendor से बँधा नहीं**: default Gemini 2.5 Flash, साथ में OpenAI, या **local / OpenAI-compatible endpoints** (Ollama, LM Studio, LiteLLM)।
+- **Query safety analysis**: चलाने से पहले DELETE, DROP, TRUNCATE जैसे destructive statements के risk का आकलन।
+- **Execution plan की व्याख्या**: EXPLAIN को आसान भाषा में समझाना और optimization के सुझाव देना।
+- **Data profile summary**: हर column के statistics को text में समझाना। इस context में हर column का `min` / `max` होता है, यानी आपके
+  डेटा की असली values। विवरण [`docs/AGENT_DATA_FLOW.md`](docs/AGENT_DATA_FLOW.md) में है।
+
+**Model configure नहीं, तो AI कोई call नहीं करता**: जब कोई `LLM_*` configuration नहीं है (default स्थिति), तो कोई डेटा आपके network से बाहर नहीं जाता।
+
+### डेटा के साथ काम
+
+- **Virtualized grid** (TanStack): लाखों rows तक smooth rendering।
+- **Inline editing**: value बदलने के लिए double-click करें (सिर्फ़ उन engines पर जिनकी SQL single-table row update support करती है)।
+- **Pivot table**: client-side pivot, 5 aggregation functions, और उसी का SQL बनाने का विकल्प।
+- **8 तरह के charts**: bar, line, pie, area, scatter, histogram, stacked bar, stacked area (Recharts)। Chart configuration save करके दोबारा इस्तेमाल करें।
+- **Export**: CSV, JSON।
+
+### Analysis और development tools
+
+- **AI data profiling**: एक click में column statistics (null rate, cardinality, min/max, sample values) और लिखित summary।
+- **ORM code generation**: live schema से TypeScript interfaces, Zod schemas, Prisma models, Go structs, Python dataclasses, Java POJOs।
+- **Test data generation**: 30+ semantic column types की पहचान (email, phone, name, address आदि), output INSERT statements या MongoDB insertMany JSON।
+- **Database documentation**: live schema से searchable data dictionary, Markdown export के साथ।
+
+### Authentication और SSO: सब कुछ MIT version में
+
+- **दो modes**: local email/password, या OIDC SSO। Environment variable से बदलें।
+- **किसी provider पर निर्भर नहीं**: Auth0, Keycloak, Okta, Azure AD, Zitadel, Google, या कोई भी OIDC-compliant provider।
+- **PKCE**: Authorization Code Flow + S256।
+- **Role mapping**: claim के आधार पर configure करें, `realm_access.roles` जैसे nested paths के साथ।
+
+### DBA operations tools (सिर्फ़ admin)
+
+7 tabs वाला monitoring dashboard (overview, performance, queries, sessions, tables, storage, connection pool), time-series trend charts, 5-60 सेकंड का adjustable auto-refresh, threshold alerts के रंग, और एक click में `VACUUM` / `ANALYZE` / `REINDEX` / `UPDATE STATISTICS` / `DBCC CHECKDB` / `ALTER INDEX REBUILD`। Admin Audit tab सर्वर के हाल के audit events दिखाता है, जैसे sign-in, permission denial, maintenance action, object edit और agent तथा MCP की operation, हर एक के साथ वह user जिसके पीछे वह है, और signed-in admin का अपना query history। दोनों current filters का ध्यान रखते हुए CSV या JSON में export होते हैं। [governance](docs/GOVERNANCE.md#query-events) के तहत Studio हर उस statement का एक query event रिकॉर्ड करता है जिसे कोई व्यक्ति चलाता है, और control plane वह organization-wide record रखता है।
+
+## इंस्टॉल करने के तरीके
+
+| तरीका | Command |
+| :--- | :--- |
+| **Docker** | `docker run -p 3000:3000 ghcr.io/libredb/libredb-studio:latest` |
+| **npx** | `npx @libredb/studio` |
+| **Helm** | `helm install libredb oci://ghcr.io/libredb/charts/libredb-studio` |
+| **Homebrew** | `brew trust libredb/tap && brew install libredb/tap/libredb-studio` |
+| **Snap** | `sudo snap install libredb-studio` |
+| **winget** | `winget install LibreDB.Studio` |
+| **deb / rpm** (server, systemd service के साथ) | [Releases page](https://github.com/libredb/libredb-studio/releases/latest) |
+| **Desktop app** (AppImage / deb) | [Releases page](https://github.com/libredb/libredb-studio/releases/latest)। Native window, server local sidecar के रूप में चलता है, कोई login page नहीं। **यह ऊपर वाला server package नहीं है।** |
+| **Desktop app** (Flatpak, sandboxed) | `flatpak --user remote-add --if-not-exists flatpark https://dl.flatpark.org/flatpark.flatpakrepo`<br>`flatpak --user install flatpark org.libredb.Studio` |
+
+`brew trust` सिर्फ़ एक बार चलाना है (Homebrew 6+ चाहिए। अगर unknown command की error आए, तो पहले `brew update` चलाएँ)। Docker, Helm और Snap बिना किसी configuration के चलते हैं: पहली बार बना admin password क्रमशः container log, Pod log और `sudo snap logs libredb-studio` में print होता है। हर channel की पूरी जानकारी (commands, configuration, systemd इस्तेमाल, Docker image tag model) [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md) में है।
+
+One-click deploy templates: Railway, Dokploy, CapRover, Sealos, Kubero, Cosmos, DigitalOcean Marketplace, Unraid Community Apps, Render Blueprint, Fly.io, Koyeb। पूरी सूची [`docs/CHANNELS.md`](docs/CHANNELS.md) में है।
+
+Kubernetes users के लिए एक OpenShift / OLM Operator bundle भी है।
+
+### अपने product में embed करें
+
+```bash
+npm i @libredb/studio
+```
+
+Studio एक npm package के रूप में भी publish होता है, जिसे आप सीधे अपने app में embed कर सकते हैं। अगर आपका product users के लिए डेटाबेस बनाता है, तो एडिटर की सबसे सही जगह यही है।
+
+**Studio के security headers अपनी Next.js config में दोबारा इस्तेमाल करें।** `@libredb/studio/security` subpath पूरी policy को plain data के रूप में publish करता है: `securityHeaders()` एक सामान्य `Record<string, string>` लौटाता है, और उसका module कुछ भी import नहीं करता। इसलिए इसे सीधे `next.config.ts` में load किया जा सकता है, जहाँ अभी न path aliases हैं, न Studio runtime।
+
+```ts
+// next.config.ts
+import { securityHeaders } from "@libredb/studio/security";
+
+export default {
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: Object.entries(securityHeaders()).map(([key, value]) => ({ key, value })),
+      },
+    ];
+  },
+};
+```
+
+विकल्प: `reportOnly` लागू होने वाले header की जगह `Content-Security-Policy-Report-Only` भेजता है। `hsts: false` HSTS बंद करता है (object देने पर custom)। `allowEval` `'unsafe-eval'` जोड़ता है, जो React के **development** build को चाहिए। `monacoVsPath` Monaco के assets अलग origin पर हों तो वह origin जोड़ता है। `extra` हर directive में आपके अपने sources मिलाता है। साथ में `studioCspDirectives()` और `HSTS_MAX_AGE_SECONDS` भी export होते हैं, उन configs के लिए जो policy सीधे भेजने के बजाय ख़ुद जोड़ना चाहती हैं।
+
+अपनाने से पहले policy एक बार पढ़ लें: CSP inline scripts की अनुमति देती है, क्योंकि हर document route statically prerender होता है और hydration scripts में nonce नहीं होता। इसलिए यह इस पर रोक लगाती है कि inject हुई script डेटा **कहाँ भेज** सकती है, इस पर नहीं कि वह चल सकती है या नहीं। यह trade-off, और Next.js app के ये headers भेजने के दो रास्ते, [`docs/SECURITY.md`](docs/SECURITY.md) में लिखे हैं।
+
+## Testing और quality
+
+- Unit, API, integration, hooks, component और E2E: छह layers के tests
+- **100% line coverage**, और यह CI का सख़्त gate है। Coverage गिरे, तो merge रुक जाता है
+- SonarCloud quality gate
+- हर release पर Node 24 / 26 पर smoke tests
+
+```bash
+bun run test           # सभी tests
+bun run test:e2e       # Playwright (पहले build ज़रूरी)
+bun run test:coverage  # coverage report
+```
+
+## Documentation
+
+विस्तृत docs अभी सिर्फ़ अंग्रेज़ी में हैं:
+
+- [Architecture](docs/ARCHITECTURE.md) · [Database providers](docs/DATABASE_PROVIDERS.md) · [हर engine का reference](docs/providers/README.md)
+- [API docs](docs/API_DOCS.md) · [OIDC setup](docs/OIDC.md) · [Storage layer](docs/STORAGE.md)
+- [Helm Chart](docs/HELM_CHART.md) · [Distribution channels](docs/CHANNELS.md) · [नया डेटाबेस जोड़ना](docs/ADDING_A_PROVIDER.md)
+
+## योगदान करें
+
+Issues और PRs का स्वागत है, और बातचीत हिन्दी में करना बिल्कुल ठीक है। शुरू करने से पहले [CONTRIBUTING.md](CONTRIBUTING.md) पढ़ें।
+
+नया database engine जोड़ने के लिए [`docs/ADDING_A_PROVIDER.md`](docs/ADDING_A_PROVIDER.md) देखें। Code, docs और tests तीनों एक ही PR में साथ-साथ बदलने चाहिए।
+
+## License
+
+[MIT](LICENSE)। न CLA, न enterprise edition, न कुछ छिपाकर रखा गया।
+
+<p align="center">
+  डेटा के साथ काम करने वाले हर व्यक्ति के लिए, डेटा चाहे जहाँ रखा हो या जहाँ भी जा रहा हो।
+</p>

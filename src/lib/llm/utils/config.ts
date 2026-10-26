@@ -3,7 +3,7 @@
  * Environment variable resolution and default configuration
  */
 
-import { type LLMConfig, type LLMProviderType, LLMConfigError } from "../types";
+import { type LLMConfig, type LLMModelEffort, type LLMProviderType, LLM_MODEL_EFFORTS, LLMConfigError } from "../types";
 
 // ============================================================================
 // Default Configuration
@@ -18,6 +18,8 @@ export const DEFAULT_MODELS: Record<LLMProviderType, string> = {
   custom: "gpt-3.5-turbo",
 };
 
+const VALID_PROVIDERS = Object.keys(DEFAULT_MODELS) as LLMProviderType[];
+
 export const DEFAULT_API_URLS: Record<string, string> = {
   ollama: "http://localhost:11434/v1",
   openai: "https://api.openai.com/v1",
@@ -27,20 +29,22 @@ export const DEFAULT_API_URLS: Record<string, string> = {
 // Environment Resolution
 // ============================================================================
 
-function getEnvVar(key: string): string | undefined {
-  return process.env[key];
+/**
+ * Whether the operator named a provider at all. A misspelling still counts: they meant to use AI,
+ * and `resolveProvider` silently falls back, so the key error is the only thing left to tell them.
+ */
+function isProviderNamed(): boolean {
+  return (process.env.LLM_PROVIDER ?? "").trim() !== "";
 }
 
 function resolveProvider(): LLMProviderType {
-  const provider = getEnvVar("LLM_PROVIDER")?.toLowerCase();
+  const provider = process.env.LLM_PROVIDER?.toLowerCase();
 
   if (!provider) {
     return DEFAULT_PROVIDER;
   }
 
-  const validProviders: LLMProviderType[] = ["gemini", "openai", "ollama", "custom"];
-
-  if (!validProviders.includes(provider as LLMProviderType)) {
+  if (!VALID_PROVIDERS.includes(provider as LLMProviderType)) {
     console.error(`[LLM] Invalid provider "${provider}", falling back to "${DEFAULT_PROVIDER}"`);
     return DEFAULT_PROVIDER;
   }
@@ -49,7 +53,7 @@ function resolveProvider(): LLMProviderType {
 }
 
 function resolveApiKey(provider: LLMProviderType): string | undefined {
-  const apiKey = getEnvVar("LLM_API_KEY");
+  const apiKey = process.env.LLM_API_KEY;
 
   // Ollama doesn't require API key
   if (!apiKey && provider === "ollama") {
@@ -60,13 +64,13 @@ function resolveApiKey(provider: LLMProviderType): string | undefined {
 }
 
 function resolveModel(provider: LLMProviderType): string {
-  const model = getEnvVar("LLM_MODEL");
+  const model = process.env.LLM_MODEL;
   return model || DEFAULT_MODELS[provider];
 }
 
 function resolveApiUrl(provider: LLMProviderType): string | undefined {
   // Primary: LLM_API_URL
-  const apiUrl = getEnvVar("LLM_API_URL");
+  const apiUrl = process.env.LLM_API_URL;
   if (apiUrl) {
     return apiUrl;
   }
@@ -88,6 +92,12 @@ function resolveApiUrl(provider: LLMProviderType): string | undefined {
   return undefined;
 }
 
+/** `LLM_MODEL_EFFORT`, trimmed and lower-cased; unset or blank leaves the provider's default. */
+function resolveModelEffort(): string | undefined {
+  const effort = (process.env.LLM_MODEL_EFFORT ?? "").trim().toLowerCase();
+  return effort === "" ? undefined : effort;
+}
+
 // ============================================================================
 // Configuration Resolution
 // ============================================================================
@@ -97,12 +107,17 @@ function resolveApiUrl(provider: LLMProviderType): string | undefined {
  */
 export function resolveConfig(overrides?: Partial<LLMConfig>): LLMConfig {
   const provider = overrides?.provider ?? resolveProvider();
+  const modelEffort = overrides?.modelEffort ?? resolveModelEffort();
 
   return {
     provider,
+    providerExplicit: overrides?.provider !== undefined || isProviderNamed(),
     apiKey: overrides?.apiKey ?? resolveApiKey(provider),
     model: overrides?.model ?? resolveModel(provider),
     apiUrl: overrides?.apiUrl ?? resolveApiUrl(provider),
+    // Absent rather than undefined when unset, so a configuration without it is the same object
+    // it was before the variable existed.
+    ...(modelEffort === undefined ? {} : { modelEffort }),
   };
 }
 
@@ -111,26 +126,75 @@ export function resolveConfig(overrides?: Partial<LLMConfig>): LLMConfig {
 // ============================================================================
 
 /**
+ * Why credentials are absent: switched off, or a setup someone started and did not finish. Only the
+ * first is silent to the caller, so a named provider never hides its own missing key.
+ */
+export function unconfiguredReason(config: LLMConfig): "missing_credentials" | undefined {
+  return config.providerExplicit ? undefined : "missing_credentials";
+}
+
+/**
+ * The configured reasoning effort, narrowed, or undefined when none is configured.
+ *
+ * OpenAI only, because it is the one provider whose every surface sends the value: its chat
+ * surface as `reasoning_effort`, its agent surface as the Responses API's `reasoning.effort`.
+ * Gemini, Ollama and a custom endpoint have no such field on either surface, so accepting the
+ * variable for them would be a setting that silently does nothing.
+ *
+ * Exported separately from `validateConfig` because the Ollama and custom chat providers replace
+ * the base validation with their own and must still refuse it.
+ *
+ * @throws LLMConfigError for a value outside `LLM_MODEL_EFFORTS`, or any value with a provider
+ *         other than openai
+ */
+export function validModelEffort(config: LLMConfig): LLMModelEffort | undefined {
+  const effort = config.modelEffort;
+  if (effort === undefined) return undefined;
+  if (!isModelEffort(effort)) throw new LLMConfigError(unknownEffortMessage(effort), config.provider);
+  if (config.provider !== "openai") throw new LLMConfigError(effortProviderMessage(config.provider), config.provider);
+  return effort;
+}
+
+function isModelEffort(value: string): value is LLMModelEffort {
+  return (LLM_MODEL_EFFORTS as readonly string[]).includes(value);
+}
+
+// Built on one line each: bun's line coverage under-counts the continuation lines of multi-line
+// string concatenation.
+const unknownEffortMessage = (effort: string): string =>
+  `Unknown LLM_MODEL_EFFORT "${effort}". Allowed values: ${LLM_MODEL_EFFORTS.join(", ")}.`;
+
+const effortProviderMessage = (provider: string): string =>
+  `LLM_MODEL_EFFORT applies to LLM_PROVIDER=openai only; unset it for the ${provider} provider.`;
+
+/**
  * Validate LLM configuration
  * @throws LLMConfigError if configuration is invalid
  */
 export function validateConfig(config: LLMConfig): void {
   // Validate provider
-  const validProviders: LLMProviderType[] = ["gemini", "openai", "ollama", "custom"];
-  if (!validProviders.includes(config.provider)) {
+  if (!VALID_PROVIDERS.includes(config.provider)) {
     throw new LLMConfigError(
-      `Invalid provider: ${config.provider}. Valid options: ${validProviders.join(", ")}`,
+      `Invalid provider: ${config.provider}. Valid options: ${VALID_PROVIDERS.join(", ")}`,
       config.provider,
     );
   }
 
   // Validate API key requirements
   if (config.provider === "gemini" && !config.apiKey) {
-    throw new LLMConfigError("Gemini API key is required. Set LLM_API_KEY environment variable.", "gemini");
+    throw new LLMConfigError(
+      "Gemini API key is required. Set LLM_API_KEY environment variable.",
+      "gemini",
+      unconfiguredReason(config),
+    );
   }
 
   if (config.provider === "openai" && !config.apiKey) {
-    throw new LLMConfigError("OpenAI API key is required. Set LLM_API_KEY environment variable.", "openai");
+    throw new LLMConfigError(
+      "OpenAI API key is required. Set LLM_API_KEY environment variable.",
+      "openai",
+      unconfiguredReason(config),
+    );
   }
 
   // Validate API URL for custom provider
@@ -142,6 +206,8 @@ export function validateConfig(config: LLMConfig): void {
   if (!config.model || config.model.trim() === "") {
     throw new LLMConfigError(`Model name is required for ${config.provider} provider.`, config.provider);
   }
+
+  validModelEffort(config);
 }
 
 // ============================================================================
@@ -171,5 +237,6 @@ export function getSafeConfigForLogging(config: LLMConfig): Record<string, strin
     model: config.model,
     apiUrl: config.apiUrl,
     apiKey: config.apiKey ? "***" : undefined,
+    modelEffort: config.modelEffort,
   };
 }

@@ -24,7 +24,7 @@
  *   leaves every database route open to any authenticated session, so an agent
  *   restricted to admins would be more restrictive than the editor it reads for.
  *   Least privilege for the agent path is enforced where it belongs — the
- *   database-native read-only profile, and optionally a dedicated `agentUser`.
+ *   read-only execution profile's boundary, and optionally a dedicated `agentUser`.
  * - **`maxResultRows` / `maxResultBytes` are model-sized, not editor-sized.** A
  *   read on this path is going to be rendered into a prompt, so the cap that
  *   matters is the one that keeps a result affordable in tokens; the editor's
@@ -77,8 +77,8 @@ export const AGENT_OPERATIONS_PROFILE: ExecutionProfile = "agent-operations";
  * spend on a run, and the hand-over is not that. What the two share is the whole of
  * the boundary: `PROFILE_ACQUISITION` gives both the same `readOnly: true` open, the
  * same optional `agentUser` credential, the same profiled cache (never the editor's
- * writable pool), and the same demand that the provider expose a database-native
- * read-only statement path — which is what makes `BEGIN READ ONLY` and
+ * writable pool), and the same demand that the provider expose a read-only
+ * statement path (`queryReadOnly`), which is what makes `BEGIN READ ONLY` and
  * `PRAGMA query_only` apply to a replayed statement exactly as they do to the run's
  * own. They differ in one thing, the budget below, and they are separate names so
  * that a later change to one cannot silently move the other.
@@ -111,9 +111,10 @@ const HANDOVER_STATEMENT_TIMEOUT_MS = 2_147_483_647;
  * - **Rows: the editor's own default**, imported rather than restated, because the
  *   number the checkbox names and the number the server enforces have to be one
  *   value. It refuses rather than truncates, like every other read on this path
- *   (§2.5 of `docs/AGENT_ANALYST_DESIGN.md` argues at length against injecting a
- *   `LIMIT`, and a server-side truncation would be the same lie with a different
- *   author). Condition 1 of the gate has already established that this statement
+ *   (the "Handing the answer to the editor (auto-execute)" section of `docs/AGENT.md`
+ *   argues at length against injecting a `LIMIT`, and a server-side truncation would
+ *   be the same lie with a different author). Condition 1 of the gate has already
+ *   established that this statement
  *   returned 200 rows or fewer on the agent's own path, so the headroom to 500 is
  *   real rather than nominal.
  * - **Time: no limit, spelled as the ceiling above.**
@@ -135,9 +136,9 @@ export const AGENT_HANDOVER_BUDGET: ReadOnlyStatementBudget = Object.freeze({
  * The three fields are enforced in three different places — the policy by the
  * operation pipeline, `runDeadlineMs` by `AgentRunDeadline`, `maxModelTurns` by the
  * run loop — and they are held together here because they only make sense together:
- * §1.3 of `docs/AGENT_ANALYST_DESIGN.md` shows that a turn ceiling raised without the
- * wall clock that makes it reachable is decoration, and a wall clock raised without
- * the turns is room nothing can use.
+ * the "What bounds a run" section of `docs/AGENT.md` shows that a turn ceiling raised
+ * without the wall clock that makes it reachable is decoration, and a wall clock
+ * raised without the turns is room nothing can use.
  */
 export interface AgentWorkflowBudget {
   /** The policy every tool call of a run of this workflow is evaluated against. */
@@ -231,8 +232,9 @@ function workflowBudget(input: {
  * What each workflow may spend, frozen per workflow (the data-analyst design, §1.6).
  *
  * A total `Record` over `AgentRunWorkflowType`, which is the fourth of exactly this
- * shape: the workflow axis already decides the tool set (`WORKFLOW_TOOLS`), what the
- * model is told (`WORKFLOW_OBJECTIVES` / `WORKFLOW_TOOL_RULES`) and the verdict rule
+ * shape: the workflow axis already decides the tool set (each variant's `tools` in
+ * `agent-manifest.ts`), what the model is told (the variant's `objective` and
+ * its language pack's `workflowToolRules`) and the verdict rule
  * (`AGENT_WORKFLOW_GOALS`). A new workflow therefore stops the build until somebody
  * decides what it may spend, rather than inheriting a ceiling meant for another
  * workload.
@@ -307,13 +309,16 @@ function workflowBudget(input: {
  *   in front of a container needs its own timeout raised — stated in `docs/AGENT.md`
  *   under "Deployment" rather than silently assumed.
  *
- * Every one of these ceilings is per DRIVE, not per run. The budget tracker, the repair
- * ledger and the deadline all live in the process that drives a run, so a run resumed
- * after a process death starts each of them again: N resumes cost up to N times a single
- * drive's ceiling. Nothing here is a lie about a run's total cost because nothing here
- * claims to bound one — bounding a run ACROSS resumes needs a ceiling folded from its own
- * ledger (the record carries `createdAtMs`, so the data exists), and that is recorded in
- * `docs/BACKLOG.md` rather than implied here.
+ * Which of these bound a RUN and which bound one DRIVE, since #999 folded the run's own
+ * ledger into the ceilings a drive starts with (`drive-budget.ts`):
+ *
+ *   - `maxStatementsPerRun` and the database-time figure bound the run. A resumed drive is
+ *     seeded with what earlier drives spent, so N resumes no longer cost N times the
+ *     ceiling.
+ *   - `runDeadlineMs` bounds the run too, and on the WALL clock: it is derived from
+ *     `createdAtMs`, so time a run spends paused or between drives is spent against it.
+ *   - `maxModelTurns` and the repair ledger are still per drive. A resumed run counts its
+ *     own turns, and its repair attempts start again (`docs/BACKLOG.md` B6).
  */
 export const AGENT_WORKFLOW_BUDGETS: Readonly<Record<AgentRunWorkflowType, AgentWorkflowBudget>> = Object.freeze({
   investigation: workflowBudget({
@@ -361,8 +366,13 @@ export const AGENT_WORKFLOW_BUDGETS: Readonly<Record<AgentRunWorkflowType, Agent
  * showed what that costs: an unanswered call ended a run at exactly 300.0s — the whole
  * investigation deadline of the day — with a two-event ledger, having spent a budget
  * meant to cover a whole investigation, and a user watched it do so with no feedback.
- * Turns on this workload land in seconds, so a ceiling this far above them is only ever
- * reached by a call that is not coming back. It is deliberately NOT per workflow: the
+ * Most turns on this workload land in seconds, and this ceiling was written on the assumption
+ * that anything reaching it was a call that would never come back. A local model falsifies that:
+ * measured on `qwen3.6:35b`, query-optimization, nine losses were cut near 100s of a 450s deadline
+ * with 34 of 36 turns unspent, while the same cell's longest PASSING run took 183s. So the ceiling
+ * is a bound on ONE CALL and the drive treats it as one — a cut turn is asked again rather than
+ * ending the run — which is what makes the sentence below true rather than aspirational. It is
+ * deliberately NOT per workflow: the
  * decision table varies what a RUN may spend, and how long one request may hang before
  * it is written off is a property of the transport, not of the question being asked.
  *
@@ -409,6 +419,40 @@ export const AGENT_REPORT_RESERVE_TURNS = 2;
 
 /** @see AGENT_REPORT_RESERVE_TURNS — the same reserve, against the wall clock. */
 export const AGENT_REPORT_RESERVE_MS = 20_000;
+
+/**
+ * How many times one turn may be re-asked when its STREAM broke, rather than the model.
+ *
+ * Two, matching the chat surface: `base-provider.ts` retries a retryable `LLMStreamError` three
+ * times against these same endpoints, and an agent turn is far more expensive than a chat one, so
+ * this is the same judgement spent more carefully.
+ *
+ * It bounds a fault in the connection, never one in the model. `isRetryableError` refuses auth,
+ * safety and config errors, so a misconfigured server still fails on its first turn; what this
+ * covers is the broken frame measured on `gpt-oss:20b`, where runs died a median of 17 seconds
+ * into a 630-second budget having already called four tools.
+ */
+export const AGENT_TRANSPORT_TURN_RETRIES = 2;
+
+/**
+ * How many times a run may be told a tool call of its own could not be parsed.
+ *
+ * A COUNT rather than a flag, and that is a correction. This bound shipped as "once per run" on
+ * the argument that a model which hears the sentence and writes the same unparseable arguments
+ * again is not rescued by hearing it twice. Measured on `gpt-oss:20b`, the argument is wrong in
+ * the way that matters: of ten runs, four met the fault, and of those four TWO heard the sentence
+ * once and went on to answer — while the other two heard it, met the fault a second time later in
+ * the run, and were ended `model-unavailable` by this bound rather than by anything the model did.
+ *
+ * The sentence works when it is allowed to be said. What the flag actually encoded was the
+ * assumption that the mistake happens once, and a long run of a reasoning model makes it more than
+ * once — in different turns, over different arguments.
+ *
+ * Two, matching `AGENT_TRANSPORT_TURN_RETRIES`, and free on the same argument every recovery here
+ * rests on: the alternative is the throw, so the run is over either way and the turn cannot cost a
+ * pass. A model that cannot comply after two still fails fast.
+ */
+export const AGENT_UNREADABLE_TOOL_CALL_ANSWERS = 2;
 
 /**
  * How many statements that FAILED AT THE DATABASE a run may try to repair.
@@ -472,3 +516,36 @@ export const AGENT_THREAD_STEP_OBJECTIVE_MAX_CHARS = 200;
  * that half-read a conversation must not be confident about the half it has.
  */
 export const AGENT_THREAD_MAX_STEPS = 20;
+
+/**
+ * How many finished conversations the run history retains, per user.
+ *
+ * The history index is append-only — one entry per finished run — so this is a READ
+ * bound, not a write bound: `foldHistoryEntries` keeps the newest conversations up
+ * to this count and drops older ones from the listing. Nothing is deleted from the
+ * index stream, because deleting from an append-only ledger would be a second kind
+ * of write and the cost of the cap is a listing, not a retention promise.
+ *
+ * The number is a user-facing bound and is stated in `docs/AGENT_GUIDE.md`; changing
+ * it there without changing it here fails the drift guard that pins the two.
+ */
+export const AGENT_HISTORY_MAX_CONVERSATIONS = 50;
+
+/**
+ * How many conversations one history page serves when the caller says nothing.
+ *
+ * A page, not the whole history: the route clamps a caller's `limit` to
+ * `AGENT_HISTORY_PAGE_MAX` and defaults an absent one here, so a caller cannot
+ * make a single request read more than the bounded index is sized for.
+ */
+export const AGENT_HISTORY_PAGE_DEFAULT = 20;
+
+/**
+ * The largest `limit` the history route will honour.
+ *
+ * Everything above it is clamped rather than refused: a caller asking for 10 000
+ * conversations gets the bounded page, and a clamped answer is the honest one —
+ * the alternative, refusing, would teach a client a number it does not need to
+ * know and turn a large page into an error the UI has to special-case.
+ */
+export const AGENT_HISTORY_PAGE_MAX = 100;

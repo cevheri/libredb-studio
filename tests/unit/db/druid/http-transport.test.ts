@@ -17,6 +17,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { DruidHttpTransport } from "@/lib/db/providers/sql/druid/http-transport";
 import { DRUID_TRANSPORT_FAILURE, DruidTransportError } from "@/lib/db/providers/sql/druid/transport";
+import { ConnectionError, DatabaseConfigError } from "@/lib/db/errors";
 import type { DatabaseConnection, DatabaseType } from "@/lib/db/types";
 
 // ============================================================================
@@ -297,6 +298,43 @@ describe("DruidHttpTransport endpoint", () => {
 
     expect(lastCall().url).toBe("http://[::1]:8888/druid/v2/sql");
   });
+
+  // A host is spliced into nothing: one that would rewrite the URL around it is
+  // refused before the transport exists, so no request can carry the credential.
+  test.each(["evil.example/steal?", "user@evil.example", "db#x", "db\\evil", "db%2f", "db evil"])(
+    "refuses the host %p before any request is sent",
+    (host) => {
+      expect(() => makeTransport({ host })).toThrow(DatabaseConfigError);
+      expect(calls).toHaveLength(0);
+    },
+  );
+
+  test.each([0, 65536, 1.5, "8888abc"])("refuses the port %p before any request is sent", (port) => {
+    expect(() => makeTransport({ port: port as number })).toThrow(DatabaseConfigError);
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("DruidHttpTransport redirects", () => {
+  test("asks fetch not to follow a redirect", async () => {
+    await makeTransport().query("SELECT 1");
+
+    expect(lastCall().init?.redirect).toBe("manual");
+  });
+
+  test("refuses a 3xx response with a ConnectionError naming only the target origin", async () => {
+    handler = () => respond("", { status: 307, headers: { location: "https://evil.example:9443/steal?token=SECRET" } });
+
+    const error = await makeTransport()
+      .query("SELECT 1")
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ConnectionError);
+    expect((error as Error).message).toContain("HTTP 307");
+    expect((error as Error).message).toContain("https://evil.example:9443");
+    expect((error as Error).message).not.toContain("SECRET");
+    expect(calls).toHaveLength(1);
+  });
 });
 
 // ============================================================================
@@ -381,6 +419,18 @@ describe("DruidHttpTransport results", () => {
     expect(result.rows).toEqual([{ c: 1, "c (2)": 2, "c (3)": 3 }]);
   });
 
+  // A name the statement declares AFTER the repeat is the user's own column too, so
+  // the number skips it rather than showing that column under a generated name.
+  test("never numbers a repeat into a name the result declares later", async () => {
+    handler = () => respond('[["c","c","c (2)"],["LONG","LONG","LONG"],["INTEGER","BIGINT","INTEGER"],[1,2,3]]');
+
+    const result = await makeTransport().query('SELECT 1 AS c, 2 AS c, 3 AS "c (2)"');
+
+    expect(result.fieldNames).toEqual(["c", "c (3)", "c (2)"]);
+    expect(result.rows).toEqual([{ c: 1, "c (3)": 2, "c (2)": 3 }]);
+    expect(result.sqlTypes).toEqual({ c: "INTEGER", "c (3)": "BIGINT", "c (2)": "INTEGER" });
+  });
+
   // Live-verified: `SELECT id FROM libredb_demo WHERE id = -1` answers
   // `[["id"],["LONG"],["BIGINT"]]` - all three header rows, no data.
   test("describes the columns of a result set with no rows", async () => {
@@ -418,20 +468,18 @@ describe("DruidHttpTransport results", () => {
     await expect(makeTransport().query("SELECT id FROM libredb_demo")).rejects.toThrow(/incomplete/i);
   });
 
-  test("fills a short data row with nulls rather than dropping the row", async () => {
-    handler = () => respond('[["a","b"],["LONG","LONG"],["BIGINT","BIGINT"],[1]]');
+  // A row whose value count differs from its header cannot be read by position:
+  // padding a short one invents nulls and cutting a long one drops values, both
+  // silently. A truncated body or a proxy rewrite is the only way to get one, so
+  // it fails like the short header above.
+  test.each<[string, string]>([
+    ["a short data row", '[["a","b"],["LONG","LONG"],["BIGINT","BIGINT"],[1]]'],
+    ["a long data row", '[["a","b"],["LONG","LONG"],["BIGINT","BIGINT"],[1,2,3]]'],
+    ["a row that is not an array", '[["a"],["LONG"],["BIGINT"],7]'],
+  ])("raises on %s rather than inventing or dropping values", async (_label, body) => {
+    handler = () => respond(body);
 
-    const result = await makeTransport().query("SELECT a, b FROM t");
-
-    expect(result.rows).toEqual([{ a: 1, b: null }]);
-  });
-
-  test("reads a row that is not an array as one with no values", async () => {
-    handler = () => respond('[["a"],["LONG"],["BIGINT"],7]');
-
-    const result = await makeTransport().query("SELECT a FROM t");
-
-    expect(result.rows).toEqual([{ a: null }]);
+    await expect(makeTransport().query("SELECT a, b FROM t")).rejects.toThrow(/row with \d+ values? for \d+ columns?/);
   });
 
   // Never fabricate a type: a types row something rewrote describes fewer columns
@@ -813,6 +861,20 @@ describe("DruidHttpTransport transport failures", () => {
     expect(error.message).toBe("Druid request failed: fetch failed");
     expect(error.category).toBe(DRUID_TRANSPORT_FAILURE);
     expect(error.errorCode).toBe(DRUID_TRANSPORT_FAILURE);
+  });
+
+  // #1431: the reason Node keeps in `cause` reaches the message.
+  test("a refused connection names the refusal and the address", async () => {
+    handler = () => {
+      throw new TypeError("fetch failed", {
+        cause: { code: "ECONNREFUSED", address: "127.0.0.1", port: 8888 },
+      });
+    };
+
+    const error = await captureError(() => makeTransport().query("SELECT 1"));
+
+    expect(error.message).toBe("Druid request failed: connection refused at 127.0.0.1:8888");
+    expect(error.category).toBe(DRUID_TRANSPORT_FAILURE);
   });
 
   test("normalizes an aborted request", async () => {

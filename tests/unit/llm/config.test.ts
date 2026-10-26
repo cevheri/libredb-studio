@@ -5,10 +5,18 @@ import {
   requiresApiKey,
   requiresApiUrl,
   getSafeConfigForLogging,
+  validModelEffort,
   DEFAULT_MODELS,
   DEFAULT_API_URLS,
 } from "@/lib/llm/utils/config";
-import { LLMConfigError } from "@/lib/llm/types";
+import type { OpenAILanguageModelChatOptions } from "@ai-sdk/openai";
+import {
+  LLM_MODEL_EFFORTS,
+  LLMConfigError,
+  type LLMConfig,
+  type LLMModelEffort,
+  type LLMProviderType,
+} from "@/lib/llm/types";
 
 // ============================================================================
 // Environment Variable Helpers
@@ -16,7 +24,7 @@ import { LLMConfigError } from "@/lib/llm/types";
 
 let savedEnv: Record<string, string | undefined>;
 
-const LLM_ENV_KEYS = ["LLM_PROVIDER", "LLM_API_KEY", "LLM_MODEL", "LLM_API_URL"];
+const LLM_ENV_KEYS = ["LLM_PROVIDER", "LLM_API_KEY", "LLM_MODEL", "LLM_API_URL", "LLM_MODEL_EFFORT"];
 
 beforeEach(() => {
   savedEnv = {};
@@ -129,6 +137,22 @@ describe("resolveConfig", () => {
 // ============================================================================
 
 describe("validateConfig", () => {
+  test("accepts every provider in DEFAULT_MODELS and rejects an unknown provider", () => {
+    for (const provider of Object.keys(DEFAULT_MODELS) as LLMProviderType[]) {
+      expect(() =>
+        validateConfig({
+          provider,
+          model: DEFAULT_MODELS[provider],
+          apiKey: "test-key",
+          apiUrl: "https://example.test/v1",
+        }),
+      ).not.toThrow();
+    }
+    expect(() => validateConfig({ provider: "unknown-provider" as LLMProviderType, model: "test-model" })).toThrow(
+      LLMConfigError,
+    );
+  });
+
   test("valid gemini config with key passes", () => {
     expect(() =>
       validateConfig({
@@ -283,5 +307,157 @@ describe("getSafeConfigForLogging", () => {
     });
 
     expect(safe.apiKey).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// Absent credentials vs an unfinished setup
+// ============================================================================
+
+/** Runs validateConfig and hands back the LLMConfigError it raised. */
+function configErrorFrom(config: LLMConfig): LLMConfigError {
+  try {
+    validateConfig(config);
+  } catch (error) {
+    if (error instanceof LLMConfigError) {
+      return error;
+    }
+    throw error;
+  }
+  throw new Error("validateConfig accepted a config it should have rejected");
+}
+
+describe("naming a provider is a statement of intent", () => {
+  test("no LLM_PROVIDER leaves the provider implicit", () => {
+    expect(resolveConfig().providerExplicit).toBe(false);
+  });
+
+  test("LLM_PROVIDER marks the provider explicit", () => {
+    process.env.LLM_PROVIDER = "gemini";
+    expect(resolveConfig().providerExplicit).toBe(true);
+  });
+
+  test("a blank LLM_PROVIDER is not a choice", () => {
+    process.env.LLM_PROVIDER = "   ";
+    expect(resolveConfig().providerExplicit).toBe(false);
+  });
+
+  test("a provider override is explicit even with no env var", () => {
+    expect(resolveConfig({ provider: "openai" }).providerExplicit).toBe(true);
+  });
+
+  test("a misspelled LLM_PROVIDER still counts as intent, though the provider falls back", () => {
+    process.env.LLM_PROVIDER = "gemni";
+    const originalError = console.error;
+    console.error = () => {};
+    const config = resolveConfig();
+    console.error = originalError;
+
+    expect(config.provider).toBe("gemini");
+    expect(config.providerExplicit).toBe(true);
+  });
+});
+
+describe("validateConfig separates absent credentials from an unfinished setup", () => {
+  test("gemini without a key is unconfigured when no provider was named", () => {
+    const error = configErrorFrom({ provider: "gemini", model: DEFAULT_MODELS.gemini });
+    expect(error.reason).toBe("missing_credentials");
+  });
+
+  test("gemini without a key is an unfinished setup once the provider is named", () => {
+    const error = configErrorFrom({ provider: "gemini", model: DEFAULT_MODELS.gemini, providerExplicit: true });
+    expect(error.reason).toBeUndefined();
+  });
+
+  test("openai without a key is unconfigured when no provider was named", () => {
+    const error = configErrorFrom({ provider: "openai", model: DEFAULT_MODELS.openai });
+    expect(error.reason).toBe("missing_credentials");
+  });
+
+  test("openai without a key is an unfinished setup once the provider is named", () => {
+    const error = configErrorFrom({ provider: "openai", model: DEFAULT_MODELS.openai, providerExplicit: true });
+    expect(error.reason).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// LLM_MODEL_EFFORT
+// ============================================================================
+
+/*
+  The allowed set is the one the installed `@ai-sdk/openai` declares for `reasoningEffort`, and
+  this pins it at compile time: an SDK upgrade that adds or drops a value stops `bun run
+  typecheck` until the list in `src/lib/llm/types.ts` follows it.
+*/
+type SdkEffort = NonNullable<OpenAILanguageModelChatOptions["reasoningEffort"]>;
+const everySdkEffortIsAllowed: [SdkEffort] extends [LLMModelEffort] ? true : false = true;
+const everyAllowedEffortIsTheSdks: [LLMModelEffort] extends [SdkEffort] ? true : false = true;
+
+describe("LLM_MODEL_EFFORT", () => {
+  test("the allowed set is the SDK's own, compile-time pinned above", () => {
+    expect(everySdkEffortIsAllowed && everyAllowedEffortIsTheSdks).toBe(true);
+    expect([...LLM_MODEL_EFFORTS].sort()).toEqual(["high", "low", "max", "medium", "minimal", "none", "xhigh"]);
+  });
+
+  test("unset leaves the effort undefined, so nothing is sent", () => {
+    process.env.LLM_PROVIDER = "openai";
+    expect(resolveConfig().modelEffort).toBeUndefined();
+    expect("modelEffort" in resolveConfig()).toBe(false);
+  });
+
+  test("an empty or blank value is the same as unset", () => {
+    process.env.LLM_PROVIDER = "openai";
+    process.env.LLM_MODEL_EFFORT = "   ";
+    expect(resolveConfig().modelEffort).toBeUndefined();
+  });
+
+  test("the value is trimmed and lower-cased", () => {
+    process.env.LLM_PROVIDER = "openai";
+    process.env.LLM_MODEL_EFFORT = "  High ";
+    expect(resolveConfig().modelEffort).toBe("high");
+  });
+
+  test("an override wins over the environment", () => {
+    process.env.LLM_MODEL_EFFORT = "high";
+    expect(resolveConfig({ provider: "openai", modelEffort: "low" }).modelEffort).toBe("low");
+  });
+
+  test.each([...LLM_MODEL_EFFORTS])("%s is accepted for openai", (effort) => {
+    const config: LLMConfig = { provider: "openai", apiKey: "sk", model: "gpt-6-luna", modelEffort: effort };
+    expect(() => validateConfig(config)).not.toThrow();
+    expect(validModelEffort(config)).toBe(effort);
+  });
+
+  test("an unknown value is refused with the allowed set named", () => {
+    const error = configErrorFrom({ provider: "openai", apiKey: "sk", model: "gpt-6-luna", modelEffort: "turbo" });
+    expect(error.message).toBe(
+      'Unknown LLM_MODEL_EFFORT "turbo". Allowed values: none, minimal, low, medium, high, xhigh, max.',
+    );
+    expect(error.provider).toBe("openai");
+  });
+
+  test.each(["gemini", "ollama", "custom"] as const)("is refused for %s, which never sends it", (provider) => {
+    const error = configErrorFrom({
+      provider,
+      apiKey: "k",
+      apiUrl: "https://llm.internal/v1",
+      model: "m",
+      modelEffort: "low",
+    });
+    expect(error.message).toBe(
+      `LLM_MODEL_EFFORT applies to LLM_PROVIDER=openai only; unset it for the ${provider} provider.`,
+    );
+    expect(error.provider).toBe(provider);
+  });
+
+  test("unset passes validation for every provider exactly as before", () => {
+    for (const provider of Object.keys(DEFAULT_MODELS) as LLMProviderType[]) {
+      expect(validModelEffort({ provider, model: "m" })).toBeUndefined();
+    }
+  });
+
+  test("the effort is part of the logged configuration", () => {
+    const safe = getSafeConfigForLogging({ provider: "openai", apiKey: "sk", model: "gpt-6-luna", modelEffort: "low" });
+    expect(safe.modelEffort).toBe("low");
   });
 });

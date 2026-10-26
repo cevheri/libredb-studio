@@ -39,8 +39,42 @@ Configuration:
 {{- if .Values.postgresql.enabled }}
   PostgreSQL:       Built-in (subchart)
 {{- end }}
+
+{{- if include "libredb-studio.governanceEnabled" . }}
+
+Governance (docs/GOVERNANCE.md):
+  Source schema:    {{ get .Values.governance "postgresSchema" | default "bridge" }}
+  Instance id:      {{ if include "libredb-studio.governanceMultiReplica" . }}each pod's own name{{ else }}{{ get .Values.governance "instanceId" | default (include "libredb-studio.fullname" .) }}{{ end }}
+  Keyring:          {{ include "libredb-studio.governanceKeyringDir" . }}/keyring.json (read-only, from Secret {{ include "libredb-studio.secretName" . }})
+  Readiness:        GET /api/ready answers 503 until the first governance snapshot loads.
+{{- if .Values.secrets.existingSecret }}
+  Secret {{ .Values.secrets.existingSecret }} must hold the keys {{ include "libredb-studio.governanceSecretKey" (dict "root" . "name" "governancePostgresUrl") }} and {{ include "libredb-studio.governanceSecretKey" (dict "root" . "name" "governancePrivateKeys") }}.
+{{- end }}
+{{- end }}
 {{- if include "libredb-studio.autoscalingEnabled" . }}
   Autoscaling:      {{ .Values.autoscaling.minReplicas }}-{{ .Values.autoscaling.maxReplicas }} replicas
+{{- end }}
+
+{{- $storage := include "libredb-studio.storageProvider" . }}
+{{- if and .Values.config.passkeyOrigin (eq $storage "local") }}
+
+WARNING: config.passkeyOrigin is set, but passkeys stay off until
+config.storageProvider is sqlite or postgres: with the browser-local store
+there is no account registry to keep them in. See docs/PASSKEYS.md.
+{{- end }}
+{{- if and .Values.config.passkeyOrigin (ne .Values.authProvider "local") }}
+
+WARNING: config.passkeyOrigin has no effect with authProvider={{ .Values.authProvider }}:
+OIDC sign-ins manage their passkeys at the identity provider.
+{{- end }}
+{{- /* Only a TLS ingress can suggest an origin: browsers refuse passkeys over plain
+       http anywhere but localhost, so a plain-http ingress has none that works. Nor can
+       an ingress whose first host is empty or missing: there is no name to build it from. */}}
+{{- $passkeyHost := "" }}
+{{- with .Values.ingress.hosts }}{{ $passkeyHost = (first .).host | default "" }}{{ end }}
+{{- if and (not .Values.config.passkeyOrigin) .Values.ingress.enabled .Values.ingress.tls $passkeyHost (ne $storage "local") (eq .Values.authProvider "local") }}
+
+Passkey sign-in (docs/PASSKEYS.md): --set config.passkeyOrigin=https://{{ $passkeyHost }}
 {{- end }}
 
 Health check:

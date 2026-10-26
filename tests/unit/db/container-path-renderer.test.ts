@@ -1,0 +1,201 @@
+import { describe, test, expect } from "bun:test";
+import * as fs from "fs";
+import * as path from "path";
+import ts from "typescript";
+
+/**
+ * The container-path sentence has one producer under `src/lib/db/providers`.
+ *
+ * #1023 hoisted the object-path checks so `assertObjectPathShape` was the only thing left
+ * rendering a `path is [...]` sentence. The container family was the same defect one layer
+ * over and was not hoisted with it: fifteen provider files rendered their own
+ * `container path is [...]`, eleven deriving the level list locally first and four carrying
+ * a private `shapeList()`, two of which had already drifted (SQL Server's had lost the
+ * guard for a declaration naming no level, so an empty one printed
+ * `A SQL Server container path is , received [...]`).
+ *
+ * This file is the mechanical half of #1065's acceptance criterion, the way
+ * `object-surface-conformance.test.ts` is for the object family. It reads the provider tree
+ * rather than exercising a provider, because the claim is about where the sentence is
+ * BUILT: a behavioural test can only show that one engine's message is right, and the
+ * defect was that fifteen engines each built their own.
+ */
+
+// Anchored to this file rather than to `process.cwd()`, because a runner that launched this
+// file from anywhere but the repository root would otherwise read nothing and pass.
+const ROOT = path.resolve(import.meta.dir, "../../..");
+const PROVIDERS = path.join(ROOT, "src/lib/db/providers");
+
+/** `path.relative` spells the separator by HOST; the pinned list below is POSIX-spelled. */
+const repoRelative = (file: string): string => path.relative(ROOT, file).split(path.sep).join("/");
+
+function sourceFiles(dir: string): string[] {
+  const found: string[] = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) found.push(...sourceFiles(full));
+    else if (entry.name.endsWith(".ts")) found.push(full);
+  }
+  return found;
+}
+
+const PHRASE = "container path is";
+
+/**
+ * Whether any string in `source` can carry the phrase, decided without parsing it.
+ *
+ * Parsing every provider file was most of this guard's cost, and on a loaded runner (bun's
+ * coverage run with `--jobs=20`, or the file alone under a 15% CPU quota) it took 7.9s
+ * against bun's 5s default. Most files cannot carry the phrase, and that is provable from
+ * the raw text. Each unit of a literal's text comes from one unit of its source: the
+ * character itself, or an escape sequence (`\x63`, `\u0063`, `\u{63}`, a legacy octal
+ * `\143`, or `\c` for a letter with no escape of its own). A line continuation
+ * (a backslash before a line break) contributes nothing, and a template's CR or CRLF
+ * becomes LF, which the phrase does not hold. So a literal whose text holds the phrase sits
+ * on source text where each of its characters is spelled as itself or as an escape, with
+ * only line continuations between them, which is what `MAY_RENDER` matches. A file it does
+ * not match holds no such literal, and only that file skips the parse. The escaped
+ * spellings are pinned by the tests at the end of this file.
+ */
+const ESCAPE = String.raw`\\(?:u\{[0-9A-Fa-f]+\}|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2}|[0-7]{1,3}|[^\r\n\u2028\u2029])`;
+const LINE_CONTINUATION = String.raw`\\(?:\r\n|[\r\n\u2028\u2029])`;
+// The phrase is letters and spaces, so each character is its own pattern.
+const MAY_RENDER = new RegExp([...PHRASE].map((char) => `(?:${char}|${ESCAPE})`).join(`(?:${LINE_CONTINUATION})*`));
+
+/**
+ * Every line of CODE that RENDERS the sentence, rather than one that talks about it.
+ *
+ * Prose quotes the phrase on purpose (a dozen docblocks explain why a path is refused), and
+ * a blanket grep would fail on the documentation that records the fix. So the file is
+ * parsed rather than scanned, the way the seam guards read a provider: comments are trivia
+ * and never reach the walk, and every string the code carries is a node, whatever its quote
+ * style. A `throw new QueryError("A Trino container path is ...")` written with double
+ * quotes is the same defect as a template, and a line scanner that strips `//` without
+ * knowing about strings reads one that carries a URL before the phrase as clean.
+ */
+function renderingLines(file: string, source: string): string[] {
+  if (!MAY_RENDER.test(source)) return [];
+  const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
+  const lines = source.split("\n");
+  // One entry per line: the two arms of a conditional that both carry the phrase would
+  // otherwise report their line twice, which reads like two throw sites.
+  const found = new Set<number>();
+
+  const visit = (node: ts.Node): void => {
+    if ((ts.isStringLiteral(node) || ts.isTemplateLiteralToken(node)) && node.text.includes(PHRASE)) {
+      found.add(sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line);
+    }
+    ts.forEachChild(node, visit);
+  };
+
+  visit(sourceFile);
+  return [...found].sort((a, b) => a - b).map((line) => `${line + 1}: ${lines[line].trim()}`);
+}
+
+/**
+ * The provider files that reach the renderer, pinned by name.
+ *
+ * A floor (`>= 14`) stood here first, and a floor cannot see the thing it exists to notice:
+ * an engine that stops reaching the renderer takes the count DOWN, and a floor still passes
+ * for the full population minus one. Naming the files makes a departure fail with the file
+ * in the message, and a new file arriving as a deliberate edit here rather than as a silent
+ * count change.
+ */
+const ENGINES = [
+  "src/lib/db/providers/document/couchbase/objects.ts",
+  // One level, the agent's devices, and the check runs in `deviceOf` (#1722).
+  "src/lib/db/providers/industrial/mtconnect/index.ts",
+  "src/lib/db/providers/industrial/modbus/index.ts",
+  "src/lib/db/providers/document/mongodb/index.ts",
+  "src/lib/db/providers/embedded/libredb.ts",
+  "src/lib/db/providers/keyvalue/redis.ts",
+  "src/lib/db/providers/sql/bigquery/index.ts",
+  "src/lib/db/providers/platform/kubernetes/objects.ts",
+  "src/lib/db/providers/sql/cassandra/objects.ts",
+  "src/lib/db/providers/sql/clickhouse/objects.ts",
+  "src/lib/db/providers/sql/databend/index.ts",
+  "src/lib/db/providers/sql/db2/objects.ts",
+  "src/lib/db/providers/sql/druid/objects.ts",
+  "src/lib/db/providers/sql/duckdb/objects.ts",
+  "src/lib/db/providers/sql/libsql/objects.ts",
+  "src/lib/db/providers/sql/snowflake/index.ts",
+  "src/lib/db/providers/sql/spark/index.ts",
+  "src/lib/db/providers/sql/mssql.ts",
+  "src/lib/db/providers/sql/mysql.ts",
+  "src/lib/db/providers/sql/oracle.ts",
+  "src/lib/db/providers/sql/postgres.ts",
+  "src/lib/db/providers/sql/sqlite.ts",
+  "src/lib/db/providers/sql/trino/objects.ts",
+  "src/lib/db/providers/stream/rabbitmq/objects.ts",
+  "src/lib/db/providers/timeseries/influxdb/influxql-provider.ts",
+  "src/lib/db/providers/vector/milvus/index.ts",
+];
+
+describe("the container-path sentence has one producer under providers/", () => {
+  const files = sourceFiles(PROVIDERS);
+
+  test("no provider builds the sentence itself", () => {
+    const offenders: string[] = [];
+    for (const file of files) {
+      const rendered = renderingLines(file, fs.readFileSync(file, "utf8"));
+      if (rendered.length > 0) offenders.push(`${repoRelative(file)}\n    ${rendered.join("\n    ")}`);
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  test("the shared renderer is the producer, and every engine reaches it", () => {
+    const kinds = fs.readFileSync(path.join(ROOT, "src/lib/db/object-kinds.ts"), "utf8");
+    expect(kinds).toContain("export function assertContainerPathShape(");
+
+    // One descriptor per engine that renders the sentence, which is what keeps an engine's
+    // own opening words and its shape spelling travelling through the shared renderer
+    // instead of being re-typed at a call site. The depths it accepts are not the
+    // descriptor's: they come from its declaration's `containerPathShapes`, through
+    // `acceptedContainerShapes()` (#1147). A new provider that hand-rolls its own message
+    // fails the test above; one that reaches the renderer without a descriptor fails here.
+    const callers = files.filter((file) => fs.readFileSync(file, "utf8").includes("assertContainerPathShape("));
+    expect(callers.map(repoRelative).sort()).toEqual([...ENGINES].sort());
+
+    for (const file of callers) {
+      expect(fs.readFileSync(file, "utf8")).toMatch(/\w+_CONTAINER_PATH_ENGINE: ContainerPathShapeEngine = \{/);
+    }
+  });
+
+  test("no provider keeps its own shape-list helper", () => {
+    // The four private `shapeList()` copies are the reason this issue exists; three of them
+    // also served an OBJECT-path message, which the shared renderer does not cover, so the
+    // helper may stay for that use. What must not stay is a helper whose only job is the
+    // container sentence, which is what a `containerShapes()` next to it means.
+    const offenders: string[] = [];
+    for (const file of files) {
+      const source = fs.readFileSync(file, "utf8");
+      if (/function containerShapes\s*\(/.test(source)) offenders.push(repoRelative(file));
+    }
+    expect(offenders).toEqual([]);
+  });
+});
+
+describe("skipping the parse for a file that cannot carry the phrase misses nothing the walk finds", () => {
+  // Past the first, each source spells the phrase so that its raw text does not contain it,
+  // which is exactly the case a filter on the raw phrase alone would wave through unparsed.
+  const SPELLINGS: Array<[string, string]> = [
+    ["a plain double-quoted string", 'throw new Error("A Trino container path is [catalog]");\n'],
+    ["a \\u escape", 'const m = "A \\u0063ontainer path is [db]";\n'],
+    ["a \\u{} escape", 'const m = "A container\\u{20}path is [db]";\n'],
+    ["a \\x escape", "const m = 'A container\\x20path is [db]';\n"],
+    ["a legacy octal escape", 'const m = "A \\143ontainer path is [db]";\n'],
+    ["an escaped ordinary letter", 'const m = "A c\\ontainer path is [db]";\n'],
+    ["a line continuation", 'const m = "A container \\\npath is [db]";\n'],
+    ["an escape inside a template", "const m = `A ${engine} container\\x20path is [${shape}]`;\n"],
+  ];
+
+  for (const [spelling, source] of SPELLINGS) {
+    test(`${spelling} is still reported`, () => {
+      expect(renderingLines("planted.ts", source)).toHaveLength(1);
+    });
+  }
+
+  test("a file that only talks about the phrase in a comment is not", () => {
+    expect(renderingLines("planted.ts", "// a container path is refused below\nconst x = 1;\n")).toEqual([]);
+  });
+});

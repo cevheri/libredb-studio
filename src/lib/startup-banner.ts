@@ -9,23 +9,48 @@
  * credentials banner in auth-bootstrap.ts. Nothing here touches the network -
  * the star invitation is a static line, never a live count.
  *
+ * With PASSKEY_ORIGIN set, one more line names the origin to open for passkeys,
+ * or why they are unavailable: the URL above is often 127.0.0.1, where browsers
+ * never offer passkeys, and the reason never quotes the value.
+ *
  * Set LIBREDB_NO_BANNER=1 (or true) to silence it.
  */
 
 import { getAppVersion } from "@/lib/app-version";
 import { REPO_URL } from "@/lib/community/repo";
+import { passkeyAvailability, passkeyOriginIsSet } from "@/lib/passkey/config";
 
 const DEFAULT_PORT = "3000";
+const DEFAULT_HOST = "127.0.0.1";
 
 function isSuppressed(): boolean {
   const value = (process.env.LIBREDB_NO_BANNER ?? "").trim().toLowerCase();
   return value === "1" || value === "true";
 }
 
-/** The port the server actually listens on; never invent a hostname. */
+/**
+ * The URL the server actually answers on. The bind address comes from
+ * HOSTNAME — the same variable bin/studio.js forwards to the standalone
+ * server — so a non-loopback bind prints a usable URL instead of a
+ * hardcoded localhost that only works on loopback. Wildcards print a
+ * loopback URL (the same convention as bin/lib/launcher-utils.mjs).
+ */
 function resolveUrl(): string {
   const port = (process.env.PORT ?? "").trim();
-  return `http://localhost:${port || DEFAULT_PORT}`;
+  let host = (process.env.HOSTNAME ?? "").trim();
+  if (!host) host = DEFAULT_HOST;
+  if (host === "0.0.0.0") host = DEFAULT_HOST;
+  else if (host === "::" || host === "[::]") host = "[::1]";
+  else if (host.includes(":") && !host.startsWith("[")) host = `[${host}]`;
+  return `http://${host}:${port || DEFAULT_PORT}`;
+}
+
+/** The passkey line, or none when the operator has not asked for passkeys. */
+function passkeyLines(): string[] {
+  if (!passkeyOriginIsSet()) return [];
+  const availability = passkeyAvailability();
+  if (availability.state === "ready") return [`Passkeys  ->  ${availability.origin}`];
+  return [`Passkeys are unavailable: ${availability.reason}`];
 }
 
 /**
@@ -40,7 +65,15 @@ export function printStartupBanner(): void {
     const title = version ? `LibreDB Studio ${version}` : "LibreDB Studio";
 
     console.log(
-      ["", `${title}  ->  ${resolveUrl()}`, "", "  Star the project if it helps you:", `  ${REPO_URL}`, ""].join("\n"),
+      [
+        "",
+        `${title}  ->  ${resolveUrl()}`,
+        ...passkeyLines(),
+        "",
+        "  Star the project if it helps you:",
+        `  ${REPO_URL}`,
+        "",
+      ].join("\n"),
     );
   } catch {
     // A banner is never worth a failed boot - stay silent and carry on.

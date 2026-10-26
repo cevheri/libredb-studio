@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { parseSqliteTableDdl } from "@/lib/agent/sqlite-ddl";
+import { parseSqliteTableDdl } from "@/lib/agent/languages/sql/engines/sqlite-ddl";
 import {
   DIGIT_RUN_LENGTH,
   HIGH_NULL_RATIO,
@@ -10,7 +10,8 @@ import {
   readTableProfile,
 } from "@/lib/agent/table-profile";
 import { inspectAgentStatement } from "@/lib/db/operations/statement-guard";
-import type { ColumnSchema, TableSchema } from "@/lib/types";
+import type { ColumnSchema } from "@/lib/types";
+import type { AgentInventoryObject } from "@/lib/agent/types";
 
 /**
  * Bounded per-table profiling (#330 T3).
@@ -27,18 +28,18 @@ const column = (name: string, type = "text"): ColumnSchema => ({ name, type, nul
 const COLUMNS: ColumnSchema[] = [column("id", "integer"), column("email", "character varying"), column("status")];
 
 describe("the composed statement", () => {
-  test.each(["postgres", "sqlite"] as const)(
+  test.each(["postgres", "sqlite", "mssql"] as const)(
     "%s: passes the same statement guard a model-drafted read does",
     (dialect) => {
       for (const depth of ["basic", "distribution", "pattern"] as const) {
-        const sql = composeTableProfile(dialect, { table: "employee", depth }, COLUMNS);
+        const sql = composeTableProfile(dialect, { segments: ["employee"], depth }, COLUMNS);
         expect(inspectAgentStatement(sql), `${dialect}/${depth}`).toBeNull();
       }
     },
   );
 
   test("every projected expression is a count, so no value can come back", () => {
-    const sql = composeTableProfile("postgres", { table: "employee", depth: "pattern" }, COLUMNS);
+    const sql = composeTableProfile("postgres", { segments: ["employee"], depth: "pattern" }, COLUMNS);
     const projection = sql.slice("SELECT ".length, sql.indexOf(" FROM "));
 
     for (const part of projection.split(", ")) expect(part.startsWith("count("), part).toBe(true);
@@ -48,9 +49,9 @@ describe("the composed statement", () => {
   });
 
   test("deepening adds aggregates rather than replacing them", () => {
-    const basic = composeTableProfile("postgres", { table: "t", depth: "basic" }, COLUMNS);
-    const distribution = composeTableProfile("postgres", { table: "t", depth: "distribution" }, COLUMNS);
-    const pattern = composeTableProfile("postgres", { table: "t", depth: "pattern" }, COLUMNS);
+    const basic = composeTableProfile("postgres", { segments: ["t"], depth: "basic" }, COLUMNS);
+    const distribution = composeTableProfile("postgres", { segments: ["t"], depth: "distribution" }, COLUMNS);
+    const pattern = composeTableProfile("postgres", { segments: ["t"], depth: "pattern" }, COLUMNS);
 
     expect(basic).not.toContain("DISTINCT");
     expect(distribution).toContain("count(DISTINCT");
@@ -62,7 +63,7 @@ describe("the composed statement", () => {
     // Comparing an integer column to a string pattern is an error on PostgreSQL,
     // and casting every column to text would turn a bounded read into a full
     // conversion of the table.
-    const sql = composeTableProfile("postgres", { table: "t", depth: "pattern" }, COLUMNS);
+    const sql = composeTableProfile("postgres", { segments: ["t"], depth: "pattern" }, COLUMNS);
 
     expect(sql).toContain('count(CASE WHEN "email" LIKE');
     expect(sql).not.toContain('count(CASE WHEN "id" LIKE');
@@ -75,8 +76,8 @@ describe("the composed statement", () => {
   // both spellings were run against a live engine; see the live-execution test
   // below and the module comment for the PostgreSQL 18 measurement.
   test("the digit-run test is the dialect's own operator, not a shared LIKE", () => {
-    const postgres = composeTableProfile("postgres", { table: "t", depth: "pattern" }, COLUMNS);
-    const sqlite = composeTableProfile("sqlite", { table: "t", depth: "pattern" }, COLUMNS);
+    const postgres = composeTableProfile("postgres", { segments: ["t"], depth: "pattern" }, COLUMNS);
+    const sqlite = composeTableProfile("sqlite", { segments: ["t"], depth: "pattern" }, COLUMNS);
 
     expect(postgres).toContain(`"email" ~ '[0-9]{${DIGIT_RUN_LENGTH},}'`);
     expect(postgres).not.toContain("GLOB");
@@ -84,9 +85,9 @@ describe("the composed statement", () => {
     expect(sqlite).not.toContain(" ~ ");
   });
 
-  test("both shape tests still project a count and nothing else on either dialect", () => {
-    for (const dialect of ["postgres", "sqlite"] as const) {
-      const sql = composeTableProfile(dialect, { table: "t", depth: "pattern" }, COLUMNS);
+  test("both shape tests still project a count and nothing else on every dialect", () => {
+    for (const dialect of ["postgres", "sqlite", "mssql"] as const) {
+      const sql = composeTableProfile(dialect, { segments: ["t"], depth: "pattern" }, COLUMNS);
       const projection = sql.slice("SELECT ".length, sql.indexOf(" FROM "));
 
       for (const part of projection.split(", ")) expect(part.startsWith("count("), `${dialect}: ${part}`).toBe(true);
@@ -95,7 +96,7 @@ describe("the composed statement", () => {
   });
 
   test("an identifier carrying the closing quote is escaped, not interpolated", () => {
-    const sql = composeTableProfile("postgres", { table: 'we"ird', depth: "basic" }, [column('c"1')]);
+    const sql = composeTableProfile("postgres", { segments: ['we"ird'], depth: "basic" }, [column('c"1')]);
 
     expect(sql).toContain('"we""ird"');
     expect(sql).toContain('"c""1"');
@@ -103,16 +104,40 @@ describe("the composed statement", () => {
   });
 
   test("a schema is qualified when given and omitted when not", () => {
-    expect(composeTableProfile("postgres", { schema: "public", table: "t", depth: "basic" }, COLUMNS)).toContain(
+    expect(composeTableProfile("postgres", { segments: ["public", "t"], depth: "basic" }, COLUMNS)).toContain(
       'FROM "public"."t"',
     );
-    expect(composeTableProfile("sqlite", { table: "t", depth: "basic" }, COLUMNS)).toContain('FROM "t"');
+    expect(composeTableProfile("sqlite", { segments: ["t"], depth: "basic" }, COLUMNS)).toContain('FROM "t"');
+  });
+
+  /**
+   * The target is EVERY segment of the resolved address, each quoted on its own (#789).
+   *
+   * It was a schema and a table, and that pair is enough for the two dialects composed here
+   * and for nothing else. The address a resolution now produces is as deep as the object
+   * read made it, and joining the leading segments into one string before quoting them
+   * composes `"shop.sales"."orders"`: a single identifier no engine holds, built out of two
+   * that it does. A refusal would be safe; a fabricated identifier is not, so the shape that
+   * can only ever be right is one quoted segment per segment.
+   */
+  test("every leading segment is quoted on its own, never joined into one identifier", () => {
+    const sql = composeTableProfile("postgres", { segments: ["shop", "sales", "orders"], depth: "basic" }, COLUMNS);
+    expect(sql).toContain('FROM "shop"."sales"."orders"');
+    expect(sql).not.toContain('"shop.sales"');
+  });
+
+  test("an address with no segments at all is refused rather than composed", () => {
+    expect(() => composeTableProfile("postgres", { segments: [], depth: "basic" }, COLUMNS)).toThrow(/usable length/);
   });
 
   test("an unverified dialect and an empty column list are refused rather than composed", () => {
-    expect(() => composeTableProfile("mysql", { table: "t", depth: "basic" }, COLUMNS)).toThrow(/no verified profile/);
-    expect(() => composeTableProfile("postgres", { table: "t", depth: "basic" }, [])).toThrow(/no columns/);
-    expect(() => composeTableProfile("postgres", { table: "  ", depth: "basic" }, COLUMNS)).toThrow(/usable length/);
+    expect(() => composeTableProfile("oracle", { segments: ["t"], depth: "basic" }, COLUMNS)).toThrow(
+      /no verified profile/,
+    );
+    expect(() => composeTableProfile("postgres", { segments: ["t"], depth: "basic" }, [])).toThrow(/no columns/);
+    expect(() => composeTableProfile("postgres", { segments: ["  "], depth: "basic" }, COLUMNS)).toThrow(
+      /usable length/,
+    );
   });
 });
 
@@ -156,6 +181,14 @@ describe("the findings, derived from the numbers", () => {
 
     expect(codes(profile)).toContain("high_null");
     expect(profile?.findings[0]?.detail).toMatch(/% of \d+ rows have no value/);
+  });
+
+  test("a column with one value in a thousand rows is never called 100% empty", () => {
+    // A live assessment on 2026-10-17 was told "100% of 1000 rows have no value here" while the profile counted one.
+    const almost = readTableProfile("t", "basic", [column("note")], [{ row_count: 1000, present_0: 1 }]);
+    expect(almost?.findings[0]?.detail).toBe("over 99% of 1000 rows have no value here.");
+    const empty = readTableProfile("t", "basic", [column("note")], [{ row_count: 1000, present_0: 0 }]);
+    expect(empty?.findings[0]?.detail).toBe("100% of 1000 rows have no value here.");
   });
 
   test("a sparse column in a tiny table is not reported, because the ratio would say more about the sample", () => {
@@ -270,7 +303,7 @@ describe("the findings, derived from the numbers", () => {
 });
 
 describe("foreign keys with no covering index", () => {
-  const table = (overrides: Partial<TableSchema>): TableSchema => ({
+  const table = (overrides: Partial<AgentInventoryObject>): AgentInventoryObject => ({
     name: "orders",
     columns: [column("id", "integer"), column("customer_id", "integer")],
     indexes: [],
@@ -357,7 +390,7 @@ describe("types with no equality operator", () => {
   // so a single json column would have failed distribution and pattern profiling for
   // every other column in the table.
   test.each(["json", "jsonb", "xml", "point", "polygon"])("%s gets no distinct count", (type) => {
-    const sql = composeTableProfile("postgres", { table: "t", depth: "distribution" }, [
+    const sql = composeTableProfile("postgres", { segments: ["t"], depth: "distribution" }, [
       column("payload", type),
       column("name", "text"),
     ]);
@@ -381,7 +414,9 @@ describe("types with no equality operator", () => {
   });
 
   test("presence is still counted for a type nothing can compare", () => {
-    const sql = composeTableProfile("postgres", { table: "t", depth: "distribution" }, [column("payload", "json")]);
+    const sql = composeTableProfile("postgres", { segments: ["t"], depth: "distribution" }, [
+      column("payload", "json"),
+    ]);
 
     expect(sql).toContain('count("payload")');
   });
@@ -399,7 +434,7 @@ describe("a foreign key covered by a constraint-created index (#502)", () => {
    * `CREATE TABLE` — and the control table proves the finding still fires when
    * there really is no index.
    */
-  const inventory = (statements: readonly string[], name: string): TableSchema => {
+  const inventory = (statements: readonly string[], name: string): AgentInventoryObject => {
     const database = new Database(":memory:");
     try {
       for (const statement of statements) database.run(statement);
@@ -428,7 +463,9 @@ describe("a foreign key covered by a constraint-created index (#502)", () => {
     const table = inventory(SCHEMA, "covered");
 
     expect(findUnindexedForeignKeys(table)).toEqual([]);
-    expect(table.indexes.map((index) => index.name)).toEqual(["(unique constraint)"]);
+    expect(Array.isArray(table.indexes) ? table.indexes.map((index) => index.name) : []).toEqual([
+      "(unique constraint)",
+    ]);
   });
 
   test("a composite UNIQUE covers the key it LEADS on, and not one it merely mentions", () => {
@@ -462,7 +499,7 @@ describe("the shape tests against a live engine", () => {
       database.run('CREATE TABLE "people" (id INTEGER, contact TEXT, note TEXT)');
       for (const row of rows) database.run('INSERT INTO "people" VALUES (?, ?, ?)', row as never);
 
-      const sql = composeTableProfile("sqlite", { table: "people", depth: "pattern" }, COLUMNS_LIVE);
+      const sql = composeTableProfile("sqlite", { segments: ["people"], depth: "pattern" }, COLUMNS_LIVE);
       const aggregate = database.query(sql).get() as Record<string, unknown>;
       return readTableProfile("people", "pattern", COLUMNS_LIVE, [aggregate]);
     } finally {
@@ -511,5 +548,207 @@ describe("the shape tests against a live engine", () => {
     expect(profile?.findings.filter((finding) => finding.code === "suspected_pii")[0]?.detail).toContain(
       "an email address",
     );
+  });
+});
+
+/**
+ * The SQL Server arm, pinned rather than covered incidentally.
+ *
+ * Every test above this block runs `postgres` or `sqlite`, so the mssql predicates,
+ * the per-dialect incomparable map and the bracket quoting were only ever executed as
+ * a by-product of the 100% line gate: every line ran, and nothing asserted what any of
+ * them produced. The cases here assert the composed text literally, and each exclusion
+ * carries the engine's own refusal as its reason. All of them were measured on
+ * SQL Server 2022 CU26 against AdventureWorks2022 before they were written down.
+ */
+describe("the SQL Server arm of the composition", () => {
+  test("the digit run is spelled as nine repeated T-SQL character classes, not a regex", () => {
+    // T-SQL has no regular expressions and no GLOB, and its LIKE has no quantifier,
+    // so the run is nine `[0-9]`s between two `%`s. Asserted literally, because a
+    // count of classes could pass while the spelling was wrong.
+    const sql = composeTableProfile("mssql", { segments: ["t"], depth: "pattern" }, COLUMNS);
+
+    expect(sql).toContain("[email] LIKE '%[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]%'");
+    expect(sql).not.toContain("GLOB");
+    expect(sql).not.toContain(" ~ ");
+  });
+
+  test("the email shape is the same LIKE all three dialects spell alike", () => {
+    const sql = composeTableProfile("mssql", { segments: ["t"], depth: "pattern" }, COLUMNS);
+
+    expect(sql).toContain("count(CASE WHEN [email] LIKE '%_@_%._%' THEN 1 END)");
+    // And the integer column beside it gets neither shape test.
+    expect(sql).not.toContain("[id] LIKE");
+  });
+
+  test("every segment of a three-part address is bracket-quoted on its own", () => {
+    const sql = composeTableProfile(
+      "mssql",
+      { segments: ["AdventureWorks2022", "Person", "PersonPhone"], depth: "basic" },
+      COLUMNS,
+    );
+
+    expect(sql).toContain("FROM [AdventureWorks2022].[Person].[PersonPhone]");
+    expect(sql).not.toContain("[AdventureWorks2022.Person]");
+  });
+
+  test("a closing bracket in an identifier is escaped, not interpolated", () => {
+    // Typed `nvarchar` rather than the file's default `text`, which SQL Server will
+    // not count at all and which is therefore left out of the projection.
+    const sql = composeTableProfile("mssql", { segments: ["we]ird"], depth: "basic" }, [column("c]1", "nvarchar")]);
+
+    expect(sql).toContain("[we]]ird]");
+    expect(sql).toContain("[c]]1]");
+    expect(inspectAgentStatement(sql)).toBeNull();
+  });
+
+  // Msg 8117, "Operand data type text is invalid for count operator", for a PLAIN
+  // count on each of the three. One such column in the projection fails the single
+  // aggregate, so it would cost the whole table its profile.
+  test.each(["text", "ntext", "image"])("a %s column is left out of the projection entirely", (type) => {
+    const sql = composeTableProfile("mssql", { segments: ["t"], depth: "pattern" }, [
+      column("body", type),
+      column("name", "nvarchar"),
+    ]);
+
+    expect(sql).not.toContain("[body]");
+    // No presence, no distinct count and no shape test - and the column beside it
+    // keeps all three.
+    expect(sql).toContain("count([name]) AS present_1");
+    expect(sql).toContain("count(DISTINCT [name]) AS distinct_1");
+    expect(sql).toContain("count(CASE WHEN [name] LIKE");
+  });
+
+  test("a table of nothing but uncountable columns still composes its row count", () => {
+    const sql = composeTableProfile("mssql", { segments: ["t"], depth: "pattern" }, [column("body", "text")]);
+
+    expect(sql).toBe("SELECT count(*) AS row_count FROM [t]");
+  });
+
+  test("PostgreSQL still counts its own text columns, which SQL Server refuses", () => {
+    // The reason the uncountable set is per dialect: `text` is PostgreSQL's ordinary
+    // string type and SQL Server's deprecated large-object one.
+    const sql = composeTableProfile("postgres", { segments: ["t"], depth: "distribution" }, [column("body", "text")]);
+
+    expect(sql).toContain('count("body")');
+    expect(sql).toContain('count(DISTINCT "body")');
+  });
+
+  // Msg 8117 again, this time only for count(DISTINCT ...): presence still counts.
+  test.each(["xml", "geography", "geometry"])("%s keeps its presence count and loses only its distinct one", (type) => {
+    const sql = composeTableProfile("mssql", { segments: ["t"], depth: "distribution" }, [column("shape", type)]);
+
+    expect(sql).toContain("count([shape]) AS present_0");
+    expect(sql).not.toContain("count(DISTINCT [shape])");
+  });
+
+  // Measured, not assumed: `count(DISTINCT DocumentNode)` over `Production.Document`
+  // answers 13 for 13 rows, and the same probe counts varbinary(max) and
+  // uniqueidentifier. hierarchyid was listed as incomparable and is not.
+  test.each(["hierarchyid", "varbinary", "uniqueidentifier"])("%s is counted DISTINCT, not excluded", (type) => {
+    const sql = composeTableProfile("mssql", { segments: ["t"], depth: "distribution" }, [column("v", type)]);
+
+    expect(sql).toContain("count(DISTINCT [v]) AS distinct_0");
+  });
+
+  /**
+   * The alias-type limitation, stated as a test so it cannot drift silently.
+   *
+   * SQL Server reports an ALIAS type by its own name, so AdventureWorks2022's
+   * `Person.PersonPhone.PhoneNumber` arrives as `Phone` and `Person.Person.FirstName`
+   * as `Name` while their base types are `nvarchar`. No pattern over a user-chosen
+   * alias name can tell a text alias from a numeric one, so the shape tests can only
+   * be as good as the type spelling the catalog read reports: given the BASE type they
+   * fire, given the alias name they do not. The fix therefore belongs in the catalog
+   * composer, which must report `TYPE_NAME(c.system_type_id)`.
+   */
+  test("a shape test follows the type spelling the catalog reports, so it needs the base type", () => {
+    const aliased = composeTableProfile("mssql", { segments: ["Person", "PersonPhone"], depth: "pattern" }, [
+      column("PhoneNumber", "Phone"),
+    ]);
+    const base = composeTableProfile("mssql", { segments: ["Person", "PersonPhone"], depth: "pattern" }, [
+      column("PhoneNumber", "nvarchar"),
+    ]);
+
+    expect(aliased).not.toContain("LIKE");
+    expect(aliased).toContain("count([PhoneNumber]) AS present_0");
+    expect(base).toContain("count(CASE WHEN [PhoneNumber] LIKE");
+  });
+
+  test("a column the composer left out is absent from the profile, never reported empty", () => {
+    // Reading the missing presence count back as zero would make every `text` column
+    // on SQL Server a high_null finding at 100%: an answer to a question nobody asked.
+    const profile = readTableProfile(
+      "t",
+      "basic",
+      [column("body", "text"), column("name", "nvarchar")],
+      [{ row_count: 100, present_1: 100 }],
+    );
+
+    expect(profile?.columns.map((entry) => entry.column)).toEqual(["name"]);
+    expect(profile?.columns[0]?.present).toBe(100);
+    expect(profile?.findings).toEqual([]);
+  });
+});
+
+/**
+ * The declared type is what a person reads and the BASE type is what a reader decides on,
+ * and on SQL Server they differ for every alias type. Measured on AdventureWorks2022:
+ * `Person.PersonPhone.PhoneNumber` is declared `Phone` over `nvarchar`, and the provider's
+ * own object read reports the declared name, so this is the path `profile_table` actually
+ * takes - the catalog composer's own base-type projection feeds `inspect_schema` and never
+ * reaches here.
+ */
+describe("composeTableProfile - an alias type is decided on by what it is built on", () => {
+  const aliasText = (): ColumnSchema => ({
+    name: "PhoneNumber",
+    type: "Phone",
+    baseType: "nvarchar",
+    nullable: true,
+    isPrimary: false,
+  });
+
+  test("an alias over a text type still gets its shape tests", () => {
+    const sql = composeTableProfile("mssql", { segments: ["Person", "PersonPhone"], depth: "pattern" }, [aliasText()]);
+
+    expect(sql).toContain("LIKE '%_@_%._%'");
+    expect(sql).toContain(`LIKE '%${"[0-9]".repeat(9)}%'`);
+  });
+
+  test("the declared name alone is not enough, which is what the base type is for", () => {
+    const { baseType: _dropped, ...declaredOnly } = aliasText();
+
+    const sql = composeTableProfile("mssql", { segments: ["Person", "PersonPhone"], depth: "pattern" }, [declaredOnly]);
+
+    // `Phone` matches no spelling this module knows, so nothing can fire for it.
+    expect(sql).not.toContain("LIKE '%_@_%._%'");
+  });
+
+  test("an alias over an uncountable type is left out whole, as the base type is", () => {
+    const column: ColumnSchema = { name: "body", type: "Article", baseType: "text", nullable: true, isPrimary: false };
+
+    const sql = composeTableProfile("mssql", { segments: ["dbo", "t"], depth: "basic" }, [column]);
+
+    expect(sql).not.toContain("[body]");
+    expect(sql).toContain("count(*) AS row_count");
+  });
+
+  test("an alias over an incomparable type keeps its presence and loses its distinct count", () => {
+    const column: ColumnSchema = { name: "doc", type: "Payload", baseType: "xml", nullable: true, isPrimary: false };
+
+    const sql = composeTableProfile("mssql", { segments: ["dbo", "t"], depth: "distribution" }, [column]);
+
+    expect(sql).toContain("count([doc]) AS present_0");
+    expect(sql).not.toContain("count(DISTINCT [doc])");
+  });
+
+  test("an engine that draws no such distinction is unchanged, because the field is absent there", () => {
+    const column: ColumnSchema = { name: "note", type: "text", nullable: true, isPrimary: false };
+
+    const sql = composeTableProfile("postgres", { segments: ["public", "t"], depth: "pattern" }, [column]);
+
+    // PostgreSQL's own `text` is its ordinary string type: it is counted, and it is shaped.
+    expect(sql).toContain('count("note") AS present_0');
+    expect(sql).toContain("LIKE '%_@_%._%'");
   });
 });

@@ -42,12 +42,16 @@
  *    a completed answer terminates it explicitly.
  */
 
+import { endpointUrl, type HttpOrigin, httpOrigin, rejectForeignLink, rejectRedirect } from "@/lib/db/http/endpoint";
+import { DatabaseConfigError } from "@/lib/db/errors";
+import { httpTransportFetch } from "@/lib/db/http/egress-policy";
 import type { DatabaseConnection } from "@/lib/db/types";
 // A `bigint` column arrives as an UNQUOTED JSON number and this protocol has no
 // setting that would quote it, so the raw body is rewritten before it is parsed.
 // Shared with the Druid transport, which is in the same position; ClickHouse escapes
 // it server-side instead (`output_format_json_quote_64bit_integers`, #264).
 import { quoteUnsafeIntegers } from "@/lib/db/utils/json-integers";
+import { uniqueFieldNames } from "@/lib/db/utils/result-fields";
 import { resolveSqlGrammar, type SqlGrammar } from "@/lib/sql/grammar";
 import { readStatementEnd } from "@/lib/sql/statement-end";
 import {
@@ -386,11 +390,6 @@ function withoutTerminator(sql: string, grammar: SqlGrammar): string {
   return rewritable && LONE_TERMINATOR.test(sql.slice(end)) ? sql.slice(0, end) : sql;
 }
 
-/** Bracket a bare IPv6 literal, which is otherwise not a legal URL authority. */
-function formatHost(host: string): string {
-  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-}
-
 /** A member the document reported as usable text, or null when it reported none. */
 function textField(source: Record<string, unknown>, field: string): string | null {
   const value = source[field];
@@ -451,28 +450,19 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
  *
  * Measured on 476: `SELECT 1 AS c, 2 AS c` really declares
  * `[{name:"c",...},{name:"c",...}]`, and a row is a record, so the repeat has to
- * be disambiguated while the row is built or the second column disappears BEFORE
- * the seam rather than after it. The suffix keeps climbing because
- * `SELECT 1 AS c, 2 AS "c (2)", 3 AS c` is legal too, and uniqueness is the
- * invariant the seam states.
+ * be numbered while the row is built or the second column disappears BEFORE the
+ * seam rather than after it. A column declared with no name is shown as
+ * `(No column name)`, the shared helper's `UNNAMED_FIELD`.
  */
 function readColumns(page: Record<string, unknown>): { names: string[]; types: Record<string, string> } | null {
   const declared = page[RESULT_FIELDS.COLUMNS];
   if (!Array.isArray(declared)) return null;
 
-  const names: string[] = [];
-  const types: Record<string, string> = {};
-  const taken = new Set<string>();
-
-  for (const entry of declared) {
-    const column = asRecord(entry) ?? {};
-    const declaredName = textField(column, COLUMN_FIELDS.NAME) ?? "";
-    let unique = declaredName;
-    for (let repeat = 2; taken.has(unique); repeat += 1) unique = `${declaredName} (${repeat})`;
-    taken.add(unique);
-    names.push(unique);
-    types[unique] = textField(column, COLUMN_FIELDS.TYPE) ?? "";
-  }
+  const columns = declared.map((entry) => asRecord(entry) ?? {});
+  const names = uniqueFieldNames(columns.map((column) => textField(column, COLUMN_FIELDS.NAME) ?? ""));
+  const types = Object.fromEntries(
+    names.map((name, index) => [name, textField(columns[index], COLUMN_FIELDS.TYPE) ?? ""]),
+  );
 
   return { names, types };
 }
@@ -500,10 +490,23 @@ function readData(dialect: TrinoDialect, page: Record<string, unknown>): unknown
   return data;
 }
 
-/** One positional row, rebuilt as the record the seam promises. */
-function toRow(fieldNames: readonly string[], row: unknown): TrinoRow {
-  const values = Array.isArray(row) ? (row as unknown[]) : [];
-  return Object.fromEntries(fieldNames.map((name, column) => [name, values[column] ?? null]));
+/**
+ * One positional row, rebuilt as the record the seam promises.
+ *
+ * A row whose value count differs from its declaration cannot be read by
+ * position: padding it would invent nulls and cutting it would drop values,
+ * both silently. So it is refused.
+ */
+function toRow(dialect: TrinoDialect, fieldNames: readonly string[], row: unknown): TrinoRow {
+  if (!Array.isArray(row) || row.length !== fieldNames.length) {
+    const count = Array.isArray(row) ? row.length : 0;
+    throw new TrinoTransportError(
+      "engine",
+      `${dialect.displayName} answered a row with ${count} values for ${fieldNames.length} columns, so the result cannot be read`,
+    );
+  }
+  const values = row as unknown[];
+  return Object.fromEntries(fieldNames.map((name, column) => [name, values[column]]));
 }
 
 function readStats(page: Record<string, unknown>): TrinoExecutionStats | null {
@@ -687,9 +690,10 @@ interface HttpOutcome {
 export class TrinoHttpTransport implements TrinoTransport {
   public readonly dialect: TrinoDialect;
 
-  private readonly origin: string;
+  private readonly origin: HttpOrigin;
   private readonly user: string;
   private readonly catalog: string | undefined;
+  private readonly schema: string | undefined;
   private readonly authorization: string | undefined;
 
   constructor(dialect: TrinoDialect, config: DatabaseConnection) {
@@ -698,14 +702,18 @@ export class TrinoHttpTransport implements TrinoTransport {
     // `connectionFields`, and an explicit `disable` has to turn TLS OFF as well as
     // an explicit mode turns it on (the #264 lesson).
     const secure = config.ssl !== undefined && config.ssl.mode !== "disable";
-    const host = formatHost(config.host ?? DEFAULT_HOST);
-    this.origin = `${secure ? "https" : "http"}://${host}:${config.port ?? dialect.defaultPort}`;
+    this.origin = httpOrigin(
+      secure ? "https" : "http",
+      config.host ?? DEFAULT_HOST,
+      config.port ?? dialect.defaultPort,
+    );
     this.user = config.user ?? DEFAULT_USER;
     // The connection's `database` holds the CATALOG, the way a PostgreSQL
     // connection pins one database. It is a default for unqualified names, not a
     // boundary: a fully qualified statement still reaches any catalog the session
     // can see.
     this.catalog = config.database;
+    this.schema = config.schema;
 
     if (config.password === undefined || config.password === "") {
       this.authorization = undefined;
@@ -757,7 +765,7 @@ export class TrinoHttpTransport implements TrinoTransport {
 
   public async cancel(queryId: string, signal?: AbortSignal): Promise<void> {
     await this.send(
-      `${this.origin}${QUERY_PATH}/${encodeURIComponent(queryId)}`,
+      endpointUrl(this.origin, `${QUERY_PATH}/${encodeURIComponent(queryId)}`),
       { method: "DELETE", headers: this.sessionHeaders() },
       signal,
     );
@@ -821,6 +829,7 @@ export class TrinoHttpTransport implements TrinoTransport {
         );
       }
 
+      rejectForeignLink(next, this.origin);
       page = await this.request(next, { method: "GET", headers: this.pollHeaders() }, signal);
     }
 
@@ -832,7 +841,7 @@ export class TrinoHttpTransport implements TrinoTransport {
     }
 
     return {
-      rows: fieldNames === null ? [] : positional.map((row) => toRow(fieldNames, row)),
+      rows: fieldNames === null ? [] : positional.map((row) => toRow(this.dialect, fieldNames, row)),
       fieldNames,
       columnTypes,
       queryId,
@@ -845,7 +854,7 @@ export class TrinoHttpTransport implements TrinoTransport {
 
   private async submit(sql: string, options: TrinoQueryOptions): Promise<Record<string, unknown>> {
     return await this.request(
-      `${this.origin}${STATEMENT_PATH}`,
+      endpointUrl(this.origin, STATEMENT_PATH),
       // The grammar comes from the DESCRIPTOR's type-id, like everything else that
       // differs between the products this transport can speak to.
       {
@@ -880,14 +889,13 @@ export class TrinoHttpTransport implements TrinoTransport {
    */
   private submitHeaders(options: TrinoQueryOptions): Record<string, string> {
     const catalog = options.catalog ?? this.catalog;
+    const schema = options.schema ?? this.schema;
     return {
       ...this.sessionHeaders(),
       "content-type": SQL_CONTENT_TYPE,
       [this.header(HEADER_SUFFIXES.TIME_ZONE)]: CLIENT_TIME_ZONE,
       ...(catalog === undefined || catalog === "" ? {} : { [this.header(HEADER_SUFFIXES.CATALOG)]: catalog }),
-      ...(options.schema === undefined || options.schema === ""
-        ? {}
-        : { [this.header(HEADER_SUFFIXES.SCHEMA)]: options.schema }),
+      ...(schema === undefined || schema === "" ? {} : { [this.header(HEADER_SUFFIXES.SCHEMA)]: schema }),
     };
   }
 
@@ -947,14 +955,17 @@ export class TrinoHttpTransport implements TrinoTransport {
       let response: Response;
       let text: string;
       try {
-        response = await fetch(url, { ...init, ...(signal ? { signal } : {}) });
+        // A followed redirect would carry the credential to wherever it points.
+        response = await httpTransportFetch(url, { ...init, redirect: "manual", ...(signal ? { signal } : {}) });
         text = await response.text();
       } catch (error) {
+        if (error instanceof DatabaseConfigError) throw error;
         // A refused socket, an unresolvable host, an abort and a body that stopped
         // arriving all land here, and all have to leave as the seam's error type.
         throw requestFailure(this.dialect, error, signal);
       }
 
+      rejectRedirect(response, url);
       if (response.ok) return { status: response.status, text };
 
       const wait = retryDelayMs(response.status, response.headers.get(RETRY_AFTER_HEADER), attempt);

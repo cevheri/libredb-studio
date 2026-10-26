@@ -13,6 +13,7 @@ import { AgentRepairLedger } from "@/lib/agent/repair-ledger";
 import { AgentRunService } from "@/lib/agent/run-service";
 import { AgentRunStore } from "@/lib/agent/run-store";
 import type { AgentRunActor, AgentRunEvent } from "@/lib/agent/types";
+import { editorExecutionContext } from "@/lib/api/execution-context";
 import { acquireExecutionProfileProvider, clearProviderCache, type ExecutionProfile } from "@/lib/db/factory";
 import { ExecutionArtifactStore } from "@/lib/db/operations/artifacts";
 import { ExecutionBudgetTracker } from "@/lib/db/operations/budgets";
@@ -49,8 +50,9 @@ import { chatToolCallStream, type FetchDouble } from "./fixtures/agent-transport
  *    `tests/integration/db/postgres-provider.test.ts` established: `mock.module("pg")`
  *    in front of a stateful in-process server double, so `PostgresProvider` runs
  *    unmodified — its `BEGIN READ ONLY` envelope, its extended-protocol statement, its
- *    `ROLLBACK`/`DISCARD ALL`. CI runs no PostgreSQL service (`docs/BACKLOG.md` A5),
- *    and that is recorded rather than papered over. Be exact about the split: what is
+ *    `ROLLBACK`/`DISCARD ALL`. The test jobs run no PostgreSQL service; the profile
+ *    meets a real server only in `tests/live/postgres-read-only-live.ts`, which the
+ *    functional-smoke job runs, and that is recorded rather than papered over. Be exact about the split: what is
  *    REAL on this side is the PROVIDER and its envelope; the catalog rows, the result
  *    rows AND the `relation "ordrs" does not exist` refusal are all scripted, written
  *    to PostgreSQL's own wording and SQLSTATE. Only the SQLite half gets a failure text
@@ -74,7 +76,9 @@ import { chatToolCallStream, type FetchDouble } from "./fixtures/agent-transport
  * process-wide.
  */
 
-const ACTOR: AgentRunActor = { sessionId: "sess_e2e", role: "user" };
+// An admin, because the SQLite arc opens on an inline connection and SQLite opens only for a trusted
+// requester (#1523); the PostgreSQL arc reads no file-access posture, so the role changes nothing there.
+const ACTOR: AgentRunActor = { sessionId: "sess_e2e", role: "admin" };
 
 const OBJECTIVE = "Which order statuses dominate the orders table?";
 
@@ -89,7 +93,7 @@ function pgServerError(message: string, code: string): Error {
 }
 
 interface EngineAnswer {
-  readonly rows: Record<string, unknown>[];
+  readonly rows: Record<string, unknown>[] | unknown[][];
   readonly fields: { name: string }[];
   readonly rowCount: number;
 }
@@ -105,56 +109,41 @@ function engineRows(data: Record<string, unknown>[]): EngineAnswer {
 
 /**
  * The column inventory `information_schema.columns` answers for this fixture's two
- * tables — one row per column, which is the projection `composed-sql.ts` composes.
+ * tables — one row per table, which is the projection `composed-sql.ts` composes.
  */
 const PG_COLUMN_ROWS: Record<string, unknown>[] = [
   {
     table_schema: "public",
     table_name: "customers",
-    column_name: "id",
-    data_type: "integer",
-    is_nullable: "NO",
-    ordinal_position: 1,
-  },
-  {
-    table_schema: "public",
-    table_name: "customers",
-    column_name: "name",
-    data_type: "text",
-    is_nullable: "NO",
-    ordinal_position: 2,
+    relkind: "r",
+    columns: [
+      { name: "id", type: "integer", nullable: "NO" },
+      { name: "name", type: "text", nullable: "NO" },
+    ],
   },
   {
     table_schema: "public",
     table_name: "orders",
-    column_name: "id",
-    data_type: "integer",
-    is_nullable: "NO",
-    ordinal_position: 1,
+    relkind: "r",
+    columns: [
+      { name: "id", type: "integer", nullable: "NO" },
+      { name: "customer_id", type: "integer", nullable: "NO" },
+      { name: "status", type: "text", nullable: "NO" },
+      { name: "total_cents", type: "integer", nullable: "NO" },
+    ],
   },
+  // A VIEW, and the reason this fixture has one: `information_schema.columns` answers a
+  // view's columns beside a table's with nothing to tell them apart, so a run was handed
+  // one under the word table (#414). The `relkind` the composed statement joins from
+  // `pg_class` is what tells them apart, and this row is where that is end-to-end visible.
   {
     table_schema: "public",
-    table_name: "orders",
-    column_name: "customer_id",
-    data_type: "integer",
-    is_nullable: "NO",
-    ordinal_position: 2,
-  },
-  {
-    table_schema: "public",
-    table_name: "orders",
-    column_name: "status",
-    data_type: "text",
-    is_nullable: "NO",
-    ordinal_position: 3,
-  },
-  {
-    table_schema: "public",
-    table_name: "orders",
-    column_name: "total_cents",
-    data_type: "integer",
-    is_nullable: "NO",
-    ordinal_position: 4,
+    table_name: "paid_orders",
+    relkind: "v",
+    columns: [
+      { name: "id", type: "integer", nullable: "NO" },
+      { name: "status", type: "text", nullable: "NO" },
+    ],
   },
 ];
 
@@ -221,7 +210,18 @@ class PostgresEngineDouble {
   /** Statements that arrived OUTSIDE the read-only envelope. Must stay empty. */
   readonly unenveloped: string[] = [];
 
+  /**
+   * `pg` under `rowMode: "array"`, which the provider asks for on the user's statement: each row
+   * its values in the order `fields` declares.
+   */
   async query(arg: unknown): Promise<EngineAnswer> {
+    const answer = await this.answer(arg);
+    if (typeof arg === "string" || (arg as { rowMode?: string }).rowMode !== "array") return answer;
+    const rows = answer.rows as Record<string, unknown>[];
+    return { ...answer, rows: rows.map((row) => answer.fields.map((field) => row[field.name])) };
+  }
+
+  private async answer(arg: unknown): Promise<EngineAnswer> {
     const text = (typeof arg === "string" ? arg : (arg as { text: string }).text).trim();
 
     // The role-privilege probe the profile runs at open, before any transaction.
@@ -282,10 +282,18 @@ class MockPool extends EventEmitter {
   async end() {}
 }
 
+// The provider imports `types` from pg for its per-pool parsers, so the mock has to export
+// it. These rows never reach a parser, and the real registry is passed rather than a stub.
+// `Client` likewise: the provider subclasses it to keep server notices (#1401), and the
+// mocked pool never builds one.
+const { types: realPgTypes, Client: realPgClient } = await import("pg");
+
 mock.module("pg", () => ({
   Pool: function () {
     return new MockPool();
   },
+  Client: realPgClient,
+  types: realPgTypes,
 }));
 
 // ─── the scripted model ─────────────────────────────────────────────────────
@@ -309,12 +317,21 @@ function scriptedModel(...turns: readonly ((turn: Turn) => Response)[]): { fetch
   return { fetch: fetchImpl, turns: seen };
 }
 
+/**
+ * An OpenAI-compatible endpoint on the Chat Completions wire, which the script below speaks; the
+ * `openai` kind answers on the Responses API instead, and `ollama` and `custom` stay here.
+ */
 async function modelOver(fetchImpl: FetchDouble): Promise<AgentModel> {
-  const config = { provider: "openai", apiKey: "sk-test", model: "gpt-4o-mini" } as const;
+  const config = {
+    provider: "custom",
+    apiKey: "sk-test",
+    model: "gpt-4o-mini",
+    apiUrl: "https://llm.internal/v1",
+  } as const;
   return {
-    provider: "openai",
+    provider: "custom",
     modelId: config.model,
-    model: await resolveAgentProviderAdapter("openai").createModel(config, fetchImpl),
+    model: await resolveAgentProviderAdapter("custom").createModel(config, fetchImpl),
   };
 }
 
@@ -405,7 +422,7 @@ async function driveArc(fixture: Fixture): Promise<Arc> {
     // read-only profile, so the run really is bounded by the profile's own controls.
     acquireProvider: async (connection, profile) => {
       profiles.push(profile);
-      return acquireExecutionProfileProvider(connection, profile);
+      return acquireExecutionProfileProvider(connection, profile, {}, editorExecutionContext(ACTOR, connection));
     },
   };
 
@@ -447,6 +464,10 @@ async function driveArc(fixture: Fixture): Promise<Arc> {
     model: await modelOver(script.fetch),
     resources,
   });
+
+  if (result.status === "paused") {
+    throw new Error(`run ${run.runId} paused mid-e2e`);
+  }
 
   const view = await store.read(run.runId);
   if (!view) throw new Error(`run ${run.runId} has no ledger`);
@@ -516,6 +537,14 @@ interface ArcExpectation {
   readonly catalogRowCount: number;
   /** The rows the engine returned, which the run's artifact store must hold verbatim. */
   readonly rows: readonly Record<string, unknown>[];
+  /**
+   * Every object the GROUNDING capture carried, with the kind it was identified as.
+   *
+   * The composed catalog path is the one both of these engines ground through, and this
+   * is what says the kind survived it (#789 fix round 3): the ids are the provider's own
+   * declaration, and a view is a view rather than an unnamed thing or a table.
+   */
+  readonly groundedAs: readonly (readonly [string, string | undefined])[];
 }
 
 /**
@@ -540,6 +569,24 @@ function expectTheWholeArc(arc: Arc, expected: ArcExpectation): void {
   // profile: the whole run's database access was under it.
   expect(arc.profiles.length).toBeGreaterThan(0);
   expect([...new Set(arc.profiles)]).toEqual(["agent-read-only"]);
+
+  // The grounding capture, and what it says each entry IS. Round 2 took the object read
+  // off this path to keep every statement inside the read-only envelope, and the kinds
+  // went with it: a PostgreSQL or SQLite run - the two engines agent mode executes on -
+  // reached the model with an inventory carrying none. They are composed on the catalog
+  // path now, so both assertions hold at once: the envelope test below is unchanged and
+  // still green, and the model is told what it is looking at.
+  const captured = arc.events.find((event) => event.kind === "context-captured");
+  const snapshot = captured !== undefined && "snapshot" in captured ? captured.snapshot : undefined;
+  expect(snapshot?.objects.map((object) => [object.name, object.kind])).toEqual(
+    expected.groundedAs.map((entry) => [...entry]),
+  );
+  // The kinds the inventory declares are exactly the ones its objects were identified as,
+  // which is what `addressableObjects` and the packed prompt both read.
+  expect(snapshot?.kinds?.map((kind) => kind.id)).toEqual(["table", "view"]);
+  // …and the word reached the MODEL, in the first request, which is the whole of why the
+  // kind is read at all.
+  expect(arc.transcripts[0]).toContain("(View)");
 
   // Beat 2 — the refusal is a DATABASE error carrying the engine's own words, not a
   // policy denial. The two are different variants on purpose (`tools.ts`), and a run
@@ -612,6 +659,9 @@ const SQLITE_DDL = [
     "status TEXT NOT NULL, " +
     "total_cents INTEGER NOT NULL)",
   "CREATE INDEX orders_status_idx ON orders (status)",
+  // The view is here for the same reason the PostgreSQL fixture has one: it is the
+  // object a kindless inventory hands over under the word table.
+  "CREATE VIEW paid_orders AS SELECT id, status FROM orders WHERE status = 'paid'",
   "INSERT INTO customers (id, name) VALUES (1, 'Ada'), (2, 'Grace')",
   "INSERT INTO orders (id, customer_id, status, total_cents) VALUES " +
     "(1, 1, 'paid', 1200), (2, 1, 'paid', 900), (3, 2, 'paid', 4500), (4, 2, 'pending', 700)",
@@ -664,7 +714,12 @@ describe("the whole investigation, against a real SQLite database file", () => {
     };
     // Read from the provider the run itself will use, rather than declaring a
     // capability set by hand that could drift from the one the engine has.
-    const provider: DatabaseProvider = await acquireExecutionProfileProvider(connection, "agent-read-only");
+    const provider: DatabaseProvider = await acquireExecutionProfileProvider(
+      connection,
+      "agent-read-only",
+      {},
+      editorExecutionContext(ACTOR, connection),
+    );
     return {
       connection,
       capabilities: provider.getCapabilities(),
@@ -689,6 +744,13 @@ describe("the whole investigation, against a real SQLite database file", () => {
       // One object row: `sqlite_master` holds one entry per table, narrowed to `orders`.
       catalogRowCount: 1,
       rows: SQLITE_STATUS_ROWS,
+      // Read out of a real `sqlite_master`: its own `type` column, mapped onto the ids
+      // `sqlite.ts` declares.
+      groundedAs: [
+        ["customers", "table"],
+        ["orders", "table"],
+        ["paid_orders", "view"],
+      ],
     });
   });
 
@@ -698,7 +760,12 @@ describe("the whole investigation, against a real SQLite database file", () => {
     // silently stopped seeding — or a read that reached a different database — fails
     // here rather than passing with an empty result.
     const fixture = await sqliteFixture();
-    const provider = await acquireExecutionProfileProvider(fixture.connection, "agent-read-only");
+    const provider = await acquireExecutionProfileProvider(
+      fixture.connection,
+      "agent-read-only",
+      {},
+      editorExecutionContext(ACTOR, fixture.connection),
+    );
     // The profile seam guarantees this method exists — it refuses a provider without
     // one — so its absence here is a wiring fault worth failing loudly on.
     if (typeof provider.queryReadOnly !== "function") throw new Error("the profiled provider has no read-only path");
@@ -725,7 +792,12 @@ describe("the whole investigation, against the PostgreSQL suite's engine fixture
       password: "secret",
       createdAt: TIME,
     };
-    const provider: DatabaseProvider = await acquireExecutionProfileProvider(connection, "agent-read-only");
+    const provider: DatabaseProvider = await acquireExecutionProfileProvider(
+      connection,
+      "agent-read-only",
+      {},
+      editorExecutionContext(ACTOR, connection),
+    );
     return {
       connection,
       capabilities: provider.getCapabilities(),
@@ -742,12 +814,18 @@ describe("the whole investigation, against the PostgreSQL suite's engine fixture
       columnNames: ["status", "order_count"],
       rowCount: 2,
       rowValue: "paid",
-      // The PostgreSQL catalog read is a structured column inventory, so a column of
-      // the table the selector narrowed to is what the model sees.
+      // The PostgreSQL catalog read is a structured column inventory, aggregated per
+      // table (B52), so a column of the table the selector narrowed to is what the
+      // model sees.
       catalogText: "customer_id",
-      // One row per COLUMN of `orders`, and none of `customers`.
-      catalogRowCount: 4,
+      // One row per TABLE: the selector narrowed to `orders`, so exactly one.
+      catalogRowCount: 1,
       rows: PG_STATUS_ROWS,
+      groundedAs: [
+        ["public.customers", "table"],
+        ["public.orders", "table"],
+        ["public.paid_orders", "view"],
+      ],
     });
   });
 

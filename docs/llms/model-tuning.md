@@ -3,7 +3,9 @@
 Studio ships a document recording what specific models were measured under — how long one of
 their turns may take, how many readings they may take before being asked to report, whether an
 empty turn is worth asking again. A model it does not name is driven with the compiled defaults,
-which is the honest treatment of a model nobody has measured.
+which is the honest treatment of a model nobody has measured — bar the two settings noted under
+[the settings](#the-settings), where an absent entry is read as the absence it is rather than as a
+`false` somebody wrote.
 
 This page is how you supply your own, with no new Studio release and no code change. It is the
 other half of [`testing-your-own.md`](testing-your-own.md): that page is how you measure a model,
@@ -105,27 +107,32 @@ bare `qwen3.8` does not find `qwen3.8:latest`. Write the tag you run.
 
 ## The settings
 
-Every one is optional. What you do not state resolves to the compiled default in the last column.
+Every one is optional. What you do not state resolves to the compiled default in the last column, with one exception: entry-level `sampling` is read as a complete statement, so a key left out of it does not fall back to the default (for example, `sampling: { temperature: 0 }` omits `topP`, and `sampling: {}` sends neither parameter).
 
 | setting | type and bounds | what it decides | default |
 | --- | --- | --- | --- |
-| `sampling` | `{temperature: 0–2, topP: 0–1}` | how every turn of this model is sampled | `{0, 1}` |
+| `sampling` | `{temperature?: 0–2, topP?: 0–1}` | how every turn of this model is sampled | `{temperature: 0, topP: 1}` |
 | `perWorkflow` | the same object, per workflow id | sampling for named surfaces only — the narrowest an override gets | — |
 | `unreportedCallCeiling` | integer 1–100 | how many calls it may make without reporting before the run is narrowed to the tools that would finish it | `12` |
 | `reportReminderLimit` | integer 0–5 | how many times a turn with no call and no report may be answered with the report reminder | `1` |
-| `planStatementRetries` | integer 0–5 | extra turns a PLAN run gets when its prose named neither a statement nor a refusal | `0` |
+| `planStatementRetries` | integer 0–5 | extra turns a PLAN run gets when its prose named neither a statement nor a refusal | `0` — but see below |
 | `presentReminderLimit` | integer 0–5 | how many times a report may be held to ask for the answer that belongs beside it | `1` |
 | `verdictHoldLimit` | integer 0–5 | how many times a report whose own verdict would REJECT it may be held and told why — the third of the reminder bounds. A run about to pass never reaches this hold, so raising it costs turns only on a run that has already lost | `2` |
+| `compareHoldLimit` | integer 0–5 | how many times a report resting on plans this run never compared may be held and told which two to compare — the fourth of the reminder bounds, and the last one that was a literal in the loop. Reachable only where `compose_report` is called by a run already earning `no-plan-comparison`, so a run about to pass never meets it and a raised limit spends turns only on a run that has already lost | `1` |
 | `retryEmptyTurn` | boolean | whether a turn that came back EMPTY is asked once more before the run is ended | `false` |
-| `retryUnreadStop` | boolean | whether a run that stopped having CALLED NOTHING is told once to read the database itself, instead of being ended — it subsumes `retryEmptyTurn`, since the gate asks what was called and not what was said | `false` |
-| `suppressPlanReasoning` | boolean | whether this model's PLAN turn asks the endpoint for no reasoning at all — reaches the OpenAI-compatible adapter only (`openai`, `ollama`, `custom`), so it is a no-op on `gemini` | `false` |
-| `suppressAgentReasoning` | boolean | the same, for this model's AGENT turns — for a model that either answers at once or thinks until the wall, which `turnTimeoutMs` does not address because a turn spent thinking finds the new wall too. Same adapters, same no-op on `gemini` | `false` |
+| `retryUnreadStop` | boolean | whether a run that stopped having CALLED NOTHING is told once to read the database itself, instead of being ended — it subsumes `retryEmptyTurn`, since the gate asks what was called and not what was said | `false` — but see below |
+| `unreadStopAsks` | integer 1–5 | how many times that sentence is said, where once is not enough — `retryUnreadStop` decides whether to answer at all, this decides how often. A model that says what it needs, hears the sentence, says the same thing again and ends is bounded rather than answered: that gate is reachable only on a run that called nothing, so it has already fallen short and another ask cannot cost a pass | `1` |
+| `suppressPlanReasoning` | boolean | whether this model's PLAN turn asks the endpoint for no reasoning at all; it reaches the OpenAI-compatible adapter only (`openai`, `ollama`, `custom`), so it is a no-op on `gemini`; on `openai` an operator's `LLM_MODEL_EFFORT` wins over it | `false` |
+| `suppressAgentReasoning` | boolean | the same, for this model's AGENT turns, for a model that either answers at once or thinks until the wall, which `turnTimeoutMs` does not address because a turn spent thinking finds the new wall too. Same adapters, same no-op on `gemini`, and the same precedence of `LLM_MODEL_EFFORT` on `openai` | `false` |
 | `refusalExamples` | boolean | whether a refused call is handed a worked example built from this run's ledger | `false` |
 | `turnTimeoutMs` | integer 1000–179999 | how long ONE turn of this model may take, where the product's own limit does not fit it | the product's limit |
 | `threadContextMaxChars` | integer 200–32000 | how much of a CONVERSATION this model may be handed — the earlier steps' objectives and the most recent step's report, when a follow-up continues a previous run | the product's budget (4000) |
 
 Workflow ids for `perWorkflow`: `investigation`, `query-optimization`, `database-assessment`,
-`operations`, `data-analysis`.
+`operations`, `data-analysis`. Note that `perWorkflow` merges onto the model's entry-level `sampling`
+(or the compiled `{temperature: 0, topP: 1}` default if omitted). For endpoints that require omitting
+`topP` (such as Anthropic/Claude), state `sampling: { temperature: ... }` at the entry level so `topP`
+is not inherited from the default.
 
 **`threadContextMaxChars` is the one setting Studio ships NO measurement for**, and that is
 deliberate rather than an omission: no entry in the shipped document names it, because nobody has
@@ -135,6 +142,17 @@ can — and this is the only place that fact can be expressed per model. Lower i
 your model starts losing the schema block or ending early; raise it if your model has room and your
 conversations are long enough to be truncating. Either way the answer comes from driving it, which
 is what [`testing-your-own.md`](testing-your-own.md) is for.
+
+**Two settings answer differently for a model with NO entry at all**, and the last column above is
+the compiled default rather than what an unnamed model gets. `planStatementRetries` and
+`retryUnreadStop` each buy a single extra turn, and each gate is reachable only on a run that has
+already fallen short — one where the closing prose named no statement, one where the model stopped
+having called nothing. Neither can turn a pass into a failure, so withholding them from a model
+nobody has measured only guarantees that the model most in need of the sentence is the one certain
+not to receive it. A model with no entry is therefore offered both: one plan ask
+(`planStatementAsksFor`) and one answer to a stop that read nothing (`answersUnreadStop`), both in
+[`src/lib/agent/models/index.ts`](../../src/lib/agent/models/index.ts). **A stated value still
+wins** — a `0` or a `false` you write here is a measurement, and Studio does not overrule it.
 
 ## The rules
 

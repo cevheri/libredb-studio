@@ -6,7 +6,16 @@ import React from "react";
 import { describe, test, expect, mock, afterEach } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { TablesTab } from "@/components/monitoring/tabs/TablesTab";
-import type { MonitoringData, ProviderCapabilities } from "@/lib/db/types";
+import { EtcdProvider } from "@/lib/db/providers/keyvalue/etcd/index";
+import { toTableStats } from "@/lib/db/providers/keyvalue/etcd/monitoring";
+import type { MonitoringData, ProviderCapabilities, ProviderLabels } from "@/lib/db/types";
+import { CENSUS_CONNECTION } from "../../helpers/census-connection";
+import { TABLE_LABELS } from "../../fixtures/provider-labels";
+import {
+  SYNTHETIC_ENTITY_CAPABILITIES,
+  SYNTHETIC_PREVIEW,
+  SYNTHETIC_REFUSED_PREVIEW,
+} from "../../fixtures/maintenance-entity-operations";
 
 function makeData(): MonitoringData {
   return {
@@ -83,7 +92,6 @@ function makeCapabilities(overrides: Partial<ProviderCapabilities> = {}): Provid
     queryLanguage: "sql",
     supportsExplain: false,
     supportsExternalQueryLimiting: true,
-    supportsCreateTable: true,
     supportsInlineRowEdit: true,
     supportsMaintenance: true,
     maintenanceOperations: ["vacuum", "analyze", "reindex", "kill"],
@@ -144,28 +152,76 @@ describe("TablesTab", () => {
       />,
     );
 
-    const analyzeButton = container.querySelector('button[title="Analyze"]');
-    const vacuumButton = container.querySelector('button[title="Vacuum"]');
-    const reindexButton = container.querySelector('button[title="Reindex"]');
+    /*
+     * THE WAIT THAT MATTERS HERE IS NOT THE ONE ON THE CALL. `handleMaintenance` invokes
+     * `onRunMaintenance` before its first await, and `fireEvent` is act-wrapped, so the call
+     * has already happened when the line after the click reads it: a `waitFor` around that
+     * assertion was satisfied on its first synchronous check and waited for nothing.
+     *
+     * What the next click actually needs is the button being clickable, and it is not:
+     * `handleMaintenance` sets `actionLoading` first, and `disabled={!!actionLoading}` takes
+     * EVERY maintenance button on the panel with it. React delivers no click to a disabled
+     * button, so a click issued while the previous action is still in flight is dropped in
+     * silence and the assertion after it burns its whole timeout on a call that will never
+     * come. Measured with a probe on this tree: `analyze` called synchronously, `vacuum`
+     * disabled immediately after, so this suite only ever got through because `waitFor`
+     * happens to drain a macrotask on its way out - a coincidence, and a busy machine is
+     * under no obligation to repeat it.
+     *
+     * So each step asserts the call synchronously, asserts the NEXT button went disabled (the
+     * control, which is what stops the wait below from being vacuous), and waits for it to
+     * come back before clicking it.
+     */
+    const analyzeButton = container.querySelector<HTMLButtonElement>('button[title="Analyze"]');
+    const vacuumButton = container.querySelector<HTMLButtonElement>('button[title="Vacuum"]');
+    const reindexButton = container.querySelector<HTMLButtonElement>('button[title="Reindex"]');
 
     expect(analyzeButton).not.toBeNull();
     expect(vacuumButton).not.toBeNull();
     expect(reindexButton).not.toBeNull();
 
     fireEvent.click(analyzeButton!);
+    expect(onRunMaintenance).toHaveBeenCalledWith("analyze", "users", "public");
+    expect(vacuumButton!.disabled).toBe(true);
     await waitFor(() => {
-      expect(onRunMaintenance).toHaveBeenCalledWith("analyze", "users");
+      expect(vacuumButton!.disabled).toBe(false);
     });
 
     fireEvent.click(vacuumButton!);
+    expect(onRunMaintenance).toHaveBeenCalledWith("vacuum", "users", "public");
+    expect(reindexButton!.disabled).toBe(true);
     await waitFor(() => {
-      expect(onRunMaintenance).toHaveBeenCalledWith("vacuum", "users");
+      expect(reindexButton!.disabled).toBe(false);
     });
 
     fireEvent.click(reindexButton!);
-    await waitFor(() => {
-      expect(onRunMaintenance).toHaveBeenCalledWith("reindex", "users");
-    });
+    expect(onRunMaintenance).toHaveBeenCalledWith("reindex", "users", "public");
+  });
+
+  test("a read-only connection draws no per-row maintenance control, and the placeholder says why (#1418)", () => {
+    const props = { data: makeData(), loading: false, onRunMaintenance: mock(async () => true), isAdmin: true };
+    const writable = render(<TablesTab {...props} capabilities={makeCapabilities()} />);
+    expect(writable.container.querySelector('button[title="Analyze"]')).not.toBeNull();
+    cleanup();
+
+    const guarded = render(<TablesTab {...props} capabilities={makeCapabilities()} readOnly />);
+    for (const title of ["Analyze", "Vacuum", "Reindex"]) {
+      expect(guarded.container.querySelector(`button[title="${title}"]`)).toBeNull();
+    }
+    // The row is still listed, with the placeholder a row with no control has always drawn.
+    expect(guarded.queryByText("users")).not.toBeNull();
+    const placeholder = guarded.getAllByText("-")[0]!;
+    expect(placeholder.getAttribute("title")).toBe(
+      "This connection is read-only: use a read-write connection for maintenance",
+    );
+  });
+
+  test("the placeholder of a row that never had a control says nothing about read-only", () => {
+    // No declared capabilities: nothing was withheld, so there is no reason to give.
+    const { getAllByText } = render(
+      <TablesTab data={makeData()} loading={false} onRunMaintenance={mock(async () => true)} isAdmin readOnly />,
+    );
+    expect(getAllByText("-")[0]!.getAttribute("title")).toBeNull();
   });
 
   test("shows non-admin placeholder for actions", () => {
@@ -248,7 +304,7 @@ describe("TablesTab", () => {
 
     fireEvent.click(reindexButton!);
     await waitFor(() => {
-      expect(onRunMaintenance).toHaveBeenCalledWith("reindex", "users");
+      expect(onRunMaintenance).toHaveBeenCalledWith("reindex", "users", "public");
     });
   });
 
@@ -463,6 +519,46 @@ describe("tables that carry no per-table bytes", () => {
     expect(getAllByTestId("table-row-size")[0]?.textContent).toBe("-");
   });
 
+  /**
+   * The mirror image: rows shaped the way CockroachDB answers through the PostgreSQL provider,
+   * where the tables come from pg_class and its `reltuples` is NULL, so the sizes are there and
+   * the counts are not (#1540). Before `rowCount` went optional a `?? 0` filled it, and this
+   * tab summed those zeros into "0 rows" over a database with rows in it.
+   */
+  function rowlessData(): MonitoringData {
+    const data = makeData();
+    return {
+      ...data,
+      tables: [
+        {
+          schemaName: "public",
+          tableName: "from_pg_class",
+          tableSize: "64 KB",
+          totalSize: "96 KB",
+          totalSizeBytes: 98304,
+        },
+      ],
+    } as unknown as MonitoringData;
+  }
+
+  test("the Tables card drops the row line rather than summing an unpublished count to 0 rows", () => {
+    const { getByTestId, queryByText } = render(
+      <TablesTab data={rowlessData()} loading={false} onRunMaintenance={mock(async () => true)} />,
+    );
+
+    // The table itself is a measurement and is still counted; only the rows are unknown.
+    expect(getByTestId("tables-stat-count").textContent).toBe("1");
+    expect(queryByText("0 rows")).toBeNull();
+  });
+
+  test("a table with no row count of its own reads as unknown, not as zero", () => {
+    const { getAllByTestId } = render(
+      <TablesTab data={rowlessData()} loading={false} onRunMaintenance={mock(async () => true)} />,
+    );
+
+    expect(getAllByTestId("table-row-count")[0]?.textContent).toBe("-");
+  });
+
   test("an engine that publishes bytes still gets its total", () => {
     const { getByTestId } = render(
       <TablesTab data={makeData()} loading={false} onRunMaintenance={mock(async () => true)} />,
@@ -503,6 +599,99 @@ describe("tables that carry no per-table bytes", () => {
     // caption below the figure is still drawn. Without this the two refusal arms would pass
     // against a card that had simply given up.
     expect(queryByText("Total")).not.toBeNull();
+  });
+});
+
+/**
+ * The rows RisingWave 3.1.0 produces through the PostgreSQL provider (#1436 review).
+ *
+ * Measured on 2026-10-08: `pg_table_size(relid)` answers 89 and `pg_indexes_size(relid)`
+ * answers 0, while `pg_total_relation_size` does not exist there at all. That left the row
+ * carrying a measured 89-byte table size beside a total of 0, and this card summed the 0 -
+ * because it gates on `tableSizeBytes` alone, which until then always arrived with a measured
+ * total. The provider now derives the total from the two parts PostgreSQL defines it as, so
+ * the card has a real figure to draw; where it cannot derive one, the parts go with it and the
+ * card's own absence gate answers N/A.
+ */
+describe("a row whose engine refuses only the total size", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  const riseWaveRow = (over: Record<string, unknown>) => {
+    const data = makeData();
+    return {
+      ...data,
+      tables: [{ schemaName: "public", tableName: "probe_sized", rowCount: 2, bloatRatio: 0, ...over }],
+    } as unknown as MonitoringData;
+  };
+
+  test("the Size card draws the derived total, not 0 B", () => {
+    const { getByTestId, queryByText } = render(
+      <TablesTab
+        data={riseWaveRow({
+          tableSize: "89 B",
+          tableSizeBytes: 89,
+          indexSize: "0 B",
+          indexSizeBytes: 0,
+          totalSize: "89 B",
+          totalSizeBytes: 89,
+        })}
+        loading={false}
+        onRunMaintenance={mock(async () => true)}
+      />,
+    );
+
+    expect(getByTestId("tables-stat-size").textContent).toBe("89 B");
+    // The card, not the page: this row's Index Size cell says "0 B" and means it, because
+    // RisingWave really answered 0 for pg_indexes_size. A measured zero stays a measurement.
+    expect(queryByText("Total")).not.toBeNull();
+  });
+
+  test("the row's own Size cell reads the derived total too", () => {
+    const { getAllByTestId } = render(
+      <TablesTab
+        data={riseWaveRow({
+          tableSize: "89 B",
+          tableSizeBytes: 89,
+          indexSize: "0 B",
+          indexSizeBytes: 0,
+          totalSize: "89 B",
+          totalSizeBytes: 89,
+        })}
+        loading={false}
+        onRunMaintenance={mock(async () => true)}
+      />,
+    );
+
+    expect(getAllByTestId("table-row-size")[0]?.textContent).toBe("89 B");
+  });
+
+  // What the provider now refuses to send, pinned here so the card's answer to it is on
+  // record: a measured part beside the placeholder total is what drew "0 B".
+  test("a part without a total would still have summed to 0 B, which is why the provider drops it", () => {
+    const { getByTestId } = render(
+      <TablesTab
+        data={riseWaveRow({ tableSize: "89 B", tableSizeBytes: 89, totalSize: "N/A", totalSizeBytes: 0 })}
+        loading={false}
+        onRunMaintenance={mock(async () => true)}
+      />,
+    );
+
+    expect(getByTestId("tables-stat-size").textContent).toBe("0 B");
+  });
+
+  test("with no total to derive, the parts go too and the card says N/A", () => {
+    const { getByTestId, queryByText } = render(
+      <TablesTab
+        data={riseWaveRow({ totalSize: "N/A", totalSizeBytes: 0 })}
+        loading={false}
+        onRunMaintenance={mock(async () => true)}
+      />,
+    );
+
+    expect(getByTestId("tables-stat-size").textContent).toBe("N/A");
+    expect(queryByText("0 B")).toBeNull();
   });
 });
 
@@ -597,7 +786,7 @@ describe("per-row controls follow the provider's own declaration", () => {
 
     // Oracle's "Rebuild Indexes" is `optimize`, and the target is the TABLE - the
     // shape that answered ORA-01418 for a table name before this change.
-    await waitFor(() => expect(onRunMaintenance).toHaveBeenCalledWith("optimize", "users"));
+    await waitFor(() => expect(onRunMaintenance).toHaveBeenCalledWith("optimize", "users", "public"));
   });
 
   test("a provider that declares no specs keeps the pre-#U9 three controls", () => {
@@ -775,5 +964,265 @@ describe("a per-table operation with no row to run it on (U22)", () => {
     );
 
     expect(queryByTestId("tables-maintenance-unattachable")).toBeNull();
+  });
+});
+
+// #1085 6.2: a provider whose list is a ranked subset of what the database holds says which subset,
+// and the cards then count the rows listed rather than the database. Measured 2026-09-23 on the
+// compose Prometheus: this tab read "Tables 50, 858 rows" beside an Overview of 344 metrics and a
+// head of 1,237 series, because the list is the 50 metrics with the most head series.
+describe("a provider that declares what its list holds", () => {
+  // Scoped here as well as in the blocks above: bun:test registers a hook on the
+  // enclosing describe only, so without this the first render in this block leaks into
+  // the second and the control arm queries the previous test's DOM.
+  afterEach(() => {
+    cleanup();
+  });
+
+  const CAPTION = "The metrics with the most head series, at most 50";
+  const scoped: ProviderLabels = { ...TABLE_LABELS, tableStatsCaption: CAPTION };
+
+  test("renders the caption, and counts the rows it lists rather than the database's tables", () => {
+    const { getByTestId, queryByText } = render(
+      <TablesTab
+        data={makeData()}
+        loading={false}
+        onRunMaintenance={mock(async () => true)}
+        capabilities={makeCapabilities()}
+        labels={scoped}
+      />,
+    );
+
+    expect(getByTestId("tables-list-scope").textContent).toBe(CAPTION);
+    // The count is the list's length, titled as what it counts.
+    expect(queryByText("Listed")).not.toBeNull();
+    expect(queryByText("Tables")).toBeNull();
+    expect(getByTestId("tables-stat-count").textContent).toBe("2");
+    expect(queryByText("501.2K rows")).not.toBeNull(); // 1,200 + 500,000 across the two listed rows
+    // The size sums the listed rows too, so it is not called the database's total.
+    expect(getByTestId("tables-stat-size").textContent).toBe("820 MB");
+    expect(queryByText("Across the list")).not.toBeNull();
+    expect(queryByText("Total")).toBeNull();
+  });
+
+  // etcd spec 7.1 and 6.3: the rows are the key-prefix groups, and a key in no group is counted in the
+  // Overview alone, so the cards count the groups listed, under etcd's caption. The labels and the
+  // capabilities are the ones the provider answers /api/db/provider-meta with, read unconnected.
+  test("etcd's Tables cards render under its tableStatsCaption, titled Listed", () => {
+    const etcd = new EtcdProvider(CENSUS_CONNECTION.etcd);
+    const base = makeData();
+    const data = {
+      ...base,
+      overview: { ...base.overview, tableCount: 7 },
+      tables: toTableStats([
+        { group: "/apisix/routes/*", count: "2" },
+        { group: "/config/app/*", count: "3" },
+      ]),
+    } as MonitoringData;
+    const { getByTestId, queryByText } = render(
+      <TablesTab
+        data={data}
+        loading={false}
+        onRunMaintenance={mock(async () => true)}
+        capabilities={etcd.getCapabilities()}
+        labels={etcd.getLabels()}
+      />,
+    );
+
+    expect(getByTestId("tables-list-scope").textContent).toBe(
+      "The key-prefix groups; a key in no group is counted in the Overview and not here",
+    );
+    expect(queryByText("Listed")).not.toBeNull();
+    expect(queryByText("Tables")).toBeNull();
+    // Two groups listed, five keys between them: never the Overview's seven, which count the ungrouped keys too.
+    expect(getByTestId("tables-stat-count").textContent).toBe("2");
+    expect(queryByText("5 rows")).not.toBeNull();
+    // No RPC reports a group's bytes, so the size is unknown rather than a sum of zeros.
+    expect(getByTestId("tables-stat-size").textContent).toBe("N/A");
+  });
+
+  test("an engine that declares no caption renders exactly as it does with no labels at all", () => {
+    const unlabelled = render(
+      <TablesTab
+        data={makeData()}
+        loading={false}
+        onRunMaintenance={mock(async () => true)}
+        capabilities={makeCapabilities()}
+      />,
+    );
+    const before = unlabelled.container.innerHTML;
+    // The control for the comparison below: this is the rendering the tab had.
+    expect(unlabelled.queryByText("Tables")).not.toBeNull();
+    expect(unlabelled.queryByText("Total")).not.toBeNull();
+    expect(unlabelled.queryByTestId("tables-list-scope")).toBeNull();
+    cleanup();
+
+    const labelled = render(
+      <TablesTab
+        data={makeData()}
+        loading={false}
+        onRunMaintenance={mock(async () => true)}
+        capabilities={makeCapabilities()}
+        labels={TABLE_LABELS}
+      />,
+    );
+
+    expect(labelled.container.innerHTML).toBe(before);
+  });
+
+  test("a search that matches none of the listed rows does not say the table does not exist", () => {
+    const { getByPlaceholderText, queryByText } = render(
+      <TablesTab data={makeData()} loading={false} onRunMaintenance={mock(async () => true)} labels={scoped} />,
+    );
+
+    // A metric outside the list exists all the same, so "No tables found." would be false.
+    fireEvent.change(getByPlaceholderText("Search..."), { target: { value: "scrape_samples_scraped" } });
+
+    expect(queryByText("No listed table matches the search.")).not.toBeNull();
+    expect(queryByText("No tables found.")).toBeNull();
+  });
+
+  test("the same search over a whole list still finds no table", () => {
+    const { getByPlaceholderText, queryByText } = render(
+      <TablesTab data={makeData()} loading={false} onRunMaintenance={mock(async () => true)} labels={TABLE_LABELS} />,
+    );
+
+    fireEvent.change(getByPlaceholderText("Search..."), { target: { value: "scrape_samples_scraped" } });
+
+    expect(queryByText("No tables found.")).not.toBeNull();
+    expect(queryByText("No listed table matches the search.")).toBeNull();
+  });
+
+  test("a list that is not there carries no caption, and its cards read as they did", () => {
+    // No list means nothing to scope: the refused read and the empty list beside a counted
+    // overview keep the absence rendering the blocks above pin.
+    const rest: MonitoringData = makeData();
+    delete rest.tables;
+    const refused = { ...rest, errors: { tables: "no table statistics for this catalog" } } as MonitoringData;
+    const base = makeData();
+    const statsless = { ...base, overview: { ...base.overview, tableCount: 6 }, tables: [] } as MonitoringData;
+
+    for (const data of [refused, statsless]) {
+      const { queryByTestId, queryByText, getByTestId } = render(
+        <TablesTab data={data} loading={false} onRunMaintenance={mock(async () => true)} labels={scoped} />,
+      );
+
+      expect(queryByTestId("tables-list-scope")).toBeNull();
+      expect(queryByText("Tables")).not.toBeNull();
+      expect(queryByText("Listed")).toBeNull();
+      expect(getByTestId("tables-stat-count").textContent).toBe("N/A");
+      cleanup();
+    }
+  });
+});
+
+describe("declared per-row operations, the typed target and the preview (spec 3.11)", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  const titlesFrom = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll("button"))
+      .map((b) => b.getAttribute("title"))
+      .filter((t): t is string => t !== null);
+
+  const declared = makeCapabilities({ ...SYNTHETIC_ENTITY_CAPABILITIES });
+
+  test("draws each declared per-row operation after the tab's own, in declaration order, on every row", () => {
+    const { container } = render(
+      <TablesTab
+        data={makeData()}
+        loading={false}
+        onRunMaintenance={mock(async () => true)}
+        onPreviewMaintenance={mock(async () => SYNTHETIC_PREVIEW)}
+        capabilities={declared}
+      />,
+    );
+
+    expect(titlesFrom(container)).toEqual([
+      "Analyze Table",
+      "Release Object",
+      "Load Object",
+      "Analyze Table",
+      "Release Object",
+      "Load Object",
+    ]);
+  });
+
+  test("a preview control is withheld where the tab was handed no way to read a preview", () => {
+    const { container } = render(
+      <TablesTab data={makeData()} loading={false} onRunMaintenance={mock(async () => true)} capabilities={declared} />,
+    );
+
+    expect(titlesFrom(container)).toEqual(["Analyze Table", "Release Object", "Analyze Table", "Release Object"]);
+  });
+
+  test("a typed-target control sends nothing until the row's own name is typed exactly, then sends once", async () => {
+    const onRunMaintenance = mock(async () => true);
+    const view = render(
+      <TablesTab data={makeData()} loading={false} onRunMaintenance={onRunMaintenance} capabilities={declared} />,
+    );
+
+    fireEvent.click(view.container.querySelector('button[title="Release Object"]') as HTMLButtonElement);
+    const dialog = await view.findByRole("alertdialog", { name: "Release Object" });
+    const input = view.getByLabelText("Type users to confirm") as HTMLInputElement;
+    const confirm = dialog.querySelector('button[type="submit"]') as HTMLButtonElement;
+    for (const wrong of ["drop", "USERS", "Users", "public.users", " users"]) {
+      fireEvent.change(input, { target: { value: wrong } });
+      expect({ wrong, disabled: confirm.disabled }).toEqual({ wrong, disabled: true });
+    }
+    expect(onRunMaintenance).not.toHaveBeenCalled();
+
+    fireEvent.change(input, { target: { value: "users" } });
+    fireEvent.click(confirm);
+
+    await waitFor(() => expect(onRunMaintenance).toHaveBeenCalledTimes(1));
+    expect(onRunMaintenance).toHaveBeenCalledWith("disarm", "users", "public");
+    await waitFor(() => expect(view.queryByRole("alertdialog")).toBeNull());
+  });
+
+  test("a preview control reads the preview for its row and offers the confirm button only after it and the name", async () => {
+    const onRunMaintenance = mock(async () => true);
+    const onPreviewMaintenance = mock(async () => SYNTHETIC_PREVIEW);
+    const view = render(
+      <TablesTab
+        data={makeData()}
+        loading={false}
+        onRunMaintenance={onRunMaintenance}
+        onPreviewMaintenance={onPreviewMaintenance}
+        capabilities={declared}
+      />,
+    );
+
+    fireEvent.click(view.container.querySelector('button[title="Load Object"]') as HTMLButtonElement);
+    const dialog = await view.findByRole("alertdialog", { name: "Load Object" });
+    await waitFor(() => expect(dialog.textContent).toContain(SYNTHETIC_PREVIEW.summary));
+    expect(onPreviewMaintenance).toHaveBeenCalledWith("compact", "users", "public");
+
+    const confirm = dialog.querySelector('button[type="submit"]') as HTMLButtonElement;
+    expect(confirm.disabled).toBe(true);
+    fireEvent.change(view.getByLabelText("Type users to confirm"), { target: { value: "users" } });
+    fireEvent.click(confirm);
+
+    await waitFor(() => expect(onRunMaintenance).toHaveBeenCalledWith("compact", "users", "public"));
+  });
+
+  test("a refused preview offers no confirm button and sends nothing", async () => {
+    const onRunMaintenance = mock(async () => true);
+    const view = render(
+      <TablesTab
+        data={makeData()}
+        loading={false}
+        onRunMaintenance={onRunMaintenance}
+        onPreviewMaintenance={mock(async () => SYNTHETIC_REFUSED_PREVIEW)}
+        capabilities={declared}
+      />,
+    );
+
+    fireEvent.click(view.container.querySelector('button[title="Load Object"]') as HTMLButtonElement);
+    const dialog = await view.findByRole("alertdialog", { name: "Load Object" });
+    await waitFor(() => expect(dialog.textContent).toContain(SYNTHETIC_REFUSED_PREVIEW.refusal as string));
+    expect(dialog.querySelector('button[type="submit"]')).toBeNull();
+    expect(onRunMaintenance).not.toHaveBeenCalled();
   });
 });

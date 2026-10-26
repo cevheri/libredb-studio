@@ -24,8 +24,14 @@ const mockProvider = createMockProvider();
 const mockGetOrCreateProvider = mock(async () => mockProvider);
 
 // ─── Mock auth + seed resolution BEFORE importing the route ─────────────────
+const mockGetSession = mock(async () => ({ role: "admin", username: "admin" }));
+
 mock.module("@/lib/auth", () => ({
-  getSession: mock(async () => ({ role: "admin", username: "admin" })),
+  getSession: mockGetSession,
+  readSession: mock(async () => {
+    const s = await mockGetSession();
+    return s ? { kind: "authenticated", session: s } : { kind: "anonymous" };
+  }),
   signJWT: mock(async () => "mock-token"),
   verifyJWT: mock(async () => null),
   login: mock(async () => {}),
@@ -219,5 +225,30 @@ describe("POST /api/db/health", () => {
 
     expect(res.status).toBe(500);
     expect(data.error).toBe("Unexpected failure");
+  });
+});
+
+// A JSON `null` body or one that is not JSON at all answered 500 INTERNAL_ERROR with the runtime's own text ("Cannot destructure property 'connection' ...").
+// Any body that is not a JSON object is the caller's malformed request, answered before any connection resolves.
+describe("POST /api/db/health: a body that is not a JSON object", () => {
+  test.each<[string, string]>([
+    ["null", "null"],
+    ["an array", "[]"],
+    ["a number", "7"],
+    ["a string", '"x"'],
+    ["text that is not JSON", "{not json"],
+  ])("a body that is %s answers 400 and opens no provider", async (_label, raw) => {
+    mockGetOrCreateProvider.mockClear();
+    const res = await POST(
+      new Request("http://localhost:3000/api/db/health", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: raw,
+      }) as never,
+    );
+
+    expect(res.status).toBe(400);
+    expect(await parseResponseJSON(res)).toEqual({ error: "Invalid request body" });
+    expect(mockGetOrCreateProvider).not.toHaveBeenCalled();
   });
 });

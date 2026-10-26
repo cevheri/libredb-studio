@@ -1,13 +1,15 @@
 import { describe, test, expect } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { classifyValue } from "@/components/results-grid/renderers/classify";
 import { getRenderer } from "@/components/results-grid/renderers/registry";
 import { jsonRenderer } from "@/components/results-grid/renderers/json";
 import { nullRenderer } from "@/components/results-grid/renderers/null";
 import { scalarRenderer } from "@/components/results-grid/renderers/scalar";
 import { binaryRenderer } from "@/components/results-grid/renderers/binary";
-import type { ValueKind } from "@/components/results-grid/renderers/types";
+import { vectorRenderer } from "@/components/results-grid/renderers/vector";
+import type { RenderContext, ValueKind } from "@/components/results-grid/renderers/types";
+import { SHIPPED_DATABASE_TYPES } from "@/lib/db/compatibility";
 
 // =============================================================================
 // classifyValue — value-shape classification (#96)
@@ -71,6 +73,41 @@ describe("classifyValue", () => {
     expect(classifyValue("[1, 2")).toBe("scalar");
     expect(classifyValue("plain text with { braces }")).toBe("scalar");
   });
+
+  test("a vector-shaped value without its column's declaration stays json, as it always was", () => {
+    expect(classifyValue([0.1, 0.2])).toBe("json");
+    expect(
+      classifyValue([
+        [1, 2],
+        [3, 4],
+      ]),
+    ).toBe("json");
+    expect(classifyValue({ indices: [1], values: [0.5] })).toBe("json");
+    expect(classifyValue({ "3": 0.5 })).toBe("json");
+  });
+
+  test("a declared vector column classifies a value of its shape as vector", () => {
+    const dense: RenderContext = { vector: { kind: "dense", dtype: "float32", dimension: 2 } };
+    const multi: RenderContext = { vector: { kind: "multi", dtype: "float32", dimension: 2 } };
+    const sparse: RenderContext = {
+      vector: { kind: "sparse", dtype: "float32", dimension: null, sparseEncoding: "indices-values" },
+    };
+    expect(classifyValue([0.1, 0.2], dense)).toBe("vector");
+    expect(classifyValue([[1, 2]], multi)).toBe("vector");
+    expect(classifyValue({ indices: [1], values: [0.5] }, sparse)).toBe("vector");
+  });
+
+  test("a declared column whose value is not of its shape keeps that shape's own kind", () => {
+    // A masked cell and a pending edit hold text, and a host may hand JSON as a string: each renders as itself.
+    const dense: RenderContext = { vector: { kind: "dense", dtype: "float32", dimension: 2 } };
+    expect(classifyValue("***", dense)).toBe("scalar");
+    expect(classifyValue("[0.1,0.2]", dense)).toBe("json");
+    expect(classifyValue({ a: 1 }, dense)).toBe("json");
+    expect(classifyValue([Number.POSITIVE_INFINITY], dense)).toBe("json");
+    expect(classifyValue({ type: "Buffer", data: [1, 2] }, dense)).toBe("binary");
+    expect(classifyValue(null, dense)).toBe("null");
+    expect(classifyValue(undefined, dense)).toBe("null");
+  });
 });
 
 // =============================================================================
@@ -83,14 +120,15 @@ describe("getRenderer", () => {
     expect(getRenderer("scalar")).toBe(scalarRenderer);
     expect(getRenderer("json")).toBe(jsonRenderer);
     expect(getRenderer("binary")).toBe(binaryRenderer);
+    expect(getRenderer("vector")).toBe(vectorRenderer);
   });
 
   test("falls back to the scalar renderer for an unregistered kind", () => {
-    expect(getRenderer("vector" as ValueKind)).toBe(scalarRenderer);
+    expect(getRenderer("matrix" as ValueKind)).toBe(scalarRenderer);
   });
 
   test("every renderer declares the kind it is registered under", () => {
-    for (const kind of ["null", "scalar", "json", "binary"] as const) {
+    for (const kind of ["null", "scalar", "json", "binary", "vector"] as const) {
       expect(getRenderer(kind).kind).toBe(kind);
     }
   });
@@ -109,11 +147,11 @@ describe("renderCompact", () => {
   test("jsonRenderer compact-stringifies objects and arrays on a single line", () => {
     expect(jsonRenderer.renderCompact({ a: 1 })).toEqual({
       display: '{"a":1}',
-      className: "text-blue-400/80 italic font-light",
+      className: "text-hue-blue/80 italic font-light",
     });
     expect(jsonRenderer.renderCompact([1, 2])).toEqual({
       display: "[1,2]",
-      className: "text-blue-400/80 italic font-light",
+      className: "text-hue-blue/80 italic font-light",
     });
   });
 
@@ -125,15 +163,15 @@ describe("renderCompact", () => {
   test("binaryRenderer renders hex in the cell and truncates a long value with its size", () => {
     expect(binaryRenderer.renderCompact({ type: "Buffer", data: [1, 2, 171, 255] })).toEqual({
       display: "\\x0102abff",
-      className: "text-cyan-400/80 font-mono",
+      className: "text-hue-cyan/80 font-mono",
     });
     const long = new Uint8Array(1024 * 1024).fill(0xab);
     expect(binaryRenderer.renderCompact(long).display).toBe(`\\x${"ab".repeat(32)}... (1.0 MB)`);
   });
 
   test("scalarRenderer keeps the status-string coloring", () => {
-    expect(scalarRenderer.renderCompact("active")).toEqual({ display: "active", className: "text-emerald-500/90" });
-    expect(scalarRenderer.renderCompact("disabled")).toEqual({ display: "disabled", className: "text-rose-500/90" });
+    expect(scalarRenderer.renderCompact("active")).toEqual({ display: "active", className: "text-hue-emerald/90" });
+    expect(scalarRenderer.renderCompact("disabled")).toEqual({ display: "disabled", className: "text-hue-rose/90" });
     expect(scalarRenderer.renderCompact("plain")).toEqual({ display: "plain", className: "text-fg-secondary" });
   });
 });
@@ -185,6 +223,16 @@ describe("renderDetail", () => {
     expect(jsonRenderer.renderDetail('{\n    "id": 1\n}').text).toBe('{\n  "id": 1\n}');
   });
 
+  test("jsonRenderer parses the trimmed text classifyValue parsed, so a leading U+00A0 never throws", () => {
+    // String.prototype.trim drops U+00A0 but JSON.parse rejects it as a token.
+    const nbsp = ' {"a":1}';
+    expect(classifyValue(nbsp)).toBe("json");
+    expect(jsonRenderer.renderDetail(nbsp).text).toBe('{\n  "a": 1\n}');
+    // A lossy value with the same padding keeps its stored text as-is.
+    const nbspLossy = ' {"n":9007199254740993}';
+    expect(jsonRenderer.renderDetail(nbspLossy).text).toBe(nbspLossy);
+  });
+
   test("jsonRenderer keeps the raw string when the number round-trip would lose fidelity", () => {
     // 9007199254740993 > 2^53: JSON.parse would round it to ...992, so the
     // detail sheet must show the stored text, not the canonicalized lie.
@@ -208,10 +256,16 @@ describe("renderDetail", () => {
     const long = new Uint8Array(1024).fill(0xab);
     expect(binaryRenderer.renderDetail(long)).toEqual({
       text: `\\x${"ab".repeat(1024)}`,
-      className: "text-cyan-400/80 font-mono",
+      className: "text-hue-cyan/80 font-mono",
       preserveWhitespace: false,
     });
     expect(binaryRenderer.renderDetail({ type: "Buffer", data: [] }).text).toBe("\\x");
+  });
+
+  test("binaryRenderer copies the whole value, the form the detail sheet and the export write", () => {
+    const long = new Uint8Array(1024 * 1024).fill(0xab);
+    expect(binaryRenderer.renderCopy?.(long)).toBe(`\\x${"ab".repeat(1024 * 1024)}`);
+    expect(binaryRenderer.renderCopy?.({ type: "Buffer", data: [] })).toBe("\\x");
   });
 
   test("whitespace inside JSON string values never triggers the raw fallback", () => {
@@ -229,14 +283,43 @@ describe("renderDetail", () => {
 // =============================================================================
 
 describe("rendering layer is provider-agnostic", () => {
-  test("no connection-type identifiers in the renderer modules or the formatter", () => {
-    const renderersDir = join(process.cwd(), "src/components/results-grid/renderers");
-    const sources = readdirSync(renderersDir).map((f) => join(renderersDir, f));
-    sources.push(join(process.cwd(), "src/components/results-grid/utils.ts"));
+  // Anchored to this file rather than to process.cwd(), so the scan is correct whoever launches it.
+  const root = resolve(import.meta.dir, "../../..");
+  const renderersDir = join(root, "src/components/results-grid/renderers");
 
-    const providerTypeIds = /\b(postgres|mysql|sqlite|oracle|mssql|mongodb|redis|libredb)\b/i;
+  test("no connection-type identifier in the renderer modules or the formatter", () => {
+    const sources = readdirSync(renderersDir).map((f) => join(renderersDir, f));
+    sources.push(join(root, "src/components/results-grid/utils.ts"));
+
+    // Every DatabaseType member, read from the exhaustive SHIPPED record rather than listed here, so a type-id
+    // added later is forbidden the day it lands.
+    const providerTypeIds = new RegExp(`\\b(${SHIPPED_DATABASE_TYPES.join("|")})\\b`, "i");
     for (const file of sources) {
       expect(readFileSync(file, "utf8")).not.toMatch(providerTypeIds);
+    }
+  });
+
+  test("the vector renderer names no engine, vendor path, or native type or metric spelling", () => {
+    const text = readFileSync(join(renderersDir, "vector.ts"), "utf8");
+    const spellings = [
+      /\bmilvus\b/i,
+      /\bqdrant\b/i,
+      /\bzilliz\b/i,
+      /\/v2\/vectordb\//,
+      /collections\/\{/,
+      /\bFloatVector\b/,
+      /\bSparseFloatVector\b/,
+      /\bFloat16Vector\b/,
+      /\bBFloat16Vector\b/,
+      /\bInt8Vector\b/,
+      /\bBinaryVector\b/,
+      /\bCOSINE\b/,
+      /\bEuclid\b/,
+      /\bHNSW\b/,
+      /\bAUTOINDEX\b/,
+    ];
+    for (const spelling of spellings) {
+      expect(text).not.toMatch(spelling);
     }
   });
 });

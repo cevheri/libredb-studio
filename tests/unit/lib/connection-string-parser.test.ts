@@ -1,5 +1,16 @@
 import { describe, test, expect } from "bun:test";
-import { parseConnectionString, detectConnectionStringType, ENGINE_URI_SCHEMES } from "@/lib/connection-string-parser";
+import {
+  parseConnectionString,
+  detectConnectionStringType,
+  ENGINE_URI_SCHEMES,
+  DATABEND_DSN_CAUTIONS,
+  DATABEND_DSN_REFUSALS,
+  DATABEND_SSLMODE_NOTICES,
+  databendNotAppliedNotice,
+  SNOWFLAKE_PASTE_SENTENCES,
+} from "@/lib/connection-string-parser";
+import { getDBConfig } from "@/lib/db-ui-config";
+import { SPARK_PASTE_SENTENCES } from "@/lib/db/providers/sql/spark/sc-uri";
 import type { SSLMode } from "@/lib/types";
 
 // ─── parseConnectionString ──────────────────────────────────────────────────
@@ -51,6 +62,92 @@ describe("parseConnectionString", () => {
       expect(result!.user).toBe("user@name");
       expect(result!.password).toBe("p@ss#word");
     });
+
+    test("percent-decodes the database name, and keeps a broken escape as written", () => {
+      expect(parseConnectionString("postgres://us%3Aer:pw@host:5432/my%20db")!.database).toBe("my db");
+      expect(parseConnectionString("postgres://u:pw@h:5432/%E5%9C%A8")!.database).toBe("在");
+      expect(parseConnectionString("postgres://u:pw@h:5432/my%ZZdb")!.database).toBe("my%ZZdb");
+      expect(parseConnectionString("postgres://u:pw@host:5432/")!.database).toBeUndefined();
+    });
+  });
+
+  describe("postgres:// URL query parameters (libpq keywords)", () => {
+    test("reads host, port, user and password from the query string", () => {
+      const result = parseConnectionString("postgres:///app?host=db.example.com&port=6543&user=alice&password=secret");
+      expect(result!.host).toBe("db.example.com");
+      expect(result!.port).toBe("6543");
+      expect(result!.user).toBe("alice");
+      expect(result!.password).toBe("secret");
+      expect(result!.database).toBe("app");
+    });
+
+    test("query parameters fill in fields the authority left out", () => {
+      const result = parseConnectionString("postgres://localhost/app?user=alice");
+      expect(result!.host).toBe("localhost");
+      expect(result!.user).toBe("alice");
+    });
+
+    test("dbname= overrides the path database the way libpq does", () => {
+      const result = parseConnectionString("postgres://alice@localhost/app?dbname=other");
+      expect(result!.database).toBe("other");
+    });
+
+    test("query parameters override the authority the way libpq does", () => {
+      const result = parseConnectionString("postgres://bob@db1.example.com:5432/app?host=db2.example.com&user=alice");
+      expect(result!.host).toBe("db2.example.com");
+      expect(result!.user).toBe("alice");
+      expect(result!.port).toBe("5432");
+    });
+
+    test("query parameter values keep their percent-encoding as typed", () => {
+      const result = parseConnectionString("postgres:///app?user=us%3Aer&password=pa%24%24word0");
+      expect(result!.user).toBe("us:er");
+      expect(result!.password).toBe("pa$$word0");
+    });
+
+    test("a double-encoded value stays double-encoded, not decoded twice", () => {
+      const result = parseConnectionString("postgres:///app?password=literal%252Fvalue");
+      expect(result!.password).toBe("literal%2Fvalue");
+    });
+
+    test("a plus in a query parameter value is a literal plus", () => {
+      const result = parseConnectionString("postgres:///app?password=pa+ss");
+      expect(result!.password).toBe("pa+ss");
+    });
+
+    test("a percent-encoded UTF-8 value decodes to the typed character", () => {
+      const result = parseConnectionString("postgres:///app?user=us%C3%A9r");
+      expect(result!.user).toBe("usér");
+    });
+
+    test("repeated query keys use the last value", () => {
+      const result = parseConnectionString("postgres:///app?host=db1.example.com&host=db2.example.com");
+      expect(result!.host).toBe("db2.example.com");
+    });
+
+    test("an empty last value still replaces an earlier one", () => {
+      const result = parseConnectionString("postgres:///app?password=old&password=");
+      expect(result!.password).toBe("");
+    });
+
+    test("a percent-encoded keyword name is decoded", () => {
+      const result = parseConnectionString("postgres:///app?ho%73t=db.example.com");
+      expect(result!.host).toBe("db.example.com");
+    });
+
+    test("an authority with only a userinfo and no host parses", () => {
+      const result = parseConnectionString("postgresql://@/app?host=db.example.com&user=alice&password=secret");
+      expect(result!.host).toBe("db.example.com");
+      expect(result!.user).toBe("alice");
+      expect(result!.password).toBe("secret");
+      expect(result!.database).toBe("app");
+    });
+
+    test("a userinfo-only authority falls back to localhost like the empty form", () => {
+      const result = parseConnectionString("postgres://alice@/app");
+      expect(result!.host).toBe("localhost");
+      expect(result!.user).toBe("alice");
+    });
   });
 
   // ── MySQL ───────────────────────────────────────────────────────────────
@@ -76,6 +173,11 @@ describe("parseConnectionString", () => {
       expect(result!.user).toBeUndefined();
       expect(result!.password).toBeUndefined();
       expect(result!.port).toBe("3307");
+    });
+
+    test("percent-decodes a non-ASCII database name", () => {
+      const result = parseConnectionString("mysql://u:pw@h:3306/caf%C3%A9");
+      expect(result!.database).toBe("café");
     });
   });
 
@@ -148,6 +250,75 @@ describe("parseConnectionString", () => {
     test("plain mongodb:// with no TLS parameter says nothing about TLS", () => {
       expect(parseConnectionString("mongodb://user:pass@host:27017/appdb")!.sslMode).toBeUndefined();
     });
+
+    // #842: an unescaped "@" in the password makes the auth/host split ambiguous instead
+    // of refusing - `p@ss:w#rd` read as password "p", host "ss".
+    describe("ambiguous credentials (#842)", () => {
+      test("more than one literal @ before the host is refused, not guessed at", () => {
+        const result = parseConnectionString("mongodb://user:p@ss:w#rd@realhost/db");
+        expect(result!.credentialsAmbiguous).toBe(true);
+        expect(result!.user).toBeUndefined();
+        expect(result!.password).toBeUndefined();
+        expect(result!.host).toBeUndefined();
+        // the original paste is still there for the connection-string mode to use
+        expect(result!.connectionString).toBe("mongodb://user:p@ss:w#rd@realhost/db");
+      });
+
+      test("a properly percent-encoded password never triggers it", () => {
+        const result = parseConnectionString("mongodb://user:p%40ss@host/db");
+        expect(result!.credentialsAmbiguous).toBeUndefined();
+        expect(result!.password).toBe("p@ss");
+      });
+
+      test("a normal multi-host replica set string never triggers it", () => {
+        const result = parseConnectionString("mongodb://user:pass@host1:27017,host2:27018/mydb?replicaSet=rs0");
+        expect(result!.credentialsAmbiguous).toBeUndefined();
+        expect(result!.host).toBe("host1");
+      });
+
+      test("a string with no credentials never triggers it", () => {
+        expect(parseConnectionString("mongodb://host:27017/db")!.credentialsAmbiguous).toBeUndefined();
+      });
+
+      // The driver accepts this string: its authority ends at the first "/" or "?".
+      test("an @ in an option value after a bare ? never triggers it", () => {
+        const result = parseConnectionString("mongodb://user:pass@host:27017?appName=me@laptop");
+        expect(result!.credentialsAmbiguous).toBeUndefined();
+        expect(result!.user).toBe("user");
+        expect(result!.password).toBe("pass");
+      });
+    });
+
+    // #842: AWS DocumentDB's own console gives out `tlsCAFile=global-bundle.pem`, which the
+    // driver reads as a path on the server process rather than the machine that pasted it.
+    describe("tlsCAFile (#842)", () => {
+      test("is reported rather than passed through silently", () => {
+        const result = parseConnectionString("mongodb://user:pass@host:27017/db?tls=true&tlsCAFile=global-bundle.pem");
+        expect(result!.tlsFileParam).toBe("tlsCAFile=global-bundle.pem");
+        // a CA file pins the chain to that CA rather than the system store, so the form lands
+        // on the mode whose CA box the paste banner points at
+        expect(result!.sslMode).toBe("verify-ca");
+      });
+
+      test("pins an SRV string to verify-ca as well", () => {
+        const uri = "mongodb+srv://user:pass@cluster0.example.net/db?tlsCAFile=ca.pem";
+        expect(parseConnectionString(uri)!.sslMode).toBe("verify-ca");
+      });
+
+      test("leaves a relaxed certificate check on require", () => {
+        const uri = "mongodb://user:pass@host/db?tls=true&tlsCAFile=ca.pem&tlsInsecure=true";
+        expect(parseConnectionString(uri)!.sslMode).toBe("require");
+      });
+
+      test("leaves TLS off when the URI turns it off", () => {
+        const uri = "mongodb://user:pass@host/db?tls=false&tlsCAFile=ca.pem";
+        expect(parseConnectionString(uri)!.sslMode).toBe("disable");
+      });
+
+      test("is absent for a string with no file-path TLS parameter", () => {
+        expect(parseConnectionString("mongodb://user:pass@host:27017/db?tls=true")!.tlsFileParam).toBeUndefined();
+      });
+    });
   });
 
   // ── Redis ───────────────────────────────────────────────────────────────
@@ -208,6 +379,57 @@ describe("parseConnectionString", () => {
     test("uses default port 1521 when omitted", () => {
       const result = parseConnectionString("oracle://user:pass@host/db");
       expect(result!.port).toBe("1521");
+    });
+  });
+
+  // ── Db2 LUW (#786) ──────────────────────────────────────────────────────
+
+  describe("db2:// URLs", () => {
+    test("parses a db2 URL into its fields", () => {
+      const result = parseConnectionString("db2://db2inst1:secret@db2host:50001/TESTDB");
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("db2");
+      expect(result!.host).toBe("db2host");
+      expect(result!.port).toBe("50001");
+      expect(result!.user).toBe("db2inst1");
+      expect(result!.password).toBe("secret");
+      expect(result!.database).toBe("TESTDB");
+      // A plain URL says nothing about TLS, so it leaves the form's mode alone.
+      expect(result!.sslMode).toBeUndefined();
+      expect(result!.unmappedTLSParam).toBeUndefined();
+    });
+
+    test("uses default port 50000 when omitted", () => {
+      expect(parseConnectionString("db2://user:pass@host/SAMPLE")!.port).toBe("50000");
+    });
+
+    // `verify-system`, not `require`, by D26's rule and the Db2 provider's own: without verified
+    // TLS the password can reach a server that impersonates the host, so TLS is verified unless a reader
+    // chooses otherwise in the panel. A self-hosted Db2 with a private CA then fails closed on the
+    // chain, and its CA certificate is what the panel asks for.
+    test.each(["ssl=true", "ssl=1", "ssl=TRUE", "security=SSL", "security=ssl", "Security=SSL"])(
+      "?%s asks for verified TLS",
+      (query) => {
+        const result = parseConnectionString(`db2://u:p@host:50001/TESTDB?${query}`);
+        expect(result!.sslMode).toBe("verify-system");
+        expect(result!.unmappedTLSParam).toBeUndefined();
+      },
+    );
+
+    test.each(["ssl=false", "ssl=0"])("?%s asks for plaintext", (query) => {
+      const result = parseConnectionString(`db2://u:p@host/TESTDB?${query}`);
+      expect(result!.sslMode).toBe("disable");
+    });
+
+    test("an unknown value is reported rather than guessed", () => {
+      expect(parseConnectionString("db2://u:p@host/TESTDB?ssl=maybe")!.unmappedTLSParam).toBe("ssl=maybe");
+      expect(parseConnectionString("db2://u:p@host/TESTDB?security=CLEARTEXT")!.unmappedTLSParam).toBe(
+        "security=CLEARTEXT",
+      );
+    });
+
+    test("db2 publishes its scheme", () => {
+      expect(ENGINE_URI_SCHEMES.db2).toBe("db2");
     });
   });
 
@@ -581,6 +803,42 @@ describe("parseConnectionString", () => {
       expect(result!.password).toBe("pass123");
     });
 
+    test("strips the tcp: protocol prefix the Azure portal writes in Server", () => {
+      const result = parseConnectionString(
+        "Server=tcp:myserver.database.windows.net,1433;Initial Catalog=mydb;Persist Security Info=False;User ID=myuser;Password=secret;MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;",
+      );
+      expect(result!.host).toBe("myserver.database.windows.net");
+      expect(result!.port).toBe("1433");
+      expect(result!.database).toBe("mydb");
+      expect(result!.user).toBe("myuser");
+      expect(result!.sslMode).toBe("verify-full");
+    });
+
+    test("strips the tcp: prefix case-insensitively and without a port", () => {
+      const result = parseConnectionString("Server=TCP:myserver;Database=mydb;");
+      expect(result!.host).toBe("myserver");
+      expect(result!.port).toBe("1433");
+    });
+
+    test("keeps a host that only starts with the letters tcp", () => {
+      expect(parseConnectionString("Server=tcp-gateway,1433;")!.host).toBe("tcp-gateway");
+    });
+
+    test("reports a named-pipes server instead of writing it into host", () => {
+      const result = parseConnectionString("Server=np:myserver;Database=mydb;User Id=sa;");
+      expect(result!.host).toBeUndefined();
+      expect(result!.port).toBeUndefined();
+      expect(result!.unsupportedServerProtocol).toBe("np");
+      expect(result!.database).toBe("mydb");
+      expect(result!.user).toBe("sa");
+    });
+
+    test("reports a shared-memory server, keeping the prefix as it was pasted", () => {
+      const result = parseConnectionString("Server=LPC:myserver;");
+      expect(result!.host).toBeUndefined();
+      expect(result!.unsupportedServerProtocol).toBe("LPC");
+    });
+
     test("handles Data Source alias", () => {
       const result = parseConnectionString("Data Source=db-host,1450;Database=app;");
       // "Data Source=..." starts with "Data", not "Server", so it won't match /^Server\s*=/i
@@ -625,6 +883,10 @@ describe("parseConnectionString", () => {
 // ─── detectConnectionStringType ─────────────────────────────────────────────
 
 describe("detectConnectionStringType", () => {
+  test("detects db2://", () => {
+    expect(detectConnectionStringType("db2://host")).toBe("db2");
+  });
+
   test("detects postgres://", () => {
     expect(detectConnectionStringType("postgres://host")).toBe("postgres");
   });
@@ -1092,4 +1354,908 @@ describe("parseConnectionString: TLS parameters", () => {
       expect(result!.unmappedTLSParam).toBe("tls=maybe");
     });
   });
+});
+
+// ─── databend:// DSNs (Databend design 6.2) ─────────────────────────────────
+
+describe("parseConnectionString: databend:// DSNs", () => {
+  test("a Databend Cloud DSN fills every field, with TLS verified and the warehouse", () => {
+    const result = parseConnectionString(
+      "databend://cloudapp:p%40ss@tn3ftqihs.gw.aws-us-east-2.default.databend.com:443/default?warehouse=small-xy2t",
+    );
+    expect(result).toEqual({
+      type: "databend",
+      host: "tn3ftqihs.gw.aws-us-east-2.default.databend.com",
+      port: "443",
+      user: "cloudapp",
+      password: "p@ss",
+      database: "default",
+      warehouse: "small-xy2t",
+      sslMode: "verify-system",
+      allowInsecureAuth: false,
+    });
+  });
+
+  test("a DSN gives no consent to a password without TLS, so every Databend paste clears it", () => {
+    for (const dsn of [
+      "databend://u:p@host/db",
+      "databend+http://u:p@host:8000/db",
+      "databend+https://u:p@host/db?sslmode=disable",
+      "databend://u:p@host/db?sslmode=verify-full",
+    ]) {
+      expect(parseConnectionString(dsn)!.allowInsecureAuth, dsn).toBe(false);
+    }
+    // Db2's form shares the box, and a db2:// paste says nothing of it, so it leaves it as it was.
+    expect(parseConnectionString("db2://u:p@host:50000/db")).not.toHaveProperty("allowInsecureAuth");
+    // A refusal fills nothing.
+    expect(parseConnectionString("databend://u:p@host/db#x")).not.toHaveProperty("allowInsecureAuth");
+  });
+
+  test("TLS is on unless sslmode=disable, as BendSQL reads the DSN", () => {
+    expect(parseConnectionString("databend://root:@localhost:8000/default")!.sslMode).toBe("verify-system");
+    const plain = parseConnectionString("databend://root:@localhost:8000/?sslmode=disable")!;
+    expect(plain.sslMode).toBe("disable");
+    expect(plain.port).toBe("8000");
+    expect(plain.user).toBe("root");
+    expect(plain.password).toBeUndefined();
+    expect(plain.database).toBeUndefined();
+  });
+
+  test("databend+http:// is plaintext and databend+https:// is TLS", () => {
+    const http = parseConnectionString("databend+http://root:@localhost:8000/default")!;
+    expect(http.type).toBe("databend");
+    expect(http.sslMode).toBe("disable");
+    expect(http.port).toBe("8000");
+    expect(parseConnectionString("databend+https://root:@db.example.com/default")!.sslMode).toBe("verify-system");
+  });
+
+  test("a DSN without a port gets 443 with TLS and 80 without, never the form's 8000", () => {
+    expect(getDBConfig("databend").defaultPort).toBe("8000");
+    expect(parseConnectionString("databend://u:p@host/db")!.port).toBe("443");
+    expect(parseConnectionString("databend+https://u:p@host/db")!.port).toBe("443");
+    expect(parseConnectionString("databend://u:p@host/db?sslmode=disable")!.port).toBe("80");
+    expect(parseConnectionString("databend+http://u:p@host/db")!.port).toBe("80");
+  });
+
+  test("an empty host reads as localhost", () => {
+    expect(parseConnectionString("databend:///db?sslmode=disable")!.host).toBe("localhost");
+  });
+
+  test("user and password are percent-decoded, and a broken escape is kept as written", () => {
+    const result = parseConnectionString("databend://us%40er:p%3Aw%2Fd@host/db")!;
+    expect(result.user).toBe("us@er");
+    expect(result.password).toBe("p:w/d");
+    expect(parseConnectionString("databend://u:100%25%zz@host/db")!.password).toBe("100%25%zz");
+  });
+
+  test("the database path is percent-decoded, and a broken escape is kept as written", () => {
+    expect(parseConnectionString("databend://u:p@host/my%20db")!.database).toBe("my db");
+    expect(parseConnectionString("databend://u:p@host/caf%C3%A9")!.database).toBe("café");
+    expect(parseConnectionString("databend://u:p@host/%E5%9C%A8")!.database).toBe("在");
+    expect(parseConnectionString("databend://u:p@host/my%ZZdb")!.database).toBe("my%ZZdb");
+  });
+
+  test("a # anywhere is refused, because it ends the URL", () => {
+    const result = parseConnectionString("databend://root:pa#ss@host:443/db");
+    expect(result).toEqual({ type: "databend", refusal: DATABEND_DSN_REFUSALS.fragment });
+    expect(DATABEND_DSN_REFUSALS.fragment).toBe(
+      "The DSN contains #, which ends a URL: percent-encode it as %23, or type the password in its own field.",
+    );
+  });
+
+  test.each([
+    "databend://cloudapp:2024/Secret-Tail@tenant.gw.aws-us-east-2.default.databend.com:443/default?warehouse=w1",
+    "databend://cloudapp:2024?Secret-Tail@tenant.gw.aws-us-east-2.default.databend.com:443/default",
+    "databend://cloudapp:/Secret-Tail@tenant.gw.aws-us-east-2.default.databend.com:443/default",
+    "databend://cloudapp:Secret/Tail@tenant.gw.aws-us-east-2.default.databend.com:443/default",
+    "databend://cloudapp:Secret?Tail@tenant.gw.aws-us-east-2.default.databend.com:443/default",
+    "databend://cloud/app:Secret-Tail@tenant.gw.aws-us-east-2.default.databend.com:443/default",
+  ])(
+    "a / or ? before the sign-in's @ is refused, since the URL parser would read the rest as the path: %s",
+    (input) => {
+      const result = parseConnectionString(input);
+      expect(result).toEqual({ type: "databend", refusal: DATABEND_DSN_REFUSALS.userinfo });
+      expect(JSON.stringify(result)).not.toContain("Tail");
+    },
+  );
+
+  // The same text is the other reading when the @ is the path's or a parameter's, so the sentence names both.
+  test.each([
+    "databend://db.example.com:8000/default?role=analyst@corp",
+    "databend://db.example.com:8000/default?tls_ca_file=/home/jane@corp.example/ca.pem",
+    "databend://db.example.com:8000/team@corp",
+  ])("an @ past the address part of a DSN with no sign-in is refused, naming both readings: %s", (input) => {
+    expect(parseConnectionString(input)).toEqual({ type: "databend", refusal: DATABEND_DSN_REFUSALS.userinfo });
+    expect(DATABEND_DSN_REFUSALS.userinfo).toBe(
+      "The DSN has an @ after a / or ?, which end the address part of a URL: percent-encode a /, ? or @ in the user or password as %2F, %3F or %40, or type the password in its own field, and an @ in the path or a parameter as %40.",
+    );
+  });
+
+  // A password may hold an unencoded @ before its / or ?, so an @ in the address part does not settle which @ signs in:
+  // `root:p@ss/x@host` would read host `ss` and put the rest of the password in Database.
+  test.each([
+    "databend://root:p@ss/x@db.example.com:8000/default",
+    "databend://root:p@ss?x@db.example.com:8000/default",
+    "databend://root:pw@db.example.com:8000/default?role=analyst@corp",
+    "databend://root@db.example.com:8000/default?tls_ca_file=/home/jane@corp.example/ca.pem",
+    "databend://root@db.example.com:8000/team@corp",
+  ])("an @ past the address part is refused even when the address part holds one: %s", (input) => {
+    const result = parseConnectionString(input);
+    expect(result).toEqual({ type: "databend", refusal: DATABEND_DSN_REFUSALS.userinfo });
+    expect(JSON.stringify(result)).not.toContain("ss/x");
+  });
+
+  test("percent-encoded, an @ of the password, the path or a parameter reads one way only", () => {
+    const password = parseConnectionString("databend://root:p%40ss%2Fx@db.example.com:8000/default")!;
+    expect([password.user, password.password, password.host, password.database]).toEqual([
+      "root",
+      "p@ss/x",
+      "db.example.com",
+      "default",
+    ]);
+    const role = parseConnectionString("databend://root:pw@db.example.com:8000/default?role=analyst%40corp")!;
+    expect(role.refusal).toBeUndefined();
+    expect(role.ignoredParameters).toEqual(["role"]);
+    expect(parseConnectionString("databend://root@db.example.com:8000/team%40corp")!.refusal).toBeUndefined();
+    const encoded = parseConnectionString("databend://db.example.com:8000/default?role=analyst%40corp")!;
+    expect(encoded.refusal).toBeUndefined();
+    expect(encoded.ignoredParameters).toEqual(["role"]);
+  });
+
+  test("a percent-encoded / or ? in the sign-in, and an @ only before the path, still parse", () => {
+    const encoded = parseConnectionString("databend://cloudapp:2024%2FSecret%3FTail@host:443/default?warehouse=w1")!;
+    expect([encoded.user, encoded.password, encoded.host, encoded.database]).toEqual([
+      "cloudapp",
+      "2024/Secret?Tail",
+      "host",
+      "default",
+    ]);
+    expect(parseConnectionString("databend://root@host:8000/default?sslmode=disable")!.refusal).toBeUndefined();
+    expect(parseConnectionString("databend:///default?sslmode=disable")!.refusal).toBeUndefined();
+  });
+
+  test("tls_ca_file is not applied: a caution says Studio reads no CA path and where the certificate goes", () => {
+    const result = parseConnectionString("databend://u:p@host/db?tls_ca_file=/etc/databend/ca.pem")!;
+    expect(result.cautions).toEqual([DATABEND_DSN_CAUTIONS.caFile]);
+    expect(result.tlsFileParam).toBeUndefined();
+    expect(result.ignoredParameters).toBeUndefined();
+    expect(result.sslMode).toBe("verify-system");
+    // Named, never valued: the path stays in the parser.
+    expect(JSON.stringify(result)).not.toContain("/etc/databend/ca.pem");
+    expect(DATABEND_DSN_CAUTIONS.caFile).toBe(
+      "Studio reads no CA file path from a DSN, so tls_ca_file was not applied: paste the certificate's contents into the CA field under SSL / TLS.",
+    );
+  });
+
+  test("an sslmode BendSQL does not read gets Databend's own caution, not the form's TLS sentence", () => {
+    const result = parseConnectionString("databend://u:p@host/db?sslmode=verify-full")!;
+    expect(result.cautions).toEqual([DATABEND_DSN_CAUTIONS.sslmode("verify-full")]);
+    expect(result.unmappedTLSParam).toBeUndefined();
+    expect(result.sslMode).toBeUndefined();
+    expect(DATABEND_DSN_CAUTIONS.sslmode("verify-full")).toBe(
+      "sslmode=verify-full is not a Databend DSN mode (BendSQL reads disable, require and enable), so SSL mode was left as it was: choose one under SSL / TLS.",
+    );
+    const both = parseConnectionString("databend://u:p@host/db?sslmode=verify-ca&tls_ca_file=/ca.pem")!;
+    expect(both.cautions).toEqual([DATABEND_DSN_CAUTIONS.sslmode("verify-ca"), DATABEND_DSN_CAUTIONS.caFile]);
+    expect(parseConnectionString("databend://u:p@host/db?sslmode=require")!.cautions).toBeUndefined();
+  });
+
+  test.each([
+    ["tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com", "eric"],
+    ["tnf34b0rm--elt-wh-medium.gw.aliyun-cn-beijing.default.databend.cn", "elt-wh-medium"],
+    ["Tenant--MyWH.GW.aws-us-east-2.default.Databend.COM.", "MyWH"],
+  ])("an older Databend Cloud host, %s, fills Warehouse from the host when the DSN has no warehouse=", (host, name) => {
+    const result = parseConnectionString(`databend://cloudapp@${host}:443/default`)!;
+    expect(result.host).toBe(host);
+    expect(result.warehouse).toBe(name);
+    expect(result.ignoredParameters).toBeUndefined();
+  });
+
+  test("warehouse= wins over the host's, and a host that is not an older Cloud host fills no Warehouse", () => {
+    const named = "databend://cloudapp@tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com:443/default";
+    expect(parseConnectionString(`${named}?warehouse=small-xy2t`)!.warehouse).toBe("small-xy2t");
+    expect(parseConnectionString(`${named}?warehouse=`)!.warehouse).toBe("eric");
+    for (const host of [
+      "tn3ftqihs.gw.aws-us-east-2.default.databend.com",
+      "tn3ftqihs--eric.ch.aws-us-east-2.default.databend.com",
+      "--eric.gw.aws-us-east-2.default.databend.com",
+      "tn3ftqihs--.gw.aws-us-east-2.default.databend.com",
+      "tn3ftqihs--e_ric.gw.aws-us-east-2.default.databend.com",
+      "tn3ftqihs--eric.gw.aws-us-east-2.default.databend.com.example.net",
+      "db--internal.example.com",
+      // Counted as Databend Cloud's for billing, but the older form is shown under databend.com and databend.cn only.
+      "tn3ftqihs--eric.gw.aws-us-east-2.default.tidbcloud.com",
+    ]) {
+      expect(parseConnectionString(`databend://cloudapp@${host}:443/default`)!.warehouse, host).toBeUndefined();
+    }
+  });
+
+  test("sslmode=require and sslmode=enable verify the certificate, with a notice saying so (X34)", () => {
+    const required = parseConnectionString("databend://u:p@host/db?sslmode=require")!;
+    expect(required.sslMode).toBe("verify-system");
+    expect(required.notice).toBe(DATABEND_SSLMODE_NOTICES.require);
+    expect(DATABEND_SSLMODE_NOTICES.require).toBe(
+      "sslmode=require in a Databend DSN verifies the certificate, as BendSQL does, so SSL mode is verify-system.",
+    );
+    const enabled = parseConnectionString("databend://u:p@host/db?sslmode=enable")!;
+    expect(enabled.sslMode).toBe("verify-system");
+    expect(enabled.notice).toBe(DATABEND_SSLMODE_NOTICES.enable);
+    expect(parseConnectionString("databend://u:p@host/db")!.notice).toBeUndefined();
+    expect(parseConnectionString("databend://u:p@host/db?sslmode=disable")!.notice).toBeUndefined();
+  });
+
+  test("an sslmode BendSQL refuses sets no mode and is reported, with the port the scheme's: 80 for +http, else 443", () => {
+    const result = parseConnectionString("databend://u:p@host/db?sslmode=verify-full")!;
+    expect(result.sslMode).toBeUndefined();
+    expect(result.cautions).toEqual([DATABEND_DSN_CAUTIONS.sslmode("verify-full")]);
+    expect(result.port).toBe("443");
+    const plain = parseConnectionString("databend+http://u:p@host/db?sslmode=verify-full")!;
+    expect(plain.sslMode).toBeUndefined();
+    expect(plain.cautions).toEqual([DATABEND_DSN_CAUTIONS.sslmode("verify-full")]);
+    expect(plain.port).toBe("80");
+    expect(parseConnectionString("databend+https://u:p@host/db?sslmode=verify-full")!.port).toBe("443");
+    // The DSN's own port wins over either default.
+    expect(parseConnectionString("databend+http://u:p@host:8000/db?sslmode=verify-full")!.port).toBe("8000");
+  });
+
+  test("BendSQL's own parameters are named once each, in order, and never valued; any other is counted", () => {
+    const result = parseConnectionString(
+      "databend://u:p@host/db?role=analyst_secret&enable_dphyp=1&warehouse=w1&tenant=t9&role=again&sslmode=disable",
+    )!;
+    expect(result.ignoredParameters).toEqual(["role", "tenant"]);
+    expect(result.unnamedParameters).toBe(1);
+    expect(result.warehouse).toBe("w1");
+    const text = JSON.stringify(result);
+    for (const value of ["analyst_secret", "again", "t9", "enable_dphyp"]) expect(text).not.toContain(value);
+    const plain = parseConnectionString("databend://u:p@host/db?warehouse=w1")!;
+    expect(plain.ignoredParameters).toBeUndefined();
+    expect(plain.unnamedParameters).toBeUndefined();
+  });
+
+  test.each([
+    // An unencoded & inside the password parameter's value: the rest of the value reads as a name of its own.
+    ["password=SENTINELA&SENTINELB", 2],
+    // A bare token, with no name=, is no parameter BendSQL names.
+    ["warehouse=w&SENTINELBARETOKEN", 1],
+    // A recognised name with no =, which can be the tail of a value split at an &, is counted too.
+    ["role", 1],
+    ["x=1&x=2&&SENTINELC", 2],
+  ])("a paste of %s names nothing from it and counts %d", (query, count) => {
+    const result = parseConnectionString(`databend://u:p@host/db?${query}`)!;
+    expect(result.refusal).toBeUndefined();
+    expect(result.ignoredParameters).toBeUndefined();
+    expect(result.unnamedParameters).toBe(count);
+    expect(JSON.stringify(result)).not.toContain("SENTINEL");
+  });
+
+  test("every parameter BendSQL reads by name and Studio does not apply is named", () => {
+    const names = [
+      "wait_time_secs",
+      "max_rows_in_buffer",
+      "max_rows_per_page",
+      "connect_timeout",
+      "page_request_timeout_secs",
+      "presign",
+      "tenant",
+      "role",
+      "login",
+      "session_token",
+      "body_format",
+      "query_result_format",
+      "retry_count",
+      "retry_delay_secs",
+    ];
+    const result = parseConnectionString(`databend://u:p@host/db?${names.map((name) => `${name}=1`).join("&")}`)!;
+    expect(result.ignoredParameters).toEqual(names);
+    expect(result.unnamedParameters).toBeUndefined();
+    // Percent-encoded, a name reads as the URL parser decodes it.
+    expect(parseConnectionString("databend://u:p@host/db?rol%65=r")!.ignoredParameters).toEqual(["role"]);
+  });
+
+  test("a repeated applied parameter takes its last value, as BendSQL's query_pairs loop does", () => {
+    const tls = parseConnectionString("databend://u:p@host/db?sslmode=disable&sslmode=require")!;
+    expect(tls.sslMode).toBe("verify-system");
+    expect(tls.port).toBe("443");
+    const plain = parseConnectionString("databend://u:p@host/db?sslmode=require&sslmode=disable")!;
+    expect(plain.sslMode).toBe("disable");
+    expect(plain.port).toBe("80");
+    expect(parseConnectionString("databend://u:p@host/db?warehouse=a&warehouse=b")!.warehouse).toBe("b");
+    // BendSQL refuses the DSN at an sslmode it cannot read, wherever it stands.
+    const refused = parseConnectionString("databend://u:p@host/db?sslmode=bogus&sslmode=disable")!;
+    expect(refused.sslMode).toBeUndefined();
+    expect(refused.cautions).toEqual([DATABEND_DSN_CAUTIONS.sslmode("bogus")]);
+  });
+
+  test("an IPv6 host and a password holding a raw @ or : are read as the URL parser splits them", () => {
+    const v6 = parseConnectionString("databend://u:p@[::1]:8000/db")!;
+    expect(v6.host).toBe("[::1]");
+    expect(v6.port).toBe("8000");
+    // The last @ ends the credentials and the first : ends the user.
+    const at = parseConnectionString("databend://u:p@ss@host/db")!;
+    expect([at.user, at.password, at.host]).toEqual(["u", "p@ss", "host"]);
+    const colon = parseConnectionString("databend://u:a:b@host/db")!;
+    expect([colon.user, colon.password, colon.host]).toEqual(["u", "a:b", "host"]);
+  });
+
+  test("the not-applied notice names the parameters, counts the rest and says what the connection takes", () => {
+    const takes =
+      "Studio's Databend connection takes host, port, user, password, database, warehouse and TLS; the other fields were filled in.";
+    expect(databendNotAppliedNotice(["role", "tenant"])).toBe(`Not applied: role, tenant. ${takes}`);
+    expect(databendNotAppliedNotice(["role"], 1)).toBe(`Not applied: role and 1 other parameter. ${takes}`);
+    expect(databendNotAppliedNotice(["role", "tenant"], 3)).toBe(
+      `Not applied: role, tenant and 3 other parameters. ${takes}`,
+    );
+    expect(databendNotAppliedNotice([], 1)).toBe(`Not applied: 1 parameter. ${takes}`);
+    expect(databendNotAppliedNotice([], 2)).toBe(`Not applied: 2 parameters. ${takes}`);
+  });
+
+  test("an empty warehouse= fills nothing", () => {
+    expect(parseConnectionString("databend://u:p@host/db?warehouse=")!.warehouse).toBeUndefined();
+  });
+
+  test.each(["access_token", "access_token_file", "private_key_file", "private_key_passphrase_file"])(
+    "%s refuses the paste and never echoes its value",
+    (name) => {
+      const result = parseConnectionString(`databend://u:p@host/db?warehouse=w&${name}=topsecret-value`);
+      expect(result).toEqual({ type: "databend", refusal: DATABEND_DSN_REFUSALS.signIn });
+      expect(JSON.stringify(result)).not.toContain("topsecret-value");
+    },
+  );
+
+  test.each([
+    ["databend+flight://root:@localhost:8900/db", "flight"],
+    ["databend+grpc://root:@localhost:8900/db", "flight"],
+    ["jdbc:databend://host:443/db?ssl=true", "jdbc"],
+    ['export BENDSQL_DSN="databend://root:pw@host:8000/db"', "shellExport"],
+    ["BENDSQL_DSN=databend://root:pw@host:8000/db", "shellExport"],
+  ] as const)("%s is refused with its own sentence", (input, key) => {
+    expect(parseConnectionString(input)).toEqual({ type: "databend", refusal: DATABEND_DSN_REFUSALS[key] });
+  });
+
+  test("each refusal sentence is its own", () => {
+    const sentences = Object.values(DATABEND_DSN_REFUSALS);
+    expect(new Set(sentences).size).toBe(sentences.length);
+    expect(DATABEND_DSN_REFUSALS.flight).toBe(
+      "Flight SQL (port 8900) is not supported: paste the HTTP DSN, databend://, for port 8000 or 443.",
+    );
+    expect(DATABEND_DSN_REFUSALS.shellExport).toBe("Paste the DSN itself: the databend:// text inside the quotes.");
+  });
+
+  test("a DSN the URL parser rejects parses to null", () => {
+    expect(parseConnectionString("databend://u:p@host:99999/db")).toBeNull();
+  });
+
+  test("databend is the engine's canonical scheme and detected from all three REST schemes", () => {
+    expect(ENGINE_URI_SCHEMES.databend).toBe("databend");
+    expect(detectConnectionStringType("databend://host")).toBe("databend");
+    expect(detectConnectionStringType("Databend+HTTP://host")).toBe("databend");
+    expect(detectConnectionStringType("databend+https://host")).toBe("databend");
+    expect(detectConnectionStringType("databend+flight://host:8900")).toBeNull();
+  });
+});
+
+// ─── Snowflake ──────────────────────────────────────────────────────────────
+
+describe("parseConnectionString: Snowflake URLs, decomposed into fields and never kept", () => {
+  /** No secret and no value the paste did not apply may appear anywhere in the result but its own field. */
+  const expectOnlyIn = (result: unknown, sentinel: string, field: string) => {
+    const copy = { ...(result as Record<string, unknown>) };
+    expect(copy[field]).toBe(sentinel);
+    delete copy[field];
+    expect(JSON.stringify(copy)).not.toContain(sentinel);
+  };
+
+  test("an account URL fills the account and keeps no connection string", () => {
+    const result = parseConnectionString("https://xy12345.us-east-2.aws.snowflakecomputing.com");
+    expect(result).toEqual({ type: "snowflake", host: "xy12345.us-east-2.aws.snowflakecomputing.com" });
+  });
+
+  test("a bare Snowflake host is claimed, and an identifier with no suffix is not", () => {
+    expect(parseConnectionString("myorg-myacct.snowflakecomputing.com")).toEqual({
+      type: "snowflake",
+      host: "myorg-myacct.snowflakecomputing.com",
+    });
+    expect(parseConnectionString("myorg-myacct")).toBeNull();
+  });
+
+  test("the scheme is read without regard to case, as the parameter names are (SF-024)", () => {
+    expect(parseConnectionString("JDBC:SNOWFLAKE://myorg-myacct.snowflakecomputing.com/?USER=x&ROLE=r")).toEqual({
+      type: "snowflake",
+      host: "myorg-myacct.snowflakecomputing.com",
+      user: "x",
+      role: "r",
+    });
+    expect(parseConnectionString("Snowflake://u@myorg-myacct/D")).toEqual({
+      type: "snowflake",
+      host: "myorg-myacct.snowflakecomputing.com",
+      user: "u",
+      database: "D",
+    });
+    expect(detectConnectionStringType("JDBC:Snowflake://myorg-myacct.snowflakecomputing.com/")).toBe("snowflake");
+  });
+
+  test("a Snowsight URL reads the account from its path", () => {
+    expect(parseConnectionString("https://app.snowflake.com/myorg/myacct/x")).toEqual({
+      type: "snowflake",
+      host: "myorg-myacct.snowflakecomputing.com",
+    });
+  });
+
+  test("a JDBC URL applies its parameters, the passphrase only to its field", () => {
+    const result = parseConnectionString(
+      "jdbc:snowflake://myorg-myacct.snowflakecomputing.com/?user=u&warehouse=wh&db=d&schema=s&role=r&authenticator=SNOWFLAKE_JWT&private_key_pwd=P-SENT",
+    );
+    expect(result).toEqual({
+      type: "snowflake",
+      host: "myorg-myacct.snowflakecomputing.com",
+      user: "u",
+      warehouse: "wh",
+      database: "d",
+      schema: "s",
+      role: "r",
+      authMethod: "keypair",
+      privateKeyPassphrase: "P-SENT",
+    });
+    expectOnlyIn(result, "P-SENT", "privateKeyPassphrase");
+    expect(result!.connectionString).toBeUndefined();
+  });
+
+  test("a SQLAlchemy URL reads user, account, database and schema, and names its password without applying it", () => {
+    const result = parseConnectionString("snowflake://u:PW-SENT@myorg-myacct/d/s?warehouse=wh&role=r");
+    expect(result).toEqual({
+      type: "snowflake",
+      host: "myorg-myacct.snowflakecomputing.com",
+      user: "u",
+      database: "d",
+      schema: "s",
+      warehouse: "wh",
+      role: "r",
+      notice: "Not applied: the password in the URL.",
+    });
+    expect(JSON.stringify(result)).not.toContain("PW-SENT");
+  });
+
+  test("names case-insensitively and values percent-decoded once", () => {
+    const result = parseConnectionString(
+      "jdbc:snowflake://myorg-myacct.snowflakecomputing.com/?USER=a%2540b&Database=my%20db&WAREHOUSE=wh",
+    );
+    expect(result).toMatchObject({ user: "a%40b", database: "my db", warehouse: "wh" });
+  });
+
+  test("a token is the access token, with pat sign-in unless an authenticator chose another", () => {
+    const result = parseConnectionString("https://myorg-myacct.snowflakecomputing.com/?token=S-SENT");
+    expect(result).toEqual({
+      type: "snowflake",
+      host: "myorg-myacct.snowflakecomputing.com",
+      password: "S-SENT",
+      authMethod: "pat",
+    });
+    expectOnlyIn(result, "S-SENT", "password");
+    expect(
+      parseConnectionString(
+        "jdbc:snowflake://myorg-myacct.snowflakecomputing.com/?authenticator=PROGRAMMATIC_ACCESS_TOKEN&token=T",
+      ),
+    ).toMatchObject({ authMethod: "pat", password: "T" });
+  });
+
+  test("an authenticator Studio does not sign in with is named and not applied", () => {
+    const result = parseConnectionString(
+      "jdbc:snowflake://myorg-myacct.snowflakecomputing.com/?authenticator=externalbrowser",
+    );
+    expect(result!.authMethod).toBeUndefined();
+    expect(result!.notice).toBe("Not applied: authenticator.");
+    expect(JSON.stringify(result)).not.toContain("externalbrowser");
+  });
+
+  test("an unnamed parameter is counted, and no name or value of one is echoed", () => {
+    const result = parseConnectionString("https://myorg-myacct.snowflakecomputing.com/?password=A&B&C=1");
+    expect(result!.notice).toBe("Not applied: password, and 2 other parameters.");
+    for (const text of ["=A", "B&", "C="]) expect(JSON.stringify(result)).not.toContain(text);
+    expect(result!.password).toBeUndefined();
+    const encoded = parseConnectionString("https://myorg-myacct.snowflakecomputing.com/?x%3DQ=1");
+    expect(encoded!.notice).toBe("Not applied: 1 other parameter.");
+    expect(JSON.stringify(encoded)).not.toContain("Q");
+  });
+
+  test("every secret-carrying name is named and never applied", () => {
+    const result = parseConnectionString(
+      "jdbc:snowflake://myorg-myacct.snowflakecomputing.com/?passcode=1&oauthClientSecret=2&oauth_client_secret=3&proxyPassword=4",
+    );
+    expect(result!.notice).toBe("Not applied: passcode, oauthClientSecret, oauth_client_secret, proxyPassword.");
+  });
+
+  test("insecureMode and disableOCSPChecks change nothing, are named, and the TLS sentence follows", () => {
+    const result = parseConnectionString(
+      "jdbc:snowflake://myorg-myacct.snowflakecomputing.com/?insecureMode=true&disableOCSPChecks=true&foo=1",
+    );
+    expect(result).toEqual({
+      type: "snowflake",
+      host: "myorg-myacct.snowflakecomputing.com",
+      notice: `Not applied: insecureMode, disableOCSPChecks, and 1 other parameter. ${SNOWFLAKE_PASTE_SENTENCES.tls}`,
+    });
+    expect(SNOWFLAKE_PASTE_SENTENCES.tls).toBe("Studio checks TLS whatever insecureMode or disableOCSPChecks say.");
+  });
+
+  test("an inline key refuses the whole paste by name, with the key absent from the refusal", () => {
+    const result = parseConnectionString(
+      "jdbc:snowflake://myorg-myacct.snowflakecomputing.com/?user=u&PRIVATE_KEY_BASE64=K-SENT",
+    );
+    expect(result).toEqual({
+      type: "snowflake",
+      refusal:
+        "Studio does not take private_key_base64 from a pasted URL. Paste the key itself into Private key, not inside a URL.",
+      discardPaste: true,
+    });
+    expect(JSON.stringify(result)).not.toContain("K-SENT");
+    for (const name of ["private_key", "private_key_raw", "privatekey"]) {
+      expect(parseConnectionString(`snowflake://u@myorg-myacct/?${name}=K`)!.refusal).toBe(
+        SNOWFLAKE_PASTE_SENTENCES.inlineKey(name),
+      );
+    }
+  });
+
+  test("a path parameter refuses the whole paste by the list's own name, with the path absent", () => {
+    for (const name of [
+      "private_key_file",
+      "private_key_path",
+      "token_file_path",
+      "client_config_file",
+      "DIAGNOSTICS_ALLOWLIST_FILE",
+      "CRL_RESPONSE_CACHE_DIR",
+      "ocsp_response_cache_filename",
+      "crl_cache_dir",
+    ]) {
+      const result = parseConnectionString(
+        `jdbc:snowflake://myorg-myacct.snowflakecomputing.com/?${name.toLowerCase()}=/etc/PATH-SENT`,
+      );
+      expect(result).toEqual({ type: "snowflake", refusal: SNOWFLAKE_PASTE_SENTENCES.path(name), discardPaste: true });
+      expect(JSON.stringify(result)).not.toContain("PATH-SENT");
+    }
+    expect(parseConnectionString("snowflake://u@myorg-myacct/?Connection_Diag_Log_Path=/tmp/PATH-SENT")!.refusal).toBe(
+      SNOWFLAKE_PASTE_SENTENCES.path("connection_diag_*_path"),
+    );
+    expect(SNOWFLAKE_PASTE_SENTENCES.path("private_key_file")).toBe(
+      "Studio does not take private_key_file from a pasted URL. Studio reads no file: paste the key's contents into Private key.",
+    );
+  });
+
+  test.each([
+    "jdbc:snowflake://attacker.com/?user=x",
+    "JDBC:SNOWFLAKE://attacker.com/",
+    "jdbc:snowflake://myorg-myacct/?user=x",
+    "jdbc:snowflake://xy12345.eu-central-1/",
+    "snowflake://x@attacker.com/z",
+    "snowflake://x@evil.example.org/z",
+  ])("%s names a host outside Snowflake and is refused, not rewritten under its domain (SF-028)", (text) => {
+    expect(parseConnectionString(text)).toEqual({
+      type: "snowflake",
+      refusal: SNOWFLAKE_PASTE_SENTENCES.foreignHost,
+      discardPaste: true,
+    });
+  });
+
+  test.each([
+    ["snowflake://u@xy12345.eu-central-1/d", "xy12345.eu-central-1.snowflakecomputing.com"],
+    ["snowflake://u@xy12345.us-east-2.aws.privatelink/d", "xy12345.us-east-2.aws.privatelink.snowflakecomputing.com"],
+    ["snowflake://u@myorg-myacct.snowflakecomputing.com/d", "myorg-myacct.snowflakecomputing.com"],
+    ["jdbc:snowflake://xy12345.eu-central-1.snowflakecomputing.com/", "xy12345.eu-central-1.snowflakecomputing.com"],
+  ])("%s keeps its account", (text, host) => {
+    expect(parseConnectionString(text)!.host).toBe(host);
+  });
+
+  test("an account the field would refuse refuses the paste with the account sentence", () => {
+    const result = parseConnectionString("snowflake://u:PW@my%20acct/d");
+    expect(result!.type).toBe("snowflake");
+    expect(result!.refusal).toBe(
+      "Enter an account identifier such as myorg-myaccount, or its https URL; a jdbc: or snowflake:// URL goes into Paste URL instead. Nothing was sent.",
+    );
+    expect(Object.keys(result!)).toEqual(["type", "refusal", "discardPaste"]);
+  });
+
+  test("an account URL on a port other than 443 is refused, and :443 is read as the account", () => {
+    expect(parseConnectionString("https://myorg-myacct.snowflakecomputing.com:8443/")).toEqual({
+      type: "snowflake",
+      refusal:
+        "Enter an account identifier such as myorg-myaccount, or its https URL; a jdbc: or snowflake:// URL goes into Paste URL instead. Nothing was sent.",
+      discardPaste: true,
+    });
+    expect(parseConnectionString("https://myorg-myacct.snowflakecomputing.com:443/")!.host).toBe(
+      "myorg-myacct.snowflakecomputing.com",
+    );
+  });
+
+  test("only a Snowflake refusal asks the form to discard the pasted text, since it may hold a token or a key", () => {
+    expect(parseConnectionString("snowflake://u@myorg-myacct/?private_key=K")!.discardPaste).toBe(true);
+    expect(parseConnectionString("https://myorg-myacct.snowflakecomputing.com/?token=S")).not.toHaveProperty(
+      "discardPaste",
+    );
+    // A Databend refusal leaves its text in the box to be corrected, as before.
+    expect(parseConnectionString("databend+flight://root:pw@db.example.com:8900/default")).not.toHaveProperty(
+      "discardPaste",
+    );
+  });
+
+  test("an authenticator named like an Object member is not a sign-in method", () => {
+    const result = parseConnectionString(
+      "jdbc:snowflake://myorg-myacct.snowflakecomputing.com/?authenticator=constructor",
+    );
+    expect(result!.authMethod).toBeUndefined();
+    expect(result!.notice).toBe("Not applied: authenticator.");
+  });
+
+  test("every other https:// paste still resolves to ClickHouse", () => {
+    const clickhouse = parseConnectionString("https://myacct.clickhouse.cloud:8443");
+    expect(clickhouse!.type).toBe("clickhouse");
+    expect(clickhouse!.host).toBe("myacct.clickhouse.cloud");
+    expect(parseConnectionString("https://snowflakecomputing.com.evil.example/")!.type).toBe("clickhouse");
+    expect(parseConnectionString("https://app.snowflake.com.evil.example/a/b")!.type).toBe("clickhouse");
+  });
+
+  test("detectConnectionStringType names snowflake for the same forms", () => {
+    expect(detectConnectionStringType("https://xy12345.us-east-2.aws.snowflakecomputing.com")).toBe("snowflake");
+    expect(detectConnectionStringType("jdbc:snowflake://a.snowflakecomputing.com/")).toBe("snowflake");
+    expect(detectConnectionStringType("snowflake://u@acct/d")).toBe("snowflake");
+    expect(detectConnectionStringType("https://ch.example.clickhouse.cloud")).toBe("clickhouse");
+  });
+});
+
+describe("parseConnectionString: sc:// addresses (Apache Spark)", () => {
+  test("hands an sc:// address to the Spark reader, which decomposes it into fields", () => {
+    expect(parseConnectionString("sc://spark.example.internal:15003/;use_ssl=true;token=abc")).toEqual({
+      type: "spark",
+      host: "spark.example.internal",
+      port: "15003",
+      password: "abc",
+      sslMode: "verify-system",
+    });
+  });
+
+  test("hands the JDBC form to the Spark reader, which refuses it and fills nothing", () => {
+    expect(parseConnectionString("jdbc:sc://h:15002")).toEqual({
+      type: "spark",
+      refusal: SPARK_PASTE_SENTENCES.jdbcPrefix,
+    });
+  });
+
+  test("ENGINE_URI_SCHEMES names no spark scheme: the login signature would show an address Spark refuses", () => {
+    expect(ENGINE_URI_SCHEMES.spark).toBeUndefined();
+  });
+});
+
+// ─── case-insensitive schemes (#1916) ───────────────────────────────────────
+
+describe("parseConnectionString: case-insensitive schemes (#1916)", () => {
+  test.each([
+    ["POSTGRES", "postgres", "5432"],
+    ["Postgres", "postgres", "5432"],
+    ["POSTGRESQL", "postgres", "5432"],
+    ["MYSQL", "mysql", "3306"],
+    ["Redis", "redis", "6379"],
+    ["ORACLE", "oracle", "1521"],
+    ["MSSQL", "mssql", "1433"],
+    ["SQLSERVER", "mssql", "1433"],
+    ["DB2", "db2", "50000"],
+    ["CLICKHOUSE", "clickhouse", "8123"],
+  ] as const)("parses %s:// URLs without regard to scheme case", (scheme, type, port) => {
+    const uri = `${scheme}://User:PaSS@Host/MyDB`;
+    expect(parseConnectionString(uri)).toMatchObject({
+      type,
+      host: "Host",
+      port,
+      user: "User",
+      password: "PaSS",
+      database: "MyDB",
+    });
+    expect(detectConnectionStringType(uri)).toBe(type);
+  });
+
+  test("keeps the case of the user, host and database under an uppercase scheme", () => {
+    expect(parseConnectionString("POSTGRES://User@Host/MyDB")).toMatchObject({
+      type: "postgres",
+      host: "Host",
+      user: "User",
+      database: "MyDB",
+    });
+  });
+
+  test("keeps the case of PostgreSQL query values and their existing precedence", () => {
+    expect(
+      parseConnectionString(
+        "POSTGRES://User:sec@Host/MyDB?user=QueryUser&password=QuErY%2FCase&host=QueryHost&dbname=QueryDB",
+      ),
+    ).toMatchObject({
+      type: "postgres",
+      host: "QueryHost",
+      user: "QueryUser",
+      password: "QuErY/Case",
+      database: "QueryDB",
+    });
+  });
+
+  test("normalizes POSTGRESQL:// before reading a userinfo-only authority", () => {
+    expect(parseConnectionString("POSTGRESQL://User@/MyDB")).toMatchObject({
+      type: "postgres",
+      host: "localhost",
+      user: "User",
+      database: "MyDB",
+    });
+  });
+
+  test("normalizes MONGODB:// and preserves the rest of the URI as typed", () => {
+    const suffix = "://User:PaSS@Host:27018/MyDB?appName=MyApp";
+    expect(parseConnectionString(`MONGODB${suffix}`)).toMatchObject({
+      type: "mongodb",
+      connectionString: `mongodb${suffix}`,
+      host: "Host",
+      port: "27018",
+      user: "User",
+      password: "PaSS",
+      database: "MyDB",
+    });
+  });
+
+  test("MONGODB+SRV:// keeps the SRV host handling and the verifying TLS default", () => {
+    const suffix = "://User:PaSS@Cluster.Example.com/MyDB?appName=MyApp";
+    const result = parseConnectionString(`MONGODB+SRV${suffix}`);
+    expect(result).toEqual({
+      type: "mongodb",
+      connectionString: `mongodb+srv${suffix}`,
+      user: "User",
+      password: "PaSS",
+      database: "MyDB",
+      sslMode: "verify-system",
+    });
+    expect(result).not.toHaveProperty("host");
+    expect(result).not.toHaveProperty("port");
+  });
+
+  test("REDISS:// still requires TLS and Redis:// still selects plaintext", () => {
+    expect(parseConnectionString("REDISS://User:PaSS@Host/MyDB")).toMatchObject({
+      type: "redis",
+      host: "Host",
+      port: "6379",
+      user: "User",
+      password: "PaSS",
+      database: "MyDB",
+      sslMode: "require",
+    });
+    expect(parseConnectionString("Redis://Host")!.sslMode).toBe("disable");
+  });
+
+  test.each([
+    ["DATABEND", "443", "verify-system"],
+    ["DATABEND+HTTPS", "443", "verify-system"],
+    ["DaTaBeNd+HtTpS", "443", "verify-system"],
+    ["DATABEND+HTTP", "80", "disable"],
+  ] as const)("parses %s:// with its existing TLS and port defaults", (scheme, port, sslMode) => {
+    const uri = `${scheme}://User:PaSS@Host/MyDB?warehouse=MyWH`;
+    expect(parseConnectionString(uri)).toEqual({
+      type: "databend",
+      host: "Host",
+      port,
+      user: "User",
+      password: "PaSS",
+      database: "MyDB",
+      warehouse: "MyWH",
+      sslMode,
+      allowInsecureAuth: false,
+    });
+    expect(detectConnectionStringType(uri)).toBe("databend");
+  });
+
+  test.each([
+    ["DATABEND+FLIGHT://Host/MyDB", DATABEND_DSN_REFUSALS.flight],
+    ["DaTaBeNd+GrPc://Host/MyDB", DATABEND_DSN_REFUSALS.flight],
+    ["JDBC:DATABEND://Host/MyDB", DATABEND_DSN_REFUSALS.jdbc],
+    ["jdbc:DataBend://Host/MyDB", DATABEND_DSN_REFUSALS.jdbc],
+  ])("keeps the existing refusal for %s", (uri, refusal) => {
+    expect(parseConnectionString(uri)).toEqual({ type: "databend", refusal });
+  });
+
+  test.each([
+    ["COUCHBASE", "8091", "disable"],
+    ["COUCHBASES", "18091", "require"],
+  ])("parses %s:// and stores the URI with a lowercase scheme", (scheme, port, sslMode) => {
+    const suffix = "://User:PaSS@Host/MyBucket";
+    expect(parseConnectionString(`${scheme}${suffix}`)).toMatchObject({
+      type: "couchbase",
+      host: "Host",
+      port,
+      user: "User",
+      password: "PaSS",
+      database: "MyBucket",
+      connectionString: `${scheme.toLowerCase()}${suffix}`,
+      sslMode,
+    });
+  });
+
+  test("LIBSQL:// preserves the authToken value's case", () => {
+    expect(parseConnectionString("LIBSQL://Db-Org.turso.io?authToken=AbCDefXYZ")).toMatchObject({
+      type: "libsql",
+      host: "Db-Org.turso.io",
+      port: "443",
+      password: "AbCDefXYZ",
+      sslMode: "require",
+    });
+  });
+
+  test.each([
+    ["HTTP", "8123", "disable"],
+    ["HTTPS", "8443", "require"],
+  ])("parses %s:// as ClickHouse when the host is not Snowflake's", (scheme, port, sslMode) => {
+    const uri = `${scheme}://User:PaSS@ch-host/MyDB`;
+    expect(parseConnectionString(uri)).toMatchObject({
+      type: "clickhouse",
+      host: "ch-host",
+      port,
+      user: "User",
+      password: "PaSS",
+      database: "MyDB",
+      sslMode,
+    });
+    expect(detectConnectionStringType(uri)).toBe("clickhouse");
+  });
+
+  test("HTTPS:// with a Snowflake host stays Snowflake ahead of ClickHouse", () => {
+    const uri = "HTTPS://xy12345.us-east-2.aws.snowflakecomputing.com";
+    expect(parseConnectionString(uri)).toEqual({
+      type: "snowflake",
+      host: "xy12345.us-east-2.aws.snowflakecomputing.com",
+    });
+    expect(detectConnectionStringType(uri)).toBe("snowflake");
+  });
+
+  test("SC:// reaches the Spark reader with the token's case preserved", () => {
+    expect(parseConnectionString("SC://spark.example.internal:15003/;use_ssl=true;token=AbC")).toEqual({
+      type: "spark",
+      host: "spark.example.internal",
+      port: "15003",
+      password: "AbC",
+      sslMode: "verify-system",
+    });
+  });
+
+  test.each(["JDBC:sc://h:15002", "jdbc:SC://h:15002", "JdBc:Sc://h:15002"])(
+    "%s reaches the Spark JDBC refusal without filling fields",
+    (uri) => {
+      expect(parseConnectionString(uri)).toEqual({
+        type: "spark",
+        refusal: SPARK_PASTE_SENTENCES.jdbcPrefix,
+      });
+    },
+  );
+
+  test("leaves an ADO.NET paste with no :// unchanged before parsing", () => {
+    expect(parseConnectionString("sErVeR=MiXeDHost;Database=MyDB;User Id=User;Password=PaSS;")).toEqual({
+      type: "mssql",
+      host: "MiXeDHost",
+      port: "1433",
+      user: "User",
+      password: "PaSS",
+      database: "MyDB",
+    });
+  });
+
+  test("does not normalize an ADO.NET prefix before a :// inside a password", () => {
+    expect(
+      parseConnectionString("Server=MiXeDHost;Database=MyDB;User Id=User;Password=KeepHTTPS://MiXeD/Case;"),
+    ).toEqual({
+      type: "mssql",
+      host: "MiXeDHost",
+      port: "1433",
+      user: "User",
+      password: "KeepHTTPS://MiXeD/Case",
+      database: "MyDB",
+    });
+  });
+
+  test.each(['export BENDSQL_DSN="DATABEND://User:PaSS@Host/MyDB"', "BENDSQL_DSN=DATABEND://User:PaSS@Host/MyDB"])(
+    "keeps the shell-export refusal for %s",
+    (input) => {
+      expect(parseConnectionString(input)).toEqual({
+        type: "databend",
+        refusal: DATABEND_DSN_REFUSALS.shellExport,
+      });
+    },
+  );
 });

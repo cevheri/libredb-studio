@@ -419,3 +419,642 @@ export const DuckDBIcon: React.FC<IconProps> = ({ className, ...props }) => (
     <circle cx="18.3" cy="5.2" r="0.85" fill="currentColor" stroke="none" />
   </svg>
 );
+
+/**
+ * Prometheus: the flame inside a ring, reduced to its outline.
+ *
+ * The brand mark is a solid disc with the flame cut out of it and a bar under the flame. A
+ * filled disc reads as a blot at the 14px (`w-3.5`) size the sidebar renders a DB icon at, so
+ * this draws the ring, the flame and the bar as strokes at the house weight: the flame is what
+ * makes it identifiable, and nothing else in this set has one.
+ */
+export const PrometheusIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 6.5c1.9 2.1 3.5 3.9 3.5 6.1a3.5 3.5 0 0 1-7 0c0-1.5.9-2.8 1.9-3.7.1 1 .5 1.7 1.1 2.1-.1-1.6.1-3.1.5-4.5Z" />
+    <path d="M9 18.5h6" />
+  </svg>
+);
+
+/**
+ * Apache Kafka: the node mark, reduced to its outline.
+ *
+ * The brand mark is a column of three rings, the middle one larger, with two more rings to its
+ * right joined to the middle one by a spoke each. That is what this draws, as strokes at the
+ * house weight with no fill: the offset pair of spokes is what makes it identifiable at the 14px
+ * (`w-3.5`) size the sidebar renders a DB icon at, and nothing else in this set has them.
+ */
+export const KafkaIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <circle cx="8.5" cy="4" r="2" />
+    <circle cx="8.5" cy="12" r="2.75" />
+    <circle cx="8.5" cy="20" r="2" />
+    <circle cx="16.5" cy="7.5" r="2" />
+    <circle cx="16.5" cy="16.5" r="2" />
+    <path d="M8.5 6v3.25" />
+    <path d="M8.5 14.75V18" />
+    <path d="m10.9 10.65 3.86-2.17" />
+    <path d="m10.9 13.35 3.86 2.17" />
+  </svg>
+);
+
+/**
+ * etcd: the project's mark, reduced to its outline.
+ *
+ * The brand mark is a toothed ring around two eyes and a line. That is what this draws, as strokes at the
+ * house weight with no fill: the ring, four of its teeth, the eyes and the line, which is what stays
+ * identifiable at the 14px the connection list draws.
+ */
+export const EtcdIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <circle cx="12" cy="12" r="7.5" />
+    <path d="M12 2.5v2" />
+    <path d="M12 19.5v2" />
+    <path d="M2.5 12h2" />
+    <path d="M19.5 12h2" />
+    <circle cx="9.5" cy="10.5" r="1" />
+    <circle cx="14.5" cy="10.5" r="1" />
+    <path d="M9 14.5c2 1.25 4 1.25 6 0" />
+  </svg>
+);
+
+/**
+ * IBM Db2 LUW (#786): a database cylinder beside a "2", as strokes at the house weight with no fill,
+ * which stays readable at the 14px the connection list draws.
+ */
+export const Db2Icon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <ellipse cx="8" cy="5.5" rx="5" ry="2.2" />
+    <path d="M3 5.5v13c0 1.2 2.2 2.2 5 2.2s5-1 5-2.2v-13" />
+    <path d="M3 12c0 1.2 2.2 2.2 5 2.2s5-1 5-2.2" />
+    <path d="M16.5 10.2c0-1 .8-1.7 1.8-1.7s1.8.7 1.8 1.7c0 1.7-3.6 2.9-3.6 5.1h3.7" />
+  </svg>
+);
+
+/**
+ * Neo4j: a generic graph glyph, never the vendor's logo.
+ *
+ * Three nodes joined by three relationships, drawn as strokes at the house weight with no fill: a property
+ * graph in its plainest form, which is what Neo4j stores and what stays identifiable at the 14px the
+ * connection list draws. The edges stop at each circle's outline, so no line crosses a node.
+ */
+export const Neo4jIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <circle cx="6" cy="7" r="2.5" />
+    <circle cx="18" cy="6" r="2.5" />
+    <circle cx="12" cy="18" r="2.5" />
+    <path d="M8.49 6.79 15.51 6.21" />
+    <path d="M7.2 9.19 10.8 15.81" />
+    <path d="M16.88 8.24 13.12 15.76" />
+  </svg>
+);
+
+/**
+ * Qdrant: a mark drawn for Studio, never the project's logo or any vendor asset.
+ *
+ * A query point with two distance rings around it and the neighbours the rings reach, the nearest-neighbour
+ * search a vector database answers, as strokes at the house weight with no fill, which is what stays
+ * identifiable at the 14px the connection list draws. The outer ring is open, so it reads as a radius and not
+ * as a second node.
+ */
+export const QdrantIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <circle cx="12" cy="12" r="1.75" />
+    <circle cx="12" cy="12" r="5.25" />
+    <path d="M3 12a9 9 0 0 1 9-9" />
+    <path d="M21 12a9 9 0 0 1-9 9" />
+    <circle cx="18.4" cy="5.6" r="1.25" />
+    <circle cx="5.6" cy="18.4" r="1.25" />
+  </svg>
+);
+
+/**
+ * InfluxDB: a mark drawn for Studio, never InfluxData's logo or any vendor asset (InfluxDB spec E19), shared by the
+ * InfluxQL and the SQL connection type.
+ *
+ * Three stacked rising strokes, the series over time a time-series database stores, at the house weight with no
+ * fill, which is what stays identifiable at the 14px the connection list draws.
+ */
+export const InfluxDBIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <path d="M3 8 8 6l4 1.5L21 3" />
+    <path d="m3 14 5-2 4 1.5L21 9" />
+    <path d="m3 20 5-2 4 1.5 9-4.5" />
+  </svg>
+);
+
+/**
+ * Milvus: a mark drawn for Studio, never the project's logo or any vendor or Attu asset (vector-family spec 10.3).
+ *
+ * A query point and its three nearest neighbours, the search a vector database answers, as strokes at the house
+ * weight with no fill, which is what stays identifiable at the 14px the connection list draws.
+ */
+export const MilvusIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <circle cx="12" cy="12" r="2.25" />
+    <circle cx="5" cy="6" r="1.75" />
+    <circle cx="19" cy="7.5" r="1.75" />
+    <circle cx="9" cy="19.5" r="1.75" />
+    <path d="M10.3 10.55 6.35 7.15" />
+    <path d="m14.15 11.3 3.15-2.65" />
+    <path d="m11.15 14.1-1.45 3.75" />
+    <path d="M3 21h3" />
+    <path d="M18 21h3" />
+  </svg>
+);
+
+/**
+ * Oxia: a mark drawn for Studio, never the project's logo (DECISIONS O16).
+ *
+ * A ring cut into three equal arcs, each ending in a short key-shaped notch pointing outward, around a small dot:
+ * the shards of one hash ring, the keys routed into them, and the namespace they share.
+ */
+export const OxiaIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <path d="M13.22 5.11 A7 7 0 0 1 18.58 14.39 L21.4 15.42" />
+    <path d="M20.22 14.99 L20.7 12.91" />
+    <path d="M17.36 16.5 A7 7 0 0 1 6.64 16.5 L4.34 18.43" />
+    <path d="M5.3 17.62 L6.86 19.08" />
+    <path d="M5.42 14.39 A7 7 0 0 1 10.78 5.11 L10.26 2.15" />
+    <path d="M10.48 3.38 L8.44 4.01" />
+    <circle cx="12" cy="12" r="1.25" />
+  </svg>
+);
+
+/**
+ * Databend: the official icon from Databend's brand assets (https://www.databend.com/brand/, "Icon · Light"), used at the
+ * Databend team's request (databendlabs/databend-docs#3512).
+ *
+ * The brand guidelines ask for the original colours and proportions, so this is the one mark here with fixed fills and no
+ * stroke: the paths and colours are the published file's, unchanged, and the accent class a caller passes does not
+ * repaint it. Only the viewBox differs, a square around the mark's own bounds so it sits on the same footprint as the
+ * 24-unit icons beside it. tests/unit/lib/db-icons.test.tsx pins the paths and colours to the published file.
+ */
+export const DatabendIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg viewBox="22 -20 98 98" className={className} {...props}>
+    <path
+      fill="#B7E3FF"
+      d="M118.8,52.16c-.73.73-3.57-1.78-4.53-3.23.17,1.77-.47,5.3-1.35,5.27-1.65-.06-2.72-4.84-2.09-8.05C100.45,40.2,89.9,45.4,89.9,45.4l0,0c1.3.16,4.35.49,4.27,1.86,0,.9-4,3.59-16.38,2.59-3.89,3.28-19.59,10.34-33.5,8C34.25,55.53,28.84,50.86,26,46c2.57,1.81,13.38,7.91,34.59,1.18,24.48-7.75,32.3-12,52.59-6.73a.08.08,0,0,0,0,0A16.9,16.9,0,0,1,114.34,44h0C117.72,46.19,119.78,51.18,118.8,52.16Z"
+    />
+    <path
+      fill="#52AAFF"
+      d="M108.76,32.91a33,33,0,0,1,4.45,7.55c-20.29-5.28-28.11-1-52.59,6.73C39.41,53.92,28.6,47.82,26,46l0,0v0a23.41,23.41,0,0,1-2.41-16c.45-.46,1-1,1.56-1.48C27.47,30.6,38.83,39.38,61,33.84,61,33.84,95.63,25.06,108.76,32.91Z"
+    />
+    <path
+      fill="#0175F2"
+      d="M97.18,22.78a41.15,41.15,0,0,1,11.58,10.13C95.63,25.06,61,33.84,61,33.84,38.83,39.38,27.47,30.6,25.14,28.5A56.76,56.76,0,0,1,45,17.62h0a30.34,30.34,0,0,0,17.09,2.32C72.44,18.47,84.62,18.24,97.18,22.78Z"
+    />
+    <path
+      fill="#015BCB"
+      d="M92.31,20.21a53.78,53.78,0,0,1,4.87,2.57c-12.56-4.54-24.74-4.31-35.07-2.84A30.38,30.38,0,0,1,45,17.62c10.33-3.35,23.66-4.73,39.1-.48A61.53,61.53,0,0,1,92.31,20.21Z"
+    />
+    <path
+      fill="#015BCB"
+      d="M61.06,2.49A2.51,2.51,0,0,1,59.53,4.8h0a10.68,10.68,0,0,0-4.84,4.83,11.27,11.27,0,0,1-.24-2.27,10.64,10.64,0,0,1,2-6.18,3.8,3.8,0,0,1,.29-.38A2.43,2.43,0,0,1,58.55,0,2.49,2.49,0,0,1,61.06,2.49Z"
+    />
+    <path
+      fill="#015BCB"
+      d="M52.43,12.17a11.11,11.11,0,0,1-.07,1.16A10.46,10.46,0,0,0,48,10.65l-.12,0A2.66,2.66,0,1,1,51,6.82,10.58,10.58,0,0,1,52.43,12.17Z"
+    />
+    <circle fill="#0175F2" cx="62.87" cy="46.71" r="2.28" />
+  </svg>
+);
+
+/** A generic bucket drawn for Studio, never a vendor's logo. */
+export const S3Icon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <ellipse cx="12" cy="6" rx="8" ry="2.5" />
+    <path d="M4 6l1.8 12.2c.2 1.6 2.9 2.8 6.2 2.8s6-1.2 6.2-2.8L20 6" />
+    <path d="M5 11c1.6.9 4.1 1.5 7 1.5s5.4-.6 7-1.5" />
+  </svg>
+);
+
+/**
+ * Kubernetes: a mark drawn for Studio, never the project's own logo: a hexagon holding three nodes joined at a
+ * centre, a cluster in the plainest terms. Stroked on the house 24-unit grid like the other drawn marks.
+ */
+export const KubernetesIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <path d="M12 2.5 L20.23 7.25 V16.75 L12 21.5 L3.77 16.75 V7.25 Z" />
+    <circle cx="12" cy="12" r="1.75" />
+    <path d="M12 10.25 V6.5" />
+    <path d="M13.52 12.88 L16.76 14.75" />
+    <path d="M10.48 12.88 L7.24 14.75" />
+  </svg>
+);
+
+/** A magnifier over bars: a mark drawn for Studio, never Google's logo. */
+export const BigQueryIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <circle cx="10.5" cy="10.5" r="6.5" />
+    <path d="m15.5 15.5 5 5" />
+    <path d="M8 12.5v-1.5" />
+    <path d="M10.5 12.5v-4" />
+    <path d="M13 12.5v-2.5" />
+  </svg>
+);
+
+/**
+ * RabbitMQ: a mark drawn for Studio, never the project's own logo: two messages waiting in line and the arrow they
+ * leave by, which is what a queue does in the plainest terms. Stroked on the house 24-unit grid like the others.
+ */
+export const RabbitMQIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <rect x="2.5" y="8" width="4" height="8" rx="1" />
+    <rect x="9" y="8" width="4" height="8" rx="1" />
+    <path d="M15.5 12h6" />
+    <path d="m19 9.5 2.5 2.5-2.5 2.5" />
+  </svg>
+);
+
+/**
+ * MQTT: a mark drawn for Studio, never a product's logo: a node with the arcs of a broadcast rising from it,
+ * which is what a broker does in the plainest terms. Stroked on the house 24-unit grid like the others.
+ */
+export const MqttIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <circle cx="6" cy="18" r="1.5" />
+    <path d="M6 13.5a4.5 4.5 0 0 1 4.5 4.5" />
+    <path d="M6 9a9 9 0 0 1 9 9" />
+    <path d="M6 4.5A13.5 13.5 0 0 1 19.5 18" />
+  </svg>
+);
+
+/**
+ * Firestore: a mark drawn for Studio, never the Firebase or Google Cloud logo: a document with a second one behind it,
+ * the collection-of-documents shape in the plainest terms. Stroked on the house 24-unit grid like the others.
+ */
+export const FirestoreIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <path d="M8 3h6l4 4v10.5a1.5 1.5 0 0 1-1.5 1.5H8a1.5 1.5 0 0 1-1.5-1.5v-13A1.5 1.5 0 0 1 8 3z" />
+    <path d="M14 3v4h4" />
+    <path d="M9.5 11h5" />
+    <path d="M9.5 14h3" />
+    <path d="M4 7v12.5A1.5 1.5 0 0 0 5.5 21H14" />
+  </svg>
+);
+
+/**
+ * Snowflake: a mark drawn for Studio, never the company's logo: a six-armed snowflake, three strokes through a centre
+ * with a chevron on each arm. Stroked on the house 24-unit grid like the others.
+ */
+export const SnowflakeIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <path d="M12 2.5 V21.5" />
+    <path d="M3.77 7.25 L20.23 16.75" />
+    <path d="M3.77 16.75 L20.23 7.25" />
+    <path d="M13.94 3.56 L12 5.5 L10.06 3.56" />
+    <path d="M5.66 6.09 L6.37 8.75 L3.71 9.46" />
+    <path d="M3.71 14.54 L6.37 15.25 L5.66 17.91" />
+    <path d="M10.06 20.44 L12 18.5 L13.94 20.44" />
+    <path d="M18.34 17.91 L17.63 15.25 L20.29 14.54" />
+    <path d="M20.29 9.46 L17.63 8.75 L18.34 6.09" />
+  </svg>
+);
+
+/**
+ * A mark drawn for Studio, never the OPC Foundation's logo or any vendor's asset.
+ *
+ * An address space is a tree of nodes with values hanging off it, so the mark is a root with two
+ * branches and a leaf on each: what the Keys panel shows, rather than a protocol badge.
+ */
+export const OpcuaIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <circle cx="5" cy="12" r="2" />
+    <circle cx="19" cy="6" r="2" />
+    <circle cx="19" cy="18" r="2" />
+    <path d="M7 12 H11 V6 H17" />
+    <path d="M11 12 V18 H17" />
+  </svg>
+);
+
+/**
+ * A mark drawn for Studio, never the Apache Spark logo or any vendor's asset.
+ *
+ * A job runs as a DAG of stages, so the mark is a fork-join diamond: one stage, two parallel stages, one stage,
+ * four rounded boxes joined by four straight strokes.
+ */
+export const SparkIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <rect x="2" y="10" width="4" height="4" rx="1" />
+    <rect x="10" y="2.5" width="4" height="4" rx="1" />
+    <rect x="10" y="17.5" width="4" height="4" rx="1" />
+    <rect x="18" y="10" width="4" height="4" rx="1" />
+    <path d="M6 10.13 9.87 6.5" />
+    <path d="M6 13.87 9.87 17.5" />
+    <path d="M14.13 6.5 18 10.13" />
+    <path d="M14.13 17.5 18 13.87" />
+  </svg>
+);
+
+/**
+ * A mark drawn for Studio, never the MTConnect Institute's logo or any vendor's asset.
+ *
+ * An agent answers with a sampled value per item per timestamp, so the mark is a baseline with
+ * three samples standing on it at three heights: what a Sample document holds, rather than a
+ * protocol badge.
+ */
+export const ModbusIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <rect x="3" y="8" width="18" height="11" rx="1.5" />
+    <path d="M8 8 V4" />
+    <path d="M16 8 V4" />
+    <circle cx="7.5" cy="13.5" r="1.1" />
+    <circle cx="12" cy="13.5" r="1.1" />
+    <circle cx="16.5" cy="13.5" r="1.1" />
+  </svg>
+);
+
+export const MtconnectIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <path d="M3 19 H21" />
+    <path d="M7 19 V13" />
+    <path d="M12 19 V6" />
+    <path d="M17 19 V10" />
+    <circle cx="7" cy="11" r="1.4" />
+    <circle cx="12" cy="4" r="1.4" />
+    <circle cx="17" cy="8" r="1.4" />
+  </svg>
+);
+
+/**
+ * NETCONF (#1724). A mark drawn for Studio and never a vendor's: a device with a configuration
+ * tree above it, which is what this provider reads and the one thing every NETCONF device has.
+ * The tree has one branch that forks, because a datastore holds modules and a module holds nodes,
+ * and those two levels are what the object browser draws.
+ */
+export const NetconfIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <rect x="3" y="16" width="18" height="5" rx="1.5" />
+    <path d="M7 18.5 H9" />
+    <path d="M12 16 V11" />
+    <path d="M7 11 H17" />
+    <path d="M7 11 V8" />
+    <path d="M17 11 V8" />
+    <circle cx="7" cy="6.5" r="1.5" />
+    <circle cx="17" cy="6.5" r="1.5" />
+  </svg>
+);
+
+/**
+ * SNMP (#1721).
+ * A mark drawn for Studio, never a vendor's asset and never a network-gear silhouette: a router
+ * or a switch would say WHAT is being read, and every other engine's mark says what the reading
+ * IS.
+ *
+ * What makes SNMP different from the other device protocols here is that an agent answers from a
+ * NAMED TREE and is read by walking it: each object hangs at a numbered place, and a reader
+ * descends from the root one branch at a time. So the mark is a trunk with three numbered stops
+ * descending from it, the last one filled, because a walk ends at a leaf and not at the device.
+ */
+export const SnmpIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <path d="M3 19 H21" />
+    <path d="M7 19 V13" />
+    <path d="M12 19 V6" />
+    <path d="M17 19 V10" />
+    <circle cx="7" cy="11" r="1.4" />
+    <circle cx="12" cy="4" r="1.4" />
+    <circle cx="17" cy="8" r="1.4" />
+    <circle cx="5" cy="5" r="2" />
+    <path d="M5 7 V17" />
+    <path d="M5 9.5 H11" />
+    <path d="M5 13.5 H11" />
+    <path d="M5 17 H11" />
+    <circle cx="13.5" cy="9.5" r="1.6" />
+    <circle cx="13.5" cy="13.5" r="1.6" />
+    <circle cx="13.5" cy="17" r="1.6" fill="currentColor" />
+    <rect x="17.5" y="3" width="4" height="5.5" rx="1" />
+    <path d="M19.5 8.5 V11 H13.5" />
+  </svg>
+);
+
+/**
+ * A mark drawn for Studio, never the Eclipse Foundation's logo or any vendor's asset, and
+ * deliberately NOT a spark: the published mark for Sparkplug is a lightning form, so borrowing that
+ * shape would be borrowing the mark itself.
+ *
+ * What the mark says instead is the thing that makes this engine different from plain MQTT: an edge
+ * node publishes a BIRTH CERTIFICATE that defines what it will later send, so the mark is a node
+ * carrying a small tag, with the two it defines hanging under it. The tag is the schema; the two
+ * below are what the tag names.
+ */
+export const SparkplugIcon: React.FC<IconProps> = ({ className, ...props }) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    {...props}
+  >
+    <circle cx="12" cy="6" r="2.5" />
+    <rect x="15" y="3.5" width="5.5" height="5" rx="1" />
+    <path d="M12 8.5 V13" />
+    <path d="M7 13 H17" />
+    <path d="M7 13 V16" />
+    <path d="M17 13 V16" />
+    <circle cx="7" cy="18.5" r="2" />
+    <circle cx="17" cy="18.5" r="2" />
+  </svg>
+);

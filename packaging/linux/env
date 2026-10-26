@@ -12,13 +12,30 @@
 # and ADMIN_PASSWORD, persists them in
 # /var/lib/libredb-studio/auth-bootstrap.json, and prints the admin password
 # once to the journal: journalctl -u libredb-studio
-# Set AUTH_BOOTSTRAP=off to require explicit values instead.
+# Set AUTH_BOOTSTRAP=off to require explicit values instead. JWT_SECRET must
+# then be at least 32 characters; generate one with: openssl rand -base64 32
+# Paste the OUTPUT, not the command: systemd reads this file literally (see the
+# format note above), so a $(...) would reach the service as those 26 characters
+# and stop the boot with "JWT_SECRET is too short".
 #AUTH_BOOTSTRAP=off
-#JWT_SECRET=change-me-to-a-random-32-char-string
+#JWT_SECRET=
 #ADMIN_EMAIL=admin@libredb.org
 #ADMIN_PASSWORD=
 #USER_EMAIL=user@libredb.org
 #USER_PASSWORD=
+#
+# Two-factor authentication (TOTP), optional and per account. Base32, at least
+# 26 characters; generate one with: openssl rand 20 | base32
+# A value that is not base32, or too short, stops login with a 503 naming the
+# variable. Enrolment and recovery: docs/MFA.md
+#ADMIN_TOTP_SECRET=
+#USER_TOTP_SECRET=
+#
+# Passkey sign-in, optional, off while unset. Set it to the exact address people
+# open Studio at, and open exactly that address: http://localhost:3000, not the
+# http://127.0.0.1:3000 the service binds to, since browsers refuse passkeys on
+# an IP address. Guide: docs/PASSKEYS.md
+#PASSKEY_ORIGIN=http://localhost:3000
 #
 # AI query assistance (optional).
 #LLM_PROVIDER=gemini

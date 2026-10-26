@@ -17,7 +17,7 @@ import React from "react";
  * stubs `@/components/CommandPalette`, and it overrides `use-tab-manager`. `mock.module`
  * is process-wide and those stubs are registered at module scope, so a test in that
  * file cannot see the real hook, the real palette item, or the real tab. Hence a second
- * file, in its own isolation group (tests/run-components.sh), which mocks LESS:
+ * file, which the runner gives a process of its own like every other, and which mocks LESS:
  *
  *   real: the command palette and its item, `use-tab-manager`, `use-agent-prefill`
  *         (so the id minting and the objective clamp actually run), and Studio's own
@@ -106,8 +106,11 @@ mock.module("@/hooks/use-connection-manager", () => ({
     activeConnection: null,
     schema: [],
     schemaContext: "[]",
+    // A connection that names its own database lists none (#1530).
+    catalogs: [],
+    activeCatalog: undefined,
+    setActiveCatalog: () => {},
     isLoadingSchema: false,
-    connectionPulse: "none",
     setConnections: mock(() => {}),
     setActiveConnection: mock(() => {}),
     setSchema: mock(() => {}),
@@ -121,7 +124,6 @@ mock.module("@/hooks/use-provider-metadata", () => ({
       capabilities: {
         queryLanguage: "sql",
         supportsExplain: true,
-        supportsCreateTable: true,
         supportsTransactions: true,
         maintenanceOperations: ["vacuum"],
         schemaRefreshPattern: "^(CREATE|DROP)\\b",
@@ -200,6 +202,12 @@ mock.module("@/lib/storage", () => ({
     // Read by the REAL command palette when it opens.
     getSavedQueries: mock(() => [] as unknown[]),
     getHistory: mock(() => [] as unknown[]),
+    getFavoriteConnectionIds: mock(() => [] as string[]),
+    toggleFavoriteConnection: mock(() => [] as string[]),
+    getConnectionOrder: mock(() => [] as string[]),
+    setConnectionOrder: mock(() => {}),
+    getConnectionGroups: mock(() => [] as unknown[]),
+    setConnectionGroups: mock(() => {}),
   },
 }));
 
@@ -338,7 +346,7 @@ describe("Studio: the palette's agent item asks about the editor's statement (#3
     });
 
     // The entry point: the palette, opened by its shortcut, and its item selected.
-    fireEvent.keyDown(document, { key: "k", metaKey: true });
+    fireEvent.keyDown(document, { key: "k", code: "KeyK", metaKey: true });
     const item = await view.findByText(AGENT_ITEM);
     fireEvent.click(item.closest('[role="option"]')!);
 

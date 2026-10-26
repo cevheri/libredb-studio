@@ -34,20 +34,20 @@ channel count.
 
 ## Coverage snapshot
 
-**33 channels · 26 live · 6 pending · 1 deprecated**
+**48 channels · 41 live · 6 pending · 1 deprecated**
 
-Live channels by platform: **Linux 8 · macOS 3 · Windows 4 · Container 4 · Kubernetes 2 · Cloud 10**
+Live channels by platform: **Linux 10 · macOS 4 · Windows 6 · Container 7 · Kubernetes 5 · Cloud 17**
 
 | Category | Live | Pending | Deprecated |
 | --- | ---: | ---: | ---: |
 | Registries & releases | 2 | 0 | 0 |
 | Containers | 2 | 0 | 0 |
-| Kubernetes & operators | 2 | 1 | 0 |
-| Package managers | 5 | 0 | 1 |
-| OS / desktop packages | 3 | 0 | 0 |
-| PaaS catalogs (listed) | 8 | 4 | 0 |
+| Kubernetes & operators | 4 | 0 | 0 |
+| Package managers | 6 | 1 | 1 |
+| OS / desktop packages | 4 | 0 | 0 |
+| PaaS catalogs (listed) | 16 | 3 | 0 |
 | Deploy recipes | 3 | 0 | 0 |
-| Cloud marketplaces | 1 | 1 | 0 |
+| Cloud marketplaces | 4 | 2 | 0 |
 
 <!-- END:CHANNEL-SCORECARD -->
 
@@ -62,33 +62,48 @@ Live channels by platform: **Linux 8 · macOS 3 · Windows 4 · Container 4 · K
 | [Docker image (GHCR)](https://github.com/libredb/libredb-studio/pkgs/container/libredb-studio) | Containers | Container | live | Automated, every release | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Docker Hub mirror](https://hub.docker.com/r/libredb/libredb-studio) | Containers | Container | live | Automated, every release | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Helm chart](https://artifacthub.io/packages/helm/libredb-studio/libredb-studio) | Kubernetes & operators | Kubernetes | live | Automated, every release | [HELM_CHART.md](HELM_CHART.md) |
+| [OperatorHub / OpenShift](https://operatorhub.io/operator/libredb-studio-operator) | Kubernetes & operators | Kubernetes | live | Automated PR, every release | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Rancher Partner Charts](https://www.suse.com/pcsc/viewVersionPage?versionID=26969) | Kubernetes & operators | Kubernetes | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
-| [OperatorHub / OpenShift](https://github.com/redhat-openshift-ecosystem/community-operators-prod) | Kubernetes & operators | Kubernetes | pending | Manual, every release | [DISTRIBUTION.md](DISTRIBUTION.md) |
+| [ZopDev Helm Charts](https://helm.zop.dev) | Kubernetes & operators | Kubernetes | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Chocolatey](https://community.chocolatey.org/packages/libredb-studio) | Package managers | Windows | live | Automated, every release | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [FlatPark (Flatpak)](https://flatpark.org/) | Package managers | Linux | live | Manual, every release | [packaging/flatpark/README.md](../packaging/flatpark/README.md) |
 | [Homebrew tap](https://github.com/libredb/homebrew-tap) | Package managers | Linux, macOS | live | Automated, every release | [DISTRIBUTION.md](DISTRIBUTION.md) |
+| [Scoop](https://github.com/ScoopInstaller/Extras/blob/master/bucket/libredb-studio.json) | Package managers | Windows | live | Manual, every release | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Snap Store](https://snapcraft.io/libredb-studio) | Package managers | Linux | live | Automated, every release | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [winget](https://github.com/microsoft/winget-pkgs/tree/master/manifests/l/LibreDB/Studio) | Package managers | Windows | live | Automated, every release | [DISTRIBUTION.md](DISTRIBUTION.md) |
+| [AUR](https://aur.archlinux.org/packages/libredb-studio-bin) | Package managers | Linux | pending | Automated, every release | [packaging/aur/README.md](../packaging/aur/README.md) |
 | Flathub | Package managers | Linux | deprecated | — | [packaging/flatpak/README.md](../packaging/flatpak/README.md) |
 | [Desktop app (AppImage, .deb)](https://github.com/libredb/libredb-studio/releases/latest) | OS / desktop packages | Linux | live | Automated, every release | [desktop/README.md](../desktop/README.md) |
 | [AppImageHub](https://github.com/libredb/libredb-studio/releases/latest) | OS / desktop packages | Linux | live | Manual, on demand | [desktop/README.md](../desktop/README.md) |
 | [Linux .deb / .rpm](https://github.com/libredb/libredb-studio/releases/latest) | OS / desktop packages | Linux | live | Automated, every release | [DISTRIBUTION.md](DISTRIBUTION.md) |
+| [VS Code extension](https://marketplace.visualstudio.com/items?itemName=libredb.libredb-studio) | OS / desktop packages | Linux, macOS, Windows | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
+| [CapRover auto-connect](https://github.com/caprover/one-click-apps) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [deploy/caprover/README.md](../deploy/caprover/README.md) |
 | [CapRover official](https://github.com/caprover/one-click-apps) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [deploy/caprover/README.md](../deploy/caprover/README.md) |
+| [CasaOS App Store](https://github.com/IceWhaleTech/CasaOS-AppStore) | PaaS catalogs (listed) | Container | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Cosmos servapp marketplace](https://github.com/azukaar/cosmos-servapps-official) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [deploy/cosmos/README.md](../deploy/cosmos/README.md) |
+| [Dokku plugin](https://dokku.com/docs/community/plugins/) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Dokploy template catalog](https://templates.dokploy.com) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [deploy/dokploy/README.md](../deploy/dokploy/README.md) |
 | [Kubero template catalog](https://www.kubero.dev/templates) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [deploy/kubero/README.md](../deploy/kubero/README.md) |
+| [1Panel community store](https://github.com/okxlin/appstore/tree/localApps/apps/libredb-studio) | PaaS catalogs (listed) | Container | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
+| [Pethost](https://pethost.dev/templates/libredb-studio/) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [README.md](../README.md) |
+| [Portainer templates (as93)](https://portainer-templates.as93.net) | PaaS catalogs (listed) | Container | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Railway one-click template](https://railway.com/deploy/libredb-studio) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [deploy/railway/PUBLISH.md](../deploy/railway/PUBLISH.md) |
+| [Railyard template catalog](https://railyard.run/templates/libredb-studio) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Sealos App Store template](https://sealos.io/products/app-store/libredb-studio) | PaaS catalogs (listed) | Cloud | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [TrueNAS SCALE apps](https://apps.truenas.com/catalog/libredb-studio_community/) | PaaS catalogs (listed) | Container | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Unraid Community Apps](https://ca.unraid.net/apps/libredb-studio-0a5x41a1cy1kay) | PaaS catalogs (listed) | Container | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
-| [CasaOS App Store](https://github.com/IceWhaleTech/CasaOS-AppStore) | PaaS catalogs (listed) | Container | pending | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
+| [YunoHost](https://apps.yunohost.org/app/libredb_studio) | PaaS catalogs (listed) | Linux | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Easypanel template catalog](https://easypanel.io/templates) | PaaS catalogs (listed) | Cloud | pending | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Portainer app templates](https://github.com/portainer/templates) | PaaS catalogs (listed) | Container | pending | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Umbrel App Store](https://github.com/getumbrel/umbrel-apps) | PaaS catalogs (listed) | Container | pending | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Fly.io launch config](https://github.com/libredb/libredb-studio/blob/main/fly.toml) | Deploy recipes | Cloud | live | Manual, on demand | [FLY.md](FLY.md) |
 | [Koyeb deploy button](https://github.com/libredb/libredb-studio/tree/main/deploy/koyeb) | Deploy recipes | Cloud | live | Manual, on demand | [deploy/koyeb/README.md](../deploy/koyeb/README.md) |
 | [Render Blueprint](https://github.com/libredb/libredb-studio/blob/main/render.yaml) | Deploy recipes | Cloud | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
+| [AWS Marketplace](https://aws.amazon.com/marketplace/pp/prodview-tsahkrgdqpnws) | Cloud marketplaces | Cloud | live | Manual, on demand | [deploy/aws/README.md](../deploy/aws/README.md) |
+| [Azure Marketplace](https://marketplace.microsoft.com/en-us/product/libredb.libredb-studio) | Cloud marketplaces | Cloud | live | Manual, on demand | [deploy/azure/README.md](../deploy/azure/README.md) |
 | [DigitalOcean Marketplace](https://marketplace.digitalocean.com/apps/libredb-studio) | Cloud marketplaces | Cloud | live | Manual, on demand | [deploy/digitalocean/README.md](../deploy/digitalocean/README.md) |
+| [Google Cloud Marketplace](https://console.cloud.google.com/marketplace/product/libredb-public/libredb-studio) | Cloud marketplaces | Kubernetes, Cloud | live | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
+| [Civo Kubernetes Marketplace](https://github.com/civo/kubernetes-marketplace) | Cloud marketplaces | Kubernetes | pending | Manual, on demand | [DISTRIBUTION.md](DISTRIBUTION.md) |
 | [Koyeb One-Click Apps catalog](https://www.koyeb.com/deploy) | Cloud marketplaces | Cloud | pending | Manual, on demand | [deploy/koyeb/CATALOG_SUBMISSION.md](../deploy/koyeb/CATALOG_SUBMISSION.md) |
 
 <!-- END:CHANNEL-TABLE -->
@@ -99,5 +114,8 @@ hand. To propose a new channel, add an entry with a `category` and a `platforms`
 list, then run `bun run distribution:matrix`. Freshness is enforced on pull
 requests with `bun run distribution:matrix --check`.
 
-Planned and deliberately not counted here until a listing exists: GCP, Azure, AWS
-and Alibaba cloud marketplaces, and Coolify, Portainer and Dokku deploy support.
+Not counted here, and why. **Alibaba Cloud** is not being pursued. **Coolify**
+declined the submission: its maintainers accept service templates only from
+projects above 1000 GitHub stars. A row appears above as soon as there is
+something to track — a submission, or a descriptor in this repo that a workflow
+reads — and stays `pending` until the product can be installed from that channel, when it becomes `live`.

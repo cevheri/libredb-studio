@@ -2,7 +2,12 @@ import "../setup-dom";
 import React from "react";
 import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
-import { mockRouterPush, mockRouterRefresh } from "../helpers/mock-navigation";
+import {
+  mockRouterPush,
+  mockRouterRefresh,
+  resetMockSearchParams,
+  setMockSearchParams,
+} from "../helpers/mock-navigation";
 import { mockToastSuccess, mockToastError } from "../helpers/mock-sonner";
 import { mock } from "bun:test";
 import { listShowcaseDatabases } from "@/lib/db-showcase";
@@ -17,6 +22,15 @@ import { EXTERNAL_DATABASE_TYPES, SHIPPED_DATABASE_TYPES, WIRE_COMPATIBLE_ENGINE
 // sonner and next/navigation are mocked via preload
 // lucide-react resolves fine natively — no mock needed
 
+// happy-dom has no WebAuthn, so the route test decides here whether this page could use a passkey.
+// The page counts as open at PAGE_ORIGIN, so only an offer for that origin can show the button.
+const PAGE_ORIGIN = "https://studio.example.com";
+let passkeysUsable = false;
+mock.module("@/lib/passkey/client", () => ({
+  passkeysUsableHere: (origin: string) => passkeysUsable && origin === PAGE_ORIGIN,
+  signInWithPasskey: () => Promise.resolve({ ok: false, message: null }),
+}));
+
 const { default: LoginForm } = await import("@/app/login/login-form");
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -25,7 +39,7 @@ import userEvent from "@testing-library/user-event";
 
 function renderLogin() {
   const user = userEvent.setup();
-  const result = render(<LoginForm authProvider="local" />);
+  const result = render(<LoginForm authProvider="local" passkey={null} />);
   const form = result.container.querySelector("form")!;
   const emailInput = result.container.querySelector('input[type="email"]')! as HTMLInputElement;
   const passwordInput = result.container.querySelector('input[type="password"]')! as HTMLInputElement;
@@ -53,9 +67,15 @@ describe("LoginPage", () => {
     expect(passwordInput.type).toBe("password");
   });
 
-  test("renders Sign In button", () => {
-    const { getByText } = renderLogin();
-    expect(getByText("Sign In")).not.toBeNull();
+  test("email and password inputs carry autoComplete hints for password managers", () => {
+    const { emailInput, passwordInput } = renderLogin();
+    expect(emailInput.autocomplete).toBe("username");
+    expect(passwordInput.autocomplete).toBe("current-password");
+  });
+
+  test("renders Sign in button", () => {
+    const { getByRole } = renderLogin();
+    expect(getByRole("button", { name: "Sign in" })).not.toBeNull();
   });
 
   test("renders LibreDB Studio title", () => {
@@ -119,6 +139,42 @@ describe("LoginPage", () => {
       expect(mockRouterPush).toHaveBeenCalledWith("/");
     });
     expect(mockToastSuccess).toHaveBeenCalledWith("Welcome back, user!");
+  });
+
+  // The session-ended redirect sends the user here with ?next= (#1420): signing in returns them to
+  // the page they were on rather than the role's default.
+  test("returns to the page the session ended on", async () => {
+    setMockSearchParams(new URLSearchParams({ next: "/settings/authenticator?x=1" }));
+    try {
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response(JSON.stringify({ success: true, role: "admin" }))),
+      ) as never;
+      const { form, emailInput, passwordInput, user } = renderLogin();
+      await user.type(emailInput, "admin@libredb.org");
+      await user.type(passwordInput, "LibreDB.2026");
+      fireEvent.submit(form);
+
+      await waitFor(() => expect(mockRouterPush).toHaveBeenCalledWith("/settings/authenticator?x=1"));
+    } finally {
+      resetMockSearchParams();
+    }
+  });
+
+  test("ignores a return path that would leave the application", async () => {
+    setMockSearchParams(new URLSearchParams({ next: "//evil.example/" }));
+    try {
+      globalThis.fetch = mock(() =>
+        Promise.resolve(new Response(JSON.stringify({ success: true, role: "user" }))),
+      ) as never;
+      const { form, emailInput, passwordInput, user } = renderLogin();
+      await user.type(emailInput, "user@libredb.org");
+      await user.type(passwordInput, "LibreDB.2026");
+      fireEvent.submit(form);
+
+      await waitFor(() => expect(mockRouterPush).toHaveBeenCalledWith("/"));
+    } finally {
+      resetMockSearchParams();
+    }
   });
 
   test("shows error toast on failed login", async () => {
@@ -197,7 +253,7 @@ describe("LoginPage", () => {
 
     resolveFetch(new Response(JSON.stringify({ success: false })));
     await waitFor(() => {
-      expect(queryByText("Sign In")).not.toBeNull();
+      expect(queryByText("Sign in")).not.toBeNull();
     });
   });
 });
@@ -227,6 +283,39 @@ describe("LoginPage route (app/login/page)", () => {
     expect(container.querySelector("form")).not.toBeNull();
   });
 
+  async function passkeyButtonFor(origin: string | undefined): Promise<HTMLElement | null> {
+    const savedStorage = process.env.STORAGE_PROVIDER;
+    const savedOrigin = process.env.PASSKEY_ORIGIN;
+    delete process.env.NEXT_PUBLIC_AUTH_PROVIDER;
+    process.env.STORAGE_PROVIDER = "sqlite";
+    if (origin === undefined) delete process.env.PASSKEY_ORIGIN;
+    else process.env.PASSKEY_ORIGIN = origin;
+    passkeysUsable = true;
+    try {
+      const { default: LoginPageRoute } = await import("@/app/login/page");
+      const { findByRole, queryByRole } = render(<LoginPageRoute />);
+      // The email field renders on the same pass as the button, so the form has settled once it exists.
+      await findByRole("textbox", { name: /email/i });
+      return queryByRole("button", { name: "Use a passkey" });
+    } finally {
+      passkeysUsable = false;
+      if (savedStorage === undefined) delete process.env.STORAGE_PROVIDER;
+      else process.env.STORAGE_PROVIDER = savedStorage;
+      if (savedOrigin === undefined) delete process.env.PASSKEY_ORIGIN;
+      else process.env.PASSKEY_ORIGIN = savedOrigin;
+    }
+  }
+
+  test("the page passes the passkey offer from the server configuration", async () => {
+    expect(await passkeyButtonFor(PAGE_ORIGIN)).not.toBeNull();
+  });
+
+  test("the page shows no passkey button without an offer, or with an offer for another origin", async () => {
+    expect(await passkeyButtonFor(undefined)).toBeNull();
+    cleanup();
+    expect(await passkeyButtonFor("https://other.example.com")).toBeNull();
+  });
+
   test("renders the SSO login when NEXT_PUBLIC_AUTH_PROVIDER is oidc", async () => {
     process.env.NEXT_PUBLIC_AUTH_PROVIDER = "oidc";
     const { default: LoginPageRoute } = await import("@/app/login/page");
@@ -243,7 +332,7 @@ describe("LoginPage showcase (issue #425)", () => {
   });
 
   function renderShowcase() {
-    return render(<LoginForm authProvider="local" />);
+    return render(<LoginForm authProvider="local" passkey={null} />);
   }
 
   test("renders every configured engine label on both surfaces", () => {
@@ -270,7 +359,7 @@ describe("LoginPage showcase (issue #425)", () => {
   });
 
   test("marks the embedded provider in the pill list instead of dropping it", () => {
-    // The hero claims 14 external engines while showing 15 pills, and this marker is what
+    // The hero's engine count is one short of its pill list, and this marker is what
     // reconciles the two for a reader. Hiding the pill was the alternative and it is worse:
     // libredb is a provider the connection picker offers, so a login page that never names
     // it contradicts the app - the reasoning db-showcase.ts already records for issue #425.
@@ -287,9 +376,10 @@ describe("LoginPage showcase (issue #425)", () => {
   });
 
   test("names every verified relative on both surfaces, with the registry's own count", () => {
-    // The gap this closes: the page claimed its engine count while the product connects to
-    // forty named products, and the other twenty-six were published in README.md and the
-    // docs compatibility table but nowhere a visitor to the login page could see them.
+    // The gap this closes: the page claimed its engine count while the product also connects
+    // to every wire-compatible relative in WIRE_COMPATIBLE_ENGINES, and those relatives were
+    // published in README.md and the docs compatibility table but nowhere a visitor to the
+    // login page could see them.
     const { getByTestId } = renderShowcase();
     expect(WIRE_COMPATIBLE_ENGINES.length).toBeGreaterThan(0);
     for (const testId of ["wire-compatible-desktop", "wire-compatible-mobile"]) {
@@ -365,8 +455,12 @@ describe("LoginPage showcase (issue #425)", () => {
     // yet (or no longer does), and docs/CHANNELS.md is explicit that a deprecated channel
     // renders nothing at all. Parsed from the YAML rather than listed here, so a newly
     // promoted or newly retired row is covered without touching this test.
+    // Resolved against this file rather than against the cwd, the way RootLayout.test.tsx:43
+    // reads its screenshot. A bare "distribution/channels.yaml" is only found when the process
+    // happens to start in the repo root, and one bun process per test file is exactly the setup
+    // in which that stops being something a test may assume.
     const { container } = renderShowcase();
-    const inventory = parseYaml(readFileSync("distribution/channels.yaml", "utf8")) as {
+    const inventory = parseYaml(readFileSync(new URL("../../distribution/channels.yaml", import.meta.url), "utf8")) as {
       channels: { status: string; name: string; short_name?: string }[];
     };
     const unlisted = inventory.channels.filter((channel) => channel.status !== "live");
@@ -383,13 +477,13 @@ describe("LoginPage showcase (issue #425)", () => {
   });
 
   test("counts external engines in the claim, never the embedded provider", () => {
-    // The number this page publishes is the one README.md publishes - fourteen drivers
-    // reaching forty named engines - and the embedded store is in neither half of that
+    // The number this page publishes is the one README.md publishes - the external drivers
+    // and the named engines they reach - and the embedded store is in neither half of that
     // arithmetic. Both counts are interpolated from the registry, so reverting the claim to
     // the showcase length (which includes libredb) fails the second assertion.
     // Matched with a tolerant regex rather than a substring: the desktop figure puts the
     // number and the unit in adjacent spans with no whitespace between them, so a
-    // "14 database engines" substring check would pass only on the mobile line and silently
+    // "<count> database engines" substring check would pass only on the mobile line and silently
     // stop covering the surface it was written for.
     const { container, getByTestId } = renderShowcase();
     const external = new RegExp(`${EXTERNAL_DATABASE_TYPES.length}\\s*database engines`);
@@ -459,5 +553,175 @@ describe("LoginPage showcase (issue #425)", () => {
     ]) {
       expect(getByTestId(testId).querySelectorAll("a").length).toBe(0);
     }
+  });
+});
+
+/**
+ * The second-factor step of the local login flow. The form is deliberately ignorant of whether
+ * an account is MFA-protected until the server says so, so every case here drives that state the
+ * only way the real app can: through a response body.
+ */
+describe("LoginPage TOTP step", () => {
+  const MFA_PROMPT = "Enter the 6-digit code from your authenticator app";
+  const MFA_INVALID = "Invalid authentication code";
+
+  function respondWith(...bodies: object[]) {
+    let call = 0;
+    const mockFetch = mock(() => {
+      const body = bodies[Math.min(call, bodies.length - 1)];
+      call += 1;
+      return Promise.resolve(new Response(JSON.stringify(body)));
+    });
+    globalThis.fetch = mockFetch as never;
+    return mockFetch;
+  }
+
+  function codeInput(container: HTMLElement) {
+    return container.querySelector("#totp") as HTMLInputElement | null;
+  }
+
+  /** Fills in the credentials and submits once, leaving the form on whatever step it reached. */
+  async function submitCredentials(result: ReturnType<typeof renderLogin>) {
+    await result.user.type(result.emailInput, "admin@libredb.org");
+    await result.user.type(result.passwordInput, "LibreDB.2026");
+    fireEvent.submit(result.form);
+  }
+
+  beforeEach(() => {
+    mockRouterPush.mockClear();
+    mockRouterRefresh.mockClear();
+    mockToastSuccess.mockClear();
+    mockToastError.mockClear();
+    globalThis.fetch = mock(() => Promise.resolve(new Response("{}"))) as never;
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  test("hides the code field until the server asks for one", () => {
+    const { container } = renderLogin();
+    expect(codeInput(container)).toBeNull();
+  });
+
+  test("reveals the code field when the server answers mfaRequired", async () => {
+    respondWith({ success: false, mfaRequired: true, message: MFA_PROMPT });
+
+    const result = renderLogin();
+    await submitCredentials(result);
+
+    await waitFor(() => expect(codeInput(result.container)).not.toBeNull());
+    expect(result.getByText("Verify code")).not.toBeNull();
+  });
+
+  test("does not frame the first prompt as an error", async () => {
+    respondWith({ success: false, mfaRequired: true, message: MFA_PROMPT });
+
+    const result = renderLogin();
+    await submitCredentials(result);
+
+    // The field appearing is the message. A toast here would read as a failure to a user who
+    // has done nothing wrong yet.
+    await waitFor(() => expect(codeInput(result.container)).not.toBeNull());
+    expect(mockToastError).not.toHaveBeenCalled();
+  });
+
+  test("offers the code field to the platform autofill rather than a bare text box", async () => {
+    respondWith({ success: false, mfaRequired: true, message: MFA_PROMPT });
+
+    const result = renderLogin();
+    await submitCredentials(result);
+
+    await waitFor(() => expect(codeInput(result.container)).not.toBeNull());
+    const field = codeInput(result.container)!;
+    expect(field.autocomplete).toBe("one-time-code");
+    expect(field.inputMode).toBe("numeric");
+    // `number` would strip the leading zero that one code in six starts with.
+    expect(field.type).toBe("text");
+  });
+
+  test("sends the code alongside the credentials on the second request", async () => {
+    const mockFetch = respondWith(
+      { success: false, mfaRequired: true, message: MFA_PROMPT },
+      { success: true, role: "admin" },
+    );
+
+    const result = renderLogin();
+    await submitCredentials(result);
+    await waitFor(() => expect(codeInput(result.container)).not.toBeNull());
+
+    await result.user.type(codeInput(result.container)!, "287082");
+    fireEvent.submit(result.form);
+
+    await waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(2));
+    const [, options] = mockFetch.mock.calls[1] as unknown as [string, RequestInit];
+    expect(JSON.parse(options.body as string)).toEqual({
+      email: "admin@libredb.org",
+      password: "LibreDB.2026",
+      totp: "287082",
+    });
+    await waitFor(() => expect(mockRouterPush).toHaveBeenCalledWith("/admin"));
+  });
+
+  test("surfaces the server's wording when a code is rejected, and clears the field", async () => {
+    respondWith(
+      { success: false, mfaRequired: true, message: MFA_PROMPT },
+      { success: false, mfaRequired: true, message: MFA_INVALID },
+    );
+
+    const result = renderLogin();
+    await submitCredentials(result);
+    await waitFor(() => expect(codeInput(result.container)).not.toBeNull());
+
+    await result.user.type(codeInput(result.container)!, "000000");
+    fireEvent.submit(result.form);
+
+    await waitFor(() => expect(mockToastError).toHaveBeenCalledWith(MFA_INVALID));
+    expect(codeInput(result.container)!.value).toBe("");
+  });
+
+  test("refuses to submit an empty code rather than spending a rate-limit slot on it", async () => {
+    const mockFetch = respondWith({ success: false, mfaRequired: true, message: MFA_PROMPT });
+
+    const result = renderLogin();
+    await submitCredentials(result);
+    await waitFor(() => expect(codeInput(result.container)).not.toBeNull());
+
+    fireEvent.submit(result.form);
+
+    expect(mockToastError).toHaveBeenCalledWith("Please enter your authentication code");
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  test("drops back to the password step when the email is edited", async () => {
+    respondWith({ success: false, mfaRequired: true, message: MFA_PROMPT });
+
+    const result = renderLogin();
+    await submitCredentials(result);
+    await waitFor(() => expect(codeInput(result.container)).not.toBeNull());
+
+    await result.user.type(result.emailInput, "x");
+
+    // A code minted for the previous account would fail and cost that account a slot in the
+    // per-account limiter, so the step resets with the credentials it was issued against.
+    //
+    // `=== null` and not `toBeNull()` on the input, here and in the test below. On a FAILING poll
+    // bun pretty-prints the received value, and for a happy-dom node that means walking its whole
+    // object graph: 301 ms for a 260-node subtree, measured. waitFor's 5 s budget goes in a few
+    // polls, so a machine that is briefly busy reds a healthy test. The boolean costs 0 ms.
+    await waitFor(() => expect(codeInput(result.container) === null).toBe(true));
+    expect(result.getByRole("button", { name: "Sign in" })).not.toBeNull();
+  });
+
+  test("drops back to the password step when the password is edited", async () => {
+    respondWith({ success: false, mfaRequired: true, message: MFA_PROMPT });
+
+    const result = renderLogin();
+    await submitCredentials(result);
+    await waitFor(() => expect(codeInput(result.container)).not.toBeNull());
+
+    await result.user.type(result.passwordInput, "x");
+
+    await waitFor(() => expect(codeInput(result.container) === null).toBe(true));
   });
 });

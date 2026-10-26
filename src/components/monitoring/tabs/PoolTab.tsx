@@ -1,5 +1,6 @@
 "use client";
 
+import { appFetch } from "@/lib/config/base-path";
 import React, { useState, useEffect, useCallback } from "react";
 import { Server, Activity, Clock, LoaderCircle, RefreshCw } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -7,10 +8,12 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
 import type { DatabaseConnection } from "@/lib/types";
-import { buildConnectionPayload } from "@/hooks/use-connection-payload";
+import { buildConnectionPayload, catalogField } from "@/hooks/use-connection-payload";
 
 interface PoolStats {
   total: number;
+  /** Configured ceiling, absent where the provider has none to report. */
+  max?: number;
   idle: number;
   active: number;
   waiting: number;
@@ -19,16 +22,18 @@ interface PoolStats {
 
 interface PoolTabProps {
   connection: DatabaseConnection | null;
+  /** The database whose pool to report on a server-level connection (#1530). */
+  catalog?: string;
 }
 
-export function PoolTab({ connection }: PoolTabProps) {
+export function PoolTab({ connection, catalog }: PoolTabProps) {
   // Only two things are state: which request the reader has asked for, and the
   // one that has come back. Everything the render needs - loading, stats, error
   // - follows from comparing the two, so nothing has to be set in the effect.
   const [refreshToken, setRefreshToken] = useState(0);
   const [settled, setSettled] = useState<{ key: string; stats: PoolStats | null; error: string | null } | null>(null);
 
-  const requestKey = connection === null ? null : `${connection.id}#${refreshToken}`;
+  const requestKey = connection === null ? null : `${connection.id}#${catalog ?? ""}#${refreshToken}`;
   const loading = requestKey !== null && settled?.key !== requestKey;
   const stats = settled?.stats ?? null;
   const error = settled?.error ?? null;
@@ -39,13 +44,13 @@ export function PoolTab({ connection }: PoolTabProps) {
     if (connection === null || requestKey === null) return;
     let ignore = false;
 
-    fetch("/api/db/pool-stats", {
+    appFetch("/api/db/pool-stats", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       // The seed id, not the object: a managed connection arrives here with its
       // password and connection string stripped, so the object cannot be resolved
       // to a database once the provider cache is cold.
-      body: JSON.stringify(buildConnectionPayload(connection)),
+      body: JSON.stringify({ ...buildConnectionPayload(connection), ...catalogField(catalog) }),
     })
       .then(async (res) => {
         const data = await res.json();
@@ -69,7 +74,7 @@ export function PoolTab({ connection }: PoolTabProps) {
     return () => {
       ignore = true;
     };
-  }, [connection, requestKey]);
+  }, [connection, catalog, requestKey]);
 
   if (!connection) {
     return (
@@ -110,8 +115,11 @@ export function PoolTab({ connection }: PoolTabProps) {
   // with no message, and that IS a measurement - 0 connections, truthfully - which keeps
   // the arithmetic and the labels below unchanged.
   const measured = stats !== null && stats.message === undefined ? stats : null;
-  const usagePercent =
-    measured !== null && measured.total > 0 ? Math.round((measured.active / measured.total) * 100) : 0;
+  // Utilization is against the configured ceiling when the provider reports one: a pool
+  // at 2 of 10 allowed clients with both busy is 20% utilized, not 100%. Without a
+  // ceiling the open count is the only denominator there is.
+  const capacity = measured?.max !== undefined && measured.max > 0 ? measured.max : (measured?.total ?? 0);
+  const usagePercent = measured !== null && capacity > 0 ? Math.round((measured.active / capacity) * 100) : 0;
 
   return (
     <div className="p-3 sm:p-6 space-y-4 sm:space-y-6">
@@ -121,7 +129,14 @@ export function PoolTab({ connection }: PoolTabProps) {
           <Server strokeWidth={1.5} className="h-4 w-4 sm:h-5 sm:w-5 text-primary" />
           <h2 className="text-xs sm:text-base font-medium">Connection Pool</h2>
         </div>
-        <Button variant="ghost" size="icon" className="h-8 w-8" onClick={reload} disabled={loading}>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8"
+          onClick={reload}
+          disabled={loading}
+          aria-label="Refresh connection pool"
+        >
           <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
         </Button>
       </div>
@@ -149,18 +164,22 @@ function PoolStatsGrid({ measured, usagePercent }: Readonly<{ measured: PoolStat
       <Card className="p-0">
         <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
           <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Total</CardTitle>
-          <Server strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-blue-500" />
+          <Server strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-hue-blue" />
         </CardHeader>
         <CardContent className="p-3 sm:p-4 pt-0">
           <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.total : "N/A"}</div>
-          {measured !== null && <p className="text-xs sm:text-xs text-muted-foreground mt-1">Max pool size</p>}
+          {measured !== null && (
+            <p className="text-xs sm:text-xs text-muted-foreground mt-1">
+              Open clients{measured.max !== undefined && ` · Max pool size ${measured.max}`}
+            </p>
+          )}
         </CardContent>
       </Card>
 
       <Card className="p-0">
         <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
           <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Active</CardTitle>
-          <Activity strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-green-500" />
+          <Activity strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-hue-green" />
         </CardHeader>
         <CardContent className="p-3 sm:p-4 pt-0">
           <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.active : "N/A"}</div>
@@ -176,7 +195,7 @@ function PoolStatsGrid({ measured, usagePercent }: Readonly<{ measured: PoolStat
       <Card className="p-0">
         <CardHeader className="flex flex-row items-center justify-between space-y-0 p-3 sm:p-4 pb-1 sm:pb-2">
           <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Idle</CardTitle>
-          <Clock strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-yellow-500" />
+          <Clock strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-hue-yellow" />
         </CardHeader>
         <CardContent className="p-3 sm:p-4 pt-0">
           <div className="text-lg sm:text-2xl font-medium">{measured !== null ? measured.idle : "N/A"}</div>

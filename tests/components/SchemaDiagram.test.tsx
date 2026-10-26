@@ -162,7 +162,7 @@ mock.module("@zumer/snapdom", () => ({
 }));
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { render, fireEvent, within, cleanup, act } from "@testing-library/react";
+import { render, fireEvent, within, cleanup, act, waitFor, waitForElementToBeRemoved } from "@testing-library/react";
 import React from "react";
 
 import { renderToStaticMarkup } from "react-dom/server";
@@ -177,16 +177,47 @@ import {
 } from "@/components/schema-diagram/highlight-store";
 import { mockToastError } from "../helpers/mock-sonner";
 import { mockSchema, emptySchema } from "../fixtures/schemas";
-import type { TableSchema } from "@/lib/types";
+import type { DetailedObject } from "@/lib/db/detailed-object";
+import { diagramNodeId } from "@/components/schema-diagram/graph";
+import type { ProviderCapabilities } from "@/lib/db/types";
 
 // =============================================================================
 // Test Data
 // =============================================================================
 
+// Two objects carrying ONE label in two containers, as the live SQL Server on 1433 holds
+// them, plus the cross-container foreign key that names its target qualified (#789, Task 36).
+const sameLabelSchema: DetailedObject[] = [
+  {
+    name: "customers",
+    kind: "table",
+    path: ["libredb_objects", "app", "customers"],
+    columns: [
+      { name: "id", type: "integer", nullable: false, isPrimary: true },
+      { name: "name", type: "varchar(255)", nullable: true, isPrimary: false },
+    ],
+    indexes: [],
+    foreignKeys: [],
+  },
+  {
+    name: "customers",
+    kind: "table",
+    path: ["shop", "dbo", "customers"],
+    columns: [
+      { name: "id", type: "integer", nullable: false, isPrimary: true },
+      { name: "email", type: "varchar(255)", nullable: true, isPrimary: false },
+    ],
+    indexes: [],
+    foreignKeys: [],
+  },
+];
+
 // Schema with NO foreign keys at all (triggers heuristic fallback)
-const schemaNoFK: TableSchema[] = [
+const schemaNoFK: DetailedObject[] = [
   {
     name: "users",
+    kind: "table",
+    path: ["users"],
     columns: [
       { name: "id", type: "integer", nullable: false, isPrimary: true },
       { name: "name", type: "varchar(255)", nullable: false, isPrimary: false },
@@ -197,6 +228,8 @@ const schemaNoFK: TableSchema[] = [
   },
   {
     name: "posts",
+    kind: "table",
+    path: ["posts"],
     columns: [
       { name: "id", type: "integer", nullable: false, isPrimary: true },
       { name: "title", type: "text", nullable: false, isPrimary: false },
@@ -208,9 +241,11 @@ const schemaNoFK: TableSchema[] = [
 ];
 
 // Schema with heuristic _id column (no FK data, but column ends with _id)
-const schemaHeuristic: TableSchema[] = [
+const schemaHeuristic: DetailedObject[] = [
   {
     name: "users",
+    kind: "table",
+    path: ["users"],
     columns: [
       { name: "id", type: "integer", nullable: false, isPrimary: true },
       { name: "email", type: "varchar", nullable: true, isPrimary: false },
@@ -221,6 +256,8 @@ const schemaHeuristic: TableSchema[] = [
   },
   {
     name: "comments",
+    kind: "table",
+    path: ["comments"],
     columns: [
       { name: "id", type: "integer", nullable: false, isPrimary: true },
       { name: "user_id", type: "integer", nullable: false, isPrimary: false },
@@ -233,9 +270,11 @@ const schemaHeuristic: TableSchema[] = [
 ];
 
 // Schema with heuristic _id column matching singular table name (no plural 's')
-const schemaHeuristicSingular: TableSchema[] = [
+const schemaHeuristicSingular: DetailedObject[] = [
   {
     name: "author",
+    kind: "table",
+    path: ["author"],
     columns: [
       { name: "id", type: "integer", nullable: false, isPrimary: true },
       { name: "name", type: "varchar(255)", nullable: false, isPrimary: false },
@@ -246,6 +285,8 @@ const schemaHeuristicSingular: TableSchema[] = [
   },
   {
     name: "books",
+    kind: "table",
+    path: ["books"],
     columns: [
       { name: "id", type: "integer", nullable: false, isPrimary: true },
       { name: "author_id", type: "integer", nullable: false, isPrimary: false },
@@ -258,22 +299,26 @@ const schemaHeuristicSingular: TableSchema[] = [
 ];
 
 // Schema with foreignKeys field omitted (tests `|| []` guards)
-const schemaUndefinedFK: TableSchema[] = [
+const schemaUndefinedFK: DetailedObject[] = [
   {
     name: "items",
+    kind: "table",
+    path: ["items"],
     columns: [
       { name: "id", type: "integer", nullable: false, isPrimary: true },
       { name: "label", type: "text", nullable: true, isPrimary: false },
     ],
     indexes: [],
     rowCount: 20,
-  } as TableSchema,
+  } as DetailedObject,
 ];
 
 // Multi-FK schema for highlighting tests
-const schemaMultiFK: TableSchema[] = [
+const schemaMultiFK: DetailedObject[] = [
   {
     name: "users",
+    kind: "table",
+    path: ["users"],
     columns: [
       { name: "id", type: "integer", nullable: false, isPrimary: true },
       { name: "name", type: "varchar(255)", nullable: false, isPrimary: false },
@@ -284,6 +329,8 @@ const schemaMultiFK: TableSchema[] = [
   },
   {
     name: "orders",
+    kind: "table",
+    path: ["orders"],
     columns: [
       { name: "id", type: "integer", nullable: false, isPrimary: true },
       { name: "user_id", type: "integer", nullable: false, isPrimary: false },
@@ -295,6 +342,8 @@ const schemaMultiFK: TableSchema[] = [
   },
   {
     name: "items",
+    kind: "table",
+    path: ["items"],
     columns: [
       { name: "id", type: "integer", nullable: false, isPrimary: true },
       { name: "order_id", type: "integer", nullable: false, isPrimary: false },
@@ -306,10 +355,12 @@ const schemaMultiFK: TableSchema[] = [
   },
 ];
 
-// Single table schema
-const singleTableSchema: TableSchema[] = [
+// A single relation, used wherever a test needs exactly one node
+const singleTableFixture: DetailedObject[] = [
   {
     name: "settings",
+    kind: "table",
+    path: ["settings"],
     columns: [
       { name: "key", type: "text", nullable: false, isPrimary: true },
       { name: "value", type: "text", nullable: true, isPrimary: false },
@@ -317,6 +368,41 @@ const singleTableSchema: TableSchema[] = [
     indexes: [],
     foreignKeys: [],
     rowCount: 5,
+  },
+];
+
+// One column per state of a default: the empty string, a value, and no default at all (#1030).
+const defaultsProbeFixture: DetailedObject[] = [
+  {
+    name: "defaults_probe",
+    kind: "table",
+    path: ["defaults_probe"],
+    columns: [
+      { name: "k", type: "text", nullable: true, isPrimary: false, defaultValue: "" },
+      { name: "d", type: "text", nullable: true, isPrimary: false, defaultValue: "abc" },
+      { name: "n", type: "text", nullable: true, isPrimary: false, defaultValue: undefined },
+    ],
+    indexes: [],
+    foreignKeys: [],
+  },
+];
+
+/**
+ * A MySQL/MariaDB reading (#1033): `type` is the type AS DECLARED and `baseType` the family.
+ * `enum('int','text')` contains the four characters `int`, so the row icon chosen from the
+ * declaration alone calls this column a number.
+ */
+const declaredTypeFixture: DetailedObject[] = [
+  {
+    name: "lentest",
+    kind: "table",
+    path: ["lentest"],
+    columns: [
+      { name: "qty", type: "int unsigned", baseType: "int", nullable: true, isPrimary: false },
+      { name: "flag", type: "enum('int','text')", baseType: "enum", nullable: true, isPrimary: false },
+    ],
+    indexes: [],
+    foreignKeys: [],
   },
 ];
 
@@ -330,6 +416,36 @@ function createDefaultProps(overrides: Partial<Parameters<typeof SchemaDiagram>[
     onClose: mock(() => {}),
     ...overrides,
   };
+}
+
+/**
+ * Clicks an export button and returns when the export has actually finished.
+ *
+ * WHY THERE IS A HELPER AT ALL. Ten tests used to click and then sleep for a fixed 20ms or
+ * 40ms, which is not a wait for the export but a bet on how long one takes. The chain is
+ * `setExporting(format)`, two `yieldToPaint` hops (`requestAnimationFrame` then `setTimeout`),
+ * `getNodesBounds`, snapdom, a blob, a download; on an idle box that is a couple of
+ * milliseconds and on a box running one bun process per test file it is not. Every assertion
+ * after such a sleep - the capture happened, the toast was raised, culling went back on -
+ * then reads state the export may not have reached, and the test reports a product defect.
+ *
+ * WHAT IS WAITED ON. `exporting` is the component's own name for "an export is in flight":
+ * it is set before the first yield and cleared in the `finally`, so it spans the whole chain
+ * including the error path, and `disabled={exporting !== null}` puts it on the button where a
+ * test can read it. Going idle again is therefore co-extensive with the export being over.
+ *
+ * THE CONTROL. `expect(button.disabled).toBe(true)` right after the click is what stops the
+ * wait from being vacuous: `fireEvent` is act-wrapped and `setExporting` runs before the first
+ * await, so a click that started an export is disabled by then. Without that line, a click
+ * that started nothing at all - the early return when there are no nodes, say - would satisfy
+ * "not disabled" immediately and every assertion after it would be about an export that never
+ * ran.
+ */
+async function exportAndSettle(view: ReturnType<typeof within>, format: "PNG" | "SVG"): Promise<void> {
+  const button = view.getByText(format).closest("button") as HTMLButtonElement;
+  fireEvent.click(button);
+  expect(button.disabled).toBe(true);
+  await waitFor(() => expect(button.disabled).toBe(false));
 }
 
 // =============================================================================
@@ -399,11 +515,9 @@ describe("SchemaDiagram", () => {
   test("onClose fires when close button clicked", () => {
     const onClose = mock(() => {});
     const props = createDefaultProps({ onClose });
-    const { container } = render(<SchemaDiagram {...props} />);
+    const { getByRole } = render(<SchemaDiagram {...props} />);
 
-    const closeButton = Array.from(container.querySelectorAll("button")).find((btn) =>
-      btn.className.includes("rounded-full"),
-    );
+    const closeButton = getByRole("button", { name: "Close schema diagram" });
     expect(closeButton).not.toBeNull();
 
     fireEvent.click(closeButton!);
@@ -447,7 +561,7 @@ describe("SchemaDiagram", () => {
   });
 
   test("shows single table count", () => {
-    const props = createDefaultProps({ schema: singleTableSchema });
+    const props = createDefaultProps({ schema: singleTableFixture });
     const { container } = render(<SchemaDiagram {...props} />);
     const view = within(container);
 
@@ -470,13 +584,9 @@ describe("SchemaDiagram", () => {
     const { container } = render(<SchemaDiagram {...props} />);
     const view = within(container);
 
-    const pngButton = view.getByText("PNG").closest("button")!;
     // Let the async export flow finish inside this test so it cannot bleed
     // into later tests (the mocks are shared module-level state).
-    await act(async () => {
-      fireEvent.click(pngButton);
-      await new Promise((r) => setTimeout(r, 40));
-    });
+    await exportAndSettle(view, "PNG");
     // Should not throw
   });
 
@@ -485,11 +595,7 @@ describe("SchemaDiagram", () => {
     const { container } = render(<SchemaDiagram {...props} />);
     const view = within(container);
 
-    const svgButton = view.getByText("SVG").closest("button")!;
-    await act(async () => {
-      fireEvent.click(svgButton);
-      await new Promise((r) => setTimeout(r, 40));
-    });
+    await exportAndSettle(view, "SVG");
     // Should not throw
   });
 
@@ -596,17 +702,17 @@ describe("SchemaDiagram", () => {
     expect(view.queryByText("Compact")).not.toBeNull();
   });
 
-  test("compact button has blue text class when compact mode is active", () => {
+  test("compact button has the accent text token when compact mode is active", () => {
     const props = createDefaultProps();
     const { container } = render(<SchemaDiagram {...props} />);
     const view = within(container);
 
     const compactButton = view.getByText("Compact").closest("button")!;
-    expect(compactButton.className).not.toContain("text-blue-400");
+    expect(compactButton.className).not.toContain("text-brand");
 
     fireEvent.click(compactButton);
     const detailButton = view.getByText("Detail").closest("button")!;
-    expect(detailButton.className).toContain("text-blue-400");
+    expect(detailButton.className).toContain("text-brand");
   });
 
   // ── No FK warning ───────────────────────────────────────────────────────
@@ -642,9 +748,11 @@ describe("SchemaDiagram", () => {
   test("shows warning when FK data exists but the displayed graph is heuristic", () => {
     // invoices HAS FK data, but it references a table outside the schema -
     // the diagram falls back to dashed heuristic edges and must explain them.
-    const unusableFk: TableSchema[] = [
+    const unusableFk: DetailedObject[] = [
       {
         name: "customer",
+        kind: "table",
+        path: ["customer"],
         columns: [{ name: "id", type: "integer", nullable: false, isPrimary: true }],
         indexes: [],
         foreignKeys: [],
@@ -652,6 +760,8 @@ describe("SchemaDiagram", () => {
       },
       {
         name: "invoices",
+        kind: "table",
+        path: ["invoices"],
         columns: [
           { name: "id", type: "integer", nullable: false, isPrimary: true },
           { name: "customer_id", type: "integer", nullable: false, isPrimary: false },
@@ -757,7 +867,7 @@ describe("SchemaDiagram", () => {
     const view = within(container);
     expect(view.queryByText("3 tables")).not.toBeNull();
 
-    rerender(<SchemaDiagram schema={singleTableSchema} onClose={onClose} />);
+    rerender(<SchemaDiagram schema={singleTableFixture} onClose={onClose} />);
     expect(view.queryByText("1 tables")).not.toBeNull();
   });
 
@@ -788,8 +898,10 @@ describe("SchemaDiagram", () => {
   // ── Schema with many tables ─────────────────────────────────────────
 
   test("schema with many tables renders correct count", () => {
-    const manyTables: TableSchema[] = Array.from({ length: 10 }, (_, i) => ({
+    const manyTables: DetailedObject[] = Array.from({ length: 10 }, (_, i) => ({
       name: `table_${i}`,
+      kind: "table",
+      path: [`table_${i}`],
       columns: [{ name: "id", type: "integer", nullable: false, isPrimary: true }],
       indexes: [],
       foreignKeys: [],
@@ -820,6 +932,62 @@ describe("SchemaDiagram", () => {
   // ═══════════════════════════════════════════════════════════════════════
 
   describe("TableNode rendering", () => {
+    test("preserves declared type casing and classifies numeric families without reading enum literals", () => {
+      const types = [
+        "enum('new','paid')",
+        "decimal(10,2)",
+        "float",
+        "double",
+        "numeric",
+        "real",
+        "number",
+        "int unsigned",
+        "bigint",
+        "UInt64",
+        "Float64",
+        "Decimal128(2)",
+        "Nullable(Int32)",
+        "HUGEINT",
+        "UBIGINT",
+        "varint",
+        "enum('int','text')",
+        "point",
+      ];
+      for (const type of types) {
+        const schema: DetailedObject[] = [
+          {
+            name: "probe",
+            kind: "table",
+            path: ["probe"],
+            indexes: [],
+            foreignKeys: [],
+            columns: [{ name: "value", type, nullable: true, isPrimary: false }],
+          },
+        ];
+        const { container, unmount } = render(<SchemaDiagram {...createDefaultProps({ schema })} />);
+        const row = container.querySelector('[title^="value: "]')!;
+        const text = row.querySelector(".font-mono")!;
+        expect(text.textContent).toBe(type);
+        expect(text.classList.contains("uppercase")).toBe(false);
+        const numeric = !type.startsWith("enum") && type !== "point";
+        expect(row.querySelector(numeric ? ".lucide-hash" : ".lucide-type")).not.toBeNull();
+        unmount();
+      }
+    });
+
+    test("uses the MySQL base type for numeric icons while preserving the declared type", () => {
+      const schema = singleTableFixture.map((table) => ({
+        ...table,
+        columns: [
+          { name: "amount", type: "decimal(10,2) unsigned", baseType: "decimal", nullable: true, isPrimary: false },
+        ],
+      }));
+      const { container } = render(<SchemaDiagram {...createDefaultProps({ schema })} />);
+      const row = container.querySelector('[title^="amount: "]')!;
+      expect(row.querySelector(".lucide-hash")).not.toBeNull();
+      expect(row.querySelector(".font-mono")!.textContent).toBe("decimal(10,2) unsigned");
+    });
+
     test("renders table name in header", () => {
       const props = createDefaultProps();
       const { container } = render(<SchemaDiagram {...props} />);
@@ -843,7 +1011,7 @@ describe("SchemaDiagram", () => {
     });
 
     test("displays column names", () => {
-      const props = createDefaultProps({ schema: singleTableSchema });
+      const props = createDefaultProps({ schema: singleTableFixture });
       const { container } = render(<SchemaDiagram {...props} />);
       const view = within(container);
 
@@ -852,17 +1020,17 @@ describe("SchemaDiagram", () => {
     });
 
     test("displays column type text", () => {
-      const props = createDefaultProps({ schema: singleTableSchema });
+      const props = createDefaultProps({ schema: singleTableFixture });
       const { container } = render(<SchemaDiagram {...props} />);
 
-      // Column types should be rendered in uppercase
+      // Column types retain the spelling reported by the provider.
       const texts = Array.from(container.querySelectorAll(".font-mono"));
       const typeTexts = texts.map((el) => el.textContent);
       expect(typeTexts).toContain("text");
     });
 
     test("shows NN for NOT NULL columns", () => {
-      const props = createDefaultProps({ schema: singleTableSchema });
+      const props = createDefaultProps({ schema: singleTableFixture });
       const { container } = render(<SchemaDiagram {...props} />);
 
       // 'key' column has nullable: false
@@ -871,8 +1039,33 @@ describe("SchemaDiagram", () => {
       expect(nnTexts).toContain("NN");
     });
 
+    test("tooltip tells an empty-string default apart from no default (#1030)", () => {
+      const props = createDefaultProps({ schema: defaultsProbeFixture });
+      const { container } = render(<SchemaDiagram {...props} />);
+
+      // Assert the title ATTRIBUTE, not getByRole(name): a role-name query falls back to `title`.
+      const rowTitle = (column: string) => container.querySelector(`[title^="${column}: "]`)?.getAttribute("title");
+
+      expect(rowTitle("k")).toBe("k: text\nDefault: '' (empty string)");
+      expect(rowTitle("d")).toBe("d: text\nDefault: abc");
+      expect(rowTitle("n")).toBe("n: text");
+      expect(container.querySelectorAll('[title*="Default"]').length).toBe(2);
+    });
+
+    test("the row icon reads the type FAMILY, not the declaration (#1033)", () => {
+      const props = createDefaultProps({ schema: declaredTypeFixture });
+      const { container } = render(<SchemaDiagram {...props} />);
+      const iconOf = (column: string) =>
+        container.querySelector(`[title^="${column}: "] svg`)?.getAttribute("class") ?? "";
+
+      // `int unsigned` is an integer and `enum('int','text')` is not, and neither says so to a
+      // substring test on the declaration.
+      expect(iconOf("qty")).toContain("lucide-hash");
+      expect(iconOf("flag")).toContain("lucide-type");
+    });
+
     test("compact mode hides column details", () => {
-      const props = createDefaultProps({ schema: singleTableSchema });
+      const props = createDefaultProps({ schema: singleTableFixture });
       const { container } = render(<SchemaDiagram {...props} />);
       const view = within(container);
 
@@ -902,16 +1095,30 @@ describe("SchemaDiagram", () => {
       const props = createDefaultProps();
       const { container } = render(<SchemaDiagram {...props} />);
 
-      expect(container.querySelector('[data-node-id="users"]')).not.toBeNull();
-      expect(container.querySelector('[data-node-id="orders"]')).not.toBeNull();
-      expect(container.querySelector('[data-node-id="products"]')).not.toBeNull();
+      expect(container.querySelector(`[data-node-id="${diagramNodeId(["public", "users"])}"]`)).not.toBeNull();
+      expect(container.querySelector(`[data-node-id="${diagramNodeId(["public", "orders"])}"]`)).not.toBeNull();
+      expect(container.querySelector(`[data-node-id="${diagramNodeId(["public", "products"])}"]`)).not.toBeNull();
+    });
+
+    test("renders a table whose name holds a double quote or a backslash (SF-010)", () => {
+      const quoted = { ...mockSchema[0], name: 'D_quote"d', path: ["public", 'D_quote"d'] };
+      const slashed = { ...mockSchema[0], name: "back\\slash", path: ["public", "back\\slash"] };
+      const props = createDefaultProps({ schema: [quoted, slashed] });
+      const { container } = render(<SchemaDiagram {...props} />);
+
+      // The selector React Flow builds from a node id when it measures the node.
+      for (const path of [quoted.path, slashed.path]) {
+        const selector = `[data-node-id="${diagramNodeId(path)}"]`;
+        expect(() => container.querySelector(selector)).not.toThrow();
+        expect(container.querySelector(selector)).not.toBeNull();
+      }
     });
 
     test("node with empty/null data returns nothing", () => {
       // Schema with a valid table ensures at least one node renders
       // The guard `if (!data) return null; if (!table) return null;` is tested
       // by the fact that the enhanced mock passes correct data through
-      const props = createDefaultProps({ schema: singleTableSchema });
+      const props = createDefaultProps({ schema: singleTableFixture });
       const { container } = render(<SchemaDiagram {...props} />);
 
       const nodeEl = container.querySelector('[data-node-id="settings"]');
@@ -935,7 +1142,7 @@ describe("SchemaDiagram", () => {
       expect(view.queryByText("Selected:")).toBeNull();
 
       // Click the users node
-      const usersNode = container.querySelector('[data-node-id="users"]')!;
+      const usersNode = container.querySelector(`[data-node-id="${diagramNodeId(["public", "users"])}"]`)!;
       fireEvent.click(usersNode);
 
       // Selection should appear with selected node name and clear button
@@ -943,7 +1150,7 @@ describe("SchemaDiagram", () => {
       // The selected table name appears in a font-mono span
       const selectedSpan = container.querySelector(".font-mono.font-medium");
       expect(selectedSpan).not.toBeNull();
-      expect(selectedSpan!.textContent).toBe("users");
+      expect(selectedSpan!.textContent).toBe("public.users");
       expect(view.queryByText("clear")).not.toBeNull();
     });
 
@@ -952,7 +1159,7 @@ describe("SchemaDiagram", () => {
       const { container } = render(<SchemaDiagram {...props} />);
       const view = within(container);
 
-      const usersNode = container.querySelector('[data-node-id="users"]')!;
+      const usersNode = container.querySelector(`[data-node-id="${diagramNodeId(["public", "users"])}"]`)!;
 
       // Select
       fireEvent.click(usersNode);
@@ -969,7 +1176,7 @@ describe("SchemaDiagram", () => {
       const view = within(container);
 
       // Select a node
-      const usersNode = container.querySelector('[data-node-id="users"]')!;
+      const usersNode = container.querySelector(`[data-node-id="${diagramNodeId(["public", "users"])}"]`)!;
       fireEvent.click(usersNode);
       expect(view.queryByText("Selected:")).not.toBeNull();
 
@@ -984,7 +1191,7 @@ describe("SchemaDiagram", () => {
       const { container } = render(<SchemaDiagram {...props} />);
       const view = within(container);
 
-      fireEvent.click(container.querySelector('[data-node-id="users"]')!);
+      fireEvent.click(container.querySelector(`[data-node-id="${diagramNodeId(["public", "users"])}"]`)!);
       expect(view.queryByText("Selected:")).not.toBeNull();
 
       // Filtering "users" out of the graph must clear the stale selection.
@@ -993,14 +1200,35 @@ describe("SchemaDiagram", () => {
 
       expect(view.queryByText("Selected:")).toBeNull();
       // ...and the surviving table does not inherit any highlight.
-      const ordersNode = container.querySelector('[data-node-id="orders"]')!;
-      expect(ordersNode.querySelector(".border-blue-500\\/60")).toBeNull();
+      const ordersNode = container.querySelector(`[data-node-id="${diagramNodeId(["public", "orders"])}"]`)!;
+      expect(ordersNode.querySelector(".border-brand-tint\\/60")).toBeNull();
 
       // The drop is permanent: clearing the filter brings the table back to
       // the canvas but must NOT resurrect a selection the user already lost.
       fireEvent.change(searchInput, { target: { value: "" } });
-      expect(container.querySelector('[data-node-id="users"]')).not.toBeNull();
+      expect(container.querySelector(`[data-node-id="${diagramNodeId(["public", "users"])}"]`)).not.toBeNull();
       expect(view.queryByText("Selected:")).toBeNull();
+    });
+
+    test("two objects sharing a label in different containers are two selectable nodes", () => {
+      // The live SQL Server on 1433 holds both of these. Keyed on the label they were one
+      // React Flow node id, so one card was dropped and the readout named neither (#789).
+      const props = createDefaultProps({ schema: sameLabelSchema });
+      const { container } = render(<SchemaDiagram {...props} />);
+      const view = within(container);
+
+      expect(container.querySelectorAll("[data-node-id]").length).toBe(2);
+      const shopNode = container.querySelector(`[data-node-id="${diagramNodeId(["shop", "dbo", "customers"])}"]`);
+      expect(shopNode).not.toBeNull();
+      expect(
+        container.querySelector(`[data-node-id="${diagramNodeId(["libredb_objects", "app", "customers"])}"]`),
+      ).not.toBeNull();
+
+      fireEvent.click(shopNode!);
+      expect(view.queryByText("Selected:")).not.toBeNull();
+      // The readout is for a PERSON, so it is the dotted address and never the key's own
+      // control character.
+      expect(container.querySelector(".font-mono.font-medium")!.textContent).toBe("shop.dbo.customers");
     });
 
     test("clicking pane background clears selection", () => {
@@ -1009,7 +1237,7 @@ describe("SchemaDiagram", () => {
       const view = within(container);
 
       // Select a node
-      const usersNode = container.querySelector('[data-node-id="users"]')!;
+      const usersNode = container.querySelector(`[data-node-id="${diagramNodeId(["public", "users"])}"]`)!;
       fireEvent.click(usersNode);
       expect(view.queryByText("Selected:")).not.toBeNull();
 
@@ -1026,16 +1254,16 @@ describe("SchemaDiagram", () => {
   // ═══════════════════════════════════════════════════════════════════════
 
   describe("Node/Edge highlighting", () => {
-    test("selected node gets highlighted (blue border)", () => {
+    test("selected node gets highlighted (brand-tint border)", () => {
       const props = createDefaultProps();
       const { container } = render(<SchemaDiagram {...props} />);
 
       // Click users node
-      const usersNode = container.querySelector('[data-node-id="users"]')!;
+      const usersNode = container.querySelector(`[data-node-id="${diagramNodeId(["public", "users"])}"]`)!;
       fireEvent.click(usersNode);
 
-      // The TableNode's root div inside the data-node-id div should have blue border
-      const innerDiv = usersNode.querySelector(".border-blue-500\\/60");
+      // The TableNode's root div inside the data-node-id div should carry the brand-tint highlight border
+      const innerDiv = usersNode.querySelector(".border-brand-tint\\/60");
       expect(innerDiv).not.toBeNull();
     });
 
@@ -1044,12 +1272,12 @@ describe("SchemaDiagram", () => {
       const { container } = render(<SchemaDiagram {...props} />);
 
       // Select 'orders' which has FK to 'users'
-      const ordersNode = container.querySelector('[data-node-id="orders"]')!;
+      const ordersNode = container.querySelector(`[data-node-id="${diagramNodeId(["public", "orders"])}"]`)!;
       fireEvent.click(ordersNode);
 
       // The 'users' table should also be highlighted (FK target)
-      const usersNode = container.querySelector('[data-node-id="users"]')!;
-      const usersInner = usersNode.querySelector(".border-blue-500\\/60");
+      const usersNode = container.querySelector(`[data-node-id="${diagramNodeId(["public", "users"])}"]`)!;
+      const usersInner = usersNode.querySelector(".border-brand-tint\\/60");
       expect(usersInner).not.toBeNull();
     });
 
@@ -1058,12 +1286,12 @@ describe("SchemaDiagram", () => {
       const { container } = render(<SchemaDiagram {...props} />);
 
       // Select 'users' — orders has FK pointing to users
-      const usersNode = container.querySelector('[data-node-id="users"]')!;
+      const usersNode = container.querySelector(`[data-node-id="${diagramNodeId(["public", "users"])}"]`)!;
       fireEvent.click(usersNode);
 
       // The 'orders' table should be highlighted (it references users via FK)
-      const ordersNode = container.querySelector('[data-node-id="orders"]')!;
-      const ordersInner = ordersNode.querySelector(".border-blue-500\\/60");
+      const ordersNode = container.querySelector(`[data-node-id="${diagramNodeId(["public", "orders"])}"]`)!;
+      const ordersInner = ordersNode.querySelector(".border-brand-tint\\/60");
       expect(ordersInner).not.toBeNull();
     });
 
@@ -1072,12 +1300,12 @@ describe("SchemaDiagram", () => {
       const { container } = render(<SchemaDiagram {...props} />);
 
       // Select 'orders' (related to users via FK, not related to products)
-      const ordersNode = container.querySelector('[data-node-id="orders"]')!;
+      const ordersNode = container.querySelector(`[data-node-id="${diagramNodeId(["public", "orders"])}"]`)!;
       fireEvent.click(ordersNode);
 
       // Products should NOT be highlighted
-      const productsNode = container.querySelector('[data-node-id="products"]')!;
-      const productsInner = productsNode.querySelector(".border-blue-500\\/60");
+      const productsNode = container.querySelector(`[data-node-id="${diagramNodeId(["public", "products"])}"]`)!;
+      const productsInner = productsNode.querySelector(".border-brand-tint\\/60");
       expect(productsInner).toBeNull();
       // Products should have default border
       const productsDefault = productsNode.querySelector(".border-hairline-strong");
@@ -1124,11 +1352,7 @@ describe("SchemaDiagram", () => {
       const { container } = render(<SchemaDiagram {...props} />);
       const view = within(container);
 
-      const pngButton = view.getByText("PNG").closest("button")!;
-      await act(async () => {
-        fireEvent.click(pngButton);
-        await new Promise((r) => setTimeout(r, 20));
-      });
+      await exportAndSettle(view, "PNG");
 
       expect(mockSnapdom).toHaveBeenCalledTimes(1);
       const [capturedEl, options] = mockSnapdom.mock.calls[0] as unknown as [HTMLElement, Record<string, unknown>];
@@ -1180,11 +1404,7 @@ describe("SchemaDiagram", () => {
       const { container } = render(<SchemaDiagram {...props} />);
       const view = within(container);
 
-      const svgButton = view.getByText("SVG").closest("button")!;
-      await act(async () => {
-        fireEvent.click(svgButton);
-        await new Promise((r) => setTimeout(r, 20));
-      });
+      await exportAndSettle(view, "SVG");
 
       expect(mockSnapdom).toHaveBeenCalledTimes(1);
       const [capturedEl] = mockSnapdom.mock.calls[0] as unknown as [HTMLElement];
@@ -1211,11 +1431,7 @@ describe("SchemaDiagram", () => {
         const { container } = render(<SchemaDiagram {...props} />);
         const view = within(container);
 
-        const pngButton = view.getByText("PNG").closest("button")!;
-        await act(async () => {
-          fireEvent.click(pngButton);
-          await new Promise((r) => setTimeout(r, 20));
-        });
+        await exportAndSettle(view, "PNG");
 
         const [, options] = mockSnapdom.mock.calls[0] as unknown as [HTMLElement, Record<string, unknown>];
         expect(options.backgroundColor).toBe("#050505");
@@ -1243,11 +1459,7 @@ describe("SchemaDiagram", () => {
           await Promise.resolve();
         });
 
-        const pngButton = view.getByText("PNG").closest("button")!;
-        await act(async () => {
-          fireEvent.click(pngButton);
-          await new Promise((r) => setTimeout(r, 20));
-        });
+        await exportAndSettle(view, "PNG");
 
         const [, options] = mockSnapdom.mock.calls[0] as unknown as [HTMLElement, Record<string, unknown>];
         expect(options.backgroundColor).toBe("#050505");
@@ -1276,22 +1488,23 @@ describe("SchemaDiagram", () => {
       const props = createDefaultProps({ schema: schemaNoFK });
       const { container } = render(<SchemaDiagram {...props} />);
       const view = within(container);
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 20));
-      });
+      // No wait here: the grid fallback is the FIRST paint's own node set, and the ELK result
+      // cannot land before the `resolveLayout()` below, which this test holds. Nothing is in
+      // flight, so a sleep would only be a window in which nothing could happen anyway.
       // Still on the grid fallback: 320px apart, not the ELK 100px.
       expect((lastReactFlowProps.nodes as Array<{ position: { x: number } }>)[1].position.x).toBe(320);
 
-      const pngButton = view.getByText("PNG").closest("button")!;
+      // The one export in this file that cannot use `exportAndSettle`: the halves have to
+      // stay apart, because the ELK result is committed in the MIDDLE of the chain.
+      const pngButton = view.getByText("PNG").closest("button") as HTMLButtonElement;
       fireEvent.click(pngButton);
+      expect(pngButton.disabled).toBe(true);
       // Commit the ELK result in its own act, so it lands between the click
       // and the macrotasks the two paint yields wait on.
       await act(async () => {
         resolveLayout();
       });
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 20));
-      });
+      await waitFor(() => expect(pngButton.disabled).toBe(false));
 
       expect(mockGetNodesBounds).toHaveBeenCalledTimes(1);
       const measured = mockGetNodesBounds.mock.calls[0][0] as Array<{ position: { x: number } }>;
@@ -1318,11 +1531,9 @@ describe("SchemaDiagram", () => {
       const { container } = render(<SchemaDiagram {...props} />);
       const view = within(container);
 
-      const pngButton = view.getByText("PNG").closest("button")!;
-      await act(async () => {
-        fireEvent.click(pngButton);
-        await new Promise((r) => setTimeout(r, 20));
-      });
+      // `exporting` is cleared in the `finally`, so the failure path settles the same way a
+      // successful one does and the toast is on screen when the wait ends.
+      await exportAndSettle(view, "PNG");
 
       expect(mockToastError).toHaveBeenCalled();
     });
@@ -1335,11 +1546,15 @@ describe("SchemaDiagram", () => {
       fireEvent.change(view.getByPlaceholderText("Filter tables..."), { target: { value: "no-such-table" } });
       expect(view.queryByText("0 tables")).not.toBeNull();
 
-      const pngButton = view.getByText("PNG").closest("button")!;
-      await act(async () => {
-        fireEvent.click(pngButton);
-        await new Promise((r) => setTimeout(r, 20));
-      });
+      // Asserted synchronously, and that is the point rather than an economy: the refusal
+      // runs BEFORE `exportDiagram`'s first await - no nodes, so it toasts and returns
+      // without ever setting `exporting` - so there is nothing in flight to wait for.
+      // `disabled` still being false is the control that keeps the negative below honest: it
+      // says the export was refused, not that it had merely not started yet, which is exactly
+      // what a fixed sleep cannot tell apart.
+      const pngButton = view.getByText("PNG").closest("button") as HTMLButtonElement;
+      fireEvent.click(pngButton);
+      expect(pngButton.disabled).toBe(false);
 
       expect(mockSnapdom).not.toHaveBeenCalled();
       expect(mockToastError).toHaveBeenCalled();
@@ -1354,11 +1569,7 @@ describe("SchemaDiagram", () => {
       const { container } = render(<SchemaDiagram {...props} />);
       const view = within(container);
 
-      const pngButton = view.getByText("PNG").closest("button")!;
-      await act(async () => {
-        fireEvent.click(pngButton);
-        await new Promise((r) => setTimeout(r, 20));
-      });
+      await exportAndSettle(view, "PNG");
 
       expect(mockToastError).toHaveBeenCalled();
     });
@@ -1386,11 +1597,7 @@ describe("SchemaDiagram", () => {
         const { container } = render(<SchemaDiagram {...props} />);
         const view = within(container);
 
-        const pngButton = view.getByText("PNG").closest("button")!;
-        await act(async () => {
-          fireEvent.click(pngButton);
-          await new Promise((r) => setTimeout(r, 40));
-        });
+        await exportAndSettle(view, "PNG");
 
         expect(mockSnapdom).toHaveBeenCalledTimes(1);
         expect(mockToBlob).toHaveBeenCalledTimes(1);
@@ -1495,8 +1702,10 @@ describe("SchemaDiagram", () => {
   // ═══════════════════════════════════════════════════════════════════════
 
   describe("Large schemas", () => {
-    const bigSchema: TableSchema[] = Array.from({ length: 150 }, (_, i) => ({
+    const bigSchema: DetailedObject[] = Array.from({ length: 150 }, (_, i) => ({
       name: `table_${i}`,
+      kind: "table",
+      path: [`table_${i}`],
       columns: [{ name: "id", type: "integer", nullable: false, isPrimary: true }],
       indexes: [],
       foreignKeys: [],
@@ -1516,11 +1725,7 @@ describe("SchemaDiagram", () => {
 
       expect(lastReactFlowProps.onlyRenderVisibleElements).toBe(true);
 
-      const pngButton = view.getByText("PNG").closest("button")!;
-      await act(async () => {
-        fireEvent.click(pngButton);
-        await new Promise((r) => setTimeout(r, 40));
-      });
+      await exportAndSettle(view, "PNG");
 
       // Culled (unmounted) nodes cannot be captured - the snapshot must run
       // with culling off so every table is in the DOM.
@@ -1546,11 +1751,13 @@ describe("SchemaDiagram", () => {
 
       // Select users while no FK data exists
       fireEvent.click(container.querySelector('[data-node-id="users"]')!);
-      expect(container.querySelector('[data-node-id="users"]')!.querySelector(".border-blue-500\\/60")).not.toBeNull();
-      expect(container.querySelector('[data-node-id="posts"]')!.querySelector(".border-blue-500\\/60")).toBeNull();
+      expect(
+        container.querySelector('[data-node-id="users"]')!.querySelector(".border-brand-tint\\/60"),
+      ).not.toBeNull();
+      expect(container.querySelector('[data-node-id="posts"]')!.querySelector(".border-brand-tint\\/60")).toBeNull();
 
       // Relations arrive: posts now references users
-      const withFk: TableSchema[] = [
+      const withFk: DetailedObject[] = [
         schemaNoFK[0],
         {
           ...schemaNoFK[1],
@@ -1558,33 +1765,40 @@ describe("SchemaDiagram", () => {
           foreignKeys: [{ columnName: "user_id", referencedTable: "users", referencedColumn: "id" }],
         },
       ];
-      await act(async () => {
-        rerender(<SchemaDiagram schema={withFk} onClose={onClose} />);
-        await new Promise((r) => setTimeout(r, 20));
-      });
+      rerender(<SchemaDiagram schema={withFk} onClose={onClose} />);
 
-      // posts is now a neighbor of the still-selected users -> highlighted
-      expect(container.querySelector('[data-node-id="posts"]')!.querySelector(".border-blue-500\\/60")).not.toBeNull();
+      // posts is now a neighbor of the still-selected users -> highlighted.
+      // The wait is on that class arriving, which is the fact this test is about; the 20ms
+      // sleep it replaces asserted only that 20ms had passed, and the neighbour set is
+      // recomputed off the new FK data through the highlight store rather than in the render
+      // that `rerender` flushed.
+      await waitFor(() =>
+        expect(
+          container.querySelector('[data-node-id="posts"]')!.querySelector(".border-brand-tint\\/60"),
+        ).not.toBeNull(),
+      );
     });
 
     test("node internals re-measure when FK anchors appear on existing tables", async () => {
       const onClose = mock(() => {});
       const { rerender } = render(<SchemaDiagram schema={schemaNoFK} onClose={onClose} />);
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 20));
-      });
+      // The baseline has to be taken once the mount has stopped moving, and `fitView` is the
+      // signal that it has: it is called after the layout completes, which is the last thing
+      // that rebuilds the graph and so the last thing that can re-measure a node.
+      await waitFor(() => expect(mockFitView).toHaveBeenCalled());
       const callsBefore = mockUpdateNodeInternals.mock.calls.length;
 
-      // Identity-only rebuild (same schema content) must NOT re-measure
-      await act(async () => {
-        rerender(<SchemaDiagram schema={[...schemaNoFK]} onClose={onClose} />);
-        await new Promise((r) => setTimeout(r, 20));
-      });
+      // Identity-only rebuild (same schema content) must NOT re-measure.
+      // No wait after the rerender: `TableNode`'s re-measure is a passive effect keyed on the
+      // handle signature, and RTL act-wraps `rerender`, so any effect this rebuild was going
+      // to run has already run when the line below reads the counter. A sleep here would add
+      // a window in which nothing new can happen and call it evidence.
+      rerender(<SchemaDiagram schema={[...schemaNoFK]} onClose={onClose} />);
       expect(mockUpdateNodeInternals.mock.calls.length).toBe(callsBefore);
 
       // FK arrival adds handles -> React Flow must be told to re-measure,
       // otherwise the new edges never attach.
-      const withFk: TableSchema[] = [
+      const withFk: DetailedObject[] = [
         schemaNoFK[0],
         {
           ...schemaNoFK[1],
@@ -1592,11 +1806,8 @@ describe("SchemaDiagram", () => {
           foreignKeys: [{ columnName: "user_id", referencedTable: "users", referencedColumn: "id" }],
         },
       ];
-      await act(async () => {
-        rerender(<SchemaDiagram schema={withFk} onClose={onClose} />);
-        await new Promise((r) => setTimeout(r, 20));
-      });
-      expect(mockUpdateNodeInternals.mock.calls.length).toBeGreaterThan(callsBefore);
+      rerender(<SchemaDiagram schema={withFk} onClose={onClose} />);
+      await waitFor(() => expect(mockUpdateNodeInternals.mock.calls.length).toBeGreaterThan(callsBefore));
     });
   });
 
@@ -1605,9 +1816,11 @@ describe("SchemaDiagram", () => {
   // ═══════════════════════════════════════════════════════════════════════
 
   describe("Layout failure", () => {
-    const wideTable: TableSchema[] = [
+    const wideTable: DetailedObject[] = [
       {
         name: "wide",
+        kind: "table",
+        path: ["wide"],
         columns: Array.from({ length: 30 }, (_, i) => ({
           name: `col_${i}`,
           type: "integer",
@@ -1633,17 +1846,18 @@ describe("SchemaDiagram", () => {
       const props = createDefaultProps({ schema: wideTable });
       const { container } = render(<SchemaDiagram {...props} />);
       const view = within(container);
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 20));
-      });
+      // The spinner is derived from `signature !== layoutedSignature`, so it is on screen
+      // from the first paint and clears when the layout settles - including this one, which
+      // settles by answering null. Waiting for it to go is waiting for the fact; the 20ms
+      // sleep it replaces was a guess at how long a promise takes to come back.
+      await waitForElementToBeRemoved(() => view.queryByText("layout"));
       expect(layoutCalls).toBe(1);
 
       // Expanding a table changes graph identity but not structure - the
-      // known-failed layout must not rerun (no spinner churn).
+      // known-failed layout must not rerun (no spinner churn). No wait after the click:
+      // the layout effect calls the engine synchronously when it runs, and `fireEvent` is
+      // act-wrapped, so a rerun would already be counted below.
       fireEvent.click(view.getByText(/\+\d+ more/));
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 20));
-      });
       expect(layoutCalls).toBe(1);
       expect(view.queryByText("col_29")).not.toBeNull();
     });
@@ -1661,18 +1875,15 @@ describe("SchemaDiagram", () => {
       const props = createDefaultProps({ schema: wideTable });
       const { container } = render(<SchemaDiagram {...props} />);
       const view = within(container);
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 20));
-      });
+      // The catch handler must clear the layouting spinner, and its removal is both the
+      // wait and the assertion: `waitForElementToBeRemoved` refuses to run at all unless the
+      // spinner was there to begin with, so it carries its own control.
+      await waitForElementToBeRemoved(() => view.queryByText("layout"));
       expect(layoutCalls).toBe(1);
-      // The catch handler must clear the layouting spinner...
-      expect(view.queryByText("layout")).toBeNull();
 
-      // ...and record the signature so cosmetic rebuilds do not retry.
+      // ...and record the signature so cosmetic rebuilds do not retry. No wait after the
+      // click, for the reason the null-layout test above gives.
       fireEvent.click(view.getByText(/\+\d+ more/));
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 20));
-      });
       expect(layoutCalls).toBe(1);
       expect(view.queryByText("col_29")).not.toBeNull();
     });
@@ -1687,14 +1898,13 @@ describe("SchemaDiagram", () => {
       const props = createDefaultProps();
       render(<SchemaDiagram {...props} />);
 
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 20));
-      });
-
       // fitView is scheduled behind a paint yield, so any bookkeeping write
       // that re-runs the layout effect would fire its cleanup, set
       // `cancelled` and swallow this call — leaving the diagram unfitted.
-      expect(mockFitView).toHaveBeenCalledWith({ padding: 0.15 });
+      // Waited on directly rather than behind a sleep: the call IS the assertion, so a wait
+      // for it cannot end early, and a machine slower than the sleep no longer reports a
+      // swallowed fit-view that was merely late.
+      await waitFor(() => expect(mockFitView).toHaveBeenCalledWith({ padding: 0.15 }));
     });
 
     test("the layout spinner shows while ELK is in flight and clears when it resolves", async () => {
@@ -1711,17 +1921,16 @@ describe("SchemaDiagram", () => {
       const { container } = render(<SchemaDiagram {...props} />);
       const view = within(container);
 
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 20));
-      });
+      // No wait for the spinner to appear: it is derived during render rather than set by an
+      // effect, so it is on screen from the first paint and stays there for as long as this
+      // test holds the layout promise. Nothing can take it away in the meantime.
       expect(view.queryByText("layout")).not.toBeNull();
 
-      await act(async () => {
+      act(() => {
         // null keeps the grid fallback but still completes the layout.
         resolveLayout(null);
-        await new Promise((r) => setTimeout(r, 20));
       });
-      expect(view.queryByText("layout")).toBeNull();
+      await waitForElementToBeRemoved(() => view.queryByText("layout"));
     });
   });
 
@@ -1730,9 +1939,11 @@ describe("SchemaDiagram", () => {
   // ═══════════════════════════════════════════════════════════════════════
 
   describe("Column capping", () => {
-    const wideTable: TableSchema[] = [
+    const wideTable: DetailedObject[] = [
       {
         name: "wide",
+        kind: "table",
+        path: ["wide"],
         columns: Array.from({ length: 30 }, (_, i) => ({
           name: `col_${i}`,
           type: "integer",
@@ -1781,13 +1992,47 @@ describe("SchemaDiagram", () => {
       expect(view.queryByText(/\+\d+ more/)).not.toBeNull();
     });
 
+    test("the expander expands the card it sits in, not its namesake in another container", () => {
+      // Both cards are wide and both are labelled `customers`. Keyed on the label, one click
+      // expanded whichever the set answered for, which is the collision a one-object fixture
+      // cannot see (#789, Task 36).
+      const wideAt = (path: readonly string[], prefix: string): DetailedObject => ({
+        name: path[path.length - 1],
+        kind: "table",
+        path: [...path],
+        columns: Array.from({ length: 30 }, (_, i) => ({
+          name: `${prefix}_${i}`,
+          type: "integer",
+          nullable: true,
+          isPrimary: i === 0,
+        })),
+        indexes: [],
+        foreignKeys: [],
+      });
+      const props = createDefaultProps({
+        schema: [wideAt(["libredb_objects", "app", "customers"], "app"), wideAt(["shop", "dbo", "customers"], "shop")],
+      });
+      const { container } = render(<SchemaDiagram {...props} />);
+      const view = within(container);
+
+      const shopCard = container.querySelector<HTMLElement>(
+        `[data-node-id="${diagramNodeId(["shop", "dbo", "customers"])}"]`,
+      )!;
+      fireEvent.click(within(shopCard).getByText(/\+\d+ more/));
+
+      expect(view.queryByText("shop_29")).not.toBeNull();
+      expect(view.queryByText("app_29")).toBeNull();
+    });
+
     test("dragged node positions are recorded and survive cosmetic rebuilds", async () => {
       const props = createDefaultProps({ schema: wideTable });
       const { container } = render(<SchemaDiagram {...props} />);
       const view = within(container);
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 20));
-      });
+      // The drag has to happen AFTER the layout has landed, or the ELK positions arrive on
+      // top of the dragged one and this test fails for a reason that is not the subject.
+      // `fitView` is called once the layout completes, so it is that moment by name rather
+      // than 20ms of hoping.
+      await waitFor(() => expect(mockFitView).toHaveBeenCalled());
 
       const onNodesChange = lastReactFlowProps.onNodesChange as (changes: unknown[]) => void;
       act(() => {
@@ -1848,11 +2093,11 @@ describe("SchemaDiagram", () => {
 
       // 'users' should be highlighted (orders has FK to users)
       const usersNode = container.querySelector('[data-node-id="users"]')!;
-      expect(usersNode.querySelector(".border-blue-500\\/60")).not.toBeNull();
+      expect(usersNode.querySelector(".border-brand-tint\\/60")).not.toBeNull();
 
       // 'items' should be highlighted (items has FK to orders)
       const itemsNode = container.querySelector('[data-node-id="items"]')!;
-      expect(itemsNode.querySelector(".border-blue-500\\/60")).not.toBeNull();
+      expect(itemsNode.querySelector(".border-brand-tint\\/60")).not.toBeNull();
     });
 
     test("no-FK warning shown for schema with undefined foreignKeys", () => {
@@ -1862,5 +2107,149 @@ describe("SchemaDiagram", () => {
 
       expect(view.queryByText(/No FK data available/)).not.toBeNull();
     });
+  });
+});
+
+// =============================================================================
+// The object model: which kinds this canvas draws (#789)
+// =============================================================================
+
+describe("SchemaDiagram kind filtering", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  // Two relation kinds and one routine. WHICH of them is drawn is a filter over what the
+  // engine declared, not a constant in the component, so an engine declaring a third
+  // relation kind is drawn with no change to this file.
+  const capabilities = {
+    queryLanguage: "sql",
+    objectKinds: [
+      { id: "table", role: "relation", label: "Table", labelPlural: "Tables", acceptsRowWrites: true },
+      { id: "view", role: "relation", label: "View", labelPlural: "Views" },
+      { id: "function", role: "routine", label: "Function", labelPlural: "Functions" },
+    ],
+  } as unknown as ProviderCapabilities;
+
+  const inventory: DetailedObject[] = [
+    {
+      name: "orders",
+      path: ["orders"],
+      kind: "table",
+      columns: [{ name: "id", type: "integer", nullable: false, isPrimary: true }],
+      indexes: [],
+      foreignKeys: [],
+    },
+    {
+      name: "order_summary",
+      path: ["order_summary"],
+      kind: "view",
+      columns: [{ name: "total", type: "numeric", nullable: true, isPrimary: false }],
+      indexes: [],
+      foreignKeys: [],
+    },
+    {
+      name: "order_total",
+      path: ["order_total"],
+      kind: "function",
+      columns: [{ name: "result", type: "numeric", nullable: true, isPrimary: false }],
+      indexes: [],
+      foreignKeys: [],
+    },
+  ];
+
+  test("both declared relation kinds are drawn and the routine is not", () => {
+    const { container } = render(<SchemaDiagram schema={inventory} capabilities={capabilities} onClose={() => {}} />);
+
+    expect(container.querySelector('[data-testid="node-orders"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="node-order_summary"]')).not.toBeNull();
+    // It has columns, so the flat model drew it as a card with a fabricated shape.
+    expect(container.querySelector('[data-testid="node-order_total"]')).toBeNull();
+  });
+
+  test("an inventory of nothing but routines renders no canvas at all", () => {
+    const routinesOnly = inventory.filter((object) => object.kind === "function");
+    const { container } = render(
+      <SchemaDiagram schema={routinesOnly} capabilities={capabilities} onClose={() => {}} />,
+    );
+
+    expect(container.querySelector('[data-testid="mock-react-flow"]')).toBeNull();
+  });
+
+  test("badges every node in a mixed-kind diagram with declared labels, including compact mode", () => {
+    for (const [kind, label] of [
+      ["view", "View"],
+      ["materialized_view", "Materialized View"],
+    ]) {
+      const declared = {
+        ...capabilities,
+        objectKinds: [
+          ...capabilities.objectKinds!,
+          {
+            id: "materialized_view",
+            role: "relation" as const,
+            label: "Materialized View",
+            labelPlural: "Materialized Views",
+          },
+        ],
+      };
+      const schema = [inventory[0], { ...inventory[1], kind }];
+      const { container, unmount } = render(
+        <SchemaDiagram schema={schema} capabilities={declared} onClose={() => {}} />,
+      );
+      for (const compact of [false, true]) {
+        if (compact) fireEvent.click(within(container).getByText("Compact").closest("button")!);
+        const table = container.querySelector('[data-node-id="orders"]')!;
+        const view = container.querySelector('[data-node-id="order_summary"]')!;
+        expect(within(table as HTMLElement).queryByText("Table")).not.toBeNull();
+        expect(within(view as HTMLElement).queryByText(label)).not.toBeNull();
+        expect(within(view as HTMLElement).queryByText(kind)).toBeNull();
+        expect(container.querySelector(".border-dashed")).toBeNull();
+      }
+      unmount();
+    }
+  });
+
+  test("a MongoDB diagram containing only collections has no kind badges or dashed borders", () => {
+    const declared = {
+      ...capabilities,
+      objectKinds: [{ id: "collection", role: "relation" as const, label: "Collection", labelPlural: "Collections" }],
+    };
+    const schema = inventory.slice(0, 2).map((object) => ({ ...object, kind: "collection" }));
+    const { container } = render(<SchemaDiagram schema={schema} capabilities={declared} onClose={() => {}} />);
+    expect(container.querySelectorAll("[data-node-id]").length).toBe(2);
+    expect(within(container).queryByText("Collection")).toBeNull();
+    expect(within(container).queryByText("collection")).toBeNull();
+    expect(container.querySelector(".border-dashed")).toBeNull();
+  });
+
+  test("filtering a mixed diagram to one relation kind removes its badges", async () => {
+    const { container } = render(<SchemaDiagram schema={inventory} capabilities={capabilities} onClose={() => {}} />);
+    expect(within(container).queryByText("Table")).not.toBeNull();
+    fireEvent.change(within(container).getByPlaceholderText("Filter tables..."), { target: { value: "orders" } });
+    await waitFor(() => {
+      expect(container.querySelector('[data-node-id="order_summary"]')).toBeNull();
+      expect(container.querySelector('[data-node-id="orders"]')).not.toBeNull();
+      expect(within(container).queryByText("Table")).toBeNull();
+    });
+  });
+
+  test("the header counts each relation kind under its own name (#1466)", () => {
+    const tablesAndViews: DetailedObject[] = [
+      ...["employees", "departments", "salaries", "titles"].map((name) => ({ ...inventory[0], name, path: [name] })),
+      { ...inventory[1], name: "current_dept", path: ["current_dept"] },
+    ];
+    const { container } = render(
+      <SchemaDiagram schema={tablesAndViews} capabilities={capabilities} onClose={() => {}} />,
+    );
+
+    expect(within(container).queryByText("4 tables, 1 view")).not.toBeNull();
+    expect(within(container).queryByText("5 tables")).toBeNull();
+  });
+
+  test("with no declaration yet, every entry is drawn", () => {
+    const { container } = render(<SchemaDiagram schema={inventory} onClose={() => {}} />);
+
+    expect(container.querySelector('[data-testid="node-order_total"]')).not.toBeNull();
   });
 });

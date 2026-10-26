@@ -9,7 +9,7 @@ import {
   reportCitingWhatWasOffered,
   reportOn,
 } from "../isolated/fixtures/agent-scripted-model";
-import { chatToolCallStream } from "../isolated/fixtures/agent-transport";
+import { chatToolCallStream, chatTwoToolCallStream } from "../isolated/fixtures/agent-transport";
 
 /**
  * The `query-optimization` template, driven end to end on both reference engines
@@ -116,6 +116,12 @@ describe("the optimization arc, on both reference engines", () => {
         "statement-drafted",
         "tool-invoked",
         "tool-completed",
+        // The bar, announced the moment the first plan is read (`plan-bar`). It lands on the
+        // clean arc too, and that is the point: at this moment no run has compared anything yet,
+        // so "will compare" and "will not" are indistinguishable. It rides on a turn already
+        // being taken and costs this run nothing - while the run that would have stopped here
+        // hears it while it still has turns.
+        "guidance-issued",
         "statement-drafted",
         "tool-invoked",
         "tool-completed",
@@ -323,6 +329,7 @@ describe("THE GATE: the verifier fails the run when the template's own artifact 
         prompts.push(promptText(turn));
         return answersProse("nothing to do")(turn);
       },
+      answersProse("nothing to do"),
     ]);
 
     expect(prompts[0]).toContain("One plan on its own answers nothing");
@@ -532,6 +539,8 @@ describe("the tools belong to the workflow, not to the model", () => {
         return chatToolCallStream("compare_plans", JSON.stringify({ before: "a", after: "b" }), "call_compare");
       },
       answersProse("There is nothing here I can compare."),
+      // A refused call read nothing, so the drive names the instruments once more.
+      answersProse("There is nothing here I can compare."),
     ]);
 
     // Refused by the OFFERED set, before any argument was looked at — and the run
@@ -567,5 +576,152 @@ describe("a drive that dies after recording a comparison does not make it twice"
     expect(firstTurn).toContain("was already recommended");
     // And the run still answers: the comparison it needs is on its own ledger.
     expect(resumed.verdict).toEqual({ outcome: "answered", verifier: "agent-query-optimization.3", unmet: [] });
+  });
+});
+
+describe("the bar a plan is judged against arrives with the plan, not with the refused report", () => {
+  /*
+    The half of `no-plan-comparison` no nudge could reach, measured 2026-09-28.
+
+    Every notice above is delivered by HOLDING `compose_report`, and a hold is suppressed
+    inside the report reserve — deliberately, because a run held on its last turn files no
+    report at all, which is worse than the verdict the hold was avoiding. So a run that
+    spends its turns reading arrives at the report with neither route recorded, is not told
+    (there is no turn to act on it), and the report is accepted and then scored
+    `unanswered`. Both branches lose, and the run never learns why.
+
+    `laguna-xs-2.1` loses this cell five times out of five that way: eleven tool calls per
+    run, THREE plans inspected — everything a comparison needs — two reserve notices, a
+    report, `no-plan-comparison`. It is not one call short of knowing; it is one call short
+    of doing, and the sentence that would have said so is timed to arrive after it can be
+    used.
+
+    So the bar is announced when the first plan is READ. It rides on the turn that was
+    about to be taken, the way `report-reserve` does, and spends none of its own — which is
+    what makes it safe to send early rather than at the one moment that is always too late.
+  */
+  test("a run that has read a plan is told on the next turn what its report will be judged on", async () => {
+    const run = await open("sqlite");
+
+    const drive = await run.drive([
+      callsTool("inspect_plan", { sql: SLOW }, "call_plan_before"),
+      callsTool("inspect_plan", { sql: FAST }, "call_plan_after"),
+      comparesPlans(),
+      reportOn("The rewrite reaches the same rows by index."),
+    ]);
+
+    // The turn AFTER the first plan already carries the bar - no report was attempted.
+    expect(drive.transcripts[1]).toContain("judged on a comparison");
+    expect(drive.transcripts[1]).toContain("recommend_change");
+    expect(drive.verdict).toEqual({ outcome: "answered", verifier: "agent-query-optimization.3", unmet: [] });
+  });
+
+  test("it waits for a PLAN: another tool's result does not trigger it", async () => {
+    /*
+      The condition the notice turns on, pinned because nothing pinned it.
+
+      Removing `tool !== "inspect_plan"` from the guard left every test green, which is the
+      definition of the guard being untested: the notice would then fire after the first tool of
+      any kind, including on a run that had read no plan at all. That run is the one
+      `no-plan-comparison` already speaks to, with a different sentence that sends it to the
+      reading rather than naming a bar it holds nothing for.
+    */
+    const run = await open("sqlite");
+
+    const drive = await run.drive([
+      callsTool("inspect_schema", { schema: "public" }, "call_schema"),
+      callsTool("inspect_plan", { sql: SLOW }, "call_plan_before"),
+      callsTool("inspect_plan", { sql: FAST }, "call_plan_after"),
+      comparesPlans(),
+      reportOn("The rewrite reaches the same rows by index."),
+    ]);
+
+    // Nothing after the schema read; the bar lands only after the plan.
+    expect(drive.transcripts[1]).not.toContain("judged on a comparison");
+    expect(drive.transcripts[2]).toContain("judged on a comparison");
+    expect(drive.verdict).toEqual({ outcome: "answered", verifier: "agent-query-optimization.3", unmet: [] });
+  });
+
+  test("a turn that calls TWO tools keeps both results together, and the bar waits for the turn to end", async () => {
+    /*
+      The protocol fault the notice introduced, measured in production 2026-09-30.
+
+      Every tool call in one assistant message must be answered by its own tool result with nothing
+      between them. The notice was pushed inside the loop that answers those calls, so a turn with
+      two of them got: result, NOTICE, result — and the next request was refused by the provider
+      with `Tool result is missing for tool call <id>`. The run then died `model-unavailable`, which
+      the measurement harness reads as a TRANSPORT fault and throws the whole cell away as
+      contaminated. `ornith-1.5:9b` lost plan and optimize that way inside one hour.
+
+      So the bar is announced after the turn's results are all in, not between them. One call per
+      turn - what every other test here scripts - cannot reach the fault, which is why it shipped.
+    */
+    const run = await open("sqlite");
+
+    const drive = await run.drive([
+      () =>
+        chatTwoToolCallStream(
+          { name: "inspect_plan", args: JSON.stringify({ sql: SLOW }), id: "call_plan_a" },
+          { name: "inspect_schema", args: JSON.stringify({ schema: "public" }), id: "call_schema_a" },
+        ),
+      callsTool("inspect_plan", { sql: FAST }, "call_plan_after"),
+      comparesPlans(),
+      reportOn("The rewrite reaches the same rows by index."),
+    ]);
+
+    // Both calls were answered, and the run went on rather than dying on a malformed transcript.
+    expect(drive.kinds.filter((kind) => kind === "tool-completed").length).toBeGreaterThanOrEqual(2);
+    expect(drive.transcripts[1]).toContain("judged on a comparison");
+    expect(drive.verdict).toEqual({ outcome: "answered", verifier: "agent-query-optimization.3", unmet: [] });
+  });
+
+  test("a run that reads and reads without touching a plan hears the bar too", async () => {
+    /*
+      The half the first fix missed, and the measurement that found it.
+
+      `laguna-xs-2.1` holds five of six surfaces and sits at 3/5 on optimize. The split across its
+      five runs is not ability - it is whether a plan was read at all:
+
+          passing (x3)  inspect_plan x2-3 + inspect_schema      43-47s
+          losing  (x1)  inspect_schema x3, run_read_query x2     222s, zero plans
+          losing  (x1)  inspect_schema x5                        127s, zero plans
+
+      The sentence that would send those two to a plan is `no-plan-comparison`, delivered by holding
+      `compose_report` - and both runs had already tripped `report-reserve`, which suppresses every
+      hold. Same shape as the bug this block was written for, on the other side of the guard: that
+      one fired only AFTER a plan was read, so a run holding none still heard nothing.
+
+      Reading is not the fault; reading INSTEAD of inspecting a plan is. So the bar is announced
+      once the run has spent tool calls on this workflow without touching a plan, while there are
+      still turns to use it.
+    */
+    const run = await open("sqlite");
+
+    const drive = await run.drive([
+      callsTool("inspect_schema", { schema: "public" }, "call_s1"),
+      callsTool("inspect_schema", { kind: "indexes" }, "call_s2"),
+      callsTool("inspect_plan", { sql: SLOW }, "call_plan_before"),
+      callsTool("inspect_plan", { sql: FAST }, "call_plan_after"),
+      comparesPlans(),
+      reportOn("The rewrite reaches the same rows by index."),
+    ]);
+
+    // Heard while the run was still reading, not after a report was refused.
+    expect(drive.transcripts[2]).toContain("judged on a comparison");
+    expect(drive.verdict).toEqual({ outcome: "answered", verifier: "agent-query-optimization.3", unmet: [] });
+  });
+
+  test("it is said once, however many plans the run goes on to read", async () => {
+    const run = await open("sqlite");
+
+    const drive = await run.drive([
+      callsTool("inspect_plan", { sql: SLOW }, "call_plan_before"),
+      callsTool("inspect_plan", { sql: FAST }, "call_plan_after"),
+      comparesPlans(),
+      reportOn("The rewrite reaches the same rows by index."),
+    ]);
+
+    const said = drive.events.filter((event) => event.kind === "guidance-issued" && event.notice === "plan-bar").length;
+    expect(said).toBe(1);
   });
 });

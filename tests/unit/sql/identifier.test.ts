@@ -20,6 +20,7 @@ describe("quoteIdentifier", () => {
     expect(quoteIdentifier("name", "trino")).toBe('"name"');
     expect(quoteIdentifier("name", "mysql")).toBe("`name`");
     expect(quoteIdentifier("name", "mssql")).toBe("[name]");
+    expect(quoteIdentifier("name", "databend")).toBe("`name`");
   });
 
   test("falls back to the standard form when no dialect is known", () => {
@@ -36,6 +37,10 @@ describe("quoteIdentifier", () => {
     expect(quoteIdentifier('a"b', "trino")).toBe('"a""b"');
     expect(quoteIdentifier("a`b", "mysql")).toBe("`a``b`");
     expect(quoteIdentifier("a]b", "mssql")).toBe("[a]]b]");
+    // Databend reads a backtick name in every sql_dialect, and a doubled backtick is
+    // its only escape there (measured, probe L4): a backslash stays data.
+    expect(quoteIdentifier("a`b", "databend")).toBe("`a``b`");
+    expect(quoteIdentifier("x\\", "databend")).toBe("`x\\`");
   });
 
   test("leaves a name that spells SQL inert", () => {
@@ -51,5 +56,16 @@ describe("quoteIdentifier", () => {
     // helper the inline editor emitted them bare and the engine rejected the SQL.
     expect(quoteIdentifier("first name", "postgres")).toBe('"first name"');
     expect(quoteIdentifier("order", "mysql")).toBe("`order`");
+  });
+
+  // Spark SQL quotes a name in backticks and doubles a backtick inside it, its own quoteIfNeeded form; a
+  // double-quoted text is a string literal there, so the standard default would compare literals.
+  test("spark quotes every name in backticks and doubles a backtick", () => {
+    expect(quoteIdentifier("name", "spark")).toBe("`name`");
+    expect(quoteIdentifier("a`b", "spark")).toBe("`a``b`");
+    expect(quoteIdentifier('say "hi"', "spark")).toBe('`say "hi"`');
+    expect(quoteIdentifier("a.b", "spark")).toBe("`a.b`");
+    expect(quoteIdentifier("x\\", "spark")).toBe("`x\\`");
+    expect(quoteIdentifier("select", "spark")).toBe("`select`");
   });
 });

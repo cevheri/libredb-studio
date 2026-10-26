@@ -6,6 +6,8 @@
 > design, architecture, usage, and tests. If you are reading the code, extending Couchbase support,
 > or authoring a new provider, start here.
 
+`DB_HTTP_BLOCK_PRIVATE_HOSTS=true` blocks loopback, private, link-local and other non-public HTTP destinations; it is off by default so local connections work.
+
 | | |
 |---|---|
 | **Status** | Implemented & shipped |
@@ -46,7 +48,7 @@ The two things that *are* Couchbase-shaped, and which every design decision belo
 
 | `DatabaseProvider` slot | Couchbase realisation | Mechanism |
 |-------------------------|-----------------------|-----------|
-| "Table" (`TableSchema`) | A **collection**, displayed as `collection` or `scope.collection` | `system:keyspaces` LEFT JOIN `system:scopes` |
+| "Table" (the relation kind) | A **collection**, displayed as `collection` or `scope.collection` | `system:keyspaces` LEFT JOIN `system:scopes` |
 | "Row" | A **document** | SQL++ result row |
 | Columns | **Inferred** field types from a 100-document sample | `INFER <keyspace> WITH {"sample_size": 100}` |
 | Primary key | The document key, projected as `__id` | `META(d).id` |
@@ -71,7 +73,7 @@ provider that is a *directory* rather than a single file, because the transport 
 
 ```
 src/lib/db/providers/document/
-├── mongodb.ts
+├── mongodb/
 └── couchbase/
     ├── index.ts             # CouchbaseProvider - the DatabaseProvider implementation
     ├── transport.ts         # CouchbaseTransport interface + neutral result types (no I/O)
@@ -119,8 +121,8 @@ a SQL dialect is expressed through `queryLanguage: "sql"`, not through the class
 
 ### 2.4 Registration & lifecycle
 
-The factory wires Couchbase in via a dynamic import
-([`factory.ts:93`](../../src/lib/db/factory.ts)):
+The factory wires Couchbase in via a dynamic import inside `createDatabaseProvider()`
+([`factory.ts`](../../src/lib/db/factory.ts)):
 
 ```ts
 case 'couchbase': {
@@ -131,11 +133,17 @@ case 'couchbase': {
 }
 ```
 
-`connect()` ([index.ts:335](../../src/lib/db/providers/document/couchbase/index.ts)) proves
+`connect()` ([`index.ts`](../../src/lib/db/providers/document/couchbase/index.ts)) proves
 reachability *and* credentials with one `GET /pools/default` — the cheapest call that needs no RBAC
-role beyond cluster read — then keeps the transport. `disconnect()` clears the transport's cached
-endpoint discovery; there are no sockets to close. API routes use `getOrCreateProvider()`, which
-caches the connected provider per `connection.id` and evicts it after 30 minutes idle.
+role beyond cluster read — then `assertBucketExists()` asks the bucket's own path
+(`GET /pools/default/buckets/<bucket>`): a 404 there is the cluster itself saying the configured
+bucket is not on it, and the connect is refused with the bucket named rather than saved to a
+connection that shows the cluster's real buckets in the tree and never says the configured one is
+wrong. Only a 404 refuses; a read that fails for any other reason — a role that may read the cluster
+but not its bucket settings — leaves the connect the pools read already proved. `disconnect()` clears
+the transport's cached endpoint discovery; there are no sockets to close. API routes use
+`getOrCreateProvider()`, which caches the connected provider per `connection.id` and evicts it after
+30 minutes idle.
 
 ---
 
@@ -172,7 +180,7 @@ operations.
 ### 3.2 The transport seam: one interface, one implementation
 
 Provider logic never calls `fetch`. It goes through `CouchbaseTransport`
-([transport.ts:87](../../src/lib/db/providers/document/couchbase/transport.ts)), so adopting the SDK
+([`transport.ts`](../../src/lib/db/providers/document/couchbase/transport.ts)), so adopting the SDK
 later would be one new file implementing the same contract rather than a rewrite:
 
 ```ts
@@ -186,8 +194,8 @@ interface CouchbaseTransport {
 }
 ```
 
-The result type is deliberately **neutral** rather than the REST envelope
-([transport.ts:45](../../src/lib/db/providers/document/couchbase/transport.ts)):
+The result type, `CouchbaseQueryResult`, is deliberately **neutral** rather than the REST
+envelope ([`transport.ts`](../../src/lib/db/providers/document/couchbase/transport.ts)):
 
 ```ts
 interface CouchbaseQueryResult {
@@ -203,7 +211,7 @@ An interface shaped like `{ results, signature, status, metrics, errors }` would
 SDK adapter to fabricate fields only the REST API produces. Both sources produce the shape above
 without inventing anything. Errors follow the same rule: the transport throws a normalized
 `CouchbaseError { code, message, retriable }`
-([transport.ts:105](../../src/lib/db/providers/document/couchbase/transport.ts)) whose `code` is a
+([`transport.ts`](../../src/lib/db/providers/document/couchbase/transport.ts)) whose `code` is a
 single numeric space — SQL++ codes (3000, 4000, 13014, …) and HTTP codes (401, 403, 503) both land
 there, so provider-level mapping is one switch.
 
@@ -221,18 +229,20 @@ are required for overview, performance and storage metrics under any transport.
 endpoint. Only the **management** port is stored (8091, or 18091 with TLS); the query endpoint comes
 from `GET /pools/default/nodeServices`, reading `nodesExt[].services.n1ql` (or `n1qlSSL` under TLS)
 and preferring `alternateAddresses.external` when present — which is what makes NAT, Docker port
-mapping and Capella work
-([http-transport.ts:445](../../src/lib/db/providers/document/couchbase/http-transport.ts)). With no
+mapping and Capella work (`pickQueryEndpoint()`,
+[`http-transport.ts`](../../src/lib/db/providers/document/couchbase/http-transport.ts)). With no
 `n1ql` entry anywhere the transport falls back to 8093 / 18093.
 
 Discovery is cached **as a promise**, so concurrent first queries share one round trip — but a
 *failed* discovery is not cached, or one unreachable moment would poison every later query on the
-connection ([http-transport.ts:431](../../src/lib/db/providers/document/couchbase/http-transport.ts)).
+connection (`getQueryEndpoint()`,
+[`http-transport.ts`](../../src/lib/db/providers/document/couchbase/http-transport.ts)).
 
 Capella endpoints (`couchbases://cb.<id>.cloud.couchbase.com`) are SRV records, so a host given
 without an explicit port is resolved through `_couchbases._tcp.<host>` first; a DNS failure or an
 empty answer falls back to treating the host as a plain A record, which is what every self-hosted
-cluster needs anyway ([http-transport.ts:418](../../src/lib/db/providers/document/couchbase/http-transport.ts)).
+cluster needs anyway (`resolveHost()`,
+[`http-transport.ts`](../../src/lib/db/providers/document/couchbase/http-transport.ts)).
 
 ### 3.4 Keyspace flattening follows the PostgreSQL rule
 
@@ -250,7 +260,7 @@ keyspacePath({ bucket: 'travel', scope: 'inventory', collection: 'hotel' })
 
 **Quoting is a security boundary.** SQL++ has no bind parameter for identifiers, so keyspace paths
 are assembled by concatenation; `quoteIdentifier()`
-([keyspace.ts:31](../../src/lib/db/providers/document/couchbase/keyspace.ts)) doubles embedded
+([`keyspace.ts`](../../src/lib/db/providers/document/couchbase/keyspace.ts)) doubles embedded
 backticks so a hostile identifier cannot terminate its own quoting and have the remainder parsed as
 SQL++. Backticks are also required for a second, mundane reason: **`bucket` and `scope` are reserved
 words** in SQL++, and an unquoted projection over `system:keyspaces` fails with error 3000 (verified
@@ -260,8 +270,9 @@ on Server 8.0.2).
 
 The Query Service returns syntax and semantic errors **inside a 200 response** with
 `status: "errors"`. The transport therefore inspects the payload *before* the HTTP code
-([http-transport.ts:249](../../src/lib/db/providers/document/couchbase/http-transport.ts)); skipping
-that check reports a failed statement as "0 rows".
+(`throwIfFailed()`,
+[`http-transport.ts`](../../src/lib/db/providers/document/couchbase/http-transport.ts));
+skipping that check reports a failed statement as "0 rows".
 
 ### 3.6 `SELECT *` nests documents, so generated queries project the key explicitly
 
@@ -270,14 +281,21 @@ name, and the key is not part of the result at all. Generated queries therefore 
 and project the key ([`query-generators.ts`](../../src/lib/query-generators.ts)):
 
 ```sql
-SELECT META(d).id AS __id, d.* FROM `travel`.`inventory`.`hotel` AS d LIMIT 50;
+SELECT META(d).id AS __id, d.* FROM `travel`.`inventory`.`hotel` AS d;
 ```
 
+It carries no row bound. Since #816 the preview cap travels as the `limit` execution option rather
+than as text in the statement, so the limiter can recognise the bound as its own and advance it for
+page two; a bound in the statement is indistinguishable from one the user typed, and a self-bounded
+statement comes back unrewritten with the requested offset discarded. This provider declares
+`supportsResultPagination: true`, so the results grid offers Load More over the preview.
+
 The alias `__id` matches `COUCHBASE_DOCUMENT_KEY_COLUMN` in the introspection module
-([introspect.ts:58](../../src/lib/db/providers/document/couchbase/introspect.ts)), so the schema tree
+([`introspect.ts`](../../src/lib/db/providers/document/couchbase/introspect.ts)), so the schema tree
 and the result grid name the key identically. A hand-written `SELECT *` still works; its columns are
 then derived from the rows, because a wildcard signature tells the transport nothing
-([http-transport.ts:183](../../src/lib/db/providers/document/couchbase/http-transport.ts)).
+(`fieldNamesFromSignature()`,
+[`http-transport.ts`](../../src/lib/db/providers/document/couchbase/http-transport.ts)).
 
 ### 3.7 Read-your-writes: `scan_consistency` defaults to `request_plus`
 
@@ -288,7 +306,8 @@ three, and the same `SELECT` returned three rows seconds later — a user insert
 sees nothing.
 
 The transport therefore sends `scan_consistency: "request_plus"` on **every** statement
-([http-transport.ts:55](../../src/lib/db/providers/document/couchbase/http-transport.ts)), so a user
+(`DEFAULT_SCAN_CONSISTENCY`,
+[`http-transport.ts`](../../src/lib/db/providers/document/couchbase/http-transport.ts)), so a user
 always sees their own writes. Callers that prefer latency over freshness opt out per statement:
 
 ```ts
@@ -322,14 +341,14 @@ prerequisite.
 **Server 7.0 to 7.2 — it fails with error 4000.** Sequential scan does not exist there, so the same
 statement returns "No index available on keyspace". The provider re-raises it as a `QueryError`
 carrying the runnable remedy, quoted for the exact keyspace the statement read from
-([index.ts:473](../../src/lib/db/providers/document/couchbase/index.ts)):
+(`primaryIndexRemedy()`, [`index.ts`](../../src/lib/db/providers/document/couchbase/index.ts)):
 
 ```text
 No index available on keyspace `travel`.`inventory`.`hotel` that matches your query.
 Create one first: CREATE PRIMARY INDEX ON `travel`.`inventory`.`hotel`
 ```
 
-In both cases `getSchemaRelations()` reads `system:indexes`, so an un-indexed collection shows an
+In both cases the deleted flat relations read reads `system:indexes`, so an un-indexed collection shows an
 empty index list in the explorer before anything is run. Documents whose key is known are reachable
 without any index on every supported version
 ([§5.3](#53-use-keys-reads-a-document-with-no-index-at-all)).
@@ -338,8 +357,8 @@ without any index on every supported version
 
 `system:completed_requests`, `system:active_requests` and the index-service statistics require the
 **Query System Catalog** RBAC role, so a denial is the *normal* case for a restricted user. Every
-monitoring source funnels through one helper
-([index.ts:189](../../src/lib/db/providers/document/couchbase/index.ts)):
+monitoring source funnels through one helper, `degradeTo()`
+([`index.ts`](../../src/lib/db/providers/document/couchbase/index.ts)):
 
 ```ts
 async function degradeTo<T>(operation: () => Promise<T>, fallback: T): Promise<T> {
@@ -348,9 +367,9 @@ async function degradeTo<T>(operation: () => Promise<T>, fallback: T): Promise<T
 ```
 
 A source the connected user cannot read yields the fallback instead of breaking an otherwise working
-connection. `getSchemaRelations()` is the deliberate exception: an empty index list *is* the
+connection. the deleted flat relations read is the deliberate exception: an empty index list *is* the
 un-indexed signal of §3.8, so degrading a failed catalog read to empty would fabricate that signal
-for the whole bucket ([introspect.ts:327](../../src/lib/db/providers/document/couchbase/introspect.ts)).
+for the whole bucket ([`introspect.ts`](../../src/lib/db/providers/document/couchbase/introspect.ts)).
 
 ### 3.10 INFER output is nested, and every flavour is unioned
 
@@ -365,7 +384,7 @@ a `~meta` pseudo-property whose nested `id` describes the document key. Verified
 ```
 
 `columnsFromFlavours()`
-([introspect.ts:178](../../src/lib/db/providers/document/couchbase/introspect.ts)) unions **all**
+([`introspect.ts`](../../src/lib/db/providers/document/couchbase/introspect.ts)) unions **all**
 flavours — taking only the first would drop every field the other shapes carry. A field is nullable
 when `%docs < 100`, when `null` is among its observed types, or when it is missing from some
 flavour. Multiple observed types render as `mixed(a|b)`, the same convention the MongoDB provider
@@ -374,7 +393,7 @@ uses. `~meta` becomes the leading `__id` column, marked primary.
 ### 3.11 EXPLAIN reuses the shared tree model
 
 `ExplainFormat` gains `"couchbase-json"`
-([`src/lib/db/types.ts:93`](../../src/lib/db/types.ts)), with the strategy in
+([`src/lib/db/types.ts`](../../src/lib/db/types.ts)), with the strategy in
 [`src/lib/explain/couchbase-json.ts`](../../src/lib/explain/couchbase-json.ts):
 
 - `buildSql()` returns `EXPLAIN ${sql}` for `SELECT` statements, in **both** modes — it produces the
@@ -385,8 +404,8 @@ uses. `~meta` becomes the leading `__id` column, marked primary.
   same reason.
 
   Returning `null` for analyze would not narrow the feature, it would disable it: the direct Explain
-  action always builds with mode `analyze`
-  ([`use-query-execution.ts:165`](../../src/hooks/use-query-execution.ts)) and refuses the run when
+  action always builds with mode `analyze` (`explainAccepted`,
+  [`use-query-execution.ts`](../../src/hooks/use-query-execution.ts)) and refuses the run when
   the strategy declines, so the button would be dead while only the background pre-warm worked.
   A non-`SELECT` is still declined in both modes.
 - `toRenderModel()` walks `#operator` into the existing `{ kind: "tree" }` model.
@@ -410,17 +429,17 @@ cardinality can appear on CE plans.
 | `host` | Yes (or `connectionString`) | Cluster node hostname. `validate()` throws `DatabaseConfigError` when both are missing |
 | `port` | No | **Management** port only. Defaults to `8091` (`18091` when SSL is on). Query ports are discovered ([§3.3](#33-ports-are-discovered-not-configured)) |
 | `user` / `password` | No | Sent as HTTP Basic on every request |
-| `database` | **Yes** | Carries the **bucket** name. One bucket per connection; the ConnectionModal labels this field "Bucket" |
+| `database` | Yes, unless supplied in the URI path | Carries the **bucket** name and overrides the URI path. One bucket per connection; the ConnectionModal labels this field "Bucket" |
 | `connectionString` | No | `couchbase://` / `couchbases://`; see [§4.2](#42-connection-strings) |
 | `ssl` | No | See [§4.3](#43-tls) |
 
 `database` being the bucket is the one field that surprises people, so the form says so:
-`ConnectionModal` renders the label "Bucket" for `type === 'couchbase'`
-([`ConnectionModal.tsx:139`](../../src/components/ConnectionModal.tsx)), and `validate()` rejects a
-connection without one ([index.ts:325](../../src/lib/db/providers/document/couchbase/index.ts)):
+`ConnectionModal` renders the label "Bucket" for `type === 'couchbase'` (`databaseFieldLabel`,
+[`ConnectionModal.tsx`](../../src/components/ConnectionModal.tsx)), and `validate()` rejects a
+connection without one ([`index.ts`](../../src/lib/db/providers/document/couchbase/index.ts)):
 
 ```text
-Couchbase requires a bucket (use the "database" field)
+Couchbase requires a bucket (use the URL path or the "database" field)
 ```
 
 Multi-bucket browsing from a single connection is out of scope; create one connection per bucket.
@@ -441,8 +460,8 @@ const connection = {
 
 ### 4.2 Connection strings
 
-`supportsConnectionString` is `true`, and the UI parser
-([`connection-string-parser.ts:138`](../../src/lib/connection-string-parser.ts)) decomposes the URL
+`supportsConnectionString` is `true`, and the UI parser, `parseConnectionString()`
+([`connection-string-parser.ts`](../../src/lib/connection-string-parser.ts)), decomposes the URL
 into discrete fields before the provider sees it:
 
 | Input | host | port | database (bucket) |
@@ -457,10 +476,16 @@ The scheme also arrives as an SSL mode - `require` for `couchbases://`, `disable
 pasted string ([§4.3](#43-tls)); without it a `couchbases://` paste posted plain HTTP to 18091.
 `require` and not a verifying mode for the reason §4.3 gives: a self-hosted cluster's certificate is
 self-signed, so only the SSL panel turns verification on.
-A connection that carries *only* a connection string has its hostname lifted out for the transport
-and nothing else — the URL's port is deliberately not used, because a `couchbase://` URL from an
+A connection in **Connection String** mode has its hostname lifted out for the transport.
+When the separate Bucket (`database`) field is empty, the provider also reads and URL-decodes the
+first path segment as the bucket: `couchbase://localhost/travel%2Dsample` selects `travel-sample`.
+A `%` that does not start a valid escape is kept verbatim, as Paste URL keeps it, because a bucket name may contain one: `couchbase://localhost/100%` selects `100%`.
+An explicit Bucket field wins. The resolved bucket is used for management requests and the SQL++
+query context alike; a URL without a bucket path still requires the field to be filled in.
+The URL's port is deliberately not used, because a `couchbase://` URL from an
 application config carries the KV port, not the management port, and discovery handles the rest
-([index.ts:368](../../src/lib/db/providers/document/couchbase/index.ts)).
+(`hostFromConnectionString()`,
+[`index.ts`](../../src/lib/db/providers/document/couchbase/index.ts)).
 `detectConnectionStringType()` maps both schemes to `couchbase`.
 
 A Capella endpoint carries neither a port nor a bucket path, so the bucket must be filled in by
@@ -481,7 +506,46 @@ does **not** verify the chain, because a self-hosted Couchbase node ships a self
 endpoint can satisfy exactly as pasted, since its certificate is signed by a public root and there is
 no PEM to go looking for — while `verify-ca`/`verify-full` verify against a pasted `caCert`. An
 explicit `ssl.rejectUnauthorized` always wins
-([http-transport.ts:256](../../src/lib/db/providers/document/couchbase/http-transport.ts)).
+(`buildTlsMaterial()`,
+[`http-transport.ts`](../../src/lib/db/providers/document/couchbase/http-transport.ts)).
+
+
+### 4.4 Endpoint validation and redirects
+
+`host` and `port` are validated when the transport is constructed, which happens in `connect()`, so
+a bad value fails Test Connection and never a capability read. A host must be a hostname, an IPv4
+address or an IPv6 address (bracketed or not), and a port must be an integer from 1 to 65535.
+Anything else is a `DatabaseConfigError` that names the field and does not repeat the value.
+Every request URL is built by the shared [`endpoint.ts`](../../src/lib/db/http/endpoint.ts) with
+`URL` and `URLSearchParams` and checked against the intended hostname, port and path before it is
+sent, so no value can move a request to another path or another server. A scheme's default port
+(80 for `http`, 443 for `https`) is left out of the URL the way `URL` serializes it.
+
+Redirects are not followed. Every request sets `redirect: "manual"`, and a 3xx answer becomes a
+`ConnectionError` naming the status and only the origin of its `Location`, since a followed
+redirect would take the Basic credential and the statement to wherever the server pointed.
+
+The host a request finally uses can come from somewhere other than the form: an SRV record for a
+host with no port, or the node addresses `/pools/default/nodeServices` reports
+([§3.3](#33-ports-are-discovered-not-configured)). Both go through the same builder, so an address
+the cluster reports that is not a valid host or port fails the query with a `DatabaseConfigError`
+before it is sent.
+
+The TLS path uses `node:https`, which does not follow a redirect on its own; a test pins that. A 3xx
+there is reported as an HTTP failure, `Couchbase request failed with HTTP 302`, rather than as the
+`ConnectionError` above.
+
+### Connection string
+
+The scheme shown for Couchbase is `couchbase://`, and the parser also accepts `couchbases://`.
+Its row in `CONNECTION_STRING` is declared in [`connection-string.ts`](../../src/lib/db/providers/document/couchbase/connection-string.ts).
+It has no `readTls`: the scheme itself is the TLS, so `couchbases://` sets `require` and `couchbase://` sets `disable`.
+It runs no seed load check.
+
+### Execution UI
+
+The rolled-back notice names `COMMIT` as the keyword that keeps an open transaction, and `couchbase` has no consent deadline, so the agent's consent card shows no deadline chip or sentence for it.
+Its row in `EXECUTION_UI` is declared in [`execution-ui.ts`](../../src/lib/db/providers/document/couchbase/execution-ui.ts).
 
 ---
 
@@ -489,7 +553,7 @@ explicit `ssl.rejectUnauthorized` always wins
 
 ### 5.1 Execution
 
-`query(sql, params?)` ([index.ts:408](../../src/lib/db/providers/document/couchbase/index.ts)) sends
+`query(sql, params?)` ([`index.ts`](../../src/lib/db/providers/document/couchbase/index.ts)) sends
 one SQL++ statement. Positional parameters map to `$1`-style placeholders:
 
 ```ts
@@ -515,11 +579,30 @@ operator — and a statement ending in a `#` run is returned unbounded rather th
 
 | Source field | `QueryResult` field | Notes |
 |--------------|---------------------|-------|
-| result rows | `rows` | JSON objects exactly as the cluster returned them |
-| signature | `fields` | `null` for a wildcard signature, in which case columns are the union of the keys the rows carry, first seen first |
+| result rows | `rows` | JSON objects exactly as the cluster returned them, except that an integer past 2^53 arrives as its exact digits (see below) |
+| signature | `fields` | `null` for a wildcard signature, in which case columns are the union of the keys the rows carry, first seen first; an empty key, from either source, is named `(No column name)` and the rows carrying it are keyed under that name (see below) |
 | — | `rowCount` | `rows.length`, or the mutation count when a statement returned no rows |
 | metrics `executionTime` | `executionTime` | The cluster's own time (excludes network latency); falls back to the measured wall clock when the cluster reported none |
 | `warnings` | `warnings` | The notices the cluster attached to a statement it completed, each carrying its message and the cluster's own code **when it reported one** — an entry with no code arrives without one rather than with a substituted `0`, which is itself a legal code. **Absent** when the cluster reported no warnings at all — never an empty array, so the result UI decides from the field's presence alone (issue #273) |
+
+**An empty key is a column named `(No column name)`.**
+JSON carries an empty key, and the transport's `JSON.parse` keeps it, so a document `{"": 1}` or a signature `{"": "number"}` would otherwise answer a column `""`, which the grid cannot take.
+[`uniquelyKeyedRows`](../../src/lib/db/utils/result-fields.ts) names it through `uniqueFieldNames`, numbered past any key the rows already use, and keys every row carrying it under that name.
+Not measured on a live cluster; the rule is pinned by the provider's integration tests.
+
+**An integer past 2^53 is handed over as its digits.** The query service sends a document's number
+as the **unquoted** literal it was stored as, and `JSON.parse` rounds one past 2^53 with no error:
+measured on 8.0.2 CE on 2026-10-04, a document `{"big":9007199254740993}` read through
+`SELECT d.big ... WHERE META(d).id = "h1"` was shown as `9007199254740992` in the grid, the API and
+every export. Every body the transport reads therefore goes through
+[`quoteUnsafeIntegers`](../../src/lib/db/utils/json-integers.ts) before it is parsed
+(`parseJsonBody` in
+[`http-transport.ts`](../../src/lib/db/providers/document/couchbase/http-transport.ts)), so such a
+value reaches the grid as a string holding its exact digits, at any depth of the document, the way
+Druid's transport hands one over. An integer inside the safe range, and every float, stays a number,
+and the pass is string-aware, so digits inside a string value are never touched. The counts and
+sizes this provider reads from the REST API all sit far inside the safe range, so none of them
+changed type.
 
 ### 5.3 `USE KEYS` reads a document with no index at all
 
@@ -540,18 +623,58 @@ The EXPLAIN button is available (`supportsExplain: true`) and renders the plan t
 [§3.11](#311-explain-reuses-the-shared-tree-model). Couchbase has no analyze mode, so both the
 direct action and the background pre-warm show the estimated plan.
 
+### 5.5 `endOpenQueryTransaction()` is absent, and which absence it is (D75)
+
+The optional provider surface that ends a transaction a statement left open on the session
+`query()` runs on ([`types.ts`](../../src/lib/db/types.ts), implemented on `postgres`, `sqlite`,
+`duckdb` and `redis`) is **not implemented here: the driver cannot be asked.**
+
+**This engine DOES leave a transaction open, and that is why the absence is this one and not "the
+engine has no transaction to leave open".** SQL++ transactions work over REST, so this was measured
+rather than assumed. On Couchbase Community Edition 8.0.2, 2026-09-15, against `POST /query/service`:
+
+- `BEGIN WORK` succeeds and answers a **`txid`**, with `transactionRemainingTime: 15s` in the
+  metrics. A statement a user runs through `query()` therefore can and does open a transaction on
+  the cluster. It is named by that id, not by a connection.
+- Nothing this provider sends can name it. The transport sends `statement`, `timeout`, `metrics`,
+  `scan_consistency` and at most `query_context`, `args`, `readonly` and `profile`
+  ([`http-transport.ts`](../../src/lib/db/providers/document/couchbase/http-transport.ts)), and
+  never a `txid`. Measured: `SELECT 1` straight after `BEGIN WORK` answered `success` with no
+  `transactionRemainingTime` at all, so it was not inside the transaction. `ROLLBACK WORK` with no
+  `txid` is refused with code 17002, *"ROLLBACK statement is not supported outside the
+  transaction"*, so the provider cannot end one either, and the surface's contract is to end it and
+  say so.
+- The cluster ends it itself when nobody does: reusing the `txid` after the window answered code
+  17010, *"Transaction timeout"*. That bounds the damage to 15 seconds; it does not make the
+  transaction absent.
+
+**It is not intrinsic, and the next reader should not stop looking.** `toQueryResult` hands
+`record.results` straight back as rows, so the `txid` from `BEGIN WORK` is already parsed out of the
+reply this provider read. An implementation that remembered it and sent `ROLLBACK WORK` with that
+`txid` in the request body could answer the surface truthfully. That is unbuilt work, not a missing
+engine feature. Until it exists the absence is a declared boundary rather than a fallback: the
+caller shape-checks for the method and this provider does not answer it.
+
 ---
+
+### 5.6 SQL grammar
+
+How this engine's statement text is read is declared once, in [`src/lib/db/providers/document/couchbase/sql-grammar.ts`](../../src/lib/db/providers/document/couchbase/sql-grammar.ts), the `couchbase` row of the SQL grammar registry in `src/lib/db/sql-grammar/`.
+Its grammar is `DEFAULT_SQL_GRAMMAR`, the compatibility default, because no rule was established for SQL++, not because SQL++ agrees with the default.
+`readsSqlText` is `true`: the editor text is SQL++, which the SQL readers read under that default.
+Redaction is `none`, since the engine has no grammar of its own: a redacted statement is stored as `?`, because a reader guessing where a literal ends can store the literal.
 
 ## 6. Schema introspection
 
-`getSchemaList()` is the primary path used by `/api/db/schema/list`, so columns are produced there
-([introspect.ts:306](../../src/lib/db/providers/document/couchbase/introspect.ts)):
+Every reading of this engine's objects goes through the object surface
+([`objects.ts`](../../src/lib/db/providers/document/couchbase/objects.ts)), over the same catalogs the
+deleted flat reading used:
 
 | Data | Source |
 |------|--------|
 | Collections | `system:keyspaces` LEFT JOIN `system:scopes`, filtered to the pinned bucket |
 | Columns | `INFER <keyspace> WITH {"sample_size": 100}` per collection, 4 at a time, 5 s server-side timeout each |
-| Indexes | `system:indexes` (via `getSchemaRelations()`) |
+| Indexes | `system:indexes` |
 | Foreign keys | always `[]` — Couchbase has none and none are invented |
 
 Three details are load-bearing:
@@ -565,13 +688,439 @@ Three details are load-bearing:
   SELECT on the collection, and the collection is empty (error 7014, "No documents found, unable to
   infer schema") — are both states the explorer should render, not fail on. Coverage is *not*
   truncated to a fixed number of collections; the concurrency bound of 4 is what keeps the cost of
-  schema loading in hand ([introspect.ts:245](../../src/lib/db/providers/document/couchbase/introspect.ts)).
+  schema loading in hand (`mapWithConcurrency()`,
+  [`introspect.ts`](../../src/lib/db/providers/document/couchbase/introspect.ts)).
 
-`getSchema()` merges both halves. A primary index carries no `index_key`, so it is reported with the
+the object surface merges both halves. A primary index carries no `index_key`, so it is reported with the
 synthetic column `META().id`; `unique` is true only for primary indexes, because no secondary GSI
 enforces uniqueness.
 
 ---
+
+## 6a. The object surface (#789)
+
+the object surface above flattens the bucket into one list of collections. The object browser is the
+other surface: it walks the engine's own hierarchy, so a bucket holds scopes and a scope holds
+collections, functions and indexes. Both surfaces are live through Phase 1 and they read the same
+catalogs.
+
+Everything in this section was measured against **Couchbase Server 8.0.2 Community** running
+[`docker/couchbase-init/01-object-fixture.sh`](../../docker/couchbase-init/01-object-fixture.sh), on
+2026-09-11. The statements and the derivations live in
+[`objects.ts`](../../src/lib/db/providers/document/couchbase/objects.ts); the four methods are on the
+provider in [`index.ts`](../../src/lib/db/providers/document/couchbase/index.ts).
+
+### 6a.1 What is declared
+
+| Level | `id` | Label | Source |
+|-------|------|-------|--------|
+| 0 | `catalog` | Bucket | `system:buckets` |
+| 1 | `schema` | Scope | `system:all_scopes`, `_system` excluded by exact name |
+
+| Kind | Role | Path | Source |
+|------|------|------|--------|
+| `collection` | relation | `[bucket, scope, collection]` | `system:keyspaces` |
+| `function` | routine | `[bucket, scope, function]` | `system:functions`, and the only kind here declaring `hasSource` ([§6b](#6b-object-source-789)) |
+| `index` | config, `attachedTo: collection` | `[bucket, scope, collection, index]` | `system:indexes` |
+
+A bucket alone is a real address as well as a bucket and a scope, and the declaration states it as `containerPathShapes: "prefixes"` ([§9](#9-capabilities--labels)).
+A bucket-level container carries no scope, and that is absent rather than `_default`, because `_default` is a real scope holding real collections.
+
+A collection declares `acceptsRowWrites: true`. That is the per-kind fact and it is deliberately
+separate from the engine-wide `supportsInlineRowEdit: false` this provider also declares: the
+results grid's `UPDATE ... SET` cannot address a document through the `__id` projection
+([§9](#9-capabilities--labels)), while an import into a collection is an ordinary `UPSERT`.
+
+`isSessionDefault` is marked at **both** levels. The bucket is the one the connection pinned; the
+scope is `_default`, in that bucket only, because an unqualified SQL++ keyspace resolves into
+`_default` and [§3.4](#34-keyspace-flattening-follows-the-postgresql-rule) already treats it as the implicit scope for the flat
+explorer. Marking only the bucket would leave the tree's first paint opening a bucket and stopping,
+with no counts read at all.
+
+The connect-time inventory read (autocomplete, the ERD) is scoped the same way (#1402): it lists
+the pinned bucket's scopes without listing every other bucket's, while the tree still lists every
+bucket lazily, one container at a time.
+
+### 6a.2 Which catalog, and why not the obvious one
+
+| Read | Catalog | Why not the alternative |
+|------|---------|------------------------|
+| Scopes | `system:all_scopes` | `system:scopes` lists **neither `_default` nor `_system`**. Measured on a bucket holding four scopes: `SELECT s.name FROM system:scopes` answers 2 rows while `SELECT COUNT(*) FROM system:scopes` answers 4. `_default` is where most of a bucket's collections live, so reading `system:scopes` would hide them. |
+| Collections | `system:keyspaces` | `system:all_keyspaces` answers every `system:keyspaces` row for the bucket **plus three**: the `_system` scope's `_mobile` and `_query`, and a scoped `_default`.`_default` row **alongside** the pre-scopes bucket-level row that already is that collection. One collection would get two paths. The excess is three whatever the bucket holds; the totals move with the fixture ([§6a.8](#6a8-the-fixture)), so they are not quoted here. |
+| Indexes | `system:indexes` | `system:all_indexes` carries a `#sequentialscan` pseudo-index for **every** keyspace it can see, in every namespace, plus the query service's own `#system` namespace indexes. What it adds is not a constant: it grows with the keyspace count, while `system:indexes` answers only the indexes that were created. |
+| Functions | `system:functions` | There is no `system:all_functions` ("Keyspace not found all_functions"). |
+
+**Nothing here counts with `COUNT(*)`, and that is measured rather than stylistic.** A `system:`
+keyspace can count rows its own projection never returns — the `system:scopes` measurement above is
+the reproducible case — so a badge taken that way would be a number the folder can never show.
+`countObjects()` is the **length of what `listObjects()` returns**, kind by kind. That costs one
+round trip per declared kind on a count, three in total, and it is what discharges the "the listing
+contains exactly what the count counted" rule structurally: there is no second statement for the two
+answers to drift apart in.
+
+### 6a.3 The two row shapes, and the bucket-level one
+
+`system:keyspaces` and `system:indexes` each answer two shapes:
+
+- a **scoped** row, carrying `bucket`/`bucket_id` and `scope`/`scope_id`;
+- the **pre-scopes bucket-level** row, carrying neither, whose name is the **bucket's** name.
+
+The second is `_default`.`_default` and its indexes. Dropping it would hide every document written
+before scopes existed, and naming the collection from the row's own `name` would address it as a
+collection called `travel`, which is a keyspace path no statement can reach. One placement function
+(`resolveKeyspaceOf()`) serves both catalogs, because their projections are aliased onto the same
+field names.
+
+That function is **total**: it always returns a placement. A scoped row that names no scope, and an
+index row that names no keyspace, are both placed in `_default`, which is where an unqualified SQL++
+keyspace resolves. Neither shape was observed on 8.0.2, and neither is claimed to be unreachable:
+dropping a row instead would take it out of the **count and the listing together**, which is an
+object that is invisible in the tree while the count still agrees with the listing, so no gate would
+see it. The only row dropped is one carrying no **name**, which addresses nothing and cannot be a
+tree row.
+
+### 6a.4 Identity
+
+- **A collection** is addressed by its name within its scope.
+- **A function** is addressed by its **bare name**, with no argument list. SQL++ has no overloading:
+  measured, with `discount(price, pct)` in place, `CREATE FUNCTION discount(price)` is refused with
+  *"Function 'discount' already exists"* — refused on the name, arity and all. The same name in
+  another scope succeeds. PostgreSQL needs an argument-type list here; Couchbase does not.
+- **An index** carries its **collection** in the path. Measured: `ix_name` is created on both
+  `inventory`.`airline` and `inventory`.`hotel` and both succeed, while a second `ix_name` on one of
+  them is refused with *"The index ix_name already exists."* So the name alone is not unique within
+  a scope, and the kind declares `attachedTo: "collection"`.
+- A collection name is unique per **scope**, not per bucket: the fixture holds `airline` in both
+  `_default` and `inventory`, each with its own `ix_name` over a different key. A read that filtered
+  a collection's indexes on the collection name alone would hand one of them the other's.
+
+### 6a.5 A GLOBAL function is excluded
+
+`system:functions` answers namespace-level functions as well as scope-level ones. A global function
+belongs to `default:`, above every bucket, so it has no container in a bucket/scope tree; listing it
+under a bucket would claim it lives somewhere it does not. The fixture creates `celsius` so the
+exclusion is pinned by a test that names it.
+
+The exclusion is **structural**: a row is placed by whether its `identity` carries a bucket and a
+scope, never by matching `identity.type` (measured values: `"global"`, `"scope"`). A future third
+identity type is therefore placed by where it says it lives rather than dropped for being an
+unrecognised spelling. There is no other classifier vocabulary in this provider at all: a row's KIND
+is decided by **which catalog it came from**, so there is no `CASE` an unmodelled value can fall out
+of.
+
+`definition["#language"]` is likewise never read. Its measured values are `inline` and, on Enterprise
+Edition, `javascript`; Community Edition refuses the latter outright (*"Functions of type javascript
+are only supported in Enterprise Edition"*). Since one kind covers both flavours, the language is a
+detail for a Phase 2 Source tab rather than a classifier.
+
+### 6a.6 What is NOT declared, and what was measured to decide it
+
+- **No `view` kind.** SQL++ has **no `CREATE VIEW` statement at all**: `CREATE VIEW v AS SELECT 1` is
+  error 3000, *"syntax error - line 1, column 8, near 'CREATE ', at: VIEW (reserved word)"*. The
+  legacy **map-reduce Views**, deprecated since 7.0 and still not removed, do exist — the fixture
+  creates `_design/dev_legacy` holding a `by_city` view over the CAPI port — and they are invisible
+  to the query service: a `LIKE` over `ENCODE_JSON` of `system:all_keyspaces`, `system:all_indexes`,
+  `system:functions`, `system:buckets` and `system:all_scopes` finds **zero** rows mentioning it, and
+  it is not a document in `_default`.`_default` either. They are reachable only over ports 8091 and
+  8092, which this provider's transport does not speak for objects. Phase 2 could add them through
+  the management REST surface; Phase 1 does not guess.
+- **No Eventing Function kind.** Eventing is a separate service with its own REST API on port 8096.
+  Measured on the fixture node, which runs `data,index,query`: nothing listens on 8096 at all, and
+  Eventing is an Enterprise Edition service in any case. It is not reachable through the query
+  service this provider speaks.
+- **No kind for the `_system` scope's contents.** `_system` is the server's own scope (`_mobile`,
+  `_query`) and is excluded by exact name. A prefix rule would be wrong twice: it would sweep up
+  `_default`, and the engine already refuses any user scope starting with `_` or `%` (*"First
+  character must not be _ or %"*, measured on `_systemx`), so nothing a person creates can hide
+  behind the exclusion.
+
+### 6a.7 `describeObject`
+
+The **kind** decides, and nothing reads the name to work out what it is holding.
+
+| Kind | Columns | Indexes | Foreign keys |
+|------|---------|---------|--------------|
+| `collection` | `INFER`, 100-document sample, the same bound the deleted flat reading used | that collection's `system:indexes` rows, scope and collection both matched | always `[]` |
+| `function` | `[]` | `[]` | `[]` |
+| `index` | `[]` | `[]` | `[]` |
+
+A rejected `INFER` yields **no columns rather than an error**: the collection being empty (error
+7014) and the user lacking SELECT on it are both ordinary states. The fixture leaves `hotel` and
+`bookings` empty so that stays measured. `foreignKeys` is always `[]` for the same reason
+`declaresForeignKeys: false` is declared: SQL++ has no referential constraint.
+
+`collection` is the only kind declaring `hasColumns`, so it is the only object row the desktop
+object tree gives a twisty to; `function` and `index` declare nothing, are leaves there, and the
+tree derives no read for them, which is the same fact the table above states by answering `[]`.
+An empty collection and an `INFER` the caller has no SELECT grant for both reach the tree as an
+open row reporting `No columns reported`, because neither is an error on this engine.
+
+A function's BODY is read by `readObjectSource` instead ([§6b](#6b-object-source-789)), not by
+`describeObject`. A function's parameter list and an index's keys as a first-class detail remain
+unmodelled.
+
+### 6a.7b `describeObjects`, the bulk column read
+
+`describeObjects(container, kind, limit?)` answers columns and indexes for every object of one kind
+in one container. The two halves of an `ObjectDetail` do not have the same answer here, and both
+answers are measurements on Couchbase Server 8.0.2 Community, on a node this task created and
+removed.
+
+**The indexes bulk-read, and already did.** `INDEXES_SQL` answers one bucket's whole index catalog
+in one statement and `describeObject` filters it down to one collection, so the batch reads it
+**once** for the folder where a loop over `describeObject` reads the same statement once per
+object.
+
+**The columns cannot.** Couchbase stores no schema: a collection has whatever fields its documents
+carry, and `INFER` is the engine's own sampler. Three measurements close every combined form:
+
+1. `INFER a, b` is error 3000, a syntax error at the comma. `INFER` takes one keyspace.
+2. `INFER` against a scope is refused: `Keyspace resolves to default:travel.inventory - only 2 or 4
+   parts are valid`. There is no folder-level form.
+3. `INFER` **is** subquery-able — both `SELECT * FROM (INFER ...) AS x` and
+   `WITH x AS (INFER ...) SELECT x` parse — so a `UNION ALL` over several of them is a real
+   statement. It is still wrong here: measured, such a statement fails **entirely** with error 7014,
+   `No documents found, unable to infer schema`, as soon as one of its keyspaces is empty. An empty
+   collection is an ordinary state, and the fixture keeps `hotel` and `bookings` empty on purpose,
+   so a combined statement would cost a whole folder its columns because one collection held no
+   documents.
+
+So the `INFER`s are **one per described object**, at most `INFER_CONCURRENCY` (4) in flight, and cut
+by the caller's `limit` before any of them is issued. A folder of N collections costs two catalog
+statements plus N `INFER`s, against 2N statements for the same objects one at a time.
+
+| Shape | Statements | Time |
+| --- | --- | --- |
+| One `describeObjects` over a 40-collection scope | 42 | 293 ms |
+| The 40 `describeObject` calls it replaces | 80 | 462 ms |
+
+The gain is real but modest, and that is the honest shape of it: the `INFER`s dominate and they do
+not go away, so what the batch removes is 39 whole-bucket index reads. The bench scope is
+re-runnable — 40 collections in a `bench` scope, two documents each — and is not part of the
+committed fixture.
+
+**One mapper, shared with the single read.** `relationDetail()` in
+[`objects.ts`](../../src/lib/db/providers/document/couchbase/objects.ts) builds both, so a batch
+cannot spell an index differently from `describeObject` on the same collection. Verified live: for
+every collection of `travel`, `travel`.`_default` and `travel`.`inventory`, the batch's detail is
+identical to `describeObject()` for the same path.
+
+**`function` and `index` answer `{ details: [] }` with no round trip**, which is the same fact the
+single read states by answering three empty arrays: a function's parameters and an index's keys are
+not columns.
+
+**The bound is the caller's, and there is no `limit + 1`.** The catalog statements answer a whole
+bucket in one round trip each, so the target set is complete before anything is cut and the
+comparison is exact. The cut is applied in code, after `comparePaths`, which makes a bounded read's
+membership **ours** rather than the server's — the server never orders this read. `INFER`'s own
+`sample_size` is deliberately **not** reported as truncation: it bounds the documents a column list
+is inferred from, exactly as in the single read and in the object surface, and no object is dropped by
+it, so reporting it would claim the batch left objects out when it left none out.
+
+**Collation, for the record.** SQL++ `ORDER BY` over `["\ue000", "😀"]` answers `U+E000` first,
+which is UTF-8 byte order, while `comparePaths` compares UTF-16 code units and puts `😀` first
+(`0xD83D` is below `0xE000`). Task 26a-2 measured the same divergence on five SQL engines. It cannot
+bite here, because no statement in the object surface carries an `ORDER BY` at all: every listing,
+and the cut a bounded read applies, is sorted in TypeScript.
+
+### 6a.8 The fixture
+
+[`docker/couchbase-init/01-object-fixture.sh`](../../docker/couchbase-init/01-object-fixture.sh) is
+part of the deliverable, not scaffolding: every claim above is re-measurable against it. Couchbase
+has **no `/docker-entrypoint-initdb.d`** — a fresh node has no cluster, no bucket and no index — so
+it is applied by the `couchbase-init` sidecar in
+[`database-compose.yml`](../../database-compose.yml), which mounts this directory at `/fixture` and
+runs the script after `cluster-init`, `bucket-create` and the bucket-level `CREATE PRIMARY INDEX`.
+The script is re-runnable, so an edit is re-applied with:
+
+```bash
+docker compose -f database-compose.yml up -d couchbase couchbase-init
+docker logs libredb-couchbase-init
+```
+
+To apply it to a node you brought up by hand, mount the directory and run the script inside the
+container, which is how the measurements above were taken:
+
+```bash
+docker run -d --name cb -p 8091:8091 -p 8092:8092 -p 8093:8093 \
+  --ulimit nofile=200000:200000 \
+  -v "$PWD/docker/couchbase-init:/fixture:ro" couchbase:community-8.0.2
+docker exec cb couchbase-cli cluster-init -c localhost \
+  --cluster-username Administrator --cluster-password password123 \
+  --cluster-name libredb --services data,index,query \
+  --cluster-ramsize 1024 --cluster-index-ramsize 512 --index-storage-setting default
+docker exec cb couchbase-cli bucket-create -c localhost -u Administrator -p password123 \
+  --bucket travel --bucket-type couchbase --storage-backend couchstore \
+  --bucket-ramsize 256 --bucket-replica 0 --wait
+docker exec -e COUCHBASE_HOST=localhost cb bash /fixture/01-object-fixture.sh
+```
+
+Port **8092** is the CAPI port and is needed only for the map-reduce view; the provider itself uses
+8091 and 8093. What the fixture holds, and the counts it produces:
+
+What it holds, so the counts below can be derived rather than remembered:
+
+- **Collections:** `inventory`.`airline`, `inventory`.`hotel`, `_default`.`airline`,
+  `_default`.`bookings`, plus `_default`.`_default`, which every bucket has and which the query
+  service reports as the pre-scopes bucket-level row ([§6a.3](#6a3-the-two-row-shapes-and-the-bucket-level-one)).
+- **Functions:** `discount` in `inventory` and `discount` in `_default`. The global `celsius` is
+  deliberately outside the tree ([§6a.5](#6a5-a-global-function-is-excluded)) and is not counted.
+  The two bodies differ on purpose, `price - (price * pct / 100)` against `x / 2`, so a source read
+  matching on the name alone answers the wrong one rather than the same one by luck, and neither is
+  a single character, because the object-surface conformance helper refuses a definition under two
+  characters as one a bound cannot be told from no bound.
+- **Indexes:** `ix_name` on each of `inventory`.`airline`, `inventory`.`hotel` and
+  `_default`.`airline`, the primary index on `inventory`.`airline`, and the bucket-level primary
+  index, which the `couchbase-init` sidecar creates before running the script.
+
+| Container | `collection` | `function` | `index` |
+|-----------|--------------|------------|---------|
+| `[travel]` | 5 | 2 | 5 |
+| `[travel, _default]` | 3 | 1 | 2 |
+| `[travel, inventory]` | 2 | 1 | 3 |
+
+The `[travel]` row is the length of each list above; the two scope rows are the same objects split
+by scope, with `_default`.`_default` and the bucket-level index falling into `_default`. Those are
+the numbers `tests/integration/db/couchbase-provider.test.ts` asserts and the numbers a live
+provider answered against the fixture on 2026-09-11. **They move whenever the script gains an
+object**, so anything stated as a total elsewhere in this document is stated against this list.
+
+---
+
+## 6b. Object source (#789)
+
+`readObjectSource(path, kind, limit?)` answers one object's definition text. Everything below was
+measured against **Couchbase Server 8.0.2 Community** running
+[`docker/couchbase-init/01-object-fixture.sh`](../../docker/couchbase-init/01-object-fixture.sh), on
+2026-09-13, including one end-to-end run of the provider itself against that node.
+
+### 6b.1 Per kind
+
+| Kind | `hasSource` | Statement | What the text IS | Monaco id |
+|------|-------------|-----------|------------------|-----------|
+| `function` | Yes | `SELECT f.identity AS identity, f.definition AS definition FROM system:functions AS f` | `definition.text`, the body as authored: `form: "partial"`, `origin: "stored"` | `sql` |
+| `collection` | No | none | the engine publishes no such text at all | not applicable |
+| `index` | No | none | the engine publishes no such text at all | not applicable |
+
+**`form: "partial"`, and it is a fact rather than a hedge.** `definition.text` is a BODY. The
+parameter list is a separate field (`definition.parameters`) and there is no `CREATE FUNCTION`
+header anywhere in the row, so what the pane shows is less than the statement that created the
+object. Composing the three into one statement would show a reader something this product wrote
+rather than something the engine published.
+
+**`origin: "stored"`, and the measurement that decides it.** The row carries the author's bytes
+AND the engine's normalisation of them, side by side. The fixture's
+`CREATE OR REPLACE FUNCTION travel.inventory.discount(price, pct) { price - (price * pct / 100) }`
+answers:
+
+```json
+{"#language":"inline",
+ "expression":"(`price` - ((`price` * `pct`) / 100))",
+ "parameters":["price","pct"],
+ "text":"price - (price * pct / 100)"}
+```
+
+`text` is what was typed; `expression` is a reconstruction. The read takes `text`, so the origin is
+`stored`. Taking `expression` would have made it `regenerated` and would have shown a reader
+backticks and parentheses they never wrote.
+
+### 6b.2 Why `collection` and `index` declare nothing
+
+- **`collection` is schemaless.** A Couchbase collection has whatever fields its documents carry.
+  There is no definition anybody authored, which is the same fact `describeObject` states by
+  INFERring columns from a document sample rather than reading a schema.
+- **`index` publishes no statement.** `system:indexes` carries an index's name, its `index_key`, its
+  `is_primary`, its `using` and its state, and **no field holding the `CREATE INDEX` text**. A
+  Source tab there could therefore only show a statement composed out of the keys, which is a
+  statement this product invented rather than one the engine published. The index KEYS are a fact
+  the catalog does publish, and they are in `describeObject`
+  ([§6a.7](#6a7-describeobject)), which is where they belong.
+
+### 6b.3 The statement, the escaper, and what reaches the wire
+
+`FUNCTIONS_SQL` gained `f.definition` beside the `f.identity` it always read. It is the SAME
+statement the listing sends, so `readObjectSource`, `listObjects` and `countObjects` cannot come to
+look at different sets of functions.
+
+**No identifier and no bind reaches this statement.** The function's identity is matched IN CODE
+against the rows the read returns, exactly as `kindObjects` places them
+([§6a.5](#6a5-a-global-function-is-excluded) is the same rule, applied to the global function). So
+there is no escaper in this engine's source read to get wrong. That is the whole answer to the
+identifier-quoting question every other provider in #789 has to settle: the catalog is
+namespace-wide and small, one row per user-defined function on the cluster, so reading all of it and
+matching in code costs nothing and keeps one visible placement rule.
+
+### 6b.4 The refusals, and the one that CANNOT be verified on this image
+
+| Cause | What happens | Whose sentence | Verified live |
+|-------|--------------|----------------|---------------|
+| The row carries no readable `definition.text` | a refusal part carrying `unavailable`, no `text` | ours, see below | No, and it cannot be. See below |
+| No row matches the path | RAISES `QueryError` naming the object, `No Couchbase function named <name> in <bucket>.<scope>` | ours | Yes |
+| The statement itself is refused | RAISES, through the ordinary error map | the cluster's | Yes, in the suite |
+
+**The unverifiable branch, stated in advance rather than discovered.** An **EXTERNAL JavaScript
+function's** body does not live in `system:functions` at all: Couchbase keeps it in a library on the
+evaluator endpoint (`<query-node>:8093/evaluator/v1/libraries/<library>`), which the query service
+does not expose and which this provider's transport does not speak. Its catalog row therefore
+carries no `definition.text`, and the read answers the refusal part above. **That branch cannot be
+driven against the image this repository runs.** Community Edition refuses to create such a function
+at all:
+
+```
+CREATE OR REPLACE FUNCTION `travel`.`inventory`.`extfn`(a) LANGUAGE JAVASCRIPT AS "add" AT "mylib"
+-> error 3000: Functions of type javascript are only supported in Enterprise Edition
+```
+
+measured verbatim on Server 8.0.2 Community on 2026-09-13, with `/pools` reporting
+`"isEnterprise": false`. So the branch is written, and it is driven by
+`tests/integration/db/couchbase-provider.test.ts` against an authored row rather than by a live
+cluster. A whitespace-only body takes the same branch and is equally unproducible here:
+`CREATE FUNCTION f() {   }` is error 3000, a syntax error at the closing brace.
+
+The refusal sentence is **ours and not the cluster's**, declared rather than smuggled: the read
+SUCCEEDS and the row it answers carries no body, so Couchbase said nothing there is anything to
+carry. It names the object and says where the body actually lives.
+
+**A refused STATEMENT raises rather than becoming a refusal part**, and that is a decision. The read
+is namespace-wide, so its failure says nothing about this object in particular, and `countObjects`
+already carries the cluster's own sentence for the same read as `{ unavailable }` per kind
+([§6a](#6a-the-object-surface-789)), which is where a whole-surface refusal belongs.
+
+### 6b.5 `system:functions` FILTERS BY PERMISSION, so a privilege problem arrives as absence
+
+Measured on 8.0.2 Community on 2026-09-13, with Community Edition's three roles (`admin`,
+`ro_admin`, `bucket_full_access`):
+
+| Caller | `SELECT f.identity, f.definition FROM system:functions` |
+|--------|--------------------------------------------------------|
+| `admin` | all three rows, including the global `celsius` |
+| `bucket_full_access[travel]` | the two `travel` rows, and NOT `celsius` |
+| `ro_admin` | zero rows, `"status": "success"` |
+
+None of the three is an error. So a caller who may not see a function meets **absence**,
+indistinguishable from a function that was never created, and the read raises for both. That is the
+honest answer to both and it is why Couchbase is not on the phase's live-refusal list: this engine
+has no privilege-driven refusal for object source to carry.
+
+### 6b.6 The derivations
+
+The bucket and the scope come from the segments the DECLARATION assigns to the `catalog` and
+`schema` levels; the function's name is `path[path.length - 1]`. Never `path[0]`, `path[1]` or
+`path[2]`. Couchbase's declaration is already two-level, so a test swapping in a two-level
+`containerLevels` would match the real one and pass for a hardcoded implementation. The suite
+therefore drives two varied declarations instead: one that SWAPS the two levels over, fed a path in
+the swapped order, where the same row must still be found; and one giving `function` an `attachedTo`
+so it is addressed at four segments, where `path[2]` names the base object while the last segment
+names the function.
+
+---
+
+## 6c. Object edit (#789)
+
+This engine is a REFUSAL because it was NOT PROBED, and this section says so rather than implying a measurement.
+Neither wave of #789 ran a replace against a UDF on this image, so nothing is known here about what a failed replace, or a byte-identical one, does to the stored function.
+This phase declares a kind editable only where a failure cannot lose the object and a success destroys nothing the user was not shown, and an unprobed engine cannot be shown to satisfy either half, so the declaration is withheld rather than guessed.
+No kind here declares `acceptsSourceEdits`, and `tests/isolated/object-edit-declarations.test.ts` is what holds that absence and this section together.
 
 ## 7. Monitoring & health
 
@@ -586,7 +1135,7 @@ measures nothing, and a metric nobody measured is omitted rather than reported a
 | `getPerformanceMetrics()` | bucket stats | cache hit ratio is `100 - ep_cache_miss_rate` (clamped 0..100); `queriesPerSecond` is `cmd_get + cmd_set`; buffer-pool usage is `quotaPercentUsed` — each is **omitted when its source published nothing** ([§7.1](#71-an-unread-metric-is-absent-not-zero)) |
 | `getSlowQueries()` | `system:completed_requests` ordered by `elapsedTime` | one row per recorded request, so `calls` is always 1 — these are individual requests, not aggregates |
 | `getActiveSessions()` | `system:active_requests` | request id, statement, user, remote address, state, elapsed |
-| `getTableStats()` | `/pools/default/buckets/<bucket>` | **bucket level only** — per-collection item counts need a `COUNT(*)` per collection, too expensive for a monitoring poll |
+| `getTableStats()` | `/pools/default/buckets/<bucket>` | **bucket level only** — per-collection item counts need a `COUNT(*)` per collection, too expensive for a monitoring poll. The row's `tableSize` and `totalSize` are both `basicStats.diskUsed`, the on-disk measure `getOverview()` publishes and the Storage tab divides by ([§7.2](#72-one-size-measure-per-bucket)) |
 | `getIndexStats()` | `system:indexes` + `/pools/default/buckets/@index-<bucket>/stats` | index name, scope, collection, keys, type. Modern servers no longer publish per-index statistics there, so an unpublished size shows as `indexSize: "N/A"` with `indexSizeBytes` **omitted** (a `0 B` read as an empty index, and the Storage tab summed it); `scans` still falls back to `0`, because `IndexStats.scans` is a required field |
 | `getStorageStats()` | `/pools/default/buckets/<bucket>` | Data (`basicStats.diskUsed`) and RAM Quota (`quota.ram` with `quotaPercentUsed`) |
 | `getHealth()` | the four above, in parallel | connections, size, cache hit ratio (the string `N/A` when there is none — `formatCacheHitRatio` from `src/lib/monitoring-cache-ratio.ts`), top 5 slow queries, top 10 sessions |
@@ -616,17 +1165,57 @@ lack ([§3.9](#39-monitoring-degrades-to-empty-never-throws)), so that was the o
 edge one. Omitted, the same panels render `N/A` / "Not measured" and score the card as healthy
 (`OverviewTab.tsx`, `PerformanceTab.tsx`).
 
+### 7.2 One size measure per bucket
+
+`basicStats` carries two sizes of the same bucket, `dataUsed` and `diskUsed`, and this provider used
+to publish one of them per monitoring tab: `getTableStats()` put `dataUsed` in the row's
+`tableSizeBytes`, the row's `totalSizeBytes` was `diskUsed`, and `getOverview()` published `diskUsed`
+as the database size the Storage tab divides every share by. One bucket therefore read two sizes at
+once: 1.57 MB on the Tables tab against 16.86 MB, "100% of DB", on the Storage tab, measured on
+Couchbase 8.0.2 CE (#1455).
+
+Both fields of the row now carry `diskUsed`, the measure `getOverview()`'s `databaseSizeBytes` and
+`getStorageStats()`'s *Data* row already publish. The bucket reads one size across the two tabs, and
+the Storage tab's share divides the bucket's own bytes by themselves. The Tables tab's *Size* column
+is therefore the bucket's **on-disk** size; `dataUsed` is deliberately not published as a table size,
+because nothing in the monitoring surface reports that measure as a total, and a share whose
+numerator and denominator measure different things is not a share.
+
+The *Indexes* card reads `N/A` beside a bucket whose disk usage the cluster does publish, and the
+field it is missing belongs to the `TableStats` row rather than to the index listing:
+`getTableStats()` returns the one bucket row and that row carries no `indexSizeBytes`, while
+[`StorageTab.tsx`](../../src/components/monitoring/tabs/StorageTab.tsx):79-80 shows the card only
+when **every** table row carries one (`tables.every((t) => t.indexSizeBytes !== undefined)`).
+`getIndexStats()` omits `IndexStats.indexSizeBytes` for its own reason
+([§7.1](#71-an-unread-metric-is-absent-not-zero)), and that listing is not the one the card reads.
+A bucket is one keyspace with no separate index size to report, so the absent figure is real rather
+than a `0`.
+
 ---
 
 ## 8. Maintenance
 
-`runMaintenance(type, target?)`
-([index.ts:762](../../src/lib/db/providers/document/couchbase/index.ts)). All three operations
+`runMaintenance(type, target?, container?)`
+([`index.ts`](../../src/lib/db/providers/document/couchbase/index.ts)). All three operations
 **require** a target.
+
+A `container` is the row's `schemaName` (#772), and the keyspace it addresses is decided from it:
+the bucket's own name (the only statistics row `getTableStats()` returns) means the
+bucket's default collection, so that row's Analyze button addresses `` `bucket`.`_default`.`_default` ``
+rather than a scope that does not exist; any other container is the SCOPE the collection sits in,
+used as one instead of being parsed back out of the display name. Without a container the
+display-name rule stands: `scope.collection`, or the default scope for a bare name.
+
+The collection menu does not click that bucket row. It opens the admin Operations page on the
+collection's own path (`?path=<bucket>&path=<scope>&path=<collection>`). The page's list is still
+`getTableStats()`, which does not name the collection, so where the provider declares the
+operation per object the page offers a row for the path itself (#1412). That row's schema is the
+scope segment and its button sends `(collection, scope)`, the "any other container" arm above.
+The row is not a measurement: item counts stay on the bucket row.
 
 | Type | Couchbase action | Notes |
 |------|------------------|-------|
-| `analyze` | `UPDATE STATISTICS FOR <keyspace> INDEX ALL` | **Enterprise Edition only.** A Community cluster answers "'Update Statistics' is an enterprise level feature." — returned verbatim as a failed result, not swallowed or reworded |
+| `analyze` | `UPDATE STATISTICS FOR <keyspace> INDEX ALL` | **Enterprise Edition only.** A Community cluster answers "'Update Statistics' is an enterprise level feature.", returned verbatim as a failed result, not swallowed or reworded. The success reply names the same keyspace the statement addressed (``Updated statistics for `travel`.`inventory`.`hotel` ``), so a row whose target is the bucket cannot report as if the bucket itself had been touched (#1091 review) |
 | `reindex` | `BUILD INDEX ON <keyspace>(...)` over the keyspace's deferred indexes | Reports "No deferred indexes on X" when there are none |
 | `kill` | `DELETE FROM system:active_requests WHERE requestId = $1` | Target is the request id shown in active sessions |
 
@@ -659,7 +1248,7 @@ placement unavailable while the other one is available - a targetless `{type:"an
 Both global cards are withheld rather than synthesised from a keyspace list this provider
 does not enumerate for maintenance. Before #U9 the global Reindex card rendered for every
 provider that declared `reindex`, so on Couchbase every click answered *"The reindex
-operation requires a target"*; the per-collection control carries the keyspace and runs.
+operation requires a target"*; the per-collection control carries the keyspace and runs, on the row the Operations page offers for that path.
 `vacuumAction` (*"Compact"*) names nothing this provider can run - its own description says
 the server compacts automatically - so `vacuum` stays undeclared, `vacuumActionOperation`
 stays absent, and that card never renders either.
@@ -668,7 +1257,7 @@ stays absent, and that card never renders either.
 
 ## 9. Capabilities & labels
 
-### `getCapabilities()` ([index.ts:276](../../src/lib/db/providers/document/couchbase/index.ts))
+### `getCapabilities()` ([`index.ts`](../../src/lib/db/providers/document/couchbase/index.ts))
 
 | Capability | Value |
 |------------|-------|
@@ -676,21 +1265,26 @@ stays absent, and that card never renders either.
 | `supportsExplain` | `true` |
 | `explainFormat` | `couchbase-json` |
 | `supportsExternalQueryLimiting` | `true` |
-| `supportsCreateTable` | `false` |
+| `createTable` | absent |
 | `supportsInlineRowEdit` | `false` — SQL++ has `UPDATE <keyspace> SET ... WHERE ...`, but the shared editor's `WHERE <pk> = <value>` would filter on `__id`, the key **projection alias**, which is not a document field ([§13](#13-known-limitations--future-work)) |
+| `supportsTestDataGeneration` | `false` - a collection takes a document write, but the Generate Test Data dialog's `INSERT INTO ... VALUES` was never measured against SQL++, so the row menus do not offer it (#1468) |
+| `supportsResultPagination` | `true` — SQL++ takes `LIMIT n OFFSET m`, and this provider's `prepareQuery` routes through the shared limiter to emit it (#816) |
 | `supportsTransactions` | `false` — the query service is reached over stateless HTTP and no session spans two requests, so the transaction trio and SANDBOX are not offered (#464) |
 | `declaresForeignKeys` | `false` — SQL++ has no referential constraint; collections are schemaless and the columns reported here are inferred from a document sample |
 | `supportsMaintenance` | `true` |
 | `maintenanceOperations` | `['analyze', 'reindex', 'kill']` |
 | `supportsConnectionString` | `true` |
 | `defaultPort` | `8091` |
+| `containerLevels` | two levels, `catalog` labelled Bucket then `schema` labelled Scope ([§6a.1](#6a1-what-is-declared)) |
+| `containerPathShapes` | `prefixes`: `[bucket]` and `[bucket, scope]` both address a container, because a bucket alone is a real address ([§6a.1](#6a1-what-is-declared)); the empty path and a longer path are both refused, by the object routes over HTTP and by this provider for a caller that reaches it directly (#1147) |
+| `objectKinds` | `collection`, `function`, `index` ([§6a](#6a-the-object-surface-789)) |
 | `schemaRefreshPattern` | `\b(CREATE\|DROP\|ALTER)\s+(COLLECTION\|SCOPE\|INDEX)\b` |
 
-`supportsCreateTable: false` is deliberate: `CreateTableModal` builds `CREATE TABLE` from a column
-list, while Couchbase collections are schemaless and `CREATE COLLECTION` takes no columns. Leaving
-the flag on would render a control that can only emit invalid SQL++.
+Declaring no `createTable` is deliberate: `CreateTableModal` builds `CREATE TABLE` from a column
+list, while Couchbase collections are schemaless and `CREATE COLLECTION` takes no columns. Declaring
+one would render a control that can only emit invalid SQL++.
 
-### `getLabels()` ([index.ts:293](../../src/lib/db/providers/document/couchbase/index.ts))
+### `getLabels()` ([`index.ts`](../../src/lib/db/providers/document/couchbase/index.ts))
 
 Document vocabulary: entity -> *Collection*, row -> *document*, select -> *Select Documents*,
 analyze -> *Update Statistics* (the card text names the Enterprise-only restriction), vacuum ->
@@ -723,6 +1317,21 @@ control is the only one on this provider, which is what the operation itself req
 `reindexGlobal*` labels above are consequently read by nobody today; they are the wording the card
 would carry if it ever returns.
 
+### SQL writing
+
+[`couchbase/sql-writing.ts`](../../src/lib/db/providers/document/couchbase/sql-writing.ts) declares how a generated statement spells a literal, a name and a bind for this engine, and it is this engine's row of `SQL_WRITING` ([`src/lib/db/sql-writing/index.ts`](../../src/lib/db/sql-writing/index.ts)), which the readers in [`src/lib/sql/values.ts`](../../src/lib/sql/values.ts) and [`src/lib/sql/identifier.ts`](../../src/lib/sql/identifier.ts) look up.
+A literal is written by `literalBackslash` and read back by `unquoteBackslash`: every escape, the quote's included, is spelled with a backslash, and doubling is not part of the grammar.
+A name is quoted by `identifierDoubleQuoted`, the SQL standard form: a double-quoted name with an inner double quote doubled.
+A bind is spelled by `placeholderDollar`, as `$1`, `$2`.
+SQL++ spells its literals the way JSON does: `char ::= unicode-character | '\' ( '\' | '"' | "'" | 'b' | 'f' | 'n' | 'r' | 't' | 'u' hex hex hex hex )`.
+Doubling is not in that grammar, so a doubled quote is not one literal there.
+The name gets the SQL standard form, which this engine's generators fall back to.
+SQL++ takes its values in `args`, which the statement reads as `$1`, `$2`.
+Inline row editing reads a key column's kind through the shared `INSTANT_TYPE_NAMES`, `FLOAT64_TYPE_NAMES` and `EXACT_DECIMAL_TYPE_NAMES` of the module's `inlineEdit`, and binds every edit as typed.
+
+The module's `export` field writes a result export's CREATE TABLE and INSERT from the shared building blocks alone: `STANDARD_DDL_TYPES` for the column types, `NOTHING_STANDS_ALONE` and `NO_BARE_SPELLING`, so every bare declared name is re-spelled from its family, `NULL_NON_FINITE` for NaN and the infinities, and `binaryTextBackslash` for a binary cell, the `\x…` text every other surface shows, quoted with `literalBackslash`.
+SQL++ parses no CREATE TABLE (a collection is schemaless and `CREATE COLLECTION` takes no columns, which is why the provider declares no `createTable`), so a file written from it is meant to run somewhere else, and every bare name in it is re-spelled from its family, portably.
+
 ---
 
 ## 10. Error handling
@@ -730,7 +1339,7 @@ would carry if it ever returns.
 The transport normalizes every failure into `CouchbaseError { code, message, retriable }`; the
 provider maps that one numeric space onto the shared classes from
 [`src/lib/db/errors.ts`](../../src/lib/db/errors.ts)
-([index.ts:444](../../src/lib/db/providers/document/couchbase/index.ts)):
+(`mapCouchbaseError()`, [`index.ts`](../../src/lib/db/providers/document/couchbase/index.ts)):
 
 | Code | Meaning | Error raised |
 |------|---------|--------------|
@@ -782,14 +1391,15 @@ Validation, connect/disconnect, capabilities, labels, `prepareQuery`, query exec
 shaping, the full error map, endpoint discovery (including `alternateAddresses` and the fallback
 port), SRV resolution and its fallback, TLS material, `request_plus` **and** the `not_bounded`
 override, collection listing, INFER flavour union, index mapping, every monitoring method and its
-degraded path, all three maintenance operations, and the explain strategy.
+degraded path, all three maintenance operations, the explain strategy, the whole object surface, and the source
+read with both of its refusal branches and both of its derivation pins ([§6b](#6b-object-source-789)).
 
 ### 11.3 Run it
 
 ```bash
 # Just this provider
-bun test tests/integration/db/couchbase-provider.test.ts
-bun test tests/unit/db/couchbase
+bun tests/run-tests.ts tests/integration/db/couchbase-provider.test.ts
+bun tests/run-tests.ts tests/unit/db/couchbase
 
 # Full isolated suite (CI-equivalent)
 bun run test
@@ -845,7 +1455,8 @@ const rows = await provider.query(
 const byKey = await provider.query(
   'SELECT d.* FROM `travel`.`inventory`.`hotel` AS d USE KEYS ["hotel::1"]',
 );
-const schema = await provider.getSchema();   // collections + inferred fields + indexes
+const objects = await provider.listObjects(container, 'table');
+const { details } = await provider.describeObjects(container, 'table');
 
 await provider.disconnect();
 ```
@@ -899,7 +1510,8 @@ and all UI registration are untouched.
 Everything else:
 
 - **No transactions.** SQL++ transactions work over REST (`BEGIN TRANSACTION` returns a `txid`), but
-  the provider exposes no begin/commit/rollback API.
+  the provider exposes no begin/commit/rollback API, and the `txid` it never sends is why
+  `endOpenQueryTransaction()` is absent ([§5.5](#55-endopenquerytransaction-is-absent-and-which-absence-it-is-d75)).
 - **No `cancelQuery`.** A running statement is terminated through maintenance `kill` with its
   request id, which needs the Query System Catalog role.
 - **`UPDATE STATISTICS` is Enterprise-only.** On Community Edition the maintenance action returns
@@ -915,13 +1527,26 @@ Everything else:
   per-index series under `@index-<bucket>`, and the provider does not guess: an unpublished size is
   `N/A` with no byte count, while `scans` reports `0` only because the field is required.
 - **One bucket per connection.** Multi-bucket browsing from a single connection is out of scope;
-  `getSchemaList()` and every monitoring read are scoped to `config.database`.
+  the deleted flat list read and every monitoring read are scoped to `config.database`.
 - **Analytics/Columnar, Full-Text Search, Eventing and Capella management APIs** (allowed-IP
   administration, cluster provisioning) are not covered.
 - **Monitoring needs privileges.** Without the Query System Catalog role, slow queries and active
   sessions are `[]`, index scan counts read `0`, and the performance metrics whose sources are denied
   are omitted rather than reported as zeroes — by design
   ([§3.9](#39-monitoring-degrades-to-empty-never-throws), [§7.1](#71-an-unread-metric-is-absent-not-zero)).
+
+---
+
+## Migration DDL
+
+[`COUCHBASE_MIGRATION_DDL`](../../src/lib/db/providers/document/couchbase/migration-ddl.ts) is what the schema-diff migration generator writes for `couchbase`, read through `migrationDdlFor` in `src/lib/db/migration-ddl/`.
+It declines the whole diff: `refusal` is the one line the migration prints after its header, in place of any DDL, and `transactionWrapper` is `null`.
+Couchbase has index and collection DDL, but no `CREATE` or `ALTER TABLE` column grammar.
+Couchbase does have distributed ACID transactions, but spells one `BEGIN TRANSACTION` and answers with a `txid` every following statement has to carry as a request parameter, a shape a flat migration file cannot express (#284).
+
+The refusal reason it prints, verbatim:
+
+- "Collections hold schemaless JSON documents, so there is no column definition to change."
 
 ---
 
@@ -941,4 +1566,4 @@ Everything else:
 - USE clause (`USE KEYS`): <https://docs.couchbase.com/server/current/n1ql/n1ql-language-reference/hints.html>
 - INFER: <https://docs.couchbase.com/server/current/n1ql/n1ql-language-reference/infer.html>
 - EXPLAIN: <https://docs.couchbase.com/server/current/n1ql/n1ql-language-reference/explain.html>
-- Sibling provider docs: [PostgreSQL](./postgres.md) · [MySQL](./mysql.md) · [Oracle](./oracle.md) · [SQL Server](./mssql.md) · [SQLite](./sqlite.md) · [MongoDB](./mongodb.md) · [Apache Trino](./trino.md) · [Redis](./redis.md) · [LibreDB](./libredb.md)
+- Sibling provider docs: [PostgreSQL](./postgres.md) · [MySQL](./mysql.md) · [Oracle](./oracle.md) · [SQL Server](./mssql.md) · [SQLite](./sqlite.md) · [MongoDB](./mongodb.md) · [Trino](./trino.md) · [Redis](./redis.md) · [LibreDB](./libredb.md)

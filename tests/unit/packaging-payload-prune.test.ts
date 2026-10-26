@@ -8,12 +8,22 @@
  * subprocess against a fixture payload dir - no full `bun run build`
  * needed, since the helper only prunes an already-assembled payload.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { describeIfPosixShell, posixShell } from "../helpers/posix-tools";
 
 const SCRIPT = join(import.meta.dir, "../../scripts/lib/prune-standalone-payload.sh");
+/*
+  Resolved rather than spawned by bare name. `Bun.spawnSync(["bash", ...])` THROWS ("Executable not
+  found in $PATH", measured in this worktree) where there is no bash, and in a PowerShell session
+  with WSL installed the bare name resolves to C:\Windows\System32\bash.exe - a Linux shell that
+  cannot stat the Win32 fixture path this passes it, so the script would refuse with "not found" and
+  the test would read that as a prune failure. Nothing else here is platform-bound: the script is
+  the one the release-artifacts workflow already runs under Git Bash on windows-latest.
+*/
+const SHELL = posixShell("bash");
 
 /** Runtime files the prune must never remove (mirrors the build script's
  * payload assembly - including the hidden .next dir: see the snap 0.9.52
@@ -41,6 +51,13 @@ const KEEP_FILES = [
   "data/.gitkeep",
   "LICENSE",
   "README.md",
+  // The notices for the crates compiled into db2-node's addons (#786); the
+  // payload script copies it in after this prune, and a later prune run over
+  // the same payload must not take it out again.
+  "THIRD_PARTY_NOTICES.txt",
+  // The traced Db2 driver: an addon at a package root, the shape a root-level
+  // prune glob could hit.
+  "node_modules/db2-node/db2-node.linux-x64-gnu.node",
 ];
 
 /** Directories on the deny-list (planted with one file each; the prune
@@ -56,18 +73,27 @@ const EXTRA_DIRS = [
   // would make the release tarball grow by a gigabyte.
   "desktop",
   "dist",
+  // The channel inventory. Read by scripts and by the showcase generator, never
+  // at runtime: the server reads src/lib/distribution/channels.generated.ts.
+  "distribution",
   "docker",
   "docs",
   "e2e",
   "logs",
   "loop",
   "packaging",
+  // The agent-failure study: paper sources and Python scripts. Tracing it in made
+  // namcap demand a python dependency for the AUR package (#971).
+  "research",
   "scripts",
   "snap",
   "snap-payload",
   "src",
   "testdb",
   "tests",
+  // The VS Code extension: its own node_modules, its bundles and the VS Code builds its test legs download into
+  // .vscode-test/. None of it is server runtime.
+  "vscode-extension",
 ];
 
 /** Root files on the deny-list, including one instance per glob pattern
@@ -81,9 +107,14 @@ const EXTRA_FILES = [
   "CLAUDE.md",
   "CODE_OF_CONDUCT.md",
   "components.json",
+  "codecov.yml",
   "CONTRIBUTING.md",
   "database-compose.yml",
   "Dockerfile",
+  // One per published image variant (#840). They are covered by a glob rather
+  // than three literals, and the literal entry covered one of the three.
+  "Dockerfile.alpine",
+  "Dockerfile.alpine-slim",
   "docker-entrypoint.sh",
   "DOCKERHUB.md",
   "eslint.config.mjs",
@@ -91,6 +122,11 @@ const EXTRA_FILES = [
   "knip.json",
   "next.config.ts",
   "playwright.config.ts",
+  // One per harness, covered by a glob: the base-path, channel and smoke configs
+  // shipped in every image while only the bare name was on the list.
+  "playwright.base-path.config.ts",
+  "playwright.channel.config.ts",
+  "playwright.smoke.config.ts",
   "postcss.config.mjs",
   "render.yaml",
   "SECURITY.md",
@@ -111,7 +147,7 @@ const EXTRA_FILES = [
   "local-cert.pem",
 ];
 
-describe("scripts/lib/prune-standalone-payload.sh (#124)", () => {
+describeIfPosixShell("bash", "scripts/lib/prune-standalone-payload.sh (#124)", () => {
   const fixtureRoots: string[] = [];
 
   afterEach(() => {
@@ -130,7 +166,7 @@ describe("scripts/lib/prune-standalone-payload.sh (#124)", () => {
   }
 
   function runPrune(...args: string[]) {
-    return Bun.spawnSync(["bash", SCRIPT, ...args], { stdout: "pipe", stderr: "pipe" });
+    return Bun.spawnSync([SHELL!, SCRIPT, ...args], { stdout: "pipe", stderr: "pipe" });
   }
 
   test("removes the repo-root extras from the payload root", () => {

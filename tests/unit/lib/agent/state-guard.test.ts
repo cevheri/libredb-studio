@@ -126,7 +126,7 @@ describe("assertPersistableState — FUNCTION_VALUE", () => {
   });
 
   test("refuses a setter-only property too", () => {
-    const state = Object.defineProperty({}, "sink", { set: () => undefined, enumerable: true });
+    const state = Object.defineProperty({}, "sink", { set: () => {}, enumerable: true });
     expect(captureRefusal(state).reasonCode).toBe("FUNCTION_VALUE");
   });
 });
@@ -342,7 +342,17 @@ describe("assertPersistableState — CREDENTIAL_KEY", () => {
     // matters - no credential stem matches it, so the derivation is its only
     // cover.
     expect(new Set(STORED_SECRET_FIELDS)).toEqual(
-      new Set(["password", "connectionString", "agentPassword", "clientKey", "privateKey", "passphrase"]),
+      new Set([
+        "password",
+        "connectionString",
+        "agentPassword",
+        "clientKey",
+        "privateKey",
+        "privateKeyPassphrase",
+        "passphrase",
+        "apiKeyId",
+        "apiKeySecret",
+      ]),
     );
   });
 
@@ -487,6 +497,7 @@ describe("assertPersistableState — RAW_RESULT_SET", () => {
       rowCount: 2,
       executionTime: 11,
       columnTypes: { id: "integer" },
+      vectorColumns: { embedding: { kind: "dense", dtype: "float32", dimension: 3 } },
       pagination: { limit: 100, offset: 0, hasMore: false, totalReturned: 2, wasLimited: false },
       warnings: [{ message: "sequential scan" }],
     };

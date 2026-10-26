@@ -1,5 +1,7 @@
 import type { NextConfig } from "next";
 import packageJson from "./package.json";
+import { readBasePath } from "./src/lib/config/base-path";
+import { readDevAllowedOrigins } from "./src/lib/config/dev-origins";
 // Relative, not "@/": Next loads this file before any tsconfig path alias exists for it, and
 // src/lib/security/headers.ts is import-free by design precisely so a next.config can read it.
 import { securityHeaders, type SecurityHeaderOptions } from "./src/lib/security/headers";
@@ -147,10 +149,11 @@ export const DOCUMENT_ONLY_HEADER_NAMES = new Set([
  * only `reportOnly` and `hsts` discriminate anything. Reducing the probe to those two leaves the
  * selected set byte-identical - `allowEval`, `monacoVsPath` and `extra` move the CSP's VALUE and
  * nothing else, and the CSP is already excluded because `reportOnly` RENAMES it, which reaches the
- * filter as an absence rather than as a difference. That is measured in
+ * filter as an absence rather than as a difference. `allowWebAuthnGet` moves only
+ * Permissions-Policy, which is document-only and never baked. That is measured in
  * tests/security/cross-origin-headers.test.ts, not left as a claim here.
  *
- * The three inert fields stay, and the same test requires this probe to be TOTAL over the declared
+ * The four inert fields stay, and the same test requires this probe to be TOTAL over the declared
  * option surface. That is the property worth having: the next option added - one that may well
  * move a non-CSP header - is probed on the day it lands instead of rotting here unnoticed, which
  * is what happened to `extra`, declared on `CspOptions` and varied by no probe field at all until
@@ -167,6 +170,8 @@ export const OPTION_PROBE: SecurityHeaderOptions = {
   hsts: false,
   monacoVsPath: "https://monaco.invalid/vs",
   extra: { "connect-src": ["https://probe.invalid"] },
+  // Listed because the probe must be total; Permissions-Policy is document-only, so it moves nothing baked.
+  allowWebAuthnGet: true,
 };
 
 /**
@@ -197,9 +202,16 @@ function staticAssetHeaders(): { key: string; value: string }[] {
   return selectStaticAssetHeaders(securityHeaders(), securityHeaders(OPTION_PROBE));
 }
 
+const basePath = readBasePath(process.env.BASE_PATH);
+
 const nextConfig: NextConfig = {
+  basePath,
+  // Dev only: hosts other than localhost that may load /_next dev resources, comma separated (a LAN name or address
+  // such as "devbox.local,192.0.2.10"). Empty by default, which keeps Next's own localhost-only default.
+  allowedDevOrigins: readDevAllowedOrigins(process.env.DEV_ALLOWED_ORIGINS),
   env: {
     NEXT_PUBLIC_APP_VERSION: packageJson.version,
+    NEXT_PUBLIC_BASE_PATH: basePath,
   },
   // Use standalone output for Docker/Kubernetes deployments
   // For Vercel, this is automatically handled
@@ -215,6 +227,43 @@ const nextConfig: NextConfig = {
   // `@duckdb/node-bindings` is listed next to `@duckdb/node-api` on purpose: it is
   // the loader that does a bare top-level `require('@duckdb/node-bindings-<platform>-
   // <arch>/duckdb.node')`, so it is the module that must never be bundled.
+  // `oracledb` is external for a reason that only shows up in Thick mode (#538).
+  // The driver is pure JS in its default Thin mode, so bundling it looked free.
+  // It is not: node-oracledb locates its native addon relative to its own
+  // `__dirname`, and Turbopack rewrites that to the literal string
+  // `/ROOT/node_modules/oracledb/lib`. `initOracleClient()` then looked for
+  // `/ROOT/node_modules/oracledb/build/Release/oracledb-<ver>-<platform>.node`,
+  // found nothing, and threw NJS-045 before the Instant Client was consulted -
+  // measured through /api/db/test-connection on the published 0.13.4 and 0.13.7
+  // images. Externalizing removes every `/ROOT/node_modules/oracledb` reference
+  // from `.next/server/chunks`. The addon itself is still a file-tracing blind
+  // spot; the Dockerfile runner stage and scripts/build-standalone-payload.sh
+  // copy the package for that.
+  // `@platformatic/kafka` is pure JavaScript and WebAssembly, but
+  // dist/protocol/crc32c.js loads the optional native addon `@node-rs/crc32`
+  // through createRequire, and bundling it fails the build with "non-ecmascript
+  // placeable asset" on that addon's .node file. External, the library resolves
+  // the addon at runtime and falls back to its WebAssembly crc32c without it.
+  // `db2-node` is a napi-rs package: its index.js requires
+  // `./db2-node.<triple>.node` and falls back to `require('db2-node-<triple>')`,
+  // a package that does not exist. Bundled, the first is a non-ecmascript asset
+  // and the second an unresolvable module, the two failures above. External,
+  // file tracing still follows those static literals to all eight addons, and
+  // the Dockerfiles and payload scripts prune them to the platform.
+  // `node-opcua-client` and `node-opcua-certificate-manager` are pure JavaScript, but two modules
+  // under them cannot be bundled. Both failures are measured, and re-measured against the installed
+  // `node-opcua-crypto` 6.2.3 (node-opcua 2.187.16) after a review found this comment describing
+  // an older version of it: removing the two names below and building answers three errors, no
+  // more and no fewer.
+  //   `node-opcua-crypto/dist/source_nodejs/read.js:288` computes its certificate store as
+  //   `fileURLToPath(new URL("../../certificates/", import.meta.url))`. Turbopack reads that URL as
+  //   a module request and answers `Module not found: Can't resolve '../../certificates/'` - and
+  //   the directory really is absent from the installed package, so no bundler could resolve it.
+  //   `@ster5/global-mutex`, which the certificate manager loads to lock its PKI directory,
+  //   requires `proper-lockfile`, an optional dependency this tree does not install: two errors.
+  // External, neither is resolved at build time. At run time the URL above is arithmetic on a
+  // string and touches no file - it is read only by the store functions, which this provider never
+  // calls - and the mutex falls back to its own implementation without proper-lockfile.
   serverExternalPackages: [
     "pg",
     "mysql2",
@@ -222,8 +271,13 @@ const nextConfig: NextConfig = {
     "better-sqlite3",
     "ssh2",
     "cassandra-driver",
+    "oracledb",
     "@duckdb/node-api",
     "@duckdb/node-bindings",
+    "@platformatic/kafka",
+    "db2-node",
+    "node-opcua-client",
+    "node-opcua-certificate-manager",
   ],
 
   // One rule over every path, not just the skipped ones: both values are constants and byte

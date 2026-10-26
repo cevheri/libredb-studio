@@ -43,6 +43,39 @@ describe("mergeDefaults", () => {
   });
 });
 
+describe("filterByRoles: the no-scan choice", () => {
+  it("carries a seeded connection's no-scan choice through to the managed connection", () => {
+    // The second silent half (#765): this mapper is a hand-written field list, so a field
+    // the schema validates and the mapper forgets reaches the browser as `undefined` and
+    // the connection scans the catalog the deployment asked it not to.
+    const [managed] = filterByRoles([{ ...baseConn, skipObjectScan: true }], ["admin"]);
+    expect(managed.skipObjectScan).toBe(true);
+  });
+
+  it("leaves it absent for a seed that does not ask for it", () => {
+    const [managed] = filterByRoles([{ ...baseConn }], ["admin"]);
+    expect(managed.skipObjectScan).toBeUndefined();
+  });
+});
+
+describe("the MCP opt-in", () => {
+  it("is carried through to the managed connection, because the mapper is a hand-written field list", () => {
+    const [managed] = filterByRoles([{ ...baseConn, mcp: true }], ["admin"]);
+    expect(managed.mcp).toBe(true);
+  });
+
+  it("stays absent for a seed that does not opt in", () => {
+    const [managed] = filterByRoles([{ ...baseConn }], ["admin"]);
+    expect(managed.mcp).toBeUndefined();
+  });
+
+  it("is never merged from defaults: absent when the connection omits it, true when it sets it", () => {
+    const defaults: SeedDefaults = { managed: true, environment: "production" };
+    expect(mergeDefaults({ ...baseConn }, defaults).mcp).toBeUndefined();
+    expect(mergeDefaults({ ...baseConn, mcp: true }, defaults).mcp).toBe(true);
+  });
+});
+
 describe("filterByRoles: engine-specific fields", () => {
   it("carries a Cassandra connection's data centre through to the managed connection", () => {
     // The one field `cassandra-driver` refuses to start without. Dropped here, a
@@ -66,6 +99,151 @@ describe("filterByRoles: engine-specific fields", () => {
     );
 
     expect(managed.authSource).toBe("admin");
+  });
+
+  it("carries an Elasticsearch connection's API key pair through to the managed connection", () => {
+    // Same silent-loss shape as authSource above (#708). Deleting either half from
+    // the mapper left every suite green: the seed validated, the connection listed,
+    // and the transport fell back to user/password on a key that works.
+    const [managed] = filterByRoles(
+      [
+        {
+          ...baseConn,
+          type: "elasticsearch",
+          port: 9200,
+          apiKeyId: "seed-key-id",
+          apiKeySecret: "seed-key-secret",
+        },
+      ],
+      ["user"],
+    );
+
+    expect(managed.apiKeyId).toBe("seed-key-id");
+    expect(managed.apiKeySecret).toBe("seed-key-secret");
+  });
+
+  it("refuses an API key pair on OpenSearch rather than projecting it", () => {
+    expect(() =>
+      filterByRoles(
+        [
+          {
+            ...baseConn,
+            type: "opensearch",
+            port: 9200,
+            apiKeyId: "seed-key-id",
+            apiKeySecret: "seed-key-secret",
+          },
+        ],
+        ["user"],
+      ),
+    ).toThrow(/Elasticsearch-only/);
+  });
+  it("carries a Trino connection's session schema through to the managed connection", () => {
+    const [managed] = filterByRoles(
+      [{ ...baseConn, type: "trino", port: 8080, database: "memory", schema: "default" }],
+      ["user"],
+    );
+
+    expect(managed.schema).toBe("default");
+  });
+
+  it("carries a Kafka connection's SASL mechanism through to the managed connection", () => {
+    // Dropped here, a seeded SCRAM connection would list with its user and password and no
+    // mechanism, which the provider refuses as a credential with no mechanism to send it by.
+    const [managed] = filterByRoles(
+      [
+        {
+          ...baseConn,
+          type: "kafka",
+          port: 9092,
+          user: "reader",
+          password: "reader-password",
+          saslMechanism: "SCRAM-SHA-512",
+        },
+      ],
+      ["user"],
+    );
+
+    expect(managed.saslMechanism).toBe("SCRAM-SHA-512");
+  });
+
+  /**
+   * THE OTHER HALF OF THE SEED ROUND TRIP, and for OPC UA it is the half that carries a safety
+   * property: a pin dropped here leaves a connection that is LISTED as pinned, opens to the right
+   * address, and trusts whatever certificate the server presents. The schema half is pinned in
+   * `tests/unit/seed/types.test.ts`; this is the hand-written field list, where a field can be
+   * validated above and silently not copied.
+   */
+  it("carries an OPC UA connection's mode, pin and deployment paths through (#1677)", () => {
+    const [managed] = filterByRoles(
+      [
+        {
+          ...baseConn,
+          type: "opcua",
+          host: "opc.tcp://plc.ornek.net:4840/UA/Server",
+          securityMode: "SignAndEncrypt",
+          serverCertificateThumbprint: "b9432ed131e30092d2a0619284763a403c33fc3929546728864b27b475c9529a",
+          securityPolicyUri: "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256",
+          clientCertificatePath: "/run/secrets/opcua/client.der",
+          clientPrivateKeyPath: "/run/secrets/opcua/client.pem",
+        },
+      ],
+      ["user"],
+    );
+    const [none] = filterByRoles([{ ...baseConn, type: "opcua", host: "opc.tcp://plc:4840" }], ["user"]);
+
+    expect(managed.securityMode).toBe("SignAndEncrypt");
+    expect(managed.serverCertificateThumbprint).toBe(
+      "b9432ed131e30092d2a0619284763a403c33fc3929546728864b27b475c9529a",
+    );
+    expect(managed.securityPolicyUri).toBe("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
+    expect(managed.clientCertificatePath).toBe("/run/secrets/opcua/client.der");
+    expect(managed.clientPrivateKeyPath).toBe("/run/secrets/opcua/client.pem");
+    // And absent stays absent, so the copy is of what the file said rather than of a default.
+    expect(none.securityMode).toBeUndefined();
+    expect(none.serverCertificateThumbprint).toBeUndefined();
+  });
+
+  it("carries a Db2 connection's consent to a cleartext password through (#786)", () => {
+    // Dropped here, the provider would refuse a seed whose file did set the consent.
+    const [managed] = filterByRoles([{ ...baseConn, type: "db2", port: 50000, allowInsecureAuth: true }], ["user"]);
+    const [none] = filterByRoles([{ ...baseConn, type: "db2", port: 50000 }], ["user"]);
+
+    expect(managed.allowInsecureAuth).toBe(true);
+    expect(none.allowInsecureAuth).toBeUndefined();
+  });
+
+  it("a seed's dataServers is copied onto the managed connection", () => {
+    const result = filterByRoles([{ ...baseConn, dataServers: "a.internal:6648 b.internal:6648" }], ["user"]);
+    const [none] = filterByRoles([{ ...baseConn }], ["user"]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].dataServers).toBe("a.internal:6648 b.internal:6648");
+    expect(none.dataServers).toBeUndefined();
+  });
+
+  it("a seed's warehouse is copied onto the managed connection", () => {
+    const result = filterByRoles([{ ...baseConn, type: "databend", warehouse: "small-xy2t" }], ["user"]);
+    const [none] = filterByRoles([{ ...baseConn }], ["user"]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].warehouse).toBe("small-xy2t");
+    expect(none.warehouse).toBeUndefined();
+  });
+
+  it("a seed's region is copied onto the managed connection", () => {
+    const result = filterByRoles([{ ...baseConn, region: "eu-central-1" }], ["user"]);
+    const [none] = filterByRoles([{ ...baseConn }], ["user"]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].region).toBe("eu-central-1");
+    expect(none.region).toBeUndefined();
+  });
+
+  it("leaves the mechanism absent on a seeded connection that names none", () => {
+    const [managed] = filterByRoles([{ ...baseConn, type: "kafka", port: 9092 }], ["user"]);
+
+    expect(managed.saslMechanism).toBeUndefined();
   });
 });
 
@@ -125,5 +303,46 @@ describe("filterByRoles", () => {
       ["user"],
     );
     expect(result).toHaveLength(0);
+  });
+
+  it("projects only roles the caller holds (or wildcard) to avoid leaking other teams' roles", () => {
+    const result = filterByRoles(
+      [{ ...baseConn, roles: ["team-billing", "team-dev", "admin"] }],
+      ["user", "team-billing"],
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0].roles).toEqual(["team-billing"]);
+  });
+
+  it("preserves wildcard role on projected connection", () => {
+    const result = filterByRoles([{ ...baseConn, roles: ["*", "team-secret"] }], ["user"]);
+    expect(result).toHaveLength(1);
+    expect(result[0].roles).toEqual(["*"]);
+  });
+});
+
+describe("filterByRoles: the read-only mode (#1089)", () => {
+  it("carries a seeded connection's mode through, because the mapper is a hand-written field list", () => {
+    // The load refuses the mode on an engine that does not enforce it; this pins the copy alone.
+    const [managed] = filterByRoles([{ ...baseConn, readOnly: true }], ["admin"]);
+    expect(managed.readOnly).toBe(true);
+  });
+
+  it("leaves it absent for a seed that does not set it", () => {
+    const [managed] = filterByRoles([{ ...baseConn }], ["admin"]);
+    expect(managed.readOnly).toBeUndefined();
+  });
+
+  it("refuses a read-only seed built in memory as unmanaged, naming the seed and both fields", () => {
+    expect(() => filterByRoles([{ ...baseConn, readOnly: true, managed: false }], ["admin"])).toThrow(
+      'Seed connection "test" sets readOnly: true with managed: false.',
+    );
+  });
+
+  it("refuses the pair once defaults.managed: false has been merged, the order the loader runs them in", () => {
+    const merged = mergeDefaults({ ...baseConn, readOnly: true }, { managed: false });
+    expect(() => filterByRoles([merged], ["admin"])).toThrow(
+      'Seed connection "test" sets readOnly: true with managed: false.',
+    );
   });
 });

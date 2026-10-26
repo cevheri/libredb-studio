@@ -2,7 +2,9 @@
 
 import React, { type RefObject } from "react";
 import type { DatabaseConnection } from "@/lib/types";
+import { connectionPulseTitle, type ConnectionPulse } from "@/hooks/use-connection-pulse";
 import type { QueryEditorRef } from "@/components/QueryEditor";
+import { CancelQueryButton, type CancelControlMode } from "./QueryToolbar";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import {
@@ -13,6 +15,8 @@ import {
   Database,
   PenLine,
   Gauge,
+  KeyRound,
+  ShieldCheck,
   LogOut,
   EllipsisVertical,
   Pencil,
@@ -21,7 +25,6 @@ import {
   Plus,
   Save,
   Settings,
-  Square,
   Trash2,
   Upload,
   User,
@@ -36,6 +39,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Button } from "@/components/ui/button";
 import { GitHubRepoLink } from "@/components/github-repo-link";
+import { ReadOnlyMarker } from "@/components/read-only-marker";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { writeToClipboard } from "@/components/copy-button";
 import { toast } from "sonner";
@@ -43,23 +47,31 @@ import { toast } from "sonner";
 interface StudioMobileHeaderProps {
   connections: DatabaseConnection[];
   activeConnection: DatabaseConnection | null;
-  connectionPulse: "healthy" | "degraded" | "error" | null;
+  connectionPulse: ConnectionPulse | null;
   user: { role?: string } | null;
   isAdmin: boolean;
   activeMobileTab: "database" | "schema" | "editor";
   isExecuting: boolean;
-  currentQuery: string;
   queryEditorRef: RefObject<QueryEditorRef | null>;
   transactionActive: boolean;
   playgroundMode: boolean;
   editingEnabled: boolean;
   onSelectConnection: (conn: DatabaseConnection) => void;
-  onAddConnection: () => void;
+  /**
+   * Opens the connection dialog. Omitted while the server refuses custom connections
+   * (`ALLOW_CUSTOM_CONNECTIONS`), and neither Add item is then rendered.
+   */
+  onAddConnection?: () => void;
   onLogout: () => void;
   onSaveQuery: () => void;
   onClearQuery: () => void;
   onExecuteQuery: () => void;
   onCancelQuery: () => void;
+  /**
+   * What the Cancel control can do on this connection (`cancelControlMode`, #1364), as in
+   * `QueryToolbar`. Omitted means the provider can cancel.
+   */
+  cancelMode?: CancelControlMode;
   /**
    * The transaction trio, supplied together or not at all — the same contract
    * `QueryToolbar` states. A caller whose provider declares no transaction session
@@ -79,6 +91,11 @@ interface StudioMobileHeaderProps {
   onImport: () => void;
   onExplain?: () => void;
   /**
+   * False where the provider declares `supportsSqlFormat: false`, the capability the editor's own Format button
+   * and menu entry read; the "Format SQL" item is then not rendered. Omitted means Format is offered.
+   */
+  offersFormat?: boolean;
+  /**
    * Asks the agent about what the editor is holding (#331 T3). It replaced a button
    * that toggled the in-editor AI chat through `queryEditorRef`; the chat is gone,
    * and WHAT to ask about is the shell's decision rather than this header's.
@@ -89,7 +106,7 @@ interface StudioMobileHeaderProps {
   onAskAgent?: () => void;
 }
 
-export function StudioMobileHeader({
+export const StudioMobileHeader = React.memo(function StudioMobileHeader({
   connections,
   activeConnection,
   connectionPulse,
@@ -97,7 +114,6 @@ export function StudioMobileHeader({
   isAdmin,
   activeMobileTab,
   isExecuting,
-  currentQuery,
   queryEditorRef,
   transactionActive,
   playgroundMode,
@@ -109,6 +125,7 @@ export function StudioMobileHeader({
   onClearQuery,
   onExecuteQuery,
   onCancelQuery,
+  cancelMode = "cancel",
   onBeginTransaction,
   onCommitTransaction,
   onRollbackTransaction,
@@ -116,6 +133,7 @@ export function StudioMobileHeader({
   onToggleEditing,
   onImport,
   onExplain,
+  offersFormat = true,
   onAskAgent,
 }: StudioMobileHeaderProps) {
   const router = useRouter();
@@ -139,7 +157,7 @@ export function StudioMobileHeader({
                 size="sm"
                 className="h-8 px-2 gap-1 bg-overlay border-hairline-strong hover:bg-fill text-fg-secondary max-w-[160px]"
               >
-                <Database strokeWidth={1.5} className="w-3 h-3 text-blue-400 shrink-0" />
+                <Database strokeWidth={1.5} className="w-3 h-3 text-brand shrink-0" />
                 <span className="truncate text-xs font-medium">
                   {activeConnection ? activeConnection.name : "Select DB"}
                 </span>
@@ -148,45 +166,53 @@ export function StudioMobileHeader({
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="w-64 bg-raised border-hairline-strong">
               {connections.length === 0 ? (
-                <DropdownMenuItem onClick={onAddConnection} className="text-fg-tertiary cursor-pointer">
-                  <Plus strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Add Connection
-                </DropdownMenuItem>
+                onAddConnection && (
+                  <DropdownMenuItem onClick={onAddConnection} className="text-fg-tertiary cursor-pointer">
+                    <Plus strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Add Connection
+                  </DropdownMenuItem>
+                )
               ) : (
                 <>
                   {connections.map((c) => (
                     <DropdownMenuItem
                       key={c.id}
                       onClick={() => onSelectConnection(c)}
-                      className={cn("cursor-pointer", activeConnection?.id === c.id && "bg-blue-600/20 text-blue-400")}
+                      className={cn("cursor-pointer", activeConnection?.id === c.id && "bg-brand-solid/20 text-brand")}
                     >
                       <Database strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" />
                       <span className="truncate">{c.name}</span>
                       {activeConnection?.id === c.id && (
-                        <div className="ml-auto w-1.5 h-1.5 rounded-full bg-blue-500" />
+                        <div className="ml-auto w-1.5 h-1.5 rounded-full bg-brand-tint" />
                       )}
                     </DropdownMenuItem>
                   ))}
-                  <DropdownMenuItem
-                    onClick={onAddConnection}
-                    className="text-fg-muted cursor-pointer border-t border-hairline mt-1"
-                  >
-                    <Plus strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Add New
-                  </DropdownMenuItem>
+                  {onAddConnection && (
+                    <DropdownMenuItem
+                      onClick={onAddConnection}
+                      className="text-fg-muted cursor-pointer border-t border-hairline mt-1"
+                    >
+                      <Plus strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Add New
+                    </DropdownMenuItem>
+                  )}
                 </>
               )}
             </DropdownMenuContent>
           </DropdownMenu>
 
-          {activeConnection && (
-            <span className="text-xs text-emerald-500 font-medium px-1.5 py-0.5 rounded bg-emerald-500/10">Online</span>
-          )}
+          {activeConnection?.readOnly === true && <ReadOnlyMarker />}
+          {activeConnection &&
+            (connectionPulse === "not-checked" ? (
+              <span className="text-xs text-fg-muted font-medium px-1.5 py-0.5 rounded bg-fill">Not checked</span>
+            ) : (
+              <span className="text-xs text-success font-medium px-1.5 py-0.5 rounded bg-success-tint/10">Online</span>
+            ))}
         </div>
 
         <div className="flex items-center gap-1">
           <Button
             variant="ghost"
             size="sm"
-            className="h-8 w-8 p-0 text-fg-muted hover:text-purple-400"
+            className="h-8 w-8 p-0 text-fg-muted hover:text-hue-purple"
             onClick={() => router.push("/monitoring")}
           >
             <Gauge strokeWidth={1.5} className="w-3.5 h-3.5" />
@@ -196,14 +222,15 @@ export function StudioMobileHeader({
           {connectionPulse && (
             <div
               className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-fill"
-              title={`Connection: ${connectionPulse}`}
+              title={connectionPulseTitle(connectionPulse)}
             >
               <div
                 className={cn(
                   "w-1.5 h-1.5 rounded-full",
-                  connectionPulse === "healthy" && "bg-emerald-500 animate-pulse",
-                  connectionPulse === "degraded" && "bg-amber-500",
-                  connectionPulse === "error" && "bg-red-500",
+                  connectionPulse === "healthy" && "bg-success-tint animate-pulse",
+                  connectionPulse === "degraded" && "bg-warning-tint",
+                  connectionPulse === "error" && "bg-danger-tint",
+                  connectionPulse === "not-checked" && "bg-fg-subtle",
                 )}
               />
             </div>
@@ -224,6 +251,12 @@ export function StudioMobileHeader({
                 <DropdownMenuItem onClick={() => router.push("/monitoring")} className="cursor-pointer">
                   <Gauge strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Monitoring
                 </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => router.push("/settings/mcp")} className="cursor-pointer">
+                  <KeyRound strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> MCP
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => router.push("/settings/authenticator")} className="cursor-pointer">
+                  <ShieldCheck strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Sign-in security
+                </DropdownMenuItem>
                 <div className="border-t border-hairline my-1" />
                 {/*
                  * A button, deliberately NOT a `DropdownMenuItem`: an item is a
@@ -234,7 +267,7 @@ export function StudioMobileHeader({
                  */}
                 <ThemeToggle showLabel className="w-full px-2 py-1.5 text-sm" />
                 <div className="border-t border-hairline my-1" />
-                <DropdownMenuItem onClick={onLogout} className="text-red-400 cursor-pointer">
+                <DropdownMenuItem onClick={onLogout} className="text-danger cursor-pointer">
                   <LogOut strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Logout
                 </DropdownMenuItem>
                 <div className="border-t border-hairline mt-1 pt-1 px-2 pb-1">
@@ -265,7 +298,7 @@ export function StudioMobileHeader({
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-7 px-2 gap-1 text-xs font-medium text-fg-muted hover:text-blue-400 shrink min-w-0"
+                className="h-7 px-2 gap-1 text-xs font-medium text-fg-muted hover:text-brand shrink min-w-0"
                 onClick={onAskAgent}
               >
                 <Bot strokeWidth={1.5} className="w-3 h-3" />
@@ -280,16 +313,22 @@ export function StudioMobileHeader({
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="start" className="bg-raised border-hairline-strong w-48">
-                <DropdownMenuItem onClick={() => queryEditorRef.current?.format()} className="cursor-pointer text-xs">
-                  <TextAlignStart strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Format SQL
-                </DropdownMenuItem>
+                {offersFormat && (
+                  <DropdownMenuItem onClick={() => queryEditorRef.current?.format()} className="cursor-pointer text-xs">
+                    <TextAlignStart strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Format SQL
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuItem
                   onClick={() => {
                     // `writeToClipboard` rather than `navigator.clipboard` directly (B43):
                     // that API is absent over plain HTTP off loopback, which several
                     // distribution channels are, and this menu closes on click — a toast is
                     // the only place left to say the clipboard is still empty.
-                    const query = queryEditorRef.current?.getValue() || currentQuery;
+                    // The header no longer receives `currentQuery` (X5): it changed on every
+                    // keystroke and re-rendered this memoized header, and the fallback it
+                    // provided was dead — the editor is mounted on every surface that can
+                    // reach this menu item.
+                    const query = queryEditorRef.current?.getValue() ?? "";
                     void writeToClipboard(query).then((copied) => {
                       if (!copied) toast.error("Could not copy the query — select the text and copy it yourself");
                     });
@@ -298,7 +337,7 @@ export function StudioMobileHeader({
                 >
                   <Copy strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Copy Query
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={onClearQuery} className="cursor-pointer text-xs text-red-400">
+                <DropdownMenuItem onClick={onClearQuery} className="cursor-pointer text-xs text-danger">
                   <Trash2 strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Clear
                 </DropdownMenuItem>
                 <DropdownMenuItem onClick={onSaveQuery} className="cursor-pointer text-xs">
@@ -308,7 +347,7 @@ export function StudioMobileHeader({
                 {onExplain && (
                   <>
                     <DropdownMenuSeparator className="bg-fill" />
-                    <DropdownMenuItem onClick={onExplain} className="cursor-pointer text-xs text-amber-400">
+                    <DropdownMenuItem onClick={onExplain} className="cursor-pointer text-xs text-hue-amber">
                       <Zap strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Explain Plan
                     </DropdownMenuItem>
                   </>
@@ -330,13 +369,10 @@ export function StudioMobileHeader({
                     </DropdownMenuItem>
                   ) : (
                     <>
-                      <DropdownMenuItem
-                        onClick={transaction.commit}
-                        className="cursor-pointer text-xs text-emerald-400"
-                      >
+                      <DropdownMenuItem onClick={transaction.commit} className="cursor-pointer text-xs text-success">
                         <CirclePlay strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> COMMIT
                       </DropdownMenuItem>
-                      <DropdownMenuItem onClick={transaction.rollback} className="cursor-pointer text-xs text-red-400">
+                      <DropdownMenuItem onClick={transaction.rollback} className="cursor-pointer text-xs text-danger">
                         <CirclePlay strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> ROLLBACK
                       </DropdownMenuItem>
                     </>
@@ -364,30 +400,23 @@ export function StudioMobileHeader({
 
             {/* Status badges */}
             {transactionActive && (
-              <span className="text-[0.625rem] font-medium text-amber-400 px-1.5 py-0.5 rounded bg-amber-500/10 border border-amber-500/20">
+              <span className="text-[0.625rem] font-medium text-warning px-1.5 py-0.5 rounded bg-warning-tint/10 border border-warning-tint/20">
                 TXN
               </span>
             )}
             {playgroundMode && (
-              <span className="text-[0.625rem] font-medium text-purple-400 px-1.5 py-0.5 rounded bg-purple-500/10 border border-purple-500/20">
+              <span className="text-[0.625rem] font-medium text-hue-purple px-1.5 py-0.5 rounded bg-hue-purple-tint/10 border border-hue-purple-tint/20">
                 SANDBOX
               </span>
             )}
           </div>
 
           {isExecuting ? (
-            <Button
-              size="sm"
-              className="bg-red-600 hover:bg-red-500 text-white font-medium text-xs h-7 px-4 gap-1.5"
-              onClick={onCancelQuery}
-            >
-              <Square strokeWidth={1.5} className="w-3 h-3 fill-current" />
-              CANCEL
-            </Button>
+            <CancelQueryButton mode={cancelMode} onCancel={onCancelQuery} className="gap-1.5" />
           ) : (
             <Button
               size="sm"
-              className="bg-blue-600 hover:bg-blue-500 text-white font-medium text-xs h-7 px-4 gap-1.5"
+              className="bg-brand-solid hover:bg-brand-solid-hover text-white font-medium text-xs h-7 px-4 gap-1.5"
               onClick={onExecuteQuery}
               disabled={!activeConnection}
             >
@@ -399,4 +428,4 @@ export function StudioMobileHeader({
       )}
     </header>
   );
-}
+});

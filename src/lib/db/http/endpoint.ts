@@ -1,0 +1,333 @@
+/**
+ * Endpoints for the HTTP-based database transports
+ *
+ * The host and port of an HTTP-based connection must only ever address the
+ * configured server and the transport's own fixed paths. A string template such
+ * as `${scheme}://${host}:${port}/path` gives no such guarantee: a host carrying
+ * a slash, a question mark, a hash or an at sign rewrites the URL around it, and
+ * the request then goes to a different path or a different server with the
+ * connection's credential attached.
+ *
+ * So the host and port are validated before any URL exists, every URL is built
+ * with `URL` and `URLSearchParams`, and the built URL is checked against the
+ * intended hostname, port and path before it is handed back. A refusal is a
+ * `DatabaseConfigError` that names the field and never repeats the value, since
+ * the value may be exactly what somebody wanted to smuggle into a log or a toast.
+ *
+ * Nothing here knows about a particular engine; each transport supplies its own
+ * scheme, default port and paths.
+ */
+
+import { BlockList, isIP, isIPv6 } from "node:net";
+import { ConnectionError, DatabaseConfigError } from "@/lib/db/errors";
+import { assertPublicLiteralHost, LOOPBACK_NETWORKS } from "./egress-policy";
+
+export type HttpScheme = "http" | "https";
+
+/** A validated scheme, host and port. `host` is in URL form: lower case, IPv6 in brackets. */
+export interface HttpOrigin {
+  readonly scheme: HttpScheme;
+  readonly host: string;
+  readonly port: number;
+}
+
+/** The port a URL leaves out of its serialization for each scheme. */
+const DEFAULT_PORTS: Record<HttpScheme, number> = { http: 80, https: 443 };
+
+const MAX_PORT = 65535;
+const MAX_HOSTNAME_LENGTH = 253;
+
+/**
+ * One DNS label: letters, digits, hyphens and the underscore a Docker Compose
+ * service name may carry, with no hyphen at either end.
+ */
+const LABEL = /^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$/i;
+
+/**
+ * A final label a URL parser reads as a number, which turns the whole name into
+ * an IPv4 address: `127.1` becomes `127.0.0.1` and `0x7f` becomes `0.0.0.127`.
+ */
+const NUMERIC_LABEL = /^(?:\d+|0x[0-9a-f]*)$/i;
+
+/** A dotted quad with no leading zeros, which a URL parser would read as octal. */
+const IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+
+const PORT_DIGITS = /^\d{1,5}$/;
+
+const INVALID_HOST = "Invalid host: expected a hostname, an IPv4 address or an IPv6 address";
+const INVALID_PORT = `Invalid port: expected an integer from 1 to ${MAX_PORT}`;
+
+function isHostname(host: string): boolean {
+  const name = host.endsWith(".") ? host.slice(0, -1) : host;
+  if (name.length === 0 || name.length > MAX_HOSTNAME_LENGTH) return false;
+
+  const labels = name.split(".");
+  return labels.every((label) => LABEL.test(label)) && !NUMERIC_LABEL.test(labels[labels.length - 1]);
+}
+
+/**
+ * An IPv6 literal without its brackets, or null. A zone (`fe80::1%eth0`) is
+ * refused: a URL cannot carry one, and the percent sign is a smuggling vector.
+ */
+function ipv6Literal(host: string): string | null {
+  const bracketed = host.startsWith("[") && host.endsWith("]");
+  const address = bracketed ? host.slice(1, -1) : host;
+  return !address.includes("%") && isIPv6(address) ? address : null;
+}
+
+/**
+ * The host in URL form, or a refusal.
+ * Exported for the Kafka bootstrap address, which is a TCP host and port rather than a URL.
+ */
+export function validateHost(host: unknown): string {
+  if (typeof host !== "string") throw new DatabaseConfigError(INVALID_HOST);
+
+  const ipv6 = ipv6Literal(host);
+  if (ipv6 !== null) {
+    return `[${ipv6.toLowerCase()}]`;
+  }
+  if (IPV4.test(host) || isHostname(host)) {
+    return host.toLowerCase();
+  }
+
+  throw new DatabaseConfigError(INVALID_HOST);
+}
+
+/**
+ * An integer port from 1 to 65535, from a number or a string of digits alone.
+ * Exported for the Kafka bootstrap address, which is a TCP host and port rather than a URL.
+ */
+export function validatePort(port: unknown): number {
+  const value = typeof port === "string" && PORT_DIGITS.test(port) ? Number(port) : port;
+  if (typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= MAX_PORT) return value;
+
+  throw new DatabaseConfigError(INVALID_PORT);
+}
+
+const loopback = new BlockList();
+for (const [network, prefix, family] of LOOPBACK_NETWORKS) loopback.addSubnet(network, prefix, family);
+
+/**
+ * Whether a host is this machine: an address in `LOOPBACK_NETWORKS`, bare or IPv4-mapped, or the exact name
+ * `localhost` in any case, and nothing else. The brackets `validateHost` puts around an IPv6 literal are stripped
+ * first.
+ * Exported for a provider that needs the loopback condition without the password sentence; not the `isLoopbackHost`
+ * of src/lib/auth.ts, which reads a Host header that may carry a port.
+ */
+export function isLoopbackHost(host: string): boolean {
+  const address = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  if (address.toLowerCase() === "localhost") return true;
+  const family = isIP(address);
+  if (family === 4) return loopback.check(address, "ipv4");
+  if (family !== 6) return false;
+  const groups = expandIPv6(address).split(":");
+  const mapped = groups.slice(0, 5).every((group) => group === "0000") && groups[5] === "ffff";
+  if (!mapped) return loopback.check(address, "ipv6");
+  const octets = [groups[6].slice(0, 2), groups[6].slice(2), groups[7].slice(0, 2), groups[7].slice(2)];
+  return loopback.check(octets.map((octet) => Number.parseInt(octet, 16)).join("."), "ipv4");
+}
+
+/**
+ * The refusal of a secret that would cross the network without TLS, or undefined where it may go.
+ *
+ * Both vector engines send the secret on every request, so a non-empty one over no TLS is refused unless the host
+ * is this machine or an SSH tunnel carries the connection. The caller maps "no TLS" (an absent or null ssl panel,
+ * or mode `disable`) to `tls: false`, passes the validated host the connection names and never the tunnel's local
+ * end, and runs this in `connect()` before any socket. `secretLabel` names the secret in the sentence, `password`
+ * when absent. The sentence never repeats the host.
+ */
+export function plaintextSecretRefusal(connection: {
+  readonly host: string;
+  readonly tunnelled: boolean;
+  readonly tls: boolean;
+  readonly hasSecret: boolean;
+  readonly secretLabel?: string;
+}): string | undefined {
+  if (!connection.hasSecret || connection.tls || connection.tunnelled || isLoopbackHost(connection.host)) {
+    return undefined;
+  }
+  const label = connection.secretLabel ?? "password";
+  return (
+    `This connection would send its ${label} without TLS to a host that is not this machine, where anyone on the ` +
+    `path can read it. Choose an SSL mode under SSL / TLS, connect through an SSH tunnel, or, if authentication is ` +
+    `off on this server, clear the ${label}.`
+  );
+}
+
+/** Validate a connection's host and port for one scheme. */
+export function httpOrigin(scheme: HttpScheme, host: unknown, port: unknown): HttpOrigin {
+  const validatedHost = validateHost(host);
+  assertPublicLiteralHost(validatedHost);
+  return { scheme, host: validatedHost, port: validatePort(port) };
+}
+
+/**
+ * An IPv6 address as eight four-digit groups, so two spellings of one address
+ * compare equal: a URL rewrites `::ffff:127.0.0.1` as `::ffff:7f00:1`. The input
+ * has already passed `isIPv6`.
+ */
+function expandIPv6(host: string): string {
+  let address = host.replace(/^\[|\]$/g, "").toLowerCase();
+
+  const ipv4Tail = /(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(address);
+  if (ipv4Tail) {
+    const [a, b, c, d] = ipv4Tail.slice(1).map(Number);
+    address = `${address.slice(0, ipv4Tail.index)}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+
+  const [head, tail] = address.split("::");
+  const left = head === "" ? [] : head.split(":");
+  const right = tail === undefined || tail === "" ? [] : tail.split(":");
+  const zeros = tail === undefined ? [] : Array<string>(8 - left.length - right.length).fill("0");
+
+  return [...left, ...zeros, ...right].map((group) => group.padStart(4, "0")).join(":");
+}
+
+function sameHost(actual: string, intended: string): boolean {
+  if (!intended.startsWith("[")) return actual === intended;
+  return actual.startsWith("[") && expandIPv6(actual) === expandIPv6(intended);
+}
+
+function refuse(field: "host" | "port" | "path"): never {
+  throw new DatabaseConfigError(
+    `Invalid ${field}: the request URL would not address the configured ${field}, so it was not sent`,
+  );
+}
+
+/**
+ * The URL of one fixed path on a validated origin, with optional query
+ * parameters.
+ *
+ * The path must already be in the form a URL keeps: absolute, with every dynamic
+ * segment passed through `encodeURIComponent`. A path the URL would rewrite, a
+ * dot segment or a raw `?` for instance, is refused rather than sent somewhere
+ * else.
+ */
+export function endpointUrl(origin: HttpOrigin, pathname: string, params?: URLSearchParams): string {
+  let url: URL;
+  try {
+    url = new URL(`${origin.scheme}://${origin.host}`);
+  } catch {
+    refuse("host");
+  }
+
+  // The setters are used for everything after the host, so no part can reach
+  // another: a path cannot introduce a host, and a query cannot introduce a path.
+  url.port = String(origin.port);
+  url.pathname = pathname;
+  if (params) url.search = params.toString();
+
+  if (!sameHost(url.hostname, origin.host)) refuse("host");
+  if (Number(url.port || DEFAULT_PORTS[origin.scheme]) !== origin.port) refuse("port");
+  if (url.pathname !== pathname) refuse("path");
+
+  return url.toString();
+}
+
+/** The origin as a URL serializes it: scheme and host, with the port only when it is not the scheme's default. */
+function originString(origin: HttpOrigin): string {
+  const url = new URL(`${origin.scheme}://${origin.host}`);
+  url.port = String(origin.port);
+  return url.origin;
+}
+
+const INVALID_TEXT = "Invalid text: expected well-formed Unicode, so it cannot be percent-encoded";
+
+/**
+ * Every UTF-8 byte outside A-Z a-z 0-9 - . _ ~ as %XX with upper-case hex; text with a lone surrogate is refused.
+ *
+ * This is SigV4's UriEncode alphabet, so each encoded segment, name or value is in its canonical form as it stands
+ * (byte transport design 3.4). It does not make every target valid: an empty first path segment gives "//x" and an
+ * empty query name gives "=v", which the byte transport's own check of the target refuses. encodeURIComponent already
+ * writes upper-case hex and leaves only `!'()*` outside that alphabet unescaped, and it throws URIError on a lone
+ * surrogate.
+ */
+export function rfc3986Encode(text: string): string {
+  let encoded: string;
+  try {
+    encoded = encodeURIComponent(text);
+  } catch {
+    throw new DatabaseConfigError(INVALID_TEXT);
+  }
+  return encoded.replace(/[!'()*]/g, (mark) => `%${mark.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+/** "/" + each segment rfc3986Encode-d, joined by "/"; empty, "." and ".." segments are kept as given. */
+export function rfc3986Path(segments: readonly string[]): string {
+  return `/${segments.map(rfc3986Encode).join("/")}`;
+}
+
+/** name=value pairs, each side rfc3986Encode-d, in the given order, joined by "&"; [] gives "". */
+export function rfc3986Query(pairs: readonly (readonly [name: string, value: string])[]): string {
+  return pairs.map(([name, value]) => `${rfc3986Encode(name)}=${rfc3986Encode(value)}`).join("&");
+}
+
+/**
+ * The Host header value node:http writes for this origin: host, bracketed if IPv6, with ":port" only when not the
+ * scheme default. The byte transport sends it itself, so a signer signs exactly the Host that goes on the wire.
+ */
+export function originHost(origin: HttpOrigin): string {
+  return new URL(endpointUrl(origin, "/")).host;
+}
+
+/**
+ * Refuse a link the server handed back unless it sits on the configured origin.
+ *
+ * A transport that follows links from a response body (a `nextUri` chain) would
+ * otherwise send the connection's credential wherever the body points. The
+ * refusal names only the two origins: a link's path and query can identify a
+ * running query or carry a token.
+ */
+export function rejectForeignLink(link: string, origin: HttpOrigin): void {
+  let target: URL;
+  try {
+    target = new URL(link);
+  } catch {
+    throw new ConnectionError("The server advertised a link that is not a URL, so it was not followed");
+  }
+
+  if (target.protocol !== "http:" && target.protocol !== "https:") {
+    throw new ConnectionError("The server advertised a link that is not an http or https URL, so it was not followed");
+  }
+
+  const port = Number(target.port || DEFAULT_PORTS[target.protocol === "https:" ? "https" : "http"]);
+  if (target.protocol === `${origin.scheme}:` && sameHost(target.hostname, origin.host) && port === origin.port) return;
+
+  throw new ConnectionError(
+    `The server advertised a link on ${target.origin}, not on ${originString(origin)}, the address the connection uses, so it was not followed. A proxy that rewrites the Host header can cause this`,
+  );
+}
+
+/** Where a redirect points, reduced to its origin, or null when that is no http(s) URL. */
+function redirectOrigin(location: string, requestUrl: string): string | null {
+  try {
+    const target = new URL(location, requestUrl);
+    return target.protocol === "http:" || target.protocol === "https:" ? target.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+function redirectTarget(location: string | null, requestUrl: string): string {
+  if (location === null) return "with no Location header";
+
+  const origin = redirectOrigin(location, requestUrl);
+  return origin === null ? "to a Location that is not an http or https URL" : `to ${origin}`;
+}
+
+/**
+ * Refuse a 3xx response.
+ *
+ * Every transport requests with `redirect: "manual"`, because a followed redirect
+ * would carry the connection's credential to wherever the server pointed. The
+ * refusal names the status and only the ORIGIN of the target: a Location path or
+ * query can hold a token, and userinfo can hold a password.
+ */
+export function rejectRedirect(response: Pick<Response, "status" | "headers">, requestUrl: string): void {
+  if (response.status < 300 || response.status > 399) return;
+
+  const target = redirectTarget(response.headers.get("location"), requestUrl);
+  throw new ConnectionError(
+    `The server answered HTTP ${response.status}, a redirect ${target}, and redirects are not followed`,
+  );
+}

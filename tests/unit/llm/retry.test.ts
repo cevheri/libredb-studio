@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
 import { withRetry, makeRetryable } from "@/lib/llm/utils/retry";
-import { LLMConfigError, LLMRateLimitError } from "@/lib/llm/types";
+import { LLMConfigError, LLMRateLimitError, LLMStreamError } from "@/lib/llm/types";
 
 // Suppress console.error output during retry tests
 let originalConsoleError: typeof console.error;
@@ -87,6 +87,30 @@ describe("withRetry", () => {
       // Non-retryable errors should cause immediate throw
       expect(fn).toHaveBeenCalledTimes(1);
     }
+  });
+
+  test("context-length error is not retried and fails immediately", async () => {
+    let attempts = 0;
+    const fn = mock(async () => {
+      attempts++;
+      throw new LLMStreamError("request exceeds the available context size (32768 tokens)", "openai");
+    });
+
+    await expect(withRetry(fn, { maxAttempts: 3, initialDelay: 1, maxDelay: 5 })).rejects.toThrow(
+      /exceeds the available context size/,
+    );
+    expect(attempts).toBe(1);
+  });
+
+  test("standard stream error is retried up to maxAttempts", async () => {
+    let attempts = 0;
+    const fn = mock(async () => {
+      attempts++;
+      throw new LLMStreamError("stream interrupted", "openai");
+    });
+
+    await expect(withRetry(fn, { maxAttempts: 3, initialDelay: 1, maxDelay: 5 })).rejects.toThrow(/stream interrupted/);
+    expect(attempts).toBe(3);
   });
 
   test("maxAttempts=1 means no retry", async () => {
@@ -176,5 +200,43 @@ describe("makeRetryable", () => {
 
     const result = await retryable(3, 7);
     expect(result).toBe(10);
+  });
+});
+
+// A signal the caller already aborted is a decision, not a transient failure: sending the request again,
+// after a backoff, only delays the error the caller is waiting for.
+describe("withRetry with an aborted signal", () => {
+  test("an abort during the backoff ends the wait early, with no further attempt", async () => {
+    const controller = new AbortController();
+    const fn = mock(async () => {
+      setTimeout(() => controller.abort(), 10);
+      throw new LLMRateLimitError("rate limited", "openai");
+    });
+    const started = Date.now();
+    await expect(
+      withRetry(fn, { maxAttempts: 3, initialDelay: 1000, maxDelay: 1000, signal: controller.signal }),
+    ).rejects.toThrow("rate limited");
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  test("a signal aborted before the first attempt sends nothing and throws its reason", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("caller left"));
+    const fn = mock(async () => "sent");
+    await expect(withRetry(fn, { signal: controller.signal })).rejects.toThrow("caller left");
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  test("a failure raised after the signal aborted ends the retries", async () => {
+    const controller = new AbortController();
+    const fn = mock(async () => {
+      controller.abort();
+      throw new LLMRateLimitError("rate limited", "openai");
+    });
+    await expect(
+      withRetry(fn, { maxAttempts: 3, initialDelay: 1, maxDelay: 5, signal: controller.signal }),
+    ).rejects.toThrow("rate limited");
+    expect(fn).toHaveBeenCalledTimes(1);
   });
 });

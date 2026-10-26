@@ -19,15 +19,62 @@
  * that NO FILE APPEARED ON DISK, not merely that an error was thrown.
  */
 
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { Database as BunDatabase } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+/** A namespace import for `spyOn`, the same module object the provider's `import * as fs from "fs"` reads. */
+import * as fsNode from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { DuckDBProvider, assertReadOnlyStatementIsBounded } from "@/lib/db/providers/sql/duckdb";
 import type { DatabaseConnection } from "@/lib/types";
-import type { ReadOnlyStatementBudget } from "@/lib/db/types";
+import type { ObjectKindSpec, ObjectSourceForm, ProviderCapabilities, ReadOnlyStatementBudget } from "@/lib/db/types";
+import {
+  FUNCTION_TYPE_RULES,
+  OBJECT_COLUMNS_SQL,
+  applyKindCounts,
+  bulkTargetSql,
+  countsSql,
+  listObjectsSql,
+  objectSourceForm,
+  objectSourceOrigin,
+  objectSourceSql,
+  seedZeroCounts,
+} from "@/lib/db/providers/sql/duckdb/objects";
+import { openDuckDBClient } from "@/lib/db/providers/sql/duckdb/client";
+import { DUCKDB_CREATE_TABLE } from "@/lib/db/providers/sql/duckdb/create-table";
 import { ConnectionError, DatabaseConfigError, ExecutionProfileError, QueryError } from "@/lib/db/errors";
+import { isSourcePartUnavailable, sourceBoundTruncationReason } from "@/lib/db/object-kinds";
 import { CACHE_HIT_RATIO_UNAVAILABLE } from "@/lib/monitoring-cache-ratio";
+import { assertObjectSurface } from "../../helpers/object-surface-conformance";
+import { comparePaths } from "@/lib/db/object-path";
+import { logger } from "@/lib/logger";
+import { MISSING_POSIX_FILE_MODES, describeIf, testIf } from "../../helpers/posix-tools";
+import {
+  CHILD_TEST_TIMEOUT_MS,
+  MISSING_POSIX_SPECIAL_FILES,
+  connectInChild,
+  makeFifo,
+  runInChild,
+} from "../../helpers/special-files";
+import {
+  WAREHOUSE_PLACEHOLDER,
+  readFixtureStatements,
+  removeDatabaseFile,
+  warehouseSibling,
+} from "../../../docker/duckdb-init/build-fixture";
 
 // ============================================================================
 // Helpers
@@ -48,6 +95,20 @@ const PINNED_VERSION = "v1.5.5";
  * did NOT appear.
  */
 const workDir = mkdtempSync(join(tmpdir(), "libredb-duckdb-test-"));
+
+/**
+ * A second scratch directory, for the one test that needs a RELATIVE database path.
+ *
+ * It has to sit under the process directory: `path.relative` can only answer a relative path
+ * when both sides share a root, and on Windows a clone on D: with %TEMP% on C: has no relative
+ * spelling of `workDir` at all. It used to be a fixed `tests-tmp-duckdb/` in the repository
+ * working tree, which two concurrent test processes would share (DuckDB's single-writer file
+ * lock then fails the second one) and which a drift guard running beside the suite would see.
+ * `node_modules/.cache` is ignored by the VCS, and `mkdtempSync` makes the name per-process.
+ */
+const RELATIVE_WORK_PARENT = resolve(import.meta.dir, "../../../node_modules/.cache");
+mkdirSync(RELATIVE_WORK_PARENT, { recursive: true });
+const relativeWorkDir = mkdtempSync(join(RELATIVE_WORK_PARENT, "libredb-duckdb-rel-"));
 
 /**
  * A CSV outside every database, for the bare-path form: DuckDB's replacement scan turns
@@ -112,7 +173,8 @@ beforeAll(() => {
 
 afterAll(() => {
   // One removal, not two: the CSV lives inside the scratch directory now.
-  rmSync(workDir, { recursive: true, force: true });
+  rmSync(workDir, { recursive: true });
+  rmSync(relativeWorkDir, { recursive: true });
 });
 
 // ============================================================================
@@ -141,10 +203,25 @@ describe("DuckDBProvider capabilities", () => {
     expect(capabilities.supportsConnectionString).toBe(false);
   });
 
+  test("declares the Create Table form's DuckDB grammar, the one exported constant", () => {
+    // The constant lives in a driver-free module so the modal's tests read it without the native addon (#1822).
+    expect(capabilities.createTable).toBe(DUCKDB_CREATE_TABLE);
+  });
+
   test("declares singleWriterFile, because the file admits one operating-system process", () => {
     // Measured: a second PROCESS is refused even in read-only mode, so the three routes
     // that would open a second handle borrow this one instead (BACKLOG D3).
     expect(capabilities.singleWriterFile).toBe(true);
+  });
+
+  test("pages with LIMIT n OFFSET m", () => {
+    // #816: declared true because `prepareQuery` really applies a positive offset.
+    // Measured across every type-id in tests/unit/db/result-pagination-capability.test.ts.
+    expect(capabilities.supportsResultPagination).toBe(true);
+
+    const pageTwo = new DuckDBProvider(makeConfig()).prepareQuery("SELECT * FROM t", { limit: 50, offset: 50 });
+    expect(pageTwo.query).toBe("SELECT * FROM t LIMIT 50 OFFSET 50");
+    expect(pageTwo.wasLimited).toBe(true);
   });
 
   test("declares double-quote identifier quoting rather than relying on the null-port heuristic", () => {
@@ -235,28 +312,174 @@ describe("connect / disconnect", () => {
     const dbPath = join(workDir, "nested", "deeper", "created.duckdb");
     provider = new DuckDBProvider(makeConfig({ database: dbPath }));
 
-    await provider.connect();
+    const mkdirSpy = spyOn(fsNode, "mkdirSync");
+    try {
+      await provider.connect();
+      // One level at a time, never recursive: Node's recursive mkdir never returns for a folder under /proc.
+      expect(mkdirSpy.mock.calls.map(([dir, options]) => [String(dir), options])).toEqual([
+        [join(workDir, "nested"), undefined],
+        [join(workDir, "nested", "deeper"), undefined],
+      ]);
+    } finally {
+      mkdirSpy.mockRestore();
+    }
     await provider.query("CREATE TABLE t (a INTEGER)");
     await provider.query("CHECKPOINT");
 
     expect(existsSync(dbPath)).toBe(true);
   });
 
+  testIf(
+    existsSync("/proc/self") ? null : "no /proc on this platform: the folder procfs refuses is Linux-only",
+    "a folder under /proc fails at once with the open error, naming ENOENT and the folder",
+    async () => {
+      const folder = `/proc/libredb-${process.pid}-${Date.now()}`;
+      const dbPath = join(folder, "x", "app.duckdb");
+      provider = new DuckDBProvider(makeConfig({ database: dbPath }));
+      const error = await provider.connect().then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(error).toBeInstanceOf(ConnectionError);
+      expect((error as Error).message).toStartWith(`Failed to open DuckDB database ${dbPath}: ENOENT`);
+      expect((error as Error).message).toContain(`'${folder}'`);
+      expect(provider.isConnected()).toBe(false);
+    },
+  );
+
+  // The header read opened a FIFO for reading, which waits for a writer that never comes: connect()
+  // never returned and a 1 s timer never fired (measured on bun 1.4.2). Each case connects in a child
+  // under a hard limit, so a regression fails here instead of hanging the suite.
+  describeIf(MISSING_POSIX_SPECIAL_FILES, "a FIFO as the database path", () => {
+    const duckdbModule = join(import.meta.dir, "../../../src/lib/db/providers/sql/duckdb/index.ts");
+
+    test.each([
+      ["the editor", {}],
+      ["the agent read-only profile", { readOnly: true }],
+    ] as const)(
+      "%s refuses it at once, naming the path, and leaves no file beside it",
+      async (_who, execution) => {
+        const dir = mkdtempSync(join(workDir, "fifo-"));
+        const fifo = join(dir, "nobody-writes.duckdb");
+        makeFifo(fifo);
+        const outcome = await connectInChild(
+          duckdbModule,
+          "DuckDBProvider",
+          { id: "fifo", name: "fifo", type: "duckdb", database: fifo },
+          execution,
+        );
+        expect(outcome).toEqual({
+          report: {
+            connected: false,
+            error: "ConnectionError",
+            message: `Failed to open DuckDB database ${fifo}: ${fifo} is a named pipe (FIFO), not a regular file`,
+          },
+          failure: null,
+        });
+        expect(readdirSync(dir)).toEqual(["nobody-writes.duckdb"]);
+        expect(statSync(fifo).isFIFO()).toBe(true);
+      },
+      CHILD_TEST_TIMEOUT_MS,
+    );
+
+    // DuckDB replays a `.wal` beside an existing database when it opens it, and that open of a FIFO never
+    // returned: it blocks a libuv threadpool thread, and four such connects left every async file and DNS
+    // call in the server pending (measured on Node v24.14.0). `.wal.checkpoint` and `.wal.recovery` are
+    // the engine's other names beside the file, and are refused the same way.
+    test.each([
+      ["the editor", ".wal", {}],
+      ["the editor", ".wal.checkpoint", {}],
+      ["the editor", ".wal.recovery", {}],
+      ["the agent read-only profile", ".wal", { readOnly: true }],
+    ] as const)(
+      "%s refuses a FIFO at the database's %s at once, naming it",
+      async (_who, suffix, execution) => {
+        const dir = mkdtempSync(join(workDir, "fifo-sidecar-"));
+        const dbPath = join(dir, "beside-a-fifo.duckdb");
+        const seed = new DuckDBProvider(makeConfig({ database: dbPath }));
+        await seed.connect();
+        await seed.disconnect();
+        makeFifo(`${dbPath}${suffix}`);
+        const outcome = await connectInChild(
+          duckdbModule,
+          "DuckDBProvider",
+          { id: "fifo", name: "fifo", type: "duckdb", database: dbPath },
+          execution,
+        );
+        expect(outcome).toEqual({
+          report: {
+            connected: false,
+            error: "ConnectionError",
+            message: `Failed to open DuckDB database ${dbPath}: ${dbPath}${suffix} is a named pipe (FIFO), not a regular file`,
+          },
+          failure: null,
+        });
+        expect(readdirSync(dir).sort()).toEqual(["beside-a-fifo.duckdb", `beside-a-fifo.duckdb${suffix}`]);
+      },
+      CHILD_TEST_TIMEOUT_MS,
+    );
+
+    // A regular file when it is checked and a FIFO when it is read: a loop renaming an empty file and a
+    // FIFO onto the path by turns blocked the header read on the server's own thread for good (measured
+    // on bun 1.4.2). The child stands that swap in deterministically, answering stat for the FIFO with
+    // the regular file's answer, so the header read is what meets the FIFO.
+    test(
+      "a FIFO swapped in after the check is refused from what the header read opened",
+      async () => {
+        const dir = mkdtempSync(join(workDir, "swap-"));
+        const fifo = join(dir, "swapped.duckdb");
+        const standIn = join(dir, "stand-in");
+        writeFileSync(standIn, "");
+        makeFifo(fifo);
+        const outcome = await runInChild(
+          [
+            'const fs = await import("node:fs");',
+            'const { spyOn } = await import("bun:test");',
+            "const statSync = fs.statSync;",
+            `const regular = statSync(${JSON.stringify(standIn)});`,
+            `spyOn(fs, "statSync").mockImplementation((target, options) => (target === ${JSON.stringify(fifo)} ? regular : statSync(target, options)));`,
+            `const { DuckDBProvider: Provider } = await import(${JSON.stringify(duckdbModule)});`,
+            `const provider = new Provider(${JSON.stringify({ id: "swap", name: "swap", type: "duckdb", database: fifo })}, {}, {});`,
+            "try {",
+            "  await provider.connect();",
+            "  await provider.disconnect();",
+            "  report({ connected: true });",
+            "} catch (error) {",
+            "  report({ connected: false, error: error.constructor.name, message: error.message });",
+            "}",
+          ].join("\n"),
+        );
+        expect(outcome).toEqual({
+          report: {
+            connected: false,
+            error: "ConnectionError",
+            message: `Failed to open DuckDB database ${fifo}: ${fifo} is a named pipe (FIFO), not a regular file`,
+          },
+          failure: null,
+        });
+        expect(statSync(fifo).isFIFO()).toBe(true);
+      },
+      CHILD_TEST_TIMEOUT_MS,
+    );
+  });
+
   test("a relative path is resolved against the process directory, matching factory.ts's fileIdentity", async () => {
     // `findOpenSingleWriterProvider` keys off `path.resolve(connection.database)`, so a
     // provider that resolved differently would silently stop matching its own handle.
-    const relative = `./${join("tests-tmp-duckdb", "relative.duckdb")}`;
-    provider = new DuckDBProvider(makeConfig({ database: relative }));
+    const absolute = join(relativeWorkDir, "relative.duckdb");
+    const relPath = `./${relative(process.cwd(), absolute)}`;
+    provider = new DuckDBProvider(makeConfig({ database: relPath }));
 
     await provider.connect();
     await provider.query("CREATE TABLE t (a INTEGER)");
     await provider.query("CHECKPOINT");
 
     const [storage] = await provider.getStorageStats();
-    expect(storage.location).toBe(join(process.cwd(), "tests-tmp-duckdb", "relative.duckdb"));
+    expect(storage.location).toBe(absolute);
 
+    // The file itself is removed by the module afterAll with the rest of relativeWorkDir, so a
+    // failed assertion above no longer leaves a database behind.
     await provider.disconnect();
-    rmSync(join(process.cwd(), "tests-tmp-duckdb"), { recursive: true, force: true });
   });
 
   test("a path carrying a NUL byte is refused as a configuration error", async () => {
@@ -266,22 +489,469 @@ describe("connect / disconnect", () => {
     expect(provider.isConnected()).toBe(false);
   });
 
-  test("two handles on the same file inside ONE process are both allowed", async () => {
-    // This is the measurement that makes the agent's read-only handle possible: the
-    // lock is per operating-system process, so a second in-process handle is fine.
+  test("a second handle on the same file inside ONE process is admitted on POSIX and refused on Windows", async () => {
+    // DuckDB takes an exclusive hold on the database file at open, and how far that hold
+    // reaches is a property of the operating system rather than of the engine.
+    //
+    // On POSIX it is a per-PROCESS lock, so a second handle from the same process is
+    // admitted. On Windows there is no such allowance: measured on windows-latest
+    // (2026-09, DuckDB v1.5.5 through @duckdb/node-api 1.5.5-r.4), the second open fails
+    // with "The process cannot access the file because it is being used by another
+    // process" and DuckDB names THIS process as the holder.
+    //
+    // Both arms are asserted positively, and the Windows arm ends by opening the second
+    // handle once the first has let go: a refusal that survived closing the first handle
+    // would be about something other than the hold, and the assertion would mean nothing.
+    //
+    // Browsing does not lean on the allowance either way - the editor is handed the open
+    // handle rather than a second one (`findOpenSingleWriterProvider`, BACKLOG D3). The one
+    // path that really wants two at once is an agent run reaching a connection the editor
+    // already holds; what Windows does to that is recorded in docs/providers/duckdb.md
+    // §3.8 and is not fixed here.
     const dbPath = await seededFile("shared.duckdb");
     const first = new DuckDBProvider(makeConfig({ database: dbPath }));
     const second = new DuckDBProvider(makeConfig({ id: "second", database: dbPath }));
+    const rowCount = async (provider: DuckDBProvider): Promise<unknown> =>
+      (await provider.query("SELECT count(*) AS n FROM users")).rows[0].n;
 
     await first.connect();
-    await second.connect();
+    try {
+      if (process.platform === "win32") {
+        const refusal = await second.connect().then(
+          () => null,
+          (error: unknown) => error,
+        );
+        expect(refusal).toBeInstanceOf(ConnectionError);
+        expect((refusal as Error).message).toContain(dbPath);
+        expect(await rowCount(first)).toBe("2");
 
-    expect((await second.query("SELECT count(*) AS n FROM users")).rows[0].n).toBe("2");
+        await first.disconnect();
+        await second.connect();
+      } else {
+        await second.connect();
+      }
 
-    await first.disconnect();
-    await second.disconnect();
+      expect(await rowCount(second)).toBe("2");
+    } finally {
+      // Whatever happened above: a handle left open is a file the module teardown cannot
+      // remove on Windows, which is how this test used to poison the rest of the file.
+      if (second.isConnected()) await second.disconnect();
+      if (first.isConnected()) await first.disconnect();
+    }
   });
 });
+
+// ============================================================================
+// What an open may and may not do to the filesystem and the network (#1404)
+//
+// Measured on v1.5.5 before the fix: with every option at its default, a DuckDB
+// connection pointed at a SQLite file made the engine fetch the ~34 MB `sqlite_scanner`
+// extension from extensions.duckdb.org, install it under the server user's home, attach
+// the file and checkpoint its WAL, and Studio answered "Connected successfully". A file
+// mode 0444 DuckDB database could not be opened at all ("Permission denied").
+// ============================================================================
+
+/** A file's bytes, as a digest the before/after comparisons read. */
+function digestOf(file: string): string {
+  return createHash("sha256").update(readFileSync(file)).digest("hex");
+}
+
+describe("a file that is not a DuckDB database is refused before the engine opens it (#1404)", () => {
+  let provider: DuckDBProvider;
+
+  afterEach(async () => {
+    if (provider?.isConnected()) await provider.disconnect();
+  });
+
+  test("a SQLite file held open by another connection is named as SQLite, and neither it nor its WAL changes", async () => {
+    const file = join(workDir, "not-duck.sqlite");
+    // Held open in WAL mode with a row past the last checkpoint, so a `-wal` sits beside
+    // the file: the shape the engine used to checkpoint into it.
+    const sqlite = new BunDatabase(file, { create: true, readwrite: true });
+    try {
+      sqlite.exec("PRAGMA journal_mode = WAL");
+      sqlite.exec("CREATE TABLE t (a INTEGER)");
+      sqlite.exec("INSERT INTO t VALUES (1)");
+      expect(existsSync(`${file}-wal`)).toBe(true);
+      const before = [digestOf(file), digestOf(`${file}-wal`)];
+
+      provider = new DuckDBProvider(makeConfig({ database: file }));
+      const refusal = await provider.connect().then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      expect(refusal).toBeInstanceOf(ConnectionError);
+      expect((refusal as Error).message).toBe(
+        `${file} is a SQLite database file, not a DuckDB database file. Open it with a SQLite connection. DuckDB did not open it, so it is unchanged.`,
+      );
+      expect(provider.isConnected()).toBe(false);
+      expect([digestOf(file), digestOf(`${file}-wal`)]).toEqual(before);
+    } finally {
+      sqlite.close();
+    }
+  });
+
+  test("any other file is refused as not a DuckDB database file, unchanged", async () => {
+    const file = join(workDir, "notes.txt");
+    writeFileSync(file, "these are not database pages\n");
+    const before = digestOf(file);
+
+    provider = new DuckDBProvider(makeConfig({ database: file }));
+
+    await expect(provider.connect()).rejects.toThrow(
+      `${file} is not a DuckDB database file: a DuckDB file carries "DUCK" at byte 8, and this one does not. DuckDB did not open it, so it is unchanged.`,
+    );
+    expect(digestOf(file)).toBe(before);
+  });
+
+  test("an empty file is refused the same way, as the engine itself would refuse it", async () => {
+    const file = join(workDir, "empty.duckdb");
+    writeFileSync(file, "");
+
+    provider = new DuckDBProvider(makeConfig({ database: file }));
+
+    await expect(provider.connect()).rejects.toThrow(/is not a DuckDB database file/);
+    expect(readFileSync(file).length).toBe(0);
+  });
+
+  test("the agent read-only profile refuses a SQLite file too", async () => {
+    const file = join(workDir, "not-duck-ro.sqlite");
+    const sqlite = new BunDatabase(file, { create: true, readwrite: true });
+    sqlite.exec("CREATE TABLE t (a INTEGER)");
+    sqlite.close();
+    const before = digestOf(file);
+
+    provider = new DuckDBProvider(makeConfig({ database: file }), {}, { readOnly: true });
+
+    await expect(provider.connect()).rejects.toThrow(/is a SQLite database file, not a DuckDB database file/);
+    expect(digestOf(file)).toBe(before);
+  });
+
+  test("a real DuckDB file still opens, on the editor handle and the read-only one", async () => {
+    const file = await seededFile("real.duckdb");
+
+    provider = new DuckDBProvider(makeConfig({ database: file }));
+    await provider.connect();
+    expect((await provider.query("SELECT count(*) AS n FROM users")).rows[0].n).toBe("2");
+    await provider.disconnect();
+
+    provider = new DuckDBProvider(makeConfig({ database: file }), {}, { readOnly: true });
+    await provider.connect();
+    expect((await provider.queryReadOnly("SELECT count(*) AS n FROM users", GENEROUS_BUDGET)).rows[0].n).toBe("2");
+  });
+
+  test("a directory is refused before the engine opens it, naming the path rather than a file format", async () => {
+    // A directory opens for reading on POSIX and then refuses the read, so it used to reach the
+    // engine. It is not a regular file, so the shared check refuses it the way it refuses a FIFO.
+    const dir = join(workDir, "a-directory.duckdb");
+    mkdirSync(dir);
+
+    provider = new DuckDBProvider(makeConfig({ database: dir }));
+    const refusal = await provider.connect().then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(refusal).toBeInstanceOf(ConnectionError);
+    expect((refusal as Error).message).toBe(
+      `Failed to open DuckDB database ${dir}: ${dir} is a directory, not a regular file`,
+    );
+    expect(provider.isConnected()).toBe(false);
+  });
+});
+
+describe("no extension is installed or loaded behind the user's back (#1404)", () => {
+  let provider: DuckDBProvider;
+
+  afterEach(async () => {
+    if (provider?.isConnected()) await provider.disconnect();
+  });
+
+  const EXTENSION_SETTINGS =
+    "SELECT current_setting('autoinstall_known_extensions') AS install, current_setting('autoload_known_extensions') AS load, current_setting('allow_community_extensions') AS community, current_setting('allow_unsigned_extensions') AS unsigned";
+
+  const POLICY = { install: false, load: false, community: false, unsigned: false };
+
+  // Run the extension policy under BOTH editor postures. On the denied handle
+  // `enable_external_access: 'false'` would refuse an INSTALL or LOAD on its own, so the
+  // admin (full-reach) handle is the one where this policy is the only thing holding the
+  // #1404 line: every assertion below must exercise it too, or a drop of EXTENSION_POLICY
+  // on the full-reach branch would pass CI.
+  const EDITOR_POSTURES = [
+    { label: "a full-reach editor handle (admin)", execution: { allowExternalFileAccess: true } as const },
+    { label: "a denied editor handle (non-admin)", execution: { allowExternalFileAccess: false } as const },
+  ];
+
+  test.each(EDITOR_POSTURES)(
+    "$label opens with autoinstall, autoload, community and unsigned extensions off",
+    async ({ execution }) => {
+      provider = new DuckDBProvider(makeConfig(), {}, execution);
+      await provider.connect();
+
+      expect((await provider.query(EXTENSION_SETTINGS)).rows).toEqual([POLICY]);
+    },
+  );
+
+  test("the read-only handle opens with all four off as well", async () => {
+    const client = await openDuckDBClient(await seededFile("ext-ro.duckdb"), { readOnly: true });
+    try {
+      expect((await client.run(EXTENSION_SETTINGS)).rows).toEqual([POLICY]);
+    } finally {
+      client.close();
+    }
+  });
+
+  test.each(EDITOR_POSTURES)(
+    "a function from an extension that is not loaded is refused with the engine's LOAD hint, not fetched, on $label",
+    async ({ execution }) => {
+      // Deterministic whether or not this machine has the extension installed: with autoload
+      // off, an installed extension is not loaded either.
+      provider = new DuckDBProvider(makeConfig(), {}, execution);
+      await provider.connect();
+
+      await expect(provider.query(`SELECT * FROM sqlite_scan('${join(workDir, "x.sqlite")}', 't')`)).rejects.toThrow(
+        /LOAD sqlite_scanner/,
+      );
+    },
+  );
+
+  test.each(EDITOR_POSTURES)(
+    "a session can still opt in with SET, which is the documented way back, on $label",
+    async ({ execution }) => {
+      provider = new DuckDBProvider(makeConfig(), {}, execution);
+      await provider.connect();
+
+      await provider.query("SET autoload_known_extensions = true");
+      await provider.query("SET autoinstall_known_extensions = true");
+
+      expect((await provider.query(EXTENSION_SETTINGS)).rows).toEqual([{ ...POLICY, install: true, load: true }]);
+    },
+  );
+
+  test.each(
+    EDITOR_POSTURES.flatMap(({ label, execution }) =>
+      ["SET allow_community_extensions = true", "SET GLOBAL allow_community_extensions = true"].map((statement) => ({
+        label,
+        execution,
+        statement,
+      })),
+    ),
+  )(
+    "community extensions cannot be turned back on inside a session on $label: $statement",
+    async ({ execution, statement }) => {
+      provider = new DuckDBProvider(makeConfig(), {}, execution);
+      await provider.connect();
+
+      await expect(provider.query(statement)).rejects.toThrow(
+        /Cannot change allow_community_extensions setting while database is running/,
+      );
+      expect((await provider.query(EXTENSION_SETTINGS)).rows).toEqual([POLICY]);
+    },
+  );
+});
+
+describeIf(
+  MISSING_POSIX_FILE_MODES ??
+    (process.getuid?.() === 0 ? "running as root: file modes do not restrict root, so nothing is unwritable" : null),
+  "a DuckDB file this process cannot write opens read-only in the editor (#1404)",
+  () => {
+    let provider: DuckDBProvider;
+
+    afterEach(async () => {
+      if (provider?.isConnected()) await provider.disconnect();
+    });
+
+    test("mode 0444: reads answer, a write is refused by the engine, and the file is unchanged", async () => {
+      const file = await seededFile("mode-0444.duckdb");
+      chmodSync(file, 0o444);
+      const before = digestOf(file);
+      const info = spyOn(logger, "info");
+      try {
+        provider = new DuckDBProvider(makeConfig({ database: file }));
+        await provider.connect();
+
+        expect((await provider.query("SELECT count(*) AS n FROM users")).rows[0].n).toBe("2");
+        await expect(provider.query("INSERT INTO users VALUES (3, 'x')")).rejects.toThrow(
+          `DuckDB database ${file} is open read-only because this process cannot write the file or its directory: Invalid Input Error: Cannot execute statement of type "INSERT" on database "mode-0444" which is attached in read-only mode!`,
+        );
+        expect(info.mock.calls.map(([message]) => String(message))).toContain(
+          `[DuckDB] Opened ${file} read-only: this process cannot write the file or its directory`,
+        );
+      } finally {
+        info.mockRestore();
+        if (provider?.isConnected()) await provider.disconnect();
+        chmodSync(file, 0o644);
+      }
+      expect(digestOf(file)).toBe(before);
+    });
+
+    test("mode 0444 in a mode 0555 directory, as on a read-only mount: connects, reads, and names why a write is refused (#1405)", async () => {
+      const dir = join(workDir, "readonly-mount");
+      mkdirSync(dir);
+      const seeded = await seededFile("mount-src.duckdb");
+      const file = join(dir, "mounted.duckdb");
+      writeFileSync(file, readFileSync(seeded));
+      chmodSync(file, 0o444);
+      chmodSync(dir, 0o555);
+      const before = digestOf(file);
+      try {
+        provider = new DuckDBProvider(makeConfig({ database: file }));
+        await provider.connect();
+
+        expect((await provider.query("SELECT id, secret FROM users ORDER BY id")).rows).toEqual([
+          { id: 1, secret: "top" },
+          { id: 2, secret: "secret" },
+        ]);
+        await expect(provider.query("DELETE FROM users")).rejects.toThrow(
+          `DuckDB database ${file} is open read-only because this process cannot write the file or its directory: `,
+        );
+        await provider.disconnect();
+        expect(existsSync(`${file}.wal`)).toBe(false);
+      } finally {
+        if (provider?.isConnected()) await provider.disconnect();
+        chmodSync(dir, 0o755);
+        chmodSync(file, 0o644);
+      }
+      expect(digestOf(file)).toBe(before);
+    });
+
+    test("a file this process cannot even read still reports the permission problem, not a format one", async () => {
+      const file = await seededFile("mode-0000.duckdb");
+      chmodSync(file, 0o000);
+      try {
+        provider = new DuckDBProvider(makeConfig({ database: file }));
+
+        // Path identity validation may reject the file before DuckDB opens it (macOS).
+        await expect(provider.connect()).rejects.toThrow(/permission denied/i);
+        expect(provider.isConnected()).toBe(false);
+      } finally {
+        chmodSync(file, 0o644);
+      }
+    });
+
+    test("a writable file still opens read-write, with no read-only reason on its errors", async () => {
+      const file = await seededFile("writable.duckdb");
+      provider = new DuckDBProvider(makeConfig({ database: file }));
+      await provider.connect();
+
+      await provider.query("INSERT INTO users VALUES (3, 'x')");
+      expect((await provider.query("SELECT count(*) AS n FROM users")).rows[0].n).toBe("3");
+      await expect(provider.query("SELECT * FROM missing_table")).rejects.toThrow(/^Catalog Error/);
+    });
+
+    /** DuckDB's refusal of a write on `catalog`, as the engine words it. */
+    const engineRefusal = (catalog: string) =>
+      `Invalid Input Error: Cannot execute statement of type "INSERT" on database "${catalog}" which is attached in read-only mode!`;
+
+    test("on a writable file, a refusal from a database ATTACHed read-only is the engine's sentence alone", async () => {
+      const file = await seededFile("writable-main.duckdb");
+      const other = await seededFile("attached-other.duckdb");
+      // An admin editor: ATTACH of a second FILE needs filesystem reach, which is admin-only since the
+      // non-admin DuckDB file-access change. The #1486/#1494 read-only-reason wrapping it pins keys on the
+      // catalog name, not the posture, so it is the same for a non-admin (covered in the non-admin block).
+      provider = new DuckDBProvider(makeConfig({ database: file }), {}, { allowExternalFileAccess: true });
+      await provider.connect();
+
+      await provider.query(`ATTACH '${other}' AS o (READ_ONLY)`);
+      const refusal = await provider.query("INSERT INTO o.users VALUES (3, 'x')").then(
+        () => null,
+        (error: unknown) => error as Error,
+      );
+      expect(refusal?.message.startsWith(engineRefusal("o"))).toBe(true);
+    });
+
+    test("the read-only reason does not outlive the handle: reconnected writable, the file takes writes and other refusals stay bare", async () => {
+      const dir = join(workDir, "remounted");
+      mkdirSync(dir);
+      const seeded = await seededFile("remount-src.duckdb");
+      const file = join(dir, "remounted.duckdb");
+      writeFileSync(file, readFileSync(seeded));
+      const other = await seededFile("remount-other.duckdb");
+      chmodSync(file, 0o444);
+      chmodSync(dir, 0o555);
+      // An admin editor: the later ATTACH of a second FILE needs filesystem reach (admin-only since the
+      // non-admin DuckDB file-access change); the read-only-reason this pins is the same for either role.
+      provider = new DuckDBProvider(makeConfig({ database: file }), {}, { allowExternalFileAccess: true });
+      try {
+        await provider.connect();
+        await expect(provider.query("INSERT INTO users VALUES (3, 'x')")).rejects.toThrow(/is open read-only because/);
+        await provider.disconnect();
+      } finally {
+        chmodSync(dir, 0o755);
+        chmodSync(file, 0o644);
+      }
+
+      await provider.connect();
+      await provider.query("INSERT INTO users VALUES (3, 'x')");
+      expect((await provider.query("SELECT count(*) AS n FROM users")).rows[0].n).toBe("3");
+      await provider.query(`ATTACH '${other}' AS o (READ_ONLY)`);
+      const refusal = await provider.query("INSERT INTO o.users VALUES (4, 'y')").then(
+        () => null,
+        (error: unknown) => error as Error,
+      );
+      expect(refusal?.message.startsWith(engineRefusal("o"))).toBe(true);
+    });
+
+    test("on a file opened read-only, the reason goes only on the engine's refusal of THAT file", async () => {
+      const dir = join(workDir, "readonly-scoped");
+      mkdirSync(dir);
+      const seeded = await seededFile("scoped-src.duckdb");
+      const file = join(dir, "scoped.duckdb");
+      writeFileSync(file, readFileSync(seeded));
+      const other = await seededFile("scoped-other.duckdb");
+      chmodSync(file, 0o444);
+      chmodSync(dir, 0o555);
+      // An admin editor: the ATTACH of a second FILE below needs filesystem reach (admin-only since the
+      // non-admin DuckDB file-access change); the scoped read-only-reason this pins is the same for either role.
+      provider = new DuckDBProvider(makeConfig({ database: file }), {}, { allowExternalFileAccess: true });
+      const refusalOf = (sql: string) =>
+        provider.query(sql).then(
+          () => null,
+          (error: unknown) => error as Error,
+        );
+      try {
+        await provider.connect();
+
+        // The same words echoed in a different error are not the refusal.
+        const conversion = await refusalOf("SELECT 'which is attached in read-only mode'::INTEGER");
+        expect(conversion?.message.startsWith("Conversion Error")).toBe(true);
+
+        // A write on another database attached read-only is not about this file.
+        await provider.query(`ATTACH '${other}' AS o (READ_ONLY)`);
+        const attached = await refusalOf("INSERT INTO o.users VALUES (3, 'x')");
+        expect(attached?.message.startsWith(engineRefusal("o"))).toBe(true);
+
+        const own = await refusalOf("INSERT INTO users VALUES (3, 'x')");
+        expect(own?.message).toBe(
+          `DuckDB database ${file} is open read-only because this process cannot write the file or its directory: ${engineRefusal("scoped")}`,
+        );
+      } finally {
+        if (provider?.isConnected()) await provider.disconnect();
+        chmodSync(dir, 0o755);
+        chmodSync(file, 0o644);
+      }
+    });
+
+    test("a mode 0444 SQLite file is refused, and is not announced as opened read-only", async () => {
+      const file = join(workDir, "mode-0444.sqlite");
+      const sqlite = new BunDatabase(file, { create: true, readwrite: true });
+      sqlite.exec("CREATE TABLE t (a INTEGER)");
+      sqlite.close();
+      chmodSync(file, 0o444);
+      const info = spyOn(logger, "info");
+      try {
+        provider = new DuckDBProvider(makeConfig({ database: file }));
+
+        await expect(provider.connect()).rejects.toThrow(/is a SQLite database file/);
+        expect(info.mock.calls.map(([message]) => String(message)).filter((m) => m.includes("[DuckDB]"))).toEqual([]);
+      } finally {
+        info.mockRestore();
+        chmodSync(file, 0o644);
+      }
+    });
+  },
+);
 
 // ============================================================================
 // Query execution
@@ -319,7 +989,7 @@ describe("query()", () => {
     expect(result.columnTypes).toEqual({ a: "INTEGER", b: "VARCHAR" });
   });
 
-  test("wide types arrive in the shapes getRowObjectsJson produces", async () => {
+  test("wide types arrive in the shapes the JSON row reader produces", async () => {
     // Pinned because they are the reason `getRowObjects()` is banned: it throws on
     // JSON.stringify ("Do not know how to serialize a BigInt").
     provider = new DuckDBProvider(makeConfig());
@@ -347,6 +1017,37 @@ describe("query()", () => {
     expect(result.rows).toEqual([]);
     expect(result.fields).toEqual(["id", "name"]);
     expect(result.columnTypes).toEqual({ id: "INTEGER", name: "VARCHAR" });
+  });
+
+  // DuckDB's own row objects key a repeat `a:1`, while `columnNames()` lists `a` twice, so
+  // both headers showed the first value; and a column the statement itself named `a:1`
+  // collided with that key and lost its value. The rows are read positionally now.
+  test("a repeated alias keeps both values under two names, with both types", async () => {
+    provider = new DuckDBProvider(makeConfig());
+    await provider.connect();
+
+    const result = await provider.query("SELECT 1 AS a, 'x' AS a");
+
+    expect(result.fields).toEqual(["a", "a (2)"]);
+    expect(result.rows).toEqual([{ a: 1, "a (2)": "x" }]);
+    expect(result.columnTypes).toEqual({ a: "INTEGER", "a (2)": "VARCHAR" });
+  });
+
+  test("a column named like DuckDB's own repeat key keeps its value", async () => {
+    provider = new DuckDBProvider(makeConfig());
+    await provider.connect();
+
+    const result = await provider.query('SELECT 2 AS "a:1", 3 AS a, 4 AS a, 4 + 5');
+
+    expect(result.fields).toEqual(["a:1", "a", "a (2)", "(4 + 5)"]);
+    expect(result.rows).toEqual([{ "a:1": 2, a: 3, "a (2)": 4, "(4 + 5)": 9 }]);
+  });
+
+  test("an empty alias is refused by the engine's parser, so no column comes back unnamed", async () => {
+    provider = new DuckDBProvider(makeConfig());
+    await provider.connect();
+
+    await expect(provider.query('SELECT 1 AS ""')).rejects.toThrow(/zero-length delimited identifier/);
   });
 
   test("an INSERT reports the rows it changed and shows no Count grid", async () => {
@@ -430,6 +1131,76 @@ describe("query()", () => {
 });
 
 // ============================================================================
+// A transaction left open on the handle (D71)
+// ============================================================================
+
+describe("endOpenQueryTransaction()", () => {
+  let provider: DuckDBProvider;
+
+  afterEach(async () => {
+    if (provider?.isConnected()) await provider.disconnect();
+  });
+
+  test("rolls back a transaction a statement left open on this connection", async () => {
+    provider = new DuckDBProvider(makeConfig());
+    await provider.connect();
+    await provider.query("CREATE TABLE t (id INTEGER)");
+
+    await provider.query("BEGIN");
+    await provider.query("INSERT INTO t VALUES (1)");
+
+    expect(await provider.endOpenQueryTransaction()).toBe("rolled-back");
+    expect((await provider.query("SELECT count(*) AS n FROM t")).rows[0].n).toBe("0");
+  });
+
+  test("answers none when no transaction is open, and leaves the connection usable", async () => {
+    // Measured on DuckDB v1.5.5: the engine publishes no transaction-state
+    // reading - `current_transaction_id()` answers in both states,
+    // `transaction_timestamp()` is an alias of `get_current_timestamp()`, and
+    // the client context carries only a connection id - so the engine's own
+    // refusal is the answer, and the refusal costs the session nothing.
+    provider = new DuckDBProvider(makeConfig());
+    await provider.connect();
+
+    expect(await provider.endOpenQueryTransaction()).toBe("none");
+    expect((await provider.query("SELECT 42 AS x")).rows[0].x).toBe(42);
+  });
+
+  test("leaves a committed transaction alone", async () => {
+    provider = new DuckDBProvider(makeConfig());
+    await provider.connect();
+    await provider.query("CREATE TABLE t (id INTEGER)");
+
+    await provider.query("BEGIN");
+    await provider.query("INSERT INTO t VALUES (1)");
+    await provider.query("COMMIT");
+
+    expect(await provider.endOpenQueryTransaction()).toBe("none");
+    expect((await provider.query("SELECT count(*) AS n FROM t")).rows[0].n).toBe("1");
+  });
+
+  test("refuses to answer before connect()", async () => {
+    provider = new DuckDBProvider(makeConfig());
+
+    await expect(provider.endOpenQueryTransaction()).rejects.toThrow(DatabaseConfigError);
+  });
+
+  test("raises a rollback failure that is not the engine's own refusal", async () => {
+    // The one thing reading an error message must not do is read every message as the
+    // same answer. Only "cannot rollback - no transaction is active" means there was
+    // nothing to roll back; a rollback that failed for any other reason has left the
+    // session in a state nobody has established, and swallowing it would report that
+    // state as clean. Provoked here by closing the connection under an OPEN transaction,
+    // which answers "Failed to query: connection disconnected" (measured, v1.5.5).
+    const client = await openDuckDBClient(":memory:", { readOnly: false });
+    await client.run("BEGIN");
+    client.close();
+
+    await expect(client.endOpenTransaction()).rejects.toThrow("connection disconnected");
+  });
+});
+
+// ============================================================================
 // Cancellation
 // ============================================================================
 
@@ -482,91 +1253,6 @@ describe("cancelQuery()", () => {
 // ============================================================================
 // Schema
 // ============================================================================
-
-describe("getSchema()", () => {
-  let provider: DuckDBProvider;
-
-  afterEach(async () => {
-    if (provider?.isConnected()) await provider.disconnect();
-  });
-
-  test("lists tables and views across schemas, qualifying everything outside main", async () => {
-    provider = await seededMemoryProvider();
-
-    const schema = await provider.getSchema();
-
-    expect(schema.map((entry) => entry.name).sort()).toEqual([
-      "analytics.events",
-      "customer_totals",
-      "customers",
-      "orders",
-    ]);
-  });
-
-  test("columns carry DuckDB's own type text, nullability, primary keys and defaults", async () => {
-    provider = await seededMemoryProvider();
-
-    const customers = (await provider.getSchema()).find((entry) => entry.name === "customers");
-
-    expect(customers?.columns).toEqual([
-      { name: "id", type: "INTEGER", nullable: false, isPrimary: true },
-      { name: "name", type: "VARCHAR", nullable: false, isPrimary: false },
-      { name: "email", type: "VARCHAR", nullable: true, isPrimary: false },
-      { name: "signed_up_at", type: "TIMESTAMP", nullable: true, isPrimary: false, defaultValue: "now()" },
-    ]);
-  });
-
-  test("nested types keep their full DuckDB spelling", async () => {
-    provider = await seededMemoryProvider();
-
-    const events = (await provider.getSchema()).find((entry) => entry.name === "analytics.events");
-
-    expect(events?.columns.map((column) => column.type)).toEqual(["BIGINT", "VARCHAR[]", 'STRUCT("source" VARCHAR)']);
-  });
-
-  test("the row count comes from estimated_size, which IS a row count", async () => {
-    // It is NOT a byte size, and presenting it as one is the fabrication this provider
-    // was built to avoid.
-    provider = await seededMemoryProvider();
-
-    const customers = (await provider.getSchema()).find((entry) => entry.name === "customers");
-
-    expect(customers?.rowCount).toBe(2);
-  });
-
-  test("foreign keys carry their referenced table and column", async () => {
-    provider = await seededMemoryProvider();
-
-    const orders = (await provider.getSchema()).find((entry) => entry.name === "orders");
-
-    expect(orders?.foreignKeys).toEqual([
-      { columnName: "customer_id", referencedTable: "customers", referencedColumn: "id" },
-    ]);
-  });
-
-  test("indexes carry their key columns as a real list", async () => {
-    provider = await seededMemoryProvider();
-
-    const orders = (await provider.getSchema()).find((entry) => entry.name === "orders");
-
-    expect(orders?.indexes.map((index) => index.columns)).toContainEqual(["customer_id"]);
-  });
-
-  test("a view is listed with its columns and no row count", async () => {
-    provider = await seededMemoryProvider();
-
-    const view = (await provider.getSchema()).find((entry) => entry.name === "customer_totals");
-
-    expect(view?.rowCount).toBeUndefined();
-    expect(view?.columns.map((column) => column.name)).toEqual(["name", "revenue"]);
-  });
-
-  test("getTables() names every object the tree lists", async () => {
-    provider = await seededMemoryProvider();
-
-    expect((await provider.getTables()).sort()).toEqual(["analytics.events", "customer_totals", "customers", "orders"]);
-  });
-});
 
 // ============================================================================
 // Monitoring
@@ -676,14 +1362,53 @@ describe("monitoring", () => {
     const [main] = await provider.getStorageStats();
 
     expect(main.name).toBe("Main Database");
-    // Both sides through `realpathSync`, because the location is DUCKDB's answer and DuckDB
-    // canonicalises it. A no-op wherever the temp directory is a real directory, which is why
-    // this read as portable: on macOS `os.tmpdir()` is `/var/folders/...`, a symlink to
-    // `/private/var/folders/...`, so the engine returns a path that names the same file by a
-    // different route and a string comparison fails on a correct answer.
+    // Both sides through `realpathSync.native`, because the location is DUCKDB's answer and
+    // DuckDB canonicalises it, so the two sides can name the same file by different routes:
+    // on macOS `os.tmpdir()` is `/var/folders/...`, a symlink to `/private/var/folders/...`,
+    // and on Windows it is the 8.3 SHORT form of whatever %TEMP% holds - on windows-latest
+    // `os.tmpdir()` answers `C:\Users\RUNNER~1\AppData\Local\Temp` while DuckDB reports
+    // `C:\Users\runneradmin\...` for the same file (measured 2026-09).
+    //
+    // `.native` and not the JS `realpathSync`: the JS one resolves symlinks, which covers
+    // macOS, but it leaves a short 8.3 component exactly as it found it. The native one is
+    // libuv's `uv_fs_realpath`, which on Windows goes through `GetFinalPathNameByHandle` and
+    // answers the long form, and on POSIX is plain `realpath(3)`.
     expect(main.location).toBeDefined();
-    expect(realpathSync(main.location!)).toBe(realpathSync(dbPath));
+    expect(realpathSync.native(main.location!)).toBe(realpathSync.native(dbPath));
     expect(main.sizeBytes).toBeGreaterThan(0);
+  });
+
+  // #1449: before the first checkpoint, every row of a file database lives in its `.wal`.
+  // `pragma_database_size()` then answers database_size "0 bytes" (measured on v1.5.5 with
+  // 1,000 rows: 12,288 bytes in the main file, 32,083 in the `.wal`), so Monitoring drew
+  // "DB Size 0 B" over a database holding data. The Storage tab's WAL tile reads a row
+  // NAMED "WAL" (StorageTab.tsx), and DuckDB published its WAL size only on the main row,
+  // so the tile read "N/A" beside a `.wal` file with data in it.
+  test("a file database with rows only in the WAL reports a non-zero size and a WAL row (#1449)", async () => {
+    const dbPath = join(workDir, "wal-only.duckdb");
+    provider = new DuckDBProvider(makeConfig({ database: dbPath }));
+    await provider.connect();
+    await provider.query("CREATE TABLE customers (id INTEGER PRIMARY KEY, name VARCHAR, email VARCHAR)");
+    await provider.query(
+      "INSERT INTO customers SELECT i, 'user' || i, 'user' || i || '@example.com' FROM range(1, 1001) t(i)",
+    );
+
+    // The precondition, so the test cannot pass for the wrong reason: no checkpoint has
+    // run, and the rows are in the `.wal`.
+    const walBytes = statSync(`${dbPath}.wal`).size;
+    expect(walBytes).toBeGreaterThan(0);
+
+    const overview = await provider.getOverview();
+    expect(overview.databaseSizeBytes).toBeGreaterThan(0);
+    expect(overview.databaseSize).not.toBe("0 B");
+    // getHealth() reads the same size, so it must agree.
+    expect((await provider.getHealth()).databaseSize).toBe(overview.databaseSize);
+
+    // The row the WAL tile reads, carrying the `.wal` file's size.
+    const wal = (await provider.getStorageStats()).find((s) => s.name === "WAL");
+    expect(wal).toBeDefined();
+    expect(wal!.sizeBytes).toBe(walBytes);
+    expect(wal!.walSizeBytes).toBe(walBytes);
   });
 
   test("storage stats name an in-memory database as such", async () => {
@@ -745,17 +1470,17 @@ describe("runMaintenance()", () => {
   });
 
   /*
-    The other side of that default, and the reason D49 exists.
+    The other side of that default.
 
     A caller that sends a BARE name for a table living outside `main` gets `main`, and the
     engine refuses because that table is not there. The refusal is the CORRECT behaviour for
     this provider - guessing which schema the caller meant would act on a table nobody named -
     so it is pinned here rather than repaired: the repair belongs to the caller.
 
-    Measured in the browser on 2026-08-27: the Tables panel's per-row Analyze button sends
+    Measured in the browser on 2026-08-27: the Tables panel's per-row Analyze button sent
     `table.tableName` without the `table.schemaName` it renders beside it, so clicking it on the
-    `analytics.events` row produced exactly this refusal. That is a shared-component defect
-    reaching all twelve providers that implement `runMaintenance`, filed as D49.
+    `analytics.events` row produced exactly this refusal. #772 repaired the caller, which now
+    sends the schema as the container (the test below).
   */
   test("a bare target naming a table outside main is refused, and the message names the real one", async () => {
     provider = await seededMemoryProvider();
@@ -771,6 +1496,28 @@ describe("runMaintenance()", () => {
     provider = await seededMemoryProvider();
 
     await expect(provider.runMaintenance("optimize", "customers")).rejects.toThrow(/takes no target/);
+  });
+
+  // #772: `schemaName` is the schema on DuckDB exactly as it is on PostgreSQL, and a caller
+  // that sends it gets that schema directly - never a re-split of the name.
+  test("a container qualifies the target instead of the main fallback", async () => {
+    provider = await seededMemoryProvider();
+
+    await expect(provider.runMaintenance("analyze", "events", "analytics")).resolves.toMatchObject({ success: true });
+  });
+
+  test("a container is used whole even when it contains a dot", async () => {
+    provider = await seededMemoryProvider();
+    await provider.query('CREATE SCHEMA "odd.schema"');
+    await provider.query('CREATE TABLE "odd.schema".events (id BIGINT)');
+
+    await expect(provider.runMaintenance("analyze", "events", "odd.schema")).resolves.toMatchObject({ success: true });
+  });
+
+  test("a bare target with no container still falls back to main", async () => {
+    provider = await seededMemoryProvider();
+
+    await expect(provider.runMaintenance("analyze", "customers")).resolves.toMatchObject({ success: true });
   });
 
   test.each(["reindex", "check", "kill"] as const)("%s is refused with the reason it is not offered", async (type) => {
@@ -827,6 +1574,18 @@ describe("queryReadOnly()", () => {
     await provider.connect();
 
     await expect(provider.queryReadOnly("SELECT 1", GENEROUS_BUDGET)).rejects.toThrow(/agent read-only profile/);
+  });
+
+  test("a repeated alias keeps both values through the profiled handle", async () => {
+    provider = await readOnlyProvider();
+
+    const result = await provider.queryReadOnly("SELECT 1 AS id, id FROM users ORDER BY id", GENEROUS_BUDGET);
+
+    expect(result.fields).toEqual(["id", "id (2)"]);
+    expect(result.rows).toEqual([
+      { id: 1, "id (2)": 1 },
+      { id: 1, "id (2)": 2 },
+    ]);
   });
 
   test("reads answer normally through the profiled handle", async () => {
@@ -986,16 +1745,25 @@ describe("queryReadOnly()", () => {
     expect(control.rows).toEqual([{ secret: "top" }]);
   }
 
-  test("the read-only handle runs with external access off, and the writable one does not", async () => {
+  test("the read-only handle runs with external access off, and the admin editor one does not", async () => {
     provider = await readOnlyProvider();
     const SETTING = "SELECT value FROM duckdb_settings() WHERE name = 'enable_external_access'";
 
     expect((await provider.queryReadOnly(SETTING, GENEROUS_BUDGET)).rows).toEqual([{ value: "false" }]);
 
-    // The control that makes the assertion above mean something: the ordinary editor
+    // The control that makes the assertion above mean something: the ADMIN editor
     // handle on the SAME file keeps its filesystem reach, because COPY and read_csv are
-    // features there rather than escapes.
-    const writable = new DuckDBProvider(makeConfig({ database: dbPath }));
+    // features there rather than escapes. A non-admin editor opens external access off too
+    // (the non-admin DuckDB file access block asserts that); this control is the admin editor, unchanged.
+    //
+    // One at a time, and the read-only handle goes first: Windows admits a single handle
+    // per DuckDB file per process (see the connect/disconnect block), so holding both
+    // open would make the control unopenable there. Sequential proves the same thing -
+    // the setting belongs to the HANDLE, not to the file, or the same path could not
+    // answer both ways.
+    await provider.disconnect();
+
+    const writable = new DuckDBProvider(makeConfig({ database: dbPath }), {}, { allowExternalFileAccess: true });
     await writable.connect();
     try {
       expect((await writable.query(SETTING)).rows).toEqual([{ value: "true" }]);
@@ -1079,13 +1847,17 @@ describe("queryReadOnly()", () => {
     await expectTheHandleStillReads(provider);
   });
 
-  test("the writable handle keeps the filesystem reach the read-only profile gives up", async () => {
-    // The engine option is the PROFILE's, not the provider's: the editor connection is
-    // measured unaffected, so COPY and read_csv_auto still work for the user at the
-    // keyboard. Without this control, disabling external access everywhere would look
-    // exactly the same in every other test.
+  test("the admin editor handle keeps the filesystem reach the read-only profile gives up", async () => {
+    // The engine option is the POSTURE's, not the provider type's: the admin editor connection
+    // is measured unaffected, so COPY and read_csv_auto still work for an admin at the keyboard.
+    // A non-admin editor gives this reach up (the non-admin DuckDB file access block). Without this control, disabling
+    // external access everywhere would look exactly the same in every other test.
     const target = join(workDir, "writable-reach.csv");
-    provider = new DuckDBProvider(makeConfig({ database: join(workDir, "writable-reach.duckdb") }));
+    provider = new DuckDBProvider(
+      makeConfig({ database: join(workDir, "writable-reach.duckdb") }),
+      {},
+      { allowExternalFileAccess: true },
+    );
     await provider.connect();
 
     await provider.query(`COPY (SELECT 1 AS a) TO '${target}' (FORMAT CSV)`);
@@ -1094,6 +1866,572 @@ describe("queryReadOnly()", () => {
     const readBack = await provider.query(`SELECT * FROM read_csv_auto('${target}')`);
     expect(readBack.rows).toEqual([{ a: "1" }]);
   });
+});
+
+// ============================================================================
+// The non-admin editor file-access posture (the non-admin DuckDB file-access change)
+//
+// A signed-in non-admin opening an ordinary (writable) DuckDB connection gets a handle
+// opened with `enable_external_access: 'false'`, so every statement that reaches the network,
+// or a file other than the database's own and the handle's private temp directory, is refused
+// by the engine while that database stays read-write. It is statement-level only: the database
+// path itself is still the connection's. The posture is carried by
+// `ProviderExecutionContext.allowExternalFileAccess`, which the route derives from the verified
+// session and the resolved connection; absent means deny (fail closed). An admin keeps full
+// reach, except on a seed a non-admin role can use, which is one handle for every role.
+//
+// This closes the CapRover discovery-export exposure for the standard login: it can no longer read
+// `/app/discovery/services.json` through DuckDB.
+//
+// Each refusal is the engine's own `Permission Error`, and each block carries a live
+// control so a wording change cannot make it pass vacuously. The placeholder written into
+// every scratch "secret" is PROBE-DUMMY-NOT-A-SECRET, never a real credential.
+// ============================================================================
+
+describe("a non-admin editor handle has no statement-level file or network reach outside its private temp directory and its database's own file names (non-admin DuckDB file access)", () => {
+  let provider: DuckDBProvider;
+  const SECRET_PLACEHOLDER = "PROBE-DUMMY-NOT-A-SECRET";
+
+  afterEach(async () => {
+    if (provider?.isConnected()) await provider.disconnect();
+  });
+
+  /** A non-admin editor handle: writable, external file access denied. */
+  async function nonAdmin(database: string): Promise<DuckDBProvider> {
+    const open = new DuckDBProvider(makeConfig({ database }), {}, { allowExternalFileAccess: false });
+    await open.connect();
+    return open;
+  }
+
+  /** A scratch file holding only the placeholder, so a leak would print nothing real. */
+  function scratchSecret(name: string): string {
+    const file = join(workDir, name);
+    writeFileSync(file, JSON.stringify({ services: [{ env: { POSTGRES_PASSWORD: SECRET_PLACEHOLDER } }] }));
+    return file;
+  }
+
+  // Every form measured reaching a file on a full handle, each refused on the sandboxed
+  // one. The list covers the design's finding 1 in full (the file functions, the Parquet and
+  // JSON readers, the replacement scans, DESCRIBE/SUMMARIZE of a path, the query()/query_table
+  // wrappers, IMPORT/EXPORT/ATTACH, CREATE VIEW/MACRO/PERSISTENT SECRET over a file) and
+  // includes the forms a name denylist cannot see (quoted name, bare path, a statement inside a
+  // literal), because the engine option is the boundary, not a guard. A new DuckDB reader added to
+  // the engine is held against this list by `the read-only denylist against duckdb_functions()`.
+  const fileRoutes = (secret: string, csv: string): ReadonlyArray<[label: string, sql: string]> => [
+    ["read_text", `SELECT * FROM read_text('${secret}')`],
+    ["read_blob", `SELECT * FROM read_blob('${secret}')`],
+    ["read_csv", `SELECT * FROM read_csv('${csv}')`],
+    ["read_csv_auto", `SELECT * FROM read_csv_auto('${csv}')`],
+    ["read_json", `SELECT * FROM read_json('${secret}')`],
+    ["read_json_auto", `SELECT * FROM read_json_auto('${secret}')`],
+    ["read_json_objects", `SELECT * FROM read_json_objects('${secret}')`],
+    ["read_ndjson_objects", `SELECT * FROM read_ndjson_objects('${secret}')`],
+    ["read_parquet", `SELECT * FROM read_parquet('${join(workDir, "na.parquet")}')`],
+    ["parquet_metadata", `SELECT * FROM parquet_metadata('${join(workDir, "na.parquet")}')`],
+    ["sniff_csv", `SELECT * FROM sniff_csv('${csv}')`],
+    ["glob", `SELECT * FROM glob('${workDir}/*')`],
+    ["the replacement scan on a bare CSV path", `SELECT * FROM '${csv}'`],
+    ["the replacement scan on a bare JSON path", `SELECT * FROM '${secret}'`],
+    ["the replacement scan on a bare Parquet path", `SELECT * FROM '${join(workDir, "na.parquet")}'`],
+    ["SUMMARIZE of a path", `SUMMARIZE '${csv}'`],
+    ["DESCRIBE of a path", `DESCRIBE SELECT * FROM '${csv}'`],
+    ["query() wrapping read_text", `SELECT * FROM query('SELECT * FROM read_text(''${secret}'')')`],
+    ["query_table of a file", `SELECT * FROM query_table('${csv}')`],
+    ["a quoted read_text, which a name denylist cannot see", `SELECT * FROM "read_text"('${secret}')`],
+    ["a schema-qualified quoted read_text", `SELECT * FROM main."read_text"('${secret}')`],
+    [
+      "a statement smuggled through a quoted json_execute_serialized_sql",
+      `SELECT * FROM "json_execute_serialized_sql"(json_serialize_sql('SELECT * FROM read_text(''${secret}'')'))`,
+    ],
+    ["COPY ... TO a file", `COPY (SELECT 1 AS a) TO '${join(workDir, "na-copy.csv")}' (FORMAT CSV)`],
+    ["COPY ... FROM a file", `COPY users FROM '${csv}'`],
+    ["EXPORT DATABASE", `EXPORT DATABASE '${join(workDir, "na-export")}'`],
+    ["IMPORT DATABASE", `IMPORT DATABASE '${join(workDir, "na-import")}'`],
+    ["ATTACH another database file", `ATTACH '${join(workDir, "na-attach.duckdb")}' AS side`],
+    ["read_duckdb of another database file", `SELECT * FROM read_duckdb('${join(workDir, "na-attach.duckdb")}')`],
+    ["CREATE VIEW over a file read", `CREATE VIEW na_view AS SELECT * FROM read_text('${secret}')`],
+    ["CREATE MACRO over a file read", `CREATE MACRO na_macro() AS TABLE SELECT * FROM read_text('${secret}')`],
+    ["CREATE PERSISTENT SECRET", "CREATE PERSISTENT SECRET na_persist (TYPE s3, KEY_ID 'x', SECRET 'y')"],
+    ["read_text of /proc/self/environ", "SELECT * FROM read_text('/proc/self/environ')"],
+  ];
+
+  test("every file route is refused with the engine's Permission Error, on a file-backed handle", async () => {
+    const secret = scratchSecret("na-secret-file.json");
+    writeFileSync(join(workDir, "na-input.csv"), "a,b\n1,2\n");
+    const file = await seededFile("non-admin-editor.duckdb");
+    provider = await nonAdmin(file);
+
+    for (const [, sql] of fileRoutes(secret, join(workDir, "na-input.csv"))) {
+      // oxlint-disable-next-line no-await-in-loop -- one statement at a time on the one handle, as the editor sends them.
+      await expect(provider.query(sql)).rejects.toThrow(/file system operations are disabled by configuration/);
+    }
+    // No scratch file the refused writes name was created.
+    expect(existsSync(join(workDir, "na-copy.csv"))).toBe(false);
+    expect(existsSync(join(workDir, "na-export"))).toBe(false);
+    // A refused read returns nothing of the file: its placeholder never surfaced.
+    const refusal = await provider.query(`SELECT * FROM read_text('${secret}')`).then(
+      () => "no refusal",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    );
+    expect(refusal).not.toContain(SECRET_PLACEHOLDER);
+  });
+
+  test("a :memory: handle's only allowed directory is its own, not the process-wide <cwd>/.tmp", async () => {
+    // A handle opened with external access off still allow-lists its default temp directory, and for
+    // every :memory: database in the process that default is the shared <cwd>/.tmp. Without a private
+    // one, a denied :memory: handle could list, read and write another session's spill files there.
+    // The handle gets a private per-handle temp directory instead (the non-admin DuckDB file-access change).
+    provider = await nonAdmin(":memory:");
+
+    const allowed = (await provider.query("SELECT current_setting('allowed_directories') AS d")).rows[0].d as string[];
+    expect(Array.isArray(allowed)).toBe(true);
+    // The one allowed directory is the handle's own, not the process-wide <cwd>/.tmp.
+    expect(allowed).toHaveLength(1);
+    expect(resolve(allowed[0])).not.toBe(resolve(join(process.cwd(), ".tmp")));
+    // And that shared directory cannot be listed at all: the cross-session spill leak is closed.
+    await expect(provider.query(`SELECT * FROM glob('${join(process.cwd(), ".tmp")}/*')`)).rejects.toThrow(
+      /file system operations are disabled by configuration/,
+    );
+  });
+
+  test("the vector is independent of the main target: a :memory: handle refuses read_text too", async () => {
+    // The design's finding 3, and the reason restricting the main database would not have
+    // closed the hole: a `:memory:` handle reads an arbitrary file just as a file-backed one
+    // does, so the open option, not the main target, is what must deny it.
+    const secret = scratchSecret("na-memory-secret.json");
+    provider = await nonAdmin(":memory:");
+
+    await expect(provider.query(`SELECT * FROM read_text('${secret}')`)).rejects.toThrow(
+      /file system operations are disabled by configuration/,
+    );
+  });
+
+  test("extension and secret directories are closed too: INSTALL, LOAD and CREATE SECRET are refused", async () => {
+    provider = await nonAdmin(":memory:");
+
+    await expect(provider.query("INSTALL httpfs")).rejects.toThrow(/disabled by configuration/);
+    await expect(provider.query("LOAD httpfs")).rejects.toThrow(/Loading external extensions is disabled/);
+    await expect(provider.query("CREATE SECRET na (TYPE s3, KEY_ID 'x', SECRET 'y')")).rejects.toThrow(
+      /disabled by configuration/,
+    );
+  });
+
+  test("the main database stays read-write: create, write, read and ATTACH ':memory:' all work", async () => {
+    const file = join(workDir, "non-admin-writable.duckdb");
+    provider = await nonAdmin(file);
+
+    await provider.query("CREATE TABLE t (id INTEGER PRIMARY KEY, label VARCHAR)");
+    await provider.query("INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+    await provider.query("UPDATE t SET label = 'c' WHERE id = 1");
+    await provider.query("DELETE FROM t WHERE id = 2");
+    expect((await provider.query("SELECT label FROM t ORDER BY id")).rows).toEqual([{ label: "c" }]);
+    // A second in-memory catalog is not a file, so it is still reachable.
+    await provider.query("ATTACH ':memory:' AS side");
+    expect(
+      (await provider.query("SELECT count(*) AS n FROM duckdb_databases() WHERE database_name = 'side'")).rows,
+    ).toEqual([{ n: "1" }]);
+  });
+
+  test("the handle reports external access off, and a statement cannot turn it back on", async () => {
+    // Ruling 1/6: the option is the boundary, and it is self-locked once the database runs.
+    provider = await nonAdmin(":memory:");
+
+    expect((await provider.query("SELECT current_setting('enable_external_access') AS v")).rows).toEqual([
+      { v: false },
+    ]);
+    await expect(provider.query("SET enable_external_access = true")).rejects.toThrow(
+      /Cannot enable external access while database is running/,
+    );
+    await expect(provider.query("SET GLOBAL enable_external_access = true")).rejects.toThrow(
+      /Cannot enable external access while database is running/,
+    );
+    // Still off, and the handle still runs an ordinary statement.
+    expect((await provider.query("SELECT current_setting('enable_external_access') AS v")).rows).toEqual([
+      { v: false },
+    ]);
+    expect((await provider.query("SELECT 1 AS one")).rows).toEqual([{ one: 1 }]);
+  });
+
+  test("the engine's own re-widening settings are refused, and external access stays off", async () => {
+    // allowed_directories and allowed_paths are DuckDB's documented exceptions to
+    // enable_external_access=false, and PRAGMA/RESET are the other re-open routes. A @duckdb/node-api
+    // bump that let a running session set any of them would re-open the file vector, so each is pinned
+    // refused and the setting is checked to stay off; glob of a real directory stays refused.
+    provider = await nonAdmin(":memory:");
+    const refused: ReadonlyArray<[sql: string, pattern: RegExp]> = [
+      [
+        `SET allowed_directories=['${workDir}']`,
+        /Cannot change allowed_directories when enable_external_access is disabled/,
+      ],
+      [`SET allowed_paths=['${workDir}']`, /Cannot change allowed_paths when enable_external_access is disabled/],
+      [`SET temp_directory='${workDir}'`, /disabled by configuration/],
+      ["PRAGMA enable_external_access=true", /Cannot enable external access while database is running/],
+      ["RESET enable_external_access", /Cannot enable external access while database is running/],
+    ];
+    for (const [sql, pattern] of refused) {
+      // oxlint-disable-next-line no-await-in-loop -- one statement at a time on the one handle, as the editor sends them.
+      await expect(provider.query(sql)).rejects.toThrow(pattern);
+    }
+    expect((await provider.query("SELECT current_setting('enable_external_access') AS v")).rows).toEqual([
+      { v: false },
+    ]);
+    await expect(provider.query(`SELECT * FROM glob('${workDir}/*')`)).rejects.toThrow(/disabled by configuration/);
+  });
+
+  test("a view and a table macro an admin persisted over a file read are refused from a denied handle", async () => {
+    // An admin can CREATE a view or macro whose body reads a file; the read happens when it is USED.
+    // A non-admin opening the same file sees the object in the catalog but cannot run its body, so a
+    // persisted object is not a way around the posture.
+    const secret = scratchSecret("na-persisted-secret.json");
+    const file = join(workDir, "na-persisted-objects.duckdb");
+    // The admin full-reach handle persists the objects and closes (checkpoint), so the denied handle
+    // below is the only handle on the file.
+    const admin = new DuckDBProvider(makeConfig({ database: file }), {}, { allowExternalFileAccess: true });
+    await admin.connect();
+    try {
+      await admin.query(`CREATE VIEW admin_view AS SELECT * FROM read_text('${secret}')`);
+      await admin.query(`CREATE MACRO admin_macro() AS TABLE SELECT * FROM read_text('${secret}')`);
+      await admin.query("CHECKPOINT");
+    } finally {
+      await admin.disconnect();
+    }
+
+    provider = await nonAdmin(file);
+    expect((await provider.query("SELECT view_name FROM duckdb_views() WHERE view_name = 'admin_view'")).rows).toEqual([
+      { view_name: "admin_view" },
+    ]);
+    await expect(provider.query("SELECT * FROM admin_view")).rejects.toThrow(/disabled by configuration/);
+    await expect(provider.query("SELECT * FROM admin_macro()")).rejects.toThrow(/disabled by configuration/);
+    const refusal = await provider.query("SELECT * FROM admin_view").then(
+      () => "no refusal",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    );
+    expect(refusal).not.toContain(SECRET_PLACEHOLDER);
+  });
+
+  testIf(
+    MISSING_POSIX_FILE_MODES ??
+      (process.getuid?.() === 0 ? "running as root: file modes do not restrict root, so nothing is unwritable" : null),
+    "a non-admin on an unwritable file opens READ_ONLY and external-access-off, reads, and keeps the #1486 reason",
+    async () => {
+      // The unwritable-file path (#1476, #1486, #1494) composed with the new posture: a 0444
+      // file gets access_mode READ_ONLY (so the engine refuses the write) AND
+      // enable_external_access: 'false' (so no file is reachable), and the read-only-reason
+      // wrapping still fronts the engine's refusal of the editor's own catalog.
+      const secret = scratchSecret("na-unwritable-secret.json");
+      const file = await seededFile("non-admin-unwritable.duckdb");
+      chmodSync(file, 0o444);
+      try {
+        provider = await nonAdmin(file);
+
+        expect((await provider.query("SELECT current_setting('access_mode') AS m")).rows).toEqual([{ m: "read_only" }]);
+        expect((await provider.query("SELECT current_setting('enable_external_access') AS v")).rows).toEqual([
+          { v: false },
+        ]);
+        expect((await provider.query("SELECT count(*) AS n FROM users")).rows).toEqual([{ n: "2" }]);
+        await expect(provider.query(`SELECT * FROM read_text('${secret}')`)).rejects.toThrow(
+          /disabled by configuration/,
+        );
+        await expect(provider.query("INSERT INTO users VALUES (3, 'x')")).rejects.toThrow(
+          `DuckDB database ${file} is open read-only because this process cannot write the file or its directory: Invalid Input Error: Cannot execute statement of type "INSERT" on database "non-admin-unwritable" which is attached in read-only mode!`,
+        );
+      } finally {
+        if (provider?.isConnected()) await provider.disconnect();
+        chmodSync(file, 0o644);
+      }
+    },
+  );
+
+  test("a refusal says it is Studio's file-access posture, in front of the engine's own sentence", async () => {
+    // The engine says only "disabled by configuration", which reads like a server fault to the
+    // user and tells the operator nothing about the role. The reason goes in front of it, the way
+    // the read-only reason does for an unwritable file (#1405), and the engine's words stay intact.
+    const secret = scratchSecret("na-reason-secret.json");
+    provider = await nonAdmin(":memory:");
+    const refusalOf = (sql: string) =>
+      provider.query(sql).then(
+        () => "no refusal",
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      );
+    const REASON =
+      "File and network access is off on this DuckDB connection: the handle was opened with external access denied, which Studio does for every role but admin and for any connection a non-admin role can use, and which an embedder overrides by passing { allowExternalFileAccess: true }: Permission Error: ";
+
+    const read = await refusalOf(`SELECT * FROM read_text('${secret}')`);
+    expect(read.startsWith(REASON)).toBe(true);
+    expect(read).toContain(`Cannot access file "${secret}" - file system operations are disabled by configuration`);
+    expect(read).not.toContain(SECRET_PLACEHOLDER);
+    expect((await refusalOf("INSTALL httpfs")).startsWith(REASON)).toBe(true);
+    expect((await refusalOf("LOAD httpfs")).startsWith(REASON)).toBe(true);
+
+    // Only the posture's own refusals: an ordinary error keeps the engine's sentence alone.
+    expect(await refusalOf("SELECT * FROM no_such_table")).toStartWith("Catalog Error:");
+  });
+
+  test("an admin editor's errors carry no posture reason", async () => {
+    const admin = new DuckDBProvider(makeConfig({ database: ":memory:" }), {}, { allowExternalFileAccess: true });
+    await admin.connect();
+    try {
+      // The admin turns its own handle's access off at run time: the engine refuses, and the
+      // refusal is not dressed as a role restriction, because this handle was not opened under one.
+      await admin.query("SET enable_external_access = false");
+      const refusal = await admin.query("SELECT * FROM read_text('/proc/self/environ')").then(
+        () => "no refusal",
+        (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      );
+      expect(refusal).toStartWith("Permission Error:");
+    } finally {
+      await admin.disconnect();
+    }
+  });
+
+  test("admin positive control: an admin editor handle keeps read_csv, read_text and COPY ... TO", async () => {
+    // The posture is per role: an admin editor is unchanged from today. Without this control,
+    // denying everywhere would look the same in every refusal above.
+    const input = join(workDir, "admin-input.csv");
+    writeFileSync(input, "a,b\n1,2\n");
+    const secret = scratchSecret("admin-readable.json");
+    const target = join(workDir, "admin-copy.csv");
+    const admin = new DuckDBProvider(
+      makeConfig({ database: join(workDir, "admin-editor.duckdb") }),
+      {},
+      { allowExternalFileAccess: true },
+    );
+    await admin.connect();
+    try {
+      expect((await admin.query("SELECT current_setting('enable_external_access') AS v")).rows).toEqual([{ v: true }]);
+      // DuckDB's replacement scan returns untyped CSV columns as VARCHAR, so getRowsJson
+      // quotes them, matching the BARE_SCAN assertions elsewhere in this file.
+      expect((await admin.query(`SELECT * FROM read_csv_auto('${input}')`)).rows).toEqual([{ a: "1", b: "2" }]);
+      expect(String((await admin.query(`SELECT content FROM read_text('${secret}')`)).rows[0].content)).toContain(
+        SECRET_PLACEHOLDER,
+      );
+      await admin.query(`COPY (SELECT 1 AS a) TO '${target}' (FORMAT CSV)`);
+      expect(existsSync(target)).toBe(true);
+    } finally {
+      await admin.disconnect();
+    }
+  });
+});
+
+// ============================================================================
+// The private temp directory of a handle with external access off
+//
+// The denied editor and the agent read-only handle each open with a private temp directory under
+// the operating system's temp directory, which the engine then allow-lists in place of the shared
+// default (docs/providers/duckdb.md section 3.16). These pin where it is made, that it is removed
+// when the handle closes or fails to open, what an unusable temp directory does, and what the
+// handle can still reach because of it.
+// ============================================================================
+
+describe("the private temp directory of a handle with external access off", () => {
+  /**
+   * Runs `body` with the operating system's temp directory pointed at `dir`, so the private directory a
+   * handle makes lands where this test can list it, apart from every other process using the real one.
+   * TMPDIR is what Linux and macOS read, TEMP and TMP what Windows reads.
+   */
+  async function withOsTempDirectory<T>(dir: string, body: () => Promise<T>): Promise<T> {
+    const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+    process.env.TMPDIR = dir;
+    process.env.TEMP = dir;
+    process.env.TMP = dir;
+    try {
+      // The redirect took, so an empty listing below means "removed" rather than "never made here".
+      expect(tmpdir()).toBe(dir);
+      return await body();
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  }
+
+  /** The temp directory the engine reports for this handle. */
+  async function tempDirectoryOf(handle: DuckDBProvider, readOnly = false): Promise<string> {
+    const sql = "SELECT current_setting('temp_directory') AS t";
+    const result = readOnly ? await handle.queryReadOnly(sql, GENEROUS_BUDGET) : await handle.query(sql);
+    return String(result.rows[0].t);
+  }
+
+  /**
+   * A path with its existing directory made canonical, so the comparison survives a symlinked temp
+   * directory (macOS) and a short-name one (Windows); the last segment may not exist yet.
+   */
+  function canonical(path: string): string {
+    return join(realpathSync.native(dirname(path)), basename(path));
+  }
+
+  test.each([
+    ["the denied editor on :memory:", null, { allowExternalFileAccess: false }],
+    ["the denied editor on a file", "private-temp-denied.duckdb", { allowExternalFileAccess: false }],
+    ["the agent read-only handle", "private-temp-agent.duckdb", { readOnly: true }],
+  ] as const)(
+    "%s keeps its temp files in a private directory and removes it on disconnect",
+    async (_label, file, execution) => {
+      const osTemp = mkdtempSync(join(workDir, "os-temp-"));
+      const database = file === null ? ":memory:" : await seededFile(file);
+      await withOsTempDirectory(osTemp, async () => {
+        const handle = new DuckDBProvider(makeConfig({ database }), {}, execution);
+        await handle.connect();
+        try {
+          const temp = await tempDirectoryOf(handle, "readOnly" in execution);
+          // One directory of its own under the operating system's temp directory, and it exists.
+          expect(readdirSync(osTemp)).toHaveLength(1);
+          expect(readdirSync(osTemp)[0]).toStartWith("libredb-duckdb-");
+          expect(canonical(temp)).toBe(canonical(join(osTemp, readdirSync(osTemp)[0])));
+          await handle.disconnect();
+          // Gone with the handle: nothing is left behind under the temp directory.
+          expect(existsSync(temp)).toBe(false);
+          expect(readdirSync(osTemp)).toEqual([]);
+        } finally {
+          if (handle.isConnected()) await handle.disconnect();
+        }
+      });
+    },
+  );
+
+  test("the full-reach editor keeps the engine's default temp directory and makes no private one", async () => {
+    const osTemp = mkdtempSync(join(workDir, "os-temp-"));
+    const database = join(workDir, "full-reach-temp.duckdb");
+    await withOsTempDirectory(osTemp, async () => {
+      const admin = new DuckDBProvider(makeConfig({ database }), {}, { allowExternalFileAccess: true });
+      await admin.connect();
+      try {
+        expect(canonical(await tempDirectoryOf(admin))).toBe(canonical(`${database}.tmp`));
+        expect(readdirSync(osTemp)).toEqual([]);
+      } finally {
+        await admin.disconnect();
+      }
+    });
+  });
+
+  test("an open that fails removes the private temp directory it made", async () => {
+    // A read-only open of a missing file is refused by the engine after the directory was made, so
+    // nothing would ever close a handle that could remove it.
+    const osTemp = mkdtempSync(join(workDir, "os-temp-"));
+    await withOsTempDirectory(osTemp, async () => {
+      await expect(openDuckDBClient(join(workDir, "absent-for-temp.duckdb"), { readOnly: true })).rejects.toThrow(
+        /does not exist and a read-only handle will not create one/,
+      );
+      expect(readdirSync(osTemp)).toEqual([]);
+    });
+  });
+
+  test("an unusable temp directory refuses the open in a sentence that names it, and the full-reach editor still opens", async () => {
+    // No fallback to the shared default: that is the directory the private one exists to keep this
+    // handle out of. The full-reach editor makes no private directory, so it is unaffected.
+    const missing = join(workDir, "no-such-os-temp");
+    await withOsTempDirectory(missing, async () => {
+      const denied = new DuckDBProvider(makeConfig(), {}, { allowExternalFileAccess: false });
+      const refusal = await denied.connect().then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(refusal).toBeInstanceOf(ConnectionError);
+      expect((refusal as Error).message).toStartWith(
+        `Could not open DuckDB database :memory:: a handle with file and network access off keeps its temporary files in a private directory, and creating one under ${missing} failed: `,
+      );
+      expect((refusal as Error).message).toEndWith(
+        "Make that directory writable for the Studio process, or point TMPDIR (TEMP on Windows) at one that is.",
+      );
+      expect(denied.isConnected()).toBe(false);
+
+      const admin = new DuckDBProvider(makeConfig(), {}, { allowExternalFileAccess: true });
+      await admin.connect();
+      try {
+        expect((await admin.query("SELECT 1 AS one")).rows).toEqual([{ one: 1 }]);
+      } finally {
+        await admin.disconnect();
+      }
+    });
+  });
+
+  testIf(
+    MISSING_POSIX_FILE_MODES ??
+      (process.getuid?.() === 0
+        ? "running as root: file modes do not restrict root, so the removal cannot fail"
+        : null),
+    "a disconnect whose temp-directory removal fails raises it and still leaves the provider disconnected",
+    async () => {
+      const osTemp = mkdtempSync(join(workDir, "os-temp-"));
+      await withOsTempDirectory(osTemp, async () => {
+        const handle = new DuckDBProvider(makeConfig(), {}, { allowExternalFileAccess: false });
+        await handle.connect();
+        const temp = await tempDirectoryOf(handle);
+        // A file the removal cannot unlink, because its directory is no longer writable.
+        writeFileSync(join(temp, "pinned"), "x");
+        chmodSync(temp, 0o500);
+        try {
+          // Linux reports the pinned file's EACCES; macOS reports the directory's ENOTEMPTY.
+          await expect(handle.disconnect()).rejects.toThrow(/EACCES|EPERM|ENOTEMPTY|permission denied|not empty/i);
+          // The engine handle closed before the removal failed, so the provider is disconnected and
+          // connect() opens a fresh handle instead of returning early on the closed one.
+          expect(handle.isConnected()).toBe(false);
+          await handle.connect();
+          expect((await handle.query("SELECT 1 AS one")).rows).toEqual([{ one: 1 }]);
+        } finally {
+          chmodSync(temp, 0o700);
+          if (handle.isConnected()) await handle.disconnect();
+          rmSync(temp, { recursive: true, force: true });
+        }
+      });
+    },
+  );
+
+  test("the denied handle still reaches its own private directory and its database's own file names, and nothing else", async () => {
+    // What the docs state as the posture's residue: the engine allow-lists the handle's temp directory
+    // and the database file with its write-ahead-log siblings. A file inside the private directory can
+    // be written, read and attached; it is the handle's own and goes when the handle closes.
+    const database = join(workDir, "denied-residue.duckdb");
+    const handle = new DuckDBProvider(makeConfig({ database }), {}, { allowExternalFileAccess: false });
+    await handle.connect();
+    try {
+      const temp = await tempDirectoryOf(handle);
+      const setting = async (name: string) =>
+        ((await handle.query(`SELECT current_setting('${name}') AS v`)).rows[0].v as string[]).map(canonical).sort();
+      expect(await setting("allowed_directories")).toEqual([canonical(temp)]);
+      expect(await setting("allowed_paths")).toEqual(
+        [database, `${database}.wal`, `${database}.wal.checkpoint`, `${database}.wal.recovery`].map(canonical).sort(),
+      );
+
+      const inside = join(temp, "inside.csv");
+      await handle.query(`COPY (SELECT 42 AS a) TO '${inside}' (FORMAT CSV)`);
+      // read_csv types the column BIGINT, which the row reader answers as a decimal string.
+      expect((await handle.query(`SELECT * FROM read_csv('${inside}')`)).rows).toEqual([{ a: "42" }]);
+      await handle.query(`ATTACH '${join(temp, "side.duckdb")}' AS side`);
+      await handle.query("CREATE TABLE side.t AS SELECT 1 AS a");
+
+      // Beside the database, but not one of its own names: refused like any other file.
+      await expect(
+        handle.query(`COPY (SELECT 1 AS a) TO '${join(workDir, "denied-residue-beside.csv")}' (FORMAT CSV)`),
+      ).rejects.toThrow(/file system operations are disabled by configuration/);
+      expect(existsSync(join(workDir, "denied-residue-beside.csv"))).toBe(false);
+    } finally {
+      await handle.disconnect();
+    }
+  });
+
+  testIf(
+    process.platform === "win32"
+      ? "Windows: the engine's allow-list names for an in-memory database were measured on POSIX paths only"
+      : null,
+    "a denied :memory: handle's database file names are four fixed names in the working directory",
+    async () => {
+      // An in-memory database writes no file, but the engine still allow-lists the names a file-backed
+      // one would use, resolved against the process directory. The docs say so rather than "nothing".
+      const handle = new DuckDBProvider(makeConfig(), {}, { allowExternalFileAccess: false });
+      await handle.connect();
+      try {
+        const paths = (await handle.query("SELECT current_setting('allowed_paths') AS v")).rows[0].v as string[];
+        const base = join(process.cwd(), ":memory:");
+        expect(paths.map(canonical).sort()).toEqual(
+          [base, `${base}.wal`, `${base}.wal.checkpoint`, `${base}.wal.recovery`].map(canonical).sort(),
+        );
+      } finally {
+        await handle.disconnect();
+      }
+    },
+  );
 });
 
 // ============================================================================
@@ -1154,6 +2492,2050 @@ describe("the read-only denylist against duckdb_functions()", () => {
       // catalog function that reaches nothing outside the database is still allowed.
       expect(() => assertReadOnlyStatementIsBounded("SELECT * FROM duckdb_tables()")).not.toThrow();
       expect(() => assertReadOnlyStatementIsBounded("CALL pragma_storage_info('users')")).not.toThrow();
+    } finally {
+      await provider.disconnect();
+    }
+  });
+});
+
+// ============================================================================
+// The object surface (#789)
+// ============================================================================
+
+/**
+ * The object-surface fixture, built in a real engine rather than mocked.
+ *
+ * THE DDL IS `docker/duckdb-init/01-object-fixture.sql` and is replayed from there (#789).
+ * It used to be written inline here, which made every measurement in this file
+ * un-reproducible outside a test run - the shape standing ruling 5i forbids. The same file
+ * builds a database FILE a person can point Studio at:
+ * `bun docker/duckdb-init/build-fixture.ts`.
+ *
+ * DuckDB is embedded, so every row below is the ENGINE's answer and not a canned
+ * recordset: `ATTACH ':memory:' AS warehouse` gives a second real catalog in the same
+ * process, which is what makes this the only provider in #789 whose two container levels
+ * are exercised against a live server in the ordinary test run.
+ *
+ * Two catalogs, four schemas, and one object of every declared kind. The `overlap` trio
+ * is not padding: measured on DuckDB v1.5.5, `CREATE SEQUENCE overlap` and
+ * `CREATE MACRO overlap(x)` both succeed while the table `overlap` exists, and
+ * `CREATE VIEW overlap` is refused (`Catalog Error: Table with name "overlap" already
+ * exists!`). So a table, a sequence and a macro really do share one name here, which is
+ * the case `tests/helpers/object-surface-conformance.ts` keeps invariant 5 inside a kind
+ * for.
+ */
+async function seededObjectProvider(): Promise<DuckDBProvider> {
+  const provider = new DuckDBProvider(makeConfig());
+  await provider.connect();
+  // Replayed from the committed fixture rather than written here, which is standing ruling
+  // 5i (#789): the DDL these assertions reason about has to be something a person outside
+  // this test run can apply. `:memory:` for the second catalog, because this provider's own
+  // database is in-process too and a file would outlive the test.
+  for (const statement of readFixtureStatements(":memory:")) await provider.query(statement);
+  return provider;
+}
+
+/**
+ * The fixture READER's own guards, which every assertion in this file rests on (#789).
+ *
+ * `readFixtureStatements` is the only thing standing between this suite and a silently
+ * empty database, and each of its three throws guards a ZERO that would otherwise pass:
+ * zero statements builds an empty database and every count below then reads zero against
+ * zero; zero substitutions sends DuckDB the literal string `{{warehouse}}` as a file PATH,
+ * which v1.5.5 accepts, creating a file of that name in the working directory while the
+ * suite still sees two catalogs; and a blank target is the same shape one step further
+ * along. None of the three is an error the engine reports, which is why they are asserted
+ * here rather than left to a failing read.
+ */
+describe("the committed DuckDB fixture", () => {
+  test("reads as statements, substitutes the second catalog, and names it in the ATTACH", () => {
+    const statements = readFixtureStatements("/tmp/warehouse-under-test.duckdb");
+
+    expect(statements.length).toBeGreaterThan(15);
+    // No statement carries a trailing semicolon and none is blank: the reader strips the
+    // terminator, and a blank statement is what a stray `;` line would produce.
+    expect(statements.filter((statement) => statement.endsWith(";") || statement.trim() === "")).toEqual([]);
+    // No comment line survives, in either position.
+    expect(statements.filter((statement) => statement.includes("--"))).toEqual([]);
+    expect(statements.filter((statement) => statement.includes(WAREHOUSE_PLACEHOLDER))).toEqual([]);
+    expect(statements).toContain("ATTACH '/tmp/warehouse-under-test.duckdb' AS warehouse");
+  });
+
+  test("a fixture file carrying no placeholder, a blank target and an empty file each raise by name", () => {
+    const empty = join(workDir, "empty-fixture-task11.sql");
+    writeFileSync(empty, "-- nothing but a comment\n");
+    const placeholderless = join(workDir, "placeholderless-fixture-task11.sql");
+    writeFileSync(placeholderless, "CREATE TABLE t (id INTEGER);\n");
+
+    expect(() => readFixtureStatements("")).toThrow(/the warehouse target is blank/);
+    expect(() => readFixtureStatements("   ")).toThrow(/the warehouse target is blank/);
+    expect(() => readFixtureStatements(":memory:", empty)).toThrow(/yielded no statement/);
+    expect(() => readFixtureStatements(":memory:", placeholderless)).toThrow(
+      /carries no \{\{warehouse\}\} to substitute/,
+    );
+  });
+
+  test("the warehouse sibling is derived from the target, so a file build holds both catalogs", () => {
+    expect(warehouseSibling("/tmp/demo.duckdb")).toBe("/tmp/demo.duckdb.warehouse.duckdb");
+  });
+
+  /**
+   * The builder's delete swallows ABSENCE and nothing else (#789).
+   *
+   * `removeDatabaseFile` exists so a second run produces a database identical to the first,
+   * and the only failure it is entitled to ignore is the file already not being there. A
+   * catch with no condition also ignores a refused unlink, and then `buildObjectFixture`
+   * opens the STALE database, replays the fixture DDL on top of it and fails with a catalog
+   * error naming an object rather than the file it could not delete. The house rule is that
+   * an error is raised explicitly and a fallback is asked for rather than assumed.
+   *
+   * A directory is the cheapest real non-ENOENT unlink failure: measured on this machine,
+   * `unlinkSync` on one raises `EISDIR`. The `.wal` and warehouse siblings of that path do
+   * not exist, so the same call also proves the ENOENT arm stays silent.
+   */
+  test("a delete refused for a reason other than absence raises rather than reporting success", () => {
+    const undeletable = join(workDir, "undeletable-task11");
+    mkdirSync(undeletable, { recursive: true });
+
+    expect(() => removeDatabaseFile(undeletable)).toThrow(/EISDIR|EPERM|EACCES/);
+    // The control: the same function over a path where NOTHING exists is silent, so the
+    // raise above is the refusal and not merely "unlink threw".
+    expect(() => removeDatabaseFile(join(workDir, "nothing-of-this-name-task11.duckdb"))).not.toThrow();
+  });
+});
+
+/** Every catalog the fixture above answers `listContainers()` with, in order. */
+const FIXTURE_CATALOGS = [["memory"], ["warehouse"]];
+
+/** The counts the fixture holds in the catalog `memory`, measured against the engine. */
+const FIXTURE_CATALOG_COUNTS = { table: 6, view: 2, macro: 3, sequence: 3 };
+
+describe("object surface", () => {
+  test("declares the kinds DuckDB has, at two container levels", () => {
+    const capabilities = new DuckDBProvider(makeConfig()).getCapabilities();
+    const kinds = capabilities.objectKinds ?? [];
+
+    expect(kinds.map((kind) => kind.id).sort()).toEqual(["macro", "sequence", "table", "view"]);
+    expect(kinds.find((kind) => kind.id === "table")?.acceptsRowWrites).toBe(true);
+    // No `acceptsRowWrites` on a view: DuckDB refuses an INSERT into a view outright
+    // ("Catalog Error: Table with name ... does not exist!" against the view's name is
+    // what an INSERT answers), so a view is never an import target here.
+    expect(kinds.find((kind) => kind.id === "view")?.acceptsRowWrites).toBeUndefined();
+    expect(kinds.find((kind) => kind.id === "macro")?.role).toBe("routine");
+    expect(kinds.find((kind) => kind.id === "sequence")?.role).toBe("config");
+    // No trigger and no procedure: DuckDB has neither, and a folder for a concept the
+    // engine does not have is a lie its zero badge makes look like a fact.
+    expect(kinds.find((kind) => kind.id === "trigger")).toBeUndefined();
+    expect(kinds.find((kind) => kind.id === "procedure")).toBeUndefined();
+    // No `index` kind: `duckdb_indexes()` is keyed by `table_oid` and an index cannot
+    // exist without a table, so it belongs in describeObject's output.
+    expect(kinds.find((kind) => kind.id === "index")).toBeUndefined();
+
+    expect(capabilities.containerLevels).toEqual([
+      { id: "catalog", label: "Database", labelPlural: "Databases" },
+      { id: "schema", label: "Schema", labelPlural: "Schemas" },
+    ]);
+  });
+
+  /**
+   * Every kind DuckDB declares has a definition text, so the second expectation is empty
+   * (#789).
+   *
+   * BOTH DIRECTIONS, because one of them is the only thing stopping a kind added later
+   * from quietly gaining a Source tab it has no read behind. The empty half is a real
+   * assertion here rather than a formality: DuckDB is one of the engines where every
+   * declared kind is source-bearing, and the day somebody declares a `secret` kind
+   * (`duckdb_secrets()` is real and deliberately not declared - see the capabilities
+   * docblock) this test is what refuses it until a read exists.
+   *
+   * All four are `sql` and not a dialect id. `plsql`, `tsql` and `cql` are not registrable
+   * ids in the installed monaco-editor 0.57.0 bundle and DuckDB has no id of its own
+   * either, so `sql` is the honest choice rather than a compromise here: DuckDB's dialect
+   * is PostgreSQL-shaped and the text the engine publishes is ordinary SQL.
+   */
+  test("declares source on exactly the kinds that have a definition text", () => {
+    const kinds = new DuckDBProvider(makeConfig()).getCapabilities().objectKinds ?? [];
+    const declared = kinds
+      .filter((kind) => kind.hasSource === true)
+      .map((kind) => [kind.id, kind.sourceLanguage] as const)
+      .sort();
+
+    expect(declared).toEqual([
+      ["macro", "sql"],
+      ["sequence", "sql"],
+      ["table", "sql"],
+      ["view", "sql"],
+    ]);
+    // The other direction, so a kind added later cannot quietly gain a Source tab.
+    expect(
+      kinds
+        .filter((kind) => kind.hasSource !== true)
+        .map((kind) => kind.id)
+        .sort(),
+    ).toEqual([]);
+  });
+
+  /**
+   * `hasColumns` against the engine's own answer, on the two kinds that decide it (#789).
+   *
+   * The declaration is what draws the twisty in the object tree, so a kind declaring it and
+   * answering nothing is a twisty that opens on nothing, and a kind answering columns while
+   * declaring nothing hides them behind a leaf with nothing on screen to say so. On this engine
+   * the fact is not a transcription: `describeObject` returns three empty arrays for anything
+   * whose role is not `relation` (`sql/duckdb/index.ts:1096-1098`), so `table` and `view` are the
+   * two kinds that can answer at all, and `macro` and `sequence` cannot.
+   */
+  test("declares columns on exactly the kinds describeObject answers columns for", async () => {
+    const kinds = new DuckDBProvider(makeConfig()).getCapabilities().objectKinds ?? [];
+    expect(
+      kinds
+        .filter((kind) => kind.hasColumns === true)
+        .map((kind) => kind.id)
+        .sort(),
+    ).toEqual(["table", "view"]);
+    // The other direction: a kind that abstains declares nothing at all, not `false`.
+    expect(kinds.filter((kind) => kind.hasColumns !== true).map((kind) => kind.hasColumns)).toEqual([
+      undefined,
+      undefined,
+    ]);
+
+    const provider = await seededObjectProvider();
+    try {
+      const view = await provider.describeObject(["memory", "main", "customer_names"], "view");
+      expect(view.columns.length).toBeGreaterThan(0);
+      for (const column of view.columns) {
+        expect(typeof column.name === "string" && column.name.trim() !== "").toBe(true);
+        expect(typeof column.type === "string" && column.type.trim() !== "").toBe(true);
+      }
+
+      expect((await provider.describeObject(["memory", "analytics", "recent_events"], "macro")).columns).toEqual([]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("satisfies the shared object surface contract", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      await assertObjectSurface(provider, {
+        containers: FIXTURE_CATALOGS,
+        kinds: FIXTURE_CATALOG_COUNTS,
+        sampleObject: { path: ["memory", "main", "orders"], kind: "table" },
+        // A name no object of any kind carries, under a kind the loop above really read,
+        // so the raise it drives has a positive control (#789). `macro` deliberately:
+        // it is the one kind whose catalog function carries a predicate of its own, so a
+        // read that dropped `function_type IN (...)` would answer a built-in scalar
+        // function's row here rather than nothing.
+        absentSource: { path: ["memory", "main", "no_such_macro"], kind: "macro" },
+      });
+    } finally {
+      await provider.disconnect();
+    }
+  });
+});
+
+/**
+ * The rest of the object surface: the containers, the listings, the detail row and the
+ * refusals. Kept out of the block above so `-t "object surface"` still runs the shared
+ * contract on its own.
+ */
+describe("DuckDB object containers, listings and detail", () => {
+  test("the top level is every attachable catalog, and a nested list reads the CALLER's catalog", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const catalogs = await provider.listContainers();
+      expect(catalogs.map((container) => container.path)).toEqual(FIXTURE_CATALOGS);
+      expect(catalogs.every((container) => container.level === 0)).toBe(true);
+      // The connected catalog is marked and the ATTACHed one is not. `:memory:` opens as
+      // the catalog `memory`, which is DuckDB's own name for it.
+      expect(catalogs.find((container) => container.name === "memory")?.isSessionDefault).toBe(true);
+      expect(catalogs.find((container) => container.name === "warehouse")?.isSessionDefault).toBe(false);
+
+      // The nested level. The two catalogs answer DIFFERENT schema sets, which is the pin:
+      // a provider that read `current_database()` instead of the caller's segment would
+      // answer `memory`'s schemas under `warehouse` and look entirely healthy doing it.
+      expect((await provider.listContainers(["memory"])).map((container) => container.path)).toEqual([
+        ["memory", "analytics"],
+        ["memory", "main"],
+      ]);
+      expect((await provider.listContainers(["warehouse"])).map((container) => container.path)).toEqual([
+        ["warehouse", "main"],
+        ["warehouse", "stock"],
+      ]);
+      expect((await provider.listContainers(["warehouse"])).every((container) => container.level === 1)).toBe(true);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("the session default is marked at BOTH levels, so first paint reaches a schema", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      // Standing ruling 5a2 (#789): first paint walks the container chain down to the
+      // session default at the DEEPEST declared level and reads counts THERE. On a
+      // two-level engine that is three reads, and a provider marking only its catalogs
+      // would leave `withSessionDefault` in `src/components/object-tree/use-tree-nodes.ts`
+      // opening a database and stopping, having read no counts at all.
+      const catalogs = await provider.listContainers();
+      const defaultCatalog = catalogs.filter((container) => container.isSessionDefault === true);
+      expect(defaultCatalog.map((container) => container.path)).toEqual([["memory"]]);
+
+      const schemas = await provider.listContainers(defaultCatalog[0].path);
+      const defaultSchema = schemas.filter((container) => container.isSessionDefault === true);
+      expect(defaultSchema.map((container) => container.path)).toEqual([["memory", "main"]]);
+      // Exactly one, at each level: the walk takes `find`, so two marked rows would make
+      // which one opens an accident of catalog order.
+      expect(schemas.filter((container) => container.name === "analytics")[0].isSessionDefault).toBe(false);
+
+      // An ATTACHed catalog marks NO schema, which is the truth rather than a gap:
+      // `current_schema()` names a schema inside `current_database()`, and a session sits
+      // in one catalog. A predicate comparing the schema name alone would mark
+      // `warehouse.main` here, and the tree would open two databases at once.
+      expect((await provider.listContainers(["warehouse"])).map((container) => container.isSessionDefault)).toEqual([
+        false,
+        false,
+      ]);
+
+      // And it FOLLOWS the session rather than naming `main`: `USE` moves both halves.
+      await provider.query("USE warehouse.stock");
+      expect((await provider.listContainers()).filter((c) => c.isSessionDefault === true).map((c) => c.path)).toEqual([
+        ["warehouse"],
+      ]);
+      expect(
+        (await provider.listContainers(["warehouse"])).filter((c) => c.isSessionDefault === true).map((c) => c.path),
+      ).toEqual([["warehouse", "stock"]]);
+      // The catalog that WAS the default now marks nothing at either level.
+      expect((await provider.listContainers(["memory"])).map((c) => c.isSessionDefault)).toEqual([false, false]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("main is listed although duckdb_schemas() calls it internal", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      // The measured trap, and the control for it in the same test: `main` is
+      // `internal = true` in a USER database while `analytics` is not, so a schema listing
+      // filtered on `NOT internal` would drop the default schema and with it most of the
+      // objects in the tree. DuckDB's own rows, read directly:
+      const flags = await provider.query(
+        "SELECT schema_name, internal FROM duckdb_schemas() WHERE database_name = 'memory' ORDER BY schema_name",
+      );
+      expect(flags.rows).toEqual([
+        { schema_name: "analytics", internal: false },
+        { schema_name: "main", internal: true },
+      ]);
+
+      const schemas = await provider.listContainers(["memory"]);
+      expect(schemas.map((container) => container.name)).toContain("main");
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("the internal system and temp catalogs are never containers", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      // Non-vacuity first: both really are attached to this session, and `system` really
+      // does hold objects - 2949 built-in functions and the whole pg_catalog compatibility
+      // layer - so excluding them is a decision rather than an empty filter.
+      const attached = await provider.query("SELECT database_name, internal FROM duckdb_databases() ORDER BY 1");
+      expect(attached.rows).toEqual([
+        { database_name: "memory", internal: false },
+        { database_name: "system", internal: true },
+        { database_name: "temp", internal: true },
+        { database_name: "warehouse", internal: false },
+      ]);
+
+      const names = (await provider.listContainers()).map((container) => container.name);
+      expect(names).not.toContain("system");
+      expect(names).not.toContain("temp");
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("nothing nests under a schema, and that is an answer rather than a refusal", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      expect(await provider.listContainers(["memory", "main"])).toEqual([]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a parent is a tree cursor, so a catalog lists its schemas even when only exact addresses are declared", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      // `containerPathShapes` governs the paths an object read ADDRESSES. A listing parent is
+      // not one: `[database]` is where the tree is, so an address check would refuse it here.
+      spyOn(provider, "getCapabilities").mockReturnValue({
+        ...new DuckDBProvider(makeConfig()).getCapabilities(),
+        containerPathShapes: "exact",
+      });
+      expect((await provider.listContainers(["memory"])).map((container) => container.path)).toEqual([
+        ["memory", "analytics"],
+        ["memory", "main"],
+      ]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("counts the whole catalog, then one schema, and seeds a declared kind at zero", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      expect(await provider.countObjects(["memory"])).toEqual({
+        table: { count: 6 },
+        view: { count: 2 },
+        macro: { count: 3 },
+        sequence: { count: 3 },
+      });
+      expect(await provider.countObjects(["memory", "main"])).toEqual({
+        table: { count: 3 },
+        view: { count: 1 },
+        macro: { count: 2 },
+        sequence: { count: 2 },
+      });
+      expect(await provider.countObjects(["memory", "analytics"])).toEqual({
+        table: { count: 3 },
+        view: { count: 1 },
+        macro: { count: 1 },
+        sequence: { count: 1 },
+      });
+      // The sum rule: unlike SQL Server, every DuckDB object of every declared kind
+      // belongs to a schema, so a catalog count IS the sum over the schemas
+      // `listContainers` lists. 3+1 tables, 1+1 views, 2+1 macros, 2+1 sequences.
+
+      // A declared kind this catalog holds none of carries `{ count: 0 }` and NOT an
+      // absent key: an absent kind means the engine has no such concept, and a folder
+      // that disappears is a different fact from a folder badged 0.
+      expect(await provider.countObjects(["warehouse"])).toEqual({
+        table: { count: 3 },
+        view: { count: 0 },
+        macro: { count: 0 },
+        sequence: { count: 0 },
+      });
+      expect(await provider.countObjects(["warehouse", "stock"])).toEqual({
+        table: { count: 1 },
+        view: { count: 0 },
+        macro: { count: 0 },
+        sequence: { count: 0 },
+      });
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a refused count carries the engine's own sentence, never a zero", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      // A REAL refusal from a real engine rather than a thrown mock, and a DETERMINISTIC
+      // one: `SET max_expression_depth=1` is pure configuration, so the SET itself always
+      // succeeds, and every catalog read after it is refused by the parser. (The obvious
+      // alternative, `SET memory_limit='1KB'`, is not usable here - measured, the SET
+      // itself fails with "could not free up enough memory for the new limit" once the
+      // fixture holds enough, so the refusal would come and go with the fixture's size.)
+      await provider.query("SET max_expression_depth=1");
+
+      // Every shape of container, because a refusal has to answer for the WHOLE declared
+      // kind set at either depth: a catalog, a schema inside it, and a second catalog
+      // entirely. Reporting `{ count: 0 }` for any one of them would render "the read was
+      // refused" as "this folder is empty".
+      for (const container of [["memory"], ["memory", "main"], ["warehouse", "stock"]]) {
+        const counts = await provider.countObjects(container);
+        expect(Object.keys(counts).sort()).toEqual(["macro", "sequence", "table", "view"]);
+        for (const kind of Object.keys(counts)) {
+          const count = counts[kind];
+          expect(count).toHaveProperty("unavailable");
+          expect((count as { unavailable: string }).unavailable).toContain("Max expression depth limit of 1 exceeded");
+        }
+      }
+      // The control, on a SIBLING provider over the same fixture: the same statement at
+      // the default depth answers numbers, so the assertions above are about the refusal
+      // and not about a broken statement. It has to be a second handle - measured, once
+      // the depth is 1 even `SET max_expression_depth=1000` and `RESET` are refused by the
+      // same limit, so the session cannot climb back out.
+      const control = await seededObjectProvider();
+      try {
+        expect(await control.countObjects(["memory"])).toEqual({
+          table: { count: 6 },
+          view: { count: 2 },
+          macro: { count: 3 },
+          sequence: { count: 3 },
+        });
+      } finally {
+        await control.disconnect();
+      }
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a container path of the wrong shape is refused by name", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      await expect(provider.countObjects([])).rejects.toThrow(
+        "A DuckDB container path is [database] or [database, schema], received []",
+      );
+      await expect(provider.listObjects(["memory", "main", "customers"], "table")).rejects.toThrow(
+        'received ["memory","main","customers"]',
+      );
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("the listing holds exactly what the count counted, at both depths", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      // Standing ruling 5f (#789), asserted rather than assumed. The count and the listing
+      // for one kind read the same `duckdb_*` table function through the same filter, and
+      // the engine is in-process and static here, so the two really must agree to the row.
+      for (const container of [["memory"], ["memory", "main"], ["memory", "analytics"], ["warehouse"]]) {
+        const counts = await provider.countObjects(container);
+        for (const [kind, count] of Object.entries(counts)) {
+          const listed = await provider.listObjects(container, kind);
+          expect({ container, kind, n: listed.length }).toEqual({
+            container,
+            kind,
+            n: (count as { count: number }).count,
+          });
+        }
+      }
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("lists each kind with the paths and names the tree addresses it by", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      expect(await provider.listObjects(["memory"], "table")).toEqual([
+        { path: ["memory", "analytics", "customers"], name: "customers", kind: "table" },
+        { path: ["memory", "analytics", "events"], name: "events", kind: "table" },
+        { path: ["memory", "analytics", "orders"], name: "orders", kind: "table" },
+        { path: ["memory", "main", "customers"], name: "customers", kind: "table" },
+        { path: ["memory", "main", "orders"], name: "orders", kind: "table" },
+        { path: ["memory", "main", "overlap"], name: "overlap", kind: "table" },
+      ]);
+      expect(await provider.listObjects(["memory"], "view")).toEqual([
+        { path: ["memory", "analytics", "event_days"], name: "event_days", kind: "view" },
+        { path: ["memory", "main", "customer_names"], name: "customer_names", kind: "view" },
+      ]);
+      // BOTH macro forms, which is the whole reason `function_type` carries two spellings:
+      // `recent_events` is a table macro and `add_one` a scalar one. A vocabulary that had
+      // lost `table_macro` would drop the first from the count AND the listing together.
+      expect(await provider.listObjects(["memory"], "macro")).toEqual([
+        { path: ["memory", "analytics", "recent_events"], name: "recent_events", kind: "macro" },
+        { path: ["memory", "main", "add_one"], name: "add_one", kind: "macro" },
+        { path: ["memory", "main", "overlap"], name: "overlap", kind: "macro" },
+      ]);
+      expect(await provider.listObjects(["memory"], "sequence")).toEqual([
+        { path: ["memory", "analytics", "event_seq"], name: "event_seq", kind: "sequence" },
+        { path: ["memory", "main", "customer_seq"], name: "customer_seq", kind: "sequence" },
+        { path: ["memory", "main", "overlap"], name: "overlap", kind: "sequence" },
+      ]);
+      // Scoped to ONE schema, so a listing that ignored `$2` would be caught here as well
+      // as by the count comparison above.
+      expect((await provider.listObjects(["memory", "analytics"], "table")).map((object) => object.path)).toEqual([
+        ["memory", "analytics", "customers"],
+        ["memory", "analytics", "events"],
+        ["memory", "analytics", "orders"],
+      ]);
+      // A different CATALOG entirely, which is what makes the outer level real.
+      expect(await provider.listObjects(["warehouse"], "table")).toEqual([
+        { path: ["warehouse", "main", "customers"], name: "customers", kind: "table" },
+        { path: ["warehouse", "main", "ledger"], name: "ledger", kind: "table" },
+        { path: ["warehouse", "stock", "items"], name: "items", kind: "table" },
+      ]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a table, a sequence and a macro may share one name, and a view may not", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      // Measured against the running engine, not assumed: this is the case
+      // `tests/helpers/object-surface-conformance.ts` keeps invariant 5 inside a kind for,
+      // and it is what makes `describeObject` take the kind rather than resolve it from
+      // the name.
+      await expect(provider.query("CREATE VIEW main.overlap AS SELECT 1")).rejects.toThrow(
+        'Table with name "overlap" already exists',
+      );
+
+      const paths = ["table", "sequence", "macro"].map(async (kind) =>
+        (await provider.listObjects(["memory", "main"], kind)).map((object) => object.path),
+      );
+      for (const kindPaths of await Promise.all(paths)) {
+        expect(kindPaths).toContainEqual(["memory", "main", "overlap"]);
+      }
+
+      // And the three answer three DIFFERENT details for that one path.
+      expect((await provider.describeObject(["memory", "main", "overlap"], "table")).columns).toEqual([
+        { name: "id", type: "INTEGER", nullable: true, isPrimary: false },
+      ]);
+      expect((await provider.describeObject(["memory", "main", "overlap"], "sequence")).columns).toEqual([]);
+      expect((await provider.describeObject(["memory", "main", "overlap"], "macro")).columns).toEqual([]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("listObjects refuses an undeclared kind, and a declared one with no catalog behind it", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      await expect(provider.listObjects(["memory"], "trigger")).rejects.toThrow(
+        'DuckDB declares no object kind "trigger"',
+      );
+
+      // A kind id is an OPEN string, so `DUCKDB_OBJECT_SOURCES["toString"]` answers a
+      // function off the prototype chain unless the lookup is `Object.hasOwn`. Declaring a
+      // kind called `toString` is what makes that reachable, and the refusal has to be the
+      // SECOND sentence - the declaration answered the first question.
+      spyOn(provider, "getCapabilities").mockReturnValue({
+        ...new DuckDBProvider(makeConfig()).getCapabilities(),
+        objectKinds: [{ id: "toString", role: "relation", label: "Odd", labelPlural: "Odds" }],
+      });
+      await expect(provider.listObjects(["memory"], "toString")).rejects.toThrow(
+        'DuckDB declares the kind "toString" but has no catalog function that answers for it',
+      );
+      // The same defect reaches `countObjects` through the statement builder, and it
+      // surfaces as a THROW rather than as `{ unavailable }`: a declaration defect is not
+      // the engine refusing a read.
+      await expect(provider.countObjects(["memory"])).rejects.toThrow("has no catalog function");
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("describes a table: columns, primary key, foreign keys and indexes", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      expect(await provider.describeObject(["memory", "main", "orders"], "table")).toEqual({
+        path: ["memory", "main", "orders"],
+        columns: [
+          { name: "id", type: "INTEGER", nullable: false, isPrimary: true },
+          { name: "customer_id", type: "INTEGER", nullable: true, isPrimary: false },
+          { name: "total", type: "DECIMAL(12,2)", nullable: true, isPrimary: false },
+        ],
+        indexes: [{ name: "ix_orders_customer", columns: ["customer_id"], unique: false }],
+        foreignKeys: [{ columnName: "customer_id", referencedTable: "customers", referencedColumn: "id" }],
+      });
+
+      // A DEFAULT reaches the column row, and a table with no index or foreign key carries
+      // two empty arrays rather than an absent key.
+      expect(await provider.describeObject(["memory", "main", "customers"], "table")).toEqual({
+        path: ["memory", "main", "customers"],
+        columns: [
+          { name: "id", type: "INTEGER", nullable: false, isPrimary: true },
+          { name: "name", type: "VARCHAR", nullable: false, isPrimary: false },
+          // The catalog reports `'none'`; the value is `none`, and the text is kept (#1029).
+          {
+            name: "note",
+            type: "VARCHAR",
+            nullable: true,
+            isPrimary: false,
+            defaultValue: "none",
+            defaultExpression: "'none'",
+          },
+        ],
+        indexes: [],
+        foreignKeys: [],
+      });
+
+      // The SCHEMA filter, which only a same-named pair can show. `analytics.customers`
+      // is a different table with a different column, and `analytics.orders` carries an
+      // index of the SAME NAME as the one on `main.orders`: a detail read that dropped
+      // `schema_name = $2` would merge the two and report columns and indexes the object
+      // does not have.
+      expect(await provider.describeObject(["memory", "analytics", "customers"], "table")).toEqual({
+        path: ["memory", "analytics", "customers"],
+        columns: [{ name: "event_id", type: "BIGINT", nullable: true, isPrimary: false }],
+        indexes: [],
+        foreignKeys: [],
+      });
+      expect((await provider.describeObject(["memory", "analytics", "orders"], "table")).indexes).toEqual([
+        { name: "ix_orders_customer", columns: ["id"], unique: false },
+      ]);
+      // The CATALOG filter, which only a same-schema same-name pair across two databases
+      // can show. `warehouse.main.customers` is a third real table at the same schema and
+      // the same name, so a detail read that dropped `database_name = $1` would answer
+      // four columns for a three-column table.
+      expect(await provider.describeObject(["warehouse", "main", "customers"], "table")).toEqual({
+        path: ["warehouse", "main", "customers"],
+        columns: [{ name: "sku", type: "VARCHAR", nullable: true, isPrimary: false }],
+        indexes: [],
+        foreignKeys: [],
+      });
+
+      // The control for that pair: DuckDB really does hold two indexes of one name, in
+      // two schemas, so the filter has something to get wrong.
+      const shared = await provider.query(
+        "SELECT schema_name FROM duckdb_indexes() WHERE index_name = 'ix_orders_customer' ORDER BY 1",
+      );
+      expect(shared.rows).toEqual([{ schema_name: "analytics" }, { schema_name: "main" }]);
+
+      // A PRIMARY KEY writes NO `duckdb_indexes()` row on this engine, which is why the
+      // index listing needs no exclusion. The control for that claim, read directly:
+      const indexes = await provider.query("SELECT COUNT(*) AS n FROM duckdb_indexes() WHERE is_primary");
+      expect(indexes.rows).toEqual([{ n: "0" }]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("describes a view's columns, and a macro and a sequence with no round trip", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      expect(await provider.describeObject(["memory", "main", "customer_names"], "view")).toEqual({
+        path: ["memory", "main", "customer_names"],
+        columns: [{ name: "name", type: "VARCHAR", nullable: true, isPrimary: false }],
+        indexes: [],
+        foreignKeys: [],
+      });
+
+      // A routine and a config object legitimately have no columns, and answering three
+      // empty arrays is the right answer rather than a failed read. Both are checked
+      // against a path whose SCHEMA is not `main`, so nothing here can be passing by
+      // accident on the default schema.
+      expect(await provider.describeObject(["memory", "analytics", "recent_events"], "macro")).toEqual({
+        path: ["memory", "analytics", "recent_events"],
+        columns: [],
+        indexes: [],
+        foreignKeys: [],
+      });
+      expect(await provider.describeObject(["memory", "analytics", "event_seq"], "sequence")).toEqual({
+        path: ["memory", "analytics", "event_seq"],
+        columns: [],
+        indexes: [],
+        foreignKeys: [],
+      });
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("describeObject refuses an unknown kind, a wrong shape, and an object that is not there", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      await expect(provider.describeObject(["memory", "main", "orders"], "trigger")).rejects.toThrow(
+        'DuckDB declares no object kind "trigger"',
+      );
+      await expect(provider.describeObject(["memory", "orders"], "table")).rejects.toThrow(
+        'A DuckDB "table" path is [database, schema, name], received ["memory","orders"]',
+      );
+      // Zero column rows means the relation is not there: `CREATE TABLE t ()` is
+      // `Parser Error: Table must have at least one column!` on this engine, so an empty
+      // `columns` array would render a dropped table as a table with no columns.
+      await expect(provider.describeObject(["memory", "main", "gone"], "table")).rejects.toThrow(
+        "No column row for memory.main.gone",
+      );
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a composite foreign key is zipped out column by column", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      await provider.query("CREATE TABLE analytics.parent (a INTEGER, b INTEGER, PRIMARY KEY (a, b))");
+      await provider.query(
+        "CREATE TABLE analytics.child (x INTEGER, y INTEGER, FOREIGN KEY (x, y) REFERENCES analytics.parent(a, b))",
+      );
+
+      const detail = await provider.describeObject(["memory", "analytics", "child"], "table");
+      expect(detail.foreignKeys).toEqual([
+        { columnName: "x", referencedTable: "analytics.parent", referencedColumn: "a" },
+        { columnName: "y", referencedTable: "analytics.parent", referencedColumn: "b" },
+      ]);
+      // The referenced table is spelled the way `getSchema()` spells it on this engine:
+      // bare in `main`, qualified anywhere else. `orders` above is the bare half.
+      expect((await provider.describeObject(["memory", "analytics", "parent"], "table")).columns).toEqual([
+        { name: "a", type: "INTEGER", nullable: false, isPrimary: true },
+        { name: "b", type: "INTEGER", nullable: false, isPrimary: true },
+      ]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("the path comparator is total: a prefix sorts before the path that extends it", () => {
+    // Asserted DIRECTLY, and the reason is worth stating rather than hiding behind a
+    // sort. Every DuckDB object of every declared kind sits at the same depth - there is
+    // no trigger here, which is the kind that put `[db, name]` and `[db, schema, table,
+    // name]` in one SQL Server folder - so no listing this provider produces can exercise
+    // the prefix arm through `listObjects`. The arm is what makes the comparator TOTAL,
+    // and a comparator that answered `undefined` for a prefix pair would be a latent
+    // defect the first time a kind on this engine has mixed depth.
+    expect(comparePaths(["a"], ["a", "b"])).toBeLessThan(0);
+    expect(comparePaths(["a", "b"], ["a"])).toBeGreaterThan(0);
+    expect(comparePaths(["a", "b"], ["a", "b"])).toBe(0);
+    // The serialised key gets the first of those backwards, which is why it is not used:
+    // `,` is 0x2C and `]` is 0x5D, so the deeper path sorts before its own prefix.
+    expect(JSON.stringify(["a", "b"]) < JSON.stringify(["a"])).toBe(true);
+  });
+
+  test("paths are ordered segment by segment, never by JSON.stringify", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      // Both names are legal DuckDB identifiers, created live to check. Raw, `"` is 0x22
+      // and sorts before `0` at 0x30; serialised, JSON rewrites `"` as `\"` and the
+      // backslash at 0x5C sorts AFTER `0`, so a `JSON.stringify` key orders these two
+      // backwards.
+      await provider.query('CREATE TABLE main."a""b" (id INTEGER)');
+      await provider.query('CREATE TABLE main."a0b" (id INTEGER)');
+
+      const names = (await provider.listObjects(["memory", "main"], "table")).map((object) => object.name);
+      expect(names.indexOf('a"b')).toBeLessThan(names.indexOf("a0b"));
+      expect(JSON.stringify(["memory", "main", 'a"b']) < JSON.stringify(["memory", "main", "a0b"])).toBe(false);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+});
+
+/**
+ * Standing ruling 5g (#789): every derivation over the declaration, pinned by handing the
+ * provider a declaration its engine does not have.
+ *
+ * This is the block the SQL Server provider (#789) recorded as unreachable there. Two
+ * derivations there could only be distinguished by an engine the fleet does not have:
+ * telling `requiredSegment(segments, "catalog")` from "the first entry of the record"
+ * needs a declaration that lists `schema` BEFORE `catalog`. A `spyOn` supplies exactly
+ * that here, and because DuckDB is embedded the swapped declaration is driven all the way
+ * to a BOUND VALUE against a real engine rather than to a refusal - which is what let the
+ * third spelling of this defect survive two providers and a review round.
+ *
+ * The fixture is what makes the bound value visible. Two ATTACHed catalogs carry each
+ * other's names as schemas, so `alpha.beta.pin` and `beta.alpha.pin` are two different
+ * real tables with two different columns: a positional read answers the wrong one rather
+ * than nothing, and the test can tell them apart by name.
+ */
+/**
+ * The bulk column read (#789), against the real embedded engine.
+ *
+ * Every assertion below is a live answer from DuckDB v1.5.5: the fixture is built by DDL
+ * in `seededObjectProvider()` and nothing here is recorded or faked.
+ */
+describe("DuckDB bulk column read", () => {
+  /**
+   * Every statement the provider sent from here on.
+   *
+   * The only way to assert "no round trip at all", which is the claim a kind with no
+   * columns makes, and the only way to assert that the round trips are CONSTANT in the
+   * number of objects rather than one per object. `spyOn` keeps the real implementation,
+   * so every answer beside the count is still the engine's.
+   */
+  function recordStatements(provider: DuckDBProvider): string[] {
+    const client = (provider as unknown as { client: { run: (sql: string, params?: unknown[]) => unknown } }).client;
+    const sent: string[] = [];
+    const real = client.run.bind(client);
+    spyOn(client, "run").mockImplementation((sql: string, params?: unknown[]) => {
+      sent.push(sql);
+      return real(sql, params);
+    });
+    return sent;
+  }
+
+  test("describes every table in a CATALOG, across both its schemas, and each detail is the single read's", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const batch = await provider.describeObjects(["memory"], "table");
+
+      expect(batch.truncated).toBeUndefined();
+      expect(batch.details.map((detail) => detail.path)).toEqual([
+        ["memory", "analytics", "customers"],
+        ["memory", "analytics", "events"],
+        ["memory", "analytics", "orders"],
+        ["memory", "main", "customers"],
+        ["memory", "main", "orders"],
+        ["memory", "main", "overlap"],
+      ]);
+      // One mapper serves both reads, so a divergence here is the bulk read spelling a
+      // column, an index or a foreign key differently from the single read of the same
+      // table - the defect two mappers cause.
+      for (const detail of batch.details) {
+        expect(detail).toEqual(await provider.describeObject(detail.path, "table"));
+      }
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("two same-named tables in two schemas keep their own columns", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      // The catalog-level read spans every schema under the catalog, so this is the case
+      // that a join on NAME alone gets wrong: `main.customers` has three columns and
+      // `analytics.customers` has one, and a merged answer would be a table with columns
+      // it does not have rather than an error anybody would notice.
+      const batch = await provider.describeObjects(["memory"], "table");
+      const byPath = new Map(batch.details.map((detail) => [detail.path.join("."), detail]));
+
+      expect(byPath.get("memory.main.customers")!.columns.map((column) => column.name)).toEqual(["id", "name", "note"]);
+      expect(byPath.get("memory.analytics.customers")!.columns.map((column) => column.name)).toEqual(["event_id"]);
+      // And the indexes land on the right table too: both schemas hold an `orders` with
+      // an index of the SAME NAME, `ix_orders_customer`, over different columns.
+      expect(byPath.get("memory.main.orders")!.indexes).toEqual([
+        { name: "ix_orders_customer", columns: ["customer_id"], unique: false },
+      ]);
+      expect(byPath.get("memory.analytics.orders")!.indexes).toEqual([
+        { name: "ix_orders_customer", columns: ["id"], unique: false },
+      ]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a SCHEMA-level read answers that schema only, and the other catalog is never merged in", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const batch = await provider.describeObjects(["memory", "main"], "table");
+
+      expect(batch.details.map((detail) => detail.path)).toEqual([
+        ["memory", "main", "customers"],
+        ["memory", "main", "orders"],
+        ["memory", "main", "overlap"],
+      ]);
+      // `warehouse.main.customers` holds one column called `sku` and shares both the
+      // schema name and the table name with `memory.main.customers`. A detail read that
+      // dropped `database_name = $1` would report a table with columns from both.
+      expect(batch.details[0]!.columns.map((column) => column.name)).toEqual(["id", "name", "note"]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a view is described from the same statements a table is", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const batch = await provider.describeObjects(["memory", "main"], "view");
+
+      expect(batch.details.map((detail) => detail.path)).toEqual([["memory", "main", "customer_names"]]);
+      expect(batch.details[0]!.columns.map((column) => column.name)).toEqual(["name"]);
+      expect(batch.details[0]!.indexes).toEqual([]);
+      expect(batch.details[0]!.foreignKeys).toEqual([]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a macro and a sequence answer an empty batch with no round trip at all", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const sent = recordStatements(provider);
+
+      await expect(provider.describeObjects(["memory"], "macro")).resolves.toEqual({ details: [] });
+      await expect(provider.describeObjects(["memory"], "sequence")).resolves.toEqual({ details: [] });
+
+      // Not "no rows came back": no statement was sent. Measured on DuckDB v1.5.5,
+      // `duckdb_columns()` holds no row at all for a sequence or a macro, so neither kind
+      // has columns on this engine and that is a fact about the KIND, answered from the
+      // declaration.
+      expect(sent).toEqual([]);
+      // The control: a kind that DOES have columns still reaches the engine.
+      await provider.describeObjects(["memory"], "view");
+      expect(sent.length).toBeGreaterThan(0);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("an undeclared kind raises, naming the engine and the kind", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      await expect(provider.describeObjects(["memory"], "trigger")).rejects.toThrow(
+        /DuckDB declares no object kind "trigger"/,
+      );
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a container path of the wrong shape raises through the declaration, not a literal depth", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      await expect(provider.describeObjects([], "table")).rejects.toThrow(
+        /A DuckDB container path is \[database\] or \[database, schema\], received \[\]/,
+      );
+      await expect(provider.describeObjects(["memory", "main", "orders"], "table")).rejects.toThrow(
+        /A DuckDB container path is \[database\] or \[database, schema\]/,
+      );
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("the container levels are read BY NAME, so reversing the declaration reverses the binds", async () => {
+    // Standing ruling 5g driven to a VALUE against a live engine. The declaration is the
+    // same two levels in the opposite order, so `container[0]` is now the SCHEMA: a
+    // positional read binds `main` as the catalog and answers nothing, while a read by
+    // level binds the same pair the right way round and the engine answers the same three
+    // tables.
+    const provider = await seededObjectProvider();
+    try {
+      spyOn(provider, "getCapabilities").mockReturnValue({
+        ...provider.getCapabilities(),
+        containerLevels: [
+          { id: "schema", label: "Schema", labelPlural: "Schemas" },
+          { id: "catalog", label: "Database", labelPlural: "Databases" },
+        ],
+      });
+
+      const batch = await provider.describeObjects(["main", "memory"], "table");
+
+      expect(batch.details.map((detail) => detail.path)).toEqual([
+        ["main", "memory", "customers"],
+        ["main", "memory", "orders"],
+        ["main", "memory", "overlap"],
+      ]);
+      expect(batch.details[0]!.columns.map((column) => column.name)).toEqual(["id", "name", "note"]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a limit that is not a positive whole number raises rather than clamping", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      for (const limit of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+        await expect(provider.describeObjects(["memory"], "table", limit)).rejects.toThrow(
+          /A DuckDB bulk column read limit must be a positive whole number/,
+        );
+      }
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a bound that bites reports the caller's own limit, and one that does not never reports", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const bounded = await provider.describeObjects(["memory"], "table", 2);
+      expect(bounded.details.map((detail) => detail.path)).toEqual([
+        ["memory", "analytics", "customers"],
+        ["memory", "analytics", "events"],
+      ]);
+      expect(bounded.truncated?.limit).toBe(2);
+      expect(bounded.truncated?.reason.length).toBeGreaterThan(0);
+      // Every bounded detail is complete, not a stub: the bound cuts OBJECTS and never
+      // columns.
+      expect(bounded.details[0]!.columns.map((column) => column.name)).toEqual(["event_id"]);
+
+      // Exactly as many as the folder holds: `limit + 1` is what the statement carries, so
+      // a saturated read is told from an exact one with no second count.
+      const exact = await provider.describeObjects(["memory"], "table", FIXTURE_CATALOG_COUNTS.table);
+      expect(exact.details).toHaveLength(FIXTURE_CATALOG_COUNTS.table);
+      expect(exact.truncated).toBeUndefined();
+
+      const unbounded = await provider.describeObjects(["memory"], "table");
+      expect(unbounded.details).toHaveLength(FIXTURE_CATALOG_COUNTS.table);
+      expect(unbounded.truncated).toBeUndefined();
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("the engine cuts under its own order and the answer is sorted by path, and those are two different orders", async () => {
+    // The one probe that separates the two on this engine. DuckDB's `ORDER BY` runs under
+    // the UTF-8 BYTE order, where U+E000 (EE 80 80) sorts below U+1F600 (F0 9F 98 80);
+    // JavaScript compares UTF-16 code units, where the surrogate 0xD83D sorts below
+    // 0xE000. Measured on v1.5.5.
+    const provider = new DuckDBProvider(makeConfig());
+    await provider.connect();
+    try {
+      await provider.query('CREATE TABLE "\u{1F600}" (x INTEGER)');
+      await provider.query('CREATE TABLE "" (x INTEGER)');
+
+      const engineOrder = await provider.query(
+        "SELECT table_name FROM duckdb_tables() WHERE database_name = 'memory' ORDER BY table_name",
+      );
+      expect(engineOrder.rows.map((row) => (row as { table_name: string }).table_name)).toEqual(["", "\u{1F600}"]);
+
+      const batch = await provider.describeObjects(["memory", "main"], "table");
+      expect(batch.details.map((detail) => detail.path)).toEqual([
+        ["memory", "main", "\u{1F600}"],
+        ["memory", "main", ""],
+      ]);
+
+      // And the cut keeps the engine's first, which is the other one.
+      const bounded = await provider.describeObjects(["memory", "main"], "table", 1);
+      expect(bounded.details.map((detail) => detail.path)).toEqual([["memory", "main", ""]]);
+      expect(bounded.truncated?.limit).toBe(1);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("the round trips are constant in the number of objects", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const sent = recordStatements(provider);
+
+      const batch = await provider.describeObjects(["memory"], "table");
+
+      // Six objects, five statements: the target read plus the four detail reads. The
+      // single read is four statements PER OBJECT, so the alternative here was 24.
+      expect(batch.details).toHaveLength(6);
+      expect(sent).toHaveLength(5);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a composite foreign key is zipped out per column, exactly as the single read does it", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const batch = await provider.describeObjects(["memory", "main"], "table");
+      const orders = batch.details.find((detail) => detail.path[2] === "orders")!;
+
+      expect(orders.foreignKeys).toEqual([
+        { columnName: "customer_id", referencedTable: "customers", referencedColumn: "id" },
+      ]);
+      expect(orders.columns.find((column) => column.name === "id")!.isPrimary).toBe(true);
+      expect(orders.columns.find((column) => column.name === "total")!.isPrimary).toBe(false);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("an empty folder answers an empty batch rather than raising", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      // `warehouse` holds no view at all, and "this container holds none" is a true answer
+      // rather than a refusal.
+      await expect(provider.describeObjects(["warehouse"], "view")).resolves.toEqual({ details: [] });
+    } finally {
+      await provider.disconnect();
+    }
+  });
+});
+
+describe("DuckDB object paths are derived from the declaration, never from a position", () => {
+  async function crossedProvider(): Promise<DuckDBProvider> {
+    const provider = new DuckDBProvider(makeConfig());
+    await provider.connect();
+    await provider.query("ATTACH ':memory:' AS alpha");
+    await provider.query("ATTACH ':memory:' AS beta");
+    await provider.query("CREATE SCHEMA alpha.beta");
+    await provider.query("CREATE SCHEMA beta.alpha");
+    await provider.query("CREATE TABLE alpha.beta.pin (from_alpha_beta INTEGER)");
+    await provider.query("CREATE TABLE beta.alpha.pin (from_beta_alpha INTEGER)");
+    return provider;
+  }
+
+  /** The real declaration, with `containerLevels` replaced and nothing else. */
+  function withLevels(provider: DuckDBProvider, containerLevels: ProviderCapabilities["containerLevels"]): void {
+    const real = new DuckDBProvider(makeConfig()).getCapabilities();
+    spyOn(provider, "getCapabilities").mockReturnValue({ ...real, containerLevels });
+  }
+
+  test("the crossed fixture really does hold two different tables at the two spellings", async () => {
+    const provider = await crossedProvider();
+    try {
+      // The control for everything below. Without it a positional read and a derived one
+      // could agree by accident, and the pin would certify nothing.
+      expect((await provider.describeObject(["alpha", "beta", "pin"], "table")).columns.map((c) => c.name)).toEqual([
+        "from_alpha_beta",
+      ]);
+      expect((await provider.describeObject(["beta", "alpha", "pin"], "table")).columns.map((c) => c.name)).toEqual([
+        "from_beta_alpha",
+      ]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a declaration listing schema BEFORE catalog moves every read with it", async () => {
+    const provider = await crossedProvider();
+    try {
+      withLevels(provider, [
+        { id: "schema", label: "Schema", labelPlural: "Schemas" },
+        { id: "catalog", label: "Database", labelPlural: "Databases" },
+      ]);
+
+      // `["beta", "alpha", "pin"]` now means schema `beta` in catalog `alpha`, so the
+      // object it addresses is `alpha.beta.pin` and its column is `from_alpha_beta`. A
+      // provider binding `path[0]` as the catalog answers `from_beta_alpha` here, which is
+      // a different real table rather than an error - exactly the silent case this ruling
+      // exists for.
+      const detail = await provider.describeObject(["beta", "alpha", "pin"], "table");
+      expect(detail.columns.map((column) => column.name)).toEqual(["from_alpha_beta"]);
+
+      // The container reads move with it too, and the path a listing CONSTRUCTS is
+      // written in the declared order so `describeObject` reads it back as the same
+      // object. The round trip is what the conformance helper does.
+      expect(await provider.countObjects(["beta", "alpha"])).toMatchObject({ table: { count: 1 } });
+      const listed = await provider.listObjects(["beta", "alpha"], "table");
+      expect(listed.map((object) => object.path)).toEqual([["beta", "alpha", "pin"]]);
+      expect((await provider.describeObject(listed[0].path, "table")).columns.map((c) => c.name)).toEqual([
+        "from_alpha_beta",
+      ]);
+
+      // And the refusal names the declared LABELS in the declared order, so a person
+      // reading it is told the shape this declaration actually accepts.
+      await expect(provider.describeObject(["alpha", "pin"], "table")).rejects.toThrow(
+        'A DuckDB "table" path is [schema, database, name], received ["alpha","pin"]',
+      );
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("container depth is derived, so a ONE-level declaration binds one segment and refuses two", async () => {
+    const provider = await crossedProvider();
+    try {
+      withLevels(provider, [{ id: "catalog", label: "Database", labelPlural: "Databases" }]);
+
+      // Driven to a BOUND VALUE, not to a refusal: at one level the whole catalog is the
+      // container, so the count covers both schemas of `alpha` and the listing carries
+      // two-segment paths. A provider that cut the path at a literal 2 would bind
+      // `schema_name = undefined` and answer nothing.
+      await provider.query("CREATE TABLE alpha.main.extra (id INTEGER)");
+      expect(await provider.countObjects(["alpha"])).toMatchObject({ table: { count: 2 } });
+      expect((await provider.listObjects(["alpha"], "table")).map((object) => object.path)).toEqual([
+        ["alpha", "extra"],
+        ["alpha", "pin"],
+      ]);
+
+      // Nothing nests under the last declared level, whichever level that is.
+      expect(await provider.listContainers(["alpha"])).toEqual([]);
+      // A two-segment container is now one segment too long, and the message says so in
+      // the declaration's own words.
+      await expect(provider.countObjects(["alpha", "beta"])).rejects.toThrow(
+        'A DuckDB container path is [database], received ["alpha","beta"]',
+      );
+      // And a detail read has no schema segment to bind at all, so it raises NAMING the
+      // level rather than binding `undefined`, which this driver answers with
+      // "Cannot create values of type ANY" - a sentence about neither the level nor the
+      // path.
+      await expect(provider.describeObject(["alpha", "pin"], "table")).rejects.toThrow(
+        "DuckDB declares no schema level to read this path's segment from",
+      );
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a declaration carrying MORE levels than the model has is cut to the declared depth", async () => {
+    const provider = await crossedProvider();
+    try {
+      // `containerDepth()` answers at most 2 and is the ONLY reader of how deep a
+      // declaration goes (standing ruling 1, #789): `containerLevels.length` is not. A
+      // third entry must therefore widen nothing - not the accepted container shapes, not
+      // the segment lookup, not the object path. Behaviour-identical to the cut version on
+      // every real declaration in the fleet, which is exactly why it needs pinning here.
+      // Cast, because `ContainerLevels` is a two-level tuple union since #789 and a third
+      // level is now a compile error where a provider would write one. The RUNTIME rule is
+      // what this pins, and it has to be reachable from a declaration the type forbids.
+      withLevels(provider, [
+        { id: "catalog", label: "Database", labelPlural: "Databases" },
+        { id: "schema", label: "Schema", labelPlural: "Schemas" },
+        { id: "schema", label: "Sub-schema", labelPlural: "Sub-schemas" },
+      ] as unknown as ProviderCapabilities["containerLevels"]);
+
+      await expect(provider.countObjects(["alpha", "beta", "extra"])).rejects.toThrow(
+        'A DuckDB container path is [database] or [database, schema], received ["alpha","beta","extra"]',
+      );
+      // And the reads that DO have a valid shape still answer, so the refusal above is the
+      // depth cut rather than the whole declaration being rejected.
+      expect(await provider.countObjects(["alpha", "beta"])).toMatchObject({ table: { count: 1 } });
+      expect((await provider.listObjects(["alpha", "beta"], "table")).map((object) => object.path)).toEqual([
+        ["alpha", "beta", "pin"],
+      ]);
+      expect(await provider.listContainers(["alpha", "beta"])).toEqual([]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  /**
+   * The SOURCE read's own derivation pin (recipe rule 9, #789).
+   *
+   * A declaration that is ALREADY two-level makes the standing-ruling-5g `spyOn` pass for an
+   * implementation hardcoding `catalog = path[0]` and `schema = path[1]`, because the
+   * swapped-in declaration matches the real one. Task 9 (mssql) named the answer: a SECOND
+   * declaration that swaps the two levels OVER and feeds a path in the swapped order, where
+   * the same three values must still reach the server. Both are written here, and both are
+   * driven to a BOUND VALUE against a real engine rather than to a refusal.
+   *
+   * The crossed fixture is what makes the bound value visible: `alpha.beta.pin` and
+   * `beta.alpha.pin` are two different real tables, so a positional read answers the WRONG
+   * DEFINITION rather than nothing, and the column name inside the text tells them apart.
+   */
+  test("the SOURCE read binds the container by level, under the real declaration and under a swapped one", async () => {
+    const provider = await crossedProvider();
+    try {
+      const definition = async (target: readonly string[]): Promise<string> => {
+        const [part] = (await provider.readObjectSource!(target, "table")).parts;
+        if (isSourcePartUnavailable(part)) throw new Error("narrowing");
+        return part.text;
+      };
+
+      // The control, under the declaration DuckDB really ships. Without it a positional read
+      // and a derived one could agree by accident and the pin would certify nothing.
+      expect(await definition(["alpha", "beta", "pin"])).toContain("from_alpha_beta");
+      expect(await definition(["beta", "alpha", "pin"])).toContain("from_beta_alpha");
+
+      withLevels(provider, [
+        { id: "schema", label: "Schema", labelPlural: "Schemas" },
+        { id: "catalog", label: "Database", labelPlural: "Databases" },
+      ]);
+
+      // `["beta", "alpha", "pin"]` now means schema `beta` in catalog `alpha`, so the object
+      // it addresses is `alpha.beta.pin`. A provider binding `path[0]` as the catalog answers
+      // `from_beta_alpha` here, which is a different real table rather than an error.
+      expect(await definition(["beta", "alpha", "pin"])).toContain("from_alpha_beta");
+      expect(await definition(["alpha", "beta", "pin"])).toContain("from_beta_alpha");
+      // The absence message names the container in the DECLARED order too, so a reader is
+      // told which object was looked for rather than which position was read.
+      await expect(provider.readObjectSource!(["beta", "alpha", "gone"], "table")).rejects.toThrow(
+        "No DuckDB table named gone in alpha.beta",
+      );
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a ONE-level declaration leaves the SOURCE read no schema to bind, and it says so", async () => {
+    const provider = await crossedProvider();
+    try {
+      withLevels(provider, [{ id: "catalog", label: "Database", labelPlural: "Databases" }]);
+
+      // Two segments is the whole path shape at one level, so the shape check passes and the
+      // read reaches the segment lookup, which raises NAMING the level rather than binding
+      // `undefined` - which this driver answers with "Cannot create values of type ANY", a
+      // sentence about neither the level nor the path.
+      await expect(provider.readObjectSource!(["alpha", "pin"], "table")).rejects.toThrow(
+        "DuckDB declares no schema level to read this path's segment from",
+      );
+      // And a three-segment path is now one segment too long, refused in the declaration's
+      // own words.
+      await expect(provider.readObjectSource!(["alpha", "beta", "pin"], "table")).rejects.toThrow(
+        'A DuckDB "table" path is [database, name], received ["alpha","beta","pin"]',
+      );
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a kind declaring attachedTo is refused, because DuckDB holds no attached object", async () => {
+    const provider = await crossedProvider();
+    try {
+      // DuckDB has no trigger and no other object that hangs off another, and the four
+      // statements here address a schema and a name. A provider that produced the extra
+      // segment anyway would draw a folder whose every path resolves to nothing, so the
+      // refusal names the declaration rather than the read.
+      const real = new DuckDBProvider(makeConfig()).getCapabilities();
+      spyOn(provider, "getCapabilities").mockReturnValue({
+        ...real,
+        objectKinds: [
+          { id: "trigger", role: "attached", label: "Trigger", labelPlural: "Triggers", attachedTo: "table" },
+        ],
+      });
+      await expect(provider.describeObject(["alpha", "beta", "pin", "stamp"], "trigger")).rejects.toThrow(
+        'DuckDB holds no object attached to another, so the kind "trigger" cannot declare attachedTo "table"',
+      );
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a declaration with NO container level refuses every container path", async () => {
+    const provider = await crossedProvider();
+    try {
+      withLevels(provider, []);
+      // `containerDepth()` reads absent and empty as the same zero, so there is no shape
+      // at all and the message says so rather than accepting `[]` as "the root".
+      await expect(provider.countObjects([])).rejects.toThrow(
+        "A DuckDB container path is nothing: this declaration carries no container level, received []",
+      );
+      expect(await provider.listContainers(["alpha"])).toEqual([]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+});
+
+/**
+ * The object SOURCE read (#789), against the real embedded engine.
+ *
+ * Every text asserted below is DuckDB v1.5.5's own answer over
+ * `docker/duckdb-init/01-object-fixture.sql`, so a reader can rebuild the database these
+ * assertions were taken from with one command.
+ */
+describe("DuckDB object source", () => {
+  /**
+   * One entry per source-bearing kind, and the POPULATION is checked against the
+   * DECLARATION rather than trusted (recipe rule 6, #789).
+   *
+   * Task 8 measured the failure this shape exists for: a wrong reply COLUMN reads as
+   * `undefined`, the provider correctly turns that into a REFUSAL, and a refusal passes the
+   * conformance walk, passes a whole-statement pin and passes every count and length
+   * assertion. Only reading the TEXT per kind notices. So the text is pinned whole, and the
+   * kinds are taken from `getCapabilities()` so a kind that gains `hasSource` without an
+   * entry here fails by name instead of going unread.
+   */
+  const EXPECTED_SOURCE: Readonly<
+    Record<string, { readonly path: readonly string[]; readonly text: string; readonly form: ObjectSourceForm }>
+  > = {
+    table: {
+      path: ["memory", "main", "orders"],
+      text:
+        "CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, total DECIMAL(12,2), " +
+        "FOREIGN KEY (customer_id) REFERENCES customers(id));",
+      form: "complete",
+    },
+    view: {
+      path: ["memory", "main", "customer_names"],
+      text: 'CREATE VIEW customer_names AS SELECT "name" FROM main.customers;',
+      form: "complete",
+    },
+    sequence: {
+      path: ["memory", "main", "customer_seq"],
+      text: "CREATE SEQUENCE customer_seq INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START 1 NO CYCLE;",
+      form: "complete",
+    },
+    macro: {
+      path: ["memory", "analytics", "recent_events"],
+      text: "SELECT * FROM analytics.events LIMIT n",
+      form: "partial",
+    },
+  };
+
+  /** Replace the reply to the SOURCE statement only, leaving every other read real. */
+  function answerSourceReadWith(provider: DuckDBProvider, rows: Record<string, unknown>[]): void {
+    const client = (
+      provider as unknown as {
+        client: { run: (sql: string, params?: unknown[]) => Promise<{ rows: Record<string, unknown>[] }> };
+      }
+    ).client;
+    const real = client.run.bind(client);
+    spyOn(client, "run").mockImplementation(async (sql: string, params?: unknown[]) =>
+      sql.includes("AS definition")
+        ? { columnNames: ["definition"], columnTypes: ["VARCHAR"], rows, rowsChanged: 0 }
+        : real(sql, params),
+    );
+  }
+
+  test("reads the definition of every source-bearing kind and says what each text is", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const kinds = (provider.getCapabilities().objectKinds ?? []).filter((kind) => kind.hasSource === true);
+      // The population, not a number typed into this test. Zero source-bearing kinds would
+      // otherwise make the loop below certify nothing at all.
+      expect(kinds.map((kind) => kind.id).sort()).toEqual(Object.keys(EXPECTED_SOURCE).sort());
+
+      for (const kind of kinds) {
+        const expectation = EXPECTED_SOURCE[kind.id];
+        const document = await provider.readObjectSource!(expectation.path, kind.id);
+
+        expect(document.path).toEqual(expectation.path);
+        expect(document.kind).toBe(kind.id);
+        expect(document.parts).toHaveLength(1);
+        const [part] = document.parts;
+        expect(isSourcePartUnavailable(part)).toBe(false);
+        if (isSourcePartUnavailable(part)) throw new Error("narrowing");
+        // WHOLE, not a substring. A refusal, a truncation and a neighbouring object's text
+        // all satisfy `toContain`, and two of the three are exactly what a wrong bind
+        // produces here.
+        expect(part.text).toBe(expectation.text);
+        expect(part.id).toBe("definition");
+        expect(part.label).toBe("Definition");
+        expect(part.language).toBe("sql");
+        expect(part.form).toBe(expectation.form);
+        // Every kind, including the three that look like the author's own statement.
+        // Measured: `CREATE TABLE main.customers (... note VARCHAR DEFAULT 'none')` comes
+        // back as `note VARCHAR DEFAULT('none')` with `name` quoted and the inline
+        // REFERENCES rewritten into a table-level FOREIGN KEY, so none of this is stored
+        // bytes.
+        expect(part.origin).toBe("regenerated");
+        // And it came off the per-kind RECORD rather than out of a literal in the read.
+        // `form` and `origin` are the same shape of fact, so a fifth kind whose text really
+        // were stored bytes has one place to say so. With all four kinds sharing one origin
+        // today, this equality is what makes a record change visible in the read at all.
+        expect(part.origin).toBe(objectSourceOrigin(kind.id));
+        expect(part.truncated).toBeUndefined();
+      }
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  /**
+   * The macro is this ENGINE's one `partial` kind, so the arm has a test of its own.
+   *
+   * Not the fleet's: the #789 design names PostgreSQL `view` and `materialized_view` and
+   * Couchbase `function` as producers of the same arm, and `postgres.ts` already answers it.
+   * What this test guards is local and worth guarding anyway: if the macro answered
+   * `complete` like the other three kinds, nothing in this suite would distinguish a body
+   * from a statement and the Source caption's distinction would be decoration HERE. Both
+   * macro FORMS are read, because `macro_definition` is a body in two different shapes.
+   */
+  test("a macro publishes a BODY and never a CREATE MACRO statement, in both macro forms", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const [scalar] = (await provider.readObjectSource!(["memory", "main", "add_one"], "macro")).parts;
+      const [table] = (await provider.readObjectSource!(["memory", "analytics", "recent_events"], "macro")).parts;
+      if (isSourcePartUnavailable(scalar) || isSourcePartUnavailable(table)) throw new Error("narrowing");
+
+      expect(scalar.text).toBe("(x + 1)");
+      expect(table.text).toBe("SELECT * FROM analytics.events LIMIT n");
+      expect(scalar.form).toBe("partial");
+      expect(table.form).toBe("partial");
+      // The negative that makes `partial` mean something: neither carries the statement a
+      // user could copy and run.
+      expect(scalar.text).not.toContain("CREATE MACRO");
+      expect(table.text).not.toContain("CREATE MACRO");
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  /**
+   * The KIND argument is load-bearing, and this fixture is what proves it.
+   *
+   * Measured on v1.5.5: a table, a sequence and a macro can all be called `overlap` in one
+   * schema. A read keyed on the path alone answers one of the three at random, which is one
+   * of the three engines that made `kind` a required argument of `readObjectSource`.
+   */
+  test("one name addresses three different definitions, and the kind picks which", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const texts = await Promise.all(
+        (["table", "sequence", "macro"] as const).map(async (kind) => {
+          const [part] = (await provider.readObjectSource!(["memory", "main", "overlap"], kind)).parts;
+          if (isSourcePartUnavailable(part)) throw new Error("narrowing");
+          return part.text;
+        }),
+      );
+
+      expect(texts).toEqual([
+        "CREATE TABLE overlap(id INTEGER);",
+        "CREATE SEQUENCE overlap INCREMENT BY 1 MINVALUE 1 MAXVALUE 9223372036854775807 START 1 NO CYCLE;",
+        "x",
+      ]);
+      expect(new Set(texts).size).toBe(3);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  /**
+   * The statement per kind, pinned WHOLE (recipe rule 6 and the Task 6 measurement, #789).
+   *
+   * Enumerating tokens closes the members somebody thought of; one whole-statement equality
+   * per kind closes the class. The catalog function, both container binds, the macro
+   * predicate and the name bind are all inside one string here.
+   */
+  test("the source statement per kind is the shared container filter plus the name bind", () => {
+    expect(objectSourceSql("table")).toBe(
+      "SELECT sql AS definition\n" +
+        "      FROM duckdb_tables()\n" +
+        "      WHERE database_name = $1 AND schema_name = $2 AND table_name = $3",
+    );
+    expect(objectSourceSql("view")).toBe(
+      "SELECT sql AS definition\n" +
+        "      FROM duckdb_views()\n" +
+        "      WHERE database_name = $1 AND schema_name = $2 AND view_name = $3",
+    );
+    expect(objectSourceSql("sequence")).toBe(
+      "SELECT sql AS definition\n" +
+        "      FROM duckdb_sequences()\n" +
+        "      WHERE database_name = $1 AND schema_name = $2 AND sequence_name = $3",
+    );
+    expect(objectSourceSql("macro")).toBe(
+      "SELECT macro_definition AS definition\n" +
+        "      FROM duckdb_functions()\n" +
+        "      WHERE database_name = $1 AND schema_name = $2 AND function_type IN ('macro', 'table_macro') " +
+        "AND function_name = $3",
+    );
+    // A kind DuckDB does not have has no catalog function, and the builder says so rather
+    // than interpolating an undefined relation into a statement.
+    expect(() => objectSourceSql("procedure")).toThrow(
+      'DuckDB declares the kind "procedure" but has no catalog function that answers for it',
+    );
+  });
+
+  /**
+   * `form` and `origin` per kind, both read off the record the statement is built from.
+   *
+   * They are the same shape of fact: a per-kind statement about the text that kind's
+   * catalog column publishes. `origin` was a bare literal in the read until this round, and
+   * the failure that invites is a fifth kind whose text really is stored bytes, added with
+   * a `definitionColumn` and a `definitionForm` because that is where the pattern points,
+   * and nothing in the record able to correct the origin the read hardcodes.
+   */
+  test("form and origin are per-kind facts, declared beside the statement", () => {
+    expect(objectSourceForm("table")).toBe("complete");
+    expect(objectSourceForm("view")).toBe("complete");
+    expect(objectSourceForm("sequence")).toBe("complete");
+    expect(objectSourceForm("macro")).toBe("partial");
+    // Measured on v1.5.5, all four: DuckDB rebuilds every one of these texts from its own
+    // catalog. There is no kind here whose stored bytes survive.
+    expect(objectSourceOrigin("table")).toBe("regenerated");
+    expect(objectSourceOrigin("view")).toBe("regenerated");
+    expect(objectSourceOrigin("sequence")).toBe("regenerated");
+    expect(objectSourceOrigin("macro")).toBe("regenerated");
+    expect(() => objectSourceOrigin("procedure")).toThrow(
+      'DuckDB declares the kind "procedure" but has no catalog function that answers for it',
+    );
+  });
+
+  test("a missing name is ABSENCE and raises naming the object, in every source-bearing kind", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const kinds = (provider.getCapabilities().objectKinds ?? []).filter((kind) => kind.hasSource === true);
+      expect(kinds.length).toBeGreaterThan(0);
+
+      for (const kind of kinds) {
+        await expect(provider.readObjectSource!(["memory", "main", "no_such_object"], kind.id)).rejects.toThrow(
+          new RegExp(`No DuckDB ${kind.id} named no_such_object in memory\\.main`),
+        );
+      }
+      // The other half of absence on a two-level engine: the object exists, in another
+      // CATALOG. A read that dropped `database_name = $1` would answer the neighbour's
+      // definition rather than raising.
+      await expect(provider.readObjectSource!(["warehouse", "main", "orders"], "table")).rejects.toThrow(
+        /No DuckDB table named orders in warehouse\.main/,
+      );
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("the caller's bound cuts the text and says so, and an exact answer is never marked", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const path = EXPECTED_SOURCE.sequence.path;
+      const [whole] = (await provider.readObjectSource!(path, "sequence")).parts;
+      if (isSourcePartUnavailable(whole)) throw new Error("narrowing");
+
+      const [cut] = (await provider.readObjectSource!(path, "sequence", 20)).parts;
+      if (isSourcePartUnavailable(cut)) throw new Error("narrowing");
+      expect(cut.text).toBe(whole.text.slice(0, 20));
+      expect(cut.truncated).toEqual({
+        limit: 20,
+        reason: sourceBoundTruncationReason(20),
+      });
+
+      const exact = (await provider.readObjectSource!(path, "sequence", whole.text.length)).parts[0];
+      if (isSourcePartUnavailable(exact)) throw new Error("narrowing");
+      expect(exact.text).toBe(whole.text);
+      expect(exact.truncated).toBeUndefined();
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  /**
+   * Every refusal shape this read can build, driven anyway, one test each below.
+   *
+   * No count is written here: the tests below ARE the inventory, one per arm of
+   * `blankDefinitionShape()`, so a numeral beside them could only agree or go stale.
+   *
+   * NONE OF THEM WAS OBSERVED ON A LIVE ENGINE, and the measurement reaches only the two
+   * shapes that are facts about the ROW. Measured on v1.5.5: zero `duckdb_tables()` rows,
+   * zero of 47 `duckdb_views()` rows, zero `duckdb_sequences()` rows and zero of 136 macros
+   * carry a NULL or whitespace-only text, and even `CREATE MACRO no_body() AS NULL` publishes
+   * the four characters `NULL`. So `docs/providers/duckdb.md` states the absence of a refusal
+   * as a CANNOT. The remaining shapes are facts about the READ, a reply carrying no definition
+   * column at all and the driver handing that column back as something other than a text, and
+   * no scan of the engine's own rows could have observed either of those. The arms exist
+   * anyway, because an empty definition must never reach an editor as a definition.
+   *
+   * EVERY ONE ASSERTS `Object.hasOwn(part, "text") === false`, which is recipe rule 8
+   * (#789): a part carrying BOTH keys narrows to the refusal arm and carries the sentence
+   * too, so a test that only asserts `part.unavailable` is satisfied by a hybrid that would
+   * put a refusal over a definition the engine really returned.
+   */
+  test("a NULL definition becomes a refusal part rather than an empty text", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      answerSourceReadWith(provider, [{ definition: null }]);
+      const [part] = (await provider.readObjectSource!(["memory", "main", "orders"], "table")).parts;
+
+      expect(isSourcePartUnavailable(part)).toBe(true);
+      if (!isSourcePartUnavailable(part)) throw new Error("narrowing");
+      expect(Object.hasOwn(part, "text")).toBe(false);
+      expect(part.unavailable).toContain("whose sql is NULL");
+      expect(part.unavailable).toContain('for the table "orders"');
+      expect(part.unavailable).toContain("nothing here was observed to produce a NULL");
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a whitespace-only definition is refused too, and is NOT reported as a NULL", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      answerSourceReadWith(provider, [{ definition: "  \n \t " }]);
+      const [part] = (await provider.readObjectSource!(["memory", "main", "add_one"], "macro")).parts;
+
+      expect(isSourcePartUnavailable(part)).toBe(true);
+      if (!isSourcePartUnavailable(part)) throw new Error("narrowing");
+      expect(Object.hasOwn(part, "text")).toBe(false);
+      // The COLUMN named is the macro's own, not the `sql` the other three kinds read.
+      expect(part.unavailable).toContain("whose macro_definition holds no non-whitespace character");
+      expect(part.unavailable).not.toContain("is NULL");
+      expect(part.unavailable).not.toContain("no macro_definition column at all");
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  /**
+   * A definition the driver did not map to a text is its OWN shape, not a NULL (#789).
+   *
+   * `ObjectSourceRow.definition` is typed `unknown` precisely because this reply is not
+   * trusted to be a string or a null: `@duckdb/node-api` already hands a BIGINT `COUNT(*)`
+   * back as a decimal STRING, so its JS mapping is not stable across column types, and a
+   * future mapping change on a catalog column would put a number, a Date or an object here.
+   * Folding that into the NULL arm produces a sentence that is FALSE for the shape in front
+   * of it and then goes on to assert that the engine was measured never to produce a NULL,
+   * which teaches the reader the provider is confused rather than that the driver changed.
+   */
+  test("a definition that is neither a text nor NULL is refused as its own shape", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      answerSourceReadWith(provider, [{ definition: 42 }]);
+      const [part] = (await provider.readObjectSource!(["memory", "main", "orders"], "table")).parts;
+
+      expect(isSourcePartUnavailable(part)).toBe(true);
+      if (!isSourcePartUnavailable(part)) throw new Error("narrowing");
+      expect(Object.hasOwn(part, "text")).toBe(false);
+      expect(part.unavailable).toContain('for the table "orders"');
+      // The driver's own mapping is named, because that is the only thing that can be
+      // acted on: the column IS there and it does hold a value.
+      expect(part.unavailable).toContain('whose sql came back as the JavaScript type "number" rather than a text');
+      expect(part.unavailable).toContain("a fact about this read and not about the object");
+      // The two sentences this shape must NOT borrow.
+      expect(part.unavailable).not.toContain("is NULL");
+      expect(part.unavailable).not.toContain("no sql column at all");
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a reply carrying no definition column at all becomes a refusal that names the READ", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      answerSourceReadWith(provider, [{}]);
+      const [part] = (await provider.readObjectSource!(["memory", "main", "customer_names"], "view")).parts;
+
+      expect(isSourcePartUnavailable(part)).toBe(true);
+      if (!isSourcePartUnavailable(part)) throw new Error("narrowing");
+      expect(Object.hasOwn(part, "text")).toBe(false);
+      // This arm is the defect recipe rule 6 exists for, so its sentence sends a reader to
+      // the statement rather than to the object.
+      expect(part.unavailable).toContain("with no sql column at all");
+      expect(part.unavailable).toContain("a fact about this read and not about the object");
+      expect(part.unavailable).not.toContain("is NULL");
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  /**
+   * The three guards a correct DECLARATION cannot reach, driven through the declaration.
+   *
+   * None is reachable with the four kinds DuckDB really declares, and a `spyOn` on
+   * `getCapabilities` is the only seam that reaches them. Reaching them is what says the
+   * guards are live rather than merely covered.
+   */
+  test("a kind that is not source-bearing, or is under-declared, raises by name", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const real = provider.getCapabilities();
+      const withKind = (extra: ObjectKindSpec) =>
+        spyOn(provider, "getCapabilities").mockReturnValue({
+          ...real,
+          objectKinds: [...(real.objectKinds ?? []), extra],
+        });
+
+      const noSource = withKind({ id: "secret", role: "config", label: "Secret", labelPlural: "Secrets" });
+      try {
+        await expect(provider.readObjectSource!(["memory", "main", "x"], "secret")).rejects.toThrow(
+          /DuckDB publishes no definition text for the kind "secret"/,
+        );
+      } finally {
+        noSource.mockRestore();
+      }
+
+      const noLanguage = withKind({
+        id: "secret",
+        role: "config",
+        label: "Secret",
+        labelPlural: "Secrets",
+        hasSource: true,
+      });
+      try {
+        await expect(provider.readObjectSource!(["memory", "main", "x"], "secret")).rejects.toThrow(
+          /declares readable source for the kind "secret" and no sourceLanguage/,
+        );
+      } finally {
+        noLanguage.mockRestore();
+      }
+
+      const noStatement = withKind({
+        id: "secret",
+        role: "config",
+        label: "Secret",
+        labelPlural: "Secrets",
+        hasSource: true,
+        sourceLanguage: "sql",
+      });
+      try {
+        await expect(provider.readObjectSource!(["memory", "main", "x"], "secret")).rejects.toThrow(
+          /DuckDB declares the kind "secret" but has no catalog function that answers for it/,
+        );
+      } finally {
+        noStatement.mockRestore();
+      }
+
+      // And a kind the declaration does not carry at all.
+      await expect(provider.readObjectSource!(["memory", "main", "x"], "procedure")).rejects.toThrow(
+        /DuckDB declares no object kind "procedure"/,
+      );
+    } finally {
+      await provider.disconnect();
+    }
+  });
+});
+
+/**
+ * Standing ruling 5a (#789): the macro vocabulary enumerates the ENGINE, not the fixture.
+ *
+ * Task 10 derived a `TABLE_TYPE` vocabulary from `SELECT DISTINCT` over its own fixture,
+ * and a spelling the engine can produce that the fixture lacked fell out of the count AND
+ * the listing together - so ruling 5f still held while the object was invisible in the
+ * tree. Here the vocabulary comes from DuckDB's two documented macro forms, and this test
+ * is the guard that it still accounts for every `function_type` the engine publishes.
+ *
+ * The engine is embedded, so this needs no separate live script the way MySQL's
+ * `CATALOG_TYPE_RULES` does: the instance under test IS the live server, and it ships
+ * ~2950 built-in functions covering every `function_type` DuckDB has.
+ */
+describe("the macro vocabulary against duckdb_functions()", () => {
+  test("every function_type the engine publishes is either a macro form or an explained exclusion", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      const result = await provider.query("SELECT DISTINCT function_type FROM duckdb_functions() ORDER BY 1");
+      const live = result.rows.map((row) => (row as { function_type: string }).function_type);
+
+      // Non-vacuity: the engine really did answer, and it really does carry both macro
+      // forms - the fixture's own `add_one` is a scalar macro and `recent_events` a table
+      // macro, so neither arm can rot into the other unnoticed.
+      expect(live.length).toBeGreaterThan(4);
+      expect(live).toContain("macro");
+      expect(live).toContain("table_macro");
+
+      const accounted = [...FUNCTION_TYPE_RULES.macros, ...Object.keys(FUNCTION_TYPE_RULES.excluded)];
+      expect([...live].sort()).toEqual([...accounted].sort());
+      // The two halves are disjoint, so a spelling cannot be counted and excluded at once.
+      expect(FUNCTION_TYPE_RULES.macros.filter((type) => type in FUNCTION_TYPE_RULES.excluded)).toEqual([]);
+      // Every exclusion carries a reason rather than sitting in a bare list.
+      for (const reason of Object.values(FUNCTION_TYPE_RULES.excluded)) expect(reason.length).toBeGreaterThan(10);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+
+  test("a built-in function is never listed as a macro of a user catalog", async () => {
+    const provider = await seededObjectProvider();
+    try {
+      // Every one of DuckDB's own functions lives in the `system` catalog, which is what
+      // makes the `database_name` filter sufficient and the macro read need no `internal`
+      // predicate of its own. Measured here rather than claimed.
+      const elsewhere = await provider.query(
+        "SELECT COUNT(*) AS n FROM duckdb_functions() WHERE internal AND database_name <> 'system'",
+      );
+      expect(elsewhere.rows).toEqual([{ n: "0" }]);
+      // The control: there really are thousands of internal functions to have leaked.
+      const internal = await provider.query("SELECT COUNT(*) AS n FROM duckdb_functions() WHERE internal");
+      expect(Number((internal.rows[0] as { n: string }).n)).toBeGreaterThan(2000);
+
+      expect((await provider.listObjects(["memory"], "macro")).map((object) => object.name)).toEqual([
+        "recent_events",
+        "add_one",
+        "overlap",
+      ]);
+    } finally {
+      await provider.disconnect();
+    }
+  });
+});
+
+/**
+ * Three facts the fixture cannot distinguish, asserted on the STATEMENT instead.
+ *
+ * Each one is a predicate that is redundant against THIS engine's data and load-bearing
+ * against the engine's contract, which is exactly the case standing ruling 5g's last
+ * paragraph asks to be stated rather than reported as an unavailable mutation.
+ */
+describe("DuckDB object statements: what the fixture cannot show", () => {
+  const KINDS = [
+    { id: "table", role: "relation" as const, label: "Table", labelPlural: "Tables" },
+    { id: "macro", role: "routine" as const, label: "Macro", labelPlural: "Macros" },
+  ];
+
+  test("the macro reads carry the function_type vocabulary, in the count and in the listing alike", () => {
+    // DuckDB has no CREATE FUNCTION, so every non-internal `duckdb_functions()` row in a
+    // user catalog is already a macro and dropping this predicate changes no count the
+    // fixture can produce. It stays because the vocabulary is what ruling 5a is about: it
+    // is the only thing that would keep a future non-macro user function out of the Macros
+    // folder, and it is what makes the two macro FORMS explicit rather than incidental.
+    const expected = "function_type IN ('macro', 'table_macro')";
+    expect(listObjectsSql("macro", false)).toContain(expected);
+    expect(listObjectsSql("macro", true)).toContain(expected);
+    expect(countsSql(KINDS, false)).toContain(expected);
+    expect(countsSql(KINDS, true)).toContain(expected);
+    // And it is the MACRO arm that carries it, not every arm: the table arm has no
+    // function_type at all, so the assertion above cannot be satisfied by a predicate
+    // pasted across the whole statement.
+    const tableArm = countsSql(KINDS, false).split("UNION ALL")[0];
+    expect(tableArm).toContain("duckdb_tables()");
+    expect(tableArm).not.toContain("function_type");
+  });
+
+  test("the counts statement binds one catalog once, across every arm", () => {
+    // The numbered form is why: `$1` reused across a UNION ALL takes ONE parameter, while
+    // a positional `?` would need one copy per arm and the arity would shift silently the
+    // moment a kind was added or removed.
+    const sql = countsSql(KINDS, true);
+    expect(sql.match(/\$1/g)).toHaveLength(2);
+    expect(sql.match(/\$2/g)).toHaveLength(2);
+    expect(sql).not.toContain("?");
+    expect(countsSql(KINDS, false)).not.toContain("$2");
+  });
+
+  test("the bulk target orders by schema and name, which no fixture on this engine can prove", () => {
+    // Standing ruling 5a asks for the fixture that would DISPROVE a statement-shape pin
+    // before the pin is accepted. It was built and it does not disprove it: five tables
+    // created in the order `main.zz, main.aa, analytics.mm, analytics.bb, main.cc` come
+    // back from a bare `SELECT ... FROM duckdb_tables()` as
+    // `analytics.bb, analytics.mm, main.aa, main.cc, main.zz`, because DuckDB walks its
+    // catalog's sorted maps. So no data this engine can hold separates the ordered
+    // statement from the unordered one, and the `ORDER BY` is pinned by TEXT.
+    //
+    // It stays because the order is what decides WHICH objects a bound keeps, and the
+    // natural order is an implementation detail of the catalog rather than a promise.
+    for (const bySchema of [false, true]) {
+      expect(bulkTargetSql("table", bySchema, false)).toContain("ORDER BY schema_name, name");
+      expect(bulkTargetSql("table", bySchema, true)).toContain("ORDER BY schema_name, name");
+    }
+    // The LIMIT placeholder takes the next free number after the container binds, which is
+    // one at catalog level and two at schema level.
+    expect(bulkTargetSql("table", false, true)).toContain("LIMIT $2");
+    expect(bulkTargetSql("table", true, true)).toContain("LIMIT $3");
+    expect(bulkTargetSql("table", false, false)).not.toContain("LIMIT");
+  });
+
+  test("the column read orders by column_index, which no fixture can prove", () => {
+    // DuckDB happens to answer `duckdb_columns()` in column order for a freshly written
+    // table, so dropping this ORDER BY breaks nothing measurable here. A table whose
+    // columns were rewritten by ALTER would be a different matter, and a detail row that
+    // lists a table's columns in an arbitrary order is wrong however stable the accident.
+    expect(OBJECT_COLUMNS_SQL).toContain("ORDER BY column_index");
+  });
+
+  test("every declared kind is seeded at zero before any row is read", () => {
+    // Asserted DIRECTLY, because this engine's counts statement cannot lose an arm: a
+    // `UNION ALL` of `COUNT(*)` answers exactly one row per arm whether the container
+    // holds anything or not, so no live read here can distinguish a seeded record from an
+    // unseeded one. The seed is standing ruling 4's requirement all the same - a declared
+    // kind missing from `countObjects` draws NO FOLDER, which is a different and stronger
+    // statement than a folder badged 0 - and it is what an engine or a statement shape
+    // that does skip empty groups would need.
+    expect(seedZeroCounts(KINDS)).toEqual({ table: { count: 0 }, macro: { count: 0 } });
+    expect(seedZeroCounts([])).toEqual({});
+  });
+
+  test("a count the driver cannot read leaves its seeded value rather than writing NaN", () => {
+    // The `toNumber` seam is injected precisely so this can be driven: a DuckDB COUNT(*)
+    // is BIGINT and arrives as a decimal STRING through `getRowsJson()`, so no live
+    // read can produce an unreadable one. A driver change that did would otherwise write
+    // `Number(undefined)`, and NaN renders as a blank badge that looks like a measurement.
+    const counts = { table: { count: 0 }, macro: { count: 0 } };
+    applyKindCounts(
+      counts,
+      [
+        { kind: "table", n: "7" },
+        { kind: "macro", n: null },
+      ],
+      (value) => (typeof value === "string" ? Number(value) : undefined),
+    );
+    expect(counts).toEqual({ table: { count: 7 }, macro: { count: 0 } });
+  });
+});
+
+/**
+ * Column defaults as DuckDB's catalog reports them (#1029).
+ *
+ * `information_schema.columns.column_default` is the expression AS WRITTEN, with SQL
+ * standard quote doubling, identical to SQLite on every string, number and expression
+ * row. A generated column reports its expression there too. Measured on DuckDB v1.5.5
+ * through `@duckdb/node-api`:
+ *
+ *   DEFAULT 'abc'                         -> 'abc'
+ *   DEFAULT 'it''s'                       -> 'it''s'
+ *   DEFAULT ''                            -> ''
+ *   DEFAULT 42                            -> 42
+ *   DEFAULT CURRENT_TIMESTAMP             -> CURRENT_TIMESTAMP
+ *   GENERATED ALWAYS AS (id * 2) VIRTUAL  -> CAST((id * 2) AS INTEGER)
+ */
+describe("DuckDBProvider column defaults (#1029)", () => {
+  const DDL = `CREATE TABLE column_defaults (
+    id INTEGER PRIMARY KEY,
+    def_null_string VARCHAR DEFAULT 'NULL',
+    def_text VARCHAR DEFAULT 'abc',
+    def_empty VARCHAR DEFAULT '',
+    def_quote VARCHAR DEFAULT 'it''s',
+    def_backslash VARCHAR DEFAULT 'a\\b',
+    def_number INTEGER DEFAULT 42,
+    def_expression TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    def_generated INTEGER GENERATED ALWAYS AS (id * 2) VIRTUAL
+  )`;
+
+  const EXPECTED: Record<string, { defaultValue?: string; defaultExpression?: string }> = {
+    id: {},
+    def_null_string: { defaultValue: "NULL", defaultExpression: "'NULL'" },
+    def_text: { defaultValue: "abc", defaultExpression: "'abc'" },
+    def_empty: { defaultValue: "", defaultExpression: "''" },
+    def_quote: { defaultValue: "it's", defaultExpression: "'it''s'" },
+    def_backslash: { defaultValue: "a\\b", defaultExpression: "'a\\b'" },
+    def_number: { defaultValue: "42", defaultExpression: "42" },
+    def_expression: { defaultValue: "CURRENT_TIMESTAMP", defaultExpression: "CURRENT_TIMESTAMP" },
+    def_generated: { defaultValue: "CAST((id * 2) AS INTEGER)", defaultExpression: "CAST((id * 2) AS INTEGER)" },
+  };
+
+  const defaultsOf = (columns: readonly { name: string; defaultValue?: string; defaultExpression?: string }[]) =>
+    Object.fromEntries(
+      columns.map((column) => [
+        column.name,
+        {
+          ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
+          ...(column.defaultExpression === undefined ? {} : { defaultExpression: column.defaultExpression }),
+        },
+      ]),
+    );
+
+  test("a string default is reported as its value, with the catalog text kept alongside", async () => {
+    const provider = new DuckDBProvider(makeConfig());
+    await provider.connect();
+    try {
+      await provider.query(DDL);
+
+      const single = await provider.describeObject(["memory", "main", "column_defaults"], "table");
+      expect(defaultsOf(single.columns)).toEqual(EXPECTED);
+
+      // The bulk read goes through the same mapper; asserting it too is what catches a fix
+      // applied to one read and not the other, the mistake #795 had to correct.
+      const batch = await provider.describeObjects(["memory", "main"], "table");
+      const bulk = batch.details.find((detail) => detail.path.at(-1) === "column_defaults")!;
+      expect(defaultsOf(bulk.columns)).toEqual(EXPECTED);
     } finally {
       await provider.disconnect();
     }

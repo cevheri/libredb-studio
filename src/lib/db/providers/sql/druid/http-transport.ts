@@ -29,6 +29,10 @@
  *   `fetch` cannot read, so a truncated body is the only evidence there is.
  */
 
+import { endpointUrl, httpOrigin, rejectRedirect } from "@/lib/db/http/endpoint";
+import { DatabaseConfigError } from "@/lib/db/errors";
+import { httpTransportFetch } from "@/lib/db/http/egress-policy";
+import { describeFetchFailure, networkFailureKind } from "@/lib/db/http/fetch-failure";
 import type { DatabaseConnection } from "@/lib/db/types";
 // Shared with `lib/explain/druid-native.ts`, which parses the EXPLAIN plan columns:
 // those arrive as JSON *text* inside this body, so the pass below correctly leaves
@@ -36,6 +40,7 @@ import type { DatabaseConnection } from "@/lib/db/types";
 // An explain strategy may not import from a provider directory, which is why this
 // lives in db/utils rather than here.
 import { quoteUnsafeIntegers } from "@/lib/db/utils/json-integers";
+import { uniqueFieldNames } from "@/lib/db/utils/result-fields";
 import {
   DRUID_TRANSPORT_FAILURE,
   type DruidQueryOptions,
@@ -226,11 +231,6 @@ function parseJson(text: string): unknown {
   }
 }
 
-/** Bracket a bare IPv6 literal, which is otherwise not a legal URL authority. */
-function formatHost(host: string): string {
-  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-}
-
 /** A field the envelope reported as usable text, or null when it reported none. */
 function textField(envelope: Record<string, unknown>, field: string): string | null {
   const value = envelope[field];
@@ -262,31 +262,8 @@ function unavailableSegmentCount(headers: Headers): number | null {
 // The result (spec section 2)
 // ============================================================================
 
-/** What a payload with no header row can honestly say about its columns. */
-const UNDESCRIBED = Object.freeze({ fieldNames: null, sqlTypes: null, nativeTypes: null });
-
 /**
- * The declared names, made unique.
- *
- * `SELECT 1 AS c, 2 AS c` really declares `["c","c"]` (live-verified), and a row
- * is a record, so the repeat has to be disambiguated as the row is built or the
- * second column disappears BEFORE the seam rather than after it. The suffix keeps
- * climbing because `SELECT 1 AS c, 2 AS "c (2)", 3 AS c` is legal too, and
- * uniqueness is the invariant the seam states.
- */
-function disambiguate(declared: readonly string[]): string[] {
-  const taken = new Set<string>();
-
-  return declared.map((name) => {
-    let unique = name;
-    for (let repeat = 2; taken.has(unique); repeat += 1) unique = `${name} (${repeat})`;
-    taken.add(unique);
-    return unique;
-  });
-}
-
-/**
- * One type per column, keyed by the disambiguated name.
+ * One type per column, keyed by the unique name.
  *
  * A column the header row did not reach is left OUT rather than given a
  * placeholder: an invented type name would be indistinguishable from one the
@@ -300,11 +277,23 @@ function typesByName(fieldNames: readonly string[], row: unknown): Record<string
   );
 }
 
-/** One positional row, rebuilt as the record the seam promises. */
+/**
+ * One positional row, rebuilt as the record the seam promises.
+ *
+ * A row whose value count differs from the header cannot be read by position:
+ * padding it would invent nulls and cutting it would drop values, both silently.
+ * Only a truncated body or a rewrite produces one, so it fails like a short header.
+ */
 function toRow(fieldNames: readonly string[], row: unknown): DruidRow {
-  const values = Array.isArray(row) ? (row as unknown[]) : [];
+  if (!Array.isArray(row) || row.length !== fieldNames.length) {
+    const count = Array.isArray(row) ? row.length : 0;
+    throw new DruidTransportError(
+      `Druid answered a row with ${count} values for ${fieldNames.length} columns, so the result cannot be read`,
+    );
+  }
+  const values = row as unknown[];
 
-  return Object.fromEntries(fieldNames.map((name, column) => [name, values[column] ?? null]));
+  return Object.fromEntries(fieldNames.map((name, column) => [name, values[column]]));
 }
 
 function toQueryResult(
@@ -331,7 +320,10 @@ function toQueryResult(
     throw new DruidTransportError(UNREADABLE_PAYLOAD);
   }
 
-  const fieldNames = disambiguate((names as unknown[]).map(String));
+  // `SELECT 1 AS c, 2 AS c` really declares `["c","c"]` (live-verified), and a row is a
+  // record, so the repeat is numbered as the row is built or the second column
+  // disappears BEFORE the seam rather than after it.
+  const fieldNames = uniqueFieldNames((names as unknown[]).map(String));
   return {
     rows: payload.slice(HEADER_ROW_COUNT).map((row) => toRow(fieldNames, row)),
     fieldNames,
@@ -372,9 +364,14 @@ function envelopeError(payload: unknown, fallback: string): DruidTransportError 
 }
 
 /** A failure that never reached the cluster, or never came back from it. */
-function transportError(cause: unknown): DruidTransportError {
-  const reason = cause instanceof Error ? cause.message : String(cause);
-  return new DruidTransportError(`Druid request failed: ${reason}`);
+function transportError(cause: unknown, url: string): DruidTransportError {
+  return new DruidTransportError(
+    `Druid request failed: ${describeFetchFailure(cause, url)}`,
+    undefined,
+    undefined,
+    undefined,
+    networkFailureKind(cause),
+  );
 }
 
 /**
@@ -501,8 +498,8 @@ export class DruidHttpTransport implements DruidTransport {
     // `connectionFields`, and an explicit `disable` has to turn TLS OFF as well as
     // an explicit mode turns it on (the #264 lesson).
     const secure = config.ssl !== undefined && config.ssl.mode !== "disable";
-    const host = formatHost(config.host ?? DEFAULT_HOST);
-    this.endpoint = `${secure ? "https" : "http"}://${host}:${config.port ?? DEFAULT_PORT}${SQL_PATH}`;
+    const origin = httpOrigin(secure ? "https" : "http", config.host ?? DEFAULT_HOST, config.port ?? DEFAULT_PORT);
+    this.endpoint = endpointUrl(origin, SQL_PATH);
     // Spec section 1, live-verified: a default install loads no security extension
     // and IGNORES this header entirely - a bogus Basic header still answers 200 -
     // so credentials are optional, and sending none is the normal case. When they
@@ -567,27 +564,34 @@ export class DruidHttpTransport implements DruidTransport {
     // help with, since it only starts counting once the statement was accepted.
     const signal = clientDeadlineMs === undefined ? undefined : AbortSignal.timeout(clientDeadlineMs);
 
+    let response: Response;
+    let text: string;
     try {
-      const response = await fetch(this.endpoint, {
+      response = await httpTransportFetch(this.endpoint, {
         method: "POST",
         headers: {
           "content-type": JSON_CONTENT_TYPE,
           ...(this.authorization === undefined ? {} : { authorization: this.authorization }),
         },
         body,
+        // A followed redirect would carry the credential to wherever it points.
+        redirect: "manual",
         ...(signal ? { signal } : {}),
       });
-
-      return {
-        ok: response.ok,
-        status: response.status,
-        text: await response.text(),
-        unavailableSegments: unavailableSegmentCount(response.headers),
-      };
+      text = await response.text();
     } catch (error) {
+      if (error instanceof DatabaseConfigError) throw error;
       // A refused socket, an abort and a truncated body all arrive here, and all
       // have to leave as the seam's own error type.
-      throw transportError(error);
+      throw transportError(error, this.endpoint);
     }
+
+    rejectRedirect(response, this.endpoint);
+    return {
+      ok: response.ok,
+      status: response.status,
+      text,
+      unavailableSegments: unavailableSegmentCount(response.headers),
+    };
   }
 }

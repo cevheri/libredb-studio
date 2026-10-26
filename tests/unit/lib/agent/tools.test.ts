@@ -6,12 +6,13 @@ import {
   AGENT_EXECUTION_PROFILE,
   AGENT_OPERATIONS_PROFILE,
 } from "@/lib/agent/execution-policy";
+import type { AgentStatementLanguageId } from "@/lib/agent/agent-manifest";
 import { AgentRunDeadline } from "@/lib/agent/deadline";
 import { AgentRepairLedger, fingerprintStatement } from "@/lib/agent/repair-ledger";
 import {
-  AGENT_ANSWER_CONTRACT,
   AGENT_TOOL_DEFINITIONS,
   type AgentToolContext,
+  agentToolDefinition,
   comparePlansTool,
   composeReportTool,
   executeAgentOperation,
@@ -27,6 +28,7 @@ import {
   runReadQueryTool,
   selectAgentTools,
 } from "@/lib/agent/tools";
+import { AGENT_ANSWER_CONTRACT } from "@/lib/agent/tool-contracts";
 import { UNTRUSTED_CONTENT_BEGIN, UNTRUSTED_CONTENT_END } from "@/lib/agent/untrusted-content";
 import {
   AGENT_WORKFLOW_PRESENTS_ANSWER,
@@ -91,7 +93,6 @@ const capabilities: ProviderCapabilities = {
   supportsExplain: true,
   explainFormat: "postgres-json",
   supportsExternalQueryLimiting: true,
-  supportsCreateTable: true,
   supportsInlineRowEdit: true,
   supportsMaintenance: false,
   maintenanceOperations: [],
@@ -255,6 +256,41 @@ describe("selectAgentTools — the server decides, from the persisted mode and w
     expect(names).toEqual(["inspect_operations", "recommend_change", "compose_report"]);
   });
 
+  test("the persisted statement language picks the variant, and an absent one reads as sql", () => {
+    // The same frozen array for the same variant, so a run recorded before languages existed and one recorded
+    // as sql are offered exactly the same tools.
+    expect(selectAgentTools({ ...persisted("agent"), statementLanguage: "sql" })).toBe(
+      selectAgentTools(persisted("agent")),
+    );
+    expect(selectAgentTools({ ...persisted("agent", "operations"), statementLanguage: "kubectl" })).toBe(
+      selectAgentTools(persisted("agent", "operations")),
+    );
+    expect(selectAgentTools({ ...persisted("planning"), statementLanguage: "kubectl" })).toEqual([]);
+    expect(
+      selectAgentTools({ ...persisted("agent", "database-assessment"), statementLanguage: "kubectl" }).map(
+        (tool) => tool.name,
+      ),
+    ).toEqual(["run_read_query", "profile_workloads", "compose_report"]);
+  });
+
+  test("a SQL run is offered the SQL definitions themselves, by name", () => {
+    // Every definition is read through `agentToolDefinition`, so a later language's override cannot reach a SQL
+    // run: what an investigation sends is the record's own entry for each name, the same object.
+    const offered = selectAgentTools({ mode: "agent", workflowType: "investigation" });
+
+    expect(offered).toEqual(offered.map((definition) => AGENT_TOOL_DEFINITIONS[definition.name]));
+    for (const definition of offered) expect(definition, definition.name).toBe(AGENT_TOOL_DEFINITIONS[definition.name]);
+  });
+
+  test("a run with no recorded language reads the SQL definition", () => {
+    expect(agentToolDefinition(undefined, "investigation", "run_read_query")).toBe(
+      AGENT_TOOL_DEFINITIONS.run_read_query,
+    );
+    expect(agentToolDefinition("sql", "operations", "inspect_operations")).toBe(
+      AGENT_TOOL_DEFINITIONS.inspect_operations,
+    );
+  });
+
   test("present_answer is offered exactly where AGENT_WORKFLOW_PRESENTS_ANSWER says it is", () => {
     // The binding that keeps four layers agreeing. The rail offers the auto-execute
     // checkbox from this record, the route accepts the field from it, and
@@ -392,6 +428,8 @@ describe("selectAgentTools — the server decides, from the persisted mode and w
     // the array comparison this assertion used to make was blind to every tool that
     // declares no operation — it passed unchanged when two more were added.
     expect([...operations].sort()).toStrictEqual([
+      "cluster.usage.read",
+      "cluster.workloads.read",
       "db.operations.read",
       "sql.explain.estimate",
       "sql.query.read",
@@ -489,6 +527,225 @@ describe("a tool that demands a citation says what a citation IS (#350)", () => 
     expect(report.kind).toBe("composed");
   });
 
+  test("provider warnings reach the model fenced, and a result with none reads as it always did", async () => {
+    const warned = harness({}, async () =>
+      queryResult({ warnings: [{ message: "Studio read the last 100 lines of each stream." }] }),
+    );
+    const plain = harness();
+    const withWarnings = await runReadQueryTool(warned.context, { sql: "SELECT 1" });
+    const without = await runReadQueryTool(plain.context, { sql: "SELECT 1" });
+
+    expect(withWarnings.modelText).toContain("Studio read the last 100 lines of each stream.");
+    expect(withWarnings.modelText).toContain("warnings");
+    expect(without.modelText).not.toContain("warnings");
+    expect(without.modelText.split(UNTRUSTED_CONTENT_BEGIN)).toHaveLength(2);
+  });
+
+  /*
+    Measured 2026-10-05 on `qwen2.5:3b-instruct`, data-analysis: FIFTY-FIVE refusals in one
+    five-run cell, every one character for character `presentation belongs to present_answer,
+    send it there`. The model called `compose_report` carrying a `presentation`, was told where
+    that field lives, and sent the same call again - fifty-five times, until the runs ended
+    having reported nothing. The cell scored 0/5.
+
+    The sentence is true and it is not an instruction. It names a destination and leaves the
+    model to work out that there are TWO calls and which comes first. The house rule for the
+    difference is already written one layer down, where `present_answer` offers an id outside
+    `refusalExamples`: a whole worked call stays behind the lever because it crowds a small
+    model's turn, while a short concrete value goes to everyone, "because being told to cite
+    something somewhere and being handed the characters are different instructions".
+
+    An order is short. The refused tool does not have to be named - it is the one the model just
+    called - so this needs no new data threaded through `parseToolInput`, only the sentence
+    saying what to do rather than where to look.
+  */
+  test("a misfiled field is told which call to make first, not only where the field lives", async () => {
+    const h = harness();
+
+    const outcome = await runReadQueryTool(h.context, { sql: "SELECT id FROM orders" });
+    if (outcome.kind !== "completed") throw new Error(`expected a completed read, got ${outcome.kind}`);
+    // The draft event belongs here: `presentableArtifact` counts a read the RUN WROTE, and without
+    // it this fixture is a run that read nothing it could present - which is the other test's case,
+    // not this one. A real `run_read_query` emits both.
+    const events: AgentRunEvent[] = [
+      { kind: "statement-drafted", atMs: 1, stepId: "step_1", sql: "SELECT id FROM orders", rationale: "the rows" },
+      { kind: "tool-completed", atMs: 2, stepId: "step_1", artifact: outcome.artifact },
+    ];
+
+    const report = composeReportTool(
+      h.context,
+      { runId: h.context.runId, events },
+      {
+        claims: [
+          {
+            claim: "orders has rows",
+            evidence: [{ source: "artifact", correlationId: outcome.artifact.correlationId }],
+          },
+        ],
+        // The field that belongs to the other tool, exactly as the losing runs sent it.
+        presentation: { kind: "table" },
+      },
+    );
+
+    if (report.kind !== "unavailable") throw new Error(`expected unavailable, got ${report.kind}`);
+    expect(report.reasonCode).toBe("INVALID_TOOL_INPUT");
+    // Where it lives, as it already said.
+    expect(report.modelText).toContain("presentation belongs to present_answer");
+    // And the part the model could act on: the order of the two calls.
+    expect(report.modelText).toContain("call present_answer with it first");
+    expect(report.modelText).toContain("without it");
+  });
+
+  /*
+    Measured 2026-10-09 on `gemma4:e2b`, investigation: ONE HUNDRED AND ONE refusals in one
+    five-run cell, every one carrying `fingerprint: expected string, received nothing` beside
+    `remove correlationId`. The cell scored 0/5 and two of its runs spent seven minutes in the
+    loop. The same refusal appears in `laguna-xs-2.1:latest` and `devstral-small-2:24b`.
+
+    `evidenceSchema` is a discriminated union on `source`: `artifact` takes `correlationId`,
+    `context-snapshot` takes `fingerprint`. A model holding an artifact id that declares the wrong
+    `source` is validated against the snapshot branch, so it is told to delete the id it has and
+    supply a value it was never given a way to obtain. The remedy is neither: it is to set `source`
+    to the branch that takes the field it already sent.
+
+    The same defect `presentation belongs to present_answer` had, one level down. The server can see
+    which branch was meant - the key is in the input - and says the opposite of what would fix it.
+  */
+  test("evidence sent under the wrong source is told which source takes the field it has", async () => {
+    const h = harness();
+
+    const outcome = await runReadQueryTool(h.context, { sql: "SELECT id FROM orders" });
+    if (outcome.kind !== "completed") throw new Error(`expected a completed read, got ${outcome.kind}`);
+    const events: AgentRunEvent[] = [{ kind: "tool-completed", atMs: 1, stepId: "step_1", artifact: outcome.artifact }];
+
+    const report = composeReportTool(
+      h.context,
+      { runId: h.context.runId, events },
+      {
+        claims: [
+          {
+            claim: "orders has rows",
+            // The id is right and the source is wrong, exactly as the losing runs sent it.
+            evidence: [{ source: "context-snapshot", correlationId: outcome.artifact.correlationId }],
+          },
+        ],
+      },
+    );
+
+    if (report.kind !== "unavailable") throw new Error(`expected unavailable, got ${report.kind}`);
+    expect(report.reasonCode).toBe("INVALID_TOOL_INPUT");
+    // The field it sent, and the source that takes it.
+    expect(report.modelText).toContain("correlationId");
+    expect(report.modelText).toContain('source to "artifact"');
+    // And NOT the instruction that loses the id it was holding.
+    expect(report.modelText).not.toContain("remove correlationId");
+  });
+
+  /*
+    THE ORDER IS ONLY AN INSTRUCTION WHERE THE OTHER CALL CAN SUCCEED.
+
+    `presentation belongs to present_answer - call present_answer with it first, then call this tool
+    again without it` was measured as a fix and shipped as one. It is now the single most frequent
+    refusal in the ledger: 382 deliveries, beside 188 `present_answer: ANSWER_NOT_A_DATA_READ`. The
+    two numbers are one loop. A run that has drafted no read has nothing presentable, so the tool it
+    is being sent to refuses it, and it comes back to `compose_report` with the same argument.
+
+    Measured 2026-10-11: `granite4:1b` analyze lost its one failing run to FIFTY refusals, and
+    `qwen2.5:3b-instruct` analyze to forty-seven, while the passing runs of the same cells finished
+    in seventeen to eighty-eight seconds.
+
+    `compose_report` does not need `presentation` at all. Where the run holds a presentable read the
+    order stands - present it, then report. Where it does not, the only move that ends the loop is to
+    drop the field, and saying so is the difference between an instruction and a wall.
+  */
+  test("a field whose other tool would refuse is told to drop it, not to call that tool", async () => {
+    const h = harness();
+
+    // A run that read the SCHEMA only: nothing here is a data read, so `present_answer` has nothing
+    // it can accept - which is the shape the 188 refusals were measured on.
+    const schema = await inspectSchemaTool(h.context, {});
+    if (schema.kind !== "completed") throw new Error(`expected a completed inspect, got ${schema.kind}`);
+    const events: AgentRunEvent[] = [{ kind: "tool-completed", atMs: 1, stepId: "step_1", artifact: schema.artifact }];
+
+    const report = composeReportTool(
+      h.context,
+      { runId: h.context.runId, events },
+      {
+        claims: [
+          {
+            claim: "orders is a table",
+            evidence: [{ source: "artifact", correlationId: schema.artifact.correlationId }],
+          },
+        ],
+        presentation: { kind: "table" },
+      },
+    );
+
+    if (report.kind !== "unavailable") throw new Error(`expected unavailable, got ${report.kind}`);
+    expect(report.reasonCode).toBe("INVALID_TOOL_INPUT");
+    // The move that ends the loop, not the one that restarts it.
+    expect(report.modelText).toContain("without it");
+    expect(report.modelText).not.toContain("call present_answer with it first");
+  });
+
+  /*
+    THE TWO BIGGEST REFUSAL LOOPS IN THE WHOLE LEDGER, and both were type reports.
+
+    Counted across the sweep's ledger on 2026-10-09, `compose_report` refusals by exact message:
+
+      140x  claims.0.evidence: expected array, received nothing
+       95x  claims.0.evidence: expected array, received object
+       32x  the same, on two claims at once
+
+    267 refusals, in the cell that is unlocked on fifteen of the sixteen rows in the candidate
+    table. `cogito:3b` was refused thirty times in one optimize cell, `qwen3.5:0.8b` twenty-two,
+    `gemma4:e2b` a hundred and one - and the dominant LOSS those cells record is `model-timeout`
+    with `no-report`, which is the consequence: the run spends its deadline re-sending a call it
+    was never told how to fix.
+
+    "expected array, received object" names the types and not the move. The model sent ONE citation
+    where a list of one belongs, which is the cheapest mistake in this contract to state a remedy
+    for: wrap what you sent. "received nothing" is the same shape one step earlier - the field is
+    required, and saying so is not the same as reporting its type.
+
+    This is the rule the file already turns on, in its own words one function down: naming what
+    WOULD have worked. A closed set gets its values, a refused call gets a worked example, a
+    misfiled field gets the order of the two calls. An array gets "wrap it".
+  */
+  test("a single citation where a list belongs is told to wrap it, not just told the type", async () => {
+    const h = harness();
+
+    const outcome = await runReadQueryTool(h.context, { sql: "SELECT id FROM orders" });
+    if (outcome.kind !== "completed") throw new Error(`expected a completed read, got ${outcome.kind}`);
+    const events: AgentRunEvent[] = [{ kind: "tool-completed", atMs: 1, stepId: "step_1", artifact: outcome.artifact }];
+
+    // ONE citation object where an array of one belongs - 95 refusals in the ledger wore this shape.
+    const tek = composeReportTool(
+      h.context,
+      { runId: h.context.runId, events },
+      {
+        claims: [
+          {
+            claim: "orders has rows",
+            evidence: { source: "artifact", correlationId: outcome.artifact.correlationId },
+          },
+        ],
+      },
+    );
+    if (tek.kind !== "unavailable") throw new Error(`expected unavailable, got ${tek.kind}`);
+    expect(tek.reasonCode).toBe("INVALID_TOOL_INPUT");
+    expect(tek.modelText).toContain("wrap it in an array");
+
+    // And the field omitted entirely - 140 refusals, the single most common in the ledger.
+    const yok = composeReportTool(
+      h.context,
+      { runId: h.context.runId, events },
+      { claims: [{ claim: "orders has rows" }] },
+    );
+    if (yok.kind !== "unavailable") throw new Error(`expected unavailable, got ${yok.kind}`);
+    expect(yok.modelText).toContain("required");
+  });
+
   /*
     Measured 2026-08-16 against a real Ollama endpoint: `qwen3.8` could not finish a
     data-analysis run, and the reason was an ENCODING rather than a capability. Kept as its own
@@ -545,6 +802,262 @@ describe("a tool that demands a citation says what a citation IS (#350)", () => 
       expect(answer.answer.artifact.correlationId).toBe(artifact.correlationId);
     });
 
+    test("and the report's claims, which is the same encoding on the tool that ends the run", async () => {
+      /*
+        The same fault one tool over, and by a wide margin the more expensive of the two.
+
+        `readSerializedPresentation` was written for `present_answer` after `qwen3.8` serialized a
+        nested object three times and was refused three times. `compose_report` takes the identical
+        mistake and was never given the identical read — and it is the call that ENDS a run, so a
+        model that makes it here does not lose a presentation, it loses everything.
+
+        Measured on `llama3.1:8b`, the most-pulled tool-capable model on Ollama: five operate runs,
+        **seventy** declines, every one of them the same line —
+
+            the fields that did not match — claims: expected array, received string
+
+        — with the model re-sending the serialized array roughly fourteen times per run until the
+        turn limit ended it. The sentence is complete and correct by then; the model reads it and
+        cannot act on it, which is precisely the case the sibling read exists for.
+
+        Read ONCE and never recursively, at the call boundary rather than in the schema, and the
+        value still goes through the same strict schema afterwards — every constraint the sibling
+        states applies here unchanged, including why the placement matters to the contract the SDK
+        advertises.
+      */
+      const h = harness();
+
+      const outcome = await runReadQueryTool(h.context, { sql: "SELECT id FROM orders" });
+      if (outcome.kind !== "completed") throw new Error(`expected a completed read, got ${outcome.kind}`);
+      const events: AgentRunEvent[] = [
+        { kind: "tool-completed", atMs: 1, stepId: "step_1", artifact: outcome.artifact },
+      ];
+      const claims = [
+        {
+          claim: "orders has rows",
+          evidence: [{ source: "artifact", correlationId: outcome.artifact.correlationId }],
+        },
+      ];
+
+      const report = composeReportTool(
+        h.context,
+        { runId: h.context.runId, events },
+        {
+          // The array serialized, which is what the model sends.
+          claims: JSON.stringify(claims),
+        },
+      );
+
+      expect(report.kind).toBe("composed");
+      if (report.kind !== "composed") return;
+      expect(report.claims).toHaveLength(1);
+      expect(report.claims[0]?.claim).toBe("orders has rows");
+    });
+
+    test("text that is not JSON at all is refused in words the model can act on", async () => {
+      /*
+        The half a lenient reader cannot fix, measured on the same model and captured off the wire.
+
+        `llama3.1:8b` sends its claims as a PYTHON repr — single quotes throughout:
+
+            "[{'claim': 'The employee table is incomplete.', 'evidence': [{'source': 'artifact', …}]}]"
+
+        The content is right: the claim is true, the source is right, the correlation id is one this
+        run produced. Only the quote character is wrong, and `JSON.parse` refuses it. Converting the
+        quotes here would be inventing an encoding rather than reading one the model chose, and it
+        breaks on the first apostrophe inside a sentence, so this layer does not try.
+
+        What it can do is stop saying something the model has no way to act on. `claims: expected
+        array, received string` is true and, to a model that believes it sent an array, says
+        nothing — measured across five assess runs, it re-sent the identical bytes THIRTY times.
+        The refusal now names the fault: the argument arrived as text, and what a JSON array
+        requires.
+      */
+      const h = harness();
+
+      const report = composeReportTool(
+        h.context,
+        { runId: h.context.runId, events: [] },
+        {
+          claims: "[{'claim': 'orders has rows', 'evidence': []}]",
+        },
+      );
+
+      expect(report.kind).toBe("unavailable");
+      if (report.kind !== "unavailable") return;
+      expect(report.reasonCode).toBe("INVALID_TOOL_INPUT");
+      expect(report.modelText).toContain("arrived as TEXT");
+      expect(report.modelText).toContain("double quotes");
+      // The model's own text is never quoted back at it; only the fault is named.
+      expect(report.modelText).not.toContain("orders has rows");
+    });
+
+    test("a serialized claims array of the wrong shape is still refused, so the schema is not relaxed", async () => {
+      const h = harness();
+
+      const report = composeReportTool(
+        h.context,
+        { runId: h.context.runId, events: [] },
+        {
+          // Valid JSON, wrong shape: the read admits nothing the object form would not have been.
+          claims: JSON.stringify([{ text: "orders has rows" }]),
+        },
+      );
+
+      expect(report.kind).toBe("unavailable");
+      if (report.kind !== "unavailable") return;
+      expect(report.reasonCode).toBe("INVALID_TOOL_INPUT");
+    });
+
+    test("the id under a near-miss key is read, so what is left to say is one field and not two", async () => {
+      /*
+        Captured 2026-09-17: five of seventeen refusals across the two failing surfaces are
+        `{"artifact_id": "669cc394-..."}` - the id right, the key one affix off, `presentation`
+        genuinely absent. `renamesAmong` has NAMED this pair in the refusal since #4xx, and the
+        models kept re-sending the same key; on `llama3.1:8b` it declined all five analyze runs and
+        never once on the value it carried.
+
+        Naming it left the model two sentences for one mistake and one real omission, and the repair
+        that suggests itself from two sentences is to send the surplus field again with more of it.
+        Reading the key leaves exactly one sentence, about the one thing actually missing.
+
+        Answered here since 2026-09-19. It was refused when this test was written, on the argument
+        that supplying the missing `presentation` would be the server choosing how the answer is
+        displayed. Ninety-three more refusals of exactly this call, across the two models whose
+        analyze cells sat at 0/5, retired that argument: see `readMisrenderedPresentation`. Both
+        halves are now read - the key and the absent rendering - and what the test still pins is
+        that the ID SURVIVES the rename.
+      */
+      const h = analysis();
+      const { artifact, events } = await readWithLedger(h.context);
+
+      const answer = presentAnswerTool(
+        h.context,
+        { runId: h.context.runId, events, autoExecute: false },
+        { artifact_id: artifact.correlationId },
+      );
+
+      if (answer.kind !== "answered") throw new Error(`expected the answer to be presented, got ${answer.kind}`);
+      expect(answer.answer.artifact.correlationId).toBe(artifact.correlationId);
+      expect(answer.answer.presentation).toEqual({ kind: "table" });
+    });
+
+    /*
+      The two shapes that were holding `present_answer` shut, measured 2026-09-19 with the argument
+      capture running for a whole sweep: 206 of 221 refused calls, and both belong to the two models
+      whose `data-analysis` cell sits at 0/5.
+
+      Neither is a model failing to do the work. Both are runs that read the data, produced the
+      artifact, and then could not say how to show it.
+    */
+    test("a spec attached to a table is dropped, because the model already said table", async () => {
+      /*
+        113 refusals, all `phi4-mini:3.8b`, all this:
+
+            {"kind": "table", "spec": {"x": "total_rows", "y": 9488, "caption": "Total rows"}}
+
+        The spec is not a chart and could not become one - no `type`, and `y` is a number where a
+        list of column names goes. It is a caption the model wanted to attach to a table. The schema
+        says a table takes no spec, which is true, and the refusal says `remove spec`, which the
+        model did not do 113 times.
+
+        So it is removed here. `kind` is explicit and `table` is what the contract itself calls a
+        complete answer; a surplus decoration is not a reason to throw the answer away.
+      */
+      const h = analysis();
+      const { artifact, events } = await readWithLedger(h.context);
+
+      const answer = presentAnswerTool(h.context, { runId: h.context.runId, events, autoExecute: false }, {
+        artifact: artifact.correlationId,
+        presentation: { kind: "table", spec: { x: "total_rows", y: 9488, caption: "Total rows" } },
+      } as never);
+
+      if (answer.kind !== "answered") throw new Error(`expected the answer to be presented, got ${answer.kind}`);
+      expect(answer.answer.presentation).toEqual({ kind: "table" });
+    });
+
+    test("and the result inlined into the table is dropped too, because the artifact already holds it", async () => {
+      /*
+        The same surplus wearing three more names, 47 refusals in one sweep:
+
+            {"kind":"table","data":{"dept_name":"Sales","total_salary":12500000}}     17
+            {"kind":"table","rows":[{"dept_name":"Development", ...}]}                16
+            {"kind":"table","columns":[{"name":"dept_name","value":"Development"}]}   14
+
+        The model is pasting the RESULT into the presentation. It has no reason to: the artifact id
+        beside it already names the rows, and `presentation` only ever says how to show them. The
+        first version of this reader dropped `spec` by name and left these three, which is the
+        mistake a by-name list always makes - so a table now keeps `kind` and nothing else.
+
+        Safe precisely because a table takes no options at all. A CHART is left alone: its `spec` is
+        the whole instruction, and dropping an unknown key there could silently change the picture.
+      */
+      const h = analysis();
+      const { artifact, events } = await readWithLedger(h.context);
+
+      const answer = presentAnswerTool(h.context, { runId: h.context.runId, events, autoExecute: false }, {
+        artifact: artifact.correlationId,
+        presentation: { kind: "table", rows: [{ dept_name: "Development", total_salary: 155098748 }] },
+      } as never);
+
+      if (answer.kind !== "answered") throw new Error(`expected the answer to be presented, got ${answer.kind}`);
+      expect(answer.answer.presentation).toEqual({ kind: "table" });
+    });
+
+    test("an artifact with no presentation at all is shown as a table", async () => {
+      /*
+        93 refusals - 52 `phi4-mini:3.8b`, 41 `granite4:3b` - of exactly this:
+
+            {"artifact": "414f56f1-a8f4-442e-9847-0dc677de3625"}
+
+        The id is right and the result is read; the model simply never says how to render it, and
+        the refusal naming `presentation` did not teach it to. Both models' analyze cells are 0/5.
+
+        This reverses a line drawn on 2026-09-17, when the same call was left refused on the
+        argument that defaulting it would be the server choosing how the user's answer is displayed.
+        The argument was wrong in one respect and the measurement is what shows it: a table is not a
+        choice between renderings, it is the contract's own statement that a result shown as itself
+        is a complete answer. The alternative on offer is not a better rendering, it is no answer.
+
+        Bounded to the case where presentation is ABSENT. A presentation that arrived and did not
+        validate is a model saying something specific, and overriding that WOULD be the server
+        choosing - `{"kind": "spreadsheet"}` stays refused, and the test above this pins it.
+      */
+      const h = analysis();
+      const { artifact, events } = await readWithLedger(h.context);
+
+      const answer = presentAnswerTool(
+        h.context,
+        { runId: h.context.runId, events, autoExecute: false },
+        { artifact: artifact.correlationId },
+      );
+
+      if (answer.kind !== "answered") throw new Error(`expected the answer to be presented, got ${answer.kind}`);
+      expect(answer.answer.presentation).toEqual({ kind: "table" });
+    });
+
+    test("a near-miss key on the report is still NAMED, because that tool reads no keys", async () => {
+      /*
+        The other side of the line `readNearMissKeys` draws.
+
+        `present_answer` reads the key, because its whole call is two fields and a displaced one is
+        unambiguous. `compose_report` does not: its claims carry evidence objects with their own
+        keys, nested two deep, and a reader confident enough to move a key there could move one
+        inside an evidence item onto a field that means something else. So the report still gets
+        the sentence `renamesAmong` composes, and this test is what keeps that path honest now that
+        its sibling no longer reaches it.
+      */
+      const h = analysis();
+
+      const report = composeReportTool(h.context, { runId: h.context.runId, events: [] }, {
+        report_claims: [{ claim: "orders has rows", evidence: [{ source: "artifact", correlationId: "corr-1" }] }],
+      } as never);
+
+      expect(report.kind).toBe("unavailable");
+      if (report.kind !== "unavailable") return;
+      expect(report.modelText).toContain("rename report_claims to claims");
+    });
+
     test("still refuses a serialized presentation of the wrong shape: the schema is not relaxed", async () => {
       const h = analysis();
       const { artifact, events } = await readWithLedger(h.context);
@@ -592,6 +1105,89 @@ describe("a tool that demands a citation says what a citation IS (#350)", () => 
       if (answer.kind !== "unavailable") return;
       expect(answer.reasonCode).toBe("INVALID_TOOL_INPUT");
       expect(answer.modelText).toContain("presentation");
+    });
+
+    test("and a field sent under a near-miss name is READ, not refused with the rename named", async () => {
+      /*
+        The same measurement carried one step further, and the step is why this test changed shape.
+
+        NAMING the rename - the behaviour this test pinned, and the docblock below is its record -
+        replaced two contradictory sentences with one correct one and did not move the cell.
+        `llama3.1:8b` went on sending `artifact_id`, and the 2026-09-17 argument capture found the
+        same call again, five of seventeen refusals across the two failing surfaces.
+
+        So the pairing the refusal was already confident enough to STATE is now applied: a call
+        whose only fault is the affix on a key is answered by presenting the answer. Nothing else
+        relaxes - a call still missing `presentation` is still refused, and the test above this one
+        is that line. The docblock that follows is kept because the reasoning is still the reasoning;
+        only its conclusion moved from "say it" to "do it".
+
+        One mistake reported as two, which is how a refusal becomes a puzzle.
+
+        A model that sends `artifact_id` where the schema says `artifact` is told two separate
+        and individually true things — `artifact: expected string, received nothing` and
+        `the arguments object: remove artifact_id` — and nothing in either sentence says they
+        are the same field. The value it sent was right; only the key was wrong. What it reads
+        is that something is missing AND something is surplus, so the obvious repair is to send
+        the surplus field again with more of it, which is the loop every other refusal in this
+        file was written to end.
+
+        Measured on llama3.1:8b, the most-pulled tool-capable model on Ollama: five analyze runs,
+        `present_answer` declined in every one, never once on the value. `artifact_id` is not an
+        exotic guess — it is what the field is called in most APIs that have one.
+
+        The rule the sentence is bounded by is untouched: both names are the model's KEYS and
+        the schema's, which are structural exactly as a path is, and the value never crosses.
+      */
+      const h = analysis();
+      const { artifact, events } = await readWithLedger(h.context);
+
+      const answer = presentAnswerTool(h.context, { runId: h.context.runId, events, autoExecute: false }, {
+        artifact_id: artifact.correlationId,
+        presentation: { kind: "table" },
+      } as never);
+
+      if (answer.kind !== "answered") throw new Error(`expected the answer to be presented, got ${answer.kind}`);
+      expect(answer.answer.presentation).toEqual({ kind: "table" });
+    });
+
+    test("and names what ARRIVED, because a model told only what was expected sends it again", async () => {
+      /*
+        The other half of the sentence above, and by a wide margin the largest single refusal
+        this project has measured. Across twelve hours of sweeps on the build this branch
+        carries, `compose_report` was declined 1530 times and ONE issue is 1110 of them:
+
+            the fields that did not match — claims: expected array
+
+        True, and still not enough to act on. A model that serialized `claims` as a JSON
+        STRING reads "expected array" and agrees with it — what it sent is an array, as far as
+        it can tell — so it sends the same bytes again. The test above records exactly that
+        loop being fixed once by naming the field; this is the same loop surviving because the
+        message names one side of a comparison and not the other.
+
+        The rule the message is bounded by does not stand in the way, and this file already
+        states it: what crosses over is "the path and the expected type ... and never the
+        value the model sent". A TYPE is structural, like a field name. `string` is not the
+        model's text; it is the shape of it.
+
+        Zod 4 drops `received` from the issue, so the type is read off the arguments the tool
+        was actually handed, by walking the issue's own path.
+      */
+      const h = analysis();
+      const { artifact, events } = await readWithLedger(h.context);
+
+      const answer = presentAnswerTool(
+        h.context,
+        { runId: h.context.runId, events, autoExecute: false },
+        // `presentation` declared as an object and sent as a number: expected against arrived.
+        { artifact: artifact.correlationId, presentation: 7 },
+      );
+
+      expect(answer.kind).toBe("unavailable");
+      if (answer.kind !== "unavailable") return;
+      expect(answer.reasonCode).toBe("INVALID_TOOL_INPUT");
+      expect(answer.modelText).toContain("presentation");
+      expect(answer.modelText).toContain("received number");
     });
 
     test("refuses a string that is not JSON at all, in the contract's own words", async () => {
@@ -645,12 +1241,19 @@ describe("a tool that demands a citation says what a citation IS (#350)", () => 
       destructuring it throws `Cannot destructure property 'presentation'` — a crash where the
       contract's own refusal belongs.
     */
-    for (const [described, input] of [
-      ["is not an object at all", "present the table"],
-      ["is null", null],
-      ["is undefined", undefined],
-      ["carries no presentation key", { artifact: "corr-real" }],
-      ["carries a presentation that is not a string", { artifact: "corr-real", presentation: 7 }],
+    /*
+      Each row carries the code it should come back with, because they are no longer all the same.
+      `carries no presentation key` used to fail the schema; since `readMisrenderedPresentation` it
+      supplies `{"kind":"table"}` and the call gets as far as the citation check, which refuses an
+      id this run never produced. Both are the contract refusing - which is what these rows exist to
+      prove - and pinning the code keeps the distinction visible rather than papering over it.
+    */
+    for (const [described, input, code] of [
+      ["is not an object at all", "present the table", "INVALID_TOOL_INPUT"],
+      ["is null", null, "INVALID_TOOL_INPUT"],
+      ["is undefined", undefined, "INVALID_TOOL_INPUT"],
+      ["carries no presentation key", { artifact: "corr-real" }, "ANSWER_ARTIFACT_UNKNOWN"],
+      ["carries a presentation that is not a string", { artifact: "corr-real", presentation: 7 }, "INVALID_TOOL_INPUT"],
     ] as const) {
       test(`hands input that ${described} to the schema untouched`, () => {
         const h = analysis();
@@ -659,7 +1262,7 @@ describe("a tool that demands a citation says what a citation IS (#350)", () => 
 
         expect(answer.kind).toBe("unavailable");
         if (answer.kind !== "unavailable") return;
-        expect(answer.reasonCode).toBe("INVALID_TOOL_INPUT");
+        expect(answer.reasonCode).toBe(code);
       });
     }
 
@@ -902,7 +1505,7 @@ describe("a tool that demands a citation says what a citation IS (#350)", () => 
         sending prose where an object goes.
 
         The paths were already named. What was gated was the SHAPE: `exampleReportCall` rebuilds a
-        whole call from the run's ledger and sits behind `refusalExamples`, which two of twenty-two
+        whole call from the run's ledger and sits behind `refusalExamples`, which two of thirty
         shipped models carry. Everyone else reads "expected object" and has to guess the object.
 
         So this splits the two, on the rule the column advice was split on: a one-line skeleton is
@@ -1010,6 +1613,97 @@ describe("a tool that demands a citation says what a citation IS (#350)", () => 
         tableCount: 1,
       } as unknown as AgentRunEvent;
 
+      /*
+        The second measurement of the same cell, and the one that says the sentence was not enough.
+
+        The refusal above was written to replace a vague one, and it is exact: it names the failing
+        position AND hands back the object that would have worked, character for character. It was
+        then measured for thirty hours across `cogito:8b`'s investigate cell - 26 runs, 936
+        refusals, as many as THIRTY-SIX inside a single run, every one identical, every run ending
+        at the turn limit with no report. The cell reads 0/5.
+
+        A model that re-sends the same bytes thirty-six times against a perfect instruction is not
+        going to be told its way out of this. And it does not need to be: the id it sent is this
+        run's OWN snapshot fingerprint, the drive recognises it well enough to quote the correct
+        object back, and citing the snapshot is something this run is entitled to do. The only
+        thing wrong is which key the id sits under.
+
+        So it is read rather than refused - the same move `readSerializedClaims` makes one field
+        over, at the same boundary, for the same reason: an encoding the model chose, resolved where
+        it is unambiguous. The BAR does not move. A snapshot citation is worth exactly what a
+        snapshot citation was already worth, and `verifyOperationsGoal` still refuses a report that
+        rests on one - such a run now earns `no-reading` honestly instead of dying holding a call
+        the server could read.
+
+        An id that names nothing is untouched: there is nowhere for it to belong, and it still gets
+        the refusal above.
+      */
+      test("an id filed under the wrong source is READ as what it unambiguously is", () => {
+        const h = harness();
+
+        const outcome = composeReportTool(
+          h.context,
+          { runId: h.context.runId, events: [snapshotEvent, artifactEvent] },
+          {
+            claims: [
+              // The snapshot's own fingerprint, sent as an artifact - the exact shape measured.
+              { claim: "The schema says so.", evidence: [{ source: "artifact", correlationId: "ctx_1" }] },
+            ],
+          },
+        );
+
+        expect(outcome.kind).toBe("composed");
+        if (outcome.kind !== "composed") return;
+        // Recorded as the citation it was, so the ledger says what the report actually rests on.
+        expect(outcome.claims[0]?.evidence[0]).toEqual({ source: "context-snapshot", fingerprint: "ctx_1" });
+      });
+
+      /*
+        Where the reader must NOT read, and the measurement that drew the line.
+
+        Reading a misfiled citation ended `cogito:8b`'s investigate loop - 936 refusals, up to
+        thirty-six in one run, 0/5 to 5/5. It also cost `mistral-small3.2:24b` its analyze cell,
+        0/5, and the ledger says exactly how: the model reported citing the snapshot, the reader
+        made that citation valid, the report composed, and the run ended `no-answer`. Before the
+        reader the same citation was REFUSED, and the refusal bought the run another turn.
+
+        The difference is whether a snapshot citation can satisfy the surface at all. Three
+        verdicts require `source === "artifact"` - query-optimization wants a plan, data-analysis
+        wants the answered read, operations wants any reading - so on those three a snapshot
+        citation is a report that cannot score, and refusing it is worth more than accepting it.
+        On the other two it is a citation the run is entitled to make.
+
+        So the reader is gated on the workflow, and the gate is measured rather than assumed: the
+        test below drives it against the verifier's own answer.
+      */
+      test("but a workflow whose verdict needs an artifact keeps the refusal, because it buys a turn", () => {
+        const h = harness({ workflowType: "data-analysis" });
+
+        const outcome = composeReportTool(
+          h.context,
+          { runId: h.context.runId, events: [snapshotEvent, artifactEvent] },
+          { claims: [{ claim: "From the inventory.", evidence: [{ source: "artifact", correlationId: "ctx_1" }] }] },
+        );
+
+        expect(outcome.kind).toBe("unavailable");
+        if (outcome.kind !== "unavailable") return;
+        expect(outcome.reasonCode).toBe("UNVERIFIABLE_EVIDENCE");
+      });
+
+      test("and an id that names nothing at all is still refused", () => {
+        const h = harness();
+
+        const outcome = composeReportTool(
+          h.context,
+          { runId: h.context.runId, events: [snapshotEvent, artifactEvent] },
+          { claims: [{ claim: "Invented.", evidence: [{ source: "artifact", correlationId: "nothing-like-this" }] }] },
+        );
+
+        expect(outcome.kind).toBe("unavailable");
+        if (outcome.kind !== "unavailable") return;
+        expect(outcome.reasonCode).toBe("UNVERIFIABLE_EVIDENCE");
+      });
+
       test("compose_report names the failing claim and evidence position", () => {
         const h = harness();
 
@@ -1032,56 +1726,14 @@ describe("a tool that demands a citation says what a citation IS (#350)", () => 
         expect(outcome.detail).not.toContain("claims.0.evidence.0");
       });
 
-      test("a snapshot cited as an artifact is told which source it belongs under", () => {
-        const h = harness();
-
-        const outcome = composeReportTool(
-          h.context,
-          { runId: h.context.runId, events: [snapshotEvent] },
-          {
-            claims: [
-              { claim: "The database has one table.", evidence: [{ source: "artifact", correlationId: "ctx_1" }] },
-            ],
-          },
-        );
-
-        if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
-        expect(outcome.reasonCode).toBe("UNVERIFIABLE_EVIDENCE");
-        // The remedy, in the words of the object the model has to send.
-        expect(outcome.detail).toContain("context-snapshot");
-        expect(outcome.detail).toContain("fingerprint");
-        expect(outcome.detail).toContain("ctx_1");
-        // And it reaches the MODEL, not only the ledger — the ledger half is what a reader
-        // diagnoses with afterwards, and the model half is what ends the loop. Asserted on the
-        // REMEDY, not on the source name: `AGENT_EVIDENCE_CONTRACT` names both sources and is
-        // appended here, so `toContain("context-snapshot")` would pass with the remedy removed.
-        expect(outcome.modelText).toContain("belongs under a different source");
-        expect(outcome.modelText).toContain("ctx_1");
-      });
-
-      test("an artifact cited as a snapshot is told the same thing, the other way round", () => {
-        // The mirror, because the two sources are symmetrical and a fix that only knew one
-        // direction would leave the other model looping.
-        const h = harness();
-
-        const outcome = composeReportTool(
-          h.context,
-          { runId: h.context.runId, events: [snapshotEvent, artifactEvent] },
-          {
-            claims: [
-              {
-                claim: "Engineering is largest.",
-                evidence: [{ source: "context-snapshot", fingerprint: "corr-real" }],
-              },
-            ],
-          },
-        );
-
-        if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
-        expect(outcome.detail).toContain("artifact");
-        expect(outcome.detail).toContain("correlationId");
-        expect(outcome.detail).toContain("corr-real");
-      });
+      /*
+        The two tests that stood here asserted the refusal these cases used to get, and the reader
+        above supersedes both: a snapshot cited as an artifact, and an artifact cited as a snapshot,
+        are now READ rather than refused. The refusal they pinned was exact and was measured for
+        thirty hours against `cogito:8b` without ever ending the loop - 936 of them, up to
+        thirty-six in one run - which is the whole argument for reading instead. Its wording is
+        kept nowhere, because a sentence nothing can reach is a sentence nobody maintains.
+      */
 
       test("an id the run never produced is still just named, with no invented remedy", () => {
         // The guard on the sentence above: it may only fire when the id really does name
@@ -1143,6 +1795,11 @@ describe("a tool that demands a citation says what a citation IS (#350)", () => 
         The id offered here is one this tool will ACCEPT — a completed data read with a
         statement of the model's behind it — and not merely the newest artifact, which for a
         run that has just profiled a table would be the very id it is about to be refused for.
+
+        The PRESENTATION is what is wrong here, and it has to be: since
+        `readMisrenderedPresentation`, a call carrying only an artifact is answered as a table
+        rather than refused, so a bare id would no longer reach a refusal to carry the example.
+        A named rendering this tool does not have is the case that still does.
       */
       const h = harness();
       const events: AgentRunEvent[] = [
@@ -1153,7 +1810,7 @@ describe("a tool that demands a citation says what a citation IS (#350)", () => 
       const outcome = presentAnswerTool(
         { ...h.context, modelId: "granite4.1:8b" },
         { runId: h.context.runId, autoExecute: false, events },
-        { artifact: "corr-real" },
+        { artifact: "corr-real", presentation: { kind: "spreadsheet" } },
       );
 
       if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
@@ -1302,6 +1959,87 @@ describe("a tool that demands a citation says what a citation IS (#350)", () => 
       expect(outcome.modelText).toContain("corr-plan");
       // The plan's id, and no invented table name.
       expect(outcome.modelText).toContain("<table>");
+    });
+
+    describe("recommend_change states its OWN call shape, which it never did", () => {
+      /*
+        Measured on `qwen2.5:7b`, query-optimization, 25 runs read from their ledgers: the 9 that
+        passed recorded a `statement`, the 16 that lost recorded none, and nothing else separated
+        them — the two sides are step-for-step identical up to that point.
+
+        What the losing runs sent was three keys, `{"change","evidence","rationale"}`, never a
+        fourth. In the SAME turn they wrote the value the missing field wants as prose: "Here is
+        the SQL statement for creating the index: ```sql CREATE INDEX idx_employee_name ON
+        employee(first_name, last_name); ```" — and eight of the nine passing runs carry that
+        string, character for character, in `statement`. The model was not failing to write the
+        SQL. It did not know the field existed.
+
+        It could not have learned it here. `compose_report` is answered with `AGENT_CLAIM_SHAPE`
+        and `present_answer` with `AGENT_ANSWER_SHAPE`, both ungated; this tool had neither, and
+        `isShapeFailure` tests for a `claims` path that this call does not have, so that branch
+        could never fire for it. Its shape existed only inside `exampleRecommendCall`, behind the
+        `refusalExamples` lever — which `qwen2.5:7b` does not carry, having no profile row at all.
+      */
+      test("a call missing `statement` is shown the object it should have been", () => {
+        const h = harness();
+
+        const outcome = recommendChangeTool(
+          h.context,
+          { runId: h.context.runId, events: [artifactEvent] },
+          {
+            change: "index",
+            rationale: "the read scans",
+            evidence: [{ source: "artifact", correlationId: "corr-real" }],
+          },
+        );
+
+        if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
+        expect(outcome.reasonCode).toBe("INVALID_TOOL_INPUT");
+        // The failing path, as it already did.
+        expect(outcome.modelText).toContain("statement: expected string");
+        // And now the field it never knew about, named in the object it belongs to.
+        expect(outcome.modelText).toContain('"statement"');
+        expect(outcome.modelText).toContain("SQL written only in your reply is not part of it");
+      });
+
+      test("the shape stays out of the ledger line, which counts paths", () => {
+        const h = harness();
+
+        const outcome = recommendChangeTool(
+          h.context,
+          { runId: h.context.runId, events: [artifactEvent] },
+          {
+            change: "index",
+            rationale: "the read scans",
+            evidence: [{ source: "artifact", correlationId: "corr-real" }],
+          },
+        );
+
+        if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
+        expect(outcome.detail).toContain("statement");
+        expect(outcome.detail).not.toContain("SQL written only in your reply");
+      });
+
+      test("a fault INSIDE an evidence item is not buried under the wrapper", () => {
+        // The guard on the sentence, and the same restraint `isShapeFailure` shows: a model that
+        // built the call correctly and mistyped one field inside a citation needs that field
+        // named, not the whole object it already got right.
+        const h = harness();
+
+        const outcome = recommendChangeTool(
+          h.context,
+          { runId: h.context.runId, events: [artifactEvent] },
+          {
+            change: "index",
+            statement: "CREATE INDEX i ON orders (id)",
+            rationale: "the read scans",
+            evidence: [{ source: "artifact", correlationId: 7 }],
+          },
+        );
+
+        if (outcome.kind !== "unavailable") throw new Error(`expected unavailable, got ${outcome.kind}`);
+        expect(outcome.modelText).not.toContain("SQL written only in your reply");
+      });
     });
 
     test("recommend_change tells a wrong-shaped citation what the shape is", () => {
@@ -1574,6 +2312,22 @@ describe("runReadQueryTool — the allowed path", () => {
 
     expect(outcome.kind).toBe("completed");
     expect(outcome.modelText).toContain("9007199254740993");
+  });
+
+  // `JSON.stringify` writes NaN and both infinities as `null`, which the model would read
+  // as SQL NULL; PostgreSQL's `pg` driver hands a stored `'NaN'::float8` back as NaN.
+  test("renders NaN and the infinities as words, not as null", async () => {
+    const h = harness({}, async () =>
+      queryResult({
+        rows: [{ f: Number.NaN, r: Number.POSITIVE_INFINITY, n: Number.NEGATIVE_INFINITY, ok: 1.5 }],
+        fields: ["f", "r", "n", "ok"],
+      }),
+    );
+
+    const outcome = await runReadQueryTool(h.context, { sql: "SELECT f, r, n, ok FROM floats" });
+
+    expect(outcome.kind).toBe("completed");
+    expect(outcome.modelText).toContain('{"f":"NaN","r":"Infinity","n":"-Infinity","ok":1.5}');
   });
 
   test("renders a Buffer-shaped binary column as hex, not its wire JSON", async () => {
@@ -2042,6 +2796,24 @@ describe("runReadQueryTool — a database error is repairable, bounded, and neve
     expect(outcome.modelText.split(UNTRUSTED_CONTENT_END)[1]).toContain("LIMIT 200");
   });
 
+  test("a statement in a language with no server adapter is a named error, never a SQL fingerprint", async () => {
+    // A statement fingerprinted as SQL, or refused with a SQL sentence, would be a wrong answer that looks like a
+    // right one, so a language id this server does not know (one a ledger carried) throws before anything is spent.
+    let reached = false;
+    const h = harness({}, async () => {
+      reached = true;
+      throw new QueryError("never sent", "postgres");
+    });
+
+    await expect(
+      executeAgentOperation(
+        { ...h.context, statementLanguage: "cypher" as AgentStatementLanguageId },
+        { operationId: "sql.query.read", sql: "MATCH (n) RETURN n" },
+      ),
+    ).rejects.toThrow("no server adapter for cypher");
+    expect(reached).toBe(false);
+  });
+
   test("a catalog from another engine is answered with the engine this connection actually is", async () => {
     // 31 refusals of this shape: information_schema and schema-qualified names sent to SQLite.
     const h = harness({}, async () => {
@@ -2284,19 +3056,18 @@ describe("runReadQueryTool — a database error is repairable, bounded, and neve
     ['invalid input syntax for type integer: "abc"', "postgres"],
     ["function nosuch(integer) does not exist", "postgres"],
     ["division by zero", "postgres"],
-    // The one this layer causes ITSELF, and the reason the classification is by
-    // phase rather than by class. `postgres.ts` issues `SET LOCAL statement_timeout`
-    // with the clamped budget, and when it fires PostgreSQL says "canceling
-    // statement due to statement timeout" — which `mapDatabaseError` matches on
-    // `canceling statement` BEFORE its timeout branch, so it arrives as a
-    // `QueryCancelledError` and never as a `TimeoutError`. Narrowing the read is
-    // exactly the repair that helps, so this must not leave the layer as a throw.
+    // The one this layer causes ITSELF via `SET LOCAL statement_timeout`. Since
+    // #1145, PostgreSQL's "canceling statement due to statement timeout" is
+    // recognised by `mapDatabaseError` BEFORE its cancellation branch and arrives as
+    // a `TimeoutError` carrying the engine's text — still repairable at this phase,
+    // because narrowing the read is exactly the repair that helps, so this must not
+    // leave the layer as a throw.
     ["canceling statement due to statement timeout", "postgres"],
     // A least-privilege `agentUser` with per-table grants (the deployment
     // `execution-policy.ts` and postgres.md §12.3 recommend) makes this the model's
     // routine first probe of an ungranted object. `mapDatabaseError` answers
-    // `AuthenticationError` for any "permission denied", so a run would otherwise die
-    // on it every time and never learn to look elsewhere.
+    // `PermissionDeniedError` for it, which stays out of `ENVIRONMENT_FAILURES`, so a
+    // run does not die on it every time and can learn to look elsewhere.
     ["permission denied for table secrets", "postgres"],
   ] as const)("a statement the engine rejected with %p is repairable, not a raw throw", async (message, dialect) => {
     const mapped = mapDatabaseError(new Error(message), dialect);
@@ -2310,8 +3081,9 @@ describe("runReadQueryTool — a database error is repairable, bounded, and neve
       throw new Error(`expected a repairable database error, got ${JSON.stringify(outcome)}`);
     }
     // The MAPPED message, not the raw engine text: `mapDatabaseError` rewrites some of
-    // them (a cancel collapses to "Query was cancelled", losing the distinguishing
-    // wording — see `docs/BACKLOG.md` B4), and what the model sees is the mapped one.
+    // them (an operator cancel collapses to "Query was cancelled"), and what the model
+    // sees is the mapped one. A PostgreSQL statement timeout, by contrast, keeps the
+    // engine's own wording since #1145.
     expect(outcome.refusal.message).toBe(mapped.message);
     expect(outcome.refusal.statementFingerprint).toBe(fingerprintStatement("SELECT * FROM ordrs"));
     // It cost an attempt and is now unrepeatable — the whole point of being repairable.
@@ -2342,17 +3114,13 @@ describe("runReadQueryTool — a database error is repairable, bounded, and neve
   });
 
   /**
-   * The ACQUISITION phase, which is what lets the two readings of an
-   * `AuthenticationError` be separated without inspecting message text.
+   * The ACQUISITION phase.
    *
-   * `mapDatabaseError` answers `AuthenticationError` for any `password` /
-   * `authentication` / `access denied` / `permission denied` message, which folds a
-   * wrong agent credential together with `permission denied for table secrets`. They
-   * are indistinguishable by CLASS but they arise at different phases: a credential
-   * failure comes from connecting, a table grant failure comes from running the
-   * statement. So nothing that fails before the statement is even sent can be a
-   * statement the model could repair, whatever its class — and that is asserted here
-   * over every class rather than for the credential case alone.
+   * A refused agent credential (`AuthenticationError`) arises while connecting, and a
+   * missing table grant (`PermissionDeniedError`, `permission denied for table
+   * secrets`) while running the statement. So nothing that fails before the statement
+   * is even sent can be a statement the model could repair, whatever its class, and
+   * that is asserted here over every class rather than for the credential case alone.
    */
   test.each([
     ["a wrong agent credential", new AuthenticationError("password authentication failed", "postgres")],
@@ -2380,7 +3148,7 @@ describe("runReadQueryTool — a database error is repairable, bounded, and neve
    * base class and is offered a repair) but fails UNSAFE for a new error CLASS: an
    * `IdleTimeoutError` added to `errors.ts` and not added to `ENVIRONMENT_FAILURES`
    * would be silently offered to the model as a statement it could rewrite, burning
-   * the repair budget on an environment fault. A test naming the eight classes that
+   * the repair budget on an environment fault. A test naming the nine classes that
    * exist today could not catch that — it would still pass. So this walks the error
    * module's own exports, finds every `DatabaseError` subclass, drives one through
    * the tool, and requires the verdict to be one somebody wrote down here.
@@ -2407,6 +3175,8 @@ describe("runReadQueryTool — a database error is repairable, bounded, and neve
       TimeoutError: "repairable",
       QueryCancelledError: "repairable",
       AuthenticationError: "repairable",
+      // A grant the agent's least-privilege credential lacks: reading another object is the repair.
+      PermissionDeniedError: "repairable",
       ConnectionError: "propagates",
       PoolExhaustedError: "propagates",
       DatabaseConfigError: "propagates",
@@ -2595,7 +3365,7 @@ describe("inspectSchemaTool — the server composes the catalog statement", () =
   });
 
   test("a dialect with no verified catalog composition is reported the same way", async () => {
-    const h = harness({ connection: { ...connection, type: "mysql" } });
+    const h = harness({ connection: { ...connection, type: "oracle" } });
 
     const outcome = await inspectSchemaTool(h.context, {});
 
@@ -2633,6 +3403,36 @@ describe("inspectSchemaTool — the server composes the catalog statement", () =
     expect(denied.acquireProvider).not.toHaveBeenCalled();
   });
 
+  /*
+    Only SQLite folds the declared schema. Every other SQL engine declares the spelling the
+    model supplied, `MAIN` included, so an allowlist naming that spelling admits it and one
+    naming the folded spelling does not.
+  */
+  test.each([
+    ["mysql", "MAIN"],
+    ["mysql", "Sales"],
+    ["mssql", "MAIN"],
+    ["mssql", "Sales"],
+    ["duckdb", "MAIN"],
+    ["duckdb", "Sales"],
+  ] as const)("on %s the schema selector %s is declared exactly as supplied", async (type, schema) => {
+    const admitted = harness({
+      connection: { ...connection, type },
+      scope: createTargetScope("conn-1", { schemas: [schema] }),
+    });
+    const denied = harness({
+      connection: { ...connection, type },
+      scope: createTargetScope("conn-1", { schemas: [schema.toLowerCase()] }),
+    });
+
+    const allowed = await inspectSchemaTool(admitted.context, { schema });
+    const refused = await inspectSchemaTool(denied.context, { schema });
+
+    expect(allowed.kind).toBe("completed");
+    if (refused.kind !== "refused") throw new Error(`expected refused, got ${refused.kind}`);
+    expect(refused.refusal).toEqual({ class: "policy-denied", reasonCode: "TARGET_OUT_OF_SCOPE" });
+  });
+
   test("arguments that do not match the tool's declared schema are a typed outcome, not a throw", async () => {
     // The declared `inputSchema` has to be load-bearing: these arguments come from a
     // model, and a caller that forgot to validate must not turn one into a raw
@@ -2642,8 +3442,8 @@ describe("inspectSchemaTool — the server composes the catalog statement", () =
     const outcomes = [
       await inspectSchemaTool(h.context, { schema: 42 } as unknown as { schema?: string }),
       await inspectSchemaTool(h.context, { unexpected: "x" } as unknown as { schema?: string }),
-      await runReadQueryTool(h.context, { sql: 7 } as unknown as { sql: string }),
-      await runReadQueryTool(h.context, {} as unknown as { sql: string }),
+      await runReadQueryTool(h.context, { sql: 7 }),
+      await runReadQueryTool(h.context, {}),
       await inspectPlanTool(h.context, { sql: null } as unknown as { sql: string }),
     ];
 
@@ -2744,6 +3544,104 @@ describe("the grounding seam — the server's own read, outside agent mode", () 
   });
 });
 
+describe("readCatalog — the extension-ownership fallback retry", () => {
+  test("a database error naming pg_depend retries once without the ownership tests", async () => {
+    let attempts = 0;
+    const h = harness({}, async () => {
+      attempts += 1;
+      if (attempts === 1) throw new QueryError('relation "pg_depend" does not exist', "postgres");
+      return queryResult();
+    });
+
+    const outcome = await readCatalogForGrounding(h.context, {});
+
+    expect(outcome.kind).toBe("completed");
+    expect(h.queryReadOnly).toHaveBeenCalledTimes(2);
+    const first = h.queryReadOnly.mock.calls[0][0] as string;
+    const second = h.queryReadOnly.mock.calls[1][0] as string;
+    expect(first).toContain("pg_depend");
+    expect(second).not.toContain("pg_depend");
+    expect(second).toContain("information_schema.columns");
+  });
+
+  test("a database error that does not name those catalogs is not retried", async () => {
+    const h = harness({}, async () => {
+      throw new QueryError('column "ordr_id" does not exist', "postgres");
+    });
+
+    const outcome = await readCatalogForGrounding(h.context, {});
+
+    expect(outcome.kind).toBe("refused");
+    expect(h.queryReadOnly).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["mysql", "mssql", "duckdb", "sqlite"] as const)(
+    "on %s the same error is not retried, because only PostgreSQL composes the ownership tests",
+    async (type) => {
+      const h = harness({ connection: { ...connection, type } }, async () => {
+        throw new QueryError('relation "pg_depend" does not exist', type);
+      });
+
+      const outcome = await readCatalogForGrounding(h.context, {});
+
+      expect(outcome.kind).toBe("refused");
+      expect(h.queryReadOnly).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test("the retry is taken once: a second error naming the catalogs is the answer", async () => {
+    const h = harness({}, async () => {
+      throw new QueryError('relation "pg_extension" does not exist', "postgres");
+    });
+
+    const outcome = await readCatalogForGrounding(h.context, {});
+
+    expect(outcome.kind).toBe("refused");
+    expect(h.queryReadOnly).toHaveBeenCalledTimes(2);
+  });
+
+  /*
+    The retry is skipped when the rewrite changes nothing, and measured at this commit that
+    branch is never taken: every PostgreSQL kind composes both ownership tests under every
+    selector, so the rewrite always shortens the statement. Each kind's retry is pinned here
+    so a kind that one day composes none of them shows up as one call instead of two.
+  */
+  test.each(["columns", "relations", "indexes", "statistics"] as const)(
+    "the %s read carries an ownership test, so the retry sends a different statement",
+    async (kind) => {
+      let attempts = 0;
+      const h = harness({}, async () => {
+        attempts += 1;
+        if (attempts === 1) throw new QueryError('relation "pg_depend" does not exist', "postgres");
+        return queryResult();
+      });
+
+      const outcome = await readCatalogForGrounding(h.context, { kind, schema: "public", table: "orders" });
+
+      expect(outcome.kind).toBe("completed");
+      expect(h.queryReadOnly).toHaveBeenCalledTimes(2);
+      expect(h.queryReadOnly.mock.calls[0][0]).toContain("pg_depend");
+      expect(h.queryReadOnly.mock.calls[1][0]).not.toContain("pg_depend");
+    },
+  );
+
+  test("the model's own inspect_schema call takes the same retry as the grounding read", async () => {
+    let attempts = 0;
+    const h = harness({}, async () => {
+      attempts += 1;
+      if (attempts === 1) throw new QueryError('relation "pg_depend" does not exist', "postgres");
+      return queryResult();
+    });
+
+    const outcome = await inspectSchemaTool(h.context, { schema: "public" });
+
+    expect(outcome.kind).toBe("completed");
+    expect(h.queryReadOnly).toHaveBeenCalledTimes(2);
+    expect(h.queryReadOnly.mock.calls[1][0]).not.toContain("pg_depend");
+    expect(h.queryReadOnly.mock.calls[1][0]).toContain("table_schema = 'public'");
+  });
+});
+
 describe("inspectPlanTool — the estimating variant only", () => {
   test("composes the estimating EXPLAIN for the connection's dialect", async () => {
     const h = harness();
@@ -2774,15 +3672,57 @@ describe("inspectPlanTool — the estimating variant only", () => {
     expect(h.queryReadOnly.mock.calls[0][0]).toBe("EXPLAIN QUERY PLAN SELECT id FROM orders");
   });
 
-  test("a provider without EXPLAIN support is denied on the capability stage", async () => {
+  /**
+   * What bounds this tool is the DIALECT, not the editor's Explain capability, and the
+   * two came apart on SQL Server: it has a verified estimating plan for the agent
+   * (`SET SHOWPLAN_ALL`, which its read-only profile compiles for every statement it
+   * admits) and no editor Explain at all, so `supportsExplain` is honestly false. While
+   * the descriptor required that flag, a `query-optimization` run there had
+   * `inspect_plan` denied `CAPABILITY_UNSUPPORTED` and finished `unanswered` with
+   * `no-plan-evidence`, measured on SQL Server 2022 before the descriptor was changed.
+   */
+  test("the editor's EXPLAIN capability does not bound this tool, because the agent composes its own", async () => {
     const h = harness({ capabilities: { ...capabilities, supportsExplain: false } });
 
     const outcome = await inspectPlanTool(h.context, { sql: "SELECT 1" });
 
-    if (outcome.kind !== "refused") throw new Error("expected refused");
-    expect(outcome.refusal).toEqual({ class: "policy-denied", reasonCode: "CAPABILITY_UNSUPPORTED" });
-    expect(h.queryReadOnly).not.toHaveBeenCalled();
+    expect(outcome.kind).not.toBe("refused");
+    expect(h.queryReadOnly).toHaveBeenCalled();
+  });
+
+  test("a dialect with no verified estimating form is refused before any provider is acquired", async () => {
+    const h = harness({ connection: { ...connection, type: "oracle" } });
+
+    const outcome = await inspectPlanTool(h.context, { sql: "SELECT 1" });
+
+    if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
+    expect(outcome.reasonCode).toBe("INVALID_TOOL_INPUT");
+    expect(outcome.detail).toBe("UNSUPPORTED_DIALECT");
     expect(h.acquireProvider).not.toHaveBeenCalled();
+  });
+
+  /**
+   * SQL Server composes NO prefix and asks for the plan as a session mode instead, so
+   * the statement reaching the provider is the model's own and the MODE is what says
+   * what to do with it. A test that only looked at the statement could not tell this
+   * apart from an engine that was sent no plan request at all.
+   */
+  test("SQL Server sends the statement unprefixed and asks for the plan as a mode", async () => {
+    const h = harness({ connection: { ...connection, type: "mssql" } });
+
+    await inspectPlanTool(h.context, { sql: "SELECT id FROM orders" });
+
+    expect(h.queryReadOnly.mock.calls[0][0]).toBe("SELECT id FROM orders");
+    expect(h.queryReadOnly.mock.calls[0][2]).toBe("estimate-plan");
+  });
+
+  test("the prefix engines are sent no mode, because their prefix is the request", async () => {
+    const h = harness();
+
+    await inspectPlanTool(h.context, { sql: "SELECT id FROM orders" });
+
+    expect(h.queryReadOnly.mock.calls[0][0]).toBe("EXPLAIN (FORMAT JSON) SELECT id FROM orders");
+    expect(h.queryReadOnly.mock.calls[0][2]).toBe("execute");
   });
 
   test("a write smuggled into a plan request is refused at the input stage", async () => {
@@ -3181,7 +4121,7 @@ describe("recommendChangeTool — a change the run proposes and does not make", 
 
     if (outcome.kind !== "recommended") throw new Error("expected recommended");
     expect(outcome.recommendation.change).toBe("index");
-    expect(outcome.recommendation.statement).toBe(INDEX_DDL);
+    expect(outcome.recommendation).toMatchObject({ statement: INDEX_DDL });
     expect(outcome.recommendation.evidence).toEqual([{ source: "artifact", correlationId: "corr-1" }]);
     expect(outcome.modelText).toContain("not executed");
   });
@@ -3197,6 +4137,438 @@ describe("recommendChangeTool — a change the run proposes and does not make", 
     });
 
     expect(outcome.kind).toBe("recommended");
+  });
+
+  /*
+    The call models actually send, captured 2026-09-17 by dumping the arguments of every refused
+    call across two models and the two surfaces that were failing - 17 refusals, NINE of them this
+    one shape, to the byte:
+
+        {"change": "CREATE INDEX idx_employee_emp_no ON employee(emp_no);",
+         "reason": "Creating an index on the employee table will improve the query performance ...",
+         "evidence": {"correlationId": "772210b6-...", "source": "artifact"}}
+
+    Everything in it is right. The DDL is valid and answers the objective, the rationale is a real
+    sentence, and the correlation id is one this run genuinely produced. Three things are displaced,
+    and each is displaced in the only direction it could be:
+
+      the SQL is in `change`, where the schema wants the WORD for the kind of change. A field
+      called `change` holding the change is not a wild guess; it is the obvious reading.
+
+      the rationale is called `reason`. Not a near miss by spelling - `renamesAmong` pairs
+      `artifact_id` with `artifact` and cannot pair these - so the model was told a field was
+      absent and a field was surplus and never that they were the same field.
+
+      the evidence is ONE object rather than a list of one.
+
+    What the model got back was `change: expected one of index, rewrite; statement: expected string,
+    received nothing; rationale: expected string, received nothing` - three sentences about a call
+    that carried all three values. Nine refusals, and the cell scored `no-report` every time.
+
+    So it is READ, in that order, and only where each step is unambiguous: the SQL names its own
+    kind of change, which leaves `statement` filled and `change` correct; that leaves exactly one
+    absent field and exactly one surplus key, which is a rename nothing else can claim; and a lone
+    evidence object is the one-item list it was always meant to be.
+  */
+  test("a call that describes the index in parts is told the server does not assemble it", () => {
+    /*
+      The largest shape in the 2026-09-17 capture: five of six refusals on `llama3.1:8b` optimize,
+      and not one of the four fields present.
+
+          {"table_name": "employee", "column_name": "emp_no", "index_name": "emp_no_idx"}
+
+      The model is not misfiling anything. It believes this tool BUILDS the index from its parts,
+      the way most index APIs do, and there is nothing in the refusal it was getting to say
+      otherwise: `change: expected one of index, rewrite; statement: expected string, received
+      nothing; rationale: expected string, received nothing` describes three fields it does not
+      believe in. The shape line was already being sent and answers a different question - what the
+      call LOOKS like - which a model that thinks the server writes the SQL reads as confirmation.
+
+      Not assembled, deliberately, and this is the same line drawn on `change` holding prose: the
+      DDL is fully determined by those three names and composing it would be this server writing
+      the statement it declines to execute, on a run that supplied no evidence for it either. What
+      changes is that the model is told which of the two of them writes the SQL.
+    */
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      table_name: "orders",
+      column_name: "customer_id",
+      index_name: "orders_customer_id_idx",
+    });
+
+    if (outcome.kind === "recommended") throw new Error("expected a refusal");
+    expect(outcome.modelText).toContain("does not compose the statement");
+  });
+
+  test("an evidence item wrapped in one key is unwrapped, because the wrapper carries nothing", () => {
+    /*
+      150 refusals captured from `granite4.1:3b` in a single sweep, 71 of them this exact shape:
+
+          "evidence": {"artifact": {"correlationId": "eb77e058-...", "source": "artifact"}}
+
+      The reference is complete and correct; it is inside a wrapper named after its own `source`.
+      The lone-object reader above turns it into a one-item list and the schema then reports
+      `evidence.0.source: invalid union`, which is true of the WRAPPER and says nothing about the
+      reference one level down. The cell that produced these is `granite4.1:3b` optimize - 0/5
+      across five readings, the last cell standing between that model and 30/30, and every run
+      lost having called its three tools and tried to file nineteen times.
+
+      Unwrapped only when the wrapper has exactly ONE key and that key's value is an object
+      carrying `source`. Two keys is a model saying something this cannot read, and guessing which
+      half to keep would be the server choosing the citation.
+    */
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      change: "index",
+      statement: INDEX_DDL,
+      rationale: "the filtered column has no index",
+      evidence: { artifact: { source: "artifact", correlationId: "corr-1" } },
+    });
+
+    if (outcome.kind !== "recommended") throw new Error(`expected recommended, got ${outcome.reasonCode}`);
+    expect(outcome.recommendation.evidence).toEqual([{ source: "artifact", correlationId: "corr-1" }]);
+  });
+
+  test("but a wrapper with two keys is left for the schema to refuse", () => {
+    // The line: one key whose value is a reference is unambiguous, two is a model saying something
+    // this reader cannot interpret - and picking one would be the server choosing the citation.
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      change: "index",
+      statement: INDEX_DDL,
+      rationale: "the filtered column has no index",
+      evidence: { artifact: { source: "artifact", correlationId: "corr-1" }, note: "also this" },
+    });
+
+    if (outcome.kind === "recommended") throw new Error("expected a refusal");
+    expect(outcome.reasonCode).toBe("INVALID_TOOL_INPUT");
+  });
+
+  test("evidence serialized as a string is read, the same reading claims already get", () => {
+    /*
+      Captured 2026-09-17 on `llama3.1:8b`, optimize: the call is otherwise perfect - `change` is
+      the enum, `statement` is valid DDL, `rationale` is a real sentence - and `evidence` arrives as
+      a STRING containing the array it should have been:
+
+          "evidence": "[{\\"source\\": \\"artifact\\", \\"correlationId\\": \\"28578f24-...\\"}]"
+
+      `readSerializedClaims` has read exactly this for `claims` since the sweep that found it there,
+      and the two fields are the same mistake in the same tool family: a model whose transport
+      stringifies one argument stringifies it wherever it appears. Double quotes throughout, so it
+      is JSON and not a Python repr - the case that stays refused, for the reason recorded on
+      `AGENT_CLAIMS_NOT_JSON`.
+    */
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      change: "index",
+      statement: INDEX_DDL,
+      rationale: "the filtered column has no index",
+      evidence: JSON.stringify([{ source: "artifact", correlationId: "corr-1" }]),
+    });
+
+    if (outcome.kind !== "recommended") throw new Error(`expected recommended, got ${outcome.reasonCode}`);
+    expect(outcome.recommendation.evidence).toEqual([{ source: "artifact", correlationId: "corr-1" }]);
+  });
+
+  test("but evidence that is a string and not JSON stays refused", () => {
+    // The line: a sentence where an array goes is not a serialization to read, and guessing an
+    // encoding is what `AGENT_CLAIMS_NOT_JSON` exists to refuse rather than invent.
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      change: "index",
+      statement: INDEX_DDL,
+      rationale: "the filtered column has no index",
+      evidence: "the artifact from the plan step",
+    });
+
+    if (outcome.kind === "recommended") throw new Error("expected a refusal");
+    expect(outcome.reasonCode).toBe("INVALID_TOOL_INPUT");
+  });
+
+  test("a field that belongs to a sibling tool is sent there, not deleted", () => {
+    /*
+      The refusal that told a model to throw away the thing the run needed.
+
+      Captured 2026-09-17 on `granite4-3b`, whose analyze cell lost 5/5 while every other surface
+      locked — one cell short of the whole model. All five losses are `report-composed` with
+      `no-answer`, and the arguments say why. The model splits the answer across the two tools and
+      puts one half on the wrong one:
+
+          present_answer  {"artifact": "bfe7ca93-..."}
+          compose_report  {"claims": [...], "presentation": {"kind": "table"}}
+
+      Six refusals of the first for a missing `presentation`; three of the second carrying the very
+      presentation that was missing. Put together they are a complete, correct pair — the model
+      produced both halves and misfiled one key.
+
+      What the server said was `the arguments object: remove presentation`. The model removed it.
+      That is the server instructing a run to discard the only presentation it ever composed, and
+      then scoring it `no-answer` for not having one.
+
+      `remove` is right for a key that belongs nowhere. For a key that is a FIELD OF ANOTHER TOOL
+      this run holds, the true sentence is where it goes. Nothing is moved for the model — moving a
+      half-call between tools would invent a call it never made — it is told, once, in the words of
+      the tool that wants it.
+    */
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      change: "index",
+      statement: INDEX_DDL,
+      rationale: "the filtered column has no index",
+      evidence: [{ source: "artifact", correlationId: "corr-1" }],
+      claims: [{ claim: "orders has no index on customer_id" }],
+    });
+
+    if (outcome.kind === "recommended") throw new Error("expected a refusal");
+    expect(outcome.modelText).toContain("claims belongs to compose_report");
+    expect(outcome.modelText).not.toContain("remove claims");
+  });
+
+  test("a near-miss key is moved onto the field it was always meant for", () => {
+    /*
+      `artifact_id` where the schema says `artifact`, and the same reading applied rather than only
+      described. `renamesAmong` has named this pair in the refusal text since #4xx and the models
+      kept re-sending the same key: measured on `llama3.1:8b`, `present_answer` declined in all five
+      analyze runs, never once on the value it carried, and captured again on 2026-09-17 - five of
+      seventeen refusals, `{"artifact_id": "669cc394-..."}` with nothing else wrong with the id.
+
+      Naming it was not enough, so it is read. Asked of `recommend_change` here because that is
+      where the reader lives; the pairing rule is `renamesAmong`'s own and unchanged.
+    */
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      change: "index",
+      statement: INDEX_DDL,
+      rationale_text: "the filtered column has no index",
+      evidence: [{ source: "artifact", correlationId: "corr-1" }],
+    });
+
+    if (outcome.kind !== "recommended") throw new Error(`expected recommended, got ${outcome.reasonCode}`);
+    expect(outcome.recommendation.rationale).toBe("the filtered column has no index");
+  });
+
+  test("the SQL a model puts in change is read as the statement, and the change named from the SQL", () => {
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      change: INDEX_DDL,
+      reason: "the filtered column has no index",
+      evidence: { source: "artifact", correlationId: "corr-1" },
+    });
+
+    if (outcome.kind !== "recommended") throw new Error(`expected recommended, got ${outcome.reasonCode}`);
+    expect(outcome.recommendation.change).toBe("index");
+    expect(outcome.recommendation).toMatchObject({ statement: INDEX_DDL });
+    expect(outcome.recommendation.rationale).toBe("the filtered column has no index");
+    expect(outcome.recommendation.evidence).toEqual([{ source: "artifact", correlationId: "corr-1" }]);
+  });
+
+  test("a card that contradicts its own statement is corrected from the statement", () => {
+    /*
+      50 refusals in one sweep, across three models, and every sampled one is this:
+
+          change: "index"   statement: "SELECT emp_no, first_name, ... FROM employee;"
+          change: "index"   statement: "SELECT * FROM employee"
+
+      `index` is the default the models reach for, and the statement they actually wrote is a
+      rewrite. `matchesCard` is right that the two disagree; what it did about it was refuse, and
+      `RECOMMENDATION_SHAPE_MISMATCH` then repeated itself until the cell died - on `granite4.2:3b`
+      this one refusal is what kept its optimize cell from closing in five separate confirmations.
+
+      Only one of the two fields can be trusted, and it is the statement: `CREATE INDEX` or `SELECT`
+      IS the kind of change, while `change` is a label the model picked before writing it. So the
+      label is corrected from the statement rather than the call being thrown away. Prose in the
+      statement still names no kind and is still refused - the test below draws that line.
+    */
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      change: "index",
+      statement: "SELECT emp_no, first_name FROM employee",
+      rationale: "the wide projection is unnecessary",
+      evidence: [{ source: "artifact", correlationId: "corr-1" }],
+    });
+
+    if (outcome.kind !== "recommended") throw new Error(`expected recommended, got ${outcome.reasonCode}`);
+    expect(outcome.recommendation.change).toBe("rewrite");
+    expect(outcome.recommendation).toMatchObject({ statement: "SELECT emp_no, first_name FROM employee" });
+  });
+
+  test("but a card whose statement is prose is still refused", () => {
+    /*
+      The other half of the 50, and the line: `change: "index"` with
+      `statement: "Add an index on employee.emp_no ..."`. There is no statement to offer an editor
+      and nothing to read the kind from, so the refusal stands.
+    */
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      change: "index",
+      statement: "Add an index on employee.emp_no to enable an index scan.",
+      rationale: "the scan is full",
+      evidence: [{ source: "artifact", correlationId: "corr-1" }],
+    });
+
+    if (outcome.kind === "recommended") throw new Error("expected a refusal");
+    expect(outcome.reasonCode).toBe("RECOMMENDATION_SHAPE_MISMATCH");
+  });
+
+  test("a null change is read from the statement rather than refused for not being the enum", () => {
+    /*
+      71 refusals of `change: expected one of index, rewrite`, 44 of them `llama3.1:8b` and 23
+      `llama3.2:3b`. Two inputs produce it: `change: null`, and `change` holding the DDL while
+      `statement` is filled too - the displaced-SQL reader only moved the SQL when `statement` was
+      empty, so a model that filled both got nothing.
+
+      Both are the same question - which kind of change is this - and the statement answers it.
+    */
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      change: null,
+      statement: INDEX_DDL,
+      rationale: "the filtered column has no index",
+      evidence: [{ source: "artifact", correlationId: "corr-1" }],
+    } as never);
+
+    if (outcome.kind !== "recommended") throw new Error(`expected recommended, got ${outcome.reasonCode}`);
+    expect(outcome.recommendation.change).toBe("index");
+  });
+
+  test("a SELECT in the same position is a rewrite, because the statement says which it is", () => {
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      change: "SELECT id FROM orders WHERE customer_id = 1",
+      rationale: "the wide projection is unnecessary",
+      evidence: [{ source: "artifact", correlationId: "corr-1" }],
+    });
+
+    if (outcome.kind !== "recommended") throw new Error(`expected recommended, got ${outcome.reasonCode}`);
+    expect(outcome.recommendation.change).toBe("rewrite");
+    expect(outcome.recommendation).toMatchObject({ statement: "SELECT id FROM orders WHERE customer_id = 1" });
+  });
+
+  test("the statement under a key of the model's own, when `statement` is empty", () => {
+    /*
+      The largest single refusal in the whole measurement, and the statement was never missing.
+
+      Counted over the argument capture: 1595 `recommend_change` refusals carry
+      `statement: expected string, received nothing`, and 949 of them hold a complete `CREATE INDEX`
+      under a key the model chose instead - 576 as `{"sql": "CREATE INDEX ..."}` alone, 301 with an
+      `index_name` beside it, 72 with the table and column spelled out too. `llama3.1:8b` sent one
+      1189 times.
+
+      What the refusal then said was "statement: expected string, received nothing", which is false
+      to the model that just sent it, so it re-sent the same bytes. The count is the proof: a model
+      that could read the refusal would not repeat it 1189 times.
+
+      The statement identifies ITSELF - `CREATE INDEX` or `SELECT` is the kind of change - so
+      nothing is guessed here: a value that parses as one of those two openings, in a run where
+      `statement` is absent, IS the statement. The two fields genuinely missing (`rationale` and
+      `evidence`) are then the only thing the refusal names, which is a refusal a model can act on.
+    */
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      sql: INDEX_DDL,
+      rationale: "the filtered column has no index",
+      evidence: [{ source: "artifact", correlationId: "corr-1" }],
+    } as never);
+
+    if (outcome.kind !== "recommended") throw new Error(`expected recommended, got ${outcome.reasonCode}`);
+    expect(outcome.recommendation.change).toBe("index");
+    expect(outcome.recommendation).toMatchObject({ statement: INDEX_DDL });
+  });
+
+  test("the same, with the model's other spellings of that key", () => {
+    // `query` and `ddl` appear beside `sql` in the capture. The key is not what identifies the
+    // statement - the statement's own opening is - so the reader may not be a list of blessed names.
+    for (const key of ["query", "ddl", "sql_statement", "create_index"]) {
+      const h = harness();
+      const outcome = recommendChangeTool(h.context, run, {
+        [key]: INDEX_DDL,
+        rationale: "the filtered column has no index",
+        evidence: [{ source: "artifact", correlationId: "corr-1" }],
+      } as never);
+
+      if (outcome.kind !== "recommended") throw new Error(`${key}: expected recommended, got ${outcome.reasonCode}`);
+      expect(outcome.recommendation).toMatchObject({ statement: INDEX_DDL });
+    }
+  });
+
+  test("a statement under its own key does not paper over the fields that ARE missing", () => {
+    /*
+      The bound, and the reason this reading is worth having at all. 1196 of those 1595 calls carry
+      ONLY the statement - no rationale, no evidence - so reading it cannot make them pass, and must
+      not pretend to. What changes is the sentence: instead of four fields named, of which three had
+      arrived, the model is told the two that are genuinely absent.
+    */
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, { sql: INDEX_DDL } as never);
+
+    if (outcome.kind === "recommended") throw new Error("expected a refusal");
+    expect(outcome.reasonCode).toBe("INVALID_TOOL_INPUT");
+    expect(outcome.detail).toContain("rationale");
+    expect(outcome.detail).toContain("evidence");
+    expect(outcome.detail).not.toContain("statement:");
+  });
+
+  test("prose under that key is refused, exactly as prose in `change` is", () => {
+    // The same line the reader beside this one holds: a key carrying "add an index on customer_id"
+    // names no statement, and composing one would be this server writing the SQL it will not run.
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      sql: "add an index on the customer_id column",
+      rationale: "the filtered column has no index",
+      evidence: [{ source: "artifact", correlationId: "corr-1" }],
+    } as never);
+
+    if (outcome.kind === "recommended") throw new Error("expected a refusal");
+    expect(outcome.reasonCode).toBe("INVALID_TOOL_INPUT");
+  });
+
+  test("but prose in change is still refused, because prose names no statement", () => {
+    /*
+      The line this reader is bounded by. `change` holding "add an index on customer_id" carries no
+      statement to offer the user's editor, and inventing one would be this server writing the SQL
+      it refuses to execute. The model is told the enum, as it always was.
+    */
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      change: "add an index on the customer_id column",
+      rationale: "the filtered column has no index",
+      evidence: [{ source: "artifact", correlationId: "corr-1" }],
+    });
+
+    if (outcome.kind === "recommended") throw new Error("expected a refusal");
+    expect(outcome.reasonCode).toBe("INVALID_TOOL_INPUT");
+  });
+
+  test("and a statement already in its own field is left exactly where the model put it", () => {
+    // The reader must not touch a call that was right: `change` says `index`, `statement` holds the
+    // DDL, and nothing is displaced. Without this the repair could overwrite a correct call.
+    const h = harness();
+
+    const outcome = recommendChangeTool(h.context, run, {
+      change: "index",
+      statement: INDEX_DDL,
+      rationale: "the filtered column has no index",
+      evidence: [{ source: "artifact", correlationId: "corr-1" }],
+    });
+
+    if (outcome.kind !== "recommended") throw new Error("expected recommended");
+    expect(outcome.recommendation).toMatchObject({ statement: INDEX_DDL });
   });
 
   test("a recommendation citing something the run never produced is refused", () => {
@@ -3327,13 +4699,18 @@ describe("the two optimization tools refuse what would make their record untrue"
 
   test.each([
     ["index", "DROP TABLE orders"],
-    ["index", "SELECT id FROM orders"],
     ["index", "CREATE INDEX ix ON orders (a); DROP TABLE orders"],
     ["rewrite", "DROP TABLE orders"],
     ["rewrite", "SELECT 1; DROP TABLE orders"],
   ])("a %s card carrying %s is refused, because the card would assert something untrue", (change, statement) => {
     // The headline is the app's own words. "Index recommended" over a DROP is the
     // app saying something false, and the statement is offered to the user's editor.
+    //
+    // Every row here is a statement whose kind CANNOT be read: a DROP names neither an index nor
+    // a rewrite, and the two compound rows carry a second statement that no card may assert. The
+    // one row that left this list - an index card over a plain SELECT - left because the statement
+    // does name its kind, so the card is corrected to `rewrite` instead of the call being thrown
+    // away. Fifty refusals of exactly that in one sweep; see `readDisplacedRecommendation`.
     const outcome = recommend(change, statement);
 
     if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
@@ -3344,8 +4721,16 @@ describe("the two optimization tools refuse what would make their record untrue"
     ["index", "CREATE INDEX orders_a_idx ON orders (a)"],
     ["index", "CREATE UNIQUE INDEX orders_a_idx ON orders (a)"],
     ["rewrite", "SELECT id FROM orders WHERE a = 1"],
+    // Said `index`, wrote a read: recorded as the rewrite it is.
+    ["index", "SELECT id FROM orders"],
   ])("a %s card carrying %s is recorded", (change, statement) => {
     expect(recommend(change, statement).kind).toBe("recommended");
+  });
+
+  test("and the card it is recorded under is the one the statement names", () => {
+    const outcome = recommend("index", "SELECT id FROM orders");
+    if (outcome.kind !== "recommended") throw new Error("expected recommended");
+    expect(outcome.recommendation.change).toBe("rewrite");
   });
 });
 
@@ -3354,7 +4739,7 @@ describe("profileTableTool — the model names a table, the server decides the r
     connectionId: "conn-1",
     fingerprint: "ctx_1",
     capturedAtMs: 1,
-    tables: [
+    objects: [
       {
         name: "public.orders",
         columns: [{ name: "id", type: "integer", nullable: false, isPrimary: true }],
@@ -3365,6 +4750,35 @@ describe("profileTableTool — the model names a table, the server decides the r
   const events: readonly AgentRunEvent[] = [
     { kind: "context-captured", atMs: 1, fingerprint: "ctx_1", tableCount: 1, snapshot },
   ];
+
+  /**
+   * The same capture with the kinds a PostgreSQL inventory really carries (#789): a table,
+   * a view, and a function whose last path segment carries the overload form of ruling 2.
+   */
+  const kindedSnapshot = {
+    ...snapshot,
+    objects: [
+      { ...snapshot.objects[0], kind: "table" },
+      {
+        name: "public.order_summary",
+        kind: "view",
+        columns: [{ name: "id", type: "integer", nullable: false, isPrimary: true }],
+        indexes: [],
+      },
+      { name: "public.order_total(integer)", kind: "function", label: "order_total", columns: [], indexes: [] },
+      { name: "public.orders_id_seq", kind: "sequence", columns: [], indexes: [] },
+    ],
+    kinds: [
+      { id: "table", role: "relation", label: "Table", labelPlural: "Tables" },
+      { id: "view", role: "relation", label: "View", labelPlural: "Views" },
+      { id: "function", role: "routine", label: "Function", labelPlural: "Functions" },
+      { id: "sequence", role: "config", label: "Sequence", labelPlural: "Sequences" },
+    ],
+  };
+  const kindedRun = {
+    runId: "run-1",
+    events: [{ kind: "context-captured", atMs: 1, fingerprint: "ctx_1", tableCount: 4, snapshot: kindedSnapshot }],
+  } as Pick<AgentRunRecord, "runId" | "events">;
   const run = { runId: "run-1", events } as Pick<AgentRunRecord, "runId" | "events">;
 
   const plan = (h: Harness, input: unknown) => planTableProfile(h.context, run, input);
@@ -3417,6 +4831,48 @@ describe("profileTableTool — the model names a table, the server decides the r
     expect(outcome.modelText).toContain("orders");
   });
 
+  /*
+    The inventory stopped being a list of tables when the object surface landed (#789): a
+    PostgreSQL capture carries the schema's views, sequences and functions beside them.
+    A profile composes and RUNS `SELECT count(*) ...` against what it resolves, so what it
+    may resolve is the declared ROLE and nothing else. The refusal says which of the two
+    things happened, for the reason the qualifier refusal was split out: a model told "that
+    table is not in the inventory" about a name it can SEE in the inventory repeats the call
+    rather than changing it.
+  */
+  test("a FUNCTION the inventory lists is refused, and the refusal does not deny the object", () => {
+    const outcome = planTableProfile(harness().context, kindedRun, { schema: "public", table: "order_total(integer)" });
+
+    if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
+    expect(outcome.reasonCode).toBe("OBJECT_NOT_PROFILABLE");
+    expect(outcome.modelText).toContain("Function");
+  });
+
+  test("a SEQUENCE is refused by the same one line, because the gate is the role and not a list of kinds", () => {
+    const outcome = planTableProfile(harness().context, kindedRun, { table: "orders_id_seq" });
+
+    if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
+    expect(outcome.reasonCode).toBe("OBJECT_NOT_PROFILABLE");
+  });
+
+  test("a VIEW is planned, because its declared role is relation and it has rows to count", () => {
+    const outcome = planTableProfile(harness().context, kindedRun, { table: "order_summary" });
+
+    if (outcome.kind !== "planned") throw new Error("expected planned");
+    expect(outcome.plan.target.entry.name).toBe("public.order_summary");
+  });
+
+  test("the names a refusal offers back are only the ones it would accept", () => {
+    const outcome = planTableProfile(harness().context, kindedRun, { table: "secrets" });
+
+    if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
+    expect(outcome.reasonCode).toBe("TABLE_NOT_INVENTORIED");
+    expect(outcome.modelText).toContain("public.orders");
+    // Offering a name this tool would then refuse is the two-dead-refusals sequence again.
+    expect(outcome.modelText).not.toContain("order_total");
+    expect(outcome.modelText).not.toContain("orders_id_seq");
+  });
+
   test("a qualifier the inventory has never heard of is refused by naming the entry that exists", () => {
     /*
       Read off the wire, from the run this refusal was costing.
@@ -3460,6 +4916,214 @@ describe("profileTableTool — the model names a table, the server decides the r
     expect(outcome.reasonCode).toBe("TABLE_QUALIFIER_UNKNOWN");
   });
 
+  /**
+   * The two-part address a 2/3-level engine's inventory does not spell (#789 fix round 2).
+   *
+   * On an engine whose container depth is 2 the inventory now carries the catalog as well,
+   * so an entry is `shop.sales.orders` while `sales.orders` is the form the engine's own
+   * documentation, and every statement the model has ever seen, writes. An exact-name match
+   * refused that outright, which is safe and still wrong: the model was shown a spelling and
+   * refused the only other one it could reasonably produce, with nothing in the refusal
+   * saying what to change.
+   *
+   * The resolution stays exactly as strict where strictness is what #345 bought: a named
+   * qualifier is still part of the answer, still never matched against a bare entry, and
+   * two objects that both answer one spelling are still refused rather than guessed between.
+   */
+  const twoLevelRun = {
+    runId: "run-1",
+    events: [
+      {
+        kind: "context-captured",
+        atMs: 1,
+        fingerprint: "ctx_1",
+        tableCount: 2,
+        snapshot: {
+          connectionId: "conn-1",
+          fingerprint: "ctx_1",
+          capturedAtMs: 1,
+          objects: [
+            {
+              name: "shop.sales.orders",
+              path: ["shop", "sales", "orders"],
+              kind: "table",
+              columns: [{ name: "id", type: "integer", nullable: false, isPrimary: true }],
+              indexes: [],
+            },
+            {
+              name: "shop.dbo.customers",
+              path: ["shop", "dbo", "customers"],
+              kind: "table",
+              columns: [{ name: "id", type: "integer", nullable: false, isPrimary: true }],
+              indexes: [],
+            },
+          ],
+          kinds: [{ id: "table", role: "relation", label: "Table", labelPlural: "Tables" }],
+        },
+      },
+    ],
+  } as Pick<AgentRunRecord, "runId" | "events">;
+
+  test("a two-part address resolves against a catalog-qualified inventory", () => {
+    const outcome = planTableProfile(harness().context, twoLevelRun, { schema: "sales", table: "orders" });
+
+    if (outcome.kind !== "planned") throw new Error(`expected a plan, got ${outcome.kind}`);
+    expect(outcome.plan.target.entry.name).toBe("shop.sales.orders");
+  });
+
+  test("the whole address resolves too, so the spelling the model was SHOWN still works", () => {
+    const outcome = planTableProfile(harness().context, twoLevelRun, { schema: "shop.sales", table: "orders" });
+
+    if (outcome.kind !== "planned") throw new Error(`expected a plan, got ${outcome.kind}`);
+    expect(outcome.plan.target.entry.name).toBe("shop.sales.orders");
+  });
+
+  test("a qualifier that is not the object's own container is still refused", () => {
+    // #345, unchanged: `dbo.orders` is not this inventory's `sales.orders`, and profiling
+    // the one the caller did not name is worse than refusing.
+    const outcome = planTableProfile(harness().context, twoLevelRun, { schema: "dbo", table: "orders" });
+
+    if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
+    expect(outcome.reasonCode).toBe("TABLE_QUALIFIER_UNKNOWN");
+  });
+
+  /*
+    An ambiguous spelling is its OWN answer, and it used to be answered as an absence.
+
+    `inventoriedTable` dropped the resolver's third outcome, so a spelling two inventoried
+    objects answer to came back as `TABLE_NOT_INVENTORIED` - "that table is not in the
+    schema inventory this run captured" - about a run that had just read both of them.
+    That is #414's defect in a new place: a run that read both objects tells the model it
+    read neither.
+
+    The fixture below carries eight other relations ahead of the two candidates on purpose.
+    The offer list attached to `TABLE_NOT_INVENTORIED` is the first six profilable names,
+    so with only two objects in the inventory it accidentally contained the candidates and
+    the answer looked adequate. With eight, the offer list holds none of them and what the
+    model is actually shown becomes visible: names it did not ask about, and no word about
+    the two it did.
+  */
+  const relation = (name: string, path: readonly string[]) => ({
+    name,
+    path,
+    kind: "table",
+    columns: [{ name: "id", type: "integer", nullable: false, isPrimary: true }],
+    indexes: [],
+  });
+
+  const ambiguousRun = (objects: readonly unknown[], defaultContainer?: readonly string[]) =>
+    ({
+      runId: "run-1",
+      events: [
+        {
+          kind: "context-captured",
+          atMs: 1,
+          fingerprint: "ctx_1",
+          tableCount: objects.length,
+          snapshot: {
+            connectionId: "conn-1",
+            fingerprint: "ctx_1",
+            capturedAtMs: 1,
+            objects,
+            kinds: [{ id: "table", role: "relation", label: "Table", labelPlural: "Tables" }],
+            ...(defaultContainer === undefined ? {} : { defaultContainer }),
+          },
+        },
+      ],
+    }) as Pick<AgentRunRecord, "runId" | "events">;
+
+  const CROWD = ["actor", "address", "category", "city", "country", "customer", "film", "inventory"].map((name) =>
+    relation(`public.${name}`, ["public", name]),
+  );
+
+  test("two containers answering one two-part spelling are refused rather than guessed between", () => {
+    const ambiguous = ambiguousRun([
+      ...CROWD,
+      relation("shop.sales.orders", ["shop", "sales", "orders"]),
+      relation("archive.sales.orders", ["archive", "sales", "orders"]),
+    ]);
+
+    const outcome = planTableProfile(harness().context, ambiguous, { schema: "sales", table: "orders" });
+
+    // The refusal is unchanged and the SENTENCE is the thing that moved: nothing about this
+    // spelling's qualifier is unknown and the table is not missing, there are simply two
+    // objects wearing the spelling, so the answer names them and lets the model pick the
+    // catalog it meant.
+    if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
+    expect(outcome.reasonCode).toBe("TABLE_SPELLING_AMBIGUOUS");
+    expect(outcome.modelText).toContain("shop.sales.orders");
+    expect(outcome.modelText).toContain("archive.sales.orders");
+  });
+
+  test("and it is not told the table is missing, nor offered names it did not ask about", () => {
+    // What the model was actually shown, measured: the first six profilable names, NEITHER
+    // of which is a candidate, under a sentence saying the table is not in the inventory.
+    const ambiguous = ambiguousRun([
+      ...CROWD,
+      relation("shop.sales.orders", ["shop", "sales", "orders"]),
+      relation("archive.sales.orders", ["archive", "sales", "orders"]),
+    ]);
+
+    const outcome = planTableProfile(harness().context, ambiguous, { schema: "sales", table: "orders" });
+
+    if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
+    expect(outcome.modelText).not.toContain("not in the schema inventory");
+    expect(outcome.modelText).not.toContain("public.actor");
+  });
+
+  /**
+   * The session default breaks the tie here too, because it breaks it EVERYWHERE ELSE
+   * (#789 bulk-read review, Important 3).
+   *
+   * `er-diagram.ts` passes the declaring object's container, `detailed-object.ts` passes
+   * the session default and the inventory join passes the same default. This was the one
+   * consumer of the address rule that passed nothing, so a run inventoried `app.orders` and
+   * `public.orders` with `public` as the session default, the object browser tagged the
+   * flat `orders` as `public.orders` and the tree resolved it, and `profile_table("orders")`
+   * in that same run was told the spelling was ambiguous. A table the run had inventoried
+   * and the browser could address could not be profiled.
+   *
+   * The run holds the fact and used to throw it away: the container walk reads it, the
+   * join uses it, and nothing carried it onto the snapshot a tool later reads.
+   */
+  test("the session default the capture read breaks a profile spelling's tie", () => {
+    const ambiguous = ambiguousRun(
+      [...CROWD, relation("app.orders", ["app", "orders"]), relation("public.orders", ["public", "orders"])],
+      ["public"],
+    );
+
+    const outcome = planTableProfile(harness().context, ambiguous, { table: "orders" });
+
+    if (outcome.kind !== "planned") throw new Error(`expected a plan, got ${outcome.kind}`);
+    expect(outcome.plan.target.entry.name).toBe("public.orders");
+  });
+
+  // The refusal is not weakened where there is no default to break the tie with: a capture
+  // that read no session default still refuses rather than guessing.
+  test("without a session default the same two candidates are still refused", () => {
+    const ambiguous = ambiguousRun([
+      ...CROWD,
+      relation("app.orders", ["app", "orders"]),
+      relation("public.orders", ["public", "orders"]),
+    ]);
+
+    const outcome = planTableProfile(harness().context, ambiguous, { table: "orders" });
+
+    if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
+    expect(outcome.reasonCode).toBe("TABLE_SPELLING_AMBIGUOUS");
+    expect(outcome.modelText).toContain("app.orders");
+    expect(outcome.modelText).toContain("public.orders");
+  });
+
+  test("a spelling only ONE object answers is still profiled, so the ambiguity arm is not a net", () => {
+    const single = ambiguousRun([...CROWD, relation("shop.sales.orders", ["shop", "sales", "orders"])]);
+
+    const outcome = planTableProfile(harness().context, single, { schema: "sales", table: "orders" });
+
+    if (outcome.kind !== "planned") throw new Error(`expected a plan, got ${outcome.kind}`);
+    expect(outcome.plan.target.segments).toEqual(["shop", "sales", "orders"]);
+  });
+
   test("the composed statement targets what was RESOLVED, not what was asked for", () => {
     // An unqualified name resolving to a qualified entry composed `FROM "orders"`,
     // leaving search_path to decide which relation was read while the ledger said
@@ -3472,10 +5136,30 @@ describe("profileTableTool — the model names a table, the server decides the r
   });
 
   test("an engine with no verified profile composition is refused, not composed on a guess", () => {
-    const outcome = plan(harness({ connection: { ...connection, type: "mysql" } }), { table: "orders" });
+    const outcome = plan(harness({ connection: { ...connection, type: "oracle" } }), { table: "orders" });
 
     if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
     expect(outcome.reasonCode).toBe("INVALID_TOOL_INPUT");
+  });
+
+  /*
+    DuckDB composes catalog reads and estimating plans but no profile (B111). The refusal
+    comes after the target is resolved, so a table the run never inventoried is still told
+    so, and an inventoried one is refused for the dialect.
+  */
+  test("on DuckDB an inventoried table is refused for the dialect, after it is resolved", () => {
+    const outcome = plan(harness({ connection: { ...connection, type: "duckdb" } }), { table: "orders" });
+
+    if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
+    expect(outcome.reasonCode).toBe("INVALID_TOOL_INPUT");
+    expect(outcome.detail).toBe("UNSUPPORTED_DIALECT");
+  });
+
+  test("on DuckDB a table the run never inventoried is refused as not inventoried", () => {
+    const outcome = plan(harness({ connection: { ...connection, type: "duckdb" } }), { table: "secrets" });
+
+    if (outcome.kind !== "unavailable") throw new Error("expected unavailable");
+    expect(outcome.reasonCode).toBe("TABLE_NOT_INVENTORIED");
   });
 
   test("a column offset past the end of the table is refused rather than profiling nothing", () => {
@@ -3490,7 +5174,7 @@ describe("profileTableTool — the model names a table, the server decides the r
     // the run still counted as having profiled the table. Found by review on #345.
     const wide = {
       ...snapshot,
-      tables: [
+      objects: [
         {
           name: "public.wide",
           columns: Array.from({ length: 20 }, (_, index) => ({
@@ -3620,7 +5304,7 @@ function curatedHarness(
     actor: { sessionId: "session-1", role: "user" },
     // A connection type with no read-only statement path at all, which is the whole
     // point: this is the engine the other tools are refused on.
-    connection: { ...connection, type: "mysql" },
+    connection: { ...connection, type: "oracle" },
     capabilities,
     labels: TABLE_LABELS,
     registry: createCanonicalOperationRegistry(),
@@ -4148,6 +5832,33 @@ describe("inspectOperationsTool — what the engine says about ITSELF", () => {
     expect(rows?.[0]).toMatchObject({ schemaName: "hr", tableName: "employee" });
   });
 
+  // `TableStats.rowCount` became optional with #1540: CockroachDB lists its tables from
+  // pg_class, whose `reltuples` it answers NULL. The reading spells that `null`, the way it
+  // already does for `deadRowCount` and `bloatRatio` beside it, so a model is told the count is
+  // unknown instead of being handed a 0 it would read as a table with nothing in it.
+  test("a table whose row count the catalog does not publish reaches the model as null", async () => {
+    const h = curatedHarness(
+      {},
+      {
+        getTableStats: mock(async () => [
+          {
+            schemaName: "public",
+            tableName: "from_pg_class",
+            tableSize: "64 KB",
+            tableSizeBytes: 1,
+            totalSizeBytes: 1,
+          },
+        ]),
+      },
+    );
+
+    const outcome = await inspectOperationsTool(h.context, { kind: "table-stats" });
+
+    if (outcome.kind !== "completed") throw new Error("expected completed");
+    const rows = h.artifacts.get(outcome.artifact.correlationId, 1_000)?.value.rows;
+    expect(rows?.[0]).toMatchObject({ tableName: "from_pg_class", rowCount: null });
+  });
+
   test("a reading with no schema dimension is not filtered by a schema it never carried", async () => {
     const h = curatedHarness();
 
@@ -4272,6 +5983,29 @@ describe("inspectOperationsTool — what the engine says about ITSELF", () => {
     // Rows are database content and reach the model fenced, like every other result.
     expect(outcome.modelText).toContain(UNTRUSTED_CONTENT_BEGIN);
     expect(outcome.modelText).toContain(UNTRUSTED_CONTENT_END);
+  });
+
+  test("a table-stats reading says what its rows are when the provider declares they are only part of the database", async () => {
+    // Prometheus lists the metrics with the most head series, so 50 rows carried as
+    // "table statistics, 50 row(s)" read as the count of every table: a cap read as a count,
+    // the defect #513 closed for this tool's own bounds (#1085 6.2).
+    const caption = "The metrics with the most head series, at most 50";
+    const h = curatedHarness({ labels: { ...TABLE_LABELS, tableStatsCaption: caption } });
+
+    const scoped = await inspectOperationsTool(h.context, { kind: "table-stats" });
+
+    if (scoped.kind !== "completed") throw new Error("expected completed");
+    expect(scoped.modelText).toContain(`table statistics (${caption}), 1 row(s)`);
+
+    // The controls. Another reading on the same engine keeps its header, and so does the same
+    // reading on an engine that declares nothing, which is every engine whose list is whole.
+    const other = await inspectOperationsTool(h.context, { kind: "index-stats" });
+    const whole = await inspectOperationsTool(curatedHarness().context, { kind: "table-stats" });
+
+    if (other.kind !== "completed" || whole.kind !== "completed") throw new Error("expected completed");
+    expect(other.modelText).toContain("index statistics, 1 row(s)");
+    expect(other.modelText).not.toContain(caption);
+    expect(whole.modelText).toContain("table statistics, 1 row(s)");
   });
 
   test("the tool tells the model, in its own description, that a reading is a moment", async () => {
@@ -4792,6 +6526,39 @@ describe("present_answer records which result IS the answer, and how to show it"
       expect(outcome.reasonCode).toBe("ANSWER_NOT_A_DATA_READ");
       // The way out, named: this run has a tool that reads data, and the refusal says so.
       expect(outcome.modelText).toContain("run_read_query");
+    });
+
+    test("a kubectl read the model drafted IS a data read, and is accepted as the answer", () => {
+      // The second statement-read operation. Its id is its own so the SQL contract stays
+      // what it was, and that must not make it a plan or a profile in this tool's eyes:
+      // it is a statement the model wrote and the engine ran.
+      const h = harness();
+      const events: AgentRunEvent[] = [
+        {
+          kind: "statement-drafted",
+          atMs: 1,
+          stepId: "step-kubectl",
+          sql: "get pods -n shop",
+          rationale: "which pods run in shop",
+        },
+        {
+          kind: "tool-completed",
+          atMs: 2,
+          stepId: "step-kubectl",
+          artifact: {
+            correlationId: "corr-kubectl-read",
+            runId: "run-1",
+            operationId: "kubectl.query.read",
+            summary: { rowCount: 2, columnNames: ["NAME", "STATUS"], elapsedMs: 5 },
+          },
+        },
+      ];
+
+      const outcome = present(h, events, { artifact: "corr-kubectl-read", presentation: { kind: "table" } });
+
+      if (outcome.kind !== "answered") throw new Error(`expected an answer, got ${outcome.kind}`);
+      expect(outcome.answer.artifact.correlationId).toBe("corr-kubectl-read");
+      expect(outcome.answer.sql).toBe("get pods -n shop");
     });
 
     test("and when the run already holds a read, the refusal hands over ITS id", () => {

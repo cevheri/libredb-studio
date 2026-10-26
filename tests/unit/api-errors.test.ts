@@ -3,11 +3,14 @@ import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import type { Mock } from "bun:test";
 import { createErrorResponse } from "@/lib/api/errors";
 import { RateLimitError } from "@/lib/api/rate-limit";
+import { validateConfig } from "@/lib/llm/utils/config";
+import type { LLMConfig, LLMProviderType } from "@/lib/llm/types";
 import {
   DatabaseError,
   DatabaseConfigError,
   ConnectionError,
   AuthenticationError,
+  PermissionDeniedError,
   PoolExhaustedError,
   QueryError,
   QueryCancelledError,
@@ -21,6 +24,8 @@ import {
   LLMSafetyError,
   LLMStreamError,
 } from "@/lib/llm/types";
+import { VaultError } from "@/lib/seed/vault-client";
+import { SeedConnectionError } from "@/lib/seed/resolve-connection";
 
 describe("createErrorResponse", () => {
   // Suppress logger output during tests
@@ -73,14 +78,41 @@ describe("createErrorResponse", () => {
     expect(body.statusCode).toBe(401);
   });
 
-  test("TimeoutError returns 408 with code TIMEOUT_ERROR", async () => {
-    const err = new TimeoutError("query took too long", "postgres", 30000);
-    const res = createErrorResponse(err);
-    expect(res.status).toBe(408);
-    const body = await res.json();
-    expect(body.code).toBe("TIMEOUT_ERROR");
-    expect(body.statusCode).toBe(408);
-    expect(body.retryable).toBe(true);
+  test("a 401 carries the fix statement next to the error when the provider set one, and only then", async () => {
+    const withFix = createErrorResponse(
+      new AuthenticationError("refused", undefined, { fixStatement: "ALTER USER ADD KEY PAIR k PUBLIC_KEY = 'b'" }),
+    );
+    expect(withFix.status).toBe(401);
+    expect(await withFix.json()).toEqual({
+      error: "refused",
+      code: "AUTH_ERROR",
+      statusCode: 401,
+      fixStatement: "ALTER USER ADD KEY PAIR k PUBLIC_KEY = 'b'",
+    });
+    const plain = createErrorResponse(new AuthenticationError("refused"));
+    expect(Object.keys(await plain.json())).not.toContain("fixStatement");
+    expect(Object.hasOwn(new AuthenticationError("refused"), "fixStatement")).toBe(false);
+  });
+
+  // A missing privilege is the database refusing the statement with the credential accepted: 403 with its own code,
+  // never the 401 of a refused credential, which tells the user to re-enter a password that is right.
+  test("PermissionDeniedError returns 403 with code PERMISSION_DENIED and the database's sentence", async () => {
+    const res = createErrorResponse(
+      new PermissionDeniedError("Permission denied: permission denied for table orders", "postgres", "INSERT"),
+    );
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      error: "Permission denied: permission denied for table orders",
+      code: "PERMISSION_DENIED",
+      statusCode: 403,
+    });
+  });
+
+  test("a TimeoutError is a statement's deadline on every route: a connect's arrives as a ConnectionError", async () => {
+    const res = createErrorResponse(new TimeoutError("query took too long", "postgres", 30000), {
+      route: "api/db/test-connection",
+    });
+    expect((await res.json()).error).toBe("Query timed out. Please try a simpler query or increase timeout.");
   });
 
   test("ConnectionError returns 503 with code CONNECTION_ERROR", async () => {
@@ -160,6 +192,36 @@ describe("createErrorResponse", () => {
     expect(body.statusCode).toBe(503);
   });
 
+  test.each(["gemini", "openai"] as const)("missing %s credentials have their own code", async (provider) => {
+    let failure: unknown;
+    try {
+      validateConfig({ provider, model: "test-model" });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(LLMConfigError);
+    const response = createErrorResponse(failure);
+    expect(response.status).toBe(503);
+    expect((await response.json()).code).toBe("LLM_UNCONFIGURED");
+  });
+
+  test.each([
+    { provider: "gemni" as LLMProviderType, model: "test-model" },
+    { provider: "ollama", model: "" },
+    { provider: "custom", model: "test-model" },
+  ] satisfies LLMConfig[])("invalid AI settings retain LLM_CONFIG: %j", async (config) => {
+    let failure: unknown;
+    try {
+      validateConfig(config);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(LLMConfigError);
+    const response = createErrorResponse(failure);
+    expect(response.status).toBe(503);
+    expect((await response.json()).code).toBe("LLM_CONFIG");
+  });
+
   test("LLMStreamError returns 502 with code LLM_STREAM", async () => {
     const err = new LLMStreamError("stream interrupted", "openai");
     const res = createErrorResponse(err);
@@ -168,6 +230,15 @@ describe("createErrorResponse", () => {
     expect(body.code).toBe("LLM_STREAM");
     expect(body.statusCode).toBe(502);
     expect(body.retryable).toBe(true);
+  });
+  test("LLMStreamError with context length exceeded returns 502 with friendly error and retryable false", async () => {
+    const err = new LLMStreamError("request exceeds the available context size (32768 tokens)", "openai");
+    const res = createErrorResponse(err);
+    expect(res.status).toBe(502);
+    const body = await res.json();
+    expect(body.code).toBe("LLM_STREAM");
+    expect(body.error).toBe("The request is too large for the configured model's context.");
+    expect(body.retryable).toBe(false);
   });
 
   test("LLMError (base) uses statusCode or 500", async () => {
@@ -186,6 +257,58 @@ describe("createErrorResponse", () => {
     const body = await res.json();
     expect(body.code).toBe("LLM_ERROR");
     expect(body.statusCode).toBe(500);
+  });
+
+  // ─── Seed Connections: Vault ──────────────────────────────────────────────
+  // A `${vault:...}` reference fails on operator configuration - an unset
+  // VAULT_ADDR, a path or key that is not there, a policy that does not grant it.
+  // None of those is the product failing, so a reference is the CONFIG_ERROR class
+  // rather than the generic 500, and the message names it so an operator reading
+  // the response can tell what to fix.
+  test("VaultError returns 400 with code CONFIG_ERROR and names the Vault reference", async () => {
+    const err = new VaultError(
+      'Vault address is not configured: set VAULT_ADDR to resolve "${vault:secret/data/prod/postgres#password}"',
+    );
+    const res = createErrorResponse(err);
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe("CONFIG_ERROR");
+    expect(body.statusCode).toBe(400);
+    expect(body.error).toContain("Vault");
+    expect(body.error).toContain("secret/data/prod/postgres");
+  });
+
+  test("an unreachable Vault is the same configuration class, not an internal error", async () => {
+    const res = createErrorResponse(new VaultError('Vault is unreachable for "secret/data/prod/postgres"'));
+
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe("CONFIG_ERROR");
+    expect(body.error).toContain("Vault");
+  });
+
+  // ALLOW_CUSTOM_CONNECTIONS off: the refusal names its own code, so a client tells the operator's
+  // policy apart from the role filter's refusal, which is the same 403 with AUTH_ERROR.
+  test("a SeedConnectionError carrying CUSTOM_CONNECTIONS_DISABLED answers 403 with that code", async () => {
+    const res = createErrorResponse(
+      new SeedConnectionError("Custom connections are disabled on this server", 403, "CUSTOM_CONNECTIONS_DISABLED"),
+    );
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({
+      error: "Custom connections are disabled on this server",
+      code: "CUSTOM_CONNECTIONS_DISABLED",
+      statusCode: 403,
+    });
+  });
+
+  test("a SeedConnectionError without a code of its own keeps the code its status implies", async () => {
+    const res = createErrorResponse(
+      new SeedConnectionError('Access denied: connection "admin-only" not available for role "user"', 403),
+    );
+
+    expect(res.status).toBe(403);
+    expect((await res.json()).code).toBe("AUTH_ERROR");
   });
 
   // ─── Generic Errors ───────────────────────────────────────────────────────

@@ -1,5 +1,6 @@
 "use client";
 
+import { appFetch } from "@/lib/config/base-path";
 import { useEffect, useMemo, useState } from "react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
@@ -10,6 +11,12 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
   Wrench,
   Search as SearchIcon,
   ChartColumn,
@@ -18,6 +25,7 @@ import {
   RefreshCw,
   Clock,
   Activity,
+  Download,
 } from "lucide-react";
 import type { AuditEvent } from "@/lib/audit";
 import { storage } from "@/lib/storage";
@@ -26,6 +34,31 @@ import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recha
 import { format, subDays, startOfDay } from "date-fns";
 import { useEffectiveTheme } from "@/hooks/use-effective-theme";
 import { chartTooltipStyle } from "@/lib/charts/palette";
+import { csvRow } from "@/lib/export/csv";
+import { jsonText } from "@/lib/export/json";
+import { queryHistoryText } from "@/lib/export/query-history";
+import { downloadText } from "@/lib/export/download";
+
+interface AuditExportProps {
+  disabled: boolean;
+  onExport: (format: "csv" | "json") => void;
+}
+
+function AuditExport({ disabled, onExport }: AuditExportProps) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" size="sm" className="h-8 text-xs gap-2" disabled={disabled}>
+          <Download className="w-3 h-3" /> Export
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem onClick={() => onExport("csv")}>Export as CSV</DropdownMenuItem>
+        <DropdownMenuItem onClick={() => onExport("json")}>Export as JSON</DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
 
 export function AuditTab() {
   return (
@@ -34,21 +67,21 @@ export function AuditTab() {
         <TabsList className="bg-transparent border-b border-hairline rounded-none p-0 h-10 w-full justify-start">
           <TabsTrigger
             value="operations"
-            className="gap-2 rounded-none border-b-2 border-transparent data-[state=active]:border-blue-400 data-[state=active]:bg-transparent data-[state=active]:text-blue-400 text-fg-muted text-xs px-4"
+            className="gap-2 rounded-none border-b-2 border-transparent data-[state=active]:border-brand data-[state=active]:bg-transparent data-[state=active]:text-brand text-fg-muted text-xs px-4"
           >
             <Wrench className="h-3.5 w-3.5" />
             Operations
           </TabsTrigger>
           <TabsTrigger
             value="queries"
-            className="gap-2 rounded-none border-b-2 border-transparent data-[state=active]:border-blue-400 data-[state=active]:bg-transparent data-[state=active]:text-blue-400 text-fg-muted text-xs px-4"
+            className="gap-2 rounded-none border-b-2 border-transparent data-[state=active]:border-brand data-[state=active]:bg-transparent data-[state=active]:text-brand text-fg-muted text-xs px-4"
           >
             <SearchIcon className="h-3.5 w-3.5" />
             Queries
           </TabsTrigger>
           <TabsTrigger
             value="stats"
-            className="gap-2 rounded-none border-b-2 border-transparent data-[state=active]:border-blue-400 data-[state=active]:bg-transparent data-[state=active]:text-blue-400 text-fg-muted text-xs px-4"
+            className="gap-2 rounded-none border-b-2 border-transparent data-[state=active]:border-brand data-[state=active]:bg-transparent data-[state=active]:text-brand text-fg-muted text-xs px-4"
           >
             <ChartColumn className="h-3.5 w-3.5" />
             Stats
@@ -78,7 +111,7 @@ async function loadAuditEvents(type: string): Promise<AuditEvent[]> {
   try {
     const params = new URLSearchParams({ limit: "200" });
     if (type !== "all") params.set("type", type);
-    const res = await fetch(`/api/admin/audit?${params}`);
+    const res = await appFetch(`/api/admin/audit?${params}`);
     const data = await res.json();
     return data.events || [];
   } catch {
@@ -139,9 +172,61 @@ function OperationsAudit() {
       (e) =>
         e.action.toLowerCase().includes(q) ||
         e.target.toLowerCase().includes(q) ||
-        (e.connectionName || "").toLowerCase().includes(q),
+        (e.connectionName || "").toLowerCase().includes(q) ||
+        (e.reason || "").toLowerCase().includes(q) ||
+        (e.passkey || "").toLowerCase().includes(q),
     );
   }, [events, searchQuery]);
+
+  const exportEvents = (format: "csv" | "json") => {
+    let content: string;
+    if (format === "csv") {
+      const headers = [
+        "Timestamp",
+        "Type",
+        "Action",
+        "Target",
+        "Connection",
+        "User",
+        "Result",
+        "Duration (ms)",
+        "Details",
+        "IP",
+        "Reason",
+        "Passkey",
+        "Bucket",
+        "Correlation ID",
+        "ID",
+      ];
+      const rows = filteredEvents.map((event) =>
+        csvRow([
+          event.timestamp,
+          event.type,
+          event.action,
+          event.target,
+          event.connectionName,
+          event.user,
+          event.result,
+          event.duration,
+          event.details,
+          event.ip,
+          event.reason,
+          event.passkey,
+          event.bucket,
+          event.correlationId,
+          event.id,
+        ]),
+      );
+      content = [csvRow(headers), ...rows].join("\n");
+    } else {
+      content = jsonText(filteredEvents, 2);
+    }
+    downloadText(
+      content,
+      format === "csv" ? "text/csv" : "application/json",
+      `audit_operations_${Date.now()}.${format}`,
+    );
+  };
 
   const successCount = events.filter((e) => e.result === "success").length;
   const successRate = events.length > 0 ? Math.round((successCount / events.length) * 100) : 0;
@@ -165,6 +250,7 @@ function OperationsAudit() {
             <SelectItem value="logout">Logout</SelectItem>
             <SelectItem value="permission_denied">Permission Denied</SelectItem>
             <SelectItem value="rate_limit_exceeded">Rate Limited</SelectItem>
+            <SelectItem value="account">Account</SelectItem>
           </SelectContent>
         </Select>
         <Input
@@ -183,6 +269,7 @@ function OperationsAudit() {
           <RefreshCw className={`w-3 h-3 mr-1.5 ${loading ? "animate-spin" : ""}`} />
           Refresh
         </Button>
+        <AuditExport disabled={loading || filteredEvents.length === 0} onExport={exportEvents} />
       </div>
 
       {/* Stats Summary */}
@@ -191,9 +278,19 @@ function OperationsAudit() {
           Total: <span className="font-bold text-fg-secondary">{events.length}</span> ops
         </span>
         <span>
-          Success: <span className="font-bold text-emerald-400">{successRate}%</span>
+          Success: <span className="font-bold text-success">{successRate}%</span>
         </span>
       </div>
+
+      {/* Scope disclosure (#851). Unconditional on purpose: the gap is a property of how the
+          process is compiled, not of the current filter or of whether any event happens to be
+          loaded, so there is no state in which this view is complete and the notice would lie. */}
+      <p data-testid="audit-proxy-disclosure" className="text-xs text-fg-muted">
+        Shows events recorded by the application; boundary denials recorded by the proxy — a cross-origin request
+        rejected at the boundary, and a non-admin session reaching for <code className="text-fg-secondary">/admin</code>{" "}
+        — are not in this buffer. The <code className="text-fg-secondary">libredb.audit.v1</code> JSON lines on the
+        process log are the authoritative record of those.
+      </p>
 
       {/* Events Table */}
       <div className="rounded-xl border border-hairline bg-panel overflow-hidden">
@@ -229,9 +326,9 @@ function OperationsAudit() {
                 <TableRow key={event.id} className="border-hairline hover:bg-fill">
                   <TableCell className="py-2">
                     {event.result === "success" ? (
-                      <CircleCheck className="w-3.5 h-3.5 text-emerald-500" />
+                      <CircleCheck className="w-3.5 h-3.5 text-success" />
                     ) : (
-                      <CircleX className="w-3.5 h-3.5 text-red-500" />
+                      <CircleX className="w-3.5 h-3.5 text-danger" />
                     )}
                   </TableCell>
                   <TableCell className="py-2 font-mono text-xs text-fg-muted">
@@ -246,6 +343,14 @@ function OperationsAudit() {
                     <Badge variant="outline" className="text-[0.625rem] font-bold border-hairline-strong">
                       {event.action}
                     </Badge>
+                    {/* The reason tells the passkey refusals apart without the export. */}
+                    {event.reason || event.passkey ? (
+                      <div data-testid="audit-event-reason" className="mt-0.5 font-mono text-[0.625rem] text-fg-muted">
+                        {[event.reason, event.passkey ? `passkey ${event.passkey}` : undefined]
+                          .filter(Boolean)
+                          .join(" · ")}
+                      </div>
+                    ) : null}
                   </TableCell>
                   <TableCell className="py-2 font-mono text-xs text-fg-tertiary truncate max-w-[120px]">
                     {event.target}
@@ -285,8 +390,16 @@ function QueryAudit() {
         (h) => h.query.toLowerCase().includes(q) || (h.connectionName || "").toLowerCase().includes(q),
       );
     }
-    return items.slice(0, 200);
+    return items;
   }, [history, searchQuery, statusFilter]);
+
+  const exportHistory = (format: "csv" | "json") => {
+    downloadText(
+      queryHistoryText(filteredHistory, format),
+      format === "csv" ? "text/csv" : "application/json",
+      `query_history_${Date.now()}.${format}`,
+    );
+  };
 
   const successCount = history.filter((h) => h.status === "success").length;
   const successRate = history.length > 0 ? Math.round((successCount / history.length) * 100) : 0;
@@ -314,8 +427,9 @@ function QueryAudit() {
         <div className="text-xs text-fg-muted ml-auto">
           <span className="font-bold text-fg-secondary">{history.length}</span> queries
           <span className="mx-2">&middot;</span>
-          <span className="text-emerald-400 font-bold">{successRate}%</span> success
+          <span className="text-success font-bold">{successRate}%</span> success
         </div>
+        <AuditExport disabled={filteredHistory.length === 0} onExport={exportHistory} />
       </div>
 
       {/* Query History Table */}
@@ -342,13 +456,13 @@ function QueryAudit() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {filteredHistory.map((item, idx) => (
+              {filteredHistory.slice(0, 200).map((item, idx) => (
                 <TableRow key={idx} className="border-hairline hover:bg-fill">
                   <TableCell className="py-2">
                     {item.status === "success" ? (
-                      <CircleCheck className="w-3.5 h-3.5 text-emerald-500" />
+                      <CircleCheck className="w-3.5 h-3.5 text-success" />
                     ) : (
-                      <CircleX className="w-3.5 h-3.5 text-red-500" />
+                      <CircleX className="w-3.5 h-3.5 text-danger" />
                     )}
                   </TableCell>
                   <TableCell className="py-2 font-mono text-xs text-fg-muted whitespace-nowrap">
@@ -386,6 +500,8 @@ function QueryAudit() {
 function AuditStats() {
   // Read once, at mount — see QueryAudit above.
   const [history] = useState<QueryHistoryItem[]>(() => storage.getHistory());
+  // The clock is read once, at mount, alongside the history it measures.
+  const [now] = useState(() => new Date());
   const tooltipStyle = chartTooltipStyle(useEffectiveTheme());
 
   const stats = useMemo(() => {
@@ -394,7 +510,6 @@ function AuditStats() {
     const successRate = total > 0 ? Math.round((successful / total) * 100) : 0;
     const avgTime = total > 0 ? Math.round(history.reduce((sum, h) => sum + h.executionTime, 0) / total) : 0;
 
-    const now = new Date();
     const byDay: { day: string; count: number }[] = [];
     for (let i = 6; i >= 0; i--) {
       const dayStart = startOfDay(subDays(now, i));
@@ -420,7 +535,7 @@ function AuditStats() {
       .slice(0, 5);
 
     return { total, successful, successRate, avgTime, byDay, topConnections };
-  }, [history]);
+  }, [history, now]);
 
   return (
     <div className="space-y-6">
@@ -432,7 +547,7 @@ function AuditStats() {
         </div>
         <div className="rounded-xl border border-hairline bg-panel p-4">
           <div className="text-xs text-fg-muted mb-1">Success Rate</div>
-          <div className="text-2xl font-bold text-emerald-400 tabular-nums">{stats.successRate}%</div>
+          <div className="text-2xl font-bold text-success tabular-nums">{stats.successRate}%</div>
           <Progress value={stats.successRate} className="h-1 mt-2" />
         </div>
         <div className="rounded-xl border border-hairline bg-panel p-4">
@@ -444,7 +559,7 @@ function AuditStats() {
         </div>
         <div className="rounded-xl border border-hairline bg-panel p-4">
           <div className="text-xs text-fg-muted mb-1">Failed</div>
-          <div className="text-2xl font-bold text-red-400 tabular-nums">{stats.total - stats.successful}</div>
+          <div className="text-2xl font-bold text-danger tabular-nums">{stats.total - stats.successful}</div>
         </div>
       </div>
 
@@ -452,7 +567,7 @@ function AuditStats() {
       <div className="grid gap-6 md:grid-cols-2">
         <div className="rounded-xl border border-hairline bg-panel p-5">
           <h3 className="text-sm font-bold text-fg-secondary mb-4 flex items-center gap-2">
-            <Activity className="h-4 w-4 text-blue-400" />
+            <Activity className="h-4 w-4 text-brand" />
             Query Activity (7 days)
           </h3>
           {stats.total === 0 ? (
@@ -480,7 +595,7 @@ function AuditStats() {
         {/* Most Active Connections */}
         <div className="rounded-xl border border-hairline bg-panel p-5">
           <h3 className="text-sm font-bold text-fg-secondary mb-4 flex items-center gap-2">
-            <Clock className="h-4 w-4 text-blue-400" />
+            <Clock className="h-4 w-4 text-brand" />
             Most Active Connections
           </h3>
           {stats.topConnections.length === 0 ? (

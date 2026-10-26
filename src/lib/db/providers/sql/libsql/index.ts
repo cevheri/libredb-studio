@@ -3,8 +3,10 @@
  *
  * One type-id for two deployments of the same engine: a self-hosted libSQL server
  * (`sqld`) and Turso Cloud, which is that server managed. Both speak Hrana, both
- * embed SQLite 3.47.0, and everything the provider asks is SQL - so this file is
- * the SQLite dialect over a network rather than a second engine.
+ * embed SQLite, and everything the provider asks is SQL - so this file is the SQLite
+ * dialect over a network rather than a second engine. WHICH SQLite depends on the build
+ * rather than on the version number: `:latest` and Turso Cloud answer 3.47.0 and the
+ * `v0.24.33` tag `database-compose.yml` pins answers 3.45.1 (docs/providers/libsql.md).
  *
  * It is NOT the SQLite provider with a different handle, and the differences are
  * measured rather than assumed (2026-08-27, sqld 0.24.33 and Turso Cloud):
@@ -29,14 +31,21 @@
  */
 
 import { SQLBaseProvider } from "../sql-base";
+import { SQLITE_CREATE_TABLE } from "../sqlite-create-table";
 import {
   type DatabaseConnection,
   type ActiveSessionDetails,
+  type Container,
+  type DatabaseObject,
   type DatabaseOverview,
   type HealthInfo,
   type IndexStats,
+  type KindCount,
   type MaintenanceResult,
   type MaintenanceType,
+  type ObjectDetail,
+  type ObjectDetailBatch,
+  type ObjectSourceDocument,
   type PerformanceMetrics,
   type ProviderCapabilities,
   type ProviderLabels,
@@ -44,7 +53,6 @@ import {
   type QueryResult,
   type SlowQueryStats,
   type StorageStats,
-  type TableSchema,
   type TableStats,
 } from "@/lib/db/types";
 import { AuthenticationError, ConnectionError, DatabaseConfigError, QueryError } from "@/lib/db/errors";
@@ -54,11 +62,20 @@ import {
   readHealth,
   readIndexStats,
   readOverview,
-  readSchema,
   readSlowQueries,
   readStorageStats,
   readTableStats,
 } from "./introspect";
+import {
+  countLibSQLObjects,
+  describeLibSQLObject,
+  describeLibSQLObjects,
+  LIBSQL_OBJECT_KINDS,
+  type LibSQLObjectReader,
+  listLibSQLObjects,
+  listObjectContainers,
+  readLibSQLObjectSource,
+} from "./objects";
 import { type LibSQLStatementResult, type LibSQLTransport, LibSQLTransportError } from "./transport";
 
 // ============================================================================
@@ -95,9 +112,17 @@ const AUTH_STATUSES = new Set([400, 401, 403]);
  * Turso serves every database over HTTPS on 443, and a self-hosted plaintext
  * server is reached through the host/port fields with TLS off. Inventing a
  * `libsql+http://` scheme no libSQL tool emits would be worse than that gap.
+ *
+ * A URL authenticates with a TOKEN, `?authToken=` or the password in its
+ * authority, so `user` is dropped on this path: the transport sends HTTP Basic
+ * for any connection that names a user, and a seed or a stored record carrying
+ * both a URL and a user must still send `Bearer <token>`. The URL's own user
+ * name is not read either.
  */
 function resolveConnection(config: DatabaseConnection): DatabaseConnection {
   if (!config.connectionString) return config;
+
+  const tokenOnly: DatabaseConnection = { ...config, user: undefined };
 
   let url: URL;
   try {
@@ -106,13 +131,13 @@ function resolveConnection(config: DatabaseConnection): DatabaseConnection {
     // Left to `validate()` and to the transport to report: a string that is not a
     // URL is a configuration error, and swallowing it here would send the request
     // to whatever the form fields happened to hold.
-    return config;
+    return tokenOnly;
   }
 
   const token = url.searchParams.get(AUTH_TOKEN_PARAM);
 
   return {
-    ...config,
+    ...tokenOnly,
     host: url.hostname || config.host,
     port: url.port === "" ? config.port : Number(url.port),
     password: token ?? (url.password === "" ? config.password : decodeURIComponent(url.password)),
@@ -174,6 +199,10 @@ export class LibSQLProvider extends SQLBaseProvider {
       explainFormat: "sqlite-queryplan",
       supportsConnectionString: true,
       supportsInlineRowEdit: true,
+      // The Generate Test Data dialog's multi-row `INSERT INTO ... VALUES` (#1468).
+      supportsTestDataGeneration: true,
+      // SQLite's grammar over the wire: `LIMIT n OFFSET m` from the shared limiter.
+      supportsResultPagination: true,
       // libSQL HAS transactions - `BEGIN` is accepted and Hrana keeps an
       // interactive stream alive with a `baton` to continue one - but this provider
       // closes its stream in the same request as the statement, so it holds no
@@ -192,9 +221,21 @@ export class LibSQLProvider extends SQLBaseProvider {
         check: { label: "Integrity Check", perEntity: false, global: true },
       },
       // Every statement is a fresh request, so a `CREATE TABLE` typed in the editor
-      // behaves exactly as it does against a file.
-      supportsCreateTable: true,
+      // behaves exactly as it does against a file. libSQL embeds SQLite, so the form
+      // writes SQLite's grammar: the same object, by import (#1822).
+      createTable: SQLITE_CREATE_TABLE,
       schemaRefreshPattern: "(CREATE|DROP|ALTER|TRUNCATE|REINDEX)\\b",
+      // Zero container levels (#789). A connection addresses one database and every
+      // object in it is addressed by a bare name, so `listContainers()` answers `[]` and
+      // the tree draws the kind folders at the root. `temp` is not a second level: sqld
+      // refuses `CREATE TEMP TABLE` and `ATTACH DATABASE` outright, and a declaration is
+      // read off a provider that never connects, so it could not describe session state
+      // in any case. See `objects.ts`.
+      containerLevels: [],
+      // `exact` over no level: the empty path is the only address, so any segment at all is a
+      // caller holding another engine's model. Read through `acceptedContainerShapes()` (#1147).
+      containerPathShapes: "exact",
+      objectKinds: LIBSQL_OBJECT_KINDS,
     };
   }
 
@@ -281,13 +322,56 @@ export class LibSQLProvider extends SQLBaseProvider {
   // Schema
   // ==========================================================================
 
-  public async getSchema(): Promise<TableSchema[]> {
-    const transport = this.requireTransport();
-    try {
-      return await readSchema(transport);
-    } catch (error) {
-      throw this.mapLibSQLError(error);
-    }
+  // ==========================================================================
+  // Object surface (#789)
+  // ==========================================================================
+
+  /**
+   * What one object read needs, assembled once per call.
+   *
+   * The error mapping travels with it rather than being rebuilt in `objects.ts`, because
+   * only this class knows the host and port a connection failure has to name and only the
+   * STATUS separates a statement the engine rejected (an HTTP 200) from a credential that
+   * expired mid-session (a 4xx).
+   */
+  private objectReader(): LibSQLObjectReader {
+    return {
+      transport: this.requireTransport(),
+      capabilities: this.getCapabilities(),
+      mapError: (error: unknown, sql?: string) => this.mapLibSQLError(error, sql),
+    };
+  }
+
+  /**
+   * No containers, because libSQL declares no container level.
+   *
+   * `[]` is the engine answering, not a refusal: every object is addressed by a bare name.
+   * Still a catalog method rather than a declaration read, so it is not answerable off a
+   * provider that never connected - `requireTransport()` is what says so.
+   */
+  public async listContainers(): Promise<Container[]> {
+    this.requireTransport();
+    return listObjectContainers();
+  }
+
+  public async countObjects(container: readonly string[]): Promise<Record<string, KindCount>> {
+    return countLibSQLObjects(this.objectReader(), container);
+  }
+
+  public async listObjects(container: readonly string[], kind: string): Promise<DatabaseObject[]> {
+    return listLibSQLObjects(this.objectReader(), container, kind);
+  }
+
+  public async describeObject(path: readonly string[], kind: string): Promise<ObjectDetail> {
+    return describeLibSQLObject(this.objectReader(), path, kind);
+  }
+
+  public async describeObjects(container: readonly string[], kind: string, limit?: number): Promise<ObjectDetailBatch> {
+    return describeLibSQLObjects(this.objectReader(), container, kind, limit);
+  }
+
+  public async readObjectSource(path: readonly string[], kind: string, limit?: number): Promise<ObjectSourceDocument> {
+    return readLibSQLObjectSource(this.objectReader(), path, kind, limit);
   }
 
   // ==========================================================================
@@ -377,8 +461,11 @@ export class LibSQLProvider extends SQLBaseProvider {
    * `check` reads the answer rather than the status: `PRAGMA integrity_check`
    * succeeds as a statement and reports the damage in its row, so a provider that
    * only checked for an exception would report a corrupt database as healthy.
+   *
+   * `container` is deliberately ignored, for the same reason as `sqlite.ts`: a libSQL
+   * connection resolves names against its one attached database (#772).
    */
-  public async runMaintenance(type: MaintenanceType, target?: string): Promise<MaintenanceResult> {
+  public async runMaintenance(type: MaintenanceType, target?: string, _container?: string): Promise<MaintenanceResult> {
     const transport = this.requireTransport();
 
     const { result, executionTime } = await this.measureExecution(async () => {
@@ -428,7 +515,7 @@ export class LibSQLProvider extends SQLBaseProvider {
 
   private describeConnectFailure(error: unknown): Error {
     const mapped = this.mapLibSQLError(error);
-    if (mapped instanceof AuthenticationError) return mapped;
+    if (mapped instanceof AuthenticationError || mapped instanceof DatabaseConfigError) return mapped;
 
     return new ConnectionError(
       `Failed to connect to libSQL: ${mapped.message}`,

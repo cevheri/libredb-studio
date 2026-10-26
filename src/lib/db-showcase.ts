@@ -7,11 +7,11 @@ import type { DatabaseType } from "@/lib/types";
  * block, issue #425). Typed `Record<DatabaseType, number>`, so a further member of the
  * union fails `bun run typecheck` on the missing key instead of quietly never being
  * shown - the same compile-time-exhaustive trick the connection picker's coverage map
- * uses in tests/hooks/use-connection-form.test.ts.
+ * uses in tests/unit/lib/db/connection-form.test.ts.
  *
  * The order is recognisability-first: an evaluator scanning the login page should meet
  * the names they already know before the ones they do not. It is deliberately NOT the
- * connection picker's order (`selectableTypes`, src/hooks/use-connection-form.ts),
+ * connection picker's order (`CONNECTION_PICKER_ORDER`, src/lib/db/connection-form.ts),
  * which groups by connect-form affordance instead. The two lists answer different
  * questions, so they are not unified; keep both when adding a provider.
  */
@@ -28,33 +28,122 @@ export const SHOWCASE_RANK: Record<DatabaseType, number> = {
   redis: 5,
   oracle: 6,
   mssql: 7,
+  // A mainstream relational engine (#786), read beside Oracle and SQL Server, the other two
+  // commercial relational engines on this page, so it closes that group ahead of the search pair.
+  db2: 8,
   // The two search engines sit here, ahead of the analytical stores: Elasticsearch is
   // one of the best-known names on this page, and OpenSearch reads as its sibling to
   // anyone who knows it - which is also what the code says, since the two type-ids
   // share one HTTP SQL transport (#424).
-  elasticsearch: 8,
-  opensearch: 9,
+  elasticsearch: 9,
+  opensearch: 10,
   // Ahead of the analytical stores and behind the search pair: Cassandra is a
   // first-rank name for anyone who has met a wide-column store, and it is the only
   // one of those on this page.
-  cassandra: 10,
-  couchbase: 11,
-  clickhouse: 12,
-  druid: 13,
+  cassandra: 11,
+  // Behind Cassandra and ahead of the analytical stores, for the reason Cassandra sits where it
+  // does: the best-known graph database, a first-rank name for anyone who has met one, and the
+  // only one on this page.
+  neo4j: 12,
+  couchbase: 13,
+  clickhouse: 14,
+  druid: 15,
   // Ahead of the embedded store and behind the three analytical ones: Trino is the
   // name an evaluator is most likely to already know out of this last group, because
   // it is the engine a data platform is usually met THROUGH rather than one more
   // store to choose between.
-  trino: 14,
-  // Behind Trino and ahead of the embedded store: libSQL is the newest name on this
-  // page and the one an evaluator is least likely to have met, but it is a product
-  // name (Turso's server) rather than our own, so it goes ahead of `libredb`.
-  libsql: 15,
-  // Last on purpose: the embedded store is the least recognisable name here. It is
+  trino: 16,
+  // Behind Trino and ahead of libSQL (#1085): a name every cloud-native evaluator already
+  // knows, but met as the metrics store beside their databases rather than as one of them,
+  // so it follows the query engine and leads the two newest names on this page.
+  prometheus: 17,
+  // Directly after Prometheus (R28, kiro F10): the showcase ranks by what Studio's audience, cloud-native teams,
+  // already runs beside Kubernetes, where Prometheus is the default metrics store and already holds 17; InfluxDB is
+  // inserted directly after it so the two time-series stores read together, and moving a shipped engine's rank needs
+  // a measurement this spec does not have.
+  influxdb: 18,
+  // The second InfluxDB connection type, one per query language.
+  influxdb3: 19,
+  // Behind the time-series stores and ahead of libSQL (#1088), for the reason Prometheus sits where it does:
+  // the message log a cloud-native team runs beside its databases, as well known to that
+  // evaluator as Prometheus and met the same way, beside the databases rather than as one of them.
+  kafka: 20,
+  // Behind Kafka and ahead of libSQL (#1089), for the reason the two before it sit where they do: the
+  // store a Kubernetes control plane keeps its state in, known to the same evaluator and met beside the
+  // databases rather than as one of them.
+  etcd: 21,
+  // Behind etcd and ahead of libSQL (vector-family spec 10.3), for the reason the three before it sit where they do: the
+  // vector database a team runs beside its databases, known to the same evaluator and met beside them.
+  milvus: 22,
+  // Behind Milvus and ahead of libSQL (vector-family spec 10.3), for the same reason: the second vector database.
+  qdrant: 23,
+  // Behind Qdrant and ahead of libSQL, for the reason the seven before it sit where they do: the store an Apache Pulsar
+  // cluster keeps its metadata in, known to the same cloud-native evaluator and met beside the databases rather than
+  // as one of them.
+  oxia: 24,
+  // Behind Oxia and ahead of libSQL (design 7.2): the cloud data warehouse a team runs beside its databases, and the
+  // newest name on this page, so only libSQL and the embedded store move, as they did for Milvus, Qdrant and Oxia.
+  databend: 25,
+  // Behind Databend and ahead of libSQL: the object store a team keeps its files in beside its
+  // databases, and the newest name on this page, so only libSQL and the embedded store move, as they did for Milvus,
+  // Qdrant, Oxia and Databend.
+  s3: 26,
+  // Behind S3 and ahead of libSQL: the platform a cloud-native team runs every database on, met beside the databases
+  // rather than as one of them, and the newest name on this page, so only libSQL and the embedded store move.
+  kubernetes: 27,
+  // Behind Kubernetes and ahead of libSQL (#1635): the broker a team runs beside its databases, met beside them
+  // rather than as one of them, and the newest name on this page, so only libSQL and the embedded store move.
+  mqtt: 28,
+  // Behind MQTT and ahead of libSQL: the cloud data warehouse a team runs beside its databases, and the newest name
+  // on this page, so only libSQL and the embedded store move, as they did for Databend and the rest.
+  bigquery: 29,
+  // Behind BigQuery and ahead of libSQL: the document database a Google Cloud team runs beside its databases, and
+  // the newest name on this page, so only libSQL and the embedded store move, as they did for BigQuery and the rest.
+  firestore: 30,
+  // Behind Firestore and ahead of libSQL (#1656): the message broker a team runs beside its databases, met beside them
+  // rather than as one of them, and the newest name on this page, so only libSQL and the embedded store move.
+  rabbitmq: 31,
+  // Behind RabbitMQ and ahead of libSQL: the third cloud data warehouse on this page, and the newest name, so only
+  // libSQL and the embedded store move, as they did for RabbitMQ and the rest.
+  snowflake: 32,
+  // Behind Snowflake and ahead of libSQL: the open-source engine a data team runs its lakehouse SQL on, and the newest
+  // name on this page, so only libSQL, the embedded store and OPC UA move.
+  spark: 33,
+  // Behind etcd and ahead of the embedded store: libSQL is the name on this page an
+  // evaluator is least likely to have met, but it is a product name (Turso's server)
+  // rather than our own, so it goes ahead of `libredb`.
+  libsql: 34,
+  // Last of the databases on purpose: the embedded store is the least recognisable database name here. It is
   // still shown - it is a shipped provider with a doc (docs/providers/libredb.md), an
   // icon and a slot in the connection picker, so omitting it would make the login page
   // contradict the app (issue #425, step 2).
-  libredb: 16,
+  libredb: 35,
+  // Last (rank 36), behind the embedded store: a plant's address space is the least recognisable name
+  // on a page of databases, so no existing engine moves for it (#1677).
+  opcua: 36,
+  // Last (rank 37), behind the address space: a machine tool's agent is a narrower name still, so nothing
+  // above it moves for it either (#1722).
+  mtconnect: 37,
+  // Last (rank 38): a device's registers are narrower still, and a map the user writes is the only
+  // thing that names them, so nothing above it moves for this one either (#1723).
+  modbus: 38,
+  // Rank 39, behind the device's registers: a device's configuration tree is a narrower name still,
+  // and the people who know it are network engineers rather than the readers a page of databases is
+  // written for, so nothing above it moves for this one either (#1724).
+  netconf: 39,
+  // Last (rank 40), behind the configuration tree: the three letters are an acronym a reader
+  // either knows from managing networks or does not know at all, and the page is read by people
+  // who came for databases (#1721).
+  snmp: 40,
+  // Last (rank 41), behind the agent's object tree: the name on the box is a specification's rather
+  // than a product's, so a reader scanning the login page is least likely to arrive already knowing
+  // it (#1720). THE RANK MOVES WITH THE BASE AND THE SENTENCE WITH IT: this entry has been written
+  // against five trees now, whose last engine was in turn NETCONF, MTConnect, Modbus, NETCONF again
+  // and SNMP. A rank carried from another base collides silently - 37, 38, 39 and 40 were each
+  // already taken by the time this branch rebased onto them - and the census that covers 0..N-1 is
+  // what said so, all four times. Nothing else would: a duplicate rank only reorders two engines on
+  // the page, so there is no failure to notice and no user to report it.
+  sparkplug: 41,
 };
 
 /**
@@ -74,7 +163,7 @@ export interface ShowcaseDatabase {
   /**
    * True for the embedded store, false for a database the user already runs.
    *
-   * The showcase shows all seventeen providers while the hero claims sixteen engines,
+   * The showcase shows every provider while the hero claims the external engines only,
    * and this flag is how the page carries that difference without any surface typing
    * the word "libredb": the pill it marks is the one the count leaves out.
    */

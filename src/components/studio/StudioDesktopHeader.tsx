@@ -2,9 +2,10 @@
 
 import React from "react";
 import type { DatabaseConnection } from "@/lib/types";
+import { connectionPulseTitle, type ConnectionPulse } from "@/hooks/use-connection-pulse";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
-import { Database, Gauge, LogOut, Settings, User } from "lucide-react";
+import { Database, Gauge, KeyRound, LogOut, Settings, ShieldCheck, User } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -14,16 +15,25 @@ import {
 import { Button } from "@/components/ui/button";
 import { GitHubRepoLink } from "@/components/github-repo-link";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { ReadOnlyMarker } from "@/components/read-only-marker";
+
+/** What the pulse indicator reads for each state. Only Online animates: the others are not live. */
+const PULSE_TEXT: Record<ConnectionPulse, string> = {
+  healthy: "Online",
+  degraded: "Slow",
+  error: "Error",
+  "not-checked": "Not checked",
+};
 
 interface StudioDesktopHeaderProps {
   activeConnection: DatabaseConnection | null;
-  connectionPulse: "healthy" | "degraded" | "error" | null;
+  connectionPulse: ConnectionPulse | null;
   user: { role?: string } | null;
   isAdmin: boolean;
   onLogout: () => void;
 }
 
-export function StudioDesktopHeader({
+export const StudioDesktopHeader = React.memo(function StudioDesktopHeader({
   activeConnection,
   connectionPulse,
   user,
@@ -35,13 +45,16 @@ export function StudioDesktopHeader({
   return (
     <header className="hidden md:flex h-14 border-b border-hairline items-center justify-between px-4 bg-surface/80 backdrop-blur-xl sticky top-0 z-30">
       <div className="flex items-center gap-3">
-        <div className="p-1.5 rounded-lg bg-blue-500/10 border border-blue-500/20">
-          <Database strokeWidth={1.5} className="w-3.5 h-3.5 text-blue-400" />
+        <div className="p-1.5 rounded-lg bg-brand-tint/10 border border-brand-tint/20">
+          <Database strokeWidth={1.5} className="w-3.5 h-3.5 text-brand" />
         </div>
         <div>
-          <h1 className="text-xs font-medium text-fg truncate max-w-[120px]">
-            {activeConnection ? activeConnection.name : "Quick Access"}
-          </h1>
+          <div className="flex items-center gap-1.5">
+            <h1 className="text-xs font-medium text-fg truncate max-w-[120px]">
+              {activeConnection ? activeConnection.name : "Quick Access"}
+            </h1>
+            {activeConnection?.readOnly === true && <ReadOnlyMarker />}
+          </div>
           {activeConnection && (
             <p className="text-xs text-fg-muted font-mono uppercase leading-none mt-0.5">
               {activeConnection.type}
@@ -50,10 +63,11 @@ export function StudioDesktopHeader({
                   • {activeConnection.environment}
                 </span>
               )}
-              {!activeConnection.environment && (
+              {/* A connection Studio does not check (resumesBilledCompute) has not been seen online. */}
+              {!activeConnection.environment && connectionPulse !== "not-checked" && (
                 <span>
                   {" "}
-                  • <span className="text-emerald-500/80">Online</span>
+                  • <span className="text-success/80">Online</span>
                 </span>
               )}
             </p>
@@ -65,26 +79,25 @@ export function StudioDesktopHeader({
         {connectionPulse && (
           <div
             className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-fill mr-2"
-            title={`Connection: ${connectionPulse}`}
+            title={connectionPulseTitle(connectionPulse)}
           >
             <div
               className={cn(
                 "w-2 h-2 rounded-full",
-                connectionPulse === "healthy" && "bg-emerald-500 animate-pulse",
-                connectionPulse === "degraded" && "bg-amber-500",
-                connectionPulse === "error" && "bg-red-500",
+                connectionPulse === "healthy" && "bg-success-tint animate-pulse",
+                connectionPulse === "degraded" && "bg-warning-tint",
+                connectionPulse === "error" && "bg-danger-tint",
+                connectionPulse === "not-checked" && "bg-fg-subtle",
               )}
             />
-            <span className="text-xs font-medium text-fg-muted">
-              {connectionPulse === "healthy" ? "Online" : connectionPulse === "degraded" ? "Slow" : "Error"}
-            </span>
+            <span className="text-xs font-medium text-fg-muted">{PULSE_TEXT[connectionPulse]}</span>
           </div>
         )}
 
         <Button
           variant="ghost"
           size="sm"
-          className="h-7 px-3 text-xs font-medium gap-2 text-fg-muted hover:text-purple-400 hover:bg-purple-500/10"
+          className="h-7 px-3 text-xs font-medium gap-2 text-fg-muted hover:text-hue-purple hover:bg-hue-purple-tint/10"
           onClick={() => router.push("/monitoring")}
         >
           <Gauge strokeWidth={1.5} className="w-3 h-3" /> Monitoring
@@ -93,8 +106,8 @@ export function StudioDesktopHeader({
         {user && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="sm" className="h-8 gap-2 hover:bg-fill px-2">
-                <User strokeWidth={1.5} className="w-3 h-3 text-blue-400" />
+              <Button variant="ghost" size="sm" className="h-8 gap-2 hover:bg-fill px-2" aria-label="User menu">
+                <User strokeWidth={1.5} className="w-3 h-3 text-brand" />
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-56 bg-raised border-hairline-strong text-fg-secondary">
@@ -106,17 +119,19 @@ export function StudioDesktopHeader({
               <DropdownMenuItem onClick={() => router.push("/monitoring")} className="cursor-pointer">
                 <Gauge strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Monitoring
               </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => router.push("/settings/mcp")} className="cursor-pointer">
+                <KeyRound strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> MCP
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => router.push("/settings/authenticator")} className="cursor-pointer">
+                <ShieldCheck strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Sign-in security
+              </DropdownMenuItem>
               <div className="border-t border-hairline my-1" />
-              <DropdownMenuItem onClick={onLogout} className="text-red-400 cursor-pointer">
+              <DropdownMenuItem onClick={onLogout} className="text-danger cursor-pointer">
                 <LogOut strokeWidth={1.5} className="w-3.5 h-3.5 mr-2" /> Logout
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         )}
-        <Settings
-          strokeWidth={1.5}
-          className="w-3.5 h-3.5 text-fg-tertiary cursor-pointer hover:text-fg-bright transition-colors mx-2"
-        />
         {/* Renders nothing when a host (platform) owns the theme — see ThemeToggle. */}
         <ThemeToggle className="mr-1" />
         <GitHubRepoLink className="text-fg-tertiary hover:text-fg-bright mr-2" />
@@ -124,4 +139,4 @@ export function StudioDesktopHeader({
       </div>
     </header>
   );
-}
+});

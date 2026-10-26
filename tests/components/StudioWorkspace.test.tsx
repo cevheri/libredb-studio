@@ -29,13 +29,15 @@ let capturedTabManagerArgs: Record<string, unknown> = {};
 const mockSetConnections = mock(() => {});
 const mockSetActiveConnection = mock(() => {});
 const mockSetSchema = mock(() => {});
+const mockLoadObjects = mock(() => {});
 const mockFetchSchema = mock(() => {});
 // Tab manager
-const mockSetTabs = mock(() => {});
+const mockSetTabs = mock((_next?: unknown) => {});
 const mockUpdateCurrentTab = mock(() => {});
 const mockUpdateTabById = mock(() => {});
 const mockHandleTableClick = mock(() => {});
 const mockHandleGenerateSelect = mock(() => {});
+const mockHandleGenerateCount = mock(() => {});
 // Query adapter
 const mockExecuteQuery = mock(() => {});
 const mockForceExecuteQuery = mock(() => {});
@@ -55,6 +57,12 @@ const mockRevokeObjectURL = mock(() => {});
 let connAdapterOverride: Record<string, unknown> = {};
 let tabMgrOverride: Record<string, unknown> = {};
 let queryAdapterOverride: Record<string, unknown> = {};
+/**
+ * When set, the tab-manager double holds its tabs in React state and hands out a `setTabs` that
+ * writes them, so a write this shell makes reaches the next render the way the real hook's does.
+ * Off by default: every other test reads the fixed `baseTab` list.
+ */
+let tabManagerHoldsState = false;
 
 // ---- Shared test data used inside mock factories ----
 
@@ -75,7 +83,17 @@ const baseTab = {
   type: "sql" as const,
 };
 
-const usersTable = { name: "users", columns: [{ name: "id", type: "integer" }] };
+const usersTable = { name: "users", path: ["app", "users"], columns: [{ name: "id", type: "integer" }] };
+/**
+ * The same LABEL in another container, which is what the live SQL Server holds and what a
+ * find-by-name cannot tell apart (#789, Task 35). It is listed FIRST below, so a shell that
+ * still resolves by name answers this one for every click.
+ */
+const otherUsersTable = {
+  name: "users",
+  path: ["shop", "dbo", "users"],
+  columns: [{ name: "shop_id", type: "integer" }],
+};
 
 // ---- Mock the workspace adapter hooks ----
 
@@ -90,6 +108,8 @@ mock.module("@/workspace/hooks/use-connection-adapter", () => ({
     isLoadingSchema: false,
     connectionPulse: null,
     fetchSchema: mockFetchSchema,
+    objectScanDeferred: false,
+    loadObjects: mockLoadObjects,
     schemaContext: JSON.stringify([usersTable]),
     metadata: null,
     ...connAdapterOverride,
@@ -119,8 +139,22 @@ mock.module("@/workspace/hooks/use-query-adapter", () => ({
 // ---- Mock shared studio hooks ----
 
 mock.module("@/hooks/use-tab-manager", () => ({
-  useTabManager: mock((args: Record<string, unknown>) => {
+  // Named as a hook because it is one: it holds state for the tests that set `tabManagerHoldsState`.
+  useTabManager: mock(function useTabManagerDouble(args: Record<string, unknown>) {
     capturedTabManagerArgs = args;
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { useState } = require("react") as typeof import("react");
+    const [heldTabs, setHeldTabs] = useState<QueryTab[]>([baseTab]);
+    const held = tabManagerHoldsState
+      ? {
+          tabs: heldTabs,
+          currentTab: heldTabs[0],
+          setTabs: (next: React.SetStateAction<QueryTab[]>) => {
+            mockSetTabs(next);
+            setHeldTabs(next);
+          },
+        }
+      : {};
     return {
       tabs: [baseTab],
       activeTabId: "tab-1",
@@ -137,6 +171,8 @@ mock.module("@/hooks/use-tab-manager", () => ({
       updateTabById: mockUpdateTabById,
       handleTableClick: mockHandleTableClick,
       handleGenerateSelect: mockHandleGenerateSelect,
+      handleGenerateCount: mockHandleGenerateCount,
+      ...held,
       ...tabMgrOverride,
     };
   }),
@@ -286,7 +322,11 @@ import { render, cleanup, act } from "@testing-library/react";
 import React from "react";
 import type { SavedQueryInput, StudioWorkspaceProps } from "@/workspace/types";
 import type { ProviderMetadata } from "@/hooks/use-provider-metadata";
+import type { DatabaseObject } from "@/lib/db/types";
+import type { QueryTab } from "@/lib/types";
+import type { TreeRowActionHandlers } from "@/components/object-tree";
 import { generateTableQuery } from "@/lib/query-generators";
+import { DEFAULT_MASKING_CONFIG } from "@/lib/data-masking";
 
 const { StudioWorkspace } = await import("@/workspace/StudioWorkspace");
 
@@ -309,6 +349,13 @@ const exportResult = {
 const mockOnQueryExecute = mock(async () => ({ rows: [], fields: [], rowCount: 0, executionTime: 1 }));
 const mockOnSchemaFetch = mock(async () => []);
 const mockOnSaveQuery = mock(async (_query: SavedQueryInput) => {});
+// The host's object reader (#789, B76). This file mocks the connection adapter away, so nothing
+// here reaches it; `tests/components/studio/embedded-object-tree.test.tsx` is where it is driven.
+const mockOnObjectsFetch = {
+  listContainers: mock(async () => []),
+  countObjects: mock(async () => ({})),
+  listObjects: mock(async () => []),
+};
 
 function renderWorkspace(props: Partial<StudioWorkspaceProps> = {}) {
   return render(
@@ -316,6 +363,7 @@ function renderWorkspace(props: Partial<StudioWorkspaceProps> = {}) {
       connections={workspaceConnections}
       onQueryExecute={mockOnQueryExecute}
       onSchemaFetch={mockOnSchemaFetch}
+      onObjectsFetch={mockOnObjectsFetch}
       onSaveQuery={mockOnSaveQuery}
       {...props}
     />,
@@ -361,6 +409,7 @@ describe("StudioWorkspace", () => {
     connAdapterOverride = {};
     tabMgrOverride = {};
     queryAdapterOverride = {};
+    tabManagerHoldsState = false;
 
     // Clear trackable mocks
     mockSetConnections.mockClear();
@@ -372,6 +421,7 @@ describe("StudioWorkspace", () => {
     mockUpdateTabById.mockClear();
     mockHandleTableClick.mockClear();
     mockHandleGenerateSelect.mockClear();
+    mockHandleGenerateCount.mockClear();
     mockExecuteQuery.mockClear();
     mockForceExecuteQuery.mockClear();
     mockCancelQuery.mockClear();
@@ -446,10 +496,16 @@ describe("StudioWorkspace", () => {
         connections={workspaceConnections}
         onQueryExecute={mockOnQueryExecute}
         onSchemaFetch={mockOnSchemaFetch}
+        onObjectsFetch={mockOnObjectsFetch}
       />,
     );
     rerender(
-      <StudioWorkspace connections={[]} onQueryExecute={mockOnQueryExecute} onSchemaFetch={mockOnSchemaFetch} />,
+      <StudioWorkspace
+        connections={[]}
+        onQueryExecute={mockOnQueryExecute}
+        onSchemaFetch={mockOnSchemaFetch}
+        onObjectsFetch={mockOnObjectsFetch}
+      />,
     );
     expect(container.innerHTML.length).toBeGreaterThan(0);
   });
@@ -588,6 +644,24 @@ describe("StudioWorkspace", () => {
     expect(text.split("\n")[1].endsWith(",")).toBe(true);
   });
 
+  test.each([";", "\t"])(
+    "CSV export forwards the chosen delimiter to the workspace download (%s)",
+    async (delimiter) => {
+      withExportResult();
+      renderWorkspace();
+      const exportFn = capturedBottomPanelProps.onExportResults as (
+        format: string,
+        artifact: null,
+        delimiter: string,
+      ) => void;
+      act(() => exportFn("csv", null, delimiter));
+      const blob = mockCreateObjectURL.mock.calls[0][0] as Blob;
+      expect((await blob.text()).split("\n")[0].replace(/^\uFEFF/, "")).toBe(
+        ["id", "name", "ratio", "active", "created", "deleted"].join(delimiter),
+      );
+    },
+  );
+
   // The blob URL outlives the task that started the download: revoking it in the
   // same task can pull the data out from under a read that has not begun.
   test("exportResults does not revoke the blob URL before the download is handed off", async () => {
@@ -674,6 +748,76 @@ describe("StudioWorkspace", () => {
     expect(text).toContain('"deleted" TEXT');
   });
 
+  /**
+   * Copying the result instead of saving it (#701).
+   *
+   * The embedded shell masks nothing, so what is copied is what the host handed over,
+   * exactly as its file export already writes it.
+   */
+  describe("copyResults", () => {
+    const originalClipboard = Object.getOwnPropertyDescriptor(globalThis.navigator, "clipboard");
+    const originalExecCommand = Object.getOwnPropertyDescriptor(globalThis.document, "execCommand");
+
+    function setClipboard(clipboard: { writeText: (text: string) => Promise<void> } | undefined): void {
+      Object.defineProperty(globalThis.navigator, "clipboard", { value: clipboard, configurable: true });
+    }
+
+    afterEach(() => {
+      if (originalClipboard === undefined) setClipboard(undefined);
+      else Object.defineProperty(globalThis.navigator, "clipboard", originalClipboard);
+      if (originalExecCommand === undefined) {
+        Object.defineProperty(globalThis.document, "execCommand", { value: undefined, configurable: true });
+      } else Object.defineProperty(globalThis.document, "execCommand", originalExecCommand);
+    });
+
+    test("copyResults writes the serialized rows to the clipboard and says so", async () => {
+      withExportResult();
+      const writeText = mock((_text: string) => Promise.resolve());
+      setClipboard({ writeText });
+      renderWorkspace();
+
+      await act(async () => (capturedBottomPanelProps.onCopyResults as (f: string) => void)("json"));
+
+      expect(writeText.mock.calls[0][0]).toContain('"name": "Alice"');
+      expect(mockToast).toHaveBeenCalledWith(expect.objectContaining({ title: expect.stringContaining("Copied") }));
+    });
+
+    // The byte-order mark belongs to the file, not to the text.
+    test("a copied CSV starts at the header row", async () => {
+      withExportResult();
+      const writeText = mock((_text: string) => Promise.resolve());
+      setClipboard({ writeText });
+      renderWorkspace();
+
+      const copyFn = capturedBottomPanelProps.onCopyResults as (f: string, h: null, d: string) => void;
+      await act(async () => copyFn("csv", null, ";"));
+
+      expect(writeText.mock.calls[0][0].split("\n")[0]).toBe("id;name;ratio;active;created;deleted");
+    });
+
+    test("a refused copy is reported rather than announced as a success", async () => {
+      withExportResult();
+      setClipboard(undefined);
+      Object.defineProperty(globalThis.document, "execCommand", { value: () => false, configurable: true });
+      renderWorkspace();
+
+      await act(async () => (capturedBottomPanelProps.onCopyResults as (f: string) => void)("json"));
+
+      expect(mockToast).toHaveBeenCalledWith(expect.objectContaining({ variant: "destructive" }));
+    });
+
+    test("copyResults does nothing without a result", async () => {
+      const writeText = mock((_text: string) => Promise.resolve());
+      setClipboard({ writeText });
+      renderWorkspace();
+
+      await act(async () => (capturedBottomPanelProps.onCopyResults as (f: string) => void)("csv"));
+
+      expect(writeText).not.toHaveBeenCalled();
+      expect(mockToast).not.toHaveBeenCalled();
+    });
+  });
+
   test("exportResults does nothing without a result", () => {
     renderWorkspace();
     act(() => (capturedBottomPanelProps.onExportResults as (f: string) => void)("csv"));
@@ -684,22 +828,227 @@ describe("StudioWorkspace", () => {
   // Sidebar callbacks
   // =========================================================================
 
-  test("onTableClick delegates to handleTableClick with executeQuery", () => {
+  /** The host declares the kinds here, so the gate reads ITS declaration. */
+  const declaredKinds = {
+    metadata: {
+      capabilities: {
+        queryLanguage: "sql",
+        objectKinds: [
+          { id: "table", role: "relation", label: "Table", labelPlural: "Tables" },
+          { id: "function", role: "routine", label: "Function", labelPlural: "Functions" },
+        ],
+      },
+    },
+  };
+
+  test("a relation activated in the object tree opens and runs its tab", () => {
+    connAdapterOverride = declaredKinds;
     renderWorkspace();
-    act(() => (capturedSidebarProps.onTableClick as (n: string) => void)("users"));
-    expect(mockHandleTableClick).toHaveBeenCalledWith("users", mockExecuteQuery);
+    act(() =>
+      (capturedSidebarProps.onObjectClick as (o: DatabaseObject) => void)({
+        path: ["app", "users"],
+        name: "users",
+        kind: "table",
+      }),
+    );
+    // The PATH and not the name, the same as the standalone shell: the generator
+    // qualifies from it, so an object outside the session default container generates a
+    // statement the server can resolve (#789).
+    expect(mockHandleTableClick).toHaveBeenCalledWith(["app", "users"], mockExecuteQuery);
+  });
+
+  /**
+   * The host declares the kinds, so the role gate is the host's declaration and not a
+   * constant here. A routine reaching `handleTableClick` would generate and EXECUTE
+   * `SELECT * FROM order_total(integer)` against the tenant's database.
+   */
+  test("a routine activated in the object tree runs nothing", () => {
+    connAdapterOverride = declaredKinds;
+    renderWorkspace();
+    act(() =>
+      (capturedSidebarProps.onObjectClick as (o: DatabaseObject) => void)({
+        path: ["app", "order_total(integer)"],
+        name: "order_total",
+        kind: "function",
+      }),
+    );
+    expect(mockHandleTableClick).not.toHaveBeenCalled();
+  });
+
+  /**
+   * A kind that declares an ACTIVATING row action runs it on activation (a pod runs its Logs), ahead of
+   * its source, on the host's declaration; a relation keeps its data preview.
+   */
+  test("a row whose kind declares an activating row action runs it, and a relation keeps its preview", () => {
+    const mockActivateRowAction = mock((_object: DatabaseObject, _actionId: string, _run: unknown) => {});
+    const mockOpenSourceTab = mock((_object: DatabaseObject) => {});
+    tabMgrOverride = { activateRowAction: mockActivateRowAction, openSourceTab: mockOpenSourceTab };
+    connAdapterOverride = {
+      metadata: {
+        capabilities: {
+          queryLanguage: "sql",
+          objectKinds: [
+            { id: "table", role: "relation", label: "Table", labelPlural: "Tables" },
+            { id: "pods", role: "config", label: "Pod", labelPlural: "Pods", hasSource: true },
+          ],
+          rowActions: [
+            { id: "logs", label: "Logs", kinds: ["pods"], activates: true },
+            { id: "peek", label: "Peek", kinds: ["table"], activates: true },
+          ],
+        },
+      },
+      sourceReader: async () => ({}),
+    };
+    renderWorkspace();
+    const click = capturedSidebarProps.onObjectClick as (o: DatabaseObject) => void;
+    const pod: DatabaseObject = { path: ["shop", "pod/web-1"], name: "pod/web-1", kind: "pods" };
+
+    act(() => click(pod));
+    act(() => click({ path: ["app", "users"], name: "users", kind: "table" }));
+
+    expect(mockActivateRowAction.mock.calls).toEqual([[pod, "logs", mockExecuteQuery]]);
+    expect(mockOpenSourceTab).not.toHaveBeenCalled();
+    expect(mockHandleTableClick).toHaveBeenCalledWith(["app", "users"], mockExecuteQuery);
+  });
+
+  // A host that declares no kinds has declared no relations either, so a click cannot be
+  // resolved and nothing is executed on a guess. `metadata` is null by default here.
+  test("an object activated while the host has declared nothing runs nothing", () => {
+    renderWorkspace();
+    act(() =>
+      (capturedSidebarProps.onObjectClick as (o: DatabaseObject) => void)({
+        path: ["app", "users"],
+        name: "users",
+        kind: "table",
+      }),
+    );
+    expect(mockHandleTableClick).not.toHaveBeenCalled();
+  });
+
+  // --- objectActions: the four this shell lost, restored (U22, #789) ---
+  //
+  // Four, not six. `DataProfiler`, `CodeGenerator` and `TestDataGenerator` stayed mounted
+  // here with nothing able to set their table once the tree replaced the flat explorer,
+  // and `handleGenerateSelect` was left with no caller in this file at all. Per-table
+  // maintenance and creating a table were NOT lost here: this shell mounts neither
+  // destination and passed `onOpenMaintenance={noop}` and `onCreateTableClick={undefined}`
+  // to the explorer before any of it, so adding them now would be a new surface rather
+  // than a repair.
+  const usersObject: DatabaseObject = { path: ["app", "users"], name: "users", kind: "table" };
+
+  function sidebarActions(): Record<string, ((object: DatabaseObject) => void) | undefined> {
+    return capturedSidebarProps.objectActions as Record<string, ((object: DatabaseObject) => void) | undefined>;
+  }
+
+  test("the four actions this shell mounts a destination for reach it", () => {
+    const { queryByTestId } = renderWorkspace();
+
+    act(() => sidebarActions().onGenerateSelect?.(usersObject));
+    expect(mockHandleGenerateSelect).toHaveBeenCalledWith(["app", "users"]);
+
+    act(() => sidebarActions().onGenerateCount?.(usersObject));
+    expect(mockHandleGenerateCount).toHaveBeenCalledWith(["app", "users"]);
+
+    act(() => sidebarActions().onProfileObject?.(usersObject));
+    expect(queryByTestId("dataprofiler")).not.toBeNull();
+
+    act(() => sidebarActions().onGenerateCode?.(usersObject));
+    expect(queryByTestId("codegenerator")).not.toBeNull();
+
+    act(() => sidebarActions().onGenerateTestData?.(usersObject));
+    expect(queryByTestId("testdatagenerator")).not.toBeNull();
+  });
+
+  test("a declared row action reaches the tab manager with the object, the action id and the host's run", () => {
+    const mockRunRowAction = mock(() => {});
+    tabMgrOverride = { runRowAction: mockRunRowAction };
+    renderWorkspace();
+
+    const onRowAction = (capturedSidebarProps.objectActions as TreeRowActionHandlers).onRowAction;
+    act(() => onRowAction?.(usersObject, "describe"));
+
+    expect(mockRunRowAction).toHaveBeenCalledWith(usersObject, "describe", mockExecuteQuery);
+  });
+
+  test("the profiler keeps masking the built-in kinds, though this shell's grid masks nothing (#1421)", () => {
+    renderWorkspace();
+
+    act(() => sidebarActions().onProfileObject?.(usersObject));
+    // The summary a host's onDescribeSchema receives held emails, passwords and tokens masked
+    // before #1421; handing the profiler the grid's no-op configuration would send them in clear.
+    expect(capturedDataProfilerProps.maskingConfig).toBe(DEFAULT_MASKING_CONFIG);
+    expect(capturedDataProfilerProps.maskingEnabled).toBe(true);
+  });
+
+  test("each modal opens on the object that was CLICKED, where two containers share one label", () => {
+    connAdapterOverride = { schema: [otherUsersTable, usersTable] };
+    renderWorkspace();
+
+    act(() => sidebarActions().onProfileObject?.(usersObject));
+    expect(capturedDataProfilerProps.tablePath).toEqual(["app", "users"]);
+    expect(capturedDataProfilerProps.tableSchema).toBe(usersTable);
+
+    act(() => sidebarActions().onGenerateCode?.(usersObject));
+    expect(capturedCodeGeneratorProps.tableSchema).toBe(usersTable);
+
+    act(() => sidebarActions().onGenerateTestData?.(usersObject));
+    expect(capturedTestDataGeneratorProps.tableSchema).toBe(usersTable);
+  });
+
+  test("the host's declaration reaches the test-data generator, which writes a runnable statement", () => {
+    // It was passed `queryLanguage={undefined}` here, so this shell could never produce a
+    // MongoDB insertMany and its INSERT named a bare label. Both come from the connection's
+    // own metadata now, the same source the tree and the generators read.
+    const capabilities = { queryLanguage: "json" };
+    connAdapterOverride = { metadata: { capabilities } };
+    renderWorkspace();
+
+    act(() => sidebarActions().onGenerateTestData?.(usersObject));
+    expect(capturedTestDataGeneratorProps.capabilities).toBe(capabilities);
+  });
+
+  test("the two this shell has no destination for are not handed over", () => {
+    renderWorkspace();
+    expect(sidebarActions().onOpenMaintenance).toBeUndefined();
+    expect(sidebarActions().onCreateObject).toBeUndefined();
+    // The control: the four above ARE handed over, so this is the shell's own boundary and
+    // not an empty object.
+    expect(sidebarActions().onProfileObject).toBeDefined();
+  });
+
+  test("a host that turned a feature off is offered no menu item for the modal it removed", () => {
+    // Each handler follows the SAME flag as the modal it opens, so the menu cannot offer a
+    // way into a modal this render does not mount.
+    renderWorkspace({ features: ALL_FEATURES_OFF });
+    expect(sidebarActions().onGenerateCode).toBeUndefined();
+    expect(sidebarActions().onProfileObject).toBeUndefined();
+    expect(sidebarActions().onGenerateTestData).toBeUndefined();
+    // Generating a statement needs no modal, so it survives every flag.
+    expect(sidebarActions().onGenerateSelect).toBeDefined();
+  });
+
+  // #765, embedded. The two shells render different chrome, so the wiring is asserted here
+  // as well as in `tests/components/Studio.test.tsx`: a host connection that defers its
+  // scan must reach the tree as deferred and be offered the adapter's own load action.
+  test("the host's deferred scan and its load action reach the object tree", () => {
+    connAdapterOverride = { objectScanDeferred: true, loadObjects: mockLoadObjects };
+    renderWorkspace();
+    expect(capturedSidebarProps.objectScanDeferred).toBe(true);
+    expect(capturedSidebarProps.onLoadObjects).toBe(mockLoadObjects);
+  });
+
+  test("control: a host connection that does not defer hands the tree no deferral", () => {
+    renderWorkspace();
+    expect(capturedSidebarProps.objectScanDeferred).toBe(false);
   });
 
   test("sidebar noop callbacks and references are wired", () => {
     renderWorkspace();
     expect(capturedSidebarProps.onSelectConnection).toBe(mockSetActiveConnection);
-    expect(capturedSidebarProps.onGenerateSelect).toBe(mockHandleGenerateSelect);
-    expect(capturedSidebarProps.isAdmin).toBe(false);
     // noop callbacks do not throw
     act(() => (capturedSidebarProps.onDeleteConnection as () => void)());
     act(() => (capturedSidebarProps.onEditConnection as () => void)());
     act(() => (capturedSidebarProps.onAddConnection as () => void)());
-    act(() => (capturedSidebarProps.onOpenMaintenance as () => void)());
   });
 
   // Awaited because the diagram is code-split: opening it resolves a dynamic import
@@ -713,33 +1062,15 @@ describe("StudioWorkspace", () => {
     expect(queryByTestId("schemadiagram")).toBeNull();
   });
 
-  test("onProfileTable opens the data profiler with the matching schema", () => {
-    const { queryByTestId } = renderWorkspace();
-    act(() => (capturedSidebarProps.onProfileTable as (n: string) => void)("users"));
-    expect(queryByTestId("dataprofiler")).not.toBeNull();
-    expect(capturedDataProfilerProps.tableName).toBe("users");
-    expect(capturedDataProfilerProps.tableSchema).toEqual(usersTable);
-    act(() => (capturedDataProfilerProps.onClose as () => void)());
-    expect(queryByTestId("dataprofiler")).toBeNull();
-  });
-
-  test("onGenerateCode opens the code generator", () => {
-    const { queryByTestId } = renderWorkspace();
-    act(() => (capturedSidebarProps.onGenerateCode as (n: string) => void)("users"));
-    expect(queryByTestId("codegenerator")).not.toBeNull();
-    act(() => (capturedCodeGeneratorProps.onClose as () => void)());
-    expect(queryByTestId("codegenerator")).toBeNull();
-  });
-
-  test("onGenerateTestData opens the test data generator which can execute queries", () => {
-    const { queryByTestId } = renderWorkspace();
-    act(() => (capturedSidebarProps.onGenerateTestData as (n: string) => void)("users"));
-    expect(queryByTestId("testdatagenerator")).not.toBeNull();
-    act(() => (capturedTestDataGeneratorProps.onExecuteQuery as (q: string) => void)("INSERT INTO users VALUES (1)"));
-    expect(mockExecuteQuery).toHaveBeenCalledWith("INSERT INTO users VALUES (1)");
-    act(() => (capturedTestDataGeneratorProps.onClose as () => void)());
-    expect(queryByTestId("testdatagenerator")).toBeNull();
-  });
+  /*
+    The data profiler, the code generator and the test data generator had their only
+    entry point in the sidebar's flat explorer, which the object tree replaced here
+    (#789). The tree has no row menu in Phase 1, so in THIS shell nothing opens them: the
+    three tests that drove them through `capturedSidebarProps` are gone rather than
+    rewritten, because a test that asserts a surface nobody can reach pins a defect.
+    The modals and their state stay mounted in `StudioWorkspace.tsx` for the consumer
+    task that re-homes them (Task 25); recorded in `docs/superpowers/works/task-07-report.md`.
+  */
 
   // =========================================================================
   // Feature flags
@@ -748,9 +1079,6 @@ describe("StudioWorkspace", () => {
   test("disabled features remove optional callbacks and modals", () => {
     const { queryByTestId } = renderWorkspace({ features: ALL_FEATURES_OFF, onSaveQuery: undefined });
     expect(capturedSidebarProps.onShowDiagram).toBeUndefined();
-    expect(capturedSidebarProps.onProfileTable).toBeUndefined();
-    expect(capturedSidebarProps.onGenerateCode).toBeUndefined();
-    expect(capturedSidebarProps.onGenerateTestData).toBeUndefined();
     // Import and save are withheld entirely, so the toolbar renders neither the
     // IMPORT (#427) nor the Save (U7) button.
     expect(capturedQueryToolbarProps.onImport).toBeUndefined();
@@ -874,6 +1202,12 @@ describe("StudioWorkspace", () => {
     expect(capturedQueryEditorProps.language).toBe("redis");
   });
 
+  test("editor language is etcd for etcd tabs (#1089)", () => {
+    tabMgrOverride = { currentTab: { ...baseTab, type: "etcd" } };
+    renderWorkspace();
+    expect(capturedQueryEditorProps.language).toBe("etcd");
+  });
+
   // =========================================================================
   // Provider metadata wiring (#427)
   // =========================================================================
@@ -912,7 +1246,7 @@ describe("StudioWorkspace", () => {
       // The generator the tab manager runs, fed the metadata this shell actually
       // passed it: with `null` it fell through to `SELECT * FROM user:* LIMIT 50;`.
       const capabilities = (capturedTabManagerArgs.metadata as ProviderMetadata).capabilities;
-      const query = generateTableQuery("user:*", capabilities, []);
+      const query = generateTableQuery(["user:*"], capabilities, []);
       expect(query.startsWith("SCAN ")).toBe(true);
       expect(query).not.toContain("SELECT");
     });
@@ -949,6 +1283,118 @@ describe("StudioWorkspace", () => {
     test("withholds onImport too when the host disables the data-import feature", () => {
       renderWorkspace({ features: ALL_FEATURES_OFF });
       expect(capturedQueryToolbarProps.onImport).toBeUndefined();
+    });
+  });
+
+  // =========================================================================
+  // The tab type follows the declared language (#1085)
+  // =========================================================================
+  //
+  // The tab manager starts from one SQL tab and types only the tabs it creates afterwards, so a
+  // host connection declaring `queryLanguage: "promql"` opened Query 1 as an SQL tab: SQL
+  // highlighting and completions, and a Format button whose SQL formatter rewrote `up == 0` as
+  // `up = = 0`. The standalone shell retypes the open tabs when the connection or its metadata
+  // changes, and this shell does the same.
+  describe("tab type from the declared language (#1085)", () => {
+    const promqlConnection = { ...dbConn, type: "prometheus" as const };
+    const promqlMetadata = { capabilities: { queryLanguage: "promql" } } as unknown as ProviderMetadata;
+
+    /** The updater of every `setTabs` call this shell made, in order. */
+    function tabWrites(): Array<(previous: QueryTab[]) => QueryTab[]> {
+      return mockSetTabs.mock.calls.map(([next]) => next as (previous: QueryTab[]) => QueryTab[]);
+    }
+
+    function rerenderWorkspace(rerender: (ui: React.ReactElement) => void) {
+      // A fresh array, the way a host that builds its list on every render passes it.
+      rerender(
+        <StudioWorkspace
+          connections={[...workspaceConnections]}
+          onQueryExecute={mockOnQueryExecute}
+          onSchemaFetch={mockOnSchemaFetch}
+          onObjectsFetch={mockOnObjectsFetch}
+          onSaveQuery={mockOnSaveQuery}
+        />,
+      );
+    }
+
+    test("Query 1 of a host declaring PromQL reaches the editor as a PromQL tab", () => {
+      tabManagerHoldsState = true;
+      connAdapterOverride = { activeConnection: promqlConnection, metadata: promqlMetadata };
+      renderWorkspace();
+      expect(capturedQueryEditorProps.language).toBe("promql");
+    });
+
+    test("Query 1 of a host declaring InfluxQL reaches the editor as an InfluxQL tab (InfluxDB spec 6.7)", () => {
+      // The embedded-surface rule: the standalone shell and this one retype Query 1 through the same
+      // `resolveTabType`, and only this test sees the embedded shell do it.
+      tabManagerHoldsState = true;
+      connAdapterOverride = {
+        activeConnection: { ...dbConn, type: "influxdb" as const },
+        metadata: { capabilities: { queryLanguage: "influxql" } } as unknown as ProviderMetadata,
+      };
+      renderWorkspace();
+      expect(capturedQueryEditorProps.language).toBe("influxql");
+    });
+
+    test("every open tab takes the type, and a list that already carries it is handed back as it is", () => {
+      connAdapterOverride = { activeConnection: promqlConnection, metadata: promqlMetadata };
+      renderWorkspace();
+      expect(tabWrites()).toHaveLength(1);
+      const [retype] = tabWrites();
+
+      const redisTab = { ...baseTab, id: "tab-2", name: "Query 2", type: "redis" as const };
+      const typedTab = { ...baseTab, id: "tab-3", name: "Query 3", type: "promql" as const };
+      const sourceTab = { ...baseTab, id: "tab-4", name: "Source: up", source: { path: ["up"], kind: "metric" } };
+      const written = retype([baseTab, redisTab, typedTab, sourceTab]);
+      expect(written.map((tab) => tab.type)).toEqual(["promql", "promql", "promql", "promql"]);
+      expect(written[0].query).toBe(baseTab.query);
+      expect(written[2]).toBe(typedTab);
+      expect(written[3].source).toBe(sourceTab.source);
+
+      // Nothing to change is the same list, so React keeps its state and the tab manager has no
+      // new list to persist.
+      const alreadyTyped = [typedTab];
+      expect(retype(alreadyTyped)).toBe(alreadyTyped);
+    });
+
+    test("fresh host objects with the same declaration write no tab again, and a new language does", () => {
+      connAdapterOverride = { activeConnection: promqlConnection, metadata: promqlMetadata };
+      const { rerender } = renderWorkspace();
+      expect(tabWrites()).toHaveLength(1);
+
+      // The adapter rebuilds both objects from the host's list, so their identity says nothing.
+      connAdapterOverride = {
+        activeConnection: { ...promqlConnection },
+        metadata: { capabilities: { queryLanguage: "promql" } } as unknown as ProviderMetadata,
+      };
+      rerenderWorkspace(rerender);
+      expect(tabWrites()).toHaveLength(1);
+
+      // The control: the same connection declaring another language is written.
+      connAdapterOverride = {
+        activeConnection: { ...promqlConnection },
+        metadata: { capabilities: { queryLanguage: "sql" } } as unknown as ProviderMetadata,
+      };
+      rerenderWorkspace(rerender);
+      expect(tabWrites()).toHaveLength(2);
+      expect(tabWrites()[1]([{ ...baseTab, type: "promql" }]).map((tab) => tab.type)).toEqual(["sql"]);
+    });
+
+    test("switching to another connection of the same language types the tabs it opens with", () => {
+      // The tab manager restores each connection's own tabs, so the switch is what they are typed on.
+      connAdapterOverride = { activeConnection: promqlConnection, metadata: promqlMetadata };
+      const { rerender } = renderWorkspace();
+      expect(tabWrites()).toHaveLength(1);
+
+      connAdapterOverride = { activeConnection: { ...promqlConnection, id: "c2" }, metadata: promqlMetadata };
+      rerenderWorkspace(rerender);
+      expect(tabWrites()).toHaveLength(2);
+    });
+
+    test("with no connection the tabs are left as they are", () => {
+      connAdapterOverride = { activeConnection: null, metadata: null };
+      renderWorkspace();
+      expect(tabWrites()).toHaveLength(0);
     });
   });
 
@@ -1024,6 +1470,17 @@ describe("StudioWorkspace", () => {
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0].type).toBe("destructive");
     expect(result.recommendation).toContain("Review this query");
+  });
+
+  test("safety dialog is handed the active connection's name, which a typed confirmation of it asks for (#1089)", () => {
+    renderWorkspace();
+    expect(capturedSafetyDialogProps.connectionName).toBe("TestPG");
+  });
+
+  test("safety dialog is handed no connection name without an active connection", () => {
+    connAdapterOverride = { activeConnection: null };
+    renderWorkspace();
+    expect(capturedSafetyDialogProps.connectionName).toBeUndefined();
   });
 
   // =========================================================================

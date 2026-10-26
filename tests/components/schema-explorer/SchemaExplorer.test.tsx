@@ -14,17 +14,27 @@ mock.module("@/components/schema-explorer/TableItem", () => ({
     table,
     isExpanded,
     onToggle,
+    onGenerateCount,
   }: {
-    table: { name: string };
+    table: { name: string; path: readonly string[] };
     isExpanded: boolean;
     onToggle: () => void;
+    onGenerateCount?: (path: readonly string[]) => void;
   }) => {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const React = require("react");
     return React.createElement(
       "div",
-      { "data-testid": `table-${table.name}`, "data-expanded": String(isExpanded), onClick: onToggle },
+      {
+        "data-testid": `table-${table.name}`,
+        "data-address": table.path.join("."),
+        "data-expanded": String(isExpanded),
+        onClick: onToggle,
+      },
       table.name,
+      onGenerateCount === undefined
+        ? null
+        : React.createElement("button", { onClick: () => onGenerateCount(table.path) }, "Count"),
     );
   },
 }));
@@ -35,11 +45,52 @@ import userEvent from "@testing-library/user-event";
 import React from "react";
 
 import { SchemaExplorer } from "@/components/schema-explorer/SchemaExplorer";
+import type { ProviderMetadata } from "@/hooks/use-provider-metadata";
+import type { ProviderLabels } from "@/lib/db/types";
 import { mockSchema, emptySchema } from "../../fixtures/schemas";
+import type { DetailedObject } from "@/lib/db/detailed-object";
+import { TEST_CREATE_TABLE_SPEC } from "../../helpers/mock-provider";
 
 // =============================================================================
 // SchemaExplorer Tests
 // =============================================================================
+
+const defaultLabels: ProviderLabels = {
+  entityName: "Table",
+  entityNamePlural: "Tables",
+  rowName: "row",
+  rowNamePlural: "rows",
+  selectAction: "SELECT * FROM",
+  generateAction: "Generate",
+  analyzeAction: "Analyze",
+  vacuumAction: "Vacuum",
+  searchPlaceholder: "Search tables or columns...",
+  analyzeGlobalLabel: "Analyze All",
+  analyzeGlobalTitle: "Analyze All Tables",
+  analyzeGlobalDesc: "Update statistics for all tables",
+  vacuumGlobalLabel: "Vacuum All",
+  vacuumGlobalTitle: "Vacuum All Tables",
+  vacuumGlobalDesc: "Reclaim storage for all tables",
+};
+
+// Named separately, and typed, so a test can spread it to vary one field: read back off
+// `createDefaultProps` the members arrive optional, because `Partial<Props>` widens them, and
+// `metadata.capabilities` is required (#427).
+const defaultMetadata: ProviderMetadata = {
+  capabilities: {
+    queryLanguage: "sql",
+    supportsExplain: true,
+    supportsExternalQueryLimiting: true,
+    createTable: TEST_CREATE_TABLE_SPEC,
+    supportsInlineRowEdit: true,
+    supportsMaintenance: false,
+    maintenanceOperations: [],
+    supportsConnectionString: false,
+    defaultPort: 5432,
+    schemaRefreshPattern: "",
+  },
+  labels: defaultLabels,
+};
 
 function createDefaultProps(overrides: Partial<Parameters<typeof SchemaExplorer>[0]> = {}) {
   return {
@@ -49,42 +100,19 @@ function createDefaultProps(overrides: Partial<Parameters<typeof SchemaExplorer>
     onGenerateSelect: mock(() => {}),
     onCreateTableClick: mock(() => {}),
     isAdmin: false,
-    metadata: {
-      capabilities: {
-        queryLanguage: "sql" as const,
-        supportsExplain: true,
-        supportsExternalQueryLimiting: true,
-        supportsCreateTable: true,
-        supportsInlineRowEdit: true,
-        supportsMaintenance: false,
-        maintenanceOperations: [],
-        supportsConnectionString: false,
-        defaultPort: 5432,
-        schemaRefreshPattern: "",
-      },
-      labels: {
-        entityName: "Table",
-        entityNamePlural: "Tables",
-        rowName: "row",
-        rowNamePlural: "rows",
-        selectAction: "SELECT * FROM",
-        generateAction: "Generate",
-        analyzeAction: "Analyze",
-        vacuumAction: "Vacuum",
-        searchPlaceholder: "Search tables or columns...",
-        analyzeGlobalLabel: "Analyze All",
-        analyzeGlobalTitle: "Analyze All Tables",
-        analyzeGlobalDesc: "Update statistics for all tables",
-        vacuumGlobalLabel: "Vacuum All",
-        vacuumGlobalTitle: "Vacuum All Tables",
-        vacuumGlobalDesc: "Reclaim storage for all tables",
-      },
-    },
+    metadata: defaultMetadata,
     ...overrides,
   };
 }
 
 describe("SchemaExplorer", () => {
+  test("forwards the count callback with each table's complete address", async () => {
+    const onGenerateCount = mock(() => {});
+    const { getByTestId } = render(<SchemaExplorer {...createDefaultProps({ onGenerateCount })} />);
+    const table = mockSchema[0];
+    await userEvent.click(within(getByTestId(`table-${table.name}`)).getByRole("button", { name: "Count" }));
+    expect(onGenerateCount).toHaveBeenCalledWith(table.path);
+  });
   afterEach(() => {
     cleanup();
   });
@@ -111,6 +139,73 @@ describe("SchemaExplorer", () => {
     const view = within(container);
 
     expect(view.queryByText("No structures found")).not.toBeNull();
+  });
+
+  // #654: an empty database is the one case where a table most needs creating, and the populated
+  // branch's header does not exist here, so the action lives in this panel under the same gate.
+  //
+  // All three select the action by its own `title`, the way the populated-branch tests below do,
+  // rather than by the panel's copy. A test anchored to "No structures found" or to the button's
+  // label keeps passing after somebody rewords the panel and stops saying anything about the button.
+  test("empty state offers the create-table action, and clicking it calls the handler", async () => {
+    const user = userEvent.setup();
+    const onCreateTableClick = mock(() => {});
+    const props = createDefaultProps({ schema: emptySchema, onCreateTableClick });
+    const { container } = render(<SchemaExplorer {...props} />);
+
+    const createButton = container.querySelector('button[title="Create Table"]');
+    expect(createButton).not.toBeNull();
+
+    await user.click(createButton as HTMLElement);
+    expect(onCreateTableClick).toHaveBeenCalledTimes(1);
+  });
+
+  test("empty state offers no create-table action when the engine declares no createTable", () => {
+    const props = createDefaultProps({
+      schema: emptySchema,
+      metadata: {
+        ...defaultMetadata,
+        capabilities: { ...defaultMetadata.capabilities, createTable: undefined },
+      },
+    });
+    const { container } = render(<SchemaExplorer {...props} />);
+
+    expect(container.querySelector('button[title="Create Table"]')).toBeNull();
+  });
+
+  // The action reuses the populated header's `title` shape so an engine that renames the entity keeps
+  // its own word here too. The default fixture calls it "Table", which is also the hardcoded
+  // fallback, so only a renamed entity can tell a working pass-through from a constant.
+  test("empty state names the engine's own entity in the create-table action", () => {
+    const props = createDefaultProps({
+      schema: emptySchema,
+      metadata: {
+        ...defaultMetadata,
+        labels: { ...defaultLabels, entityName: "Collection" },
+      },
+    });
+    const { container } = render(<SchemaExplorer {...props} />);
+
+    const createButton = container.querySelector('button[title="Create Collection"]');
+    expect(createButton).not.toBeNull();
+    expect(createButton?.textContent).toContain("Create Collection");
+  });
+
+  test("empty state offers no create-table action before the capabilities load (#1435)", () => {
+    const props = createDefaultProps({ schema: emptySchema, metadata: null });
+    const { container } = render(<SchemaExplorer {...props} />);
+
+    expect(container.textContent).toContain("No structures found");
+    expect(container.querySelector('button[title="Create Table"]')).toBeNull();
+  });
+
+  // A read that FAILED says nothing about whether the engine takes DDL, so the error branch offers
+  // no action at all - deliberately, and not as a side effect of the empty branch owning the button.
+  test("a failed read offers no create-table action", () => {
+    const props = createDefaultProps({ schema: emptySchema, schemaError: "'(' expected" });
+    const { container } = render(<SchemaExplorer {...props} />);
+
+    expect(container.querySelector('button[title="Create Table"]')).toBeNull();
   });
 
   // D31: an empty tree after a FAILED read must not read as "this database has
@@ -181,6 +276,34 @@ describe("SchemaExplorer", () => {
     expect(usersItem().getAttribute("data-expanded")).toBe("false");
   });
 
+  test("expanding one of two objects that share a label leaves the other collapsed", async () => {
+    // The live SQL Server holds both. Keyed on the label, one click expanded both rows and
+    // the list itself carried one React key for two objects (#789, Task 36).
+    const user = userEvent.setup();
+    const namesakes: DetailedObject[] = [
+      { name: "customers", kind: "table", path: ["libredb_objects", "app", "customers"], columns: [], indexes: [] },
+      { name: "customers", kind: "table", path: ["shop", "dbo", "customers"], columns: [], indexes: [] },
+    ];
+    const props = createDefaultProps({ schema: namesakes });
+    // React's duplicate-key warning is the only place a list key is OBSERVABLE, and the key
+    // is exactly what this defect was: two objects, one label, one key. Without it the row
+    // identity assertions below pass while React is reconciling two rows as one.
+    const originalError = console.error;
+    const errors: string[] = [];
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    };
+    const { container } = render(<SchemaExplorer {...props} />);
+    console.error = originalError;
+    expect(errors.filter((message) => message.includes("same key"))).toEqual([]);
+    const rows = () => Array.from(container.querySelectorAll<HTMLElement>("[data-address]"));
+
+    expect(rows().map((row) => row.dataset.address)).toEqual(["libredb_objects.app.customers", "shop.dbo.customers"]);
+
+    await user.click(rows()[1]);
+    expect(rows().map((row) => row.dataset.expanded)).toEqual(["false", "true"]);
+  });
+
   // ── Table count badge ─────────────────────────────────────────────────────
 
   test("shows table count badge", () => {
@@ -193,7 +316,7 @@ describe("SchemaExplorer", () => {
 
   // ── Create table button ───────────────────────────────────────────────────
 
-  test("create table button visible when capabilities.supportsCreateTable", () => {
+  test("create table button visible when the engine declares a createTable", () => {
     const onCreateTableClick = mock(() => {});
     const props = createDefaultProps({ onCreateTableClick });
     const { container } = render(<SchemaExplorer {...props} />);
@@ -217,14 +340,13 @@ describe("SchemaExplorer", () => {
 
   // ── Create table button hidden ──────────────────────────────────────────
 
-  test("create table button hidden when supportsCreateTable is false", () => {
+  test("create table button hidden when the engine declares no createTable", () => {
     const props = createDefaultProps({
       metadata: {
         capabilities: {
           queryLanguage: "sql" as const,
           supportsExplain: true,
           supportsExternalQueryLimiting: true,
-          supportsCreateTable: false,
           supportsInlineRowEdit: true,
           supportsMaintenance: false,
           maintenanceOperations: [],
@@ -364,7 +486,6 @@ describe("SchemaExplorer", () => {
           queryLanguage: "json" as const,
           supportsExplain: false,
           supportsExternalQueryLimiting: false,
-          supportsCreateTable: false,
           supportsInlineRowEdit: false,
           supportsMaintenance: false,
           maintenanceOperations: [],
@@ -404,7 +525,7 @@ describe("SchemaExplorer", () => {
           queryLanguage: "json" as const,
           supportsExplain: false,
           supportsExternalQueryLimiting: false,
-          supportsCreateTable: true,
+          createTable: TEST_CREATE_TABLE_SPEC,
           supportsInlineRowEdit: false,
           supportsMaintenance: false,
           maintenanceOperations: [],
@@ -446,9 +567,9 @@ describe("SchemaExplorer", () => {
 
     // Default search placeholder
     expect(view.getByPlaceholderText("Search tables or columns...")).not.toBeNull();
-    // Default create button title
-    const createButton = container.querySelector('button[title="Create Table"]');
-    expect(createButton).not.toBeNull();
+    // No create action before the capabilities load: the Create Table form quotes every name in
+    // the connection's own dialect and refuses to open without them (#1435).
+    expect(container.querySelector('button[title="Create Table"]')).toBeNull();
     // Tables should still render
     expect(container.querySelector('[data-testid="table-users"]')).not.toBeNull();
   });

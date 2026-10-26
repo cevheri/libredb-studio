@@ -1,0 +1,36 @@
+# WHY THE Sparkplug B live check STEP IS NOT IN THIS FILE ANY MORE.
+#
+# This file used to carry the step itself, staged here because five engines were landing in
+# one round and five sessions editing one workflow would have been that round's merge in
+# miniature. Whoever owned the workflow was to paste it in. MEASURED 19 October 2026: the
+# paste never happened for any of the six engines, so none of the nineteen workflow files
+# mentioned this fixture and the live check ran only by hand.
+#
+# The step now lives in `.github/workflows/ci.yml`, in the `functional-smoke` job, named
+# `Sparkplug B live check`. It is not duplicated here on purpose: the pin this fixture runs is held equal to
+# the compose fragment's by a test, and a pin that lives in a third file nobody compares is a
+# third pin. What stays here is the reasoning the step is too short to carry.
+#
+# `.github/workflows/ci.yml` is a shared surface, so this block is not written into it: it is
+# lifted in whole, after the RabbitMQ read-only check, inside the same job and with the same
+# indentation (six spaces before `- name:`).
+#
+# WHAT IT RUNS, and why each piece is there:
+#
+#   * The broker is started FROM A DIGEST, and the digest is exported so the live check can hold
+#     it equal to the one `docker/sparkplug/compose-service.yml` pins. A CI run that measured
+#     another build would otherwise prove nothing about the build the repository claims.
+#   * `trap ... EXIT` removes both containers whatever happens, including a failure inside the
+#     readiness loop, so a red step never leaves a broker behind on the runner.
+#   * TWO INDEPENDENT READINESS CHECKS, because each can pass while the fixture is useless: the
+#     first asks the broker about itself (`$SYS/broker/version`), which proves the listener
+#     accepts a session; the second waits for a Sparkplug PUBLISH to actually arrive, which
+#     proves the publisher is running and talking. A broker with no publisher answers the first
+#     and never the second, and that is exactly the state a one-check step would call ready.
+#   * The live check runs under BOTH RUNTIMES, Bun and Node, because the provider ships to both
+#     and the two have already differed here: a file that reaches `createDatabaseProvider` does
+#     not build for Node at all (the factory imports every provider, and DuckDB's win32 binding
+#     cannot be resolved on another platform).
+#   * It never writes. The provider's encoder has no function that builds a PUBLISH, and the one
+#     request that would command somebody else's equipment is refused by name, which item 9 of
+#     the live check asks live.

@@ -4,7 +4,9 @@ This document outlines the architectural patterns, tech stack, and system design
 
 ## System Overview
 
-LibreDB Studio is a hybrid, cloud-native database management tool that provides an IDE-like experience in the browser. It supports **14 database backends** via a Strategy Pattern abstraction: PostgreSQL, MySQL, SQLite, Oracle, SQL Server, MongoDB, Couchbase, ClickHouse, Apache Druid, Elasticsearch, OpenSearch, Apache Trino, Redis, LibreDB. The count is the `SHIPPED` record in [`src/lib/db/compatibility.ts`](../src/lib/db/compatibility.ts), which is exhaustive over `DatabaseType`; `elasticsearch` and `opensearch` are two ids served by one provider module.
+LibreDB Studio is a hybrid, cloud-native database management tool that provides an IDE-like experience in the browser.
+It supports **42 database backends** via a Strategy Pattern abstraction: PostgreSQL, MySQL, SQLite, libSQL, DuckDB, Oracle, Db2 LUW, SQL Server, MongoDB, Couchbase, Firestore, ClickHouse, Apache Druid, Trino, BigQuery, Databend, Snowflake, Apache Spark, Apache Cassandra, Elasticsearch, OpenSearch, Redis, Prometheus, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Apache Kafka, MQTT, RabbitMQ, OPC UA, MTConnect, Modbus, etcd, Neo4j, Milvus, Qdrant, Oxia, S3-compatible object storage, Kubernetes, NETCONF, SNMP, Sparkplug B, LibreDB.
+The count is the `SHIPPED` record in [`src/lib/db/compatibility.ts`](../src/lib/db/compatibility.ts), which is exhaustive over `DatabaseType`; `elasticsearch` and `opensearch` are two ids served by one provider module, and `influxdb` and `influxdb3` are two ids served by one provider directory with a class each.
 
 It runs in two modes: as a **standalone Next.js app** and as an **embedded npm package** (`@libredb/studio`) consumed by libredb-platform. See [§4.6](#46-workspace-abstraction-npm-package-embedding).
 
@@ -16,7 +18,7 @@ It runs in two modes: as a **standalone Next.js app** and as an **embedded npm p
 | Runtime | Bun / Node.js |
 | Language | TypeScript (strict mode) |
 | Styling | Tailwind CSS 4 + Shadcn/UI |
-| Animations | Framer Motion v12 |
+| Animations | Framer Motion v13 |
 | SQL Editor | Monaco Editor |
 | Data Grid | TanStack React Table + react-virtual |
 | AI | Multi-model (Gemini, OpenAI, Ollama, Custom) |
@@ -41,19 +43,47 @@ graph TD
         DBFactory --> SQL[SQL Providers]
         DBFactory --> Document[Document Providers]
         DBFactory --> KeyValue[Key-Value Providers]
+        DBFactory --> TimeSeries[Time-Series Providers]
+        DBFactory --> Stream[Stream Providers]
+        DBFactory --> Graph[Graph Providers]
+        DBFactory --> Vector[Vector Providers]
+        DBFactory --> ObjectStore[Object Storage Providers]
+        DBFactory --> Platform[Platform Providers]
 
         SQL --> PG[(PostgreSQL)]
         SQL --> MySQL[(MySQL)]
         SQL --> SQLite[(SQLite)]
         SQL --> Oracle[(Oracle)]
+        SQL --> Db2[(Db2 LUW)]
         SQL --> MSSQL[(SQL Server)]
         SQL --> ClickHouse[(ClickHouse)]
         SQL --> Druid[(Apache Druid)]
         SQL --> Search[(Elasticsearch / OpenSearch)]
-        SQL --> Trino[(Apache Trino)]
+        SQL --> Trino[(Trino)]
+        SQL --> Databend[(Databend)]
+        SQL --> BigQuery[(BigQuery)]
+        SQL --> Snowflake[(Snowflake)]
+        SQL --> Spark[(Apache Spark)]
+        SQL --> Cassandra[(Apache Cassandra)]
+        SQL --> LibSQL[(libSQL)]
+        SQL --> DuckDB[(DuckDB)]
         Document --> MongoDB[(MongoDB)]
         Document --> Couchbase[(Couchbase)]
+        Document --> Firestore[(Firestore)]
         KeyValue --> Redis[(Redis)]
+        KeyValue --> Etcd[(etcd)]
+        KeyValue --> Oxia[(Oxia)]
+        TimeSeries --> Prometheus[(Prometheus)]
+        TimeSeries --> InfluxDB[(InfluxDB / InfluxDB 3)]
+        Stream --> Kafka[(Apache Kafka)]
+        Stream --> RabbitMQ[(RabbitMQ)]
+        Graph --> Neo4j[(Neo4j)]
+        Vector --> Milvus[(Milvus)]
+        Vector --> Qdrant[(Qdrant)]
+        ObjectStore --> S3[(S3-compatible object storage)]
+        Platform --> Kubernetes[(Kubernetes)]
+        DBFactory --> Embedded[Embedded Providers]
+        Embedded --> LibreDB[(LibreDB)]
     end
 
     subgraph "AI Providers (Strategy Pattern)"
@@ -78,7 +108,11 @@ classDiagram
         +connect()
         +disconnect()
         +executeQuery()
-        +getSchema()
+        +listContainers()
+        +countObjects()
+        +listObjects()
+        +describeObject()
+        +describeObjects()
         +getHealth()
         +getCapabilities() ProviderCapabilities
         +getLabels() ProviderLabels
@@ -93,28 +127,63 @@ classDiagram
         +cancelQuery()
     }
 
+    class GraphBaseProvider {
+        <<abstract>>
+        #profile GraphEngineProfile
+        +query()
+        +cancelQuery()
+    }
+
     BaseDatabaseProvider <|-- SQLBaseProvider
     BaseDatabaseProvider <|-- MongoDBProvider
     BaseDatabaseProvider <|-- CouchbaseProvider
+    BaseDatabaseProvider <|-- FirestoreProvider
     BaseDatabaseProvider <|-- RedisProvider
+    BaseDatabaseProvider <|-- PrometheusProvider
+    BaseDatabaseProvider <|-- InfluxDBProvider
+    BaseDatabaseProvider <|-- KafkaProvider
+    BaseDatabaseProvider <|-- EtcdProvider
+    BaseDatabaseProvider <|-- OxiaProvider
+    BaseDatabaseProvider <|-- GraphBaseProvider
+    BaseDatabaseProvider <|-- MilvusProvider
+    BaseDatabaseProvider <|-- QdrantProvider
+    BaseDatabaseProvider <|-- S3Provider
+    BaseDatabaseProvider <|-- KubernetesProvider
+    BaseDatabaseProvider <|-- RabbitMQProvider
+    BaseDatabaseProvider <|-- LibreDBProvider
 
     SQLBaseProvider <|-- PostgresProvider
     SQLBaseProvider <|-- MySQLProvider
     SQLBaseProvider <|-- SQLiteProvider
     SQLBaseProvider <|-- OracleProvider
+    SQLBaseProvider <|-- Db2Provider
     SQLBaseProvider <|-- MSSQLProvider
     SQLBaseProvider <|-- ClickHouseProvider
     SQLBaseProvider <|-- DruidProvider
     SQLBaseProvider <|-- SearchProvider
     SQLBaseProvider <|-- TrinoProvider
+    SQLBaseProvider <|-- DatabendProvider
+    SQLBaseProvider <|-- BigQueryProvider
+    SQLBaseProvider <|-- SnowflakeProvider
+    SQLBaseProvider <|-- SparkProvider
+    SQLBaseProvider <|-- CassandraProvider
+    SQLBaseProvider <|-- LibSQLProvider
+    SQLBaseProvider <|-- DuckDBProvider
+    SQLBaseProvider <|-- InfluxDB3Provider
+
+    GraphBaseProvider <|-- Neo4jProvider
 ```
 
 Each provider implements:
-- **`getCapabilities()`** - queryLanguage, supportsExplain, supportsCreateTable, maintenanceOperations, etc.
+- **`getCapabilities()`** - queryLanguage, supportsExplain, createTable, maintenanceOperations, etc.
 - **`getLabels()`** - entityName, selectAction, searchPlaceholder, etc. (drives all UI text)
 - **`prepareQuery()`** - handles query limiting per-provider (SQL LIMIT injection vs MongoDB native)
 
-Adding a new database type requires: **1 provider class** + **1 entry in `db-ui-config.ts`**.
+A graph engine is the one family with a shared base of its own: `GraphBaseProvider` (`src/lib/db/graph/graph-base-provider.ts`) runs every statement through the shared Cypher read policy, the engine's statement gate (which an allowlisted SHOW form skips) and one READ session over the Bolt transport, and the engine supplies a `GraphEngineProfile` (its policy lists, catalog reads, gate and error table) plus its declarations and monitoring reads.
+The graph core under `src/lib/db/graph/` is pure and shipped to the browser, where the editor's Cypher language and completion read it; `bolt/` and the base class are server only.
+[`ADDING_A_PROVIDER.md`](./ADDING_A_PROVIDER.md#adding-a-graph-engine) describes the layers and the profile, and [`providers/neo4j.md`](./providers/neo4j.md) the one engine on them.
+
+Adding a new database type takes several steps, from registering the type to verifying it; [`ADDING_A_PROVIDER.md`](./ADDING_A_PROVIDER.md) walks through each one.
 
 `CouchbaseProvider` extends `BaseDatabaseProvider` even though SQL++ is a SQL dialect: SQL++ quotes identifiers with doubled backticks, which `escapeIdentifier()` produces for no existing type, so it owns its quoting and declares its SQL-ness through `queryLanguage: 'sql'` instead. Being reached over HTTP is **not** the reason — `ClickHouseProvider`, `DruidProvider` and `TrinoProvider` add no driver either, and all three extend `SQLBaseProvider`, because double-quoted identifiers are correct in each dialect. Each driver-free provider is a directory rather than a single file, with its wire format behind a transport seam that provider logic never bypasses. Trino inherits everything except the limiter: its grammar is `[ OFFSET count ] [ LIMIT count ]` and only that way round, so `prepareQuery()` transposes the clause the shared limiter emits. See [`docs/providers/couchbase.md`](providers/couchbase.md), [`clickhouse.md`](providers/clickhouse.md), [`druid.md`](providers/druid.md) and [`trino.md`](providers/trino.md).
 
@@ -127,6 +196,40 @@ Both database and LLM layers use the Strategy Pattern with a factory:
 - `src/lib/llm/factory.ts` - Creates the correct LLM provider based on configuration
 
 No `isMongoDB` / `=== 'mongodb'` checks outside provider classes. All behavior differences are driven through capabilities and labels.
+The connection dialog reads the same way: each engine's fields are a row of `CONNECTION_FIELDS` in `src/lib/db/connection-fields.ts`, and its scheme, URL TLS reader and seed checks a row of `CONNECTION_STRING` in `src/lib/db/connection-string/`, declared beside its provider.
+The rolled-back notice's keyword and the agent consent card's deadline chip and sentence are a row of `EXECUTION_UI` in `src/lib/db/execution-ui/`, read by type id so they answer without provider metadata, and the explain request's engine hint with no connection is `explainRequestEngine` there.
+`tests/unit/lib/no-engine-branches.test.ts` is the guard: outside the provider layer, a type-id branch fails unless its closed lists name it as a registry or a false positive, and its debt list of branches still to move is empty.
+
+`src/lib/db/object-kinds.ts` is the kernel through which every provider reads its own declaration, and it takes only facts that follow from the declaration and hold for every engine.
+How deep the container chain is (`containerDepth()`), which container paths are an address (`acceptedContainerShapes()`, over `containerPathShapes`) and which object kinds exist (`declaredKinds()`) are such facts.
+So is which kinds one container holds (`applicableKinds()`, over `Container.kinds`, and `kindsForContainer()`, its form over every enumerable kind): the tree, the tree filter, the inventory and search routes and the agent's grounding walk ask a container only for those.
+The HTTP object routes read them through the same functions, so a route refusal and a provider refusal cannot disagree about one declaration (#1147).
+A rule that only one engine's reads need stays in that engine's file, next to the reads it protects.
+PostgreSQL's `containerSchema()` is the example: it refuses a declaration that names no `schema` level, because the PostgreSQL reads look the schema up by id, so it lives beside those reads rather than in the kernel (#1092).
+A descriptor field that only one engine sets is a sign that its rule belongs in that engine.
+`ObjectPathShapeEngine.attachedSegment` (#978) is the one pre-existing exception: a per-engine acceptance policy carried in provider descriptors rather than in the declaration, and moving it into the declaration is separate work.
+
+The editor's query dialects follow the same rule through three registries, each a `Record` the compiler holds complete.
+`QUERY_DIALECTS` (`src/lib/db/query-dialects.ts`) gives each declared `queryDialect` its tab type and its three row-menu answers.
+`DIALECT_EDITORS` (`src/lib/editor/dialect-editors.ts`) gives each tab type its Monaco language and its formatter, keyed by tab type because that is what a restored tab carries.
+`DIALECT_GENERATORS` (`src/lib/query-generators.ts`) gives each dialect what a tree click and Generate Query write, and, for a provider that declares `rowActions`, what each declared row action runs.
+A dialect is one record in each, and no reader branches on its name: `tests/unit/lib/dialect-reader-allowlist.test.ts` holds every other reader of `queryDialect`, of the JSON language and of a negated language to a closed list with its owner.
+
+How a generated statement spells a literal, a name and a bind follows the same rule beside `QUERY_DIALECTS`, keyed by type id rather than by dialect.
+`src/lib/db/sql-writing/` holds the `SqlWritingSpec` contract (`types.ts`), the building blocks more than one engine spells alike (`shared.ts`), and `SQL_WRITING` (`index.ts`), a `Record` over `DatabaseType` the compiler holds complete.
+Each row is declared in a module beside its provider, which imports only the contract, the building blocks, the engine-neutral export helpers (`export-shared.ts`) and, where it has one, its own `typed-literals` sibling, so one engine's rules cannot reach another's.
+`quoteLiteral`, `unquoteLiteral`, `temporalLiteral` and `positionalPlaceholder` (`src/lib/sql/values.ts`) and `quoteIdentifier` (`src/lib/sql/identifier.ts`) read the row through `sqlWritingFor`, which gives a missing connection and a string outside the union their own named specs.
+`useInlineEditing` (`src/hooks/use-inline-editing.ts`) reads the row's `inlineEdit` the same way: the type names that make a key column an instant, a 64-bit float or an exact decimal, and the `boundEdit` that wraps an edit's bind where the engine needs one.
+`buildResultExport` (`src/lib/export/result-export.ts`) and `typedLiteral` (`src/lib/export/typed-literals.ts`) read the row's `export` field the same way: the CREATE TABLE types, the type vocabulary that classifies a declared type, and the literals an exported INSERT writes.
+The golden files under `tests/unit/db/sql-writing/golden/` pin every engine's output.
+
+The schema-diff migration text follows it too, through `MIGRATION_DDL` in `src/lib/db/migration-ddl/`, a `Record<DatabaseType, MigrationDdlSpec>` the compiler holds complete beside `QUERY_DIALECTS`.
+Each row is a module beside its provider (`<family>/<id>-migration-ddl.ts`, or `migration-ddl.ts` inside a provider directory) that either refuses the whole diff with one line or writes every statement kind through its own function, sharing PostgreSQL's spelling by importing a named building block from `shared.ts`.
+`generateMigrationSQL` reads a connection's row through `migrationDdlFor`, which answers a spec of its own for no connection and for a type outside the union, and names no type id itself.
+
+How each engine's statement text is read sits in a registry of the same kind beside `QUERY_DIALECTS`: `SQL_GRAMMAR` in `src/lib/db/sql-grammar/`, a `Record<DatabaseType, SqlGrammarSpec>` the compiler holds total.
+Each row is a module beside its engine's provider that states the grammar facts the statement splitter, the row limiter and the confirmation gate read, whether the text is SQL at all (`readsSqlText`), what a redacted query event keeps, the words the update-target reader adds, and how completion quotes a name.
+`sqlGrammarFor()` answers a missing type with `NO_CONNECTION_SQL_GRAMMAR` and an unknown one with `UNKNOWN_TYPE_SQL_GRAMMAR`, so no reader of these facts names a type id.
 
 ### 4.2. Authentication Flow
 
@@ -141,6 +244,17 @@ sequenceDiagram
         U->>F: Email + Password
         F->>A: POST /api/auth/login
         A->>F: Set HTTP-Only JWT Cookie
+    else Passkey sign-in
+        U->>F: Click Use a passkey
+        F->>A: POST /api/auth/passkey/sign-in {options}
+        A->>F: Challenge + signed ceremony cookie
+        U->>F: Unlock passkey on the device
+        F->>A: POST /api/auth/passkey/sign-in {verify}
+        A->>F: Set HTTP-Only JWT Cookie
+    else Platform launch
+        U->>F: Open the platform's launch link, token in the URL fragment
+        F->>A: POST /api/auth/launch {token}
+        A->>F: Set HTTP-Only JWT Cookie
     else OIDC SSO
         U->>F: Click SSO Login
         F->>O: Redirect (PKCE)
@@ -151,7 +265,15 @@ sequenceDiagram
     end
 ```
 
-Controlled by `NEXT_PUBLIC_AUTH_PROVIDER` (`local` | `oidc`). Both flows result in the same JWT session cookie. Proxy (`src/proxy.ts`) enforces RBAC (admin vs user roles).
+Controlled by `NEXT_PUBLIC_AUTH_PROVIDER` (`local` | `oidc`). Every flow results in the same JWT session cookie. Proxy (`src/proxy.ts`) enforces RBAC (admin vs user roles).
+
+The passkey branch exists only with local auth, `STORAGE_PROVIDER=sqlite` or `postgres`, and a valid `PASSKEY_ORIGIN`. The challenge travels in an HttpOnly, SameSite=Strict cookie signed with a key derived from `JWT_SECRET`, the verify step checks the assertion against the one configured origin and the credential stored in the server store, and marks the challenge spent in the same transaction that records the sign-in, so any replica completes it at most once. A verified passkey replaces the password and the TOTP code, because both ceremonies require user verification. See [PASSKEYS.md](PASSKEYS.md).
+
+The launch branch exists only while `LAUNCH_TOKEN_SECRET` is set.
+The `/launch` page reads an HS256 token from its URL fragment, removes it from the address bar and posts it to `POST /api/auth/launch`: at once when the browser holds a session, otherwise only after the person clicks Continue on a page naming the account the token signs into.
+The route verifies it against the configured issuer and audience, refuses a token issued for more than 60 seconds or presented twice, refuses to replace a session for another account, and in store mode creates or updates an account bound to the token's issuer and subject before it sets the session cookie; it never signs in to an account that has a password.
+Under `NEXT_PUBLIC_AUTH_PROVIDER=oidc` the route and the page answer 503.
+See [LAUNCH.md](LAUNCH.md).
 
 ### 4.3. Multi-Statement Execution
 
@@ -159,8 +281,9 @@ Controlled by `NEXT_PUBLIC_AUTH_PROVIDER` (`local` | `oidc`). Both flows result 
 - String literals (single/double quotes)
 - Block and line comments
 - Dollar-quoting (PostgreSQL)
+- Procedural bodies and separator lines, from the dialect's `script` grammar fact: an Oracle PL/SQL unit or a SQLite trigger is one statement, and a `/` (Oracle) or `GO` (SQL Server) line is a boundary that is never sent
 
-Multi-statement queries execute sequentially via `POST /api/db/multi-query`.
+Multi-statement queries execute sequentially via `POST /api/db/multi-query`, one request per execution unit (`splitExecutionUnits`): a statement, or on SQL Server the whole batch between `GO` lines.
 
 ### 4.4. Storage Abstraction Layer
 
@@ -171,6 +294,7 @@ Multi-statement queries execute sequentially via `POST /api/db/multi-query`.
   - `postgres`: Server-side PostgreSQL via `pg`
 - **`useStorageSync` hook** in Studio.tsx: discovers mode at runtime via `/api/storage/config`, pulls on mount, pushes mutations (debounced 500ms)
 - **Migration**: First login auto-migrates localStorage to server; `libredb_server_migrated` flag prevents re-migration
+- **Browser copy owner** (server mode): `libredb_workspace_owner` binds the browser copy to the signed-in account; a different account starts from its own server data and sign-out clears the copy (see [STORAGE.md](STORAGE.md#the-browser-copy-belongs-to-the-signed-in-account))
 - **Graceful degradation**: If server unreachable, localStorage continues working
 
 ### 4.5. Client State Management
@@ -207,7 +331,32 @@ The SQLite **DB provider** is runtime-adaptive: it loads `bun:sqlite` under Bun 
 
 A read-only investigation agent: a model drafts SQL against a connected database, repairs statements that fail, and composes a report whose claims cite the results they came from. Three boundaries define it. Its availability is **derived, not flagged** (#331 T5): the agent exists when a model is configured through the existing `src/lib/llm` settings *and* the durable ledger has a writable path, so no rail renders where the first Start would fail, and the discovery probe answers `{"enabled": false, "reason": …}` naming the condition that is missing — that is how the rail learns to stay absent and how the operator learns why. `LIBREDB_AGENT_ENABLED=false` remains the explicit off-switch. `isAgentRuntimeEnabled()` stays synchronous, answering the off-switch and the model configuration for its five in-request callers; the ledger's writable path is I/O and is composed into the answer by `GET /api/agent/config` alone. It is **standalone-only**, so the `@libredb/studio` package gains no agent module, agent type or runtime dependency (asserted by a package-boundary test); and every database reach goes through the same `src/lib/db/operations/` pipeline as the rest of the app, under a read-only execution profile with the agent's own frozen policy — there is no second path to a driver. A run is an append-only ledger on a durable backend (`WORKFLOW_TARGET_WORLD`: zero-config single-instance `local`, or the opt-in Postgres world for multiple replicas), and it re-derives its state from that ledger, so a resumed run never repeats a tool execution. Model configuration is the existing `src/lib/llm` settings surface — there is no second place to enter a key, and therefore no second reader of one.
 
+What the agent does differently per statement language lives in language packs under `src/lib/agent/languages/`: one family pack per statement language (`sql`, `kubectl`, `mongo`), and one overlay per engine under `languages/<statement-language>/engines/<type-id>.ts` that supplies the engine's dialect.
+A pack member is Shared (the family's, which an engine overlay may override only for the members `ENGINE_OVERRIDABLE_SERVER_MEMBERS` names), Dialect-bound (supplied by each SQL engine or declared `"unsupported"`, enforced by the compiler) or Optional.
+A run reads its pack through the run resolver, `runServerPack`: the family its persisted statement language names, with the connection's overlay applied only when that engine speaks the family.
+The packs live in the agent, which imports the database layer and is never imported by it, and a pack never opens execution on an engine.
+How the packs, overlays and resolvers fit together: [`docs/AGENT.md`](AGENT.md#language-packs).
+
 Full behaviour, the tool set, what bounds a run, the HTTP surface and the honest limitations: [`docs/AGENT.md`](AGENT.md).
+
+### 4.10. MCP Server (`src/lib/mcp/`, off by default)
+
+An MCP endpoint at `/api/mcp` for AI clients of the user's own, served by the official MCP TypeScript SDK: `createMcpHandler` at module scope and one `McpServer` per request, in revision 2026-07-28 and, statelessly, 2025-11-25 and 2025-06-18.
+It authenticates with a scoped bearer token each user mints on the settings screen, signed with a key derived from `JWT_SECRET` under a configured label, and never with the session cookie; `src/proxy.ts` and the route both check the Origin, the Host on a loopback bind, and the token.
+Its three tools reach only seed connections opted in with `mcp: true`, through `acquireExecutionProfileProvider` alone, bound every result to 32 KiB behind an untrusted-content notice, and write `mcp_operation` audit events, the decision before any provider.
+It is standalone-only: nothing under `src/lib/mcp/` or `src/app/` is reachable from the package's entry points, which a package-boundary test asserts.
+Full behaviour, client configuration and limits: [`docs/MCP.md`](MCP.md).
+
+### 4.11. Governance (`src/lib/governance/`, `src/lib/query-events/`, off by default)
+
+Studio can run under a control plane that decides which databases each person may open.
+The two never call each other: the control plane publishes a governance source, PostgreSQL views and tables in one schema, and Studio reads it with a role of its own and writes its heartbeat and query events back into it.
+`src/lib/governance/contract.ts` holds that contract as data together with every statement Studio issues against it, `src/lib/governance/settings-registry.ts` holds the runtime settings a control plane may set, and `scripts/generate-governance-manifest.ts` publishes both as `tests/fixtures/governance/contract-v1.json`, which a control plane vendors from a release.
+The runtime beside them opens sealed credentials with the keyring (`keyring.ts`, `secrets.ts`), admits the governance source's connection rows (`admission.ts`), reads the source through a pool of its own (`db.ts`) into one snapshot at a time (`snapshot.ts`, `state.ts`), decides from the snapshot's age whether data routes may be served (`freshness.ts`), and keeps it current with a refresher and a change listener (`start.ts`, `listener.ts`).
+`src/lib/query-events/` turns each executed unit into a row of `query_events_v1` (`build.ts`), keeping of the statement only what the runtime setting `queryLog.statementCapture` allows (`redact.ts`), and queues the rows in memory for batched inserts into the governance source (`sink.ts`, `postgres-sink.ts`).
+With the runtime setting `queryLog.onSinkFailure` at `refuse`, its admission gate refuses an execution while those inserts back off or the queue is at least 90% full (`admission.ts`).
+Governance is off unless `GOVERNANCE_SOURCE=postgres` is set.
+The contract, its conformance files and its semantics: [`docs/GOVERNANCE.md`](GOVERNANCE.md).
 
 ## 5. Directory Structure
 
@@ -215,12 +364,14 @@ Full behaviour, the tool set, what bounds a run, the HTTP surface and the honest
 src/
 ├── app/                    # Next.js App Router
 │   ├── api/
-│   │   ├── auth/           # Login/logout/me + OIDC (PKCE, callback)
+│   │   ├── auth/           # Login/logout/me + OIDC (PKCE, callback), TOTP, passkey/ (owner management) + passkey/sign-in/
 │   │   ├── ai/             # explain, query-safety, describe-schema
-│   │   ├── db/             # Query, schema, health, maintenance, transactions
+│   │   ├── db/             # Query, objects/ (the object surface), health, maintenance, transactions
 │   │   ├── storage/        # Storage sync API (config, CRUD, migrate)
 │   │   ├── connections/    # managed/ — built-in (seeded) connections listing
+│   │   │                   #   policy/: whether this server allows custom connections
 │   │   ├── agent/          # Agent runs, stream, artifacts, drive (404 unless enabled — §4.9)
+│   │   ├── mcp/            # MCP endpoint (bearer token, 404 unless enabled) and token/ (minting)
 │   │   └── admin/          # Fleet health, audit
 │   ├── admin/              # Admin dashboard (RBAC protected) — layout.tsx renders the
 │   │   │                   #   shell; one route per section, each independently
@@ -242,9 +393,17 @@ src/
 │   ├── sidebar/             # ConnectionsList, ConnectionItem
 │   ├── studio/              # StudioTabBar, QueryToolbar, BottomPanel
 │   ├── results-grid/        # ResultCard, RowDetailSheet, StatsBar
-│   ├── admin/               # AdminDashboard shell (5 section routes) + tabs/ panels
+│   ├── admin/               # AdminDashboard shell (section routes) + tabs/ panels
 │   ├── monitoring/          # MonitoringDashboard + tabs
-│   ├── schema-explorer/     # SchemaExplorer
+│   ├── object-tree/         # The desktop sidebar's lazy object tree (containers, kind groups, folders, objects, columns)
+│   │   ├── ObjectTree.tsx    # Tree shell: hand-rolled window, roving tabindex, keyboard, menu anchor
+│   │   ├── TreeRow.tsx       # One row, ARIA numbers taken verbatim; the chevron is its own hit target
+│   │   ├── RowMenu.tsx       # The row menu, rendered as a sibling of the tree element, not inside it
+│   │   ├── flatten.ts        # Expansion state to a flat row list, with each row's ARIA position (pure)
+│   │   ├── use-tree-nodes.ts # The lazy cache: containers, counts, a folder's objects, a row's columns
+│   │   ├── row-actions.ts    # What a row may be asked to do, read off the kind's own declaration and the declared row actions
+│   │   └── index.ts          # What a shell imports: ObjectTree plus the two types its handlers need
+│   ├── schema-explorer/     # SchemaExplorer (the flat list: mobile schema tab, published export)
 │   └── ui/                  # Shadcn/UI primitives
 ├── workspace/               # Embeddable shell (StudioWorkspace) + host adapter hooks
 ├── exports/                 # Public npm-package barrel exports (tsup build:lib)
@@ -252,23 +411,50 @@ src/
 └── lib/
     ├── db/                  # Database provider module
     │   ├── providers/
-    │   │   ├── sql/         # postgres, mysql, sqlite (+ sqlite-driver runtime adapter), oracle, mssql, clickhouse/ (transport seam + SQL over HTTP), druid/ (transport seam + SQL over POST /druid/v2/sql), search/ (transport seam + SQL over HTTP; elasticsearch and opensearch, two ids one module), trino/ (transport seam + SQL over the Trino client protocol), cassandra/ (transport seam + CQL over the native protocol via cassandra-driver), libsql/ (transport seam + SQLite's dialect over the Hrana protocol), duckdb/ (driver seam + an embedded analytical engine over @duckdb/node-api)
+    │   │   ├── sql/         # postgres, mysql, sqlite (+ sqlite-driver runtime adapter), oracle, db2/ (driver seam + SYSCAT catalog over db2-node), mssql, clickhouse/ (transport seam + SQL over HTTP), druid/ (transport seam + SQL over POST /druid/v2/sql), search/ (transport seam + SQL over HTTP; elasticsearch and opensearch, two ids one module), trino/ (transport seam + SQL over the Trino client protocol), databend/ (transport seam + SQL over Databend's HTTP query API), snowflake/ (transport seam + SQL over the Snowflake SQL API v2, key-pair JWT or access token), spark/ (gRPC client + SQL over Spark Connect, Arrow results decoded by apache-arrow), cassandra/ (transport seam + CQL over the native protocol via cassandra-driver), libsql/ (transport seam + SQLite's dialect over the Hrana protocol), duckdb/ (driver seam + an embedded analytical engine over @duckdb/node-api)
     │   │   ├── document/    # mongodb, couchbase/ (transport seam + SQL++ over REST)
-    │   │   ├── keyvalue/    # redis
+    │   │   ├── keyvalue/    # redis, etcd/ (gRPC client seam + an etcdctl subset over etcd's gRPC API via the shared gRPC transport), oxia/ (gRPC client seam + an oxia client read-command console over Oxia's gRPC client API via the shared gRPC transport; key order probed)
+    │   │   ├── timeseries/  # prometheus/ (transport seam + PromQL over the Prometheus HTTP API); influxdb/ (influxdb and influxdb3, two classes on two bases
+    │   │   │                #   sharing one connection layer over the shared node transport: InfluxQL over the v1 /query API, and SQL over
+    │   │   │                #   InfluxDB 3's /api/v3/query_sql; the InfluxQL lexer, read policy, quoter and generators are browser-safe)
+    │   │   ├── stream/      # kafka/ (read-client seam + JSON read requests over the Kafka protocol via @platformatic/kafka)
+    │   │   ├── graph/       # neo4j/ (an engine profile, catalog, statement gate and monitoring on the graph layer below)
+    │   │   ├── vector/      # milvus/ (a gRPC client of its own via the shared gRPC transport, Milvus's REST v2 requests as the console, run over gRPC); qdrant/ (a REST client of its own over the shared node transport, the closed console, the payload sample)
+    │   │   ├── objectstore/ # s3/ (a REST client of its own over the shared byte transport, signed by its own SigV4 module over node:crypto; an AWS CLI read-command console; object metadata and capped previews, Parquet through hyparquet)
+    │   │   ├── platform/    # kubernetes/ (a REST client of its own over the shared node transport behind a read-only request allowlist; a kubectl read-command console; namespaces and kinds in the tree, a YAML view of every object, Secret values redacted)
     │   │   └── embedded/    # libredb (built-in embedded provider for the sample connection)
+    │   ├── graph/           # The graph layer a Cypher-over-Bolt engine extends (docs/ADDING_A_PROVIDER.md, "Adding a graph engine"):
+    │   │                    #   cypher/ (lexer, statements, quoting, read policy, generators), objects.ts, values.ts and
+    │   │                    #   profile.ts are pure and browser-safe; bolt/ (the GraphClient seam, the URI, the one
+    │   │                    #   neo4j-driver-lite client, driver values to JSON) and graph-base-provider.ts are server only
+    │   ├── http/            # endpoint.ts: the validated URL builder every HTTP transport uses (no redirects); node-transport.ts: the shared node:http(s) transport a new REST provider takes (one keep-alive Agent per connection, no proxy variables, a streamed byte cap); node-transport.ts also holds the byte transport (GET and HEAD to an exact target, bytes, selected headers, a per-request signer)
+    │   ├── grpc/            # channel.ts: the one gRPC channel (options, unary and bidirectional calls, deadlines, aborts, the sent or unsent notice); credentials.ts: TLS credentials and the closing wrapper; tls.ts: the SSL / TLS panel, the TLS identity and the dial target, for every gRPC provider
     │   ├── factory.ts       # Provider factory
+    │   ├── query-dialects.ts # The dialect registry: each queryDialect's tab type and row-menu answers
     │   └── types.ts         # Database types
     ├── agent/               # Agent runtime: run ledger, workflow, tools, policy (docs/AGENT.md)
+    │   └── languages/       # Statement language packs, their engine overlays and resolvers (docs/AGENT.md, Language packs)
+    ├── mcp/                 # MCP server: SDK handler, token, pre-processing, tools (docs/MCP.md)
+    ├── governance/          # Governance (docs/GOVERNANCE.md): contract v1, the settings registry and the runtime that
+    │                        #   reads the source: keyring, admission, pool, snapshot, freshness, refresher, listener
+    ├── query-events/        # Query event rows under governance: the builder, statement redaction, UUIDv7 event ids,
+    │                        #   the sink that queues the rows and inserts them in batches, and the admission gate
+    │                        #   that refuses an execution while the sink cannot record it
+    ├── passkey/             # Passkey sign-in (docs/PASSKEYS.md): config (PASSKEY_ORIGIN reader), policy, ceremony
+    │                        #   cookie, WebAuthn wrapper, management and sign-in services, browser client
+    ├── launch/              # Launch-token sign-in (docs/LAUNCH.md): config (LAUNCH_TOKEN_* reader), the token
+    │                        #   verifier (jose, HS256 pinned) and the in-process jti replay cache
     ├── llm/                 # LLM provider module
-    ├── editor/              # Monaco completions (SQL + MongoDB), the tab-type/language ladder,
-    │                       # and the LibreDB + Redis command languages
+    ├── editor/              # Monaco completions (SQL + MongoDB), the tab-type/language ladder, the
+    │                       # editor registry (dialect-editors.ts), the LibreDB, Redis, etcd, Oxia, S3 and kubectl command languages, Cypher, InfluxQL, and the Milvus and Qdrant console languages
     ├── schema-diff/         # Diff engine + migration SQL generator
     ├── export/              # The writers behind every "save this to disk": RFC 4180 CSV,
     │                        #   the SQL INSERT/DDL forms, and the one blob-download path
     ├── sql/                 # Statement splitter, alias extractor
-    ├── seed/                # Seed connections (config, filter, credential resolver) + libredb-sample seeding
+    ├── seed/                # Seed connections: operator sources (sources/), operator loader, filter, credential resolver, CapRover discovery + sample seeding
     ├── config/              # auth-env.ts — single JWT_SECRET reader (auth.ts, proxy.ts, oidc.ts)
-    ├── api/                 # API error codes + schema-route helpers
+    │                        #   custom-connections.ts: the ALLOW_CUSTOM_CONNECTIONS switch
+    ├── api/                 # API error codes + object-route helpers
     ├── ssh/                 # SSH tunnel support
     ├── auth.ts              # JWT utilities
     ├── auth-bootstrap.ts    # Zero-config first-run auth bootstrap (runs in instrumentation)
@@ -284,7 +470,8 @@ src/
 ## 6. Deployment
 
 - **Docker / Helm**: Multi-stage Bun build with standalone Next.js output; these channels resolve their bind address in the container entrypoint, preferring a dual-stack `::` that they verify by connecting an IPv4 client to a throwaway listener, and falling back to `0.0.0.0` where the namespace has no usable IPv6. `HOSTNAME` (chart: `config.bindAddress`) overrules that and is honoured verbatim. Canonical image `ghcr.io/libredb/libredb-studio`.
-- **Native channels** (`bin/studio.js` npx launcher, Homebrew tap, `.deb`/`.rpm`, Snap, standalone tarballs; sources under `bin/` and `packaging/`): local-first, bind `127.0.0.1` by default unless `--host`/`HOSTNAME` opts in. The npx launcher ships as a pure library and downloads the SHA256-verified standalone server tarball from GitHub Releases. Full matrix and per-channel details in [`docs/DISTRIBUTION.md`](DISTRIBUTION.md).
-- **Health Check**: `GET /api/db/health`
+- **Native channels** (`bin/studio.js` npx launcher, Homebrew tap, `.deb`/`.rpm`, Snap, standalone tarballs; sources under `bin/` and `packaging/`): local-first, bind `127.0.0.1` by default unless `--host` or `LIBREDB_BIND` opts in, or a `HOSTNAME` that differs from the machine's own name does (`resolveBindAddress`, #813: an inherited value is what a shell or a container runtime exported, not a choice). The npx launcher ships as a pure library and downloads the SHA256-verified standalone server tarball from GitHub Releases. Full matrix and per-channel details in [`docs/DISTRIBUTION.md`](DISTRIBUTION.md).
+- **VS Code extension** (`vscode-extension/`): reuses the provider layer in a JSON-RPC child process forked from VS Code and Studio's result grid in a webview, as described in [`docs/VSCODE_EXTENSION.md`](VSCODE_EXTENSION.md).
+- **Health Check**: `GET /health`, `GET /api/health` or `GET /api/db/health` — same answer, no dependencies
 - **Stateless API**: API routes are stateless, suitable for horizontal scaling
-- **Environment**: Configured via `.env.local` (see CLAUDE.md for full variable list). Missing auth secrets are generated on first standalone boot — see [§4.7](#47-standalone-boot-flow-srcinstrumentationts).
+- **Environment**: Configured via `.env.local` (see [`.env.example`](../.env.example) for the full variable list, with an example for each). Missing auth secrets are generated on first standalone boot — see [§4.7](#47-standalone-boot-flow-srcinstrumentationts).

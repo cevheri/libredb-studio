@@ -139,8 +139,45 @@ const STATUS_ORDER = { live: 0, pending: 1, deprecated: 2 };
  * there would be a way to ship a release with no npm package or no image, and
  * one mistyped `false` would do it silently. parseChannels rejects the flag
  * anywhere else, so that invariant is enforced, not merely documented.
+ *
+ * `operatorhub-community` qualifies on exactly the stated grounds (issue #656):
+ * its submission is an upstream pull request that a human merges, the first
+ * listing in a catalog is manual, and the token it needs may be absent - none
+ * of which should paint a release run red.
+ *
+ * `aur` qualifies on the same grounds (#971): the push needs an AUR account
+ * and its SSH key, and the account can only be registered by a person.
  */
-export const SWITCHABLE_CHANNEL_IDS = new Set(["docker-hub-mirror", "homebrew", "snap", "winget", "chocolatey"]);
+export const SWITCHABLE_CHANNEL_IDS = new Set([
+  "aur",
+  "docker-hub-mirror",
+  "homebrew",
+  "snap",
+  "winget",
+  "chocolatey",
+  "operatorhub-community",
+]);
+
+/**
+ * Channels whose release workflow stages the upstream change on a LibreDB fork
+ * of the catalog and stops there: a member tests it and opens the pull request
+ * by hand, so no workflow opens one. `update.fork` holds what the workflow may
+ * do, and like `update.ci_enabled` it is required on these channels and
+ * rejected everywhere else, so that is always a stated decision.
+ *
+ * `caprover-official` qualifies because its catalog's maintainer keeps version
+ * bumps manual ("When someone sends a PR we know that version works",
+ * caprover/one-click-apps#1334) and the catalog's pull request template asks for
+ * a test on a CapRover dashboard. .github/workflows/caprover-fork.yml stages the
+ * auto-connect template on the same branch, under this channel's settings.
+ */
+export const FORK_STAGED_CHANNEL_IDS = new Set(["caprover-official"]);
+
+/** `update.fork.mode`: `create_or_update` may create a missing fork in the libredb org; `update` may not. */
+export const FORK_MODES = ["update", "create_or_update"];
+
+/** `update.fork.push`: `auto` pushes the staged branch from the release run; `manual` leaves the push to a member. */
+export const FORK_PUSH_MODES = ["auto", "manual"];
 
 /**
  * Probes measure channels whose served state is not one document a single
@@ -213,19 +250,38 @@ const PROBES = {
     },
   },
 
-  "winget-max-version": {
-    requiredUrls: ["versions"],
+  // Catalogs that publish one directory per version and no floating "latest"
+  // document: winget-pkgs, and both community operator catalogs. Every entry
+  // under pin.urls is a separate listing measured under its own key, so a
+  // channel that spans two catalogs (operatorhub.io and the OpenShift console
+  // publish the same bundle independently) reports each one and a lagging
+  // catalog surfaces as disagreeing sources rather than as a single number.
+  "github-dir-max-version": {
+    requiredUrls: [],
+    requiresAnyUrl: true,
     async run({ pin, timeoutMs }) {
-      // A directory listing is not paginated: the contents API returns the whole
-      // directory in one response and ignores per_page (verified against
-      // winget-pkgs, 785 entries in a single body). Its documented ceiling is
-      // 1,000 entries, above which GitHub directs callers to the Git Trees API -
-      // 1,000 published winget versions is not a reachable horizon here.
-      const listing = await fetchJson(pin.urls.versions, timeoutMs, githubAuthHeaders(pin.urls.versions));
-      if (!Array.isArray(listing.body)) {
-        return { error: `catalog listing unavailable (status ${listing.status})` };
+      const versions = [];
+      for (const [source, url] of Object.entries(pin.urls)) {
+        // A directory listing is not paginated: the contents API returns the
+        // whole directory in one response and ignores per_page (verified
+        // against winget-pkgs, 785 entries in a single body). Its documented
+        // ceiling is 1,000 entries, above which GitHub directs callers to the
+        // Git Trees API - 1,000 published versions is not a reachable horizon
+        // for either catalog here.
+        const listing = await fetchJson(url, timeoutMs, githubAuthHeaders(url));
+        if (!Array.isArray(listing.body)) {
+          return { error: `${source}: catalog listing unavailable (status ${listing.status})` };
+        }
+        const measured = maxPublishedVersion(listing.body.map((entry) => entry.name));
+        if (measured.error) {
+          return { error: `${source}: ${measured.error}` };
+        }
+        // maxPublishedVersion labels its single result "catalog"; with more
+        // than one listing in play the pin key is the only label that says
+        // WHICH catalog lagged, so it replaces that placeholder.
+        versions.push({ source, version: measured.versions[0].version });
       }
-      return maxPublishedVersion(listing.body.map((entry) => entry.name));
+      return { versions };
     },
   },
 };
@@ -420,6 +476,29 @@ export function parseChannels(yamlText) {
         `${CHANNELS_YAML}: ${id}: update.ci_enabled is only allowed on ${[...SWITCHABLE_CHANNEL_IDS].join(", ")}`,
       );
     }
+    const fork = channel.update.fork;
+    if (FORK_STAGED_CHANNEL_IDS.has(id)) {
+      if (fork === null || typeof fork !== "object" || Array.isArray(fork)) {
+        throw new Error(`${CHANNELS_YAML}: ${id}: update.fork must be a mapping with mode and push`);
+      }
+      if (channel.update.method !== "upstream_pr") {
+        throw new Error(`${CHANNELS_YAML}: ${id}: update.fork needs update.method upstream_pr`);
+      }
+      const unknown = Object.keys(fork).filter((key) => key !== "mode" && key !== "push");
+      if (unknown.length > 0) {
+        throw new Error(`${CHANNELS_YAML}: ${id}: update.fork has unknown keys: ${unknown.join(", ")}`);
+      }
+      if (!FORK_MODES.includes(fork.mode)) {
+        throw new Error(`${CHANNELS_YAML}: ${id}: update.fork.mode must be one of ${FORK_MODES.join("|")}`);
+      }
+      if (!FORK_PUSH_MODES.includes(fork.push)) {
+        throw new Error(`${CHANNELS_YAML}: ${id}: update.fork.push must be one of ${FORK_PUSH_MODES.join("|")}`);
+      }
+    } else if (fork !== undefined) {
+      throw new Error(
+        `${CHANNELS_YAML}: ${id}: update.fork is only allowed on ${[...FORK_STAGED_CHANNEL_IDS].join(", ")}`,
+      );
+    }
     const pin = channel.pin;
     if (!pin || !STRATEGIES.includes(pin.strategy)) {
       throw new Error(`${CHANNELS_YAML}: ${id}: pin.strategy must be one of ${STRATEGIES.join("|")}`);
@@ -439,6 +518,11 @@ export function parseChannels(yamlText) {
         if (typeof pin.urls?.[key] !== "string") {
           throw new Error(`${CHANNELS_YAML}: ${id}: probe '${pin.probe}' needs pin.urls.${key}`);
         }
+      }
+      // A probe that measures "every listing named here" has no fixed url key
+      // to require, so an empty map would make it silently measure nothing.
+      if (probe.requiresAnyUrl && Object.keys(pin.urls ?? {}).length === 0) {
+        throw new Error(`${CHANNELS_YAML}: ${id}: probe '${pin.probe}' needs at least one entry under pin.urls`);
       }
       for (const key of probe.requiredArrays ?? []) {
         if (!Array.isArray(pin[key]) || pin[key].length === 0) {
@@ -460,6 +544,16 @@ export function parseChannels(yamlText) {
 }
 
 /**
+ * Whether release CI may publish this switchable channel: the flag says it
+ * should, and the status says there is a listing to publish to. A pending
+ * channel (staged before its account or listing exists, as the AUR was, #971)
+ * or a deprecated one is never published, so going live is the switch.
+ */
+export function ciPublishes(channel) {
+  return channel.status === "live" && channel.update.ci_enabled === true;
+}
+
+/**
  * `<name>=<bool>` lines for $GITHUB_OUTPUT, one per switchable channel present.
  * Dashes become underscores because a GitHub expression cannot dot-access an
  * output name that contains one.
@@ -467,7 +561,16 @@ export function parseChannels(yamlText) {
 export function ciEnabledOutputs(channels) {
   return channels
     .filter((channel) => SWITCHABLE_CHANNEL_IDS.has(channel.id))
-    .map((channel) => `${channel.id.replaceAll("-", "_")}=${channel.update.ci_enabled}`);
+    .map((channel) => `${channel.id.replaceAll("-", "_")}=${ciPublishes(channel)}`);
+}
+
+/**
+ * `<name>=<value>` lines for $GITHUB_OUTPUT: what the fork staging workflow may
+ * do for one fork-staged channel. `live` is false for a pending or deprecated
+ * channel, which the workflow never pushes, whatever `push` says.
+ */
+export function forkOutputs(channel) {
+  return [`mode=${channel.update.fork.mode}`, `push=${channel.update.fork.push}`, `live=${channel.status === "live"}`];
 }
 
 /**
@@ -662,17 +765,26 @@ export function platformCell(platforms) {
     .join(", ");
 }
 
-/** Who bumps this channel and how fast. A dash for retired channels. */
+/**
+ * Who bumps this channel and how fast. A dash for retired channels.
+ *
+ * Three states, not two. `upstream_pr` with a CI switch means the submission
+ * is opened by our release workflow but merged by somebody else's maintainers
+ * (the community operator catalogs, issue #656) - calling that "Automated"
+ * would promise a landing we do not control, and "Manual" would hide the
+ * automation that exists.
+ */
 export function updateSummary(channel) {
   if (channel.status === "deprecated") {
     return "—";
   }
-  const automation =
-    channel.update.method === "ci_publish"
-      ? channel.update.ci_enabled === false
-        ? "Automated (paused)"
-        : "Automated"
-      : "Manual";
+  const paused = channel.update.ci_enabled === false;
+  let automation = "Manual";
+  if (channel.update.method === "ci_publish") {
+    automation = paused ? "Automated (paused)" : "Automated";
+  } else if (channel.update.method === "upstream_pr" && channel.update.ci_enabled !== undefined) {
+    automation = paused ? "Automated PR (paused)" : "Automated PR";
+  }
   return `${automation}, ${humanizeSla(channel.update.sla).toLowerCase()}`;
 }
 
@@ -851,10 +963,29 @@ async function main(argv) {
     console.error("ERROR: --ci-enabled requires a channel id");
     process.exit(2);
   }
-  if (ciOutputs || ciIdx !== -1) {
+  const forkIdx = argv.indexOf("--fork-outputs");
+  const forkId = forkIdx === -1 ? undefined : argv[forkIdx + 1];
+  if (forkIdx !== -1 && (forkId === undefined || forkId.startsWith("--"))) {
+    console.error("ERROR: --fork-outputs requires a channel id");
+    process.exit(2);
+  }
+  if (ciOutputs || ciIdx !== -1 || forkIdx !== -1) {
     const inventory = parseChannels(fs.readFileSync(path.join(root, CHANNELS_YAML), "utf8"));
     if (ciOutputs) {
       for (const line of ciEnabledOutputs(inventory)) console.log(line);
+      return;
+    }
+    if (forkIdx !== -1) {
+      if (!FORK_STAGED_CHANNEL_IDS.has(forkId)) {
+        console.error(`ERROR: '${forkId}' is not a fork-staged channel (${[...FORK_STAGED_CHANNEL_IDS].join(", ")})`);
+        process.exit(2);
+      }
+      const channel = inventory.find((entry) => entry.id === forkId);
+      if (!channel) {
+        console.error(`ERROR: channel '${forkId}' is not in ${CHANNELS_YAML}`);
+        process.exit(2);
+      }
+      for (const line of forkOutputs(channel)) console.log(line);
       return;
     }
     if (!SWITCHABLE_CHANNEL_IDS.has(ciId)) {
@@ -866,7 +997,7 @@ async function main(argv) {
       console.error(`ERROR: channel '${ciId}' is not in ${CHANNELS_YAML}`);
       process.exit(2);
     }
-    console.log(String(channel.update.ci_enabled));
+    console.log(String(ciPublishes(channel)));
     return;
   }
 

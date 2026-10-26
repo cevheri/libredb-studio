@@ -56,8 +56,8 @@
  * them.
  *
  * Neither key set is written out by hand. The credential NAMES are derived from
- * the field classifications in `src/lib/storage/connection-secrets.ts` — the
- * repository's single answer to "which stored fields are credentials" — plus one
+ * the field classifications in `src/lib/storage/secret-fields.ts`, the
+ * repository's single answer to "which stored fields are credentials", plus one
  * map for the LLM settings, which had none. The result names are derived from
  * `QueryResult`'s own keys the same way.
  *
@@ -150,6 +150,8 @@ const LLM_CONFIG_FIELDS: Record<keyof LLMConfig, FieldClass> = {
   apiKey: "secret",
   model: "public",
   apiUrl: "public",
+  providerExplicit: "public",
+  modelEffort: "public",
 };
 
 type ResultFieldClass = "payload" | "summary";
@@ -159,21 +161,25 @@ type ResultFieldClass = "payload" | "summary";
  * it. Total over `QueryResult`, so a new result field must be classified before
  * it compiles.
  *
+ * `resultSets` is payload: every set of a multi-result batch, rows and all (#1312).
  * `explainPlan` is payload: a plan tree is the output of the operation that
  * produced it and can be arbitrarily large. `warnings` is not — engine notices
  * are bounded diagnostics, and run state already carries engine text in a
  * database-error refusal, so refusing them here would be inconsistent as well as
- * costly. `fields`, `columnTypes` and `pagination` describe shape, not rows.
+ * costly. `fields`, `columnTypes`, `vectorColumns` and `pagination` describe shape, not rows.
  */
 const QUERY_RESULT_FIELDS: Record<keyof QueryResult, ResultFieldClass> = {
   rows: "payload",
   explainPlan: "payload",
+  resultSets: "payload",
   fields: "summary",
   rowCount: "summary",
   executionTime: "summary",
   pagination: "summary",
   warnings: "summary",
   columnTypes: "summary",
+  vectorColumns: "summary",
+  rolledBack: "summary",
 };
 
 /**

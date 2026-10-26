@@ -3,8 +3,10 @@ import {
   CONNECTION_FIELDS,
   decryptConnections,
   encryptConnections,
+  type FieldClass,
   SSH_TUNNEL_FIELDS,
   SSL_FIELDS,
+  withoutSecretFields,
 } from "@/lib/storage/connection-secrets";
 import { ENVELOPE_VERSION, readSecret, resetStorageEncryptionKey } from "@/lib/storage/encryption";
 import type { DatabaseConnection } from "@/lib/types";
@@ -35,6 +37,7 @@ function fullConnection(): DatabaseConnection {
     type: "postgres",
     host: "db.internal",
     port: 5432,
+    queryTimeout: 120000,
     user: "app",
     password: "CANARY-DB-PASSWORD",
     database: "prod",
@@ -42,6 +45,10 @@ function fullConnection(): DatabaseConnection {
     createdAt: new Date("2026-01-01T00:00:00.000Z"),
     agentUser: "agent-ro",
     agentPassword: "CANARY-AGENT-PASSWORD",
+    apiKeyId: "CANARY-API-KEY-ID",
+    apiKeySecret: "CANARY-API-KEY-SECRET",
+    privateKey: "CANARY-SNOWFLAKE-PRIVATE-KEY",
+    privateKeyPassphrase: "CANARY-SNOWFLAKE-PASSPHRASE",
     ssl: {
       mode: "verify-full",
       caCert: "-----BEGIN CERTIFICATE-----CA-----END CERTIFICATE-----",
@@ -70,6 +77,10 @@ const CANARIES = [
   "CANARY-SSH-PRIVATE-KEY",
   "CANARY-SSH-PASSPHRASE",
   "CANARY-AGENT-PASSWORD",
+  "CANARY-API-KEY-ID",
+  "CANARY-API-KEY-SECRET",
+  "CANARY-SNOWFLAKE-PRIVATE-KEY",
+  "CANARY-SNOWFLAKE-PASSPHRASE",
 ];
 
 describe("the classification is exhaustive by construction", () => {
@@ -84,13 +95,23 @@ describe("the classification is exhaustive by construction", () => {
       [
         "agentPassword",
         "agentUser",
+        // Db2's consent to a cleartext password (#786). A choice about the transport, so `public`.
+        "allowInsecureAuth",
+        // Elasticsearch's API key pair (#708). Unlike `user`, an id is one generated,
+        // opaque half of a credential pair rather than a name an operator chose, so
+        // both halves are classified secret below.
+        "apiKeyId",
+        "apiKeySecret",
         // MongoDB's auth database. A database NAME, so `public`; the password
         // checked against it is the secret and is classified below.
         "authSource",
         "color",
         "connectionString",
         "createdAt",
+        // Oxia's data-server addresses. Addresses, as host is; the token they receive is the secret.
+        "dataServers",
         "database",
+        "schema",
         "environment",
         "group",
         "host",
@@ -103,17 +124,63 @@ describe("the classification is exhaustive by construction", () => {
         "name",
         "password",
         "port",
+        "queryTimeout",
+        // Whether the provider refuses writes on this connection (#1089). A mode, not a credential:
+        // it grants nothing, and the browser reads it to draw the Read-only marker.
+        "readOnly",
+        // The S3 signing region. A region NAME (`us-east-1`) that decides how a request is signed and grants nothing.
+        "region",
+        // Kafka's SASL mechanism (#1088). A mechanism NAME (`SCRAM-SHA-512`), which the
+        // broker's own configuration lists in the clear, so `public`; the password it checks
+        // is the secret and is classified above.
+        "saslMechanism",
         "seedId",
+        // Whether this browser reads the catalog when the connection opens (#765). A
+        // display preference: it grants nothing and unlocks nothing.
+        "skipObjectScan",
         "serviceName",
         "ssl",
         "sshTunnel",
         "type",
         "user",
+        // The warehouse of Databend (design 6.1) and Snowflake. A compute NAME, which picks where a statement runs
+        // and grants nothing, so `public`.
+        "warehouse",
+        // BigQuery's job location: a region name, which grants nothing, so `public`.
+        "location",
+        // Kubernetes' API path, namespace list and TLS server name: where requests go and what the tree draws, so
+        // `public`; the token and the client key that authenticate them are classified as secrets.
+        "apiPath",
+        "namespaces",
+        "tlsServerName",
+        // An AMQP port: an address, as port is, so `public`.
+        "amqpPort",
+        // Snowflake's sign-in method and role: which credential is sent and what the statements may do, so `public`.
+        // The PEM key and its passphrase are the credential and are classified as secrets.
+        "authMethod",
+        "privateKey",
+        "privateKeyPassphrase",
+        "role",
+        // A security mode is a setting, and a thumbprint is the PUBLIC fingerprint of a public
+        // certificate: it identifies a server and authenticates nobody (#1677).
+        "securityMode",
+        "serverCertificateThumbprint",
+        "hostKeyFingerprint",
+        // OPC UA's three deployment fields, seed-file only. A policy URI is published by the server,
+        // and the other two are PATHS: the private key stays in the file the path names, which is
+        // the reason this provider takes a path rather than a key.
+        "securityPolicyUri",
+        "clientCertificatePath",
+        "clientPrivateKeyPath",
+        // Modbus's register map: addresses on a device the user wrote down. Modbus TCP defines no
+        // authentication at all, so there is nothing here to leak, and masking a document would
+        // stop the person who wrote it from fixing it.
+        "registerMap",
       ].sort(),
     );
   });
 
-  test("exactly the seven credential-bearing fields are classified secret", () => {
+  test("exactly the eleven credential-bearing fields are classified secret", () => {
     const secrets = [
       ...Object.keys(CONNECTION_FIELDS).filter((k) => CONNECTION_FIELDS[k as never] === "secret"),
       ...Object.keys(SSL_FIELDS)
@@ -127,8 +194,12 @@ describe("the classification is exhaustive by construction", () => {
     expect(secrets).toEqual(
       [
         "agentPassword",
+        "apiKeyId",
+        "apiKeySecret",
         "connectionString",
         "password",
+        "privateKey",
+        "privateKeyPassphrase",
         "ssl.clientKey",
         "sshTunnel.passphrase",
         "sshTunnel.password",
@@ -140,6 +211,16 @@ describe("the classification is exhaustive by construction", () => {
   test("a certificate is not a secret and stays readable for diagnosis", () => {
     expect(SSL_FIELDS.caCert).toBe("public");
     expect(SSL_FIELDS.clientCert).toBe("public");
+  });
+
+  test("a SASL mechanism names how the password is checked, and is no secret itself", () => {
+    expect(CONNECTION_FIELDS.saslMechanism).toBe("public");
+  });
+
+  test("the read-only mode is public, because the browser reads it to draw the marker (#1089)", () => {
+    // Classified secret, it would be stripped from every managed seed the browser is sent
+    // (`withoutSecretFields`), and a read-only seed would lose its marker and its Operations line.
+    expect(CONNECTION_FIELDS.readOnly).toBe("public");
   });
 });
 
@@ -163,6 +244,8 @@ describe("encryptConnections", () => {
     expect(encrypted.sshTunnel?.password?.startsWith(prefix)).toBe(true);
     expect(encrypted.sshTunnel?.privateKey?.startsWith(prefix)).toBe(true);
     expect(encrypted.sshTunnel?.passphrase?.startsWith(prefix)).toBe(true);
+    expect(encrypted.apiKeyId?.startsWith(prefix)).toBe(true);
+    expect(encrypted.apiKeySecret?.startsWith(prefix)).toBe(true);
   });
 
   test("leaves the fields an operator needs to identify the deployment readable", () => {
@@ -265,8 +348,8 @@ describe("decryptConnections", () => {
     resetStorageEncryptionKey();
     const result = decryptConnections(encrypted);
 
-    // Seven unreadable fields on one record.
-    expect(result.undecryptable).toBe(7);
+    // Eleven unreadable fields on one record.
+    expect(result.undecryptable).toBe(11);
     // The record SURVIVES. Dropping it would be persisted as a deletion by the write-through
     // cache on the next sync, destroying ciphertext a restored key could still have opened.
     expect(result.connections).toHaveLength(1);
@@ -284,10 +367,91 @@ describe("decryptConnections", () => {
     process.env.JWT_SECRET = "a-different-secret-that-cannot-open-it";
     resetStorageEncryptionKey();
 
-    expect(decryptConnections(encrypted).undecryptable).toBe(14);
+    expect(decryptConnections(encrypted).undecryptable).toBe(22);
   });
 
   test("an empty list is not an error", () => {
     expect(decryptConnections([])).toEqual({ connections: [], undecryptable: 0 });
+  });
+});
+
+describe("withoutSecretFields", () => {
+  const keysOf = (map: Record<string, FieldClass>, fieldClass: FieldClass): string[] =>
+    Object.keys(map).filter((key) => map[key] === fieldClass);
+  const groups = (conn: DatabaseConnection) =>
+    [
+      [conn as unknown as Record<string, unknown>, CONNECTION_FIELDS],
+      [conn.ssl as unknown as Record<string, unknown>, SSL_FIELDS],
+      [conn.sshTunnel as unknown as Record<string, unknown>, SSH_TUNNEL_FIELDS],
+    ] as const;
+
+  // Derived from the maps rather than listed, so a field classified secret tomorrow is covered
+  // by this test the day it is classified.
+  test("removes every field the maps classify as secret", () => {
+    const original = fullConnection();
+    for (const [group, map] of groups(original)) {
+      for (const key of keysOf(map, "secret")) {
+        // Control: the fixture really carries each secret, so the absence below is not vacuous.
+        expect(typeof group[key]).toBe("string");
+      }
+    }
+
+    const withheld = withoutSecretFields(original);
+    for (const [group, map] of groups(withheld)) {
+      for (const key of keysOf(map, "secret")) {
+        expect(key in group).toBe(false);
+      }
+    }
+    const serialized = JSON.stringify(withheld);
+    for (const canary of CANARIES) {
+      expect(serialized).not.toContain(canary);
+    }
+  });
+
+  test("keeps every public field as it was", () => {
+    const original = fullConnection();
+    const withheld = withoutSecretFields(fullConnection());
+    const before = groups(original);
+    const after = groups(withheld);
+    for (const [index, [group, map]] of before.entries()) {
+      for (const key of keysOf(map, "public")) {
+        expect(after[index][0][key]).toEqual(group[key]);
+      }
+    }
+  });
+
+  // An empty value holds nothing to withhold, and the walker skips it as encryption does.
+  test("leaves an empty secret as it is", () => {
+    const withheld = withoutSecretFields({ ...fullConnection(), password: "" });
+    expect(withheld.password).toBe("");
+    expect("apiKeySecret" in withheld).toBe(false);
+  });
+
+  test("a managed connection keeps its warehouse and loses its password", () => {
+    const managed: DatabaseConnection = { ...fullConnection(), managed: true, warehouse: "small-xy2t" };
+    const withheld = withoutSecretFields(managed);
+    expect(withheld.warehouse).toBe("small-xy2t");
+    expect("password" in withheld).toBe(false);
+    expect(CONNECTION_FIELDS.warehouse).toBe("public");
+  });
+
+  test("a managed connection keeps dataServers and loses its password", () => {
+    const managed: DatabaseConnection = {
+      ...fullConnection(),
+      managed: true,
+      dataServers: "oxia-0.internal:6648,oxia-1.internal:6648",
+    };
+    const withheld = withoutSecretFields(managed);
+    expect(withheld.dataServers).toBe("oxia-0.internal:6648,oxia-1.internal:6648");
+    expect("password" in withheld).toBe(false);
+    expect(CONNECTION_FIELDS.dataServers).toBe("public");
+  });
+
+  test("leaves the connection it was given untouched", () => {
+    const original = fullConnection();
+    withoutSecretFields(original);
+    expect(original.password).toBe("CANARY-DB-PASSWORD");
+    expect(original.ssl?.clientKey).toBe("CANARY-TLS-CLIENT-KEY");
+    expect(original.sshTunnel?.privateKey).toBe("CANARY-SSH-PRIVATE-KEY");
   });
 });

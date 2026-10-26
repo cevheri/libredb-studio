@@ -16,9 +16,9 @@
  * **Rule 2 - the driver is never imported at module scope as a VALUE.** This is the
  * expensive one. `@duckdb/node-bindings-<platform>-<arch>` ships a ~70 MB
  * `libduckdb.so` next to its `duckdb.node`, and a top-level `import` would load it
- * into every process that touches the provider registry - the factory, the
- * capabilities route, and the fourteen engines that are not DuckDB. So the value
- * import lives inside `openDuckDBClient` and a `import type` (erased at compile time,
+ * into every process that loads any module of this directory, before
+ * anything has asked to open a DuckDB file. So the value import lives
+ * inside `openDuckDBClient` and a `import type` (erased at compile time,
  * loading nothing) is the only static form allowed.
  *
  * Both rules prove their detectors in both directions below: a detector that finds
@@ -57,6 +57,7 @@ const DRIVER_TOKENS = [
   "runAndReadAll",
   "getRowObjectsJson",
   "getRowObjects",
+  "getRowsJson",
   "disconnectSync",
   "closeSync",
   "access_mode",
@@ -66,7 +67,7 @@ const SEAM_RULE = [
   `The DuckDB driver leaked out of ${CLIENT_FILE}.`,
   "",
   "`@duckdb/node-api` opens a DuckDBInstance, connects a DuckDBConnection, and answers a statement with a",
-  "DuckDBResultReader whose rows only survive serialization through getRowObjectsJson(). Issue #424 keeps all",
+  "DuckDBResultReader whose rows only survive serialization through its JSON readers. Issue #424 keeps all",
   "of that inside client.ts: provider logic reads the neutral DuckDBStatementResult (columnNames, columnTypes,",
   "rows, rowsChanged) through the DuckDBClient seam. That is what makes a second implementation - the Wasm",
   "build, a subprocess against the CLI - one new file rather than a rewrite of the provider and its",
@@ -169,7 +170,7 @@ describe("DuckDB driver seam", () => {
 
   // A detector that finds nothing anywhere is indistinguishable from a broken one, so
   // the file that is SUPPOSED to speak to the driver must light it up.
-  test.each(["@duckdb/node-api", "DuckDBInstance", "DuckDBConnection", "runAndReadAll", "getRowObjectsJson"])(
+  test.each(["@duckdb/node-api", "DuckDBInstance", "DuckDBConnection", "runAndReadAll", "getRowsJson"])(
     "the client itself uses %s, proving the detector reads real code",
     (token) => {
       const tokens = findLeaks(CLIENT_FILE, readProviderSource(CLIENT_FILE)).map((leak) => leak.token);
@@ -189,8 +190,8 @@ describe("DuckDB driver seam", () => {
 
 describe("the driver is never loaded at module scope", () => {
   test("no file in the provider directory imports it eagerly", () => {
-    // ~70 MB of native library per process that touches the provider registry is what
-    // this one line prevents.
+    // ~70 MB of native library in every process that loads this directory, before any
+    // DuckDB file is opened, is what this one line prevents.
     const eager = providerSources().flatMap((file) =>
       eagerDriverImports(file, readProviderSource(file)).map((text) => `${file}: ${text}`),
     );
@@ -201,7 +202,14 @@ describe("the driver is never loaded at module scope", () => {
   test("the client reaches the driver through a dynamic import inside a function", () => {
     const source = readProviderSource(CLIENT_FILE);
 
-    expect(source).toContain('await import("@duckdb/node-api")');
+    // The import expression is the default argument of `loadDuckDBDriver`, so it
+    // is evaluated per call rather than at module load, and `openDuckDBClient`
+    // goes through that function rather than importing the package itself. The
+    // indirection is what lets a deployment without the driver say so (#840);
+    // the eager-import test above guards the "never at module scope" half, and a
+    // default argument is not module scope.
+    expect(source).toContain('= () => import("@duckdb/node-api")');
+    expect(source).toContain("await loadDuckDBDriver()");
   });
 
   test("the detector allows a type-only import and rejects a value one", () => {

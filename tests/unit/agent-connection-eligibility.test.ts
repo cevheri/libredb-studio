@@ -21,6 +21,7 @@ import { describe, expect, test, beforeAll } from "bun:test";
 import type { DatabaseConnection } from "@/lib/types";
 import {
   buildConnectionPayload,
+  connectionResolutionKey,
   resolveAgentRunConnectionId,
   type ManagedConnectionPayload,
   type ServedSeeds,
@@ -107,10 +108,51 @@ describe("which connection a run may be started on", () => {
     expect(startableId(browserCopy(server, { database: "somewhere-else" }), loaded(server))).toBeNull();
   });
 
+  test("a Trino copy with a different session schema is not startable by the seed id", () => {
+    const server = descriptor({ type: "trino", database: "memory", schema: "default" });
+    expect(startableId(browserCopy(server), loaded(server))).toBe("seed:sales");
+    expect(startableId(browserCopy(server, { schema: "other" }), loaded(server))).toBeNull();
+  });
+
   test("a copy given different credentials is not startable", () => {
     const server = descriptor();
 
     expect(startableId(browserCopy(server, { password: "different" }), loaded(server))).toBeNull();
+  });
+
+  test("a Kafka copy that authenticates by another SASL mechanism is not startable by the seed id", () => {
+    // A broker keeps a SCRAM credential per mechanism, so the same user and password under another
+    // mechanism are another principal's secret (#1088): the mechanism is a resolution field.
+    const server = descriptor({ type: "kafka", port: 9092, database: undefined, saslMechanism: "SCRAM-SHA-512" });
+    expect(startableId(browserCopy(server), loaded(server))).toBe("seed:sales");
+    expect(startableId(browserCopy(server, { saslMechanism: "SCRAM-SHA-256" }), loaded(server))).toBeNull();
+    expect(startableId(browserCopy(server, { saslMechanism: undefined }), loaded(server))).toBeNull();
+  });
+
+  test("a copy that lists other data servers is not startable by the seed id", () => {
+    // Which addresses a read may reach and the token may be sent to: a resolution field.
+    const server = descriptor({ dataServers: "a.internal:6648,b.internal:6648" });
+    expect(startableId(browserCopy(server), loaded(server))).toBe("seed:sales");
+    expect(startableId(browserCopy(server, { dataServers: "a.internal:6648" }), loaded(server))).toBeNull();
+    expect(startableId(browserCopy(server, { dataServers: undefined }), loaded(server))).toBeNull();
+  });
+
+  test("a copy naming another warehouse, or none, is not startable by the seed id (X21)", () => {
+    // Which compute a statement runs on, and which warehouse it resumes and bills: a resolution field, on the
+    // dataServers reasoning.
+    const server = descriptor({ type: "databend", port: 443, warehouse: "small-xy2t" });
+    expect(startableId(browserCopy(server), loaded(server))).toBe("seed:sales");
+    expect(startableId(browserCopy(server, { warehouse: "large-ab12" }), loaded(server))).toBeNull();
+    expect(startableId(browserCopy(server, { warehouse: undefined }), loaded(server))).toBeNull();
+  });
+
+  test("a copy naming another region, or none, is not startable by the seed id", () => {
+    // The scope every S3 request is signed for: a server with a region of its own refuses another one, so the
+    // region is a resolution field, on the warehouse reasoning. The field is read the same way on every type.
+    const server = descriptor({ region: "eu-central-1" });
+    expect(startableId(browserCopy(server), loaded(server))).toBe("seed:sales");
+    expect(startableId(browserCopy(server, { region: "us-east-1" }), loaded(server))).toBeNull();
+    expect(startableId(browserCopy(server, { region: undefined }), loaded(server))).toBeNull();
   });
 
   // The field a hand-written comparison forgets: it changes which role the agent
@@ -133,6 +175,16 @@ describe("which connection a run may be started on", () => {
     });
 
     expect(startableId(renamed, loaded(server))).toBe("seed:sales");
+  });
+
+  // #1089. The mode says what a connection may DO, not which database it reaches or as whom, so a
+  // copy differing only in it still reaches the seed's database with the seed's credentials, and a run
+  // started on the seed's id runs under the seed's own mode.
+  test("a copy differing only in its read-only mode is startable by the seed id", () => {
+    const server = descriptor();
+
+    expect(startableId(browserCopy(server, { readOnly: true }), loaded(server))).toBe("seed:sales");
+    expect(startableId(browserCopy(server, { readOnly: false }), loaded(server))).toBe("seed:sales");
   });
 
   // B37. A seed list that was never read is not an empty seed list. Deciding
@@ -294,5 +346,118 @@ describe("what a request body says about a connection", () => {
     const conn = plain({ managed: true });
 
     expect(buildConnectionPayload(conn)).toEqual({ connection: conn });
+  });
+});
+
+describe("which database a connection would be read from", () => {
+  /** The smallest connection the type allows, so each test varies one field and nothing else. */
+  const base: DatabaseConnection = {
+    id: "c1",
+    name: "Sales",
+    type: "postgres",
+    host: "db.internal",
+    port: 5432,
+    database: "sales",
+    user: "reader",
+    createdAt: new Date(0),
+  };
+
+  test("a field that cannot move the database does not move the key", () => {
+    // Each of these is classified `cosmetic` in CONNECTION_RELEVANCE, and the reason the
+    // key exists is that a panel keyed on the connection OBJECT re-read whenever a parent
+    // rebuilt it. `queryTimeout` is the one that got past a hand-written list and destroyed
+    // a snapshot whose read was still in flight.
+    const same = connectionResolutionKey(base);
+
+    expect(connectionResolutionKey({ ...base, name: "Sales (prod)" })).toBe(same);
+    expect(connectionResolutionKey({ ...base, queryTimeout: 60_000 })).toBe(same);
+    expect(connectionResolutionKey({ ...base, id: "c2" })).toBe(same);
+    expect(connectionResolutionKey({ ...base, createdAt: new Date(1) })).toBe(same);
+    expect(connectionResolutionKey({ ...base, color: "red", group: "prod", environment: "production" })).toBe(same);
+  });
+
+  test("the read-only mode does not move the key (#1089)", () => {
+    // What a connection may do is not which database a read reaches: a panel keyed on this must not
+    // read again because the mode was switched.
+    const same = connectionResolutionKey(base);
+
+    expect(connectionResolutionKey({ ...base, readOnly: true })).toBe(same);
+    expect(connectionResolutionKey({ ...base, readOnly: false })).toBe(same);
+  });
+
+  test("a field that moves the database moves the key", () => {
+    const same = connectionResolutionKey(base);
+
+    expect(connectionResolutionKey({ ...base, host: "elsewhere" })).not.toBe(same);
+    expect(connectionResolutionKey({ ...base, database: "other" })).not.toBe(same);
+    expect(connectionResolutionKey({ ...base, user: "someone-else" })).not.toBe(same);
+    expect(connectionResolutionKey({ ...base, port: 5433 })).not.toBe(same);
+  });
+
+  test("a register map moves the key, because the panels keyed on it hold the previous map's tree", () => {
+    // Modbus's map is NOT a target and NOT a credential, so the summary criterion - which database,
+    // and as whom - does not reach it: the same device answers, to the same nobody, either way. The
+    // reason it is `resolution` is what READS this key. `use-provider-metadata` makes it part of
+    // `readKey`, `use-connection-pulse` keys the pulse on it and `SchemaDiff` keys its snapshot on
+    // it, so a map that changed while the key did not would leave the previous map's points drawn.
+    //
+    // And the map DEFINES the names rather than filtering them, which is why Kubernetes' namespace
+    // list is `cosmetic` and this is not: `volts` is one address under one document and another
+    // under the next, so the two are not two views of one answer.
+    const same = connectionResolutionKey({ ...base, type: "modbus" });
+    const one = JSON.stringify([{ name: "volts", unitId: 1, table: "holding_register", address: 100, type: "uint16" }]);
+    // The same NAME over a different address is what the key has to separate, so the two documents
+    // are made the SAME LENGTH and the test MEASURES that rather than claiming it: any byte of
+    // difference moves the key on its own, because the key carries the whole document, and a case
+    // whose two maps differ in length would pass without ever reaching the address. `unit` is the
+    // padding - a unit of measure a coil can carry - chosen to bring this document to the other's
+    // eighty-six bytes.
+    const other = JSON.stringify([
+      { name: "volts", unitId: 3, table: "coil", address: 5, type: "bool", unit: "on/off" },
+    ]);
+    expect(Buffer.byteLength(other, "utf8")).toBe(Buffer.byteLength(one, "utf8"));
+
+    expect(connectionResolutionKey({ ...base, type: "modbus", registerMap: one })).not.toBe(same);
+    expect(connectionResolutionKey({ ...base, type: "modbus", registerMap: other })).not.toBe(
+      connectionResolutionKey({ ...base, type: "modbus", registerMap: one }),
+    );
+  });
+
+  test("a container present on one side only is a difference, and so is a field inside it", () => {
+    // The nested tables are read the same way as the top one, and an absent container is
+    // not an empty one: adding SSL changes where and as whom the connection connects.
+    const plain = connectionResolutionKey(base);
+    const withSsl = connectionResolutionKey({ ...base, ssl: { mode: "require" } });
+
+    expect(withSsl).not.toBe(plain);
+    expect(connectionResolutionKey({ ...base, ssl: { mode: "disable" } })).not.toBe(withSsl);
+
+    const tunnel: DatabaseConnection = {
+      ...base,
+      sshTunnel: { enabled: true, host: "bastion", port: 22, username: "ops", authMethod: "password" },
+    };
+    expect(connectionResolutionKey(tunnel)).not.toBe(plain);
+    // ...but the fingerprint is classified cosmetic: pinning the bastion we were already
+    // going to use does not repoint anything.
+    expect(
+      connectionResolutionKey({ ...tunnel, sshTunnel: { ...tunnel.sshTunnel!, hostKeyFingerprint: "ab:cd" } }),
+    ).toBe(connectionResolutionKey(tunnel));
+  });
+
+  test("insertion order does not change the key", () => {
+    // Two builders producing the same connection in a different order must key the same,
+    // or the panel reads again for a difference that is not one.
+    const reordered: DatabaseConnection = {
+      createdAt: base.createdAt,
+      user: base.user,
+      database: base.database,
+      port: base.port,
+      host: base.host,
+      type: base.type,
+      name: base.name,
+      id: base.id,
+    };
+
+    expect(connectionResolutionKey(reordered)).toBe(connectionResolutionKey(base));
   });
 });

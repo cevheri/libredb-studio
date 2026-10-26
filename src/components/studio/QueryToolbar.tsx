@@ -7,6 +7,73 @@ import { cn } from "@/lib/utils";
 import { FlaskConical, Pencil, Play, Save, Square, Terminal, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
+/**
+ * What the editor's Cancel control can do on a connection (#1364).
+ *
+ * - `cancel`: the provider can ask the engine to stop the statement (`cancelQuery`).
+ * - `stop-waiting`: it cannot (`supportsQueryCancel: false`). The control still ends the
+ *   editor's wait, so it reads "STOP WAITING", and the toast says the statement keeps running
+ *   on the server. It used to read CANCEL and report "Query Cancelled" while the engine kept
+ *   going (measured on ClickHouse before it could cancel, and on libSQL).
+ * - `unavailable`: the engine also blocks the server while it runs
+ *   (`blocksServerWhileRunning`, SQLite). Nothing the user did next would be answered before
+ *   the statement ends, so the control is disabled with the reason.
+ *
+ * Read on `=== false` / `=== true` only: an embedded host declares its own capabilities, and
+ * one that says nothing keeps the Cancel it always had.
+ */
+export type CancelControlMode = "cancel" | "stop-waiting" | "unavailable";
+
+export function cancelControlMode(metadata: ProviderMetadata | null): CancelControlMode {
+  if (metadata?.capabilities.blocksServerWhileRunning === true) return "unavailable";
+  if (metadata?.capabilities.supportsQueryCancel === false) return "stop-waiting";
+  return "cancel";
+}
+
+/** Why the control is disabled in `unavailable` mode. */
+export const CANCEL_UNAVAILABLE_REASON =
+  "This database runs a statement on the Studio server's own thread and cannot cancel it, so the statement runs until it ends.";
+
+/** What "STOP WAITING" does, on hover. */
+export const STOP_WAITING_HINT =
+  "This database cannot cancel a running statement. Stop waiting ends the editor's wait; the statement keeps running on the server.";
+
+/**
+ * The Cancel control of both editor shells' toolbars, in the mode `cancelControlMode` gives.
+ *
+ * The disabled reason sits on a wrapper, not on the button: a disabled `Button` takes no
+ * pointer events (`disabled:pointer-events-none`), so a title on the button never shows.
+ */
+export function CancelQueryButton({
+  mode,
+  onCancel,
+  className,
+}: {
+  mode: CancelControlMode;
+  onCancel: () => void;
+  className?: string;
+}) {
+  const button = (
+    <Button
+      size="sm"
+      className={cn("bg-danger-solid hover:bg-danger-solid-hover text-white font-medium text-xs h-7 px-4", className)}
+      onClick={onCancel}
+      disabled={mode === "unavailable"}
+      title={mode === "stop-waiting" ? STOP_WAITING_HINT : undefined}
+    >
+      <Square strokeWidth={1.5} className="w-3 h-3 fill-current" />
+      {mode === "stop-waiting" ? "STOP WAITING" : "CANCEL"}
+    </Button>
+  );
+  return mode === "unavailable" ? (
+    <span title={CANCEL_UNAVAILABLE_REASON} className="inline-flex">
+      {button}
+    </span>
+  ) : (
+    button
+  );
+}
+
 interface QueryToolbarProps {
   activeConnection: DatabaseConnection | null;
   metadata: ProviderMetadata | null;
@@ -35,7 +102,7 @@ interface QueryToolbarProps {
   onImport?: () => void;
 }
 
-export function QueryToolbar({
+export const QueryToolbar = React.memo(function QueryToolbar({
   activeConnection,
   metadata,
   isExecuting,
@@ -66,18 +133,18 @@ export function QueryToolbar({
     <>
       {/* Playground Mode Banner */}
       {playgroundMode && (
-        <div className="hidden md:flex items-center justify-center gap-2 px-4 py-1 bg-emerald-500/10 border-b border-emerald-500/20 text-emerald-400">
+        <div className="hidden md:flex items-center justify-center gap-2 px-4 py-1 bg-success-tint/10 border-b border-success-tint/20 text-success">
           <FlaskConical strokeWidth={1.5} className="w-3 h-3" />
-          <span className="text-xs font-mediumr">Sandbox Mode — All changes will be auto-rolled back</span>
+          <span className="text-xs font-medium">Sandbox Mode — All changes will be auto-rolled back</span>
         </div>
       )}
 
       {/* Desktop Query Toolbar */}
       <div className="hidden md:flex items-center justify-between px-4 py-1.5 bg-surface border-b border-hairline">
         <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2 px-2 py-0.5 rounded bg-blue-500/5 border border-blue-500/10">
-            <Terminal strokeWidth={1.5} className="w-3 h-3 text-blue-400" />
-            <span className="text-xs font-medium text-blue-400">Query</span>
+          <div className="flex items-center gap-2 px-2 py-0.5 rounded bg-hue-blue-tint/5 border border-hue-blue-tint/10">
+            <Terminal strokeWidth={1.5} className="w-3 h-3 text-hue-blue" />
+            <span className="text-xs font-medium text-hue-blue">Query</span>
           </div>
           {/* The separator is chrome for Save; with Save withheld it would be a rule
               standing alone, the same reason the control group drops its border (#427). */}
@@ -96,18 +163,11 @@ export function QueryToolbar({
           )}
         </div>
         {isExecuting ? (
-          <Button
-            size="sm"
-            className="bg-red-600 hover:bg-red-500 text-white font-medium text-xs h-7 px-4 gap-2"
-            onClick={onCancelQuery}
-          >
-            <Square strokeWidth={1.5} className="w-3 h-3 fill-current" />
-            CANCEL
-          </Button>
+          <CancelQueryButton mode={cancelControlMode(metadata)} onCancel={onCancelQuery} className="gap-2" />
         ) : (
           <Button
             size="sm"
-            className="bg-blue-600 hover:bg-blue-500 text-white font-medium text-xs h-7 px-4 gap-2"
+            className="bg-brand-solid hover:bg-brand-solid-hover text-white font-medium text-xs h-7 px-4 gap-2"
             onClick={onExecuteQuery}
             disabled={!activeConnection}
           >
@@ -122,13 +182,13 @@ export function QueryToolbar({
             {transaction !== null &&
               (transactionActive ? (
                 <>
-                  <span className="text-[0.625rem] font-medium text-amber-400 px-1.5 py-0.5 bg-amber-500/10 rounded border border-amber-500/20 mr-1">
+                  <span className="text-[0.625rem] font-medium text-warning px-1.5 py-0.5 bg-warning-tint/10 rounded border border-warning-tint/20 mr-1">
                     TXN
                   </span>
                   <Button
                     size="sm"
                     variant="ghost"
-                    className="h-7 text-xs font-medium text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10 gap-1"
+                    className="h-7 text-xs font-medium text-success hover:text-success-bright hover:bg-success-tint/10 gap-1"
                     onClick={transaction.commit}
                   >
                     COMMIT
@@ -136,7 +196,7 @@ export function QueryToolbar({
                   <Button
                     size="sm"
                     variant="ghost"
-                    className="h-7 text-xs font-medium text-red-400 hover:text-red-300 hover:bg-red-500/10 gap-1"
+                    className="h-7 text-xs font-medium text-danger hover:text-danger-bright hover:bg-danger-tint/10 gap-1"
                     onClick={transaction.rollback}
                   >
                     ROLLBACK
@@ -161,7 +221,7 @@ export function QueryToolbar({
                 className={cn(
                   "h-7 text-xs font-medium gap-1",
                   playgroundMode
-                    ? "text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20"
+                    ? "text-success bg-success-tint/10 hover:bg-success-tint/20"
                     : "text-fg-muted hover:text-fg-bright",
                 )}
                 onClick={onTogglePlayground}
@@ -180,7 +240,7 @@ export function QueryToolbar({
                 className={cn(
                   "h-7 text-xs font-medium gap-1",
                   editingEnabled
-                    ? "text-amber-400 bg-amber-500/10 hover:bg-amber-500/20"
+                    ? "text-warning bg-warning-tint/10 hover:bg-warning-tint/20"
                     : "text-fg-muted hover:text-fg-bright",
                 )}
                 onClick={onToggleEditing}
@@ -208,4 +268,4 @@ export function QueryToolbar({
       </div>
     </>
   );
-}
+});

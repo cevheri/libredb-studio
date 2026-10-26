@@ -8,7 +8,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import type { MonitoringData } from "@/lib/db/types";
 import type { TimeSeriesPoint } from "@/lib/time-series-buffer";
-import { evaluateThreshold, getThresholdColor, DEFAULT_THRESHOLDS } from "@/lib/monitoring-thresholds";
+import { evaluateThreshold, getThresholdColor, thresholdFor } from "@/lib/monitoring-thresholds";
+import { storage } from "@/lib/storage";
 import { CACHE_HIT_RATIO_UNAVAILABLE } from "@/lib/monitoring-cache-ratio";
 import { MetricChart } from "./MetricChart";
 import { PanelUnavailable } from "../PanelUnavailable";
@@ -46,8 +47,8 @@ function metricSeries(
  */
 function deadlockIconClass(deadlocks: number | undefined): string {
   if (deadlocks === undefined) return "text-muted-foreground";
-  if (deadlocks > 0) return "text-red-500";
-  return "text-green-500";
+  if (deadlocks > 0) return "text-danger";
+  return "text-hue-green";
 }
 
 /**
@@ -113,10 +114,10 @@ export function PerformanceTab({ data, loading, history = [] }: PerformanceTabPr
   }
 
   const getHealthStatus = (ratio: number) => {
-    if (ratio >= 95) return { label: "Excellent", color: "text-green-500", bg: "bg-green-500" };
-    if (ratio >= 90) return { label: "Good", color: "text-blue-500", bg: "bg-blue-500" };
-    if (ratio >= 80) return { label: "Fair", color: "text-yellow-500", bg: "bg-yellow-500" };
-    return { label: "Poor", color: "text-red-500", bg: "bg-red-500" };
+    if (ratio >= 95) return { label: "Excellent", color: "text-hue-green", bg: "bg-hue-green-tint" };
+    if (ratio >= 90) return { label: "Good", color: "text-brand", bg: "bg-brand-tint" };
+    if (ratio >= 80) return { label: "Fair", color: "text-hue-yellow", bg: "bg-hue-yellow-tint" };
+    return { label: "Poor", color: "text-danger", bg: "bg-danger-tint" };
   };
 
   // Optional on purpose: an engine that cannot measure its cache (Druid) reports
@@ -138,21 +139,20 @@ export function PerformanceTab({ data, loading, history = [] }: PerformanceTabPr
     bufferPoolUsage === undefined ? undefined : { usage: bufferPoolUsage, ...getHealthStatus(bufferPoolUsage) };
   const deadlocks = performance?.deadlocks;
 
-  // Threshold evaluations. An absent metric scores "healthy" so the card border stays
-  // neutral: colouring it would rate the absence, which is what the stand-in 100 below
-  // does for the cache ratio.
-  const cacheThreshold = evaluateThreshold(
-    cacheHitRatio ?? 100,
-    DEFAULT_THRESHOLDS.find((t) => t.metric === "cacheHitRatio")!,
-  );
+  // Read storage here: storage-facade imports the defaults, so the threshold helper
+  // must stay pure to avoid a circular dependency.
+  const thresholds = storage.getThresholdConfig();
+  // An absent metric remains ungraded regardless of the saved thresholds.
+  const cacheThreshold =
+    cacheHitRatio === undefined
+      ? "healthy"
+      : evaluateThreshold(cacheHitRatio, thresholdFor(thresholds, "cacheHitRatio"));
   const bufferThreshold =
     bufferPoolUsage === undefined
       ? "healthy"
-      : evaluateThreshold(bufferPoolUsage, DEFAULT_THRESHOLDS.find((t) => t.metric === "bufferPoolUsage")!);
+      : evaluateThreshold(bufferPoolUsage, thresholdFor(thresholds, "bufferPoolUsage"));
   const deadlockThreshold =
-    deadlocks === undefined
-      ? "healthy"
-      : evaluateThreshold(deadlocks, DEFAULT_THRESHOLDS.find((t) => t.metric === "deadlocks")!);
+    deadlocks === undefined ? "healthy" : evaluateThreshold(deadlocks, thresholdFor(thresholds, "deadlocks"));
 
   // Build trend data from history. See `metricSeries` for why a missing sample is
   // dropped rather than read as a zero.
@@ -312,20 +312,22 @@ export function PerformanceTab({ data, loading, history = [] }: PerformanceTabPr
             {/* Guarded on the ratio existing, not on a stand-in value: there is
                 nothing to advise about a cache nobody measured. */}
             {cacheHitRatio !== undefined && cacheHitRatio < 90 && (
-              <div className="flex items-start gap-2 p-2 bg-yellow-500/10 rounded-md">
+              <div className="flex items-start gap-2 p-2 bg-hue-yellow-tint/10 rounded-md">
                 <TriangleAlert
                   strokeWidth={1.5}
-                  className="h-3 w-3 sm:h-4 sm:w-4 text-yellow-500 mt-0.5 flex-shrink-0"
+                  className="h-3 w-3 sm:h-4 sm:w-4 text-hue-yellow mt-0.5 flex-shrink-0"
                 />
                 <div>
                   <p className="text-xs sm:text-xs font-medium">Low Cache Hit</p>
-                  <p className="text-xs sm:text-xs text-muted-foreground hidden sm:block">Increase shared_buffers</p>
+                  <p className="text-xs sm:text-xs text-muted-foreground hidden sm:block">
+                    {performance?.cacheHitAdvice ?? "The working set does not fit in the engine's cache"}
+                  </p>
                 </div>
               </div>
             )}
             {(performance?.deadlocks ?? 0) > 0 && (
-              <div className="flex items-start gap-2 p-2 bg-red-500/10 rounded-md">
-                <TriangleAlert strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-red-500 mt-0.5 flex-shrink-0" />
+              <div className="flex items-start gap-2 p-2 bg-danger-tint/10 rounded-md">
+                <TriangleAlert strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-danger mt-0.5 flex-shrink-0" />
                 <div>
                   <p className="text-xs sm:text-xs font-medium">Deadlocks</p>
                   <p className="text-xs sm:text-xs text-muted-foreground hidden sm:block">Review lock ordering</p>
@@ -333,8 +335,8 @@ export function PerformanceTab({ data, loading, history = [] }: PerformanceTabPr
               </div>
             )}
             {cacheHitRatio !== undefined && cacheHitRatio >= 90 && !performance?.deadlocks && (
-              <div className="flex items-center gap-2 p-2 bg-green-500/10 rounded-md">
-                <Activity strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-green-500 flex-shrink-0" />
+              <div className="flex items-center gap-2 p-2 bg-hue-green-tint/10 rounded-md">
+                <Activity strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-hue-green flex-shrink-0" />
                 <p className="text-xs sm:text-xs">Performing well!</p>
               </div>
             )}

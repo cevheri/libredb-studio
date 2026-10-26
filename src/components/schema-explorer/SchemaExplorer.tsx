@@ -1,7 +1,8 @@
 "use client";
 
 import React, { useState, useMemo, useCallback } from "react";
-import { TableSchema } from "@/lib/types";
+import type { DetailedObject } from "@/lib/db/detailed-object";
+import { pathKey } from "@/lib/db/object-path";
 import type { ProviderMetadata } from "@/hooks/use-provider-metadata";
 import { Search, Hash, LoaderCircle, CircleAlert, Database, Plus, Settings } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -10,7 +11,7 @@ import { AnimatePresence } from "framer-motion";
 import { TableItem } from "./TableItem";
 
 interface SchemaExplorerProps {
-  schema: TableSchema[];
+  schema: readonly DetailedObject[];
   isLoadingSchema: boolean;
   /**
    * Why the schema read produced nothing, in the engine's own words. Optional so the
@@ -18,24 +19,26 @@ interface SchemaExplorerProps {
    * both mean "nothing failed", not "nothing was wrong".
    */
   schemaError?: string | null;
-  onTableClick?: (tableName: string) => void;
-  onGenerateSelect?: (tableName: string) => void;
+  onTableClick?: (path: readonly string[]) => void;
+  onGenerateSelect?: (path: readonly string[]) => void;
+  onGenerateCount?: (path: readonly string[]) => void;
   onCreateTableClick?: () => void;
   isAdmin?: boolean;
-  onOpenMaintenance?: (tab?: "global" | "tables" | "sessions", table?: string) => void;
+  onOpenMaintenance?: (tab?: "global" | "tables" | "sessions", path?: readonly string[]) => void;
   databaseType?: string;
   metadata?: ProviderMetadata | null;
-  onProfileTable?: (tableName: string) => void;
-  onGenerateCode?: (tableName: string) => void;
-  onGenerateTestData?: (tableName: string) => void;
+  onProfileTable?: (path: readonly string[]) => void;
+  onGenerateCode?: (path: readonly string[]) => void;
+  onGenerateTestData?: (path: readonly string[]) => void;
 }
 
-export function SchemaExplorer({
+export const SchemaExplorer = React.memo(function SchemaExplorer({
   schema,
   isLoadingSchema,
   schemaError = null,
   onTableClick,
   onGenerateSelect,
+  onGenerateCount,
   onCreateTableClick,
   isAdmin = false,
   onOpenMaintenance,
@@ -45,17 +48,21 @@ export function SchemaExplorer({
   onGenerateTestData,
 }: SchemaExplorerProps) {
   const labels = metadata?.labels;
+  // Create Table is offered only once these have loaded: the form writes every typed name in the
+  // connection's own quoting and refuses to open without it (#1435).
   const capabilities = metadata?.capabilities;
   const [searchQuery, setSearchQuery] = useState("");
   const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set());
 
-  const toggleTable = useCallback((tableName: string) => {
+  // Keyed by the ADDRESS: two objects in two containers share a label, so a label-keyed set
+  // expanded both rows at once and gave the list one React key for two objects (#789).
+  const toggleTable = useCallback((key: string) => {
     setExpandedTables((prev) => {
       const next = new Set(prev);
-      if (next.has(tableName)) {
-        next.delete(tableName);
+      if (next.has(key)) {
+        next.delete(key);
       } else {
-        next.add(tableName);
+        next.add(key);
       }
       return next;
     });
@@ -76,8 +83,8 @@ export function SchemaExplorer({
     return (
       <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
         <div className="relative mb-4">
-          <LoaderCircle strokeWidth={1.5} className="w-8 h-8 animate-spin text-blue-500/20" />
-          <Database strokeWidth={1.5} className="w-3.5 h-3.5 absolute inset-0 m-auto text-blue-500 animate-pulse" />
+          <LoaderCircle strokeWidth={1.5} className="w-8 h-8 animate-spin text-brand/20" />
+          <Database strokeWidth={1.5} className="w-3.5 h-3.5 absolute inset-0 m-auto text-brand animate-pulse" />
         </div>
         <span className="text-xs font-medium animate-pulse">Scanning Schema...</span>
       </div>
@@ -95,7 +102,7 @@ export function SchemaExplorer({
         className="flex flex-col items-center justify-center py-12 px-6 text-center"
       >
         <div className="w-12 h-12 rounded-full bg-muted flex items-center justify-center mb-4 border border-border">
-          <CircleAlert strokeWidth={1.5} className="w-6 h-6 text-amber-400" />
+          <CircleAlert strokeWidth={1.5} className="w-6 h-6 text-warning" />
         </div>
         <h3 className="text-foreground text-xs font-medium mb-1">Schema could not be read</h3>
         <p className="text-xs text-muted-foreground leading-relaxed break-words">{schemaError}</p>
@@ -113,6 +120,16 @@ export function SchemaExplorer({
         <p className="text-xs text-muted-foreground leading-relaxed">
           We couldn&apos;t find any tables or views in this connection.
         </p>
+        {capabilities?.createTable !== undefined && (
+          <button
+            className="mt-3 flex items-center gap-1.5 rounded-md bg-brand-solid hover:bg-brand-solid-hover text-white px-3 py-1.5 text-xs font-medium transition-colors"
+            onClick={onCreateTableClick}
+            title={`Create ${labels?.entityName || "Table"}`}
+          >
+            <Plus strokeWidth={1.5} className="w-3.5 h-3.5" />
+            Create {labels?.entityName || "Table"}
+          </button>
+        )}
       </div>
     );
   }
@@ -122,29 +139,29 @@ export function SchemaExplorer({
       <div className="sticky top-0 z-10 px-3 pb-3 pt-1 space-y-3 bg-background">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <Database strokeWidth={1.5} className="w-3.5 h-3.5 text-blue-500/50" />
+            <Database strokeWidth={1.5} className="w-3.5 h-3.5 text-brand/50" />
             <span className="text-xs font-medium text-muted-foreground">Explorer</span>
           </div>
           <div className="flex items-center gap-1.5">
             {isAdmin && (
               <button
-                className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-amber-400 transition-colors"
+                className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-warning transition-colors"
                 onClick={() => onOpenMaintenance?.("global")}
                 title="Database Maintenance"
               >
                 <Settings strokeWidth={1.5} className="w-3.5 h-3.5" />
               </button>
             )}
-            {capabilities?.supportsCreateTable !== false && (
+            {capabilities?.createTable !== undefined && (
               <button
-                className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-blue-400 transition-colors"
+                className="p-1 rounded hover:bg-accent text-muted-foreground hover:text-brand transition-colors"
                 onClick={onCreateTableClick}
                 title={`Create ${labels?.entityName || "Table"}`}
               >
                 <Plus strokeWidth={1.5} className="w-3.5 h-3.5" />
               </button>
             )}
-            <span className="text-[0.625rem] bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded-full font-mono border border-blue-500/10">
+            <span className="text-[0.625rem] bg-brand-tint/10 text-brand px-1.5 py-0.5 rounded-full font-mono border border-brand-tint/10">
               {schema.length}
             </span>
           </div>
@@ -153,17 +170,19 @@ export function SchemaExplorer({
         <div className="relative group">
           <Search
             strokeWidth={1.5}
-            className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground group-focus-within:text-blue-500 transition-colors"
+            className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground group-focus-within:text-brand transition-colors"
           />
           <Input
             placeholder={labels?.searchPlaceholder || "Search tables or columns..."}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="h-8 pl-8 pr-8 text-xs bg-muted/50 border-border focus-visible:ring-1 focus-visible:ring-blue-500/50 placeholder:text-muted-foreground/50"
+            className="h-8 pl-8 pr-8 text-xs bg-muted/50 border-border focus-visible:ring-1 focus-visible:ring-brand-tint/50 placeholder:text-muted-foreground/50"
           />
           {searchQuery && (
             <button
               onClick={() => setSearchQuery("")}
+              aria-label="Clear search"
+              title="Clear search"
               className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
             >
               <Hash strokeWidth={1.5} className="w-3.5 h-3.5 rotate-45" />
@@ -176,15 +195,16 @@ export function SchemaExplorer({
         <AnimatePresence mode="popLayout">
           {filteredSchema.map((table) => (
             <TableItem
-              key={table.name}
+              key={pathKey(table.path)}
               table={table}
-              isExpanded={expandedTables.has(table.name)}
-              onToggle={() => toggleTable(table.name)}
+              isExpanded={expandedTables.has(pathKey(table.path))}
+              onToggle={() => toggleTable(pathKey(table.path))}
               labels={labels}
               capabilities={capabilities}
               isAdmin={isAdmin}
               onTableClick={onTableClick}
               onGenerateSelect={onGenerateSelect}
+              onGenerateCount={onGenerateCount}
               onProfileTable={onProfileTable}
               onGenerateCode={onGenerateCode}
               onGenerateTestData={onGenerateTestData}
@@ -195,4 +215,4 @@ export function SchemaExplorer({
       </div>
     </div>
   );
-}
+});

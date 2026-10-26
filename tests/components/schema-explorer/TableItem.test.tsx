@@ -6,9 +6,9 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
 // The SHARED sonner mock rather than a local `mock.module("sonner", ...)`: mock.module is
-// process-wide and the last call wins, so a second declaration here would hand
-// StudioMobileHeader.test.tsx — same group in tests/run-components.sh — a `toast` whose
-// error mock it holds no reference to.
+// process-wide and the last call wins, so a second declaration here would replace the one
+// bunfig preloads for this process and hand the tests below a `toast` whose error mock
+// nothing in this file holds a reference to.
 import { mockToastError, mockToastSuccess } from "../../helpers/mock-sonner";
 
 // The insecure-context harness, as in tests/components/copy-button.test.tsx: an absent
@@ -55,25 +55,68 @@ mock.module("@/components/ui/context-menu", () => ({
 }));
 
 mock.module("@/components/schema-explorer/ColumnList", () => ({
-  ColumnList: ({ columns, indexes }: { columns: unknown[]; indexes: unknown[] }) =>
-    React.createElement("div", { "data-testid": "column-list" }, `${columns.length} cols, ${indexes.length} idx`),
+  ColumnList: ({
+    columns,
+    indexes,
+    exclusionConstraints = [],
+  }: {
+    columns: unknown[];
+    indexes: unknown[];
+    exclusionConstraints?: unknown[];
+  }) =>
+    React.createElement(
+      "div",
+      { "data-testid": "column-list" },
+      `${columns.length} cols, ${Array.isArray(indexes) ? indexes.length : 0} idx` +
+        (exclusionConstraints.length > 0 ? `, ${exclusionConstraints.length} exclude` : ""),
+    ),
 }));
 
 // ── Imports after mocks ─────────────────────────────────────────────────────
 
 import { TableItem } from "@/components/schema-explorer/TableItem";
-import type { TableSchema } from "@/lib/types";
+import type { DetailedObject } from "@/lib/db/detailed-object";
+import { KafkaProvider } from "@/lib/db/providers/stream/kafka/index";
+import { EtcdProvider } from "@/lib/db/providers/keyvalue/etcd/index";
 import type { ProviderMetadata } from "@/hooks/use-provider-metadata";
+import { SYNTHETIC_ENTITY_CAPABILITIES } from "../../fixtures/maintenance-entity-operations";
 
-// Capability fixtures are partial on purpose: TableItem reads three fields, and
+// Capability fixtures are partial on purpose: TableItem reads a handful of fields, and
 // spelling out every ProviderCapabilities key in each case would bury them (#427).
 type Caps = ProviderMetadata["capabilities"];
 const caps = (partial: Partial<Caps>): Caps => partial as Caps;
 
-/** Postgres-shaped: ordinary tables, both maintenance operations declared. */
-const sqlCaps = caps({ supportsMaintenance: true, maintenanceOperations: ["vacuum", "analyze"] });
-/** Redis-shaped: rows are derived key-prefix groupings, only ANALYZE declared. */
+/**
+ * The kinds the fixtures declare, written the way a provider writes them (#1085, D-M). A
+ * `table` takes row writes and a `view` does not: the per-KIND half of the row-write rule the
+ * desktop tree asks, which this menu asks too since #1085 (decision D-M).
+ */
+const tableKind = {
+  id: "table",
+  role: "relation",
+  label: "Table",
+  labelPlural: "Tables",
+  acceptsRowWrites: true,
+} as const;
+const viewKind = { id: "view", role: "relation", label: "View", labelPlural: "Views" } as const;
+
+/** Postgres-shaped: tables that take row writes, views that do not, both maintenance operations declared. */
+const sqlCaps = caps({
+  queryLanguage: "sql",
+  objectKinds: [tableKind, viewKind],
+  supportsInlineRowEdit: true,
+  supportsTestDataGeneration: true,
+  supportsMaintenance: true,
+  maintenanceOperations: ["vacuum", "analyze"],
+});
+/**
+ * Redis-shaped: rows are derived key-prefix groupings, the language is JSON in a dialect of
+ * its own, the grid edits no row, and only ANALYZE is declared.
+ */
 const redisCaps = caps({
+  queryLanguage: "json",
+  queryDialect: "redis",
+  supportsInlineRowEdit: false,
   tablesAreDerivedGroupings: true,
   supportsMaintenance: true,
   maintenanceOperations: ["analyze"],
@@ -85,16 +128,51 @@ const redisCaps = caps({
  * gates rather than one (#427).
  */
 const libredbCaps = caps({
+  queryLanguage: "json",
+  queryDialect: "libredb",
+  supportsInlineRowEdit: false,
   tablesAreDerivedGroupings: true,
   supportsMaintenance: false,
   maintenanceOperations: [],
 });
 /**
+ * Kafka's own declaration (#1088), read from the provider rather than written here: JSON in a
+ * dialect of its own, a topic kind that takes no row writes, no grid row edit and no maintenance.
+ */
+const kafkaCaps: Caps = new KafkaProvider({
+  id: "kafka-table-item",
+  name: "Kafka",
+  type: "kafka",
+  host: "localhost",
+  port: 9092,
+  createdAt: new Date(0),
+}).getCapabilities();
+/**
+ * etcd's own declaration (#1089), read from the provider: a command line in a dialect of its own, a
+ * key-prefix group that is a derived grouping, no kind that takes row writes and no grid row edit.
+ */
+const etcdCaps: Caps = new EtcdProvider({
+  id: "etcd-table-item",
+  name: "etcd",
+  type: "etcd",
+  host: "127.0.0.1",
+  port: 2379,
+  createdAt: new Date(0),
+}).getCapabilities();
+/**
  * Search-shaped (Elasticsearch / OpenSearch, #424 Phase 1): an index is a real,
  * addressable object — so the `tablesAreDerivedGroupings` gate does NOT catch it —
  * and the engine still declares no maintenance of any kind.
  */
-const searchCaps = caps({ supportsMaintenance: false, maintenanceOperations: [] });
+const searchCaps = caps({
+  queryLanguage: "sql",
+  // An index takes a bulk document write while the engine declares no grid row edit, which
+  // is why Generate Test Data is withheld on it since D-M (#1085).
+  objectKinds: [{ id: "index", role: "relation", label: "Index", labelPlural: "Indices", acceptsRowWrites: true }],
+  supportsInlineRowEdit: false,
+  supportsMaintenance: false,
+  maintenanceOperations: [],
+});
 /**
  * SQLite-shaped (#496): `VACUUM` rewrites the whole file and takes no target, so the
  * provider declares `vacuum: { perEntity: false }` — and the monitoring Tables tab
@@ -122,6 +200,24 @@ const mysqlCaps = caps({
 });
 
 /**
+ * Db2-shaped (#786): RUNSTATS and REORG each name the kinds they run on, because a Db2 view is
+ * a relation and refuses both, and the vacuum slot names `optimize`.
+ */
+const db2Caps = caps({
+  supportsMaintenance: true,
+  maintenanceOperations: ["analyze", "optimize"],
+  maintenanceOperationSpecs: {
+    analyze: { label: "Run Statistics", perEntity: true, global: false, kinds: ["table", "materialized_query_table"] },
+    optimize: {
+      label: "Reorganize Table",
+      perEntity: true,
+      global: false,
+      kinds: ["table", "materialized_query_table"],
+    },
+  },
+});
+
+/**
  * Labels are partial for the same reason capabilities are: TableItem reads four
  * of the fifteen. The two defaults spelled out here are `BaseDatabaseProvider`'s
  * own, so a case that overrides one is visibly overriding it (#427).
@@ -132,8 +228,10 @@ const labelsFor = (partial: Partial<Labels>): Labels =>
 
 // ── Test data ───────────────────────────────────────────────────────────────
 
-const largeTable: TableSchema = {
+const largeTable: DetailedObject = {
   name: "users",
+  kind: "table",
+  path: ["users"],
   rowCount: 1500,
   indexes: [{ name: "idx_users_email", columns: ["email"], unique: true }],
   columns: [
@@ -142,8 +240,18 @@ const largeTable: TableSchema = {
   ],
 };
 
-const smallTable: TableSchema = {
+/**
+ * The same object OUTSIDE the session default container, which is the only fixture the two
+ * menu items below can be measured with: `name` is the label and `path` is the address
+ * (standing ruling 2), and at path `["users"]` the two are the same string, so an
+ * implementation still handing over the name would pass (#789).
+ */
+const qualifiedTable: DetailedObject = { ...largeTable, path: ["app", "users"] };
+
+const smallTable: DetailedObject = {
   name: "settings",
+  kind: "table",
+  path: ["settings"],
   rowCount: 42,
   indexes: [],
   columns: [
@@ -152,11 +260,19 @@ const smallTable: TableSchema = {
   ],
 };
 
-const noRowCountTable: TableSchema = {
+const noRowCountTable: DetailedObject = {
   name: "logs",
+  kind: "table",
+  path: ["logs"],
   indexes: [],
   columns: [{ name: "id", type: "SERIAL", nullable: false, isPrimary: true }],
 };
+
+/** A view beside `largeTable`: a relation with columns whose kind declares no row writes (#1085, D-M). */
+const viewObject: DetailedObject = { ...largeTable, name: "active_users", kind: "view", path: ["active_users"] };
+
+/** An index on a search engine, the row `searchCaps` declares. */
+const searchIndex: DetailedObject = { ...largeTable, name: "orders", kind: "index", path: ["orders"] };
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
@@ -197,7 +313,81 @@ describe("TableItem", () => {
     const { queryByText } = render(
       <TableItem table={largeTable} isExpanded={false} onToggle={mock(() => {})} isAdmin={false} />,
     );
-    expect(queryByText("1.5k")).not.toBeNull();
+    expect(queryByText("1.5K")).not.toBeNull();
+  });
+
+  // Where there is no hover the menu button is always shown, so it cannot share the count's
+  // slot the way it does on a desktop: the two drew on top of each other on a phone.
+  test("on a screen with no hover the count and the menu button sit side by side", () => {
+    const { getByText } = render(
+      <TableItem table={largeTable} isExpanded={false} onToggle={mock(() => {})} isAdmin={false} />,
+    );
+    const count = getByText("1.5K");
+    const slot = count.parentElement as HTMLElement;
+    const trigger = slot.querySelector("button") as HTMLElement;
+
+    expect(slot.className).toContain("[@media(hover:none)]:w-auto");
+    expect(count.className).toContain("[@media(hover:none)]:static");
+    expect(trigger.className).toContain("[@media(hover:none)]:static");
+  });
+
+  test("compacts millions while the title carries the full reported count and its caveat", () => {
+    const { getByText } = render(
+      <TableItem
+        table={{ ...largeTable, rowCount: 1553900 }}
+        isExpanded={false}
+        onToggle={mock(() => {})}
+        isAdmin={false}
+      />,
+    );
+    expect(getByText("1.6M").title).toContain("1,553,900");
+    expect(getByText("1.6M").title).toContain("estimate");
+    // The count itself ignores pointer events; the slot under its menu button must
+    // carry the title too, otherwise a real pointer can never reach that tooltip.
+    expect(getByText("1.6M").parentElement?.title).toBe(getByText("1.6M").title);
+  });
+
+  test.each(["dropdown", "context-menu"])(
+    "the %s count action passes the address, without selecting rows",
+    (surface) => {
+      const onGenerateCount = mock(() => {});
+      const onTableClick = mock(() => {});
+      const { getByTestId } = render(
+        <TableItem
+          table={qualifiedTable}
+          isExpanded={false}
+          onToggle={mock(() => {})}
+          isAdmin={false}
+          capabilities={caps({ queryLanguage: "sql" })}
+          onGenerateCount={onGenerateCount}
+          onTableClick={onTableClick}
+        />,
+      );
+      fireEvent.click(within(getByTestId(surface)).getByText("Generate Count Query"));
+      expect(onGenerateCount).toHaveBeenCalledWith(["app", "users"]);
+      expect(onTableClick).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each([
+    undefined,
+    redisCaps,
+    libredbCaps,
+    caps({ queryLanguage: "promql" }),
+    caps({ queryLanguage: "influxql" }),
+    kafkaCaps,
+  ])("withholds count for unresolved or unsupported capabilities (%#)", (capabilities) => {
+    const { queryAllByText } = render(
+      <TableItem
+        table={largeTable}
+        isExpanded={false}
+        onToggle={mock(() => {})}
+        isAdmin={false}
+        capabilities={capabilities}
+        onGenerateCount={mock(() => {})}
+      />,
+    );
+    expect(queryAllByText("Generate Count Query")).toHaveLength(0);
   });
 
   test("renders raw row count for < 1000", () => {
@@ -234,6 +424,24 @@ describe("TableItem", () => {
     expect(columnList!.textContent).toContain("1 idx");
   });
 
+  test("passes exclusionConstraints through to ColumnList when expanded (#1778)", () => {
+    const withExclude: DetailedObject = {
+      ...largeTable,
+      exclusionConstraints: [
+        {
+          name: "reservations_no_overlapping_active",
+          definition: "EXCLUDE USING gist (table_id WITH =, tsrange(starts_at, ends_at) WITH &&)",
+        },
+      ],
+    };
+    const { queryByTestId } = render(
+      <TableItem table={withExclude} isExpanded onToggle={mock(() => {})} isAdmin={false} />,
+    );
+    const columnList = queryByTestId("column-list");
+    expect(columnList).not.toBeNull();
+    expect(columnList!.textContent).toContain("1 exclude");
+  });
+
   test("applies bg-accent/50 class when expanded", () => {
     const { container } = render(<TableItem table={largeTable} isExpanded onToggle={mock(() => {})} isAdmin={false} />);
     const row = container.querySelector(".bg-accent\\/50");
@@ -253,13 +461,13 @@ describe("TableItem", () => {
 
   // ── Dropdown action callbacks ─────────────────────────────────────────────
 
-  test('onTableClick fires with table name on "Select Top 50" click', () => {
-    const onTableClick = mock((name: string) => {
-      void name;
+  test('onTableClick fires with the object PATH on "Select Top 50" click', () => {
+    const onTableClick = mock((path: readonly string[]) => {
+      void path;
     });
     const { getByTestId } = render(
       <TableItem
-        table={largeTable}
+        table={qualifiedTable}
         isExpanded={false}
         onToggle={mock(() => {})}
         isAdmin={false}
@@ -269,16 +477,16 @@ describe("TableItem", () => {
     const dropdown = within(getByTestId("dropdown"));
     fireEvent.click(dropdown.getByText("Select Top 50"));
     expect(onTableClick).toHaveBeenCalledTimes(1);
-    expect(onTableClick.mock.calls[0][0]).toBe("users");
+    expect(onTableClick.mock.calls[0][0]).toEqual(["app", "users"]);
   });
 
-  test('onGenerateSelect fires with table name on "Generate Query" click', () => {
-    const onGenerateSelect = mock((name: string) => {
-      void name;
+  test('onGenerateSelect fires with the object PATH on "Generate Query" click', () => {
+    const onGenerateSelect = mock((path: readonly string[]) => {
+      void path;
     });
     const { getByTestId } = render(
       <TableItem
-        table={largeTable}
+        table={qualifiedTable}
         isExpanded={false}
         onToggle={mock(() => {})}
         isAdmin={false}
@@ -288,7 +496,7 @@ describe("TableItem", () => {
     const dropdown = within(getByTestId("dropdown"));
     fireEvent.click(dropdown.getByText("Generate Query"));
     expect(onGenerateSelect).toHaveBeenCalledTimes(1);
-    expect(onGenerateSelect.mock.calls[0][0]).toBe("users");
+    expect(onGenerateSelect.mock.calls[0][0]).toEqual(["app", "users"]);
   });
 
   test('copyToClipboard copies table name and shows toast on "Copy Name" click', async () => {
@@ -322,61 +530,65 @@ describe("TableItem", () => {
     expect(mockToastSuccess).not.toHaveBeenCalled();
   });
 
-  test('onProfileTable fires with table name on "Profile Table" click', () => {
-    const onProfileTable = mock((name: string) => {
-      void name;
+  test('onProfileTable fires with the table ADDRESS on "Profile Table" click', () => {
+    const onProfileTable = mock((path: readonly string[]) => {
+      void path;
     });
     const { getByTestId } = render(
       <TableItem
-        table={largeTable}
+        table={qualifiedTable}
         isExpanded={false}
         onToggle={mock(() => {})}
         isAdmin={false}
+        // Declared, because unknown capabilities offer none of the three row actions (#1085, D-M).
+        capabilities={sqlCaps}
         onProfileTable={onProfileTable}
       />,
     );
     const dropdown = within(getByTestId("dropdown"));
     fireEvent.click(dropdown.getByText("Profile Table"));
     expect(onProfileTable).toHaveBeenCalledTimes(1);
-    expect(onProfileTable.mock.calls[0][0]).toBe("users");
+    expect(onProfileTable.mock.calls[0][0]).toEqual(["app", "users"]);
   });
 
-  test('onGenerateCode fires with table name on "Generate Code" click', () => {
-    const onGenerateCode = mock((name: string) => {
-      void name;
+  test('onGenerateCode fires with the table ADDRESS on "Generate Code" click', () => {
+    const onGenerateCode = mock((path: readonly string[]) => {
+      void path;
     });
     const { getByTestId } = render(
       <TableItem
-        table={largeTable}
+        table={qualifiedTable}
         isExpanded={false}
         onToggle={mock(() => {})}
         isAdmin={false}
+        capabilities={sqlCaps}
         onGenerateCode={onGenerateCode}
       />,
     );
     const dropdown = within(getByTestId("dropdown"));
     fireEvent.click(dropdown.getByText("Generate Code"));
     expect(onGenerateCode).toHaveBeenCalledTimes(1);
-    expect(onGenerateCode.mock.calls[0][0]).toBe("users");
+    expect(onGenerateCode.mock.calls[0][0]).toEqual(["app", "users"]);
   });
 
-  test('onGenerateTestData fires with table name on "Generate Test Data" click', () => {
-    const onGenerateTestData = mock((name: string) => {
-      void name;
+  test('onGenerateTestData fires with the table ADDRESS on "Generate Test Data" click', () => {
+    const onGenerateTestData = mock((path: readonly string[]) => {
+      void path;
     });
     const { getByTestId } = render(
       <TableItem
-        table={largeTable}
+        table={qualifiedTable}
         isExpanded={false}
         onToggle={mock(() => {})}
         isAdmin={false}
+        capabilities={sqlCaps}
         onGenerateTestData={onGenerateTestData}
       />,
     );
     const dropdown = within(getByTestId("dropdown"));
     fireEvent.click(dropdown.getByText("Generate Test Data"));
     expect(onGenerateTestData).toHaveBeenCalledTimes(1);
-    expect(onGenerateTestData.mock.calls[0][0]).toBe("users");
+    expect(onGenerateTestData.mock.calls[0][0]).toEqual(["app", "users"]);
   });
 
   // ── Admin-only actions ────────────────────────────────────────────────────
@@ -399,14 +611,14 @@ describe("TableItem", () => {
     expect(dropdown.queryByText("Vacuum Table")).toBeNull();
   });
 
-  test('onOpenMaintenance fires with "tables" and table name on Analyze click', () => {
-    const onOpenMaintenance = mock((tab?: string, tbl?: string) => {
+  test('onOpenMaintenance fires with "tables" and the table ADDRESS on Analyze click', () => {
+    const onOpenMaintenance = mock((tab?: "global" | "tables" | "sessions", path?: readonly string[]) => {
       void tab;
-      void tbl;
+      void path;
     });
     const { getByTestId } = render(
       <TableItem
-        table={largeTable}
+        table={qualifiedTable}
         isExpanded={false}
         onToggle={mock(() => {})}
         isAdmin
@@ -418,17 +630,17 @@ describe("TableItem", () => {
     fireEvent.click(dropdown.getByText("Analyze Table"));
     expect(onOpenMaintenance).toHaveBeenCalledTimes(1);
     expect(onOpenMaintenance.mock.calls[0][0]).toBe("tables");
-    expect(onOpenMaintenance.mock.calls[0][1]).toBe("users");
+    expect(onOpenMaintenance.mock.calls[0][1]).toEqual(["app", "users"]);
   });
 
   test("onOpenMaintenance fires on Vacuum click", () => {
-    const onOpenMaintenance = mock((tab?: string, tbl?: string) => {
+    const onOpenMaintenance = mock((tab?: "global" | "tables" | "sessions", path?: readonly string[]) => {
       void tab;
-      void tbl;
+      void path;
     });
     const { getByTestId } = render(
       <TableItem
-        table={largeTable}
+        table={qualifiedTable}
         isExpanded={false}
         onToggle={mock(() => {})}
         isAdmin
@@ -440,7 +652,7 @@ describe("TableItem", () => {
     fireEvent.click(dropdown.getByText("Vacuum Table"));
     expect(onOpenMaintenance).toHaveBeenCalledTimes(1);
     expect(onOpenMaintenance.mock.calls[0][0]).toBe("tables");
-    expect(onOpenMaintenance.mock.calls[0][1]).toBe("users");
+    expect(onOpenMaintenance.mock.calls[0][1]).toEqual(["app", "users"]);
   });
 
   // ── Custom labels ─────────────────────────────────────────────────────────
@@ -603,11 +815,27 @@ describe("TableItem", () => {
       expect(toggle.className).toContain("py-1.5");
       expect(toggle.parentElement?.className).not.toContain("py-1.5");
     });
+
+    test("table actions button is named for the table and exposes the same tooltip", () => {
+      const { getByRole } = render(
+        <TableItem table={largeTable} isExpanded={false} onToggle={mock(() => {})} isAdmin={false} />,
+      );
+      const actions = getByRole("button", { name: "Actions for users" });
+      expect(actions.getAttribute("title")).toBe("Actions for users");
+    });
+
+    test("table actions button derives its aria-label from the table name", () => {
+      const { getByRole } = render(
+        <TableItem table={smallTable} isExpanded={false} onToggle={mock(() => {})} isAdmin={false} />,
+      );
+      const actions = getByRole("button", { name: "Actions for settings" });
+      expect(actions.getAttribute("aria-label")).toBe("Actions for settings");
+    });
   });
   // ── Derived-grouping rows and declared maintenance (#427) ─────────────────
 
   describe("capability gating (#427)", () => {
-    test("hides Profile Table and Generate Test Data when rows are derived groupings", () => {
+    test("a Redis-shaped declaration hides Profile Table (flag and language) and Generate Test Data (row-write rule)", () => {
       const { getByTestId } = render(
         <TableItem
           table={largeTable}
@@ -636,7 +864,7 @@ describe("TableItem", () => {
       expect(dropdown.queryByText("Generate Code")).not.toBeNull();
     });
 
-    test("shows Profile Table and Generate Test Data when rows are addressable objects", () => {
+    test("a Postgres-shaped table, which takes row writes, shows Profile Table and Generate Test Data", () => {
       const { getByTestId } = render(
         <TableItem
           table={largeTable}
@@ -649,6 +877,21 @@ describe("TableItem", () => {
       const dropdown = within(getByTestId("dropdown"));
       expect(dropdown.queryByText("Profile Table")).not.toBeNull();
       expect(dropdown.queryByText("Generate Test Data")).not.toBeNull();
+    });
+
+    test("an SQL declaration with supportsColumnProfiling false hides Profile Table and keeps Generate Code", () => {
+      const { getByTestId } = render(
+        <TableItem
+          table={largeTable}
+          isExpanded={false}
+          onToggle={mock(() => {})}
+          isAdmin={false}
+          capabilities={{ ...sqlCaps, supportsColumnProfiling: false }}
+        />,
+      );
+      const dropdown = within(getByTestId("dropdown"));
+      expect(dropdown.queryByText("Profile Table")).toBeNull();
+      expect(dropdown.queryByText("Generate Code")).not.toBeNull();
     });
 
     test("offers no per-row maintenance at all when rows are derived groupings (#427)", () => {
@@ -710,7 +953,7 @@ describe("TableItem", () => {
     test("hides both items on an engine that declares no maintenance, addressable rows or not", () => {
       const { getByTestId } = render(
         <TableItem
-          table={largeTable}
+          table={searchIndex}
           isExpanded={false}
           onToggle={mock(() => {})}
           isAdmin
@@ -721,10 +964,13 @@ describe("TableItem", () => {
       const dropdown = within(getByTestId("dropdown"));
       expect(dropdown.queryByText("Index Statistics")).toBeNull();
       expect(dropdown.queryByText("Merge Segments")).toBeNull();
-      // The row IS addressable here, so everything the #427 gate removes for a
-      // derived grouping stays: this gate is about maintenance and nothing else.
+      // The row IS addressable here, so what the #427 gate removes for a derived grouping
+      // stays: this gate is about maintenance and nothing else. Generate Test Data is withheld
+      // here since D-M (#1085), by the row-write rule and not by this gate: the index kind takes
+      // a bulk document write, and the engine declares no grid row edit, which is the half the
+      // desktop tree has always asked. The describe below on the desktop tree's rule pins it on its own.
       expect(dropdown.queryByText("Profile Table")).not.toBeNull();
-      expect(dropdown.queryByText("Generate Test Data")).not.toBeNull();
+      expect(dropdown.queryByText("Generate Test Data")).toBeNull();
     });
 
     /*
@@ -797,6 +1043,40 @@ describe("TableItem", () => {
       expect(dropdown.queryByText("Analyze Table")).toBeNull();
     });
 
+    test("offers an operation only on the kinds its spec names, as the desktop tree does", () => {
+      const labels = labelsFor({ vacuumAction: "Reorganize Table", vacuumActionOperation: "optimize" });
+      const table = render(
+        <TableItem
+          table={largeTable}
+          isExpanded={false}
+          onToggle={mock(() => {})}
+          isAdmin
+          capabilities={db2Caps}
+          labels={labels}
+        />,
+      );
+      const tableMenu = within(table.getByTestId("dropdown"));
+      expect(tableMenu.queryByText("Run Statistics")).not.toBeNull();
+      expect(tableMenu.queryByText("Reorganize Table")).not.toBeNull();
+      cleanup();
+
+      const view = render(
+        <TableItem
+          table={viewObject}
+          isExpanded={false}
+          onToggle={mock(() => {})}
+          isAdmin
+          capabilities={db2Caps}
+          labels={labels}
+        />,
+      );
+      const viewMenu = within(view.getByTestId("dropdown"));
+      expect(viewMenu.queryByText("Run Statistics")).toBeNull();
+      expect(viewMenu.queryByText("Reorganize Table")).toBeNull();
+      // Withheld for the kind alone: the rest of the menu is still there.
+      expect(viewMenu.queryByText("Select Top 50")).not.toBeNull();
+    });
+
     test("offers nothing while the capabilities are still unknown", () => {
       // `/api/db/provider-meta` answers with nothing both while it is in flight and
       // when it failed, and both maintenance surfaces read that as a denial. A menu
@@ -823,5 +1103,342 @@ describe("TableItem", () => {
       expect(dropdown.queryByText("Analyze Table")).toBeNull();
       expect(dropdown.queryByText("Vacuum Table")).toBeNull();
     });
+  });
+
+  /**
+   * The three row actions ask exactly what the desktop tree asks (#1085, decision D-M).
+   *
+   * `src/components/object-tree/row-actions.ts` gates Profile on the derived-grouping flag and
+   * on `offersColumnProfiling`, Generate Code on `offersCodeGeneration`, and Generate Test Data
+   * on `offersTestDataGeneration`: the row's kind accepting row writes AND the engine declaring
+   * `supportsTestDataGeneration` (#1468), the grid's row edit before that. This
+   * menu asked only the grouping flag, so it offered the generator on every view and on every
+   * engine the tree withholds it from. Each negative below is read from a menu that still
+   * carries the actions that name the row, and each test carries its own control: a
+   * declaration that differs in the field under test and is offered what the negative is not.
+   */
+  describe("the row actions ask what the desktop tree asks (#1085, D-M)", () => {
+    const ROW_ACTIONS = ["Profile Table", "Generate Code", "Generate Test Data"] as const;
+
+    /**
+     * MongoDB-shaped: a collection takes a document write, the engine declares the generator,
+     * and it declares no grid row edit, since the grid has no `UPDATE ... SET` to emit (#1468).
+     */
+    const collectionKind = {
+      id: "collection",
+      role: "relation",
+      label: "Collection",
+      labelPlural: "Collections",
+      acceptsRowWrites: true,
+    } as const;
+    const mongoCaps = caps({
+      queryLanguage: "json",
+      objectKinds: [collectionKind],
+      supportsInlineRowEdit: false,
+      supportsTestDataGeneration: true,
+    });
+    const collection: DetailedObject = { ...largeTable, name: "orders", kind: "collection", path: ["shop", "orders"] };
+
+    /** Prometheus-shaped: PromQL, a metric kind that takes no row write, no grid row edit, no maintenance. */
+    const promqlCaps = caps({
+      queryLanguage: "promql",
+      objectKinds: [{ id: "metric", role: "relation", label: "Metric", labelPlural: "Metrics", hasColumns: true }],
+      supportsInlineRowEdit: false,
+      supportsMaintenance: false,
+      maintenanceOperations: [],
+    });
+    const metricObject: DetailedObject = { name: "up", kind: "metric", path: ["up"], columns: [], indexes: [] };
+
+    /** One non-admin row's dropdown, scoped to its own render so two renders in one test cannot collide. */
+    const menuOf = (table: DetailedObject, capabilities?: Caps): HTMLElement => {
+      const { container } = render(
+        <TableItem
+          table={table}
+          isExpanded={false}
+          onToggle={mock(() => {})}
+          isAdmin={false}
+          capabilities={capabilities}
+        />,
+      );
+      return within(container).getByTestId("dropdown");
+    };
+    const offered = (menu: HTMLElement): string[] =>
+      ROW_ACTIONS.filter((label) => within(menu).queryByText(label) !== null);
+
+    test("a SQL table is offered all three", () => {
+      expect(offered(menuOf(largeTable, sqlCaps))).toEqual(["Profile Table", "Generate Code", "Generate Test Data"]);
+    });
+
+    test("a view, whose kind declares no row writes, is offered everything but Generate Test Data", () => {
+      expect(offered(menuOf(viewObject, sqlCaps))).toEqual(["Profile Table", "Generate Code"]);
+      // The control: the same engine, and a kind that does take row writes.
+      expect(offered(menuOf(largeTable, sqlCaps))).toContain("Generate Test Data");
+    });
+
+    test("a MongoDB collection is offered Generate Test Data although its grid edits no row (#1468)", () => {
+      expect(offered(menuOf(collection, mongoCaps))).toEqual(["Profile Table", "Generate Code", "Generate Test Data"]);
+      // The control: the same declaration with the engine's generator flag switched off.
+      expect(offered(menuOf(collection, { ...mongoCaps, supportsTestDataGeneration: false }))).toEqual([
+        "Profile Table",
+        "Generate Code",
+      ]);
+    });
+
+    test("a writer whose grid edits rows but which does not declare the generator is not offered it", () => {
+      // Couchbase, Cassandra, Trino and both search engines hold a kind that takes row writes and
+      // declare no generator; the grid's flag no longer stands in for it in either direction.
+      expect(offered(menuOf(largeTable, { ...sqlCaps, supportsTestDataGeneration: undefined }))).toEqual([
+        "Profile Table",
+        "Generate Code",
+      ]);
+      expect(offered(menuOf(largeTable, sqlCaps))).toContain("Generate Test Data");
+    });
+
+    test("a Redis-shaped declaration keeps Generate Code and nothing else of the three", () => {
+      expect(offered(menuOf(largeTable, redisCaps))).toEqual(["Generate Code"]);
+      // The control: the same row on an ordinary SQL declaration is offered all three.
+      expect(offered(menuOf(largeTable, sqlCaps))).toEqual(["Profile Table", "Generate Code", "Generate Test Data"]);
+    });
+
+    test("the grouping flag withholds Profile on its own, and no longer decides Generate Test Data", () => {
+      // Redis and LibreDB also declare a JSON dialect, which the language gate refuses as well,
+      // so this is the declaration that shows the flag still does its own work. The desktop
+      // tree answers the same for it: its row-write rule has never read the flag.
+      expect(offered(menuOf(largeTable, { ...sqlCaps, tablesAreDerivedGroupings: true }))).toEqual([
+        "Generate Code",
+        "Generate Test Data",
+      ]);
+      // The control: the same declaration without the flag.
+      expect(offered(menuOf(largeTable, sqlCaps))).toContain("Profile Table");
+    });
+
+    test("a PromQL metric is offered none of the three, and no rule is drawn for them", () => {
+      const menu = menuOf(metricObject, promqlCaps);
+      expect(offered(menu)).toEqual([]);
+      expect(menu.querySelectorAll("hr")).toHaveLength(0);
+      // The actions that name the row are still there, so an empty list is the gate and not a
+      // menu that failed to render.
+      expect(within(menu).queryByText("Select Top 50")).not.toBeNull();
+      expect(within(menu).queryByText("Copy Name")).not.toBeNull();
+      // The control, in the one field under test: the same metric in SQL is offered the two
+      // actions that ask the language, and draws the rule above them. Generate Test Data stays
+      // withheld there too, because the metric kind declares no row writes.
+      const sqlMenu = menuOf(metricObject, { ...promqlCaps, queryLanguage: "sql" });
+      expect(offered(sqlMenu)).toEqual(["Profile Table", "Generate Code"]);
+      expect(sqlMenu.querySelectorAll("hr")).toHaveLength(1);
+    });
+
+    test("an InfluxQL measurement is offered none of the three, and no rule is drawn for them (InfluxDB spec 6.7)", () => {
+      const measurementCaps = caps({
+        queryLanguage: "influxql",
+        objectKinds: [
+          { id: "measurement", role: "relation", label: "Measurement", labelPlural: "Measurements", hasColumns: true },
+        ],
+        supportsInlineRowEdit: false,
+        supportsMaintenance: false,
+        maintenanceOperations: [],
+      });
+      const cpu: DetailedObject = {
+        name: "cpu",
+        kind: "measurement",
+        path: ["telegraf", "cpu"],
+        columns: [],
+        indexes: [],
+      };
+      const menu = menuOf(cpu, measurementCaps);
+      expect(offered(menu)).toEqual([]);
+      expect(menu.querySelectorAll("hr")).toHaveLength(0);
+      expect(within(menu).queryByText("Copy Name")).not.toBeNull();
+      // The control: the same measurement in SQL is offered the two actions that ask the language.
+      expect(offered(menuOf(cpu, { ...measurementCaps, queryLanguage: "sql" }))).toEqual([
+        "Profile Table",
+        "Generate Code",
+      ]);
+    });
+
+    test("a Kafka topic is offered none of the three, and no rule is drawn for them (#1088)", () => {
+      const topic: DetailedObject = { name: "orders", kind: "topic", path: ["orders"], columns: [], indexes: [] };
+      const menu = menuOf(topic, kafkaCaps);
+      expect(offered(menu)).toEqual([]);
+      expect(menu.querySelectorAll("hr")).toHaveLength(0);
+      // The actions that name the row are still there, so an empty list is the gate and not a menu
+      // that failed to render.
+      expect(within(menu).queryByText("Select Top 50")).not.toBeNull();
+      expect(within(menu).queryByText("Copy Name")).not.toBeNull();
+      // The control, in the one field under test: the same declaration with the dialect removed is
+      // MongoDB's JSON, which is profiled and generates code. Generate Test Data stays withheld there
+      // too, because the topic kind declares no row writes and the engine no generator.
+      const jsonMenu = menuOf(topic, { ...kafkaCaps, queryDialect: undefined });
+      expect(offered(jsonMenu)).toEqual(["Profile Table", "Generate Code"]);
+      expect(jsonMenu.querySelectorAll("hr")).toHaveLength(1);
+    });
+
+    test("an etcd key-prefix group is offered none of the three, and no rule is drawn for them (#1089)", () => {
+      const group: DetailedObject = {
+        name: "/app/config/*",
+        kind: "prefix",
+        path: ["/app/config/*"],
+        columns: [],
+        indexes: [],
+      };
+      const menu = menuOf(group, etcdCaps);
+      expect(offered(menu)).toEqual([]);
+      expect(menu.querySelectorAll("hr")).toHaveLength(0);
+      expect(within(menu).queryByText("Copy Name")).not.toBeNull();
+      // The control, in the one field under test: with the dialect removed the declaration is MongoDB's JSON,
+      // which generates code, so that refusal is the dialect's. Profile stays withheld by the derived grouping,
+      // and Generate Test Data because no etcd kind takes row writes.
+      const jsonMenu = menuOf(group, { ...etcdCaps, queryDialect: undefined });
+      expect(offered(jsonMenu)).toEqual(["Generate Code"]);
+    });
+
+    test("unknown capabilities offer none of the three", () => {
+      // `/api/db/provider-meta` answers with nothing both while it is in flight and when it
+      // failed, and a menu that guessed "offer it" is how the dead buttons came back.
+      const menu = menuOf(largeTable);
+      expect(offered(menu)).toEqual([]);
+      expect(menu.querySelectorAll("hr")).toHaveLength(0);
+      expect(within(menu).queryByText("Select Top 50")).not.toBeNull();
+      expect(within(menu).queryByText("Generate Query")).not.toBeNull();
+      // The control: the same row once the declaration has arrived.
+      expect(offered(menuOf(largeTable, sqlCaps))).toEqual(["Profile Table", "Generate Code", "Generate Test Data"]);
+    });
+  });
+});
+
+describe("declared per-row operations in the mobile row menu (spec 3.11)", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  const declaredCaps = caps({ queryLanguage: "sql", objectKinds: [tableKind], ...SYNTHETIC_ENTITY_CAPABILITIES });
+  const MAINTENANCE_ITEMS = ["Analyze Table", "Release Object", "Load Object"];
+  const maintenanceTexts = (dropdown: HTMLElement) =>
+    Array.from(dropdown.querySelectorAll('[role="menuitem"]'))
+      .map((item) => item.textContent ?? "")
+      .filter((text) => MAINTENANCE_ITEMS.includes(text));
+
+  test("offers each declared operation after the provider's own, in declaration order", () => {
+    const { getByTestId } = render(
+      <TableItem
+        table={qualifiedTable}
+        isExpanded={false}
+        onToggle={mock(() => {})}
+        isAdmin
+        capabilities={declaredCaps}
+        labels={labelsFor({})}
+        onOpenMaintenance={mock(() => {})}
+      />,
+    );
+
+    expect(maintenanceTexts(getByTestId("dropdown"))).toEqual(MAINTENANCE_ITEMS);
+  });
+
+  test('a declared item opens maintenance on "tables" with the row\'s ADDRESS', () => {
+    const onOpenMaintenance = mock((tab?: "global" | "tables" | "sessions", path?: readonly string[]) => {
+      void tab;
+      void path;
+    });
+    const { getByTestId } = render(
+      <TableItem
+        table={qualifiedTable}
+        isExpanded={false}
+        onToggle={mock(() => {})}
+        isAdmin
+        capabilities={declaredCaps}
+        onOpenMaintenance={onOpenMaintenance}
+      />,
+    );
+
+    fireEvent.click(within(getByTestId("dropdown")).getByText("Load Object"));
+    expect(onOpenMaintenance).toHaveBeenCalledTimes(1);
+    expect(onOpenMaintenance.mock.calls[0][0]).toBe("tables");
+    expect(onOpenMaintenance.mock.calls[0][1]).toEqual(["app", "users"]);
+  });
+
+  test("a declared operation that names its kinds is offered on those kinds only, as the desktop tree does", () => {
+    const kindedCaps = caps({
+      queryLanguage: "sql",
+      objectKinds: [tableKind, viewKind],
+      ...SYNTHETIC_ENTITY_CAPABILITIES,
+      maintenanceOperationSpecs: {
+        ...SYNTHETIC_ENTITY_CAPABILITIES.maintenanceOperationSpecs,
+        compact: { ...SYNTHETIC_ENTITY_CAPABILITIES.maintenanceOperationSpecs.compact, kinds: ["table"] },
+      },
+    });
+    const table = render(
+      <TableItem
+        table={qualifiedTable}
+        isExpanded={false}
+        onToggle={mock(() => {})}
+        isAdmin
+        capabilities={kindedCaps}
+        labels={labelsFor({})}
+        onOpenMaintenance={mock(() => {})}
+      />,
+    );
+    expect(maintenanceTexts(table.getByTestId("dropdown"))).toEqual(MAINTENANCE_ITEMS);
+    cleanup();
+
+    const view = render(
+      <TableItem
+        table={viewObject}
+        isExpanded={false}
+        onToggle={mock(() => {})}
+        isAdmin
+        capabilities={kindedCaps}
+        labels={labelsFor({})}
+        onOpenMaintenance={mock(() => {})}
+      />,
+    );
+    expect(maintenanceTexts(view.getByTestId("dropdown"))).toEqual(["Analyze Table", "Release Object"]);
+  });
+
+  test("a declared operation alone still draws the maintenance group", () => {
+    const { getByTestId } = render(
+      <TableItem
+        table={qualifiedTable}
+        isExpanded={false}
+        onToggle={mock(() => {})}
+        isAdmin
+        capabilities={caps({
+          queryLanguage: "sql",
+          objectKinds: [tableKind],
+          supportsMaintenance: true,
+          maintenanceOperations: ["disarm"],
+          maintenanceOperationSpecs: { disarm: SYNTHETIC_ENTITY_CAPABILITIES.maintenanceOperationSpecs.disarm },
+        })}
+        onOpenMaintenance={mock(() => {})}
+      />,
+    );
+
+    expect(maintenanceTexts(getByTestId("dropdown"))).toEqual(["Release Object"]);
+  });
+
+  test("a non-admin, and a derived grouping, are offered none of them", () => {
+    const { getByTestId, unmount } = render(
+      <TableItem
+        table={qualifiedTable}
+        isExpanded={false}
+        onToggle={mock(() => {})}
+        isAdmin={false}
+        capabilities={declaredCaps}
+        onOpenMaintenance={mock(() => {})}
+      />,
+    );
+    expect(maintenanceTexts(getByTestId("dropdown"))).toEqual([]);
+    unmount();
+
+    const grouped = render(
+      <TableItem
+        table={qualifiedTable}
+        isExpanded={false}
+        onToggle={mock(() => {})}
+        isAdmin
+        capabilities={caps({ ...declaredCaps, tablesAreDerivedGroupings: true })}
+        onOpenMaintenance={mock(() => {})}
+      />,
+    );
+    expect(maintenanceTexts(grouped.getByTestId("dropdown"))).toEqual([]);
   });
 });

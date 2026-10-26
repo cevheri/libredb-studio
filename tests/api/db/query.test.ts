@@ -1,4 +1,5 @@
-import { describe, test, expect, mock, beforeEach } from "bun:test";
+import { describe, test, expect, mock, beforeEach, afterEach, spyOn } from "bun:test";
+import { installStandInVocabulary, STAND_IN_TYPE } from "../../helpers/stand-in-vocabulary";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createMockRequest, parseResponseJSON } from "../../helpers/mock-next";
@@ -6,6 +7,12 @@ import { createMockProvider } from "../../helpers/mock-provider";
 import { discoverRoutes } from "../../security/helpers/discover-routes";
 import { clearRateLimitState } from "@/lib/api/rate-limit";
 import { agentReadSqlInput } from "@/lib/db/operations/statement-guard";
+import { OXIA_MAX_TEXT_BYTES } from "@/lib/db/providers/keyvalue/oxia/constants";
+import {
+  SNOWFLAKE_ERROR_SENTENCES,
+  SnowflakeError,
+  toDatabaseError as toSnowflakeDatabaseError,
+} from "@/lib/db/providers/sql/snowflake/errors";
 import {
   QueryError,
   TimeoutError,
@@ -23,10 +30,15 @@ import {
   isRetryableError,
   mapDatabaseError,
 } from "@/lib/db/errors";
+import type { DatabaseConnection } from "@/lib/types";
+import type { QueryEventRow } from "@/lib/query-events/types";
+import type { QueryEventBatchWrite, QueryEventWriteFailure } from "@/lib/query-events/postgres-sink";
 
 // ─── Mock provider ──────────────────────────────────────────────────────────
 const mockProvider = createMockProvider();
 const mockGetOrCreateProvider = mock(async () => mockProvider);
+/** The unconnected provider a route reads a declaration from, `provider-meta`'s way (#457). */
+const mockCreateDatabaseProvider = mock(async (_connection: unknown) => mockProvider);
 
 const mockGetSession = mock(
   async (): Promise<{ role: string; username: string } | null> => ({ role: "admin", username: "admin" }),
@@ -35,17 +47,25 @@ const mockGetSession = mock(
 // ─── Mock auth + seed resolution BEFORE importing the route ─────────────────
 mock.module("@/lib/auth", () => ({
   getSession: mockGetSession,
+  readSession: mock(async () => {
+    const s = await mockGetSession();
+    return s ? { kind: "authenticated", session: s } : { kind: "anonymous" };
+  }),
   signJWT: mock(async () => "mock-token"),
   verifyJWT: mock(async () => null),
   login: mock(async () => {}),
   logout: mock(async () => {}),
 }));
 
+/** What `resolveConnection` answers instead of the default below, for the governance tests at the end of this file. */
+let resolveConnectionOverride: ((body: Record<string, unknown>) => Promise<unknown>) | undefined;
+
 mock.module("@/lib/seed/resolve-connection", () => {
   class SeedConnectionError extends Error {
     constructor(
       message: string,
       public statusCode: number,
+      public code?: string,
     ) {
       super(message);
       this.name = "SeedConnectionError";
@@ -53,8 +73,23 @@ mock.module("@/lib/seed/resolve-connection", () => {
   }
   return {
     resolveConnection: mock(async (body: Record<string, unknown>) => {
+      if (resolveConnectionOverride !== undefined) return resolveConnectionOverride(body);
       if (!body.connection && !body.connectionId) {
         throw new SeedConnectionError("Either connection or connectionId is required", 400);
+      }
+      // A managed id resolves from the OPERATOR's config and everything the caller attached to the
+      // request is discarded — which the real `resolveConnection` does for the same reason (a `seed:`
+      // id is the operator's namespace, GHSA-3wh2-8x78). This is exactly the path the top-level
+      // `database` field has to survive: nothing the caller sent on a connection reaches this object.
+      if (typeof body.connectionId === "string" && body.connectionId.startsWith("seed:")) {
+        return {
+          id: body.connectionId,
+          name: "Seed Redis",
+          type: "redis",
+          host: "seed-host",
+          port: 6379,
+          database: "0",
+        };
       }
       return body.connection;
     }),
@@ -65,7 +100,7 @@ mock.module("@/lib/seed/resolve-connection", () => {
 // ─── Mock @/lib/db BEFORE importing the route ───────────────────────────────
 mock.module("@/lib/db", () => ({
   getOrCreateProvider: mockGetOrCreateProvider,
-  createDatabaseProvider: mock(),
+  createDatabaseProvider: mockCreateDatabaseProvider,
   removeProvider: mock(),
   clearProviderCache: mock(),
   getProviderCacheStats: mock(),
@@ -87,8 +122,26 @@ mock.module("@/lib/db", () => ({
   BaseDatabaseProvider: class {},
 }));
 
+// ─── The query event insert, faked: the sink, the builder and the admission gate stay real ──────
+const realPostgresSink = await import("@/lib/query-events/postgres-sink");
+/** Every row the sink handed to an insert that took it. */
+const insertedEvents: QueryEventRow[] = [];
+/** When set, every insert fails this way and keeps its batch queued, so the sink backs off. */
+let insertFailure: QueryEventWriteFailure | null = null;
+mock.module("@/lib/query-events/postgres-sink", () => ({
+  ...realPostgresSink,
+  writeQueryEventBatch: mock(async (rows: readonly QueryEventRow[]): Promise<QueryEventBatchWrite> => {
+    if (insertFailure !== null) return { settled: 0, rejections: [], failure: insertFailure };
+    insertedEvents.push(...rows);
+    return { settled: rows.length, rejections: [], failure: null };
+  }),
+}));
+
 // ─── Import route handler AFTER mocking ─────────────────────────────────────
 const { POST } = await import("@/app/api/db/query/route");
+// The real check the factory runs first (#1089). This file replaces `@/lib/db`, the route's own import,
+// and not `@/lib/db/factory`, so the test below can run the real refusal inside the replaced factory.
+const { assertReadOnlyHonoured } = await import("@/lib/db/factory");
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 const validConnection = {
@@ -113,6 +166,69 @@ describe("POST /api/db/query", () => {
     );
   });
 
+  // `count` is what the engine answered to the statement that ran, which asks for one row past the
+  // 50-row page (#1440): 50 is a page that ended exactly full, 51 is a page with a next one.
+  for (const [count, providerLimited, expectedMore, expectedReturned, expectedLimited] of [
+    [2, false, false, 2, false],
+    [50, false, false, 50, false],
+    [51, false, true, 50, true],
+    [2, true, false, 2, true],
+  ] as const) {
+    test(`reports a ${count}-row answer with provider cut=${providerLimited} accurately`, async () => {
+      (mockProvider.query as ReturnType<typeof mock>).mockResolvedValueOnce({
+        rows: Array.from({ length: count }, (_, i) => ({ id: i + 1 })),
+        fields: ["id"],
+        rowCount: count,
+        executionTime: 1,
+        pagination: { limit: 50, offset: 0, hasMore: false, totalReturned: count, wasLimited: providerLimited },
+      });
+      const req = createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: validConnection, sql: "SELECT * FROM users" },
+      });
+      const res = await POST(req as never);
+      const data = await parseResponseJSON<{ pagination: unknown }>(res);
+      expect(res.status).toBe(200);
+      expect(data.pagination).toEqual({
+        limit: 50,
+        offset: 0,
+        hasMore: expectedMore,
+        totalReturned: expectedReturned,
+        wasLimited: expectedLimited,
+      });
+    });
+  }
+
+  // `JSON.stringify` writes NaN and both infinities as `null`, so a stored NaN reached the
+  // grid as SQL NULL (PostgreSQL 18.6 `'NaN'::float8`, 2026-10-04). They travel as words.
+  test("answers NaN and the infinities as words, not as null", async () => {
+    (mockProvider.query as ReturnType<typeof mock>).mockResolvedValueOnce({
+      rows: [
+        {
+          f: Number.NaN,
+          r: Number.POSITIVE_INFINITY,
+          n: Number.NEGATIVE_INFINITY,
+          arr: [Number.NaN, 2],
+          ok: 1.5,
+          z: null,
+        },
+      ],
+      fields: ["f", "r", "n", "arr", "ok", "z"],
+      rowCount: 1,
+      executionTime: 1,
+    });
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "SELECT * FROM floats" },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ rows: unknown[] }>(res);
+
+    expect(res.status).toBe(200);
+    expect(data.rows).toEqual([{ f: "NaN", r: "Infinity", n: "-Infinity", arr: ["NaN", 2], ok: 1.5, z: null }]);
+  });
+
   test("returns 401 when no session exists", async () => {
     mockGetSession.mockResolvedValueOnce(null);
 
@@ -126,6 +242,19 @@ describe("POST /api/db/query", () => {
 
     expect(res.status).toBe(401);
     expect(data.error).toContain("Authentication required");
+  });
+
+  test("a queryId that is not a string returns 400 (#1364)", async () => {
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "SELECT 1", queryId: 42 },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(data.error).toBe("queryId must be a string");
   });
 
   test("passes queryId to provider when cancellation is supported", async () => {
@@ -143,7 +272,34 @@ describe("POST /api/db/query", () => {
     const res = await POST(req as never);
 
     expect(res.status).toBe(200);
-    expect(providerWithCancel.query).toHaveBeenCalledWith("SELECT * FROM users LIMIT 50", undefined, "query-42");
+    expect(providerWithCancel.query).toHaveBeenCalledWith(
+      "SELECT * FROM users LIMIT 50",
+      undefined,
+      "query-42",
+      expect.any(String),
+    );
+  });
+
+  test("answers a multi-result text with its first set and sends no copy of the others (#1312)", async () => {
+    (mockProvider.query as ReturnType<typeof mock>).mockResolvedValueOnce({
+      rows: [{ a: 1 }],
+      fields: ["a"],
+      rowCount: 1,
+      executionTime: 1,
+      resultSets: [
+        { rows: [{ a: 1 }], fields: ["a"] },
+        { rows: [{ b: 2 }], fields: ["b"] },
+      ],
+    });
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "EXEC sp_help" },
+    });
+    const data = await parseResponseJSON<Record<string, unknown>>(await POST(req as never));
+
+    expect(data.rows).toEqual([{ a: 1 }]);
+    expect(Object.hasOwn(data, "resultSets")).toBe(false);
   });
 
   // ── Bound parameters (#290) ───────────────────────────────────────────────
@@ -166,10 +322,12 @@ describe("POST /api/db/query", () => {
     const res = await POST(req as never);
 
     expect(res.status).toBe(200);
-    expect(mockProvider.query).toHaveBeenCalledWith(`UPDATE users SET "name" = $1 WHERE "id" = $2 LIMIT 50`, [
-      "\\' WHERE 1=1 -- ",
-      7,
-    ]);
+    expect(mockProvider.query).toHaveBeenCalledWith(
+      `UPDATE users SET "name" = $1 WHERE "id" = $2 LIMIT 50`,
+      ["\\' WHERE 1=1 -- ", 7],
+      undefined,
+      expect.any(String),
+    );
   });
 
   test("binds parameters alongside a queryId when cancellation is supported", async () => {
@@ -196,6 +354,7 @@ describe("POST /api/db/query", () => {
       `UPDATE users SET "name" = $1 WHERE "id" = $2 LIMIT 50`,
       ["Alice", 7],
       "query-42",
+      expect.any(String),
     );
   });
 
@@ -232,7 +391,35 @@ describe("POST /api/db/query", () => {
     expect(data.pagination).toBeDefined();
     expect(data.pagination.limit).toBe(50);
     expect(data.pagination.offset).toBe(0);
-    expect(data.pagination.wasLimited).toBe(true);
+    expect(data.pagination.wasLimited).toBe(false);
+  });
+
+  test("carries the engine's notices beside the result (#1401)", async () => {
+    // Apache Cloudberry 2.1.0's own WARNING for a foreign key it accepts and will not enforce.
+    const warning = {
+      message:
+        "referential integrity (FOREIGN KEY) constraints are not supported in Apache Cloudberry, will not be enforced",
+      code: "01000",
+      severity: "WARNING",
+    };
+    (mockProvider.query as ReturnType<typeof mock>).mockResolvedValueOnce({
+      rows: [],
+      fields: [],
+      rowCount: 0,
+      executionTime: 1,
+      warnings: [warning],
+    });
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: {
+        connection: validConnection,
+        sql: "ALTER TABLE orders ADD CONSTRAINT orders_cust_fk FOREIGN KEY (customer_id) REFERENCES customers(id)",
+      },
+    });
+
+    const data = await parseResponseJSON<{ warnings?: unknown[] }>(await POST(req as never));
+
+    expect(data.warnings).toEqual([warning]);
   });
 
   test("returns 400 when connection is missing", async () => {
@@ -248,6 +435,58 @@ describe("POST /api/db/query", () => {
     expect(data.error).toContain("required");
   });
 
+  // A `sql` that is present but not a string reached the provider and answered 500 with the TypeError's own text.
+  // It is refused in words before any provider resolves, a falsy one (0, false) included.
+  for (const [label, sql] of [
+    ["a number", 123],
+    ["an object", { text: "SELECT 1" }],
+    ["an array", ["SELECT 1"]],
+    ["true", true],
+    ["zero", 0],
+    ["false", false],
+  ] as const) {
+    test(`answers 400 when sql is ${label}, before any provider resolves`, async () => {
+      mockGetOrCreateProvider.mockClear();
+      const req = createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: validConnection, sql },
+      });
+
+      const res = await POST(req as never);
+      const data = await parseResponseJSON<{ error: string }>(res);
+
+      expect(res.status).toBe(400);
+      expect(data.error).toBe("sql must be a string");
+      expect(mockGetOrCreateProvider).not.toHaveBeenCalled();
+    });
+  }
+
+  test("an empty sql keeps the answer of a missing one", async () => {
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "" },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(data.error).toBe("Connection and query are required");
+  });
+
+  test("a null sql keeps the answer of a missing one", async () => {
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: null },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(data.error).toBe("Connection and query are required");
+  });
+
   test("returns 400 when sql is missing", async () => {
     const req = createMockRequest("/api/db/query", {
       method: "POST",
@@ -259,6 +498,34 @@ describe("POST /api/db/query", () => {
 
     expect(res.status).toBe(400);
     expect(data.error).toContain("required");
+  });
+
+  // #1089. The factory refuses a readOnly the engine cannot keep before it builds anything, and this
+  // route answers that refusal as the configuration error it is. The replaced factory runs the real
+  // check on the connection the route resolved, so a route that dropped or rewrote the field on the way
+  // would fail here too.
+  test("an inline read-only connection on an engine that does not enforce the mode answers 400 and runs nothing", async () => {
+    mockCreateDatabaseProvider.mockClear();
+    mockGetOrCreateProvider.mockImplementationOnce(async (...args: unknown[]) => {
+      assertReadOnlyHonoured(args[0] as DatabaseConnection);
+      return mockProvider;
+    });
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: { ...validConnection, readOnly: true }, sql: "SELECT * FROM users" },
+    });
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string; code: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(data.code).toBe("CONFIG_ERROR");
+    expect(data.error).toBe(
+      "readOnly: true is refused for postgres: its provider does not enforce a read-only mode, so the connection would open able to write. Remove readOnly from the connection, or connect with a database role that cannot write.",
+    );
+    expect(mockGetOrCreateProvider).toHaveBeenCalledTimes(1);
+    expect(mockCreateDatabaseProvider).not.toHaveBeenCalled();
+    expect(mockProvider.query).not.toHaveBeenCalled();
   });
 
   test("returns 400 for QueryError", async () => {
@@ -279,7 +546,29 @@ describe("POST /api/db/query", () => {
     expect(data.code).toBe("QUERY_ERROR");
   });
 
-  test("returns 408 for TimeoutError", async () => {
+  test("a syntax error that names the bound Studio added says so; one that does not is left alone (SF-022)", async () => {
+    const send = async (message: string) => {
+      (mockProvider.query as ReturnType<typeof mock>).mockRejectedValueOnce(new QueryError(message));
+      const req = createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: validConnection, sql: "SELECT * FROM D_PARENT WHERE" },
+      });
+      const res = await POST(req as never);
+      return { status: res.status, data: await parseResponseJSON<{ error: string; code: string }>(res) };
+    };
+
+    const named = await send("SQL compilation error: syntax error line 1 at position 29 unexpected 'LIMIT'.");
+    expect(named.status).toBe(400);
+    expect(named.data.code).toBe("QUERY_ERROR");
+    expect(named.data.error).toEndWith(
+      "unexpected 'LIMIT'. Studio added the clause LIMIT 50 to this statement to bound its rows, so a position or token this error names may be in that clause rather than in your text.",
+    );
+    expect((await send("Object 'D_PARENT' does not exist or not authorized.")).data.error).toBe(
+      "Object 'D_PARENT' does not exist or not authorized.",
+    );
+  });
+
+  test("returns 504 for TimeoutError", async () => {
     (mockProvider.query as ReturnType<typeof mock>).mockRejectedValueOnce(
       new TimeoutError("Query timed out after 30000ms"),
     );
@@ -292,8 +581,30 @@ describe("POST /api/db/query", () => {
     const res = await POST(req as never);
     const data = await parseResponseJSON<{ error: string }>(res);
 
-    expect(res.status).toBe(408);
+    expect(res.status).toBe(504);
     expect(data.error).toContain("timed out");
+  });
+
+  test("a Snowflake statement past its deadline answers 400 QUERY_ERROR, not a retryable timeout, so the person is not invited to run it again", async () => {
+    // A TimeoutError is retryable, and a second run would start the statement on the warehouse a second time; the Snowflake
+    // provider cancels the statement at its deadline and throws a QueryError naming the timeout instead.
+    const sql = "SELECT SYSTEM$WAIT(700000)";
+    (mockProvider.query as ReturnType<typeof mock>).mockRejectedValueOnce(
+      toSnowflakeDatabaseError(new SnowflakeError("query", SNOWFLAKE_ERROR_SENTENCES.deadline(604_800)), sql),
+    );
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string; code: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(res.status).not.toBe(504);
+    expect(data.code).toBe("QUERY_ERROR");
+    expect(data.error).toBe(SNOWFLAKE_ERROR_SENTENCES.deadline(604_800));
   });
 
   test("returns 500 for DatabaseError", async () => {
@@ -331,6 +642,28 @@ describe("POST /api/db/query", () => {
     expect(data.error).toContain("cancelled");
   });
 
+  test("a PostgreSQL statement timeout answers 504 TIMEOUT_ERROR, not 499 (#1145)", async () => {
+    // The end-to-end shape of the bug: the provider throws the mapped error a real
+    // `statement_timeout` produces, and the route must answer a retryable 504 timeout
+    // rather than the 499 QUERY_CANCELLED that kept the previous rows on screen and
+    // never told the user the statement timed out.
+    (mockProvider.query as ReturnType<typeof mock>).mockRejectedValueOnce(
+      mapDatabaseError(new Error("canceling statement due to statement timeout"), "postgres"),
+    );
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "SELECT pg_sleep(5)" },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string; code: string; retryable?: boolean }>(res);
+
+    expect(res.status).toBe(504);
+    expect(data.code).toBe("TIMEOUT_ERROR");
+    expect(res.status).not.toBe(499);
+  });
+
   test("returns 500 for generic error", async () => {
     (mockProvider.query as ReturnType<typeof mock>).mockRejectedValueOnce(new Error("Something unexpected happened"));
 
@@ -346,6 +679,22 @@ describe("POST /api/db/query", () => {
     expect(data.error).toBe("Something unexpected happened");
   });
 
+  // The probe adds one to the limit, so a limit that is not a number would be concatenated, not added.
+  for (const options of [{ limit: "500" }, { limit: -1 }, { limit: 1.5 }, { offset: "0" }, { offset: -5 }, null]) {
+    test(`refuses options ${JSON.stringify(options)} before any provider is reached`, async () => {
+      const req = createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: validConnection, sql: "SELECT * FROM users", options },
+      });
+
+      const res = await POST(req as never);
+
+      expect(res.status).toBe(400);
+      expect(mockProvider.prepareQuery).not.toHaveBeenCalled();
+      expect(mockProvider.query).not.toHaveBeenCalled();
+    });
+  }
+
   test("calls prepareQuery with sql and options", async () => {
     const req = createMockRequest("/api/db/query", {
       method: "POST",
@@ -358,11 +707,45 @@ describe("POST /api/db/query", () => {
 
     await POST(req as never);
 
-    expect(mockProvider.prepareQuery).toHaveBeenCalledTimes(1);
-    expect(mockProvider.prepareQuery).toHaveBeenCalledWith("SELECT * FROM users", { limit: 100 });
+    // The first call is the page the caller asked for; the second, made only because the limiter
+    // bounded it, asks for one row more so the route can tell a full last page from a full page (#1440).
+    expect(mockProvider.prepareQuery).toHaveBeenCalledTimes(2);
+    expect(mockProvider.prepareQuery).toHaveBeenNthCalledWith(1, "SELECT * FROM users", { limit: 100 });
+    expect(mockProvider.prepareQuery).toHaveBeenNthCalledWith(2, "SELECT * FROM users", {
+      limit: 51,
+      unlimited: false,
+    });
   });
 
-  test("pagination hasMore is true when rows.length equals limit", async () => {
+  test("the statement that runs is the one that asks for a row past the page, and the extra row is not answered", async () => {
+    (mockProvider.prepareQuery as ReturnType<typeof mock>)
+      .mockImplementationOnce(() => ({ query: "page", wasLimited: true, limit: 3, offset: 0 }))
+      .mockImplementationOnce(() => ({ query: "page+1", wasLimited: true, limit: 4, offset: 0 }));
+    (mockProvider.query as ReturnType<typeof mock>).mockResolvedValueOnce({
+      rows: [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }],
+      fields: ["id"],
+      rowCount: 4,
+      executionTime: 10,
+    });
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "SELECT * FROM users" },
+    });
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{
+      rows: unknown[];
+      rowCount: number;
+      pagination: { hasMore: boolean; totalReturned: number; wasLimited: boolean };
+    }>(res);
+
+    expect((mockProvider.query as ReturnType<typeof mock>).mock.calls.at(-1)?.[0]).toBe("page+1");
+    expect(data.rows).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+    expect(data.rowCount).toBe(3);
+    expect(data.pagination).toMatchObject({ hasMore: true, totalReturned: 3, wasLimited: true });
+  });
+
+  test("a page that ends exactly full offers no further page (#1440)", async () => {
     const fiftyRows = Array.from({ length: 50 }, (_, i) => ({ id: i + 1 }));
     (mockProvider.query as ReturnType<typeof mock>).mockResolvedValueOnce({
       rows: fiftyRows,
@@ -382,8 +765,46 @@ describe("POST /api/db/query", () => {
     }>(res);
 
     expect(res.status).toBe(200);
-    expect(data.pagination.hasMore).toBe(true);
+    expect(data.pagination.hasMore).toBe(false);
     expect(data.pagination.totalReturned).toBe(50);
+  });
+
+  /**
+   * `hasMore` requires that the bound is OURS (#816).
+   *
+   * A statement the limiter DECLINED to rewrite comes back `wasLimited: false` with the
+   * user's own bound still in the text — a ClickHouse query ending in `SETTINGS`, or a
+   * hand-written `LIMIT 50`. Without this conjunct such a statement, returning exactly
+   * `prepared.limit` rows, offered a Load More whose click re-ran it unchanged and
+   * appended the rows already on screen. The two neighbouring tests both run with the
+   * mock's default `wasLimited: true`, so neither can see this arm.
+   */
+  test("pagination hasMore is false at exactly limit rows when the bound is not ours", async () => {
+    const declinedProvider = createMockProvider({
+      prepareQueryResult: { query: "SELECT * FROM users LIMIT 50", wasLimited: false, limit: 50, offset: 0 },
+    });
+    mockGetOrCreateProvider.mockResolvedValueOnce(declinedProvider as never);
+    (declinedProvider.query as ReturnType<typeof mock>).mockResolvedValueOnce({
+      rows: Array.from({ length: 50 }, (_, i) => ({ id: i + 1 })),
+      fields: ["id"],
+      rowCount: 50,
+      executionTime: 10,
+    });
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "SELECT * FROM users LIMIT 50" },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{
+      pagination: { hasMore: boolean; totalReturned: number; wasLimited: boolean };
+    }>(res);
+
+    expect(res.status).toBe(200);
+    expect(data.pagination.wasLimited).toBe(false);
+    expect(data.pagination.totalReturned).toBe(50);
+    expect(data.pagination.hasMore).toBe(false);
   });
 
   test("pagination hasMore is false when rows.length less than limit", async () => {
@@ -408,6 +829,151 @@ describe("POST /api/db/query", () => {
     expect(res.status).toBe(200);
     expect(data.pagination.hasMore).toBe(false);
     expect(data.pagination.totalReturned).toBe(3);
+  });
+
+  /**
+   * A bound the PROVIDER applied reaches the response too (#1085, section 5.4).
+   *
+   * The route rebuilt `pagination` from `prepareQuery` alone, so a provider that cut its own
+   * result said so into a field the response then overwrote. The fixture is that provider's
+   * shape: its `prepareQuery` rewrites nothing, and its result carries its own `pagination`.
+   * The rows fill `prepared.limit` exactly and the provider's own `hasMore` says true, so a
+   * route that took `hasMore` from the provider, or from the joined `wasLimited`, would offer
+   * a Load More that re-runs the same statement; and the provider's other four fields differ
+   * from the route's, so only `wasLimited` may cross.
+   */
+  test("keeps a provider-reported wasLimited, and hasMore stays on the limiter's own bound", async () => {
+    const selfBounded = createMockProvider({
+      prepareQueryResult: { query: "up", wasLimited: false, limit: 3, offset: 0 },
+    });
+    mockGetOrCreateProvider.mockResolvedValueOnce(selfBounded as never);
+    (selfBounded.query as ReturnType<typeof mock>).mockResolvedValueOnce({
+      rows: [{ value: 1 }, { value: 2 }, { value: 3 }],
+      fields: ["value"],
+      rowCount: 3,
+      executionTime: 4,
+      pagination: { limit: 500, offset: 7, hasMore: true, totalReturned: 500, wasLimited: true },
+    });
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "up" },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{
+      pagination: { limit: number; offset: number; hasMore: boolean; totalReturned: number; wasLimited: boolean };
+    }>(res);
+
+    expect(res.status).toBe(200);
+    expect(data.pagination).toEqual({ limit: 3, offset: 0, hasMore: false, totalReturned: 3, wasLimited: true });
+  });
+
+  test("the control: the same provider with no pagination of its own reports the limiter's false", async () => {
+    const unbounded = createMockProvider({
+      prepareQueryResult: { query: "up", wasLimited: false, limit: 3, offset: 0 },
+    });
+    mockGetOrCreateProvider.mockResolvedValueOnce(unbounded as never);
+    (unbounded.query as ReturnType<typeof mock>).mockResolvedValueOnce({
+      rows: [{ value: 1 }, { value: 2 }, { value: 3 }],
+      fields: ["value"],
+      rowCount: 3,
+      executionTime: 4,
+    });
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "up" },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{
+      pagination: { limit: number; offset: number; hasMore: boolean; totalReturned: number; wasLimited: boolean };
+    }>(res);
+
+    expect(res.status).toBe(200);
+    expect(data.pagination).toEqual({ limit: 3, offset: 0, hasMore: false, totalReturned: 3, wasLimited: false });
+  });
+
+  test("a SQL result with no pagination of its own answers exactly what the route answered before", async () => {
+    // Every shipped provider's shape: the mock's default `prepareQuery` rewrote the statement
+    // (`wasLimited: true`, limit 50, `tests/helpers/mock-provider.ts:157-165`) and the result
+    // carries no `pagination`. The whole object is pinned, so no field of it moved.
+    (mockProvider.query as ReturnType<typeof mock>).mockResolvedValueOnce({
+      rows: Array.from({ length: 51 }, (_, i) => ({ id: i + 1 })),
+      fields: ["id"],
+      rowCount: 51,
+      executionTime: 10,
+    });
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "SELECT * FROM users" },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{
+      pagination: { limit: number; offset: number; hasMore: boolean; totalReturned: number; wasLimited: boolean };
+    }>(res);
+
+    expect(res.status).toBe(200);
+    expect(data.pagination).toEqual({ limit: 50, offset: 0, hasMore: true, totalReturned: 50, wasLimited: true });
+  });
+
+  test("a provider's own false cannot clear a bound the limiter applied", async () => {
+    // The same limiter-bounded statement, and a result that says `wasLimited: false`. No shipped
+    // provider sets `pagination`, so this is the arm that keeps an external implementer's
+    // `false` from hiding the badge, and `hasMore` still answers from the limiter's bound.
+    (mockProvider.query as ReturnType<typeof mock>).mockResolvedValueOnce({
+      rows: Array.from({ length: 51 }, (_, i) => ({ id: i + 1 })),
+      fields: ["id"],
+      rowCount: 51,
+      executionTime: 10,
+      pagination: { limit: 50, offset: 0, hasMore: false, totalReturned: 51, wasLimited: false },
+    });
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "SELECT * FROM users" },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{
+      pagination: { limit: number; offset: number; hasMore: boolean; totalReturned: number; wasLimited: boolean };
+    }>(res);
+
+    expect(res.status).toBe(200);
+    expect(data.pagination).toEqual({ limit: 50, offset: 0, hasMore: true, totalReturned: 50, wasLimited: true });
+  });
+
+  test("a provider's own false leaves an untouched statement unlimited", async () => {
+    // The mirror of the test above: nothing bounded this statement, and the provider's result
+    // carries a `pagination` that says `wasLimited: false`. Only a `true` crosses, so a
+    // `pagination` that is present is not by itself a bound, and the badge stays off.
+    const untouched = createMockProvider({
+      prepareQueryResult: { query: "up", wasLimited: false, limit: 3, offset: 0 },
+    });
+    mockGetOrCreateProvider.mockResolvedValueOnce(untouched as never);
+    (untouched.query as ReturnType<typeof mock>).mockResolvedValueOnce({
+      rows: [{ value: 1 }, { value: 2 }, { value: 3 }],
+      fields: ["value"],
+      rowCount: 3,
+      executionTime: 4,
+      pagination: { limit: 3, offset: 0, hasMore: false, totalReturned: 3, wasLimited: false },
+    });
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "up" },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{
+      pagination: { limit: number; offset: number; hasMore: boolean; totalReturned: number; wasLimited: boolean };
+    }>(res);
+
+    expect(res.status).toBe(200);
+    expect(data.pagination).toEqual({ limit: 3, offset: 0, hasMore: false, totalReturned: 3, wasLimited: false });
   });
 
   test("returns 499 for interrupted query execution", async () => {
@@ -467,7 +1033,7 @@ describe("POST /api/db/query — the editor path stays outside the agent policy 
 
     expect(res.status).toBe(200);
     // Reached the driver verbatim: not refused, not rewritten, not downgraded.
-    expect(writeProvider.query).toHaveBeenCalledWith(writeStatement, undefined);
+    expect(writeProvider.query).toHaveBeenCalledWith(writeStatement, undefined, undefined, expect.any(String));
     // The shared, fully-privileged provider cache - never an execution profile.
     expect(mockGetOrCreateProvider).toHaveBeenCalledTimes(1);
   });
@@ -504,5 +1070,1176 @@ describe("POST /api/db/query — the editor path stays outside the agent policy 
   test("no /api/db route imports the agent operations layer", () => {
     const gated = dbRouteFiles.filter((file) => readFileSync(file, "utf8").includes("@/lib/db/operations"));
     expect(gated).toEqual([]);
+  });
+});
+
+// ─── Server-built EXPLAIN (#574) ────────────────────────────────────────────
+//
+// The Explain panel used to build the EXPLAIN statement in the browser from the
+// static `explainFormat` that `POST /api/db/provider-meta` answers WITHOUT
+// connecting (#457). On the MySQL wire family the accepted form is only knowable
+// once connected: measured 2026-09-06, `EXPLAIN FORMAT=JSON SELECT 1` is errno
+// 1105 on TiDB v8.5.1 ("explain format 'json' is not supported now") and Apache
+// Doris 4.1.3 ("mismatched input '='"), and errno 1064 on StarRocks 3.3.22 and
+// SingleStore, while plain `EXPLAIN SELECT 1` is accepted on all of them. So the
+// statement is built here, where the CONNECTED provider is, and the client sends
+// the original statement plus the mode it wants.
+describe("POST /api/db/query with an explain request", () => {
+  const explainCapableProvider = () => createMockProvider({ capabilities: { explainFormat: "postgres-json" } });
+
+  beforeEach(() => {
+    clearRateLimitState();
+    mockGetOrCreateProvider.mockClear();
+    (mockProvider.query as ReturnType<typeof mock>).mockClear();
+    mockGetSession.mockClear();
+    mockGetSession.mockImplementation(
+      async (): Promise<{ role: string; username: string } | null> => ({ role: "admin", username: "admin" }),
+    );
+  });
+
+  test("runs the statement the connected provider's strategy builds and names the format", async () => {
+    const provider = explainCapableProvider();
+    mockGetOrCreateProvider.mockResolvedValueOnce(provider as never);
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: {
+        connection: validConnection,
+        sql: "SELECT * FROM users",
+        options: {},
+        explain: { mode: "estimate" },
+      },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ explainFormat: string }>(res);
+
+    expect(res.status).toBe(200);
+    // The estimate plans without ANALYZE, so the statement is never executed (#1311).
+    expect(provider.query).toHaveBeenCalledWith(
+      "EXPLAIN (FORMAT JSON) SELECT * FROM users LIMIT 50",
+      undefined,
+      undefined,
+      expect.any(String),
+    );
+    expect(data.explainFormat).toBe("postgres-json");
+  });
+
+  test("an analyze request builds the executing form the Explain button asks for", async () => {
+    const provider = explainCapableProvider();
+    mockGetOrCreateProvider.mockResolvedValueOnce(provider as never);
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "SELECT * FROM users", options: {}, explain: { mode: "analyze" } },
+    });
+
+    const res = await POST(req as never);
+
+    expect(res.status).toBe(200);
+    expect(provider.query).toHaveBeenCalledWith(
+      "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT * FROM users LIMIT 50",
+      undefined,
+      undefined,
+      expect.any(String),
+    );
+  });
+
+  /**
+   * An EXPLAIN prefixes ONE statement. Handed `SELECT 1 AS a; INSERT ...` it explained
+   * the SELECT and the simple-query protocol then ran the INSERT as a statement of its
+   * own: measured on Materialize 26.44.1, AlloyDB Omni 17.9 and Cloudberry 2.1.0, a RUN
+   * of that text applied the INSERT twice, once in the run and once in its background
+   * plan request (#1311). Refused before any provider is opened, so nothing runs.
+   */
+  test.each<[string, string]>([
+    ["a SELECT followed by a write", "SELECT 1 AS a; INSERT INTO t VALUES (7)"],
+    ["two SELECTs", "SELECT 1; SELECT 2"],
+    // `E'\\''` is one quote character to PostgreSQL, so the `;` after it ends the
+    // statement and the INSERT is a second one. Whether a backslash escapes is not a
+    // grammar fact the splitter carries, so it reads the run as unterminated and finds
+    // no boundary: an unresolvable text is not a single statement either.
+    ["a backslash-escaped string hiding a write", "SELECT E'\\''; INSERT INTO t VALUES (7)"],
+    // PostgreSQL ends a `--` comment at a lone carriage return and CockroachDB, on the same type id, does not, so
+    // whether the INSERT is code depends on the server, and such a text is not one statement to explain.
+    ["a write after a lone carriage return in a line comment", "SELECT 1 -- x\r; INSERT INTO t VALUES (7)"],
+  ])("returns 400 and runs nothing for an explain of %s", async (_label, sql) => {
+    // No provider is queued: the refusal comes before one is opened, and a queued
+    // `mockResolvedValueOnce` nobody consumed would leak into the next test.
+    for (const mode of ["estimate", "analyze"]) {
+      const req = createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: validConnection, sql, explain: { mode } },
+      });
+
+      const res = await POST(req as never);
+      const data = await parseResponseJSON<{ error: string }>(res);
+
+      expect(res.status).toBe(400);
+      expect(data.error).toBe("Only a single statement can be explained");
+    }
+    expect(mockProvider.query).not.toHaveBeenCalled();
+    expect(mockGetOrCreateProvider).not.toHaveBeenCalled();
+  });
+
+  // A comment is not a statement: the splitter keeps a note after the last `;` as a
+  // fragment of its own, and counting it refused a single SELECT the run itself accepts.
+  test.each<[string, string]>([
+    ["a trailing and a quoted semicolon", "SELECT ';' AS s;"],
+    ["a trailing line comment", "SELECT 1; -- note"],
+    ["a trailing block comment", "SELECT 1; /* c */"],
+  ])("a statement with %s is still one statement", async (_label, sql) => {
+    const provider = explainCapableProvider();
+    mockGetOrCreateProvider.mockResolvedValueOnce(provider as never);
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql, options: {}, explain: { mode: "estimate" } },
+    });
+
+    const res = await POST(req as never);
+
+    expect(res.status).toBe(200);
+    expect(provider.query).toHaveBeenCalledTimes(1);
+  });
+
+  test("returns 400 and runs nothing when the provider declares no EXPLAIN support", async () => {
+    const provider = createMockProvider({ capabilities: { supportsExplain: false, explainFormat: "postgres-json" } });
+    mockGetOrCreateProvider.mockResolvedValueOnce(provider as never);
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "SELECT 1", explain: { mode: "analyze" } },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(data.error).toBe("This server does not support EXPLAIN");
+    expect(provider.query).not.toHaveBeenCalled();
+  });
+
+  test("returns 400 and runs nothing when the provider declares no explain format", async () => {
+    // supportsExplain true with no format is the Elasticsearch shape: the button is
+    // hidden because no format is declared, so a request for one is still refused.
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "SELECT 1", explain: { mode: "analyze" } },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(data.error).toBe("This server does not support EXPLAIN");
+    expect(mockProvider.query).not.toHaveBeenCalled();
+  });
+
+  test("an explain on an engine whose text is not SQL is not counted as SQL statements: the provider's own gate answers", async () => {
+    // A Firestore statement enforces one statement in its own parser; the SQL counter would read a `;` in its comment as a
+    // second statement. On every other non-SQL engine no EXPLAIN is declared, so the answer moves from the statement-count
+    // sentence to this one, and no UI path sends such a request (Firestore spec 3.2).
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: {
+        connection: { ...validConnection, type: "mongodb" },
+        sql: "first; second",
+        explain: { mode: "estimate" },
+      },
+    });
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string }>(res);
+    expect(res.status).toBe(400);
+    expect(data.error).toBe("This server does not support EXPLAIN");
+    expect(mockProvider.query).not.toHaveBeenCalled();
+  });
+
+  test("returns 400 and runs nothing when the provider names a format this build does not register", async () => {
+    // `getExplainStrategy` indexes a Record, so a format outside the union comes back as
+    // undefined rather than null. A strict null check let that fall through to
+    // `strategy.buildSql` and a TypeError, which the error mapper reports as a 500 with
+    // no sentence a user can act on. Unreachable from this repo's providers today; an
+    // external implementer of the published interface can declare anything.
+    const provider = createMockProvider({
+      capabilities: { supportsExplain: true, explainFormat: "oracle-hierarchy" as never },
+    });
+    mockGetOrCreateProvider.mockResolvedValueOnce(provider as never);
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "SELECT 1", explain: { mode: "analyze" } },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(data.error).toBe("This server does not support EXPLAIN");
+    expect(provider.query).not.toHaveBeenCalled();
+  });
+
+  test("returns 400 and runs nothing for a statement the strategy declines", async () => {
+    const provider = explainCapableProvider();
+    mockGetOrCreateProvider.mockResolvedValueOnce(provider as never);
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: {
+        connection: validConnection,
+        sql: "UPDATE users SET name = 'x'",
+        explain: { mode: "analyze" },
+      },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(data.error).toBe("Only SELECT statements can be explained");
+    expect(provider.query).not.toHaveBeenCalled();
+  });
+
+  test("binds an explain request's parameters to the statement the strategy built", async () => {
+    // The strategies only PREFIX the statement, so the built statement carries the
+    // same placeholders in the same order and the same values bind them. This is the
+    // contract PR #304 relied on when the browser still built the EXPLAIN itself:
+    // without it, every generated statement that sends its values separately would
+    // lose its plan.
+    const provider = explainCapableProvider();
+    mockGetOrCreateProvider.mockResolvedValueOnce(provider as never);
+
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: {
+        connection: validConnection,
+        sql: "SELECT * FROM users WHERE id = $1",
+        options: {},
+        params: [7],
+        explain: { mode: "estimate" },
+      },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ explainFormat: string }>(res);
+
+    expect(res.status).toBe(200);
+    expect(provider.query).toHaveBeenCalledWith(
+      "EXPLAIN (FORMAT JSON) SELECT * FROM users WHERE id = $1 LIMIT 50",
+      [7],
+      undefined,
+      expect.any(String),
+    );
+    expect(data.explainFormat).toBe("postgres-json");
+  });
+
+  test.each([
+    ["a missing mode", {}],
+    ["an unknown mode", { mode: "profile" }],
+    ["a non-object explain", "estimate"],
+    ["a null explain", null],
+  ])("returns 400 for %s", async (_label, explain) => {
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "SELECT 1", explain },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(data.error).toContain("explain");
+    expect(mockProvider.query).not.toHaveBeenCalled();
+  });
+
+  test("a request without an explain field runs the statement and names no format", async () => {
+    const req = createMockRequest("/api/db/query", {
+      method: "POST",
+      body: { connection: validConnection, sql: "SELECT * FROM users" },
+    });
+
+    const res = await POST(req as never);
+    const data = await parseResponseJSON<Record<string, unknown>>(res);
+
+    expect(res.status).toBe(200);
+    expect(mockProvider.query).toHaveBeenCalledWith(
+      "SELECT * FROM users LIMIT 50",
+      undefined,
+      undefined,
+      expect.any(String),
+    );
+    expect("explainFormat" in data).toBe(false);
+  });
+});
+
+describe("POST /api/db/query and the transaction its own statement left open", () => {
+  beforeEach(() => {
+    clearRateLimitState();
+    mockGetOrCreateProvider.mockClear();
+    // One test below installs a persistent provider double, so the default is put back
+    // here rather than at the end of that test, where a failing assertion would skip it.
+    mockGetOrCreateProvider.mockResolvedValue(mockProvider as never);
+    (mockProvider.query as ReturnType<typeof mock>).mockClear();
+  });
+
+  // ── WHY THIS ROUTE ENDS ITS OWN TRANSACTION, AND ONLY ITS OWN (D74, D87) ──
+  //
+  // A single statement CAN leave a transaction open here: MEASURED 2026-09-15 against
+  // PostgreSQL 18.4 through this handler with the real provider and the real cache, a
+  // lone `BEGIN` answered 200, released its pooled client in status `T`, and the next
+  // request on the same cached provider ran its `CREATE TABLE` inside that stranger's
+  // transaction, answered 200, and an independent reader saw no such table.
+  //
+  // The finally below was tried once WITHOUT D87 and reverted, because the ender it calls
+  // named one shared pointer: it rolled back whichever client anybody had recorded last.
+  // Measured on the same engine, a plain `SELECT pg_sleep(3)` sent here rolled back a
+  // concurrent `/api/db/multi-query` script mid-flight — the script was told all four
+  // statements had succeeded, its `COMMIT` included, and its `CREATE TABLE` was gone — and
+  // also discarded an interactive `POST /api/db/transaction` session's committed work
+  // while `commit` still answered "Transaction committed". Nothing threw in either run.
+  //
+  // So the route mints a scope, passes it to the statement it runs, and ends THAT scope.
+  // The two tests below are the two halves: the serial leak closes, and the cross-request
+  // probe leaves the other caller's transaction untouched.
+
+  /**
+   * A stand-in for the shared `PostgresProvider`: clients recorded per call SCOPE, and an
+   * ender that can only reach the clients the scope it is given ran on. The scope is the
+   * fourth argument of `query()`, which is what the route supplies.
+   */
+  function sharedProviderKeyedByScope() {
+    const perScope = new Map<string, { inTransaction: boolean }>();
+    let releaseSlowQuery = () => {};
+    let slowQueryStarted = () => {};
+    const slowQueryRunning = new Promise<void>((resolve) => {
+      slowQueryStarted = resolve;
+    });
+
+    const provider = {
+      ...createMockProvider(),
+      query: mock(async (sql: string, _params?: unknown[], _queryId?: string, scope?: string) => {
+        const client = { inTransaction: /^\s*BEGIN/i.test(sql) };
+        // Only a call that left a transaction open is recorded, and only under the scope
+        // that ran it, which is what the provider does with the server's own status byte.
+        if (scope !== undefined && client.inTransaction) perScope.set(scope, client);
+        if (sql.includes("pg_sleep")) {
+          slowQueryStarted();
+          await new Promise<void>((resolve) => {
+            releaseSlowQuery = resolve;
+          });
+        }
+        return { rows: [], fields: [], rowCount: 0, executionTime: 1 };
+      }),
+      endOpenQueryTransaction: mock(async (scope: string) => {
+        const client = perScope.get(scope);
+        perScope.delete(scope);
+        if (client === undefined || !client.inTransaction) return "none" as const;
+        client.inTransaction = false;
+        return "rolled-back" as const;
+      }),
+      openTransactionCount: () => [...perScope.values()].filter((c) => c.inTransaction).length,
+    };
+    return { provider, slowQueryRunning, releaseSlowQuery: () => releaseSlowQuery() };
+  }
+
+  test("ends the transaction its own statement left open and says so", async () => {
+    const { provider } = sharedProviderKeyedByScope();
+    mockGetOrCreateProvider.mockResolvedValue(provider as never);
+
+    const res = await POST(
+      createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: validConnection, sql: "BEGIN" },
+      }) as never,
+    );
+    const data = await parseResponseJSON<Record<string, unknown>>(res);
+
+    expect(res.status).toBe(200);
+    expect(data.openTransaction).toBe("rolled-back");
+    // Nothing is left behind for the next user of this cached provider to walk into.
+    expect(provider.openTransactionCount()).toBe(0);
+  });
+
+  test("says nothing about a transaction when its statement opened none", async () => {
+    const { provider } = sharedProviderKeyedByScope();
+    mockGetOrCreateProvider.mockResolvedValue(provider as never);
+
+    const res = await POST(
+      createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: validConnection, sql: "SELECT 1" },
+      }) as never,
+    );
+    const data = await parseResponseJSON<Record<string, unknown>>(res);
+
+    expect(res.status).toBe(200);
+    expect(provider.endOpenQueryTransaction).toHaveBeenCalledTimes(1);
+    expect("openTransaction" in data).toBe(false);
+  });
+
+  test("does not discard a transaction another caller of the shared provider opened", async () => {
+    const { provider, slowQueryRunning, releaseSlowQuery } = sharedProviderKeyedByScope();
+    mockGetOrCreateProvider.mockResolvedValue(provider as never);
+
+    // A: an ordinary slow read through this route. It opens nothing.
+    const slow = POST(
+      createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: validConnection, sql: "SELECT pg_sleep(3)" },
+      }) as never,
+    );
+    await slowQueryRunning;
+
+    // B: another caller of the same cached provider opens a transaction while A runs,
+    // which is what a `/api/db/multi-query` script or the interactive session does. It
+    // runs under a scope of its own, as every other caller does.
+    await provider.query("BEGIN", undefined, undefined, "scope-of-another-caller");
+
+    releaseSlowQuery();
+    const res = await slow;
+    const data = await parseResponseJSON<Record<string, unknown>>(res);
+
+    expect(res.status).toBe(200);
+    // B's transaction is still B's. A rolled nothing back, and A claimed nothing.
+    expect(provider.openTransactionCount()).toBe(1);
+    expect("openTransaction" in data).toBe(false);
+
+    // The control that makes the two assertions above non-vacuous: named by its OWN scope,
+    // the same ender reaches the very transaction A could not.
+    expect(await provider.endOpenQueryTransaction("scope-of-another-caller")).toBe("rolled-back");
+    expect(provider.openTransactionCount()).toBe(0);
+  });
+
+  test("ends the transaction a FAILING statement left open, which is where they come from", async () => {
+    // The finally is a finally for this: a statement that raised inside its own BEGIN is
+    // what releases a client in status `E`, and every later request that draws it answers
+    // 500 until somebody ends it.
+    const endOpenQueryTransaction = mock(async () => "rolled-back" as const);
+    const provider = { ...createMockProvider(), endOpenQueryTransaction };
+    (provider.query as ReturnType<typeof mock>).mockImplementationOnce(async () => {
+      throw new QueryError(
+        "current transaction is aborted, commands ignored until end of transaction block",
+        "postgres",
+      );
+    });
+    mockGetOrCreateProvider.mockResolvedValueOnce(provider as never);
+
+    const res = await POST(
+      createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: validConnection, sql: "SELECT 1" },
+      }) as never,
+    );
+    const data = await parseResponseJSON<Record<string, unknown>>(res);
+
+    expect(res.status).toBe(400);
+    expect(endOpenQueryTransaction).toHaveBeenCalledTimes(1);
+    // The error response is the statement's own; the route invents no transaction verdict
+    // on a body it is not returning.
+    expect("openTransaction" in data).toBe(false);
+  });
+
+  test("leaves a provider that cannot name its own session exactly as it found it", async () => {
+    // `endOpenQueryTransaction` is optional for the reason its declaration gives, and a
+    // provider without it is not guessed at.
+    const provider = createMockProvider();
+    expect("endOpenQueryTransaction" in provider).toBe(false);
+    mockGetOrCreateProvider.mockResolvedValueOnce(provider as never);
+
+    const res = await POST(
+      createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: validConnection, sql: "BEGIN" },
+      }) as never,
+    );
+    const data = await parseResponseJSON<Record<string, unknown>>(res);
+
+    expect(res.status).toBe(200);
+    expect("openTransaction" in data).toBe(false);
+  });
+});
+
+// ─── the database a run reads (#1095) ────────────────────────────────────────
+/**
+ * A key lives in exactly one numbered database and `GET <key>` cannot name it, so a run that must
+ * reach another one says which — as a field BESIDE the connection, because a managed connection
+ * travels as an id and the server discards whatever the caller attached to it. The field is refused
+ * outright on an engine that declares no key-space walk: on any other engine it would be a per-run
+ * override of an operator-pinned `database` with no walk to justify it.
+ */
+describe("POST /api/db/query — the database a run reads", () => {
+  beforeEach(() => {
+    clearRateLimitState();
+    mockGetOrCreateProvider.mockClear();
+    mockCreateDatabaseProvider.mockClear();
+    (mockProvider.query as ReturnType<typeof mock>).mockClear();
+    (mockProvider.prepareQuery as ReturnType<typeof mock>).mockClear();
+    (mockProvider.getCapabilities as ReturnType<typeof mock>).mockClear();
+  });
+
+  /** The connections the route asked to open, in order, with the typing the calls carry. */
+  function openedConnections(): Array<Record<string, unknown>> {
+    return (mockGetOrCreateProvider.mock.calls as unknown as Array<[Record<string, unknown>]>).map((call) => call[0]);
+  }
+
+  test("applies a run's database to the connection a managed id resolved to", async () => {
+    // `defaultCapabilities` declares no walk, and the gate reads the declaration: one walk-shaped
+    // answer is injected for this request, exactly as the real provider declares it.
+    (mockProvider.getCapabilities as ReturnType<typeof mock>).mockReturnValueOnce({
+      keyScan: { defaultCount: 500, maxCount: 1000 },
+      // Redis's own container level beside its walk: the field is taken only where there is a database
+      // to name (spec 3.4).
+      containerLevels: [{ id: "schema", label: "Database", labelPlural: "Databases" }],
+    });
+
+    const res = await POST(
+      createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connectionId: "seed:test-redis-6380", sql: "GET db1:only:key", database: 3 },
+      }) as never,
+    );
+
+    expect(res.status).toBe(200);
+    // The declaration is read from the operator's config without a socket, and only the connection
+    // with this run's database applied is opened. Before this field a caller had no way to produce
+    // that connection at all, so the read fell back to the session's database while the key tab
+    // claimed it had read another.
+    expect(mockCreateDatabaseProvider.mock.calls[0]?.[0]).toMatchObject({ host: "seed-host", database: "0" });
+    const opened = openedConnections();
+    expect(opened).toHaveLength(1);
+    expect(opened[0]).toMatchObject({ host: "seed-host", database: "3" });
+  });
+
+  test("refuses a database on an engine that declares no key-space walk, without connecting", async () => {
+    (mockProvider.getCapabilities as ReturnType<typeof mock>).mockReturnValueOnce({});
+
+    const res = await POST(
+      createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: validConnection, sql: "SELECT 1", database: 1 },
+      }) as never,
+    );
+    const data = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    expect(data.error).toContain("declares no key-space walk");
+    // Refused from the declaration alone: an unreachable Postgres answered 503 here while the gate
+    // ran after the connect, which reported a network fault for a request that was never valid.
+    expect(mockCreateDatabaseProvider).toHaveBeenCalledTimes(1);
+    expect(openedConnections()).toHaveLength(0);
+  });
+
+  test("refuses a database on an engine that walks one key space, without connecting", async () => {
+    // The walk declared and no container level to name, because one connection is one key space: etcd's
+    // declaration, and the same declaration with the level left out rather than empty (spec 3.4, 4.1).
+    const shapes = [
+      {
+        keyScan: {
+          defaultCount: 500,
+          maxCount: 1000,
+          separator: "/",
+          cursor: "opaque",
+          pattern: "prefix",
+          totalScope: "walk",
+        },
+        containerLevels: [],
+      },
+      { keyScan: { defaultCount: 500, maxCount: 1000 } },
+    ];
+
+    for (const capabilities of shapes) {
+      (mockProvider.getCapabilities as ReturnType<typeof mock>).mockReturnValueOnce(capabilities);
+      const res = await POST(
+        createMockRequest("/api/db/query", {
+          method: "POST",
+          body: {
+            connection: { id: "etcd-1", name: "etcd", type: "etcd", host: "127.0.0.1", port: 2379 },
+            sql: "get /app/cfg",
+            database: 0,
+          },
+        }) as never,
+      );
+      const data = await parseResponseJSON<{ error: string }>(res);
+
+      expect(res.status).toBe(400);
+      expect(data.error).toBe(
+        'etcd walks one key space and declares no database level: "database" names the numbered database a key was walked in, and this engine has none to name',
+      );
+    }
+    // Decided from the unconnected declaration, so no provider, SSH forward or channel was opened or
+    // cached for a value the engine refuses.
+    expect(mockCreateDatabaseProvider).toHaveBeenCalledTimes(2);
+    expect(openedConnections()).toHaveLength(0);
+  });
+
+  test("refuses an invalid database with the sentence the walk route refuses with", async () => {
+    const res = await POST(
+      createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: validConnection, sql: "SELECT 1", database: -1 },
+      }) as never,
+    );
+    const data = await parseResponseJSON<{ error: string }>(res);
+
+    expect(res.status).toBe(400);
+    // `optionalDatabase`'s own sentence, shared with `POST /api/db/keys/scan` — the same words on both
+    // routes is the point, so a change to one of them has to change this expectation too.
+    expect(data.error).toBe('"database" must be a non-negative integer');
+    // Refused before anything is opened at all.
+    expect(openedConnections()).toHaveLength(0);
+  });
+
+  test("names no database at all when a run carries none, and opens the connection once", async () => {
+    const res = await POST(
+      createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: validConnection, sql: "SELECT 1" },
+      }) as never,
+    );
+
+    expect(res.status).toBe(200);
+    // Absent is not zero: one lookup, with the connection exactly as configured, and no
+    // declaration to read.
+    expect(mockCreateDatabaseProvider).not.toHaveBeenCalled();
+    expect(openedConnections()).toHaveLength(1);
+    expect(openedConnections()[0]).toMatchObject({ database: "testdb" });
+  });
+});
+
+/**
+ * A connection type's console text bound. It is read after `resolveConnection` and the
+ * `!sql` check and before the bound parameters, the provider and the statement cache, and the answer never repeats
+ * the text. Milvus and Qdrant declare one; the stand-in below pins the rule apart from them, and the 9 MiB case pins
+ * an engine that declares none.
+ */
+describe("POST /api/db/query: a declared console text bound", () => {
+  const LIMIT = 64;
+  const standIn = { id: "stand-in-1", name: "Stand-in", type: STAND_IN_TYPE };
+  let remove: () => void = () => {};
+
+  beforeEach(() => {
+    clearRateLimitState();
+    mockGetOrCreateProvider.mockClear();
+    (mockProvider.prepareQuery as ReturnType<typeof mock>).mockClear();
+    (mockProvider.query as ReturnType<typeof mock>).mockClear();
+    remove = installStandInVocabulary({ maxTextBytes: LIMIT });
+  });
+
+  afterEach(() => {
+    remove();
+    remove = () => {};
+  });
+
+  async function post(body: Record<string, unknown>) {
+    const res = await POST(createMockRequest("/api/db/query", { method: "POST", body }) as never);
+    return { res, data: await parseResponseJSON<{ error?: string }>(res) };
+  }
+
+  test("answers 413 one byte over, naming the size and the bound, never the text, before any provider", async () => {
+    const sql = `SECRET-${"x".repeat(LIMIT - 6)}`;
+    const { res, data } = await post({ connection: standIn, sql });
+    expect(res.status).toBe(413);
+    expect(data.error).toBe(
+      "The statement is 65 bytes in UTF-8, over the 64-byte limit for this connection type. Shorten it to run it.",
+    );
+    expect(JSON.stringify(data)).not.toContain("SECRET");
+    expect(mockGetOrCreateProvider).not.toHaveBeenCalled();
+    expect(mockProvider.prepareQuery).not.toHaveBeenCalled();
+  });
+
+  test("counts UTF-8 bytes, not characters", async () => {
+    const { res, data } = await post({ connection: standIn, sql: "é".repeat(40) });
+    expect(res.status).toBe(413);
+    expect(data.error).toContain("80 bytes");
+  });
+
+  test("refuses before it reads the bound parameters", async () => {
+    const { res } = await post({ connection: standIn, sql: "x".repeat(LIMIT + 1), params: "not-an-array" });
+    expect(res.status).toBe(413);
+  });
+
+  test("lets a text of exactly the bound through to the provider", async () => {
+    const sql = "x".repeat(LIMIT);
+    const { res } = await post({ connection: standIn, sql });
+    expect(res.status).toBe(200);
+    expect(mockGetOrCreateProvider).toHaveBeenCalledTimes(1);
+    expect((mockProvider.prepareQuery as ReturnType<typeof mock>).mock.calls[0][0]).toBe(sql);
+  });
+
+  test("refuses a sql that is not a string where the type declares a bound", async () => {
+    const { res, data } = await post({ connection: standIn, sql: ["x"] });
+    expect(res.status).toBe(400);
+    expect(data.error).toBe("sql must be a string");
+    expect(mockGetOrCreateProvider).not.toHaveBeenCalled();
+  });
+
+  test("an engine that declares no bound runs a 9 MiB statement as before", async () => {
+    const sql = `SELECT 1 -- ${"x".repeat(9 * 1024 * 1024)}`;
+    const { res } = await post({ connection: validConnection, sql });
+    expect(res.status).toBe(200);
+    expect((mockProvider.prepareQuery as ReturnType<typeof mock>).mock.calls[0][0]).toHaveLength(sql.length);
+  });
+});
+
+describe("POST /api/db/query: an oxia buffer", () => {
+  const oxia = { id: "oxia-1", name: "Oxia", type: "oxia", host: "127.0.0.1", port: 6648 };
+
+  beforeEach(() => {
+    clearRateLimitState();
+    mockGetOrCreateProvider.mockClear();
+    (mockProvider.prepareQuery as ReturnType<typeof mock>).mockClear();
+  });
+
+  test("reaches the provider whole, its # comment and its quotes kept (SB2-4.3)", async () => {
+    // One `oxia client` read command is not SQL text: the route reads no SQL comment out of it and splits nothing.
+    const sql = "# the keys of one tenant\nlist --key-min '/t a/' --key-max \"/t a0\" # until the next tenant\n";
+    const res = await POST(
+      createMockRequest("/api/db/query", { method: "POST", body: { connection: oxia, sql } }) as never,
+    );
+    expect(res.status).toBe(200);
+    expect(mockGetOrCreateProvider).toHaveBeenCalledTimes(1);
+    expect((mockProvider.prepareQuery as ReturnType<typeof mock>).mock.calls[0][0]).toBe(sql);
+  });
+
+  test("answers 413 one byte past the real row's bound, before any provider, and lets the bound itself through", async () => {
+    // The route reads the bound from oxia's own vocabulary row, so this is what the registration adds here.
+    const over = `get /${"x".repeat(OXIA_MAX_TEXT_BYTES - 4)}`;
+    const refused = await POST(
+      createMockRequest("/api/db/query", { method: "POST", body: { connection: oxia, sql: over } }) as never,
+    );
+    expect(refused.status).toBe(413);
+    expect((await parseResponseJSON<{ error?: string }>(refused)).error).toBe(
+      `The statement is ${OXIA_MAX_TEXT_BYTES + 1} bytes in UTF-8, over the ${OXIA_MAX_TEXT_BYTES}-byte limit for this connection type. Shorten it to run it.`,
+    );
+    expect(mockGetOrCreateProvider).not.toHaveBeenCalled();
+
+    const atBound = `get /${"x".repeat(OXIA_MAX_TEXT_BYTES - 5)}`;
+    expect(atBound).toHaveLength(OXIA_MAX_TEXT_BYTES);
+    const res = await POST(
+      createMockRequest("/api/db/query", { method: "POST", body: { connection: oxia, sql: atBound } }) as never,
+    );
+    expect(res.status).toBe(200);
+    expect((mockProvider.prepareQuery as ReturnType<typeof mock>).mock.calls[0][0]).toBe(atBound);
+  });
+});
+
+// ─── Server-level connections (#1530) ───────────────────────────────────────
+describe("POST /api/db/query on a server-level connection (#1530)", () => {
+  const serverConnection = { ...validConnection, id: "server-1", database: "" };
+
+  beforeEach(() => {
+    clearRateLimitState();
+    mockGetOrCreateProvider.mockClear();
+    (mockProvider.query as ReturnType<typeof mock>).mockClear();
+  });
+
+  test("runs the statement in the session of the database the request names", async () => {
+    const session = createMockProvider();
+    const capabilities = mockProvider.getCapabilities as ReturnType<typeof mock>;
+    const defaults = mockProvider.getCapabilities();
+    capabilities.mockImplementation(() => ({ ...defaults, catalogSessions: true }));
+    const server = mockProvider as typeof mockProvider & { forCatalog?: unknown };
+    const forCatalog = mock(async (_catalog: string) => session);
+    server.forCatalog = forCatalog;
+    try {
+      const res = await POST(
+        createMockRequest("/api/db/query", {
+          method: "POST",
+          body: { connection: serverConnection, sql: "SELECT current_database()", catalog: "shop" },
+        }) as never,
+      );
+      expect(res.status).toBe(200);
+      expect(forCatalog.mock.calls).toEqual([["shop"]]);
+      expect(session.query).toHaveBeenCalledTimes(1);
+      expect(mockProvider.query).not.toHaveBeenCalled();
+    } finally {
+      capabilities.mockImplementation(() => defaults);
+      delete server.forCatalog;
+    }
+  });
+
+  test("refuses a catalog on a connection pinned to its database", async () => {
+    const res = await POST(
+      createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: validConnection, sql: "SELECT 1", catalog: "shop" },
+      }) as never,
+    );
+    expect(res.status).toBe(400);
+    expect((await parseResponseJSON<{ error: string }>(res)).error).toContain('cannot run one in "shop"');
+    expect(mockProvider.query).not.toHaveBeenCalled();
+  });
+
+  test("refuses a catalog that is not a database name", async () => {
+    const res = await POST(
+      createMockRequest("/api/db/query", {
+        method: "POST",
+        body: { connection: serverConnection, sql: "SELECT 1", catalog: 3 },
+      }) as never,
+    );
+    expect(res.status).toBe(400);
+    expect(mockProvider.query).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/db/query: the request's abort", () => {
+  function abortableRequest(body: Record<string, unknown>, signal: AbortSignal): Request {
+    return new Request("http://localhost:3000/api/db/query", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    });
+  }
+
+  beforeEach(() => {
+    clearRateLimitState();
+    mockGetSession.mockImplementation(async () => ({ role: "admin", username: "admin" }));
+  });
+
+  test("an abort during the call cancels the bound id once", async () => {
+    let release: (() => void) | undefined;
+    const cancelQuery = mock(async (_id: string) => {
+      release?.();
+      return true;
+    });
+    const provider = Object.assign(createMockProvider(), { cancelQuery });
+    (provider.query as ReturnType<typeof mock>).mockImplementation(async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      throw new QueryCancelledError("The query was cancelled.");
+    });
+    mockGetOrCreateProvider.mockImplementation(async () => provider as never);
+    const controller = new AbortController();
+    const answer = POST(
+      abortableRequest(
+        { connection: validConnection, sql: "SELECT 1", queryId: "q-9-one" },
+        controller.signal,
+      ) as never,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    controller.abort();
+    await answer;
+    expect(cancelQuery).toHaveBeenCalledTimes(1);
+    expect(cancelQuery).toHaveBeenCalledWith("q-9-one");
+  });
+
+  test("a request already aborted calls provider.query zero times", async () => {
+    const provider = Object.assign(createMockProvider(), { cancelQuery: mock(async () => true) });
+    mockGetOrCreateProvider.mockImplementation(async () => provider as never);
+    const controller = new AbortController();
+    controller.abort();
+    await POST(
+      abortableRequest(
+        { connection: validConnection, sql: "SELECT 1", queryId: "q-9-two" },
+        controller.signal,
+      ) as never,
+    );
+    expect(provider.query).not.toHaveBeenCalled();
+  });
+
+  test("a provider without cancelQuery sees no cancel", async () => {
+    const provider = createMockProvider();
+    mockGetOrCreateProvider.mockImplementation(async () => provider as never);
+    const controller = new AbortController();
+    const answer = POST(
+      abortableRequest(
+        { connection: validConnection, sql: "SELECT 1", queryId: "q-9-three" },
+        controller.signal,
+      ) as never,
+    );
+    controller.abort();
+    await answer;
+    expect("cancelQuery" in provider).toBe(false);
+  });
+});
+
+const { recordGovernanceSnapshot, resetGovernanceState } = await import("@/lib/governance/state");
+const { validateSettings } = await import("@/lib/governance/settings");
+const { grantedSnapshot } = await import("../../helpers/governance/granted-snapshot");
+const { queryEventInput } = await import("../../helpers/governance/query-event-input");
+const { flushQueryEvents, queryEventSinkState, recordQueryEvent, resetQueryEventSink } = await import(
+  "@/lib/query-events/sink"
+);
+const { SeedConnectionError: MockedSeedConnectionError } = (await import(
+  "@/lib/seed/resolve-connection"
+)) as unknown as {
+  SeedConnectionError: new (message: string, statusCode: number, code?: string) => Error;
+};
+const { logger } = await import("@/lib/logger");
+
+/**
+ * The editor's query events (docs/GOVERNANCE.md#query-events): under governance one `editor` event per request that
+ * ran, with its status, its rows and the level of the grant it ran with, and one `refused` event per request turned
+ * away before it ran. The sink, the builder and the admission gate are the real ones; only the insert is faked, and
+ * every test reads the rows the sink handed to it.
+ */
+describe("POST /api/db/query: query events under governance", () => {
+  const SUBJECT = "8d0f6a4e-2b1c-4f3a-9e7d-5c6b4a3f2e1d";
+  const governedSession = { role: "user", username: "alice@example.com", idpSubject: SUBJECT };
+  /** A governed record as `resolveConnection` hands it out under a write grant. */
+  const governedConnection = {
+    id: "seed:orders",
+    name: "Orders",
+    type: "postgres",
+    host: "orders.db.example.internal",
+    port: 5432,
+    database: "orders",
+    user: "writer",
+    password: "example-only-write-password",
+    managed: true,
+    literal: true,
+    grantLevel: "write",
+  };
+  const ENV: Readonly<Record<string, string>> = {
+    GOVERNANCE_SOURCE: "postgres",
+    GOVERNANCE_POSTGRES_URL: "postgresql://libredb_studio@db.internal:5432/libredb?sslmode=verify-full",
+    GOVERNANCE_INSTANCE_ID: "libredb-studio",
+  };
+  let saved: Record<string, string | undefined> = {};
+
+  function settings(...rows: { readonly key: string; readonly value: unknown }[]): void {
+    recordGovernanceSnapshot({
+      ...grantedSnapshot([], []),
+      settings: validateSettings(
+        rows.map(({ key, value }) => ({ key, value, updated_at: new Date() })),
+        1,
+      ),
+    });
+  }
+
+  /** Every event the sink holds, inserted at once, as the shutdown flush inserts them. */
+  async function recordedEvents(): Promise<QueryEventRow[]> {
+    await flushQueryEvents();
+    return insertedEvents;
+  }
+
+  function run(body: Record<string, unknown>) {
+    return POST(createMockRequest("/api/db/query", { method: "POST", body }) as never);
+  }
+
+  beforeEach(() => {
+    saved = {};
+    for (const [name, value] of Object.entries(ENV)) {
+      saved[name] = process.env[name];
+      process.env[name] = value;
+    }
+    clearRateLimitState();
+    insertedEvents.length = 0;
+    insertFailure = null;
+    settings();
+    resolveConnectionOverride = async () => governedConnection;
+    mockGetSession.mockImplementation(async () => governedSession);
+    mockGetOrCreateProvider.mockClear();
+    mockGetOrCreateProvider.mockImplementation(async () => mockProvider);
+    (mockProvider.query as ReturnType<typeof mock>).mockClear();
+    (mockProvider.query as ReturnType<typeof mock>).mockImplementation(async () => ({
+      rows: [{ id: 1 }, { id: 2 }],
+      fields: ["id"],
+      rowCount: 2,
+      executionTime: 3,
+    }));
+  });
+
+  afterEach(() => {
+    resetQueryEventSink();
+    resetGovernanceState();
+    resolveConnectionOverride = undefined;
+    insertFailure = null;
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    mockGetSession.mockImplementation(async () => ({ role: "admin", username: "admin" }));
+  });
+
+  test("governance: a successful statement records one editor event with rows, duration and the grant level", async () => {
+    const res = await run({ connectionId: "seed:orders", sql: "SELECT id FROM orders" });
+
+    expect(res.status).toBe(200);
+    const events = await recordedEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      source: "editor",
+      status: "success",
+      subject: SUBJECT,
+      username: "alice@example.com",
+      session_role: "user",
+      connection_id: "orders",
+      connection_name: "Orders",
+      engine: "postgres",
+      access_level: "write",
+      statement_type: "SELECT",
+      explain: null,
+      row_count: 2,
+      unit_index: null,
+      correlation_id: null,
+      error_code: null,
+    });
+    expect(Number.isInteger(events[0].duration_ms)).toBe(true);
+    expect(events[0].duration_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  test("governance: a failing statement records status error with its SQLSTATE", async () => {
+    (mockProvider.query as ReturnType<typeof mock>).mockImplementation(async (sql: string) => {
+      throw mapDatabaseError(
+        Object.assign(new Error('relation "missing" does not exist'), { code: "42P01" }),
+        "postgres",
+        sql,
+      );
+    });
+
+    const res = await run({ connectionId: "seed:orders", sql: "SELECT * FROM missing" });
+
+    expect(res.status).toBe(400);
+    const events = await recordedEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ source: "editor", status: "error", error_code: "42P01", row_count: null });
+  });
+
+  test("governance: a cancelled statement records status cancelled", async () => {
+    (mockProvider.query as ReturnType<typeof mock>).mockImplementation(async () => {
+      throw new QueryCancelledError("The query was cancelled.");
+    });
+
+    await run({ connectionId: "seed:orders", sql: "SELECT pg_sleep(60)" });
+
+    const events = await recordedEvents();
+    expect(events.map((event) => event.status)).toEqual(["cancelled"]);
+  });
+
+  test("governance: the event keeps the text the user submitted, not the EXPLAIN or the bound built from it", async () => {
+    settings({ key: "queryLog.statementCapture", value: "full" });
+    const provider = createMockProvider({ capabilities: { explainFormat: "postgres-json" } });
+    mockGetOrCreateProvider.mockImplementation(async () => provider);
+
+    const res = await run({ connectionId: "seed:orders", sql: "SELECT * FROM orders", explain: { mode: "estimate" } });
+
+    expect(res.status).toBe(200);
+    expect(provider.query).toHaveBeenCalledWith(
+      "EXPLAIN (FORMAT JSON) SELECT * FROM orders LIMIT 50",
+      undefined,
+      undefined,
+      expect.any(String),
+    );
+    const events = await recordedEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ statement: "SELECT * FROM orders", explain: "plan", status: "success" });
+  });
+
+  test("governance: refuse mode with a backing-off sink answers 503 AUDIT_UNAVAILABLE before any provider call and records a refused event", async () => {
+    settings({ key: "queryLog.onSinkFailure", value: "refuse" });
+    const warn = spyOn(logger, "warn").mockImplementation(() => {});
+    try {
+      // One earlier event whose insert fails: the sink now backs off.
+      insertFailure = { sqlstate: "08006", reason: "08006" };
+      recordQueryEvent(queryEventInput());
+      await flushQueryEvents();
+      expect(queryEventSinkState().backingOff).toBe(true);
+
+      const res = await run({ connectionId: "seed:orders", sql: "DELETE FROM orders" });
+      const data = await parseResponseJSON<{ code: string }>(res);
+
+      expect(res.status).toBe(503);
+      expect(data.code).toBe("AUDIT_UNAVAILABLE");
+      expect(mockGetOrCreateProvider).not.toHaveBeenCalled();
+      expect(mockProvider.query).not.toHaveBeenCalled();
+
+      insertFailure = null;
+      const refused = (await recordedEvents()).filter((event) => event.status === "refused");
+      expect(refused).toHaveLength(1);
+      expect(refused[0]).toMatchObject({
+        source: "editor",
+        connection_id: "orders",
+        engine: "postgres",
+        access_level: "write",
+        statement_type: "DELETE",
+        error_code: "AUDIT_UNAVAILABLE",
+      });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("governance: a non-granted id records a refused event with null engine and access level", async () => {
+    settings({ key: "queryLog.statementCapture", value: "full" });
+    resolveConnectionOverride = async () => {
+      throw new MockedSeedConnectionError(
+        "Connection not found: it does not exist or is not granted to you",
+        404,
+        "CONNECTION_NOT_FOUND",
+      );
+    };
+
+    const res = await run({ connectionId: "seed:payroll", sql: "SELECT * FROM salaries" });
+
+    expect(res.status).toBe(404);
+    expect(mockGetOrCreateProvider).not.toHaveBeenCalled();
+    const events = await recordedEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      source: "editor",
+      status: "refused",
+      connection_id: "payroll",
+      connection_name: null,
+      engine: null,
+      access_level: null,
+      // The engine that would read the text is unknown, so none is kept in any mode.
+      statement: null,
+      error_code: "CONNECTION_NOT_FOUND",
+    });
+  });
+
+  test("governance: a refusal for an id outside the seed: namespace records nothing", async () => {
+    resolveConnectionOverride = async () => {
+      throw new MockedSeedConnectionError("Invalid connection ID format", 400);
+    };
+
+    const res = await run({ connectionId: "not-a-seed", sql: "SELECT 1" });
+
+    expect(res.status).toBe(400);
+    expect(await recordedEvents()).toEqual([]);
+  });
+
+  test("governance: a request refused as malformed before admission records nothing", async () => {
+    const res = await run({ connectionId: "seed:orders", sql: "SELECT 1", queryId: 7 });
+
+    expect(res.status).toBe(400);
+    expect(await recordedEvents()).toEqual([]);
+  });
+
+  test("with governance off the route records nothing", async () => {
+    process.env.GOVERNANCE_SOURCE = "";
+
+    const res = await run({ connectionId: "seed:orders", sql: "SELECT id FROM orders" });
+
+    expect(res.status).toBe(200);
+    expect(queryEventSinkState().queued).toBe(0);
+    expect(await recordedEvents()).toEqual([]);
+  });
+});
+
+// A JSON `null` body or one that is not JSON at all answered 500 INTERNAL_ERROR with the runtime's own text ("Cannot destructure property 'sql' ...").
+// Any body that is not a JSON object is the caller's malformed request, answered before any connection resolves.
+describe("POST /api/db/query: a body that is not a JSON object", () => {
+  test.each<[string, string]>([
+    ["null", "null"],
+    ["an array", "[]"],
+    ["a number", "7"],
+    ["a string", '"x"'],
+    ["text that is not JSON", "{not json"],
+  ])("a body that is %s answers 400 and opens no provider", async (_label, raw) => {
+    mockGetOrCreateProvider.mockClear();
+    const res = await POST(
+      new Request("http://localhost:3000/api/db/query", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: raw,
+      }) as never,
+    );
+
+    expect(res.status).toBe(400);
+    expect(await parseResponseJSON(res)).toEqual({ error: "Invalid request body" });
+    expect(mockGetOrCreateProvider).not.toHaveBeenCalled();
   });
 });

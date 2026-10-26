@@ -15,16 +15,18 @@
  * directory only - the root package.json must stay typeless because the
  * library dist ships CJS .js files consumed via require().
  *
- * The `#!/usr/bin/env node` shebang above is load-bearing, not decoration.
- * `bunx` honours it and spawns a real node process, which is why `bunx
- * @libredb/studio` works; the server below is then started with
- * `process.execPath`, so it inherits that node. Drop the shebang and a bunx
- * user gets Bun instead, where `better-sqlite3` - the STORAGE_PROVIDER=sqlite
- * backend - segfaults rather than failing cleanly (oven-sh/bun#4290, open
- * since 2023: Bun implements N-API but not the V8 C++ API these NAN addons
- * link against). `assessNodeRuntime` cannot catch it either, because Bun
- * reports a `process.versions.node` well above the floor - 26.3.0 on Bun
- * 1.4.0. Only `bunx --bun` reaches that path, and that is the caller asking.
+ * The `#!/usr/bin/env node` shebang above keeps `bunx @libredb/studio` on
+ * Node: `bunx` honours it and spawns a real node process, and the server
+ * below is then started with `process.execPath`, so it inherits that node,
+ * the runtime the release image runs (`CMD ["node", "server.js"]` in the
+ * Dockerfile). Drop the shebang and a bunx user gets Bun instead.
+ * `assessNodeRuntime` cannot tell, because Bun reports a
+ * `process.versions.node` well above the floor - 26.3.0 on Bun 1.4.0, and
+ * still 26.3.0 on the pinned 1.4.2. That path used to segfault while
+ * `better-sqlite3`, the STORAGE_PROVIDER=sqlite backend, was a NAN addon
+ * (oven-sh/bun#4290); since v13 it is a Node-API addon, and the standalone
+ * server signs in and stores to SQLite under Bun 1.4.2. Only `bunx --bun`
+ * reaches that path, and that is the caller asking.
  */
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
@@ -37,15 +39,22 @@ import {
   assessNodeRuntime,
   assessProvenance,
   extractArchive,
+  DEFAULT_PORT,
+  startupUrl,
   LauncherUsageError,
+  LOOPBACK_PLAINTEXT_FLAG,
+  loopbackPlaintextEnv,
+  mcpUrlFor,
   parseLauncherArgs,
   parseSha256Sums,
   preservePayloadData,
   PROVENANCE_REPO,
   PROVENANCE_SIGNER_WORKFLOW,
   releaseDownloadUrl,
+  resolveBindAddress,
   resolveCacheDir,
   resolveLedgerDir,
+  resolvePathVariables,
   sha256File,
 } from "./lib/launcher-utils.mjs";
 
@@ -66,9 +75,12 @@ network only prints a warning; an archive whose provenance is actively
 rejected stops the launcher (override: LIBREDB_STUDIO_SKIP_PROVENANCE=1).
 
 Options:
-  --port <n>        Port to listen on (default: $PORT or 3000)
-  --host <addr>     Address to bind (default: $HOSTNAME or 127.0.0.1;
-                    use --host 0.0.0.0 to expose on the network)
+  --port <n>        Port to listen on (default: $PORT or ${DEFAULT_PORT})
+  --host <addr>     Address to bind (default: 127.0.0.1). --host wins, then
+                    $LIBREDB_BIND; $HOSTNAME counts only when it differs from
+                    this machine's own name, so a value inherited from a shell
+                    or injected by a container runtime is ignored; use
+                    --host 0.0.0.0 to expose on the network
   --archive <path>  Start from a local standalone archive instead of
                     downloading (env: LIBREDB_STUDIO_ARCHIVE). WARNING:
                     local archives skip checksum verification unless
@@ -82,10 +94,13 @@ Options:
   --help, -h        Show this help
 
 The server binds to 127.0.0.1 by default; exposing it on the network is an
-explicit opt-in (--host or HOSTNAME). All environment variables are forwarded
-to the server (PORT, HOSTNAME, JWT_SECRET, ADMIN_PASSWORD, STORAGE_PROVIDER,
-STORAGE_SQLITE_PATH, ...). When JWT_SECRET or ADMIN_PASSWORD are not set, the
-server generates them on first run and prints the admin credentials once.
+explicit opt-in (--host, LIBREDB_BIND, or a HOSTNAME that differs from this
+machine's own name). All environment variables are forwarded to the server
+(PORT, HOSTNAME, JWT_SECRET, ADMIN_PASSWORD, STORAGE_PROVIDER,
+STORAGE_SQLITE_PATH, ...). A relative path in a path variable such as
+SEED_CONFIG_PATH resolves against the directory the command is run from.
+When JWT_SECRET or ADMIN_PASSWORD are not set, the server generates them on
+first run and prints the admin credentials once.
 
 The AI agent appears once LLM_API_KEY (and the other LLM_* settings) are set;
 its run history is kept in ~/.libredb-studio/workflow-data unless
@@ -293,19 +308,29 @@ function verifyProvenance(archivePath, name) {
 
 /**
  * Spawn `node server.js` from the payload, forwarding the full environment.
- * Local-first: without --host/HOSTNAME the server binds to loopback only
- * (the standalone Next server would otherwise default to 0.0.0.0).
+ * Local-first: the server binds to loopback unless `--host`, `LIBREDB_BIND` or a
+ * `HOSTNAME` that differs from this machine's own name says otherwise
+ * (resolveBindAddress owns that rule and the reasoning - issue #813; the
+ * standalone Next server would otherwise default to 0.0.0.0).
  *
  * @param {string} payloadDir
  * @param {number | null} port
  * @param {string | null} host
  */
 function startServer(payloadDir, port, host) {
-  const env = { ...process.env };
+  // The server runs with its cwd in the payload cache, so a relative path the operator set is
+  // resolved here, against the directory the command was run from.
+  const env = resolvePathVariables(process.env, process.cwd());
   if (port !== null) env.PORT = String(port);
-  if (host !== null) env.HOSTNAME = host;
-  if (!env.HOSTNAME) env.HOSTNAME = "127.0.0.1";
+  env.HOSTNAME = resolveBindAddress({
+    host,
+    libredbBind: process.env.LIBREDB_BIND,
+    hostnameEnv: process.env.HOSTNAME,
+    systemHostname: os.hostname(),
+  });
   if (!env.NODE_ENV) env.NODE_ENV = "production";
+  // kubectl proxy (plain HTTP to this machine) is offered only by a server no other machine can reach.
+  Object.assign(env, loopbackPlaintextEnv(env.HOSTNAME, env[LOOPBACK_PLAINTEXT_FLAG]));
   // The agent's run history (#331 T5). The server is spawned with cwd set to the
   // payload directory, so the workflow SDK's cwd-relative default would put the
   // ledger inside a cache that re-extraction does not preserve — and the agent
@@ -313,9 +338,13 @@ function startServer(payloadDir, port, host) {
   // per-user directory keeps one history across folders and upgrades; an operator
   // who sets the variable keeps whatever they set.
   if (!env.WORKFLOW_LOCAL_DATA_DIR) env.WORKFLOW_LOCAL_DATA_DIR = resolveLedgerDir(os.homedir());
+  // The MCP endpoint's canonical address (#246), which every token is bound to: derived from the
+  // address and port this server is about to take, unless the operator set one, such as a public
+  // address behind a reverse proxy.
+  if (!env.LIBREDB_MCP_URL?.trim()) env.LIBREDB_MCP_URL = mcpUrlFor(env.HOSTNAME, env.PORT);
   // Log-line contract: npx-engine-smoke.yml parses the resolved version from
   // "Starting LibreDB Studio <version> " - keep the prefix stable.
-  console.log(`Starting LibreDB Studio ${pkg.version} on http://${env.HOSTNAME}:${env.PORT || "3000"}`);
+  console.log(`Starting LibreDB Studio ${pkg.version} on ${startupUrl(env.HOSTNAME, env.PORT)}`);
   const child = spawn(process.execPath, ["server.js"], { cwd: payloadDir, env, stdio: "inherit" });
   child.on("error", (error) => fail(`Could not start server.js: ${error.message}`));
   for (const signal of /** @type {const} */ (["SIGINT", "SIGTERM"])) {

@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getOrCreateProvider } from "@/lib/db/factory";
+import { INVALID_REQUEST_BODY, readJsonObject } from "@/lib/api/json-object-body";
 import { createErrorResponse } from "@/lib/api/errors";
 import { resolveConnection } from "@/lib/seed/resolve-connection";
 import { guardRoute } from "@/lib/api/require-session";
+import { requestCatalog } from "@/lib/db/catalog-scope";
+import { editorProvider } from "@/lib/api/editor-provider";
 
 export async function POST(request: NextRequest) {
   // Moved ahead of request.json(): an unauthenticated caller no longer gets a body parsed on its
@@ -11,16 +13,22 @@ export async function POST(request: NextRequest) {
   if ("response" in guard) return guard.response;
 
   try {
-    const body = await request.json();
+    // A body that is not a JSON object is a malformed request, refused before any connection resolves.
+    const body = await readJsonObject(request);
+    if (body === null) {
+      return NextResponse.json({ error: INVALID_REQUEST_BODY }, { status: 400 });
+    }
 
     const connection = await resolveConnection(body, guard.session);
 
-    const provider = await getOrCreateProvider(connection);
+    const provider = await editorProvider(guard.session, connection, requestCatalog(body));
 
     // Check if provider has getPoolStats
     if ("getPoolStats" in provider && typeof (provider as Record<string, unknown>).getPoolStats === "function") {
       const stats = (
-        provider as { getPoolStats: () => { total: number; idle: number; active: number; waiting: number } }
+        provider as {
+          getPoolStats: () => { total: number; idle: number; active: number; waiting: number; max?: number };
+        }
       ).getPoolStats();
       return NextResponse.json(stats);
     }

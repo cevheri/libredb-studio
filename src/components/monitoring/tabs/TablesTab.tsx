@@ -19,12 +19,23 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import {
+  declaredEntityOperations,
   maintenanceControl,
+  type MaintenanceOperation,
   type MaintenanceType,
   type MonitoringData,
   type ProviderCapabilities,
+  type ProviderLabels,
 } from "@/lib/db/types";
 import { formatBytes } from "@/lib/db/utils/pool-manager";
+import {
+  MaintenanceEntityDialog,
+  READ_ONLY_MAINTENANCE,
+  closedEntityDialog,
+  entityRequest,
+  type EntityDialogOpening,
+  type LoadMaintenancePreview,
+} from "@/components/maintenance-entity-dialog";
 import { PanelUnavailable } from "../PanelUnavailable";
 
 /**
@@ -49,6 +60,14 @@ const MAINTENANCE_ACTIONS: { type: MaintenanceType; label: string; Icon: LucideI
   { type: "reindex", label: "Reindex", Icon: Zap, className: "h-6 w-6 sm:h-8 sm:w-8 hidden sm:inline-flex" },
   { type: "check", label: "Check", Icon: ShieldCheck, className: "h-6 w-6 sm:h-8 sm:w-8 hidden sm:inline-flex" },
 ];
+
+/** One per-row control: a `MAINTENANCE_ACTIONS` entry, or a declared operation outside `MaintenanceType` (spec 3.11). */
+interface RowAction {
+  type: MaintenanceOperation;
+  label: string;
+  Icon: LucideIcon;
+  className: string;
+}
 
 /**
  * Pure formatters, at module scope rather than re-created inside `TablesTab` on every
@@ -88,8 +107,8 @@ function formatVacuumDate(date: Date | undefined, vacuumSupported: boolean): str
  */
 function vacuumIconClass(stateKnown: boolean, needingVacuum: number): string {
   if (!stateKnown) return "text-muted-foreground";
-  if (needingVacuum > 0) return "text-yellow-500";
-  return "text-green-500";
+  if (needingVacuum > 0) return "text-hue-yellow";
+  return "text-hue-green";
 }
 
 /** The same three states, as the note under the figure. `null` is the unknown case. */
@@ -127,12 +146,12 @@ function VacuumNote({
  * table and why none of them appears.
  *
  * Two things the note deliberately does NOT say:
- *  - No page to go to instead. The only caller (`MonitoringDashboard`) passes no `isAdmin`, and the
- *    prop defaults to true, so this component cannot tell an admin from the non-admin that
- *    /monitoring is the route for - and `src/proxy.ts` denies a non-admin /admin/operations. Of the
- *    two fixes available (thread the real role down, or drop the clause) dropping it is the smaller
- *    one and the only one that changes no other behaviour: threading the role would also switch off
- *    the per-row buttons on that route, which is older behaviour and not this change's business.
+ *  - No page to go to instead. The clause was dropped while the only caller (`MonitoringDashboard`)
+ *    passed no `isAdmin` and the prop's default of true left this component unable to tell an admin
+ *    from the non-admin that /monitoring is the route for - and `src/proxy.ts` denies a non-admin
+ *    /admin/operations. The dashboard has passed the signed-in role since #1424, and the note renders
+ *    for an admin only (`maintenanceUnattachable` requires `isAdmin`), so the clause could now be
+ *    written; that change gated the controls and left this note's wording alone.
  *  - One cause for two inputs. `refused` is the `errors.tables` branch, where `PanelUnavailable` is
  *    already showing the engine's own reason - a permission or catalog failure as often as a missing
  *    statistic - so that branch says only what was measured here: nothing could be read.
@@ -146,6 +165,18 @@ function MaintenanceUnattachableNote({ actions, refused }: Readonly<{ actions: s
   );
 }
 
+/**
+ * Why the list shows no row. Three causes, which is why this is a function: no statistics at all,
+ * a search that matched none of the rows a provider says are only part of the database, and a
+ * whole list with no match. The middle one must not say no table was found: the search saw only
+ * the listed rows, and a table outside them may match.
+ */
+function emptyListNote(statsAbsent: boolean, searchMissedAPartialList: boolean): string {
+  if (statsAbsent) return "No table statistics available.";
+  if (searchMissedAPartialList) return "No listed table matches the search.";
+  return "No tables found.";
+}
+
 function bloatBadgeVariant(ratio: number): "destructive" | "outline" | "secondary" {
   if (ratio > 20) return "destructive";
   if (ratio > 10) return "outline";
@@ -155,7 +186,7 @@ function bloatBadgeVariant(ratio: number): "destructive" | "outline" | "secondar
 interface TablesTabProps {
   data: MonitoringData | null;
   loading: boolean;
-  onRunMaintenance: (type: string, target?: string) => Promise<boolean>;
+  onRunMaintenance: (type: string, target?: string, container?: string) => Promise<boolean>;
   isAdmin?: boolean;
   /**
    * The connected provider's declared capabilities (issue #272). Undefined while
@@ -166,11 +197,39 @@ interface TablesTabProps {
    * exists for whenever `/api/db/provider-meta` errors.
    */
   capabilities?: ProviderCapabilities;
+  /**
+   * The connected provider's own labels, read here for `tableStatsCaption` alone. Absent while
+   * /api/db/provider-meta is in flight or after it failed, and then the tab renders as it does for
+   * an engine that declares no caption.
+   */
+  labels?: ProviderLabels;
+  /**
+   * Reads a per-row operation's preview (spec 3.11), from `useMonitoringData`. Absent, a control whose spec asks for
+   * a preview is not offered: the tab would have no way to show what it does before it runs.
+   */
+  onPreviewMaintenance?: LoadMaintenancePreview;
+  /**
+   * The connection is marked read-only (#1418). Its provider refuses every maintenance operation, so no row draws a
+   * control: the rule the Operations tab follows, read from the same public field by the one caller.
+   */
+  readOnly?: boolean;
 }
 
-export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, capabilities }: TablesTabProps) {
+export function TablesTab({
+  data,
+  loading,
+  onRunMaintenance,
+  onPreviewMaintenance,
+  isAdmin = true,
+  capabilities,
+  labels,
+  readOnly = false,
+}: TablesTabProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+  // A per-row operation's dialog, and the count that keys each opening, as the Operations tab keeps its own (spec 3.11).
+  const [entityDialog, setEntityDialog] = useState<EntityDialogOpening | null>(null);
+  const [entityDialogOpenings, setEntityDialogOpenings] = useState(0);
 
   if (loading && !data) {
     return <TablesSkeleton />;
@@ -181,7 +240,7 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
   const filteredTables = tables.filter((t) => t.tableName.toLowerCase().includes(searchQuery.toLowerCase()));
 
   // Calculate totals
-  const totalRows = tables.reduce((sum, t) => sum + t.rowCount, 0);
+  const totalRows = tables.reduce((sum, t) => sum + (t.rowCount ?? 0), 0);
   const totalSize = tables.reduce((sum, t) => sum + t.totalSizeBytes, 0);
   // The same gate StorageTab has carried since #469: `tableSizeBytes` is what says whether
   // this engine publishes per-table bytes at all, and `totalSizeBytes` is a required field
@@ -215,6 +274,19 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
   // on `tablesUnavailable` above, which is the reading this approximation exists for.
   const statsAbsent = tablesUnavailable !== undefined || (tables.length === 0 && (data?.overview?.tableCount ?? 0) > 0);
   const sizeAbsent = statsAbsent || !tables.every((t) => t.tableSizeBytes !== undefined);
+  // The same gate for the row counts, which `rowCount` became optional for: CockroachDB lists
+  // its tables from pg_class, whose `reltuples` it answers NULL, and summing those to "0 rows"
+  // reported an empty database over tables with rows in them (#1540). One unknown count makes
+  // the total unknown, which is why this is `every()` rather than a per-row concern.
+  const rowsAbsent = statsAbsent || !tables.every((t) => t.rowCount !== undefined);
+
+  // What the rows are, when the provider says they are only part of the database (#1085 6.2). The
+  // Prometheus list is the metrics with the most head series, so a count of it titled "Tables" and a
+  // sum of it read as the database's own figures, beside an Overview that counts every metric. With
+  // a caption the cards count the rows listed instead (see `ProviderLabels.tableStatsCaption`). Only
+  // over a list that is there: an absent or refused one has nothing to scope and keeps the absence
+  // rendering above.
+  const listScope = statsAbsent ? undefined : labels?.tableStatsCaption;
 
   // Whether the engine HAS vacuum is a capability question, not a data question, so it is
   // read from what the provider declares instead of inferred from the rows. Cassandra
@@ -228,10 +300,26 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
     capabilities?.supportsMaintenance === true && capabilities.maintenanceOperations.includes("vacuum");
   const vacuumStateKnown = !vacuumUnsupported && !statsAbsent;
 
-  const handleMaintenance = async (type: MaintenanceType, tableName: string) => {
+  // `schemaName` travels beside the table name because the table's namespace is not the same
+  // thing to every engine: a schema for PostgreSQL, the database for MySQL, an owner for
+  // Oracle. The row already renders `${schemaName}.${tableName}`, so the value was one
+  // property away and was being dropped here (#772).
+  const runRowMaintenance = async (type: MaintenanceOperation, tableName: string, container?: string) => {
     setActionLoading(`${type}-${tableName}`);
-    await onRunMaintenance(type, tableName);
+    await onRunMaintenance(type, tableName, container);
     setActionLoading(null);
+  };
+
+  // A row control whose spec asks for the row's own name or for a preview opens the per-row dialog, which sends
+  // through `runRowMaintenance` once confirmed (spec 3.11); every other control sends with one click, as before.
+  const handleMaintenance = async (type: MaintenanceOperation, tableName: string, container?: string) => {
+    const entity = entityRequest(capabilities, type, tableName, container);
+    if (entity !== null) {
+      setEntityDialog({ request: entity, open: true, key: entityDialogOpenings });
+      setEntityDialogOpenings(entityDialogOpenings + 1);
+      return;
+    }
+    await runRowMaintenance(type, tableName, container);
   };
 
   // Offer only the maintenance a provider declares it can perform HERE: /api/db/maintenance
@@ -240,10 +328,29 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
   // database from a control that named one table, Oracle's index rebuild answered ORA-01418
   // for every table name there is. `maintenanceControl` reads the provider's own
   // `perEntity` declaration for each, and hands back the engine's own wording with it (#496).
-  const availableActions = MAINTENANCE_ACTIONS.flatMap((action) => {
-    const control = maintenanceControl(capabilities, action.type, "perEntity");
-    return control.offered ? [{ ...action, label: control.label ?? action.label }] : [];
-  });
+  //
+  // Every declared operation outside `MaintenanceType` that runs on one row follows the tab's own, in declaration
+  // order and under a generic icon (spec 3.11). One whose spec asks for a preview is offered only where this tab was
+  // handed a way to read one.
+  const declaredActions: RowAction[] = [
+    ...MAINTENANCE_ACTIONS.flatMap((action) => {
+      const control = maintenanceControl(capabilities, action.type, "perEntity");
+      return control.offered ? [{ ...action, label: control.label ?? action.label }] : [];
+    }),
+    ...declaredEntityOperations(capabilities).map((operation) => ({
+      type: operation.type,
+      label: operation.label,
+      Icon: Wrench,
+      className: "h-6 w-6 sm:h-8 sm:w-8",
+    })),
+  ].filter(
+    (action) =>
+      onPreviewMaintenance !== undefined || maintenanceControl(capabilities, action.type, "perEntity").preview !== true,
+  );
+  // Withheld on a read-only connection, where each would end in the provider's refusal (#1418). The placeholder a row
+  // with no control draws then says why, and says nothing where there was never a control to withhold.
+  const availableActions = readOnly ? [] : declaredActions;
+  const withheldForReadOnly = readOnly && isAdmin && declaredActions.length > 0;
 
   // Both halves have to be true for the dead end U22 names: the engine declares a control
   // that takes ONE table, and this panel has no table to offer it on. `statsAbsent` covers
@@ -254,18 +361,27 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
 
   return (
     <div className="p-3 sm:p-6 space-y-4 sm:space-y-6">
+      {/* Above the cards, so it heads every figure on the tab and the list below them. */}
+      {listScope !== undefined && (
+        <p className="text-xs text-muted-foreground" data-testid="tables-list-scope">
+          {listScope}
+        </p>
+      )}
+
       {/* Stats Cards */}
       <div className="grid grid-cols-3 gap-2 sm:gap-4">
         <Card className="p-0">
           <CardHeader className="flex flex-row items-center justify-between space-y-0 p-2 sm:p-4 pb-1 sm:pb-2">
-            <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">Tables</CardTitle>
+            <CardTitle className="text-xs sm:text-xs font-medium text-muted-foreground">
+              {listScope === undefined ? "Tables" : "Listed"}
+            </CardTitle>
             <Table2 strokeWidth={1.5} className="h-3 w-3 sm:h-4 sm:w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent className="p-2 sm:p-4 pt-0">
             <div className="text-lg sm:text-2xl font-medium" data-testid="tables-stat-count">
               {statsAbsent ? "N/A" : tables.length}
             </div>
-            {!statsAbsent && (
+            {!rowsAbsent && (
               <p className="text-xs sm:text-xs text-muted-foreground mt-1">{formatNumber(totalRows)} rows</p>
             )}
           </CardContent>
@@ -280,7 +396,11 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
             <div className="text-lg sm:text-2xl font-medium" data-testid="tables-stat-size">
               {sizeAbsent ? "N/A" : formatBytes(totalSize)}
             </div>
-            {!sizeAbsent && <p className="text-xs sm:text-xs text-muted-foreground mt-1">Total</p>}
+            {!sizeAbsent && (
+              <p className="text-xs sm:text-xs text-muted-foreground mt-1">
+                {listScope === undefined ? "Total" : "Across the list"}
+              </p>
+            )}
           </CardContent>
         </Card>
 
@@ -324,7 +444,7 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
           ) : filteredTables.length === 0 ? (
             <div className="text-center py-8 text-muted-foreground">
               <Table2 strokeWidth={1.5} className="h-8 w-8 mx-auto mb-2 opacity-50" />
-              <p className="text-xs">{statsAbsent ? "No table statistics available." : "No tables found."}</p>
+              <p className="text-xs">{emptyListNote(statsAbsent, listScope !== undefined && tables.length > 0)}</p>
             </div>
           ) : (
             <div className="overflow-x-auto">
@@ -351,8 +471,8 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
                           <span className="text-xs sm:text-xs text-muted-foreground">{table.schemaName}</span>
                         </div>
                       </TableCell>
-                      <TableCell className="text-right font-mono text-xs py-2">
-                        {formatNumber(table.rowCount)}
+                      <TableCell className="text-right font-mono text-xs py-2" data-testid="table-row-count">
+                        {table.rowCount === undefined ? "-" : formatNumber(table.rowCount)}
                         {table.deadRowCount ? (
                           <span className="text-xs text-muted-foreground block">
                             {formatNumber(table.deadRowCount)} dead
@@ -388,7 +508,7 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
                                 variant="ghost"
                                 size="icon"
                                 className={className}
-                                onClick={() => handleMaintenance(type, table.tableName)}
+                                onClick={() => handleMaintenance(type, table.tableName, table.schemaName)}
                                 disabled={!!actionLoading}
                                 title={label}
                               >
@@ -401,7 +521,12 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
                             ))}
                           </div>
                         ) : (
-                          <span className="text-xs text-muted-foreground">-</span>
+                          <span
+                            className="text-xs text-muted-foreground"
+                            title={withheldForReadOnly ? READ_ONLY_MAINTENANCE : undefined}
+                          >
+                            -
+                          </span>
                         )}
                       </TableCell>
                     </TableRow>
@@ -418,6 +543,22 @@ export function TablesTab({ data, loading, onRunMaintenance, isAdmin = true, cap
           )}
         </CardContent>
       </Card>
+
+      {/* A per-row operation's typed target or preview (spec 3.11). */}
+      {entityDialog && (
+        <MaintenanceEntityDialog
+          key={entityDialog.key}
+          open={entityDialog.open}
+          onOpenChange={(open) => !open && setEntityDialog(closedEntityDialog)}
+          request={entityDialog.request}
+          loadPreview={onPreviewMaintenance}
+          onConfirm={async () => {
+            const { type, target, container } = entityDialog.request;
+            await runRowMaintenance(type, target, container);
+            return null;
+          }}
+        />
+      )}
     </div>
   );
 }

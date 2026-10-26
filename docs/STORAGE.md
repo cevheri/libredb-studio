@@ -55,6 +55,12 @@ LibreDB Studio supports three storage modes. Pick the one that fits your use cas
 | **SQLite** | Small teams, single server | Server file | Yes | 1 env var |
 | **PostgreSQL** | Enterprise, multi-node | External DB | Yes | 2 env vars |
 
+Server storage (`sqlite` or `postgres`) gives each person their own private workspace by partitioning connections, saved queries, and settings by the login username.
+For a team of three or more, pair server storage with Single Sign-On via [OIDC](OIDC.md) to provide individual logins, personal workspaces, and an audit trail that attributes actions to each user.
+In server storage the browser copy belongs to the signed-in account: signing out clears this browser's copy, open editor tabs included, and signing in as a different account starts from that account's server data.
+The default `local` mode stores data in the browser and does not isolate workspaces between people using the same browser profile.
+In `local` mode the next account to sign in on that browser profile sees, and can open, the connections saved there before it.
+
 ---
 
 ## 1. Local Mode (Default)
@@ -99,7 +105,8 @@ On the first API request, the SQLite provider:
 1. **Creates the directory** — `./data/` (or whatever parent directory the path points to) is created recursively if it doesn't exist
 2. **Creates the database file** — `libredb-storage.db` is created by `better-sqlite3`
 3. **Enables WAL mode** — Write-Ahead Logging for better concurrent read performance
-4. **Creates the table** — `user_storage` table with the schema below
+4. **Turns foreign keys on**: `PRAGMA foreign_keys = ON`, read back, so passkeys follow their account; the start fails if the engine does not enable it
+5. **Creates the tables**: `user_storage`, `accounts` and the three passkey tables, with the schema below
 
 No manual setup, no migrations, no SQL scripts needed.
 
@@ -162,6 +169,48 @@ CREATE TABLE IF NOT EXISTS user_storage (
 
 -- Recommended: enable WAL mode for concurrent read performance
 PRAGMA journal_mode = WAL;
+
+CREATE TABLE IF NOT EXISTS accounts (
+  email         TEXT PRIMARY KEY,
+  password_hash TEXT NOT NULL,
+  role          TEXT NOT NULL,
+  totp_secret   TEXT,
+  totp_pending  TEXT,
+  disabled      INTEGER NOT NULL DEFAULT 0,
+  session_version INTEGER NOT NULL DEFAULT 0,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+
+-- Passkeys (#785). Every connection that deletes accounts must enforce foreign keys:
+-- Studio's own do, the sqlite3 shell does not unless told.
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS passkey_users (
+  account_email TEXT PRIMARY KEY REFERENCES accounts(email) ON DELETE CASCADE,
+  user_handle   TEXT NOT NULL UNIQUE,
+  created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS passkey_credentials (
+  id              TEXT PRIMARY KEY,
+  credential_id   TEXT NOT NULL UNIQUE,
+  account_email   TEXT NOT NULL REFERENCES passkey_users(account_email) ON DELETE CASCADE,
+  public_key      TEXT NOT NULL,
+  sign_count      INTEGER NOT NULL,
+  transports      TEXT NOT NULL,
+  backup_eligible INTEGER NOT NULL,
+  backup_state    INTEGER NOT NULL,
+  rp_id           TEXT NOT NULL,
+  name            TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  last_used_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS passkey_credentials_account ON passkey_credentials (account_email);
+CREATE TABLE IF NOT EXISTS passkey_spent_challenges (
+  challenge_hash TEXT PRIMARY KEY,
+  expires_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS passkey_spent_challenges_expiry ON passkey_spent_challenges (expires_at);
 ```
 
 ---
@@ -203,9 +252,9 @@ On the first API request, the PostgreSQL provider:
 
 1. **Creates a connection pool** — max 5 connections, 30s idle timeout
 2. **Handles idle-client failures** — the pool gets an `error` listener immediately (see below)
-3. **Creates the table** — `user_storage` table with the schema below via `CREATE TABLE IF NOT EXISTS`
+3. **Creates the tables**: `user_storage`, `accounts` and the three passkey tables, with the schema below, via `CREATE TABLE IF NOT EXISTS` on every start
 
-The database itself must already exist. The **table** is auto-created, but the **database** is not.
+The database itself must already exist. The **tables** are auto-created, but the **database** is not.
 
 This pool is long-lived: once created it serves every storage request for the life of the process. A
 pooled client that fails while **idle** — the server dropped it, the network went away, the DBA
@@ -222,12 +271,38 @@ The PostgreSQL user specified in `STORAGE_POSTGRES_URL` needs:
 
 | Privilege | Why |
 |-----------|-----|
-| `CREATE TABLE` | Auto-create `user_storage` on first request (only needed once) |
-| `INSERT` | Save user data |
-| `UPDATE` | Update existing data |
-| `SELECT` | Read user data |
+| `CREATE` on the schema | Every start runs `CREATE TABLE IF NOT EXISTS`, and PostgreSQL checks this privilege even when the table already exists |
+| `REFERENCES` on `accounts` | The passkey tables' foreign keys, only while the app creates those tables itself |
+| `SELECT`, `INSERT`, `UPDATE`, `DELETE` | Read and write the five tables; deleting an account or a passkey, and purging spent passkey challenges, delete rows |
 
-If your DBA restricts `CREATE TABLE`, you can create the table manually (see below) and the user only needs `INSERT`/`UPDATE`/`SELECT`.
+The app user owns the tables it creates, which covers the data privileges on them.
+A default PostgreSQL 17 `public` schema grants other roles no `CREATE`, so grant it explicitly (`GRANT CREATE ON SCHEMA public TO libredb_app;`) when the app user does not own the schema.
+A missing privilege stops the start with an error that names the passkey tables, the privileges and the manual DDL below.
+Measured on PostgreSQL 17.11; which earlier versions check `CREATE` the same way was not measured.
+
+### A Named Schema (`STORAGE_POSTGRES_SCHEMA`)
+
+By default the statements name the tables without a schema, so they land wherever the connection's `search_path` puts them, usually `public`.
+Set `STORAGE_POSTGRES_SCHEMA` to keep them in one schema instead:
+
+```bash
+STORAGE_POSTGRES_SCHEMA=studio
+```
+
+With it set, every table, foreign key, index and existence check is written as `"studio".<name>`, so the tables never follow a `search_path` into another schema, and a role with no `CREATE` on `public` works.
+Unset or empty, every statement is exactly what it was before the variable existed.
+
+Studio never creates the schema.
+Create it first, owned by the role in `STORAGE_POSTGRES_URL`, and that role then needs no other privilege on the database:
+
+```sql
+CREATE SCHEMA studio AUTHORIZATION libredb_studio;
+```
+
+When the schema is missing, the first storage request fails with `schema studio does not exist: create it with CREATE SCHEMA studio AUTHORIZATION <role>`, naming the role the connection runs as.
+The value must be a lowercase identifier of up to 63 characters (`^[a-z_][a-z0-9_]{0,62}$`); with `STORAGE_PROVIDER=postgres`, any other value stops the boot with a banner that names the variable.
+The [Manual Table Creation](#manual-table-creation-optional-1) DDL below applies once every table name in it, including those after `REFERENCES` and `ON`, carries the schema, as in `CREATE TABLE IF NOT EXISTS studio.user_storage (...)`.
+`tests/live/storage-schema-postgres.ts` proves this on a real server, for a role that owns only schema `studio` and has no `CREATE` on `public`.
 
 ### Docker Compose (App + PostgreSQL)
 
@@ -252,7 +327,10 @@ services:
       - POSTGRES_USER=libredb
       - POSTGRES_PASSWORD=secret
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # PostgreSQL 18+ images expect the mount at /var/lib/postgresql, not /var/lib/postgresql/data.
+      # A pgdata volume from the old layout has to be removed once: run docker compose down, then
+      # docker volume rm on the volume whose name ends in _pgdata (find it with docker volume ls).
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U libredb"]
       interval: 5s
@@ -321,16 +399,65 @@ CREATE TABLE IF NOT EXISTS user_storage (
 
 -- Optional: index for faster lookups by user
 CREATE INDEX IF NOT EXISTS idx_user_storage_user_id ON user_storage (user_id);
+
+CREATE TABLE IF NOT EXISTS accounts (
+  email         TEXT PRIMARY KEY,
+  password_hash TEXT NOT NULL,
+  role          TEXT NOT NULL,
+  totp_secret   TEXT,
+  totp_pending  TEXT,
+  disabled      INTEGER NOT NULL DEFAULT 0,
+  session_version INTEGER NOT NULL DEFAULT 0,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+
+-- Passkeys (#785). Create these before an image with passkey sign-in starts.
+CREATE TABLE IF NOT EXISTS passkey_users (
+  account_email TEXT PRIMARY KEY REFERENCES accounts(email) ON DELETE CASCADE,
+  user_handle   TEXT NOT NULL UNIQUE,
+  created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS passkey_credentials (
+  id              TEXT PRIMARY KEY,
+  credential_id   TEXT NOT NULL UNIQUE,
+  account_email   TEXT NOT NULL REFERENCES passkey_users(account_email) ON DELETE CASCADE,
+  public_key      TEXT NOT NULL,
+  sign_count      BIGINT NOT NULL,
+  transports      TEXT NOT NULL,
+  backup_eligible INTEGER NOT NULL,
+  backup_state    INTEGER NOT NULL,
+  rp_id           TEXT NOT NULL,
+  name            TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  last_used_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS passkey_credentials_account ON passkey_credentials (account_email);
+CREATE TABLE IF NOT EXISTS passkey_spent_challenges (
+  challenge_hash TEXT PRIMARY KEY,
+  expires_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS passkey_spent_challenges_expiry ON passkey_spent_challenges (expires_at);
 ```
 
 #### Minimal Privileges (When Table Already Exists)
 
-If a DBA creates the table, the app user only needs:
+If a DBA creates all five tables, the app user needs no `REFERENCES`, but it still needs `CREATE` on the schema, because every start runs `CREATE TABLE IF NOT EXISTS` and PostgreSQL checks that privilege even for a table that exists:
 
 ```sql
--- Grant only data access (no DDL needed)
-GRANT SELECT, INSERT, UPDATE ON user_storage TO libredb_app;
+GRANT CREATE ON SCHEMA public TO libredb_app;
+-- DELETE: removing an account removes its user_storage rows in the same transaction,
+-- and passkey removals and the purge of spent challenges delete rows too.
+GRANT SELECT, INSERT, UPDATE, DELETE ON user_storage TO libredb_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON accounts TO libredb_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON passkey_users TO libredb_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON passkey_credentials TO libredb_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON passkey_spent_challenges TO libredb_app;
 ```
+
+The earlier claim that data grants alone suffice does not hold where the schema gives the app user no `CREATE`, as on a default PostgreSQL 17.
+The app user need not own the tables: Studio creates a passkey index only when it is missing, because PostgreSQL checks ownership before it honours `IF NOT EXISTS` on `CREATE INDEX`, so the DBA creates both passkey indexes with the tables.
+A start that needs no `CREATE` at all is `docs/BACKLOG.md` PK9.
 
 ---
 
@@ -348,6 +475,7 @@ When you switch from local mode to SQLite or PostgreSQL, **existing browser data
 **No manual steps required.** Just change the env var and restart.
 
 > If multiple users were sharing a browser in local mode, only the data from the user who migrates first will be sent. Each user's server storage is isolated by their login email.
+> From then on the browser copy belongs to that account (`libredb_workspace_owner`), and a different account signing in on the same browser starts from its own server data.
 
 For the full migration lifecycle and the underlying merge semantics, see [Migration Flow](#10-migration-flow) in Part 2.
 
@@ -360,13 +488,16 @@ nothing to switch on and nothing to configure.
 
 ### What is encrypted
 
-Seven fields, all on a saved connection:
+Eleven fields, all on a saved connection (`src/lib/storage/secret-fields.ts` is the authority):
 
 | Field | What it is |
 |-------|------------|
-| `password` | The database password |
+| `password` | The database password, or the token an engine takes in its place (a Snowflake programmatic access token among them) |
 | `connectionString` | A URL that can embed `user:password@` |
 | `agentPassword` | The optional least-privilege agent-profile password (#328) |
+| `apiKeyId`, `apiKeySecret` | Elasticsearch's API key pair |
+| `privateKey` | Snowflake's key-pair private key, as pasted |
+| `privateKeyPassphrase` | The passphrase that unlocks the key above |
 | `ssl.clientKey` | The TLS client private key |
 | `sshTunnel.password` | The SSH password |
 | `sshTunnel.privateKey` | The SSH private key |
@@ -430,7 +561,12 @@ version column. A row that is never written again stays plaintext — which is w
 - **Browser `localStorage` is not encrypted.** It is the rendering source and it holds the same
   credentials in the clear. That is a deliberate product decision — it is what lets Studio work
   without a master password — and it is why cross-site scripting is treated as a top-severity
-  issue in this project rather than a session-theft issue.
+  issue in this project rather than a session-theft issue. It applies to every field above alike:
+  a Snowflake private key and its passphrase sit in the same connection object, so for anyone who
+  can read this browser's storage an encrypted key is no better protected than an unencrypted one,
+  exactly as an SSH key and its passphrase are. The connection dialog does not draw a saved key
+  again (it shows that one is entered, with Show key and Replace key), which keeps it off a screen
+  share; it does not change what the browser stores.
 - **Anyone who can read the server's environment can read the credentials.** The key lives there.
   This protects a stolen database file or dump on its own; it is not a vault.
 - **For `STORAGE_PROVIDER=sqlite` with no `STORAGE_ENCRYPTION_KEY` set, a backup or volume snapshot
@@ -455,6 +591,7 @@ version column. A row that is never written again stays plaintext — which is w
 | `STORAGE_PROVIDER` | No | `local` | `local`, `sqlite`, or `postgres` |
 | `STORAGE_SQLITE_PATH` | No | `./data/libredb-storage.db` | Path to SQLite file. Directory and file are auto-created. |
 | `STORAGE_POSTGRES_URL` | **Yes** (postgres mode) | — | PostgreSQL connection string. **No default — app will error without it.** |
+| `STORAGE_POSTGRES_SCHEMA` | No | unset | Schema that holds the storage tables, such as `studio`. The schema must exist. Unset keeps the tables unqualified. See [A Named Schema](#a-named-schema-storage_postgres_schema). |
 
 > These are **server-side only** variables (no `NEXT_PUBLIC_` prefix). The client discovers the mode at runtime via `GET /api/storage/config`. This means one Docker image works for all modes. See [Why Not `NEXT_PUBLIC_*`?](#why-not-next_public_) for the rationale.
 
@@ -490,6 +627,21 @@ curl -b cookies.txt http://localhost:3000/api/storage
 2. Make sure the response shows `"serverMode": true`
 3. Check browser console for sync errors (look for `[StorageSync]` prefixed logs)
 
+### Store Outage: 503 "ACCOUNT_STORE_UNAVAILABLE"
+
+When `STORAGE_PROVIDER=sqlite` or `postgres`, each authenticated request checks that the session's account remains active and permitted in the account store. If the store suffers an outage (e.g. PostgreSQL is unreachable or SQLite is locked):
+
+- **Three surfaces answer 503** — they call `readSession()` and return `{ "error": "Account store unavailable", "code": "ACCOUNT_STORE_UNAVAILABLE" }` with no permission-denial audit and without touching the cookie:
+  1. `guardRoute` (`src/lib/api/require-session.ts`) — protects all database, query, admin, and AI routes.
+  2. `GET /api/auth/me` (`src/app/api/auth/me/route.ts`) — the browser polls this to establish session state.
+  3. `/api/mcp` (`src/app/api/mcp/route.ts` via `mcpTokenOwnerAllowed`) — the MCP bearer-token route.
+
+- **Other routes that call `getSession()` directly** still receive `null` under its non-throwing contract and answer `401`. These are routes that bypass `guardRoute` and check the session themselves (e.g. `GET /api/connections/managed`, which the editor calls on load).
+
+- The browser's session cookie is **preserved** throughout. Verified with a valid cookie against a mocked storage outage: the browser did not loop to `/login` because `/api/auth/me` answered 503, not 401, so the client-side `AUTH_REQUIRED` redirect guard did not fire (#1942).
+
+- Once the store recovers, client requests resume immediately without requiring the user to sign in again.
+
 ### SQLite: "SQLITE_CANTOPEN"
 
 - The directory in `STORAGE_SQLITE_PATH` must be writable by the app process
@@ -500,6 +652,11 @@ curl -b cookies.txt http://localhost:3000/api/storage
 - You set `STORAGE_PROVIDER=postgres` but didn't provide `STORAGE_POSTGRES_URL`
 - Unlike SQLite, PostgreSQL has **no default** — a connection string is always required
 - Fix: add `STORAGE_POSTGRES_URL=postgresql://user:pass@host:5432/dbname` to your env
+
+### PostgreSQL: "schema studio does not exist"
+
+- `STORAGE_POSTGRES_SCHEMA` names a schema the database does not have, and Studio never creates one
+- Fix: run the `CREATE SCHEMA ... AUTHORIZATION ...` statement the message prints, as a role allowed to create schemas
 
 ### PostgreSQL: "Connection refused"
 
@@ -544,7 +701,7 @@ If the key is gone, re-enter the affected passwords; everything else about the c
 
 ## Database Schema Reference
 
-Both SQLite and PostgreSQL use the same single-table design. The table is auto-created on first request, but the full DDL is provided here for reference.
+Both SQLite and PostgreSQL use the same five tables. They are auto-created on first request, but the full DDL is provided here for reference. `user_storage` holds each person's product data. `accounts` holds local email/password identities when the server store is on. `passkey_users`, `passkey_credentials` and `passkey_spent_challenges` hold passkeys ([PASSKEYS.md](./PASSKEYS.md)).
 
 ### SQLite
 
@@ -558,6 +715,46 @@ CREATE TABLE IF NOT EXISTS user_storage (
 );
 
 PRAGMA journal_mode = WAL;
+
+CREATE TABLE IF NOT EXISTS accounts (
+  email         TEXT PRIMARY KEY,
+  password_hash TEXT NOT NULL,
+  role          TEXT NOT NULL,
+  totp_secret   TEXT,
+  totp_pending  TEXT,
+  disabled      INTEGER NOT NULL DEFAULT 0,
+  session_version INTEGER NOT NULL DEFAULT 0,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS passkey_users (
+  account_email TEXT PRIMARY KEY REFERENCES accounts(email) ON DELETE CASCADE,
+  user_handle   TEXT NOT NULL UNIQUE,
+  created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS passkey_credentials (
+  id              TEXT PRIMARY KEY,
+  credential_id   TEXT NOT NULL UNIQUE,
+  account_email   TEXT NOT NULL REFERENCES passkey_users(account_email) ON DELETE CASCADE,
+  public_key      TEXT NOT NULL,
+  sign_count      INTEGER NOT NULL,
+  transports      TEXT NOT NULL,
+  backup_eligible INTEGER NOT NULL,
+  backup_state    INTEGER NOT NULL,
+  rp_id           TEXT NOT NULL,
+  name            TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  last_used_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS passkey_credentials_account ON passkey_credentials (account_email);
+CREATE TABLE IF NOT EXISTS passkey_spent_challenges (
+  challenge_hash TEXT PRIMARY KEY,
+  expires_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS passkey_spent_challenges_expiry ON passkey_spent_challenges (expires_at);
 ```
 
 ### PostgreSQL
@@ -573,18 +770,73 @@ CREATE TABLE IF NOT EXISTS user_storage (
 
 -- Optional: index for faster lookups by user
 CREATE INDEX IF NOT EXISTS idx_user_storage_user_id ON user_storage (user_id);
+
+CREATE TABLE IF NOT EXISTS accounts (
+  email         TEXT PRIMARY KEY,
+  password_hash TEXT NOT NULL,
+  role          TEXT NOT NULL,
+  totp_secret   TEXT,
+  totp_pending  TEXT,
+  disabled      INTEGER NOT NULL DEFAULT 0,
+  session_version INTEGER NOT NULL DEFAULT 0,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS passkey_users (
+  account_email TEXT PRIMARY KEY REFERENCES accounts(email) ON DELETE CASCADE,
+  user_handle   TEXT NOT NULL UNIQUE,
+  created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS passkey_credentials (
+  id              TEXT PRIMARY KEY,
+  credential_id   TEXT NOT NULL UNIQUE,
+  account_email   TEXT NOT NULL REFERENCES passkey_users(account_email) ON DELETE CASCADE,
+  public_key      TEXT NOT NULL,
+  sign_count      BIGINT NOT NULL,
+  transports      TEXT NOT NULL,
+  backup_eligible INTEGER NOT NULL,
+  backup_state    INTEGER NOT NULL,
+  rp_id           TEXT NOT NULL,
+  name            TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  last_used_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS passkey_credentials_account ON passkey_credentials (account_email);
+CREATE TABLE IF NOT EXISTS passkey_spent_challenges (
+  challenge_hash TEXT PRIMARY KEY,
+  expires_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS passkey_spent_challenges_expiry ON passkey_spent_challenges (expires_at);
 ```
 
 ### Schema Explanation
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `user_id` | TEXT | User's email from JWT token (e.g., `admin@libredb.org`) |
-| `collection` | TEXT | Data category: `connections`, `history`, `saved_queries`, `schema_snapshots`, `saved_charts`, `active_connection_id`, `audit_log`, `masking_config`, `threshold_config`, `dismissed_seeds` |
+| `user_id` | TEXT | User's email from JWT token (e.g., `admin@libredb.org`), or under governance `sub:` followed by the identity provider's subject ([Governance Mode](#governance-mode)) |
+| `collection` | TEXT | Data category: `connections`, `history`, `saved_queries`, `schema_snapshots`, `saved_charts`, `active_connection_id`, `audit_log`, `masking_config`, `threshold_config`, `dismissed_seeds`, `favorite_connections`, `connection_order`, `connection_groups` |
 | `data` | TEXT | JSON-serialized collection data |
 | `updated_at` | TEXT / TIMESTAMPTZ | Last modification timestamp |
 
 Each row stores **one user's one collection** as a JSON blob. Adding a new collection type requires no schema changes — just a new row.
+
+The passkey tables:
+
+| Column | Meaning |
+|--------|---------|
+| `passkey_users.user_handle` | The account's WebAuthn user handle: 64 random bytes, base64url, never derived from the email |
+| `passkey_credentials.id` | Internal UUID; the only passkey identifier the UI, the API and the audit log carry |
+| `passkey_credentials.credential_id` | The WebAuthn credential ID, unique across all accounts; never in a passkey list, a URL or the audit log |
+| `passkey_credentials.public_key` | The base64url COSE public key |
+| `passkey_credentials.sign_count` | The last signature counter; `BIGINT` on PostgreSQL because WebAuthn counters are unsigned 32-bit |
+| `passkey_credentials.transports` | JSON array of transport hints (`ble`, `cable`, `hybrid`, `internal`, `nfc`, `smart-card`, `usb`) |
+| `passkey_credentials.backup_eligible`, `backup_state` | 0 or 1: whether the passkey can sync, and whether it has |
+| `passkey_credentials.rp_id` | The host name the passkey was registered under |
+| `passkey_spent_challenges.challenge_hash`, `expires_at` | Lowercase hex SHA-256 of a challenge that completed a ceremony, and its token's expiry |
+
+Timestamps are ISO-8601 `TEXT` on both engines, as on `accounts`, so rows copy between engines unchanged.
+None of these columns is secret, so they are not sealed with the storage encryption key.
 
 ---
 
@@ -647,7 +899,7 @@ This part describes the internals of the storage abstraction layer: design goals
 
 ### 3.1 Collections
 
-All application state is organized into **10 collections**, each stored as a JSON blob:
+All application state is organized into **13 collections**, each stored as a JSON blob:
 
 | Collection | Type | Description | Max Items |
 |-----------|------|-------------|-----------|
@@ -661,10 +913,22 @@ All application state is organized into **10 collections**, each stored as a JSO
 | `masking_config` | `MaskingConfig` | Data masking rules and RBAC | — |
 | `threshold_config` | `ThresholdConfig[]` | Monitoring alert thresholds | — |
 | `dismissed_seeds` | `string[]` | Seed IDs the user dismissed (deleted a `managed: false` seed copy) so it is not re-added | — |
+| `favorite_connections` | `string[]` | Connection ids the user has starred | — |
+| `connection_order` | `string[]` | Connection ids in the user's custom drag order | — |
+| `connection_groups` | `ConnectionGroup[]` | The user's own sections in the Connections panel, in display order: `{ id, name, collapsed, connectionIds }` | — |
+
+**A snapshot taken before the object model has no kind and no path.** `schema_snapshots` holds what
+the schema list held when the snapshot was taken, and a live reading now always carries an object's
+kind and its full address; a record written by an older version carries the name and the columns
+only. Those records are kept and stay comparable rather than being migrated or discarded, so the
+diff matches an old snapshot to a new reading BY NAME, and a diff against one cannot tell a view
+from a table or two same-named objects in different schemas apart. Take a fresh snapshot to get a
+baseline that carries both. Nothing is lost either way: a stored snapshot is the user's own data and
+this product does not rewrite it in place.
 
 ### 3.2 Server Database Schema
 
-Both SQLite and PostgreSQL use the same logical schema — a single table with collection-based JSON blobs:
+Both SQLite and PostgreSQL use the same logical schema — `user_storage` holds collection-based JSON blobs, and `accounts` holds the local identity registry:
 
 ```sql
 CREATE TABLE IF NOT EXISTS user_storage (
@@ -674,9 +938,40 @@ CREATE TABLE IF NOT EXISTS user_storage (
   updated_at TEXT/TIMESTAMPTZ NOT NULL,     -- Last modification time
   PRIMARY KEY (user_id, collection)
 );
+
+CREATE TABLE IF NOT EXISTS accounts (
+  email         TEXT PRIMARY KEY,  -- local login email; also the user_storage user_id
+  password_hash TEXT NOT NULL,     -- scrypt encoding, never the password; for an account a launch created,
+                                   --   launch-identity$<iss>$<sub> (base64url), which no password matches (LAUNCH.md)
+  role          TEXT NOT NULL,     -- 'admin' or 'user'
+  totp_secret   TEXT,              -- confirmed TOTP secret, sealed like a connection password, or NULL
+  totp_pending  TEXT,              -- enrolment not yet confirmed, sealed; login ignores it
+  disabled      INTEGER NOT NULL,  -- 1 rejects login and keeps this user's rows
+  session_version INTEGER NOT NULL, -- signed into each session; a change ends older sessions
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS passkey_users (        -- one row per account with a passkey
+  account_email TEXT PRIMARY KEY,                 -- REFERENCES accounts ON DELETE CASCADE
+  user_handle   TEXT NOT NULL UNIQUE,             -- random WebAuthn user handle
+  created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS passkey_credentials (  -- one row per passkey
+  id            TEXT PRIMARY KEY,                 -- internal id, the only one clients see
+  credential_id TEXT NOT NULL UNIQUE,             -- WebAuthn credential ID
+  account_email TEXT NOT NULL,                    -- REFERENCES passkey_users ON DELETE CASCADE
+  ...                                             -- public key, counter, flags, rp_id, name, dates
+);
+
+CREATE TABLE IF NOT EXISTS passkey_spent_challenges ( -- challenges of successful ceremonies
+  challenge_hash TEXT PRIMARY KEY,
+  expires_at     TEXT NOT NULL                    -- purged 600 seconds after this
+);
 ```
 
-This design is intentionally simple:
+`user_storage` is intentionally simple:
 - **No schema migrations** needed when adding new collections
 - **One row per user per collection** — efficient upsert
 - **JSON blobs** keep the server storage schema-agnostic
@@ -698,6 +993,9 @@ audit_log         → libredb_audit_log
 masking_config    → libredb_masking_config
 threshold_config  → libredb_threshold_config
 dismissed_seeds   → libredb_dismissed_seeds
+favorite_connections → libredb_favorite_connections
+connection_order  → libredb_connection_order
+connection_groups → libredb_connection_groups
 ```
 
 ---
@@ -707,10 +1005,13 @@ dismissed_seeds   → libredb_dismissed_seeds
 ```
 src/lib/storage/
 ├── index.ts              # Barrel export — preserves @/lib/storage import path
-├── types.ts              # StorageData, StorageCollection, ServerStorageProvider
+├── types.ts              # StorageData, StorageCollection, ServerStorageProvider, PasskeyStore
 ├── local-storage.ts      # Pure localStorage CRUD (SSR-safe)
 ├── storage-facade.ts     # Public storage object with domain methods
+├── provider-type.ts      # getStorageProviderType(), import-free so the proxy can read it
 ├── factory.ts            # Env-based provider instantiation (singleton)
+├── owner-key.ts          # storageOwnerKey(): the user_id a session's rows are filed under
+├── passkey-row.ts        # passkey_credentials row to StoredPasskey, refusing a malformed row
 └── providers/
     ├── sqlite.ts         # better-sqlite3 implementation
     └── postgres.ts       # pg (Pool) implementation
@@ -770,7 +1071,7 @@ storage.saveConnection(conn);
 
 | Category | Methods |
 |----------|---------|
-| **Connections** | `getConnections()`, `saveConnection(conn)`, `deleteConnection(id)`, `getDismissedSeeds()` |
+| **Connections** | `getConnections()`, `saveConnection(conn)`, `deleteConnection(id)`, `getDismissedSeeds()`, `getFavoriteConnectionIds()`, `toggleFavoriteConnection(id)`, `getConnectionOrder()`, `setConnectionOrder(order)` |
 | **History** | `getHistory()`, `addToHistory(item)`, `clearHistory()` |
 | **Saved Queries** | `getSavedQueries()`, `saveQuery(query)`, `deleteSavedQuery(id)` |
 | **Schema Snapshots** | `getSchemaSnapshots(connId?)`, `saveSchemaSnapshot(snap)`, `deleteSchemaSnapshot(id)` |
@@ -791,7 +1092,7 @@ All read methods are **synchronous** — they read from `localStorage` only. No 
 **File:** `src/lib/storage/types.ts`
 
 ```typescript
-interface ServerStorageProvider {
+interface ServerStorageProvider extends PasskeyStore {
   initialize(): Promise<void>;
   getAllData(userId: string): Promise<Partial<StorageData>>;
   getCollection<K extends StorageCollection>(
@@ -803,8 +1104,35 @@ interface ServerStorageProvider {
   mergeData(userId: string, data: Partial<StorageData>): Promise<void>;
   isHealthy(): Promise<boolean>;
   close(): Promise<void>;
+  listAccounts(): Promise<StoredAccount[]>;
+  getAccount(email: string): Promise<StoredAccount | null>;
+  insertAccount(account: StoredAccount): Promise<void>; // first removes passkey rows left under that email
+  // Writes only while the row still has options.expected (the version the caller read), else
+  // AccountWriteConflict; resolves to the number of passkeys removed (clearPasskeys).
+  updateAccount(account: StoredAccount, options: AccountUpdateOptions): Promise<number>;
+  deleteAccount(email: string, options?: AccountWriteOptions): Promise<void>; // also user_storage rows; passkeys cascade
+}
+
+interface AccountUpdateOptions {
+  expected: { sessionVersion: number; updatedAt: string };
+  keepEnabledAdmin?: boolean; // refuse a write that would leave no enabled admin
+  clearPasskeys?: boolean;    // delete the account's passkeys in the same transaction
+}
+
+interface PasskeyStore {
+  listPasskeys(email: string): Promise<StoredPasskey[]>;
+  countPasskeys(): Promise<Map<string, number>>;
+  getPasskeyUserHandle(email: string): Promise<string | null>;
+  findPasskey(credentialId: string): Promise<PasskeyMatch | null>;
+  insertPasskey(write: PasskeyRegistrationWrite): Promise<void>;     // PasskeyRegistrationConflict
+  recordPasskeySignIn(write: PasskeySignInWrite): Promise<void>;     // PasskeySignInConflict
+  renamePasskey(email: string, id: string, name: string): Promise<boolean>;
+  deletePasskey(write: PasskeyRemovalWrite): Promise<void>;          // PasskeyRemovalConflict
 }
 ```
+
+Each passkey write is one transaction that changes or locks the account row first, and refuses with a typed conflict carrying a closed reason instead of writing part of its change.
+A registration applies only while the account's session version equals the one its ceremony was confirmed under, and a removal only while it equals the caller's; the removal moves the account to the next version in the same transaction, which ends the account's other sessions.
 
 ### 7.2 SQLite Provider
 
@@ -849,7 +1177,6 @@ STORAGE_POSTGRES_URL=postgresql://user:pass@localhost:5432/libredb?sslmode=disab
 The factory uses the **Singleton pattern** — one provider instance per process, lazy-initialized on first access:
 
 ```typescript
-getStorageProviderType()     // → 'local' | 'sqlite' | 'postgres'
 isServerStorageEnabled()     // → true if not 'local'
 getStorageConfig()           // → { provider, serverMode }
 getStorageProvider()         // → ServerStorageProvider | null (singleton)
@@ -858,11 +1185,14 @@ closeStorageProvider()       // → cleanup for testing
 
 Provider classes are **dynamically imported** — SQLite and PostgreSQL dependencies are only loaded when their provider is selected.
 
+`getStorageProviderType()` (→ `'local' | 'sqlite' | 'postgres'`) lives in `src/lib/storage/provider-type.ts`, which imports nothing, so `src/proxy.ts` can read the storage type for its `Permissions-Policy` without loading storage.
+
 ---
 
 ## 8. API Routes
 
-All routes (except `/config`) require JWT authentication. The authenticated user's `username` (email) is used as the `user_id` for storage scoping.
+All routes (except `/config`) require JWT authentication.
+The `user_id` for storage scoping is the authenticated user's `username` (email), or under governance `sub:` followed by the identity provider's subject ([Governance Mode](#governance-mode)).
 
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
@@ -931,6 +1261,19 @@ App Mount
   │   └─ serverMode: true ──┐
   │                          │
   │   ┌──────────────────────▼──────────────────────┐
+  │   │ Owner: GET /api/auth/me → username          │
+  │   │  ├─ Unreadable → syncError, isReady stays   │
+  │   │  │   false, nothing is pulled or pushed     │
+  │   │  ├─ libredb_workspace_owner = username      │
+  │   │  │   → keep the browser copy                │
+  │   │  ├─ No owner, never migrated → keep it,     │
+  │   │  │   owner = username (local-mode data,     │
+  │   │  │   migrated below into this account only) │
+  │   │  └─ Otherwise → clear the browser copy,     │
+  │   │      mark it migrated, owner = username     │
+  │   └──────────────────────┬──────────────────────┘
+  │                          │
+  │   ┌──────────────────────▼──────────────────────┐
   │   │ Check libredb_server_migrated flag          │
   │   │  ├─ Not migrated → POST /api/storage/migrate│
   │   │  │   (send all localStorage → server merge) │
@@ -940,7 +1283,8 @@ App Mount
   │                          │
   │   ┌──────────────────────▼──────────────────────┐
   │   │ Pull: GET /api/storage                      │
-  │   │  → Write server data into localStorage      │
+  │   │  → Write server data into localStorage,     │
+  │   │    only while the owner is still username   │
   │   │  → Components re-render from localStorage   │
   │   └──────────────────────┬──────────────────────┘
   │                          │
@@ -965,9 +1309,47 @@ When any `storage.*` mutation fires:
    - Reads each pending collection from `localStorage`
    - Sends `PUT /api/storage/[collection]` for each
 
+### The Browser Copy Belongs to the Signed-In Account
+
+In server mode the browser copy is bound to the account that signed in: `libredb_workspace_owner` holds its username, and it is compared with `GET /api/auth/me` before any page reads the copy.
+Every page that reads it (the editor, the admin dashboard and the monitoring page) renders inside `WorkspaceOwnerGate`, which runs that check first; the lifecycle above runs it again when it starts, before anything is migrated or pulled, and from then on every request names the owner (see below).
+The settings pages (`/settings/mcp`, `/settings/authenticator`) do not read the copy but render inside the gate too, because a sign-in can land on them, and the gate records the owner there.
+While the check runs, those pages show a loading indicator; when the signed-in account cannot be read, they show a message instead of the copy.
+They show it too when `GET /api/storage/config` cannot be read and the copy carries an owner or the migration flag, both written only in server mode; a copy with neither renders as it is, so local mode does not change.
+The copy is every synced collection, the editor tabs (never stored on the server), the object-source drafts, the agent thread hint, the names of the collections a sign-out could not push, the migration flag and the owner key itself; per-browser preferences such as the theme and line numbers are not part of it.
+`clearAccountWorkspace()` in `src/lib/storage/local-storage.ts` holds that list.
+
+- **Same account:** the copy is kept, the collections a sign-out could not push are pushed, and the pull overwrites each collection the server holds, except one still waiting to be pushed; a collection the server does not hold yet stays local.
+- **A different account, or a copy with no owner that was already migrated:** the copy is cleared first and recorded as this account's, so the account starts from its own server data.
+- **A copy with no owner that was never migrated:** local-mode data, recorded as the signed-in account's and migrated into that account as described in [Migration Flow](#10-migration-flow).
+  A different account that signs in before the migration ran finds it owned by the first account, so the copy is cleared for it.
+- **Sign-out** (the editor, the admin dashboard and the launch page): the signing-out tab's pending collections are pushed while the session is still valid, then `POST /api/auth/logout` ends the session, and only then is the copy cleared.
+  Only the signing-out tab's pending collections are pushed first: a change waiting in another open tab reaches the server only if that tab pushes it before the session ends, and is refused after.
+  The cleared copy keeps the migration flag and no owner, so whatever is written to it afterwards is cleared at the next sign-in rather than migrated.
+  A pending push that does not land does not stop the sign-out: when it failed because the session had already ended, the copy is cleared and the tab goes to sign in; otherwise (server storage unreachable) the session still ends, the copy stays for this account with the names of the collections that were not pushed, and the sign-out says so.
+  The next sign-in of the same account on this browser pushes those collections before it pulls, and a pull does not replace a collection still waiting to be pushed; the next sign-in of a different account clears the copy, those changes with it.
+  A change made in the signing-out tab while the sign-out request is out is not pushed; it goes with the cleared copy.
+  When the server refuses the sign-out, or its answer is lost, the tab asks `GET /api/auth/me`: with no session left the sign-out counts as done and the copy is cleared, and while the session goes on the copy stays, the sync goes on, and the sign-out says it did not complete.
+  When the storage mode cannot be read, a copy that carries the owner key or the migration flag fails the sign-out and stays; a copy with neither is local-mode data, and the session just ends.
+  A sign-out from a tab whose session another tab has meanwhile replaced with a different account's gets `409 WORKSPACE_OWNER_MISMATCH` on its push and reloads; a logout request it sends before the reload lands ends the session the browser holds, which is that other account's.
+- **Other open tabs:** every tab of the browser profile shares the copy, so when another tab records a different owner or clears the copy (a sign-out, or a different account signing in and landing on the editor, an admin page, the monitoring page or a settings page), each page inside `WorkspaceOwnerGate` stops rendering and reloads, and the owner check runs again for the account signed in now.
+  A sign-in can also land where no owner is recorded (an unknown address), so a page inside `WorkspaceOwnerGate` also asks which account is signed in whenever its tab is shown again, and reloads the same way when that is no longer the account it rendered for.
+  The editor's sync asks which account is signed in once more when it starts, and reloads the same way when that is no longer the account the page matched the copy for.
+- **Every request names the account:** once a page has matched the copy, every request it sends names that account in the `X-LibreDB-Workspace-Owner` header, and the server refuses one that names an account other than the signed-in one with `409 WORKSPACE_OWNER_MISMATCH` before the route runs, on every route that needs a session; the public routes (`src/proxy.ts`) are not checked ([API_DOCS.md](API_DOCS.md#storage-api)).
+- **The embedded workspace:** none of this applies to `StudioWorkspace` from the npm package, which mounts no sync, gate or owner check: its host supplies the connections, and the editor tabs it keeps in the host page's storage are the host's to scope to its own accounts.
+  The page then reloads, and the owner check runs again for the account signed in now, so a push, a pull or a migration a page sends after another tab signed in as a different account never reaches that account's server data, also in a tab that stays visible.
+  In the browser the same rule holds: a page writes the copy (the storage facade, its editor tabs, its object-source drafts, and each collection of a pull) only while the owner key still names the account it claimed, so a page that has not reloaded yet writes nothing into the copy another tab claimed.
+- **A session that ended on its own** (expiry, a disabled account) clears nothing: the copy stays until the next sign-in's owner check, which covers a different account on the first of these pages it opens.
+  A page inside `WorkspaceOwnerGate` that finds no session when it opens, or when its tab is shown again, shows neither the copy nor a message and goes to sign in.
+  It does not cover a copy written while `GET /api/storage/config` could not be read on a browser profile that had no owner and no migration flag yet: such a copy is treated as local-mode data, so the next account to sign in records it as its own and migrates it.
+- **The first sign-in after upgrading to a release that records the owner:** a browser that was already migrated has no owner yet, so its copy is cleared once, for the same account too, and that sign-in starts from the account's server data.
+  Open editor tabs from before the upgrade are not kept, since they are never stored on the server, and neither are object-source drafts or any change that had not reached the server.
+
+In local mode none of this runs: the browser copy is the only copy, it stays on sign-out, and no owner is recorded.
+
 ### Graceful Degradation
 
-- If `/api/storage/config` fails → stays in localStorage-only mode
+- If `/api/storage/config` fails → stays in localStorage-only mode, unless the browser copy carries `libredb_workspace_owner` or `libredb_server_migrated`: then the pages that read the copy show a message instead of it, because the copy may belong to a different account
 - If push fails → logs warning, sets `syncError`, does **not** block the UI
 - Components always read from `localStorage` — no loading states for storage
 
@@ -979,15 +1361,18 @@ When a user first enables server mode (or a new user logs in for the first time)
 
 ```
 1. Hook detects serverMode = true
-2. Checks localStorage('libredb_server_migrated') flag
-3. If not migrated:
-   a. Reads whichever of the 10 collections exist in localStorage (a fresh browser with none simply sets the flag and skips)
+2. Reads the signed-in username (GET /api/auth/me), clears a browser copy that belongs to another account, and sets 'libredb_workspace_owner' to the username
+3. Checks localStorage('libredb_server_migrated') flag
+4. If not migrated:
+   a. Reads whichever of the 13 collections exist in localStorage (a fresh browser with none simply sets the flag and skips)
    b. POST /api/storage/migrate with the collected payload
    c. Server calls provider.mergeData() — upserts each collection as a whole blob in one transaction
    d. Sets 'libredb_server_migrated' flag in localStorage
-4. Pull: GET /api/storage → overwrite localStorage with server data
-5. Subsequent mutations sync normally via push
+5. Pull: GET /api/storage → overwrite localStorage with server data, unless a sign-out cleared the copy while the pull was out
+6. Subsequent mutations sync normally via push
 ```
+
+Step 2 is described in [The Browser Copy Belongs to the Signed-In Account](#the-browser-copy-belongs-to-the-signed-in-account).
 
 This ensures existing localStorage data is preserved when transitioning to server mode.
 
@@ -1027,7 +1412,7 @@ Every row in `user_storage` is scoped by `user_id`:
 (user@libredb.org,  connections) → [{"id":"c2", "name":"Dev DB"...}]
 ```
 
-- `user_id` = JWT session `username` (email address)
+- `user_id` = JWT session `username` (email address), or under governance `sub:` followed by the identity provider's subject ([Governance Mode](#governance-mode))
 - **Client never sends `user_id`** — server always extracts from JWT cookie
 - Every query includes `WHERE user_id = $username` — no cross-user access possible
 
@@ -1039,7 +1424,67 @@ Every row in `user_storage` is scoped by `user_id`:
 
 ### OIDC Users
 
-OIDC users (Auth0, Keycloak, Okta, Azure AD) have their `preferred_username` or email claim mapped to the same `username` field used as `user_id`. See [OIDC.md](./OIDC.md) for SSO configuration — it pairs well with server storage for team deployments.
+OIDC users (Auth0, Keycloak, Okta, Azure AD) have their email claim, else their `preferred_username`, mapped to the same `username` field used as `user_id`, under the rule in [OIDC.md](./OIDC.md#session-identity). See [OIDC.md](./OIDC.md) for SSO configuration; it pairs well with server storage for team deployments.
+
+### Governance Mode
+
+With `GOVERNANCE_SOURCE=postgres` ([GOVERNANCE.md](./GOVERNANCE.md#sign-in)) the key is not the username.
+Studio files every row under `sub:` followed by the session's `idpSubject`, the identity provider's subject for the user ([OIDC.md](./OIDC.md#session-identity)), which for Keycloak is the user id:
+
+```
+(sub:6f1c2b7e-0d4a-4c51-9a1e-2f3b8c9d0e11, connections) → [...]
+(sub:6f1c2b7e-0d4a-4c51-9a1e-2f3b8c9d0e11, history)     → [...]
+```
+
+- The subject is the key a control plane writes the user's grants under, and it stays when the email changes.
+  So a later email change does not move a user's storage: the next sign-in reads and writes the same rows.
+- The username keeps its other uses: display, rate limiting and the owner of the browser copy, so the `X-LibreDB-Workspace-Owner` header still names it ([The Browser Copy Belongs to the Signed-In Account](#the-browser-copy-belongs-to-the-signed-in-account)).
+  After an email change the next sign-in finds a copy owned by the old address, clears it, and pulls the same rows from the server again.
+- The prefix keeps subjects apart from usernames.
+  Rows a store filed under a username before governance was switched on stay under that username, and governance mode neither reads nor moves them.
+- Under governance sign-in refuses a session without a subject, and a storage route that meets one answers 500 rather than file rows under the username.
+- `src/lib/storage/owner-key.ts` builds the key.
+  Without governance it is the username exactly as before, also for an OIDC session that carries a subject.
+
+### Accounts
+
+`STORAGE_PROVIDER=sqlite` or `postgres` keeps local email/password identities in an `accounts` table next to `user_storage`.
+`STORAGE_PROVIDER=local` has no server database, so it keeps using `ADMIN_PASSWORD` and the optional `USER_PASSWORD` on every login.
+`NEXT_PUBLIC_AUTH_PROVIDER=oidc` does not read or write `accounts`: the issuer is the only identity, and a stored role cannot deny or elevate someone the issuer already named.
+
+On the first start with an empty table, `ADMIN_EMAIL` / `ADMIN_PASSWORD` (and `USER_EMAIL` / `USER_PASSWORD` when the password is set) are copied in and then left alone.
+Passwords are stored as scrypt (RFC 7914) with N=16384, r=8, p=1, a 16-byte salt and a 32-byte key, encoded `scrypt$<N>$<r>$<p>$<salt>$<key>`.
+A stored hash whose parameters differ is rewritten with the current parameters after a successful login.
+A failed login does not write.
+
+Further accounts are created under Admin → Accounts.
+Disabling an account stops login and leaves its `user_storage` rows in place, so enabling it again restores that person's connections.
+Deleting an account removes those rows in the same transaction, so creating the same email later does not inherit them.
+Its passkeys and user handle go with it through the foreign keys of the passkey tables.
+Studio's own SQLite connections enforce foreign keys; a delete made outside Studio, such as in the `sqlite3` shell, must run `PRAGMA foreign_keys = ON` first.
+On PostgreSQL the foreign keys always hold, except for a delete made with `session_replication_role = replica`.
+When a delete bypassed them on either engine, creating an account under the same email later removes the passkey rows left behind in the same transaction and logs a warning with their count, so the old passkeys never sign in to the new account.
+A DBA-managed PostgreSQL schema must create the passkey tables before an image with passkey sign-in starts; see [PASSKEYS.md](./PASSKEYS.md#upgrading-a-dba-managed-schema).
+The last enabled admin cannot be disabled, demoted, or deleted, and the store decides that inside the write's own transaction, so two concurrent requests cannot each remove one of the last two admins.
+
+**Sessions follow the account.**
+Each session token carries the account's `session_version`, and every request reads the row again: a session ends at its next request when its account is disabled, deleted, demoted or promoted, or has its password reset by an admin.
+An admin who changes their own role or password keeps the session making the change, and their other sessions end.
+An admin password set also removes the account's passkeys unless the admin keeps them, and removing a passkey ends the account's other sessions too; see [PASSKEYS.md](./PASSKEYS.md#admin-actions-and-recovery).
+Every account write applies only while the row still has the session version and update time its writer read, so a change that lands first is never reverted by a request that read the row before it; the loser answers 409.
+MCP tokens minted for a stored account carry the same version and stop working the same way.
+A new row starts at a random version, so a session of a deleted account never matches a later account with the same email.
+Upgrading an existing `sqlite` or `postgres` deployment to a release with the registry signs every local user out once: a session from before it carries no version.
+
+**The environment after seeding.**
+Once the table has rows, changing `ADMIN_PASSWORD` no longer changes the admin's password.
+Each start compares the two once and logs a warning when `ADMIN_PASSWORD` does not match the stored admin, or when `ADMIN_EMAIL` has no row.
+To apply the environment, for a rotated secret or an admin locked out of every account, set `ADMIN_PASSWORD_RESET=true` and restart: `ADMIN_EMAIL` becomes an enabled admin that signs in with `ADMIN_PASSWORD`, with `ADMIN_TOTP_SECRET` as its second factor or none, its older sessions end, and the audit log records the change with actor `environment`; it has no passkeys afterwards.
+Remove the variable afterwards, because every start applies it again while it is set, and the log says so.
+
+TOTP secrets that were set in the environment are copied onto the seeded rows.
+After that, enrolment is per account, and the stored secrets are sealed with the same key as connection passwords.
+See [MFA.md](./MFA.md#when-accounts-live-in-the-server-store).
 
 ---
 

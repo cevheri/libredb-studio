@@ -1,9 +1,14 @@
 import { NextResponse } from "next/server";
+import { persistedRunFacts, workflowAvailability } from "@/lib/agent/agent-manifest";
 import { admitAgentModel } from "@/lib/agent/capability-gate";
 import { isAgentRuntimeEnabled, isThreadContextEnabled } from "@/lib/agent/config";
 import { connectionIdentity } from "@/lib/agent/context-snapshot";
-import { AGENT_EXECUTION_ENGINES } from "@/lib/agent/engine-support";
-import { AGENT_MAX_OBJECTIVE_LENGTH } from "@/lib/agent/execution-policy";
+import {
+  AGENT_HISTORY_PAGE_DEFAULT,
+  AGENT_HISTORY_PAGE_MAX,
+  AGENT_MAX_OBJECTIVE_LENGTH,
+} from "@/lib/agent/execution-policy";
+import { decodeHistoryCursor, type AgentHistoryCursor } from "@/lib/agent/history";
 import { threadContextMaxCharsFor } from "@/lib/agent/models";
 import { agentPosture } from "@/lib/agent/posture";
 import type { AgentRunStatusReport } from "@/lib/agent/run-service";
@@ -13,7 +18,6 @@ import { threadContextFor } from "@/lib/agent/thread-context";
 import {
   AGENT_TERMINAL_STATUSES,
   AGENT_WORKFLOW_PRESENTS_ANSWER,
-  AGENT_WORKFLOW_SENDS_STATEMENTS,
   DEFAULT_AGENT_WORKFLOW_TYPE,
   type AgentRunFailureReason,
   type AgentRunMode,
@@ -23,11 +27,15 @@ import {
   type AgentThreadHeader,
 } from "@/lib/agent/types";
 import { createErrorResponse } from "@/lib/api/errors";
+import { createDatabaseProvider, getOrCreateProvider } from "@/lib/db";
+import { catalogSessionConnection } from "@/lib/db/catalog-scope";
+import { editorProvider } from "@/lib/api/editor-provider";
 import { resolveConfig } from "@/lib/llm/utils/config";
 import { guardRoute } from "@/lib/api/require-session";
 import { getDBConfig } from "@/lib/db-ui-config";
 import { logger } from "@/lib/logger";
 import { resolveConnection } from "@/lib/seed/resolve-connection";
+import type { DatabaseConnection } from "@/lib/types";
 
 /**
  * Opens an agent run (#329 T9).
@@ -134,6 +142,68 @@ function badRequest(message: string, refused?: AgentStartRefusalCode): NextRespo
   return NextResponse.json({ error: message, ...(refused === undefined ? {} : { refused }) }, { status: 400 });
 }
 
+/**
+ * The finished conversations this session can reopen, newest first (#830).
+ *
+ * The list is scoped to the verified session — `guardRoute` above — and the
+ * session id is the one a run's `actor.sessionId` records, so one user can only
+ * ever list their own runs. An absent runtime answers the same `404` as every
+ * other agent route, so an unauthenticated caller learns nothing.
+ */
+export async function GET(req: Request) {
+  const guard = await guardRoute({ route: "GET /api/agent/runs", bucket: "ai", request: req });
+  if ("response" in guard) return guard.response;
+
+  if (!isAgentRuntimeEnabled()) {
+    return NextResponse.json({ error: "The agent runtime is not enabled on this server" }, { status: 404 });
+  }
+
+  const url = new URL(req.url);
+  const rawLimit = url.searchParams.get("limit");
+  let limit = AGENT_HISTORY_PAGE_DEFAULT;
+  if (rawLimit !== null) {
+    // A plain decimal spelling only: `Number.parseInt` would accept "1.5" as 1,
+    // and a value that is not the integer it claims to be must be refused rather
+    // than coerced into the page the caller happened to ask for.
+    if (!/^\d+$/.test(rawLimit)) {
+      return badRequest("limit must be a positive integer");
+    }
+    const parsed = Number(rawLimit);
+    if (parsed <= 0) {
+      return badRequest("limit must be a positive integer");
+    }
+    // Clamped rather than refused: a caller asking for a page larger than the
+    // bounded index is served the bounded page, and a refusal would teach it a
+    // number it does not need to know.
+    limit = Math.min(parsed, AGENT_HISTORY_PAGE_MAX);
+  }
+
+  const rawCursor = url.searchParams.get("cursor");
+  let cursor: AgentHistoryCursor | undefined;
+  if (rawCursor !== null) {
+    const decoded = decodeHistoryCursor(rawCursor);
+    if (decoded === null) return badRequest("cursor is not a valid history cursor");
+    cursor = decoded;
+  }
+
+  try {
+    const service = await getAgentRunService();
+    const page = await service.listConversations(guard.session.username, { limit, cursor });
+    return NextResponse.json({ conversations: page.conversations, nextCursor: page.nextCursor });
+  } catch (error) {
+    return createErrorResponse(error, { route: "api/agent/runs" });
+  }
+}
+
+/** Whether the connection reaches a whole server (#1530); a record that cannot be built declares nothing. */
+async function reachesWholeServer(connection: DatabaseConnection): Promise<boolean> {
+  try {
+    return (await createDatabaseProvider(connection)).getCapabilities().catalogSessions === true;
+  } catch {
+    return false;
+  }
+}
+
 export async function POST(req: Request) {
   const guard = await guardRoute({ route: ROUTE, bucket: "ai", request: req });
   if ("response" in guard) return guard.response;
@@ -155,6 +225,7 @@ export async function POST(req: Request) {
 
     const { mode, workflowType, workflowSource, workflowReading, autoExecute, objective, connectionId, previousRunId } =
       body;
+    const { catalog } = body;
     if (typeof mode !== "string" || !MODES.has(mode)) {
       return badRequest('mode must be "planning" or "agent"');
     }
@@ -234,11 +305,14 @@ export async function POST(req: Request) {
     if (previousRunId !== undefined && (typeof previousRunId !== "string" || previousRunId.trim().length === 0)) {
       return badRequest("previousRunId must be a non-empty string when provided");
     }
+    if (catalog !== undefined && (typeof catalog !== "string" || catalog.trim().length === 0)) {
+      return badRequest("catalog must be a non-empty string when provided");
+    }
 
     const connection = await resolveConnection({ connectionId }, guard.session);
 
     /*
-      An engine whose provider implements no database-native read-only statement path,
+      An engine whose provider implements no read-only statement path,
       refused at the point the run is OPENED (#512).
 
       Driven live on 2026-08-15 before this existed: a run on the bundled `libredb`
@@ -249,31 +323,35 @@ export async function POST(req: Request) {
       can change it. So the run spent a run id, a grounding capture and a model turn to
       reach a sentence that was already available here.
 
-      Three things this checks, in the order they exclude each other:
+      The decision is the manifest's `workflowAvailability`, which checks, in the order
+      they exclude each other:
 
        - **The MODE.** Plan mode drafts on every engine and executes nothing it drafts,
          so an unsupported engine is no reason to refuse one.
-       - **The WORKFLOW**, read off `AGENT_WORKFLOW_SENDS_STATEMENTS` rather than a list
-         written here. `operations` sends no statement at all, and refusing it would
+       - **The WORKFLOW.** `operations` sends no statement at all, and refusing it would
          withhold a workflow that runs on every engine over a claim that is not true of
          it (#411) — which is the same reason the rail's amber pre-start card does not
          gate Start. The workflow has to be known first, and under Automatic it is: the
          rail classifies at `POST /api/agent/classify` and names the workflow in this
          request, so the refusal lands after the classify call and before the open.
-       - **The ENGINE**, from `AGENT_EXECUTION_ENGINES` — the one named mirror of the
-         factory's own gate (`requiresReadOnlyStatements && typeof provider.queryReadOnly
-         !== "function"`), which `tests/unit/lib/agent/engine-support.test.ts` keeps
-         equal to the provider prototypes it claims to describe. Read here rather than
-         probed off a constructed provider, because a construction is not free on the
-         engines this refusal is about: on a single-writer file the second handle throws
-         rather than opening (B49), and it is the same constant the rail, the safety
-         strip and the login hero already read, so the notice and the refusal cannot
-         disagree about which engines they are talking about.
+       - **The ENGINE'S LANGUAGE**, from `AGENT_STATEMENT_LANGUAGE`, keyed by type-id
+         and held by `tests/unit/lib/agent/agent-manifest.test.ts` to every provider
+         that has `queryReadOnly`, the factory's own gate. Read here rather than probed
+         off a constructed provider, because a construction is not free on the engines
+         this refusal is about: on a single-writer file the second handle throws rather
+         than opening (B49), and it is the same record the rail and the safety strip
+         read, so the notice and the refusal cannot disagree about which engines they
+         are talking about.
+       - **The VARIANT and what it requires.** A language may have no variant of the
+         workflow, or a variant whose tools need a reading this engine does not serve;
+         either is refused with the manifest's own sentence.
 
-      The sentence is the posture's, which is the one the rail's own amber card shows as
-      its reason — it names the engines that DO have such a path, that `operations` runs
-      here, and that plan mode drafts here, so a refused user is told both ways forward
-      rather than a third phrasing of the same fact.
+      An engine with no language is answered with the posture's sentence, which is the one
+      the rail's own amber card shows as its reason: it names the engines that DO have
+      such a path, that `operations` runs here, and that plan mode drafts here, so a
+      refused user is told both ways forward rather than a third phrasing of the same
+      fact. The other two refusals carry the same marker, because they are the same kind
+      of fact: the request has to change its workflow, its mode or its connection.
 
       Ahead of `admitAgentModel` on purpose: that gate probes the configured model,
       which is a model call. The engine fact needs no model to establish, so it is
@@ -286,22 +364,50 @@ export async function POST(req: Request) {
       is the same status the route's other cross-field refusal (`autoExecute` on a
       workflow that presents no answer) answers with.
     */
-    if (
-      mode === "agent" &&
-      AGENT_WORKFLOW_SENDS_STATEMENTS[requestedWorkflow] &&
-      !AGENT_EXECUTION_ENGINES.includes(connection.type)
-    ) {
+    const availability = workflowAvailability(mode as AgentRunMode, requestedWorkflow, connection.type);
+    if (!availability.open) {
       return badRequest(
-        agentPosture({
-          mode: "agent",
-          engine: connection.type,
-          engineLabel: getDBConfig(connection.type).label,
-          handover: false,
-        }).body,
+        availability.cause === "no-adapter"
+          ? agentPosture({
+              mode: "agent",
+              engine: connection.type,
+              engineLabel: getDBConfig(connection.type).label,
+              handover: false,
+            }).body
+          : availability.sentence,
         // The only refusal here that a client can already be explaining for itself, so
         // the only one that carries a code (#513).
         "engine-unsupported",
       );
+    }
+    // The hand-over replays the answer's statement in the user's editor; a variant that cannot auto-execute (every
+    // kubectl variant: a kubectl answer is never run on the editor's terms) refuses the setting rather than persisting
+    // a run that would promise it. The workflow check above answers before the connection is resolved; this one is
+    // the engine's, read from the same variant the rail and the system prompt read.
+    if (autoExecute === true && availability.variant?.canAutoExecute !== true) {
+      return badRequest(
+        "autoExecute is not offered for this workflow on this engine: its answer is never run in the editor.",
+      );
+    }
+
+    /*
+      ON A SERVER-LEVEL CONNECTION A RUN READS ONE DATABASE (#1530), named in `catalog` and
+      decided here, once: the connection itself names none, and a run that walked every
+      database on the server to ground itself would open a session in each. Required exactly
+      when the declaration says so, read without connecting the way provider-meta reads it,
+      and a database the role cannot open is refused before the run exists rather than after
+      its first drive fails to connect.
+    */
+    const serverLevel = await reachesWholeServer(connection);
+    if (serverLevel !== (catalog !== undefined)) {
+      return badRequest(
+        serverLevel
+          ? "This connection reaches every database on its server: name the database the run reads in catalog"
+          : "catalog names a database only on a connection that reaches a whole server, and this one names its own",
+      );
+    }
+    if (catalog !== undefined) {
+      await editorProvider(guard.session, connection, catalog);
     }
 
     /*
@@ -312,7 +418,9 @@ export async function POST(req: Request) {
       read below for exactly that. The password is excluded by `connectionIdentity`
       itself, which is why this is that function and not a hash of the record.
     */
-    const connectionIdentityOfRun = connectionIdentity(connection);
+    const connectionIdentityOfRun = connectionIdentity(
+      catalog === undefined ? connection : catalogSessionConnection(connection, catalog),
+    );
 
     /*
       Before a run exists, not after one has failed. A model that cannot call tools
@@ -321,7 +429,9 @@ export async function POST(req: Request) {
       probe positively ESTABLISHED, so nothing that merely went wrong (a quota, a bad
       key, an unreachable endpoint) reaches here as a refusal; those still start, and
       the drive reports them in its own vocabulary. 422 rather than 400: the request is
-      well-formed, and it is the server's configuration that cannot honour it.
+      well-formed, and it is the server's configuration that cannot honour it. A
+      configuration the model refused (a reasoning effort it does not take) is thrown
+      instead, and the catch below answers it as the configuration error it is.
     */
     const gate = await admitAgentModel(mode as AgentRunMode);
     if (gate.kind === "refused") {
@@ -432,6 +542,9 @@ export async function POST(req: Request) {
       // the request that predates the field, so a run that starts its own conversation
       // writes the same bytes a run opened before conversations existed did.
       ...(thread === undefined ? {} : { thread }),
+      // The language and the verifier the run was opened under, each written only where it
+      // differs from what its absence reads as, so an SQL run's header keeps its bytes.
+      ...persistedRunFacts(mode as AgentRunMode, requestedWorkflow, availability),
       actor: { sessionId: guard.session.username, role: guard.session.role },
       connectionId: connection.id,
       // The database this run is ACTUALLY reading, written unconditionally - including
@@ -441,6 +554,7 @@ export async function POST(req: Request) {
       // predecessor's instead would keep declining, which is what the rail's copy used
       // to promise and the code never did (#512).
       connectionIdentity: connectionIdentityOfRun,
+      ...(catalog === undefined ? {} : { catalog }),
       objective,
     });
 
@@ -448,9 +562,10 @@ export async function POST(req: Request) {
     // same middleware. The run's durability does not depend on this call
     // surviving: everything it does is written to the ledger first, so a drive
     // that dies leaves a run that CAN be resumed — POST /api/agent/drive does
-    // exactly that. What does not exist yet is anything that asks for one, so a
-    // process that dies mid-run leaves it running until something calls that
-    // route (`docs/BACKLOG.md` B9).
+    // exactly that, and the local resume sweep (#1000) now asks for one on its
+    // own, so a process that dies mid-run leaves it running only until the
+    // sweep's next pass finds it stale (`docs/BACKLOG.md` B9 for what that
+    // still does not cover).
     void driveAgentRun(record.runId).catch((error: unknown) => {
       logger.error("Agent run drive ended in failure", error, { route: "api/agent/runs", runId: record.runId });
     });
@@ -471,6 +586,7 @@ export async function POST(req: Request) {
         // asked for and did not happen. Echoed from the RECORD, so a run that started
         // its own conversation reports the thread of one the fold gave it.
         thread: record.thread,
+        ...(record.catalog === undefined ? {} : { catalog: record.catalog }),
       },
       { status: 202 },
     );

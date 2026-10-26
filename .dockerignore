@@ -22,6 +22,7 @@ dist
 # tested locally was not the image CI publishes (CI checkouts are clean).
 desktop
 dist-desktop
+vscode-extension
 dist-rel
 operator
 packaging
@@ -31,9 +32,19 @@ charts
 # Test and automation trees
 e2e
 tests
+# The Playwright configs import e2e helpers, and next build type-checks every
+# .ts the context keeps, so a config left in would fail the image build.
+playwright*.config.ts
+# The governance vectors generator seals with the test sealer under tests/, so
+# it would fail the image build's type check the same way. It is a developer
+# tool that no image runs.
+scripts/generate-governance-vectors.ts
 playwright-report
 test-results
 data-e2e-offline
+data-e2e-base-path
+data-e2e-launch
+data-e2e-passkey
 .loop
 loop
 .claude
@@ -72,6 +83,7 @@ docs
 # Development files
 .vscode
 .idea
+.devcontainer
 *.swp
 *.swo
 *~

@@ -27,8 +27,17 @@
  * so embedding @libredb/studio in libredb-platform is unaffected.
  */
 
-import { JWT_SECRET_MIN_LENGTH } from "@/lib/config/auth-env";
+import {
+  JWT_SECRET_MIN_LENGTH,
+  SESSION_TTL_MAX_SECONDS,
+  SESSION_TTL_MIN_SECONDS,
+  sessionTtlSeconds,
+} from "@/lib/config/auth-env";
+import { isBootstrapEnabled } from "@/lib/auth-bootstrap";
+import { readBearerAudience } from "@/lib/oidc-bearer";
 import { isServerStorageEnabled } from "@/lib/storage/factory";
+import { getStorageProviderType } from "@/lib/storage/provider-type";
+import { readSchemaName } from "@/lib/storage/schema-name";
 
 /**
  * Validate `STORAGE_ENCRYPTION_KEY` when server-side storage is configured.
@@ -62,6 +71,92 @@ function verifyStorageEncryptionKeyAtBoot(): boolean {
 }
 
 /**
+ * Validate `AUTH_SESSION_TTL_SECONDS`. Unset keeps the 24-hour default; a set value that is not an integer from 300
+ * to 86400 would make every login throw, so boot stops here instead.
+ */
+function verifySessionTtlAtBoot(): boolean {
+  try {
+    sessionTtlSeconds();
+    return true;
+  } catch {
+    console.error(
+      [
+        "",
+        "============================================================",
+        " LibreDB Studio cannot start: AUTH_SESSION_TTL_SECONDS is invalid",
+        ` Got "${process.env.AUTH_SESSION_TTL_SECONDS}"; it must be a whole number of seconds`,
+        ` from ${SESSION_TTL_MIN_SECONDS} to ${SESSION_TTL_MAX_SECONDS}.`,
+        " Every login would fail, so boot stops here.",
+        " Fix it either way:",
+        "   1. Set a value in range, for example AUTH_SESSION_TTL_SECONDS=28800",
+        "   2. Unset AUTH_SESSION_TTL_SECONDS to keep the 24-hour default",
+        "============================================================",
+        "",
+      ].join("\n"),
+    );
+    process.exit(1);
+    return false;
+  }
+}
+
+/**
+ * Validate `STORAGE_POSTGRES_SCHEMA` when the PostgreSQL storage provider is configured.
+ *
+ * The provider writes the name into every storage statement, so a value that is not a plain
+ * lowercase identifier would fail only at the first storage request, after sign-in. Under any other
+ * provider the variable is inert and is not checked.
+ */
+function verifyStorageSchemaAtBoot(): boolean {
+  if (getStorageProviderType() !== "postgres") return true;
+  try {
+    readSchemaName("STORAGE_POSTGRES_SCHEMA");
+    return true;
+  } catch (error) {
+    console.error(
+      [
+        "",
+        "============================================================",
+        " LibreDB Studio cannot start: STORAGE_POSTGRES_SCHEMA is invalid",
+        ` ${(error as Error).message}.`,
+        " Set it to the schema that holds the storage tables, such as studio,",
+        " or unset it to keep the tables where the connection's search_path puts them.",
+        "============================================================",
+        "",
+      ].join("\n"),
+    );
+    process.exit(1);
+    return false;
+  }
+}
+
+/**
+ * Validate `OIDC_BEARER_AUDIENCE` (src/lib/oidc-bearer.ts). Unset leaves the bearer channel off. A set value without
+ * NEXT_PUBLIC_AUTH_PROVIDER=oidc, or equal to OIDC_CLIENT_ID, would answer every native client 503, so boot stops here.
+ * The same check runs on every bearer request, because an embedded Studio never runs this preflight.
+ */
+function verifyBearerAudienceAtBoot(): boolean {
+  try {
+    readBearerAudience();
+    return true;
+  } catch (error) {
+    console.error(
+      [
+        "",
+        "============================================================",
+        " LibreDB Studio cannot start: OIDC_BEARER_AUDIENCE is invalid",
+        ` ${(error as Error).message}.`,
+        " Set it to the audience the identity provider puts in the native client's access tokens,",
+        " or unset it to turn bearer access tokens off.",
+        "============================================================",
+        "",
+      ].join("\n"),
+    );
+    process.exit(1);
+    return false;
+  }
+}
+
+/**
  * Validate the auth environment before the server starts serving.
  *
  * Returns `true` when boot may continue. On a fatal misconfiguration it prints
@@ -70,12 +165,45 @@ function verifyStorageEncryptionKeyAtBoot(): boolean {
  * is stubbed (tests) rather than terminating the process immediately.
  */
 export function verifyAuthEnvAtBoot(): boolean {
+  if (!verifySessionTtlAtBoot() || !verifyBearerAudienceAtBoot()) return false;
+
   const secret = process.env.JWT_SECRET;
 
-  // Unset or empty is not this check's business: zero-config bootstrap generates
-  // a secret, and with AUTH_BOOTSTRAP=off getJwtSecret owns the missing-secret
-  // path (dev fallback outside production, clear 503 in it).
-  if (!secret || secret.length >= JWT_SECRET_MIN_LENGTH) return verifyStorageEncryptionKeyAtBoot();
+  // A missing secret is only this check's business in the one case where nothing
+  // else will produce one: AUTH_BOOTSTRAP=off, which turns off secret generation
+  // along with credential generation, in production, where getJwtSecret has no dev
+  // fallback either. The server then starts, answers the health probe "healthy",
+  // and returns 503 to every login - the monitor stays green and the first report
+  // comes from a user who cannot sign in (#908).
+  //
+  // The reasoning in this file's header applies unchanged: with no secret the
+  // server can sign no session at all, so no working deployment can regress by
+  // stopping here, and the operator gets the same actionable banner the too-short
+  // path already prints.
+  if (!secret && process.env.NODE_ENV === "production" && !isBootstrapEnabled()) {
+    console.error(
+      [
+        "",
+        "============================================================",
+        " LibreDB Studio cannot start: JWT_SECRET is not set",
+        " AUTH_BOOTSTRAP is off, which also turns off secret generation,",
+        " so nothing will produce one. Every login would fail with HTTP 503.",
+        " Fix it either way:",
+        "   1. Set a secret: JWT_SECRET=$(openssl rand -base64 32)",
+        "   2. Leave AUTH_BOOTSTRAP on and let the first run generate one",
+        "============================================================",
+        "",
+      ].join("\n"),
+    );
+    process.exit(1);
+    return false;
+  }
+
+  // Otherwise an unset secret is not this check's business: zero-config bootstrap
+  // generates one, and outside production getJwtSecret has its dev fallback.
+  if (!secret || secret.length >= JWT_SECRET_MIN_LENGTH) {
+    return verifyStorageEncryptionKeyAtBoot() && verifyStorageSchemaAtBoot();
+  }
 
   // The secret value never reaches the logs — only its length.
   console.error(

@@ -1,10 +1,22 @@
 import { NextResponse } from "next/server";
-import { getOrCreateProvider, type MaintenanceType } from "@/lib/db";
+import { getOrCreateProvider, type MaintenanceOperation } from "@/lib/db";
 import { emitAuditEvent } from "@/lib/audit";
 import { createErrorResponse } from "@/lib/api/errors";
+import { mapDatabaseError } from "@/lib/db/errors";
 import { maintenanceControl, type MaintenancePlacement } from "@/lib/db/types";
 import { resolveConnection } from "@/lib/seed/resolve-connection";
-import { auditRoleDenial, guardRoute } from "@/lib/api/require-session";
+import { auditRoleDenial, guardRoute, adminRequiredResponse } from "@/lib/api/require-session";
+import { requestCatalog } from "@/lib/db/catalog-scope";
+import { editorProvider } from "@/lib/api/editor-provider";
+import { clientAddress } from "@/lib/api/client-address";
+import { ApiErrorCode } from "@/lib/api/error-codes";
+import type { UserPayload } from "@/lib/auth";
+import type { GovernedConnection } from "@/lib/governance/visible";
+import { admitQueryExecution } from "@/lib/query-events/admission";
+import { queryEventStart } from "@/lib/query-events/build";
+import { recordQueryEvent } from "@/lib/query-events/sink";
+import type { QueryEventInput, QueryEventStatus } from "@/lib/query-events/types";
+import type { DatabaseConnection } from "@/lib/types";
 import { logger } from "@/lib/logger";
 
 export async function POST(request: Request) {
@@ -19,12 +31,17 @@ export async function POST(request: Request) {
 
   if (guard.session.role !== "admin") {
     auditRoleDenial({ route: "POST /api/db/maintenance", user: guard.session.username, request });
-    return NextResponse.json({ error: "Unauthorized. Admin access required." }, { status: 403 });
+    return adminRequiredResponse();
   }
 
   try {
-    const body = await request.json();
-    const { type, target } = body;
+    // A body that is not JSON, or JSON that is not an object (`null`, an array, a number), is the caller's mistake and
+    // answers 400 in a fixed sentence, rather than reaching the destructuring below as a raw runtime error.
+    const body = await request.json().catch(() => null);
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+    }
+    const { type, target, container } = body;
 
     const connection = await resolveConnection(body, guard.session);
 
@@ -32,14 +49,44 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Maintenance type is required" }, { status: 400 });
     }
 
-    const provider = await getOrCreateProvider(connection);
+    // `container` is the row's `schemaName`: a string naming the container the target lives in,
+    // or absent for a request that names none. A non-string one is a malformed request, and it
+    // is answered HERE rather than allowed through to a provider, where the first use - an
+    // `identifier.replace` - threw a TypeError and the client read a 500 for a request this
+    // route could have refused by reading the field's type (#1091 review). Nothing is opened
+    // and nothing is run for it.
+    if (container !== undefined && typeof container !== "string") {
+      return NextResponse.json(
+        { error: `"container" must be a string naming the target's container` },
+        { status: 400 },
+      );
+    }
+
+    // `target` is the same kind of field: a string naming the object the operation runs against,
+    // or absent for the whole-database form. A non-string one reached the provider, where a number
+    // failed as `identifier.replace is not a function` and the client read a 500 quoting provider
+    // source, and the audit row below recorded the serialized value. It is refused here, before
+    // any provider opens and before any audit row.
+    if (target !== undefined && typeof target !== "string") {
+      return NextResponse.json(
+        { error: `"target" must be a string naming the object to run against` },
+        { status: 400 },
+      );
+    }
+
+    // An EMPTY string reads as the absence of a container, the same way an empty `target` reads
+    // as the whole-database form below. Nothing here may hand a provider a value that its own
+    // falsy test would have refused anyway, because the audit row below records what arrived.
+    const requestedContainer: string | undefined = container || undefined;
+
+    const provider = await editorProvider(guard.session, connection, requestCatalog(body));
     const capabilities = provider.getCapabilities();
 
     if (!capabilities.supportsMaintenance) {
       return NextResponse.json({ error: `Maintenance operations not supported for this database` }, { status: 400 });
     }
 
-    if (!capabilities.maintenanceOperations.includes(type as MaintenanceType)) {
+    if (!capabilities.maintenanceOperations.includes(type as MaintenanceOperation)) {
       return NextResponse.json(
         {
           error: `Operation '${type}' not supported for this database. Supported: ${capabilities.maintenanceOperations.join(", ")}`,
@@ -78,8 +125,8 @@ export async function POST(request: Request) {
     // the existing "operation not supported" 400 unreachable for exactly the four providers
     // whose vacuum wording names something else.
     const placement: MaintenancePlacement = target ? "perEntity" : "global";
-    const perEntityControl = maintenanceControl(capabilities, type as MaintenanceType, "perEntity");
-    const globalControl = maintenanceControl(capabilities, type as MaintenanceType, "global");
+    const perEntityControl = maintenanceControl(capabilities, type as MaintenanceOperation, "perEntity");
+    const globalControl = maintenanceControl(capabilities, type as MaintenanceOperation, "global");
     const requestedControl = placement === "perEntity" ? perEntityControl : globalControl;
 
     if (!requestedControl.offered && (perEntityControl.offered || globalControl.offered)) {
@@ -101,9 +148,73 @@ export async function POST(request: Request) {
       return NextResponse.json({ error }, { status: 400 });
     }
 
+    // The engine principal this connection acts as, for a provider that can name one (spec 3.11): a user name, never
+    // any part of a secret, so it is recorded beside the Studio user on every row below.
+    const engineUser = provider.engineUser?.();
+
+    // The fields every row of this run shares, built once so the completed row and the thrown row
+    // cannot disagree about which operation was run against what.
+    const auditFields = {
+      type: type === "kill" ? "kill_session" : "maintenance",
+      action: type.toUpperCase(),
+      target: target || "all",
+      // The container the request named, omitted when it named none. `app.orders` and
+      // `public.orders` recorded identically while this row carried only `target`, and an
+      // operator reconstructing what was done to a database could not tell the two apart
+      // (#1091 review). Optional on the EVENT the way `reason` and `bucket` are, so a
+      // whole-database row does not grow a field claiming a container it never had.
+      container: requestedContainer,
+      connectionName: connection.name || connection.database || "unknown",
+      user: guard.session.username || "admin",
+      // Omitted, not undefined, for a provider that names no engine principal, so its rows keep their shape.
+      ...(engineUser === undefined ? {} : { engineUser }),
+    } as const;
+
+    // The query event of this action (docs/GOVERNANCE.md, "Query events"), recorded under governance only. The
+    // admission gate runs before the action reaches the engine, so a refused action runs nothing and leaves one
+    // `refused` event. The statement is null: the provider builds it inside `runMaintenance` and never returns it.
+    const started = queryEventStart();
+    const recordMaintenanceEvent = (status: QueryEventStatus, errorCode?: string) =>
+      recordQueryEvent(maintenanceEvent(guard.session, connection, request, started, status, errorCode));
+    try {
+      admitQueryExecution();
+    } catch (error) {
+      recordMaintenanceEvent("refused", ApiErrorCode.AUDIT_UNAVAILABLE);
+      throw error;
+    }
+
     const startTime = Date.now();
-    const result = await provider.runMaintenance(type, target);
+    let result: Awaited<ReturnType<typeof provider.runMaintenance>>;
+    try {
+      result = await provider.runMaintenance(type, target, requestedContainer);
+    } catch (error) {
+      recordMaintenanceEvent("error");
+      // A run that THREW is still a run: it may have reached the engine before it failed, and
+      // until #1091's review recorded the gap (R04 G8) it left no row at all. The row takes the
+      // closed reason `maintenance_execution_failed` and never the thrown message, which
+      // `emitAuditEvent`'s docblock forbids by name. It is isolated for the same reason as the
+      // completed row below: a broken sink must not replace the operation's own failure with its
+      // own, so the caller reads exactly what the thrown error maps to, as it did before this row.
+      try {
+        emitAuditEvent({
+          ...auditFields,
+          result: "failure",
+          reason: "maintenance_execution_failed",
+          duration: Date.now() - startTime,
+        });
+      } catch (auditError) {
+        logger.error("Failed to record maintenance audit event", auditError, { route: "POST /api/db/maintenance" });
+      }
+      // The driver's error, typed (#1387). A provider hands the engine's refusal on as the driver
+      // raised it, and the outer catch read every untyped error as Studio's own failure: an engine
+      // that refuses the statement (CockroachDB's `VACUUM` syntax error, TiDB's `CHECK TABLE`)
+      // answered 500 INTERNAL_ERROR. Mapped here, a refusal the driver codes as the statement's
+      // own fault answers 400 with the engine's sentence, and anything else keeps a 5xx.
+      throw mapDatabaseError(error, connection.type);
+    }
     const duration = Date.now() - startTime;
+    // The engine's verdict, read as the audit row below reads it.
+    recordMaintenanceEvent(result.success === false ? "error" : "success");
 
     // Isolated in its own try/catch: runMaintenance() above has already succeeded and its result
     // is already decided by the time this runs, so a broken audit sink must never turn a
@@ -111,11 +222,7 @@ export async function POST(request: Request) {
     // catch below is for failures of the operation itself, not for failures to record it.
     try {
       emitAuditEvent({
-        type: type === "kill" ? "kill_session" : "maintenance",
-        action: type.toUpperCase(),
-        target: target || "all",
-        connectionName: connection.name || connection.database || "unknown",
-        user: guard.session.username || "admin",
+        ...auditFields,
         // The engine's verdict, not the request's. `runMaintenance` resolving is only the
         // statement having reached the engine: since 2026-08-25 MySQL and Oracle read the
         // server's own answer, so `success: false` on a 200 is the ordinary reply for a
@@ -134,4 +241,34 @@ export async function POST(request: Request) {
   } catch (error) {
     return createErrorResponse(error, { route: "api/db/maintenance" });
   }
+}
+
+/**
+ * The query event of one maintenance action: an administrator's action on the connection this request resolved. Under
+ * governance the connection is a governed record, which carries the level of its credential, and the session carries
+ * the identity provider subject its grant names.
+ */
+function maintenanceEvent(
+  session: UserPayload,
+  connection: DatabaseConnection,
+  request: Request,
+  started: QueryEventInput["started"],
+  status: QueryEventStatus,
+  errorCode: string | undefined,
+): QueryEventInput {
+  return {
+    source: "maintenance",
+    principal: { subject: session.idpSubject ?? "", username: session.username, role: session.role },
+    connection: {
+      id: connection.id,
+      name: connection.name,
+      engine: connection.type,
+      accessLevel: (connection as Partial<GovernedConnection>).grantLevel ?? null,
+    },
+    statement: null,
+    status,
+    started,
+    errorCode,
+    clientIp: clientAddress(request),
+  };
 }

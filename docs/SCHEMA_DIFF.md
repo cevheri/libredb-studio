@@ -1,0 +1,94 @@
+# Generated migration SQL
+
+`generateMigrationSQL` in `src/lib/schema-diff/migration-generator.ts` converts a schema diff into
+reviewable SQL. Its dialect coverage is pinned by the exhaustive tables in
+`tests/unit/schema-diff/migration-generator.test.ts` and `migration-dialects.test.ts`.
+Per-engine DDL is read through `migrationDdlFor` in `src/lib/db/migration-ddl/`, from a module beside each provider that its provider doc's `Migration DDL` section describes.
+
+For SQL Server, migrations use `BEGIN TRANSACTION` and `COMMIT`; added columns use `ADD`, and
+index drops include `ON <table>`. Oracle uses `ADD (<definition>)`, places `DEFAULT` before
+`NOT NULL`, and emits no transaction wrapper because DDL commits implicitly. Oracle table,
+index and constraint drops use the unconditional forms, which avoid depending on a particular
+release's support for `IF EXISTS`. A generated migration is not an idempotent script.
+Db2 LUW keeps the PostgreSQL `ADD COLUMN` and `DROP COLUMN` forms, which it accepts, and emits no
+transaction wrapper, because a Db2 `BEGIN` opens a compound block; its constraint and index drops
+use the unconditional forms too, because Db2 refuses `IF EXISTS` there, and a column modification
+is written as a comment, because Db2 needs `ALTER COLUMN ... SET DATA TYPE` and may leave the table
+REORG-pending ([providers/db2.md](./providers/db2.md#11-schema-diff)).
+
+Removed foreign keys and indexes precede column changes, so an indexed column can be removed
+and an index name can be reused in the same table diff. Changes to an existing index's columns,
+column order or uniqueness replace its old definition; a uniqueness change can fail if existing
+data violates the new constraint. Identifier quoting escapes delimiters;
+line breaks in informational comments are flattened so metadata cannot start a SQL statement.
+
+A created table's primary key is written inside its `CREATE TABLE`, which builds the key's index
+with it, so the unique index over exactly the key's columns that PostgreSQL (`<table>_pkey`) and
+MySQL (`PRIMARY`) report in the index list is not created again (#1395). Emitting it stopped a
+PostgreSQL 18.6 replay with `relation "<table>_pkey" already exists`. Every other index of the
+table is still created. An existing table's added indexes are all emitted, because the generator
+writes no key for one.
+
+MongoDB, Redis, LibreDB, Couchbase, Druid, Elasticsearch, OpenSearch, Prometheus, InfluxDB (InfluxQL), InfluxDB 3 (SQL), Apache Kafka, MQTT, RabbitMQ, OPC UA, etcd, Neo4j, Milvus, Qdrant, Oxia, S3-compatible object storage and Kubernetes receive an explanatory
+comment instead of relational table DDL. Trino, ClickHouse and Databend refuse foreign-key clauses;
+Trino and Databend refuse primary keys too, so an added table's key is declined in a comment after its `CREATE TABLE`.
+Trino has no index grammar, Databend's indexes are inverted, ngram, vector and spatial search indexes the diff does not record, and the diff does not retain enough
+ClickHouse index metadata to distinguish and recreate its index kinds, so those index changes
+also produce comments. Existing Cassandra and SQLite-family limitations remain explicit.
+Databend gets no transaction wrapper, because a DDL statement commits the open transaction, and a column modification is written as a comment: Databend has `ALTER TABLE ... MODIFY COLUMN`, but the MySQL spelling this generator writes fails `NOT NULL` on an empty table and silently drops an existing default it does not restate.
+Apache Spark declines foreign keys and primary keys in comments, because it accepts either only as an informational `NOT ENFORCED` constraint in a catalog that implements constraints, so an added table's key is declined after its `CREATE TABLE`.
+Spark SQL's `CREATE INDEX` and `DROP INDEX` work only in a catalog whose tables support indexes, so Spark's index changes produce comments too, and so does a column modification: whether a column's type, nullability or default can change depends on the catalog and the table format.
+Spark gets no transaction wrapper, because no transaction spans two Spark SQL statements.
+
+Objects are compared by their path below the two readings' roots: the container prefix every object of a
+reading shares, with both sides dropping the same, smaller number of leading segments. So two schemas'
+`t1` are two objects, and two connections rooted in different databases or schemas compare table by
+table. A snapshot taken before objects carried paths is compared by name, as it always was. Every
+table is named by its full path (`"b2a"."t1"`, `` `app`.`t1` ``), an added table under the source's
+root, and an index dropped without `ON <table>` is named in its table's container. An empty source has
+no root, so its added tables keep only their path below the target's root, which the session running the
+migration resolves, and never name the target's own database or schema. A view, a
+materialized view or any other object that is not a table is named in a `-- Skipped` comment rather
+than altered, created or dropped (SF-047).
+
+Review each migration against its target: a diff does not carry original foreign-key constraint
+names, a foreign key's referenced table as a path (it is written as the reading spelled it, D150),
+cross-table dependency order, or a general type-conversion strategy.
+Default expressions remain SQL expressions supplied by the diff; they are not parameter values.
+
+## Live regression probe
+
+The optional probe in `tests/live/schema-diff-dialects.ts` creates a fresh SQL Server database or
+Oracle user schema and removes it in `finally`. Use disposable servers on localhost. It checks:
+
+- CREATE, ADD and DROP statements, defaults, NOT NULL and foreign-key enforcement;
+- dropping an indexed foreign-key column and reusing the index name;
+- hostile line breaks and quoting in object names without modifying a sentinel row;
+- transaction rollback on SQL Server and implicit DDL commit on Oracle;
+- negative controls: the previous `ADD COLUMN` and bare `BEGIN` forms must fail.
+
+Run one engine at a time, supplying the password configured on its disposable container:
+
+```sh
+MIGRATION_PROBE_ENGINE=mssql MSSQL_TEST_PORT=11433 MSSQL_TEST_PASSWORD="$PROBE_PASSWORD" \
+  bun tests/live/schema-diff-dialects.ts
+MIGRATION_PROBE_ENGINE=oracle ORACLE_TEST_PORT=11521 ORACLE_TEST_PASSWORD="$PROBE_PASSWORD" \
+  bun tests/live/schema-diff-dialects.ts
+```
+
+The Oracle connection targets `FREEPDB1`. Both probes require credentials allowed to create and
+remove the isolated test database/schema. They are separate from `bun run test`, which needs no
+external database server.
+
+Measured on 2026-09-08 with Oracle AI Database 26ai Free 23.26.1.0.0
+(`gvenzl/oracle-free:23.26.1-slim-faststart`) and the SQL Server 15 ARM64 engine in
+Microsoft Azure SQL Edge Developer 15.0.2000.1574 (`mcr.microsoft.com/azure-sql-edge:1.0.7`).
+The SQL Server 2022 CU17 x86 container could not start under the local Mac's emulation, so the
+live T-SQL measurement uses the ARM engine above; it is not a SQL Server 2022 certification.
+
+Grammar references:
+[SQL Server ALTER TABLE](https://learn.microsoft.com/en-us/sql/t-sql/statements/alter-table-transact-sql),
+[SQL Server DROP INDEX](https://learn.microsoft.com/en-us/sql/t-sql/statements/drop-index-transact-sql),
+[Oracle ALTER TABLE](https://docs.oracle.com/en/database/oracle/oracle-database/19/sqlrf/ALTER-TABLE.html),
+[Trino SQL statements](https://trino.io/docs/current/sql.html), and
+[ClickHouse index examples](https://github.com/ClickHouse/clickhouse-docs/blob/main/docs/guides/best-practices/skipping-indexes-examples.md).

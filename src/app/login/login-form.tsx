@@ -1,12 +1,13 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { appFetch, withBasePath } from "@/lib/config/base-path";
+import { useState, useSyncExternalStore } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
-import { ExternalLink, Lock, Mail, ShieldCheck, Shield } from "lucide-react";
+import { ExternalLink, Fingerprint, KeyRound, Lock, Mail, ShieldCheck, Shield } from "lucide-react";
 import { toast } from "sonner";
 import LibreDBLogo from "@/components/libredb-logo";
 import { CommunitySection } from "@/components/community-section";
@@ -14,6 +15,10 @@ import { ConnectionSignature } from "@/components/login/connection-signature";
 import { DatabaseShowcase } from "@/components/login/database-showcase";
 import { HeroProof, HERO_CLAIMS } from "@/components/login/hero-proof";
 import { WireCompatibleLine } from "@/components/login/wire-compatible-line";
+import type { AuditReason } from "@/lib/audit";
+import type { PasskeySignInOffer } from "@/lib/passkey/api-types";
+import { passkeysUsableHere, signInWithPasskey } from "@/lib/passkey/client";
+import { RETURN_PATH_PARAM, safeReturnPath } from "@/lib/api/session-ended";
 
 /**
  * The agent half of the mobile summary. Pulled from `HERO_CLAIMS` rather than retyped, so
@@ -21,14 +26,86 @@ import { WireCompatibleLine } from "@/components/login/wire-compatible-line";
  */
 const agentClaimDetail = HERO_CLAIMS.find((claim) => claim.key === "agent")?.detail ?? "";
 
-function LoginFormInner({ authProvider }: { authProvider: string }) {
+/**
+ * One fixed sentence per failure class, keyed by the `?error=` code the OIDC routes redirect with.
+ * The page is unauthenticated, so nothing the issuer said is ever rendered here: the code names the
+ * class and that is all. A `switch` rather than an object lookup, so an unexpected value (including
+ * `constructor` or any other inherited key) always falls through to the generic message. The labels
+ * are pinned to the audit union so a renamed reason fails to compile here instead of quietly
+ * degrading to the generic sentence.
+ */
+function oidcErrorMessage(code: string): string {
+  switch (code) {
+    case "oidc_config" satisfies AuditReason:
+      return "Single sign-on is not configured correctly on this server. Contact your administrator.";
+    case "oidc_discovery" satisfies AuditReason:
+      return "The identity provider could not be reached. Try again later, or contact your administrator if this continues.";
+    case "oidc_no_role" satisfies AuditReason:
+      return "Your account has no role that allows access to LibreDB Studio. Ask your administrator.";
+    case "oidc_role_overflow" satisfies AuditReason:
+      return "Your account has too many roles or a role name is too long. Ask your administrator.";
+    case "oidc_session_revoked" satisfies AuditReason:
+      return "An administrator has ended your sessions. Try again later, or ask your administrator.";
+    default:
+      return "Authentication failed. Please try again.";
+  }
+}
+
+const noSubscription = () => () => {};
+
+interface LoginFormProps {
+  authProvider: string;
+  /** The server's passkey offer, or null when passkeys are not ready for this deployment. */
+  passkey: PasskeySignInOffer | null;
+}
+
+/**
+ * No Suspense boundary wraps this form. The page renders on every request (`force-dynamic`), where `useSearchParams`
+ * reads the request on the server without suspending, so a boundary bought nothing; and React outlined its large
+ * content into a hidden segment that a script moves into place, which on a loaded CI runner left the hidden copy beside
+ * the form the client had drawn, two `input#email` (Functional Smoke, run 37022597426).
+ */
+export default function LoginForm({ authProvider, passkey }: LoginFormProps) {
   const isOIDC = authProvider === "oidc";
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [totp, setTotp] = useState("");
+  /**
+   * Set once the server has answered `mfaRequired` for these credentials. The form never guesses
+   * at it: whether an account carries a second factor is server-side configuration, and asking
+   * the client to know it up front would mean publishing which accounts are protected.
+   */
+  const [mfaRequired, setMfaRequired] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  /**
+   * The server snapshot is false, so the server render and the first client render match; the
+   * client snapshot then asks this browser, which alone knows whether it has WebAuthn and sits on
+   * the configured origin. Neither changes while the page is open, hence no subscription.
+   */
+  const passkeyShown = useSyncExternalStore(
+    noSubscription,
+    () => passkey !== null && passkeysUsableHere(passkey.origin),
+    () => false,
+  );
   const router = useRouter();
   const searchParams = useSearchParams();
   const oidcError = searchParams.get("error");
+  /**
+   * Where the user was when their session ended (#1420), set by the session-ended redirect. Read
+   * through safeReturnPath, so a crafted sign-in link cannot send anyone off this application.
+   */
+  const returnPath = safeReturnPath(searchParams.get(RETURN_PATH_PARAM));
+  const landingFor = (role: string) => returnPath ?? (role === "admin" ? "/admin" : "/");
+
+  /**
+   * Editing either credential drops the second-factor step. Without this, changing the email
+   * after being prompted would submit the new account with a code minted for the previous one -
+   * a guaranteed failure that also spends a slot in the per-account rate-limit bucket.
+   */
+  const resetMfa = () => {
+    setMfaRequired(false);
+    setTotp("");
+  };
 
   const handleLogin = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -38,20 +115,34 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
       return;
     }
 
+    if (mfaRequired && !totp) {
+      toast.error("Please enter your authentication code");
+      return;
+    }
+
     setIsLoading(true);
     try {
-      const response = await fetch("/api/auth/login", {
+      const response = await appFetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
+        // `totp` is omitted entirely until the server asks for it, so a deployment without MFA
+        // sees exactly the request body it saw before.
+        body: JSON.stringify(mfaRequired ? { email, password, totp } : { email, password }),
       });
 
       const data = await response.json();
 
       if (data.success) {
         toast.success(`Welcome back, ${data.role}!`);
-        router.push(data.role === "admin" ? "/admin" : "/");
+        router.push(landingFor(data.role));
         router.refresh();
+      } else if (data.mfaRequired) {
+        // The first prompt needs no toast - the code field appearing IS the message, and an error
+        // toast would frame a normal step of the flow as a failure. Being asked a second time
+        // does mean the code was rejected, and that is worth saying out loud.
+        if (mfaRequired) toast.error(data.message);
+        setMfaRequired(true);
+        setTotp("");
       } else {
         // data.message is the login route's own body ({ success: false, message }); data.error is
         // everything else that can refuse a login POST before or without reaching that body - the
@@ -63,6 +154,26 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
       }
     } catch {
       toast.error("An error occurred. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  /**
+   * A failed or cancelled passkey only says so: it never submits the password form or tries any
+   * other method, so falling back stays the user's own choice.
+   */
+  const handlePasskeySignIn = async () => {
+    setIsLoading(true);
+    try {
+      const result = await signInWithPasskey();
+      if (result.ok) {
+        toast.success(`Welcome back, ${result.role}!`);
+        router.push(landingFor(result.role));
+        router.refresh();
+      } else if (result.message !== null) {
+        toast.error(result.message);
+      }
     } finally {
       setIsLoading(false);
     }
@@ -93,14 +204,30 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
         />
 
         {/* Ambient glow orbs — blue accent family */}
-        <div className="absolute top-1/4 -left-20 w-80 h-80 bg-blue-500/[0.07] rounded-full blur-3xl" />
-        <div className="absolute bottom-1/3 right-10 w-64 h-64 bg-cyan-500/[0.05] rounded-full blur-3xl" />
+        <div className="absolute top-1/4 -left-20 w-80 h-80 bg-brand-tint/[0.07] rounded-full blur-3xl" />
+        <div className="absolute bottom-1/3 right-10 w-64 h-64 bg-hue-cyan-tint/[0.05] rounded-full blur-3xl" />
 
         {/* Right edge separator */}
         <div className="absolute right-0 top-0 bottom-0 w-px bg-fill-strong" />
 
-        {/* Content */}
-        <div className="relative z-10 flex flex-col p-12 xl:p-16 w-full overflow-y-auto">
+        {/*
+          Content. 32px above and below rather than the 48px at the sides: the column's height is
+          the hero's budget at 1366x768 and 1280x800 (#541, pinned by e2e/login.spec.ts). The
+          twenty-second showcase entry (#786) wrapped the engine list into a fourth row at 1366x768
+          and scrolled the page by 7px; no column gap that still separates the entries keeps it at
+          three rows with room for one more, so the 16px came from the padding instead (48 to 40).
+          The thirtieth entry (Kubernetes) wrapped it into a fifth row at 1366x768 and scrolled the
+          page to 781px, with the column gap already at its 6px floor (database-showcase.tsx), so
+          another 16px comes from the padding (40 to 32).
+          The forty-second entry (Sparkplug B, #1720) wrapped it into a SEVENTH row at 1280x800 and
+          scrolled that size to 802px of its 800. The row gap is at 2px and the column gap at its
+          6px floor, so the padding pays again, 32 to 24. Swept in a container at the four sizes,
+          with only the one lever moved each time: the row gap at 1px leaves 4px of 800 and at 0px
+          10px, the padding at 28px leaves 6px, and at 24px it leaves 14 - which is the slack the
+          page had at forty-one entries (784 of 800), so the entry after this one is what spends it.
+          The full table is in database-showcase.tsx, beside the gaps it compares against.
+        */}
+        <div className="relative z-10 flex flex-col px-12 py-6 w-full overflow-y-auto">
           {/* Top: Logo */}
           <a
             href="https://libredb.org"
@@ -109,9 +236,9 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
             className="flex items-center gap-3 group w-fit"
           >
             <div className="flex h-14 w-14 items-center justify-center rounded-xl bg-fill-strong border border-hairline-strong group-hover:bg-fill-strong group-hover:border-hairline-strong transition-all duration-200">
-              <LibreDBLogo className="h-9 w-9 text-blue-400" />
+              <LibreDBLogo className="h-9 w-9 text-brand" />
             </div>
-            <span className="text-xl font-semibold text-white tracking-tight group-hover:text-blue-400 transition-colors duration-200">
+            <span className="text-xl font-semibold text-white tracking-tight group-hover:text-brand transition-colors duration-200">
               LibreDB Studio
             </span>
           </a>
@@ -127,9 +254,9 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
             pushed the sign-in card itself below the fold). The content now ends with the
             community row, so one auto margin above it is the whole layout.
           */}
-          <div className="space-y-8 mt-auto">
+          <div className="space-y-6 mt-auto">
             <div className="space-y-4 max-w-xl">
-              <h1 className="text-4xl font-bold text-white tracking-tight leading-[1.1]">
+              <h1 className="text-4xl font-bold text-white tracking-tight leading-none">
                 The open-source SQL IDE that
                 <span className="bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent">
                   {" "}
@@ -151,15 +278,16 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
             <ConnectionSignature />
 
             {/*
-              The pills and the relatives line are ONE block with a 12px gap, not two
+              The pills and the relatives line are ONE block with an 8px gap, not two
               siblings in the 32px rhythm above. Two reasons, and the second is a measurement:
               the line is the second half of the engine list rather than a fourth claim, so it
               belongs to the pills; and this column had no room to give. At 1280x800 the hero
               measured exactly 800px before this change - zero slack - so every pixel added
-              here scrolls the page. Folding the two into one block buys back 20px of the 32
-              the standalone gap would have cost.
+              here scrolls the page. Folding the two into one block buys back most of the 32
+              the standalone gap would have cost; issue #541 tightened the fold itself from
+              12px to 8px to close the overflow the relatives line later reopened.
             */}
-            <div className="space-y-3">
+            <div className="space-y-2">
               <DatabaseShowcase variant="desktop" />
               <WireCompatibleLine variant="desktop" />
             </div>
@@ -167,7 +295,12 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
             <HeroProof />
           </div>
 
-          <div className="mt-8">
+          {/* `mt-6`, not `mt-8`: the fifth engine name in the agent claim (#1612)
+              had to be paid back somewhere, and the page's 800px budget at
+              1280x800 (#541) has no slack of its own. The community block's breathing
+              room is the largest honest reserve left in this column; 24px still reads
+              as a section break below a three-column figure. */}
+          <div className="mt-6">
             <CommunitySection variant="desktop" />
           </div>
         </div>
@@ -185,13 +318,13 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
             className="flex flex-col items-center gap-4 lg:hidden group"
           >
             <div className="relative">
-              <div className="absolute -inset-2 rounded-full bg-blue-500/20 blur-lg" />
-              <div className="relative flex h-20 w-20 items-center justify-center rounded-2xl bg-raised border border-hairline-strong shadow-lg shadow-blue-500/10 group-hover:border-blue-500/20 transition-all duration-200">
-                <LibreDBLogo className="h-12 w-12 text-blue-400" />
+              <div className="absolute -inset-2 rounded-full bg-brand-tint/20 blur-lg" />
+              <div className="relative flex h-20 w-20 items-center justify-center rounded-2xl bg-raised border border-hairline-strong shadow-lg shadow-blue-500/10 group-hover:border-brand-tint/20 transition-all duration-200">
+                <LibreDBLogo className="h-12 w-12 text-brand" />
               </div>
             </div>
             <div className="text-center space-y-1">
-              <h2 className="text-2xl font-bold tracking-tight group-hover:text-blue-400 transition-colors duration-200">
+              <h2 className="text-2xl font-bold tracking-tight group-hover:text-brand transition-colors duration-200">
                 LibreDB Studio
               </h2>
               <p className="text-sm text-muted-foreground">Open-source SQL IDE for cloud-native teams</p>
@@ -216,7 +349,7 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
                 <>
                   {oidcError && (
                     <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
-                      Authentication failed. Please try again.
+                      {oidcErrorMessage(oidcError)}
                     </div>
                   )}
 
@@ -236,7 +369,12 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
                     className="w-full h-11 text-base font-medium shadow-lg shadow-primary/20 active:scale-[0.98] transition-all gap-2"
                     onClick={() => {
                       setIsLoading(true);
-                      window.location.href = "/api/auth/oidc/login";
+                      // The return path rides through the provider in the signed state cookie.
+                      window.location.href = withBasePath(
+                        returnPath === null
+                          ? "/api/auth/oidc/login"
+                          : `/api/auth/oidc/login?${RETURN_PATH_PARAM}=${encodeURIComponent(returnPath)}`,
+                      );
                     }}
                     disabled={isLoading}
                   >
@@ -269,10 +407,14 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
                         <Input
                           id="email"
                           type="email"
+                          autoComplete="username"
                           placeholder="Enter your email"
                           className="pl-10 h-11 transition-all focus:ring-2 focus:ring-primary/20"
                           value={email}
-                          onChange={(e) => setEmail(e.target.value)}
+                          onChange={(e) => {
+                            setEmail(e.target.value);
+                            resetMfa();
+                          }}
                           required
                         />
                       </div>
@@ -284,22 +426,82 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
                         <Input
                           id="password"
                           type="password"
+                          autoComplete="current-password"
                           placeholder="Enter your password"
                           className="pl-10 h-11 transition-all focus:ring-2 focus:ring-primary/20"
                           value={password}
-                          onChange={(e) => setPassword(e.target.value)}
+                          onChange={(e) => {
+                            setPassword(e.target.value);
+                            resetMfa();
+                          }}
                           required
                         />
                       </div>
                     </div>
+                    {mfaRequired && (
+                      <div className="space-y-2">
+                        <Label htmlFor="totp">Authentication code</Label>
+                        <div className="relative group">
+                          <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground transition-colors group-focus-within:text-primary" />
+                          <Input
+                            id="totp"
+                            name="totp"
+                            /*
+                             * `text` with an explicit numeric inputMode, not `number`: a number
+                             * input strips a leading zero, and one in six codes starts with one.
+                             * `one-time-code` is what lets iOS and macOS offer the code from the
+                             * paired authenticator without the user leaving the page.
+                             */
+                            type="text"
+                            inputMode="numeric"
+                            autoComplete="one-time-code"
+                            pattern="[0-9]*"
+                            maxLength={6}
+                            /*
+                             * The field appears mid-flow in response to the user's own submit, so
+                             * moving focus to it is what a sighted user expects and what tells a
+                             * screen-reader user the form grew a step.
+                             */
+                            autoFocus
+                            placeholder="123456"
+                            className="pl-10 h-11 tracking-[0.4em] font-mono transition-all focus:ring-2 focus:ring-primary/20"
+                            value={totp}
+                            onChange={(e) => setTotp(e.target.value)}
+                            required
+                          />
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          Open your authenticator app and enter the current 6-digit code for this account.
+                        </p>
+                      </div>
+                    )}
                     <Button
                       className="w-full h-11 text-base font-medium shadow-lg shadow-primary/20 active:scale-[0.98] transition-all"
                       type="submit"
                       disabled={isLoading}
                     >
-                      {isLoading ? "Authenticating..." : "Sign In"}
+                      {isLoading ? "Authenticating..." : mfaRequired ? "Verify code" : "Sign in"}
                     </Button>
                   </form>
+                  {passkeyShown && !mfaRequired && (
+                    <>
+                      <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                        <div className="h-px flex-1 bg-border" />
+                        <span>or</span>
+                        <div className="h-px flex-1 bg-border" />
+                      </div>
+                      {/* The name must not contain "sign in": E2E tests locate the password submit by it. */}
+                      <Button
+                        type="button"
+                        variant="outline"
+                        className="w-full h-11 gap-2"
+                        onClick={handlePasskeySignIn}
+                        disabled={isLoading}
+                      >
+                        <Fingerprint className="h-4 w-4" /> Use a passkey
+                      </Button>
+                    </>
+                  )}
                 </>
               )}
             </CardContent>
@@ -338,13 +540,5 @@ function LoginFormInner({ authProvider }: { authProvider: string }) {
         </div>
       </div>
     </div>
-  );
-}
-
-export default function LoginForm({ authProvider }: { authProvider: string }) {
-  return (
-    <Suspense>
-      <LoginFormInner authProvider={authProvider} />
-    </Suspense>
   );
 }

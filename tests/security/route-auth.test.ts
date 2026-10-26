@@ -1,18 +1,32 @@
 import { describe, expect, test, mock, spyOn, beforeEach } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { discoverRoutes } from "./helpers/discover-routes";
+import * as realAuth from "@/lib/auth";
+import type { SessionReading, UserPayload } from "@/lib/auth";
+import { ApiErrorCode } from "@/lib/api/error-codes";
+import {
+  ALL_ROUTES,
+  API_ROOT_DIR,
+  PROVIDER_ROUTES,
+  ROUTES_WITHOUT_A_PROVIDER,
+  SRC_ROOT_DIR,
+} from "./helpers/provider-routes";
 
-const mockGetSession = mock(
-  async (): Promise<{ role: string; username: string } | null> => ({ role: "admin", username: "admin" }),
-);
+const mockGetSession = mock(async (): Promise<UserPayload | null> => ({ role: "admin", username: "admin" }));
+
+let storeUnavailableOverride: Error | null = null;
+const mockReadSession = mock(async (): Promise<SessionReading> => {
+  if (storeUnavailableOverride) {
+    return { kind: "store_unavailable", error: storeUnavailableOverride };
+  }
+  const session = await mockGetSession();
+  return session ? { kind: "authenticated", session } : { kind: "anonymous" };
+});
 
 mock.module("@/lib/auth", () => ({
+  ...realAuth,
   getSession: mockGetSession,
-  signJWT: mock(async () => "mock-token"),
-  verifyJWT: mock(async () => null),
-  login: mock(async () => {}),
-  logout: mock(async () => {}),
+  readSession: mockReadSession,
 }));
 
 // ─── Mock @/lib/llm so a bypassed guard can never be mistaken for a working one ──
@@ -78,6 +92,10 @@ mock.module("@/lib/llm", () => ({
   LLMSafetyError: MockLLMSafetyError,
 }));
 
+// Read from the real module before it is replaced, so this mock carries the one list the SDK pin
+// in `tests/unit/llm/config.test.ts` keeps in step, not a copy that could drift from it.
+const { LLM_MODEL_EFFORTS } = await import("@/lib/llm/types");
+
 mock.module("@/lib/llm/types", () => ({
   LLMError: MockLLMError,
   LLMConfigError: MockLLMConfigError,
@@ -85,6 +103,41 @@ mock.module("@/lib/llm/types", () => ({
   LLMRateLimitError: MockLLMRateLimitError,
   LLMSafetyError: MockLLMSafetyError,
   LLMStreamError: MockLLMStreamError,
+  /*
+    Mirrors the real predicate over the classes mocked above, and it is here because a module mock
+    is WHOLE: `mock.module` replaces the module, so an export this object omits does not fall
+    through to the real one — it stops existing, and every importer of it fails to load. The agent
+    drive imports this one, so leaving it out turned two 401 assertions in this file into
+    `SyntaxError: Export named 'isRetryableError' not found`, and only under `test:coverage`, where
+    each file runs in its own process and nothing else has loaded the real module first.
+
+    Auth and safety are refused, so a misconfigured server still fails on its first turn; a broken
+    stream is retryable, which is the case this file's subjects never reach but its importers hold.
+  */
+  isRetryableError: (error: unknown): boolean =>
+    !(
+      error instanceof MockLLMAuthError ||
+      error instanceof MockLLMSafetyError ||
+      error instanceof MockLLMConfigError
+    ) && error instanceof MockLLMError,
+  /*
+    The same reason, one export later. `investigation.ts` imports this beside `isRetryableError`,
+    so omitting it takes the module down for every importer exactly as omitting that one did —
+    which is the failure this comment was written after, repeated because the note said what had
+    happened and not that the NEXT export would do it too.
+  */
+  isToolCallParseError: (error: unknown): boolean =>
+    error instanceof MockLLMStreamError && /parsing tool call/i.test(error.message),
+  /*
+    Same whole-module mock requirement: `errors.ts` imports `isContextLengthError`
+    and route handlers import `MAX_SCHEMA_CONTEXT_CHARS`.
+  */
+  isContextLengthError: (error: unknown): boolean =>
+    (error instanceof MockLLMStreamError || error instanceof Error) &&
+    error.message.includes("exceeds the available context size"),
+  MAX_SCHEMA_CONTEXT_CHARS: 30_000,
+  // Same whole-module requirement: `utils/config.ts` validates `LLM_MODEL_EFFORT` against it.
+  LLM_MODEL_EFFORTS,
 }));
 
 const { guardRoute } = await import("@/lib/api/require-session");
@@ -114,7 +167,7 @@ describe("guardRoute", () => {
     expect("response" in guard).toBe(true);
     const response = (guard as { response: Response }).response;
     expect(response.status).toBe(401);
-    expect(await response.json()).toEqual({ error: "Authentication required" });
+    expect(await response.json()).toEqual({ error: "Authentication required", code: "AUTH_REQUIRED" });
   });
 
   test("still returns 401 when the permission_denied audit emit throws", async () => {
@@ -159,61 +212,20 @@ describe("guardRoute", () => {
   });
 });
 
-// Enumerated from disk instead of hardcoded, so a route added ANYWHERE under src/app/api/ is
-// checked automatically instead of silently escaping this test. This replaces a curated
-// GUARDED_ROUTES list (AI routes discovered dynamically, plus one hand-picked db/ entry) that
-// was itself an instance of the exact failure it was trying to prevent: it never covered
-// db/query, db/multi-query, db/transaction, db/maintenance, db/cancel, db/health,
-// db/monitoring, db/pool-stats, db/profile, db/provider-meta, db/schema, db/schema/list,
-// db/schema/relations, db/schema-snapshot, db/test-connection or admin/fleet-health - eleven of
-// which reached a database provider through a bare inline getSession() with no rate limit and
-// no denial audit, sitting undetected next to routes that had already been fixed. Walking the
-// whole tree and requiring an explicit reason for every exemption is what makes a newly added
-// provider-reaching route red by default instead of invisible by default.
-const SRC_ROOT_DIR = join(import.meta.dir, "..", "..", "src");
-const API_ROOT_DIR = join(SRC_ROOT_DIR, "app", "api");
-
-const ALL_ROUTES = discoverRoutes(API_ROOT_DIR);
-
 /**
- * Every route that legitimately reaches no database or LLM provider, so the enumeration below
- * does not require it to call guardRoute. Every entry needs a reason: an unexplained addition
- * here is exactly the hand-maintained-inventory drift this enumeration exists to prevent, and
- * the sanity check below fails if a key does not match a route that actually exists.
+ * Route handlers that sit OUTSIDE `src/app/api/`, which the walk in ./helpers/provider-routes.ts cannot see.
  *
- * One entry (`agent/drive`) is NOT in that category and says so in its own reason: it does reach
- * a provider, and it is exempt from THIS enumeration only because the enumeration probes with a
- * POST carrying no credential and asserts guardRoute's exact 401 body. That route cannot have a
- * user session by construction - it is the durable transport's callback - so it authenticates
- * with a server-minted single-purpose credential instead, and the same "no credential, no work"
- * property is proven against it in tests/api/agent/drive.test.ts. An exemption whose reason is a
- * different verified control is the only kind allowed here; "it has no auth" never is.
+ * `/health` is one deliberately: it is the plainest path a platform's health field defaults
+ * to, and it has to be at the app root to be that (#909). The walk is left where it is
+ * rather than widened, because widening it would re-key every entry in the allowlist below
+ * — so the scope is made explicit here instead, and this list fails the moment a second
+ * handler appears outside `api/` without anyone deciding to put it there.
+ *
+ * `/health` itself is held by `tests/api/health-routes.test.ts` (it answers 200 with a fixed
+ * body and no session) and by `tests/api/proxy.test.ts` (it is on the public list, so it can
+ * never answer with a redirect to the login screen).
  */
-const ROUTES_WITHOUT_A_PROVIDER: Record<string, string> = {
-  "admin/audit": "reads/writes the in-process audit ring buffer only; no database or LLM provider",
-  "agent/config":
-    "answers whether the agent runtime is enabled, from process.env alone; no database or LLM provider (GET, no POST export). It still requires a session — a bare getSession() like connections/managed, because metering a visibility probe out of the ai bucket would spend a run's budget on rendering a panel — and tests/api/agent/config.test.ts proves an unauthenticated caller learns nothing about the flag",
-  "agent/drive":
-    "reaches a provider, but is the durable transport's callback and can have no user session: it verifies a server-minted single-purpose credential and its 401 body differs from guardRoute's on purpose (tests/api/agent/drive.test.ts)",
-  "agent/runs/[runId]":
-    "reads and cancels one run's own durable ledger; no database or LLM provider (GET/DELETE, no POST export). Its session check is guardRoute, through src/lib/api/agent-run-access.ts",
-  "agent/runs/[runId]/artifacts/[correlationId]":
-    "hands back rows one run already stored, from process memory; no database or LLM provider is reached to answer it (GET, no POST export). Same guardRoute path as above, through src/lib/api/agent-run-access.ts, and tests/api/agent/artifacts.test.ts proves an unauthenticated caller gets 401 and reads nothing",
-  "agent/runs/[runId]/stream":
-    "follows one run's own durable ledger; no database or LLM provider (GET, no POST export). Same guardRoute path as above",
-  "auth/login": "authenticates the credential itself; a session cannot be required before one exists",
-  "auth/logout": "clears the session cookie unconditionally; touches no provider either way",
-  "auth/me": "reads the caller's own session claims only (GET, no POST export)",
-  "auth/oidc/callback": "completes the OIDC exchange that CREATES the session (GET, no POST export)",
-  "auth/oidc/login": "starts the OIDC redirect before a session exists (GET, no POST export)",
-  "connections/managed": "reads seed config metadata only; never opens a database connection (GET, no POST export)",
-  storage: "reaches the app's own storage backend (STORAGE_PROVIDER), not a user database or LLM provider (GET only)",
-  "storage/[collection]": "same storage backend as above, scoped to the caller's own data (PUT, no POST export)",
-  "storage/config": "publicly documents whether server storage is enabled; no session, no provider (GET only)",
-  "storage/migrate": "same storage backend as above; its own 401 body differs from guardRoute's on purpose",
-};
-
-const PROVIDER_ROUTES = ALL_ROUTES.filter(([key]) => !(key in ROUTES_WITHOUT_A_PROVIDER));
+const ROUTES_OUTSIDE_API = ["health"];
 
 describe("routes that reach a provider require a session", () => {
   beforeEach(() => {
@@ -238,6 +250,23 @@ describe("routes that reach a provider require a session", () => {
   // Three since #331 T3 removed chat with the in-editor assistant it served, after T2 removed
   // nl2sql, autopilot, impact and index-advisor with their panels: describe-schema, explain,
   // query-safety.
+  test("no route handler outside src/app/api/ escapes this audit unnoticed", () => {
+    const appRoot = join(SRC_ROOT_DIR, "app");
+    const found: string[] = [];
+    const walk = (dir: string, prefix: string) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        if (prefix === "" && entry.name === "api") continue;
+        const key = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+        if (existsSync(join(dir, entry.name, "route.ts"))) found.push(key);
+        walk(join(dir, entry.name), key);
+      }
+    };
+    walk(appRoot, "");
+
+    expect(found.sort()).toEqual(ROUTES_OUTSIDE_API);
+  });
+
   test("the same walk finds at least today's three AI routes", () => {
     expect(ALL_ROUTES.filter(([key]) => key.startsWith("ai/")).length).toBeGreaterThanOrEqual(3);
   });
@@ -282,11 +311,11 @@ describe("routes that reach a provider require a session", () => {
     { label: "a handleSchemaRequest() call", pattern: /\bhandleSchemaRequest\s*\(/ },
   ];
 
-  // The one allowlist entry whose reason does NOT claim to be provider-free (see the doc comment
-  // on ROUTES_WITHOUT_A_PROVIDER). Skipping it is itself verified below - the assertion requires
-  // the entry's reason to still say so, so this set cannot quietly grow into a second unchecked
+  // The two allowlist entries whose reasons do NOT claim to be provider-free (see the doc comment
+  // on ROUTES_WITHOUT_A_PROVIDER). Skipping them is itself verified below - the assertion requires
+  // each entry's reason to still say so, so this set cannot quietly grow into a second unchecked
   // allowlist.
-  const ALLOWLISTED_BUT_REACHES_A_PROVIDER = ["agent/drive"];
+  const ALLOWLISTED_BUT_REACHES_A_PROVIDER = ["agent/drive", "mcp"];
 
   /** Blanks out comments while preserving line numbering, so a mention in prose is not a hit. */
   function withoutComments(source: string): string {
@@ -357,22 +386,77 @@ describe("routes that reach a provider require a session", () => {
     "@/hooks/use-connection-payload": "shapes a connection record for the client; opens nothing",
     "@/lib/agent/config": `reads the agent runtime's env config and ${PROVIDER_NAMING_HELPER} (@/lib/llm/utils/config) to validate the model id, which resolves config rather than calling a model`,
     "@/lib/agent/model-tuning": "the per-model tuning table; data only",
-    "@/lib/agent/runtime": `the run loop, and it ${PROVIDER_NAMING_HELPER} - but the artifacts route imports only readAgentArtifact, which reads the in-process ExecutionArtifactStore`,
+    "@/lib/agent/runtime": `the run loop, and it ${PROVIDER_NAMING_HELPER} - the artifacts route imports only readAgentArtifact (the in-process ExecutionArtifactStore), and agent/runs/[runId] imports driveAgentRun, which the resume action uses to drive the run`,
+    "@/lib/agent/run-service": `the run lifecycle service (pause/unpause/cancel/status), and it ${PROVIDER_NAMING_HELPER} (@/lib/db/operations/execution) - but only for releaseExecutionRun, which releases the run's in-process budget and artifacts, never a database or model`,
+    "@/lib/api/account-response": "maps account-registry failures to HTTP responses; opens nothing",
+    "@/lib/api/account-store-error":
+      "error payload and message for account store read failures; data only, pure, opens no provider (#1942)",
     "@/lib/api/agent-run-access": "resolves a run id to its ledger behind guardRoute; reads no provider",
+    "@/lib/api/bounded-json": "reads a request body up to a byte limit; opens nothing",
     "@/lib/api/client-address": "parses the forwarded-for chain for the audit record",
+    "@/lib/api/liveness": "builds the fixed liveness body; imports nothing and touches nothing",
     "@/lib/api/errors": `maps a thrown error to a response and ${PROVIDER_NAMING_HELPER} (@/lib/db/errors, @/lib/llm/types) for the error CLASSES alone - nearly every route imports it, and treating it as an entry point would fire on all fifteen`,
+    "@/lib/api/login-budget":
+      "the login failure budgets shared by every route that checks a password, a code or a passkey",
     "@/lib/api/rate-limit": "the in-process token buckets",
+    "@/lib/api/request-scheme":
+      "reads the request's scheme and host for a display-only plain-HTTP warning; opens nothing",
+    "@/lib/api/session-ended":
+      "the session-required 401 body and the return-path check for sign-in; data and string checks only",
     "@/lib/api/require-session": "guardRoute itself",
     "@/lib/audit": "the in-process audit ring buffer",
     "@/lib/auth": "session cookie minting and reading",
     "@/lib/auth-compare": "constant-time credential comparison",
     "@/lib/auth-errors": "the auth failure taxonomy",
-    "@/lib/local-auth": "the local email/password credential store",
+    "@/lib/config/auth-env": "reads JWT_SECRET and AUTH_SESSION_TTL_SECONDS from process.env; opens nothing",
+    "@/lib/config/base-path": "prefixes redirect URLs and cookie paths; these routes use no fetch or provider",
+    "@/lib/config/custom-connections":
+      "reads ALLOW_CUSTOM_CONNECTIONS from process.env and logs an unrecognised value once; opens nothing",
+    "@/lib/config/oidc-logout-hint":
+      "reads OIDC_LOGOUT_HINT from process.env and names the logout hint cookie and its path; opens nothing",
+    "@/lib/governance/config":
+      "reads GOVERNANCE_SOURCE and the other GOVERNANCE_* settings from process.env; opens nothing, the governance source included",
+    "@/lib/governance/contract":
+      "the bridge contract's constants and zod shapes, among them the readiness answers; data only, opens nothing",
+    "@/lib/governance/freshness":
+      "derives the freshness state from the in-process governance state and the GOVERNANCE_* settings; imports no pg and opens nothing",
+    "@/lib/governance/settings":
+      "the runtime settings store, read from the in-process governance snapshot; imports no pg and opens nothing",
+    "@/lib/governance/state": "the in-process governance state holder; data only, imports no pg and opens nothing",
+    "@/lib/governance/status":
+      "builds the admin governance status from the in-process governance state, the GOVERNANCE_* settings and the keyring file's key ids; opens nothing, the governance source included",
+    "@/lib/governance/visible":
+      "lists the connections a session may see: without governance through @/lib/seed, and under governance from the in-process governance snapshot by the session's grants; opens nothing, the governance source included",
+    "@/lib/is-record": "a plain-object type guard; data only",
+    "@/lib/launch/config": "reads the three LAUNCH_TOKEN_* variables; opens nothing",
+    "@/lib/launch/verify":
+      "verifies a launch token with jose and spends its jti in an in-process map; computation only",
+    "@/lib/local-accounts":
+      "the local account registry on the app's storage backend; opens no user database or LLM provider",
+    "@/lib/passkey/management":
+      "passkey registration and management on the caller's own stored account in the app's storage backend; no user database or LLM provider",
+    "@/lib/passkey/policy": "passkey limits and constants; data only",
+    "@/lib/passkey/sign-in": "passkey sign-in against the app's own account store; no user database or LLM provider",
+    "@/lib/passkey/webauthn": "WebAuthn verification through @simplewebauthn/server; computation only",
+    "@/lib/password-hash": "scrypt for stored account passwords; no provider",
     "@/lib/logger": "structured logging",
+    "@/lib/non-finite": "writes NaN and the infinities in held rows as words; pure, imports nothing",
     "@/lib/oidc": "the OIDC discovery and PKCE exchange",
-    "@/lib/seed": "reads seed connection metadata from config; never connects",
+    "@/lib/oidc-identity":
+      "the issuer comparison and the username rule for identity provider claims; pure, imports nothing",
+    "@/lib/seed":
+      "reads seed connection metadata from config and the CapRover discovery export; its only network use is a bare node:net reachability probe for built-image candidates, through ./discovery-loader, never a database or LLM provider",
+    "@/lib/seed/discovery-loader":
+      "reads the CapRover discovery export file and builds its status; its only network use is a bare node:net reachability probe for built-image candidates, never a database or LLM provider",
+    "@/lib/seed/operator-loader":
+      "reads the operator seed sources (seed files on disk and the process environment), resolves ${ENV} references and keeps the result and its status in process memory; never a database or LLM provider",
+    "@/lib/storage/connection-secrets":
+      "the credential field classification; withoutSecretFields copies a connection record without its secrets and opens nothing",
     "@/lib/storage/factory": "the app's own storage backend (STORAGE_PROVIDER), not a user database",
+    "@/lib/storage/owner-key":
+      "derives the storage row key from the session, the username or under governance sub: and the identity provider's subject, reading GOVERNANCE_SOURCE through @/lib/governance/config; opens nothing",
     "@/lib/storage/types": "the storage backend's interfaces",
+    "@/lib/totp": "second-factor verification: an HMAC over the submitted code and an in-process spent-step map",
   };
 
   /**
@@ -501,7 +585,7 @@ describe("routes that reach a provider require a session", () => {
       const res = await POST(req as never);
 
       expect(res.status).toBe(401);
-      expect(await res.json()).toEqual({ error: "Authentication required" });
+      expect(await res.json()).toEqual({ error: "Authentication required", code: "AUTH_REQUIRED" });
     });
   }
 });
@@ -561,5 +645,37 @@ describe("an admin-only route's role denial is audited", () => {
     } finally {
       logSpy.mockRestore();
     }
+  });
+
+  describe("guardRoute store outage (#1942)", () => {
+    beforeEach(() => {
+      storeUnavailableOverride = null;
+    });
+
+    test("answers 503 with ACCOUNT_STORE_UNAVAILABLE when account store throws", async () => {
+      const { POST } = await import("@/app/api/admin/fleet-health/route");
+      storeUnavailableOverride = new Error("sqlite disk I/O error");
+      const logSpy = spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const res = await POST(probe());
+        expect(res.status).toBe(503);
+        const data = (await res.json()) as { code: string; error: string };
+        expect(data.code).toBe(ApiErrorCode.ACCOUNT_STORE_UNAVAILABLE);
+        // No permission_denied audit event emitted on store outage
+        const auditLines = logSpy.mock.calls
+          .map((c: unknown[]) => {
+            try {
+              return JSON.parse(c[0] as string);
+            } catch {
+              return null;
+            }
+          })
+          .filter((e) => e?.event === "permission_denied");
+        expect(auditLines).toHaveLength(0);
+      } finally {
+        logSpy.mockRestore();
+        storeUnavailableOverride = null;
+      }
+    });
   });
 });

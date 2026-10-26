@@ -12,13 +12,25 @@ import { describe, test, expect } from "bun:test";
 import {
   WIRE_COMPATIBLE_ENGINES,
   compatibleEnginesFor,
+  CONNECTION_FORM_URI_MODE,
+  CONNECTION_STRING_ACCEPTED,
   connectableProductCount,
   EXTERNAL_DATABASE_TYPES,
+  isExternalDatabaseType,
+  MCP_EXPOSABLE,
+  OPENS_LOCAL_FILE,
+  OPENS_SERVER_LEVEL_WITHOUT_DATABASE,
+  READ_ONLY_ENFORCED,
+  READS_FILE_ACCESS_POSTURE,
   SHIPPED_DATABASE_TYPES,
+  SINGLE_WRITER_FILE,
 } from "@/lib/db/compatibility";
+import { createDatabaseProvider } from "@/lib/db/factory";
+import { isFileBased } from "@/lib/db-ui-config";
 import type { DatabaseType } from "@/lib/types";
 import { isQueryFenceTag } from "@/lib/sql/fence-tags";
 import { parse as parseYaml } from "yaml";
+import { CENSUS_CONNECTION } from "../../helpers/census-connection";
 
 /**
  * The compose service that reproduces each registry entry.
@@ -53,7 +65,6 @@ const COMPOSE_SERVICE_BY_ENGINE: Readonly<Record<string, string>> = {
   StarRocks: "starrocks",
   "Apache Doris": "doris",
   "Percona Server for MySQL": "percona-mysql",
-  Databend: "databend",
   Vitess: "vitess",
   OceanBase: "oceanbase",
   SingleStore: "singlestore",
@@ -63,6 +74,8 @@ const COMPOSE_SERVICE_BY_ENGINE: Readonly<Record<string, string>> = {
   Garnet: "garnet",
   FerretDB: "ferretdb",
   ScyllaDB: "scylla",
+  VictoriaMetrics: "victoriametrics",
+  Redpanda: "redpanda",
 };
 
 describe("wire-compatibility registry", () => {
@@ -105,46 +118,58 @@ describe("wire-compatibility registry", () => {
     expect(WIRE_COMPATIBLE_ENGINES.map((engine) => engine.name.toLowerCase())).toContain("scylladb");
   });
 
-  test("Apache Doris is recorded as a partial MySQL relative, on what the probe measured", () => {
+  test("Apache Doris is recorded as a full MySQL relative, on what the 2026-09-06 re-measurement found", () => {
     // Probed 2026-08-26 against `apache/doris:all-in-one-4.1.3` (#424 Phase 0). The entry
     // exists because StarRocks - already registered here - is a FORK of Doris, and this
     // registry had been carrying the fork while missing the original. It is not a copy of
-    // that row: thirteen of the fifteen surfaces answer where StarRocks manages eleven,
+    // that row: every one of the fifteen surfaces answers where StarRocks still loses health and
+    // the session panel to its missing information_schema.PROCESSLIST,
     // and the numbers are the sharp difference. StarRocks reports hard zeros; Doris reports
     // 2000 rows and 10187 bytes for a table holding exactly that, so the object browser and
     // the table-statistics panel are trustworthy here.
     //
-    // Two surfaces fail, both on ONE statement form: `SHOW STATUS LIKE '...'` is a parse
-    // error in the Doris grammar while a bare `SHOW STATUS` is accepted (and answers zero
-    // rows), which takes the overview and health panels. That cause is ours rather than the
-    // engine's and is filed as a backlog defect - the tier records what a user gets today,
-    // not what a fix could give them.
+    // The tier was `partial` for exactly two surfaces, the overview and health panels, and
+    // for one cause that was ours rather than the engine's: `SHOW STATUS LIKE '...'` is a
+    // parse error in the Doris grammar while a bare `SHOW STATUS` is accepted. Both panels
+    // render since that read was fixed (#573), and the Explain panel renders Doris's own
+    // text plan since the provider stopped sending `EXPLAIN FORMAT=JSON` (#574), so the
+    // tier is `full`. Verified in a browser against the built app on 2026-09-06.
     const relatives = compatibleEnginesFor("mysql");
     const doris = relatives.find((engine) => engine.name === "Apache Doris");
     expect(doris).toBeDefined();
     expect(doris?.via).toBe("mysql");
-    expect(doris?.tier).toBe("partial");
+    expect(doris?.tier).toBe("full");
     expect(doris?.probedVersion).toBe("Apache Doris 4.1.3-rc02-7126cf65d96 (version() reports 5.7.99)");
-    // The caveat set has to name the two failures and the two traps, because each one is a
-    // thing a reader would otherwise believe works: the fictitious version, the invisible
-    // foreign key, the absent indexes, and the statement form that costs two panels.
+    // The caveat set has to name the traps that remain, because each one is a thing a reader
+    // would otherwise believe works: the invisible foreign key and the absent indexes. It
+    // also has to say what the overview publishes now that it renders, which is an absence
+    // rather than a number, because Doris answers `SHOW STATUS` and
+    // `SHOW VARIABLES LIKE 'max_connections'` with zero rows each. The fictitious version()
+    // number is deliberately absent from this list: the overview reads @@version_comment
+    // instead and shows the real build, so it is no longer something a reader would be
+    // misled by.
     const caveats = doris?.caveats.join(" ") ?? "";
-    expect(caveats).toContain("SHOW STATUS");
-    expect(caveats).toContain("5.7.99");
+    expect(caveats).toContain("N/A, not published");
     expect(caveats).toContain("KEY_COLUMN_USAGE");
     expect(caveats).toContain("information_schema.statistics");
+    // The two resolved claims must not come back: neither panel is unavailable any more.
+    expect(doris?.caveats.some((caveat) => caveat.includes("The Explain panel does not work"))).toBe(false);
+    expect(doris?.caveats.some((caveat) => caveat.includes("panels are unavailable"))).toBe(false);
   });
 
   test("the Doris row is not the StarRocks row, and says so where it matters", () => {
     // A fork's measurements are a PRIOR, never an inheritance. This test pins the one
     // difference that would be tempting to copy across and would be wrong: StarRocks'
-    // caveats say the row counts and sizes are hard zeros, and Doris's must not, because
-    // the probe read the true numbers there.
+    // caveats say a freshly loaded table's row count and size both wait on its own
+    // background statistics collector, and Doris's must not, because the probe read the
+    // true numbers there immediately.
     const byName = new Map(WIRE_COMPATIBLE_ENGINES.map((engine) => [engine.name, engine]));
     const starrocks = byName.get("StarRocks");
     const doris = byName.get("Apache Doris");
-    expect(starrocks?.caveats.some((caveat) => caveat.includes("Row counts and sizes are always 0"))).toBe(true);
-    expect(doris?.caveats.some((caveat) => caveat.includes("always 0"))).toBe(false);
+    expect(starrocks?.caveats.some((caveat) => caveat.includes("background statistics collector catches up"))).toBe(
+      true,
+    );
+    expect(doris?.caveats.some((caveat) => caveat.includes("background statistics collector"))).toBe(false);
     expect(doris?.caveats.some((caveat) => caveat.includes("2000 rows"))).toBe(true);
   });
 
@@ -171,27 +196,27 @@ describe("wire-compatibility registry", () => {
     expect(refusedSection).toContain("pg_backend_pid()");
   });
 
-  test("Garnet is a full Redis relative whose own version the product does not show", () => {
+  test("Garnet is a full Redis relative whose own version the product now shows", () => {
     // Probed 2026-08-26 against `ghcr.io/microsoft/garnet:2.1.5` (#424 Phase 0). Every Redis
     // surface answers, so `full` by this registry's own definition - the numbers that are
     // wrong are recorded as caveats, the way Citus's are.
     //
-    // What separates this row from the other three Redis relatives: Valkey and DragonflyDB
-    // show an emulation level because that is all they publish, and KeyDB publishes nothing
-    // of its own at all. Garnet DOES publish `garnet_version:2.1.5` and `server_name:garnet`
-    // in INFO, and the product still shows Redis 7.4.3 - the one place where the real
-    // version was there to be read and went unread.
+    // Valkey, DragonflyDB and Garnet all publish a version field of their own
+    // (`valkey_version`, `dragonfly_version`, `garnet_version` in INFO) beside the Redis
+    // compatibility level, re-measured live 2026-09-04, and `labelServerVersion()` reads it -
+    // so the overview shows "Garnet 2.1.5 (Redis 7.4.3)", not the compat level alone. KeyDB
+    // alone publishes nothing of its own, so no caveat here names a version problem.
     const garnet = compatibleEnginesFor("redis").find((engine) => engine.name === "Garnet");
     expect(garnet).toBeDefined();
     expect(garnet?.tier).toBe("full");
     expect(garnet?.probedVersion).toBe("Garnet 2.1.5 (advertises Redis 7.4.3)");
     const caveats = garnet?.caveats.join(" ") ?? "";
-    expect(caveats).toContain("garnet_version");
     // The two numbers a reader must not trust, both from INFO fields Garnet does not publish
     // at all: no `used_memory` (so every size reads 0 B) and no keyspace counters (so the
     // cache hit ratio is the `: 100` fallback D14 already records).
     expect(caveats).toContain("used_memory");
     expect(caveats).toContain("cache hit ratio");
+    expect(caveats).not.toContain("garnet_version");
   });
 
   test("both Percona distributions are full relatives, and they differ in one thing only", () => {
@@ -204,8 +229,8 @@ describe("wire-compatibility registry", () => {
     // trap Garnet's row records and it lands on only one of the pair: Percona for
     // PostgreSQL puts its own name in `version()` ("PostgreSQL 18.6 - Percona Server for
     // PostgreSQL 18.6.1"), so the product displays it, while Percona Server for MySQL
-    // answers a bare `8.4.11-11` and keeps its identity in `@@version_comment`, which the
-    // provider does not read - so that one is indistinguishable from stock MySQL on screen.
+    // answers a bare `8.4.11-11` and keeps its identity in `@@version_comment` - which the
+    // overview reads since #1444, the only way to tell it from stock MySQL on screen.
     const mysqlSide = compatibleEnginesFor("mysql").find((e) => e.name === "Percona Server for MySQL");
     const pgSide = compatibleEnginesFor("postgres").find((e) => e.name === "Percona Distribution for PostgreSQL");
     expect(mysqlSide?.tier).toBe("full");
@@ -257,25 +282,75 @@ describe("wire-compatibility registry", () => {
     expect(parade?.caveats.some((caveat) => caveat.includes("pg_indexes_size"))).toBe(false);
   });
 
-  test("Databend is query-editor-only because our own reads cannot run there", () => {
-    // Probed 2026-08-27 against `datafuselabs/databend:v1.2.925-patch-11`. SQL runs: a
-    // 2000-row `count(*)` and a plain `EXPLAIN` both answer, and the catalogs THEMSELVES
-    // answer when asked with literal SQL - `information_schema.tables` reported the true
-    // 3 and 2000 rows with sizes.
-    //
-    // The object browser still gets nothing, and the reason is ours: every parameterised
-    // read goes through mysql2's prepared protocol and Databend replies
-    // `Prepare is not support in Databend`. D8 moved the PARAMETERLESS statements to the
-    // text protocol; the ones carrying placeholders - the table list, the schema, sessions,
-    // table/index/storage stats - still prepare. So this row is `query-only` for what a
-    // user gets today, with the cause recorded as a backlog item rather than as the
-    // engine's fault.
-    const databend = compatibleEnginesFor("mysql").find((engine) => engine.name === "Databend");
-    expect(databend?.tier).toBe("query-only");
-    expect(databend?.probedVersion).toBe("Databend v1.2.925-patch-11 (advertises MySQL 8.0.90)");
-    const caveats = databend?.caveats.join(" ") ?? "";
-    expect(caveats).toContain("Prepare is not support in Databend");
-    expect(caveats).toContain("information_schema.tables");
+  test("VictoriaMetrics is a Prometheus relative, recorded at the tier its gate-4 probe measured", () => {
+    // Probed 2026-09-23 against `victoriametrics/victoria-metrics:v1.152.0`, a single node scraping
+    // the compose fixture's targets, through `createDatabaseProvider({ type: "prometheus" })`, with
+    // Prometheus 3.13.3 probed in the same pass as the baseline (#1085 section 7, #424 Phase 6). A
+    // surface counted as answered only where it passed AND held data wherever Prometheus did, the
+    // ScyllaDB rule, so an empty folder is not a folder that works, nor is a monitoring read or an
+    // object count with a failed panel or count, and by that rule 20 of the 36 surfaces outside the
+    // editor that the baseline answered answer here. The advertised 2.24.0 is in the probed version and in no caveat,
+    // because the overview, the one panel that shows a version, fails there. The relative is
+    // claimed for PromQL only: nothing written in MetricsQL, its own query language, was measured.
+    expect(SHIPPED_DATABASE_TYPES).toContain("prometheus");
+    const relatives = compatibleEnginesFor("prometheus");
+    expect(relatives.map((engine) => engine.name)).toEqual(["VictoriaMetrics"]);
+    const victoria = relatives[0];
+    expect(victoria?.via).toBe("prometheus");
+    expect(victoria?.tier).toBe("partial");
+    expect(victoria?.probedVersion).toBe("VictoriaMetrics v1.152.0 (advertises Prometheus 2.24.0)");
+    // One pin per caveat the probe earned, so a caveat cannot be dropped or reworded away silently.
+    const caveats = victoria?.caveats.join(" ") ?? "";
+    expect(caveats).toContain("unsupported path requested");
+    expect(caveats).toContain("does not serve the path");
+    // The Tables tab lists up to fifty there too, since the TSDB read sends topN beside limit.
+    expect(caveats).not.toContain("its own top ten");
+    expect(caveats).toContain("shows its type and help");
+    expect(caveats).toContain("has no scrapeInterval or scrapeTimeout");
+    expect(caveats).toContain("1970-01-01T00:00:00Z");
+    expect(caveats).toContain("-vmalert.proxyURL");
+    expect(caveats).toContain("empty vector");
+    expect(caveats).toContain("31 points");
+    expect(caveats).toContain("PromQL info");
+    // A metadata entry, a target and the TSDB status each lack a member Prometheus sends, and each
+    // is read without it, so the Tables tab, a metric's Source tab and the Targets folder answer.
+    // The message shown for a path the server does not serve names that path and its status, and
+    // no longer says a proxy or a login page answered. None of those old claims may come back.
+    for (const resolved of [
+      "Tables tab of the monitoring dashboard fails",
+      "Source tab fails",
+      "Targets folder fails",
+      "suggests a proxy or a login page",
+      "expected text at",
+      "expected an object at",
+    ]) {
+      expect(caveats).not.toContain(resolved);
+    }
+  });
+
+  test("Redpanda is a full Kafka relative, recorded at the tier its live read-only check measured", () => {
+    // Probed 2026-09-25 against `redpandadata/redpanda:v26.2.2`, a single node seeded by
+    // docker/kafka/seed.sh and docker/kafka/seed-binary.ts, through a real KafkaProvider run by
+    // tests/live/kafka-read-only.ts --redpanda, with the single Apache Kafka 4.3.1 node as the
+    // baseline in the same pass (#1088 section 8). Every surface answered, with data wherever Kafka
+    // held data: the counts, the three listings and sources, a read in every `from` form, the four
+    // codecs, the transactional topic, the refusals, the three panels, the group listing and each
+    // group's lag against rpk's own, the forwarder and IPv6 checks, and the unchanged broker
+    // snapshot. So the tier is full, and the caveats name what reads differently from Kafka.
+    expect(SHIPPED_DATABASE_TYPES).toContain("kafka");
+    const relatives = compatibleEnginesFor("kafka");
+    expect(relatives.map((engine) => engine.name)).toEqual(["Redpanda"]);
+    const redpanda = relatives[0];
+    expect(redpanda?.via).toBe("kafka");
+    expect(redpanda?.tier).toBe("full");
+    expect(redpanda?.probedVersion).toBe("Redpanda v26.2.2");
+    // One pin per caveat the probe earned, so a caveat cannot be dropped or reworded away silently.
+    const caveats = redpanda?.caveats.join(" ") ?? "";
+    expect(caveats).toContain("max.connections");
+    expect(caveats).toContain("nine");
+    expect(caveats).toContain("usage percentage");
+    expect(caveats).toContain("ListGroups up to v4");
+    expect(redpanda?.caveats).toHaveLength(4);
   });
 
   test("every entry names a driver we actually ship", () => {
@@ -312,6 +387,162 @@ describe("wire-compatibility registry", () => {
     expect(compatibleEnginesFor("not-a-database" as DatabaseType)).toEqual([]);
   });
 
+  test("db2 ships as an external driver, with the posture Oracle has (#786)", () => {
+    // IBM Db2 LUW over DRDA. No relative is recorded: z/OS and IBM i speak the same protocol and
+    // are out of scope until a live probe has measured one.
+    expect(SHIPPED_DATABASE_TYPES).toContain("db2");
+    expect(EXTERNAL_DATABASE_TYPES).toContain("db2");
+    expect(compatibleEnginesFor("db2")).toEqual([]);
+    // The provider enforces no read-only mode, so `readOnly: true` is refused, and MCP is offered,
+    // both as on Oracle.
+    expect(READ_ONLY_ENFORCED.db2).toBe(false);
+    expect(MCP_EXPOSABLE.db2).toBe(true);
+  });
+
+  test("qdrant ships as an external engine that keeps the read-only mode and is offered to MCP (vector-family spec 6.7, 10.2)", () => {
+    // A server the user already runs, reached over its REST API. No relative is recorded: Qdrant Cloud speaks the
+    // same API and is claimed nowhere until a test cluster passes gate 4 (vector-family spec 6.2).
+    expect(SHIPPED_DATABASE_TYPES).toContain("qdrant");
+    expect(isExternalDatabaseType("qdrant")).toBe(true);
+    expect(compatibleEnginesFor("qdrant")).toEqual([]);
+    expect(READ_ONLY_ENFORCED.qdrant).toBe(true);
+    expect(MCP_EXPOSABLE.qdrant).toBe(true);
+  });
+
+  test("milvus ships as an external engine that keeps the read-only mode and is offered to MCP (vector-family spec 5.7, 10.2)", () => {
+    // A server or cluster the user already runs, reached over its gRPC API. No relative is recorded: Zilliz Cloud
+    // speaks the same API and is claimed nowhere until a test cluster passes gate 4 (vector-family spec 5.2).
+    expect(SHIPPED_DATABASE_TYPES).toContain("milvus");
+    expect(isExternalDatabaseType("milvus")).toBe(true);
+    expect(compatibleEnginesFor("milvus")).toEqual([]);
+    expect(READ_ONLY_ENFORCED.milvus).toBe(true);
+    expect(MCP_EXPOSABLE.milvus).toBe(true);
+  });
+
+  test("influxdb and influxdb3 ship as external engines that keep the read-only mode and are offered to MCP (InfluxDB spec I2, I8, I13)", () => {
+    // Two servers the user already runs, one per query language, served from one provider directory. No relative is
+    // recorded: InfluxDB Cloud, Clustered and Enterprise 1.x are claimed nowhere until a gate-4 probe measures one.
+    for (const type of ["influxdb", "influxdb3"] as const) {
+      expect(SHIPPED_DATABASE_TYPES).toContain(type);
+      expect(isExternalDatabaseType(type)).toBe(true);
+      expect(compatibleEnginesFor(type)).toEqual([]);
+      expect(READ_ONLY_ENFORCED[type]).toBe(true);
+      expect(MCP_EXPOSABLE[type]).toBe(true);
+    }
+  });
+
+  test("oxia ships as an external engine that keeps the read-only mode and is not offered to MCP (SB3-1.2)", () => {
+    // A server or cluster the user already runs, reached over Oxia's gRPC client API; no relative is recorded.
+    expect(SHIPPED_DATABASE_TYPES).toContain("oxia");
+    expect(isExternalDatabaseType("oxia")).toBe(true);
+    expect(compatibleEnginesFor("oxia")).toEqual([]);
+    expect(READ_ONLY_ENFORCED.oxia).toBe(true);
+    expect(MCP_EXPOSABLE.oxia).toBe(false);
+  });
+
+  test("databend ships as an external engine, offered to MCP, with no read-only promise and no relatives", () => {
+    // Self-hosted Databend and Databend Cloud, reached over the HTTP query API by a client of this repository's own.
+    // Its MySQL-wire relative row is retired (owner decision O2): with both, README's "no driver of their own" list
+    // and `connectableProductCount()` would count Databend twice. The provider enforces no read-only mode, so
+    // `readOnly: true` is refused, and MCP is offered, as on Db2.
+    expect(SHIPPED_DATABASE_TYPES).toContain("databend");
+    expect(isExternalDatabaseType("databend")).toBe(true);
+    expect(compatibleEnginesFor("databend")).toEqual([]);
+    expect(READ_ONLY_ENFORCED.databend).toBe(false);
+    expect(MCP_EXPOSABLE.databend).toBe(true);
+    expect(READS_FILE_ACCESS_POSTURE.databend).toBe(false);
+    expect(CONNECTION_FORM_URI_MODE.databend).toBe(false);
+    expect(CONNECTION_STRING_ACCEPTED.databend).toBe(false);
+    expect(WIRE_COMPATIBLE_ENGINES.map((engine) => engine.name)).not.toContain("Databend");
+    expect(compatibleEnginesFor("mysql").map((engine) => engine.name)).not.toContain("Databend");
+    expect(Object.keys(COMPOSE_SERVICE_BY_ENGINE)).not.toContain("Databend");
+  });
+
+  test("bigquery ships as an external engine, offered to MCP, with no read-only promise and no relatives", () => {
+    expect(SHIPPED_DATABASE_TYPES).toContain("bigquery");
+    expect(isExternalDatabaseType("bigquery")).toBe(true);
+    expect(compatibleEnginesFor("bigquery")).toEqual([]);
+    expect(READ_ONLY_ENFORCED.bigquery).toBe(false);
+    expect(MCP_EXPOSABLE.bigquery).toBe(true);
+    expect(READS_FILE_ACCESS_POSTURE.bigquery).toBe(false);
+    expect(CONNECTION_FORM_URI_MODE.bigquery).toBe(false);
+    expect(CONNECTION_STRING_ACCEPTED.bigquery).toBe(false);
+  });
+
+  test("snowflake ships as an external engine, offered to MCP, with no read-only promise and no relatives", () => {
+    expect(SHIPPED_DATABASE_TYPES).toContain("snowflake");
+    expect(isExternalDatabaseType("snowflake")).toBe(true);
+    expect(compatibleEnginesFor("snowflake")).toEqual([]);
+    expect(READ_ONLY_ENFORCED.snowflake).toBe(false);
+    expect(MCP_EXPOSABLE.snowflake).toBe(true);
+    expect(READS_FILE_ACCESS_POSTURE.snowflake).toBe(false);
+    expect(CONNECTION_FORM_URI_MODE.snowflake).toBe(false);
+    expect(CONNECTION_STRING_ACCEPTED.snowflake).toBe(false);
+  });
+
+  test("s3 ships as an external engine that keeps the read-only mode, is not offered to MCP, and has no relatives", () => {
+    // S3-compatible object storage the user already runs, reached over the S3 REST API by a client of this repository's
+    // own. MinIO, Silo, Garage and RustFS are the servers the s3 driver itself was verified on, not relatives:
+    // counting them would count one product twice.
+    expect(SHIPPED_DATABASE_TYPES).toContain("s3");
+    expect(isExternalDatabaseType("s3")).toBe(true);
+    expect(compatibleEnginesFor("s3")).toEqual([]);
+    expect(READ_ONLY_ENFORCED.s3).toBe(true);
+    expect(MCP_EXPOSABLE.s3).toBe(false);
+    expect(READS_FILE_ACCESS_POSTURE.s3).toBe(false);
+    expect(CONNECTION_FORM_URI_MODE.s3).toBe(false);
+    expect(CONNECTION_STRING_ACCEPTED.s3).toBe(false);
+    const relatives = WIRE_COMPATIBLE_ENGINES.map((engine) => engine.name);
+    for (const server of ["MinIO", "Silo", "Garage", "RustFS"]) expect(relatives).not.toContain(server);
+  });
+
+  test("kubernetes ships as an external engine that keeps the read-only mode, is not offered to MCP and has no relatives", () => {
+    // A cluster the user already runs, reached over the API server's REST API; no relative is recorded.
+    expect(SHIPPED_DATABASE_TYPES).toContain("kubernetes");
+    expect(isExternalDatabaseType("kubernetes")).toBe(true);
+    expect(compatibleEnginesFor("kubernetes")).toEqual([]);
+    expect(READ_ONLY_ENFORCED.kubernetes).toBe(true);
+    expect(MCP_EXPOSABLE.kubernetes).toBe(false);
+    expect(READS_FILE_ACCESS_POSTURE.kubernetes).toBe(false);
+    expect(CONNECTION_FORM_URI_MODE.kubernetes).toBe(false);
+    expect(CONNECTION_STRING_ACCEPTED.kubernetes).toBe(false);
+  });
+
+  test("the fleet counts: shipped, external, wire-compatible relatives and connectable products", () => {
+    // The one place these numerals live. A new provider moves them here and nowhere else, and the derived
+    // assertions around this test say how the counts relate.
+    expect([SHIPPED_DATABASE_TYPES.length, EXTERNAL_DATABASE_TYPES.length, WIRE_COMPATIBLE_ENGINES.length]).toEqual([
+      42, 41, 27,
+    ]);
+    expect(connectableProductCount()).toBe(68);
+  });
+
+  test("the Apache Spark row of each record (#1736)", () => {
+    expect(SHIPPED_DATABASE_TYPES).toContain("spark");
+    expect(EXTERNAL_DATABASE_TYPES).toContain("spark");
+    // No engine read-only mode and no file-access posture to read (Apache Spark).
+    expect(READ_ONLY_ENFORCED.spark).toBe(false);
+    expect(READS_FILE_ACCESS_POSTURE.spark).toBe(false);
+    // list_connections and inspect_schema; run_read_query refuses it, since the provider has no queryReadOnly.
+    expect(MCP_EXPOSABLE.spark).toBe(true);
+    // A pasted sc:// address is decomposed into fields; a seed gives fields, never a string.
+    expect(CONNECTION_FORM_URI_MODE.spark).toBe(false);
+    expect(CONNECTION_STRING_ACCEPTED.spark).toBe(false);
+    // 63 and not 62 because MTConnect joined as an external engine with no wire-compatible relative:
+  });
+
+  test("firestore ships as an external engine that keeps the read-only mode, is not offered to MCP and has no relatives", () => {
+    // A Firestore database the user already runs in Google Cloud, read over Firestore REST v1; no relative is recorded.
+    expect(SHIPPED_DATABASE_TYPES).toContain("firestore");
+    expect(isExternalDatabaseType("firestore")).toBe(true);
+    expect(compatibleEnginesFor("firestore")).toEqual([]);
+    expect(READ_ONLY_ENFORCED.firestore).toBe(true);
+    expect(MCP_EXPOSABLE.firestore).toBe(false);
+    expect(READS_FILE_ACCESS_POSTURE.firestore).toBe(false);
+    expect(CONNECTION_FORM_URI_MODE.firestore).toBe(false);
+    expect(CONNECTION_STRING_ACCEPTED.firestore).toBe(false);
+  });
+
   test("duckdb ships as a driver and is a relative of nothing", () => {
     // The negative half is the load-bearing one. DuckDB speaks no wire protocol at all -
     // it is an in-process library reading a file - so no engine can be compatible with
@@ -345,8 +576,8 @@ describe("wire-compatibility registry", () => {
   });
 
   test("a query-only engine always carries a caveat saying so", () => {
-    // The live probes forced this distinction: Materialize and RisingWave answer
-    // SQL and nothing else, while Citus matches PostgreSQL surface for surface.
+    // The live probes forced this distinction: Databend answers SQL and nothing else
+    // through the provider, while Citus matches PostgreSQL surface for surface.
     // Publishing both as "compatible" is exactly the overclaim #424 forbids, so a
     // query-only tier is not allowed to be silent about it.
     for (const engine of WIRE_COMPATIBLE_ENGINES.filter((e) => e.tier === "query-only")) {
@@ -405,5 +636,150 @@ describe("wire-compatibility registry", () => {
         expect(caveat.trim().length).toBeGreaterThan(0);
       }
     }
+  });
+});
+
+/**
+ * `MCP_EXPOSABLE` (#1089): which engines a seed connection may expose to MCP clients. The seed schema
+ * reads it before it accepts `mcp: true`, so it answers for every shipped type-id and nothing else,
+ * and no reader can change an answer at run time. The refusal it drives is pinned in
+ * `tests/unit/seed/types.test.ts`.
+ */
+describe("MCP_EXPOSABLE (#1089)", () => {
+  test("answers for every shipped type-id and for nothing else", () => {
+    expect(Object.keys(MCP_EXPOSABLE).sort()).toEqual([...SHIPPED_DATABASE_TYPES].sort());
+  });
+
+  test("is frozen, so no reader can offer or withdraw MCP for an engine at run time", () => {
+    expect(Object.isFrozen(MCP_EXPOSABLE)).toBe(true);
+  });
+
+  test("offers MCP for every shipped engine but etcd, oxia, s3, kubernetes, mqtt, firestore, opcua, modbus and netconf", () => {
+    // An engine MCP is not offered for answers false with its registration, and is named here then.
+    // Modbus refuses for a reason of its own, written beside its registration in
+    // compatibility.ts rather than repeated here.
+    expect(SHIPPED_DATABASE_TYPES.filter((type) => MCP_EXPOSABLE[type] !== true)).toEqual([
+      "etcd",
+      "oxia",
+      "s3",
+      "kubernetes",
+      "mqtt",
+      "firestore",
+      "opcua",
+      "modbus",
+      "netconf",
+      "snmp",
+      "sparkplug",
+    ]);
+  });
+});
+
+/**
+ * `OPENS_LOCAL_FILE` (governance row admission, docs/GOVERNANCE.md#row-admission-and-skip-codes): the engines whose
+ * connection is a file on Studio's own host. Admission never governs one, whatever `GOVERNANCE_ALLOWED_ENGINES` says,
+ * and reads this record rather than a type id. The governance layer must not load `src/lib/db-ui-config.ts`, which
+ * value-imports the React icon components, so the record is held equal here to that file's own answer: `isFileBased()`,
+ * the connection form's file path in place of a server address.
+ */
+describe("OPENS_LOCAL_FILE", () => {
+  test("answers for every shipped type-id and for nothing else", () => {
+    expect(Object.keys(OPENS_LOCAL_FILE).sort()).toEqual([...SHIPPED_DATABASE_TYPES].sort());
+  });
+
+  test("is frozen, so no reader can change an answer at run time", () => {
+    expect(Object.isFrozen(OPENS_LOCAL_FILE)).toBe(true);
+  });
+
+  test.each([...SHIPPED_DATABASE_TYPES])(
+    "%s: the record answers what the connection form's file path declares",
+    (type) => {
+      expect(OPENS_LOCAL_FILE[type]).toBe(isFileBased(type));
+    },
+  );
+
+  test("sqlite, duckdb and libredb open a local file, and no other engine does", () => {
+    // Vacuity, by name: a record that answered false everywhere would pass the census above against a form that
+    // also drew no file path.
+    expect(SHIPPED_DATABASE_TYPES.filter((type) => OPENS_LOCAL_FILE[type])).toEqual(["sqlite", "duckdb", "libredb"]);
+  });
+});
+
+/**
+ * Whether `type`'s provider, built from the census connection with no database and no connection string, reports
+ * `catalogSessions`: a session of its own to each database the caller picks (#1530). Nothing connects.
+ *
+ * A provider that refuses to be built without a database opens nothing without one, so it answers false. That the
+ * refusal is about the database is shown by building the same census connection with its database, which must work.
+ */
+async function reportsCatalogSessionsWithoutDatabase(type: DatabaseType): Promise<boolean> {
+  const withoutDatabase = { ...CENSUS_CONNECTION[type], database: undefined, connectionString: undefined };
+  try {
+    return (await createDatabaseProvider(withoutDatabase)).getCapabilities().catalogSessions === true;
+  } catch {
+    await createDatabaseProvider(CENSUS_CONNECTION[type]);
+    return false;
+  }
+}
+
+/**
+ * `OPENS_SERVER_LEVEL_WITHOUT_DATABASE` (governance row admission, docs/GOVERNANCE.md#row-admission-and-skip-codes):
+ * the engines whose provider reaches the whole server when a connection names no database. Admission skips such a
+ * definition as SERVER_LEVEL_NOT_ALLOWED and reads this record rather than a type id, so it is held equal to what every
+ * shipped provider declares.
+ */
+describe("OPENS_SERVER_LEVEL_WITHOUT_DATABASE", () => {
+  test("answers for every shipped type-id and for nothing else", () => {
+    expect(Object.keys(OPENS_SERVER_LEVEL_WITHOUT_DATABASE).sort()).toEqual([...SHIPPED_DATABASE_TYPES].sort());
+  });
+
+  test("is frozen, so no reader can change an answer at run time", () => {
+    expect(Object.isFrozen(OPENS_SERVER_LEVEL_WITHOUT_DATABASE)).toBe(true);
+  });
+
+  test("OPENS_SERVER_LEVEL_WITHOUT_DATABASE matches the engines whose provider reports catalogSessions without a database", async () => {
+    const reports = await Promise.all(SHIPPED_DATABASE_TYPES.map(reportsCatalogSessionsWithoutDatabase));
+    const measured = SHIPPED_DATABASE_TYPES.filter((_, index) => reports[index]);
+    expect(SHIPPED_DATABASE_TYPES.filter((type) => OPENS_SERVER_LEVEL_WITHOUT_DATABASE[type])).toEqual(measured);
+    // Vacuity, by name: a record and a census that both found nothing would agree above.
+    expect(measured).toEqual(["postgres"]);
+  });
+
+  test("a PostgreSQL provider given a database, or a connection string, opens no catalog sessions", async () => {
+    // The other half of the measurement: the record is about the missing database, not about the engine.
+    const withDatabase = { ...CENSUS_CONNECTION.postgres, connectionString: undefined };
+    const withString = { ...CENSUS_CONNECTION.postgres, database: undefined, connectionString: "postgres://h/app" };
+    const providers = await Promise.all(
+      [withDatabase, withString].map((connection) => createDatabaseProvider(connection)),
+    );
+    expect(providers.map((provider) => provider.getCapabilities().catalogSessions)).toEqual([undefined, undefined]);
+  });
+});
+
+/**
+ * `SINGLE_WRITER_FILE` (per-user providers, docs/GOVERNANCE.md#per-user-providers): the engines whose provider keeps
+ * one handle per file in this process. The provider cache key leaves the owner out for them, because a provider per
+ * user would be a second handle on one file, and it decides before any provider exists, so it reads this record rather
+ * than a type id. Held equal here to what every shipped provider declares, built from the census connection with
+ * nothing connecting.
+ */
+describe("SINGLE_WRITER_FILE", () => {
+  test("answers for every shipped type-id and for nothing else", () => {
+    expect(Object.keys(SINGLE_WRITER_FILE).sort()).toEqual([...SHIPPED_DATABASE_TYPES].sort());
+  });
+
+  test("is frozen, so no reader can change an answer at run time", () => {
+    expect(Object.isFrozen(SINGLE_WRITER_FILE)).toBe(true);
+  });
+
+  test("SINGLE_WRITER_FILE matches the engines whose capabilities declare singleWriterFile", async () => {
+    const providers = await Promise.all(
+      SHIPPED_DATABASE_TYPES.map((type) => createDatabaseProvider(CENSUS_CONNECTION[type])),
+    );
+    const measured = SHIPPED_DATABASE_TYPES.filter(
+      (_, index) => providers[index].getCapabilities().singleWriterFile === true,
+    );
+    expect(SHIPPED_DATABASE_TYPES.filter((type) => SINGLE_WRITER_FILE[type])).toEqual(measured);
+    // Vacuity, by name: a record and a census that both found nothing would agree above.
+    expect(measured).toEqual(["duckdb", "libredb"]);
   });
 });

@@ -18,6 +18,7 @@ const ENV_KEYS = [
   "ADMIN_PASSWORD",
   "AUTH_BOOTSTRAP",
   "LIBREDB_NO_BANNER",
+  "GOVERNANCE_SOURCE",
 ] as const;
 
 /** The sqlite sample seeds fire-and-forget; poll for its observable effects. */
@@ -47,13 +48,35 @@ describe("instrumentation register()", () => {
     setSqliteSampleSeedState("idle");
   });
 
-  afterEach(() => {
-    for (const key of ENV_KEYS) {
-      if (orig[key] === undefined) delete process.env[key];
-      else process.env[key] = orig[key];
+  afterEach(async () => {
+    // Drain the fire-and-forget seed before anything it reads is taken away.
+    //
+    // register() returns while the sqlite copy is still running, and not every
+    // test above awaits it - "seeds the sample file on a nodejs boot" is about
+    // the libredb sample and leaves a sqlite seed in flight. That copy logs
+    // when it lands, so a later test's logger spy catches a line no call of
+    // its own produced: measured on 2026-09-17 as a red Windows leg (CI run
+    // 35172616920) where "SQLite embedded sample seed completed" reached the
+    // fast-path test, which asserts exactly that no such info line appears.
+    // Linux stayed green only because the stray line landed one test earlier,
+    // where nothing was watching info.
+    //
+    // Draining on the state is enough to contain the log: instrumentation.ts
+    // sets the terminal state and logs in the same synchronous step, so a
+    // state that is no longer "seeding" means the line has already been
+    // emitted into the test that started it. The cleanup runs in `finally`,
+    // because a drain that times out must not leave the next test to fail on
+    // this one's env and state.
+    try {
+      await waitFor(() => getSqliteSampleSeedState() !== "seeding");
+    } finally {
+      for (const key of ENV_KEYS) {
+        if (orig[key] === undefined) delete process.env[key];
+        else process.env[key] = orig[key];
+      }
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      setSqliteSampleSeedState("idle");
     }
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-    setSqliteSampleSeedState("idle");
   });
 
   test("does nothing outside the nodejs runtime", async () => {
@@ -115,6 +138,45 @@ describe("instrumentation register()", () => {
     expect(fs.existsSync(path.join(tmpDir, "sample.libredb"))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, "sample-employees.db"))).toBe(false);
     expect(process.env.JWT_SECRET).toBe("x".repeat(24));
+  });
+
+  test("hard-exits before seeding and the banner when the governance preflight refuses the environment", async () => {
+    process.env.NEXT_RUNTIME = "nodejs";
+    process.env.AUTH_BOOTSTRAP = "off";
+    // Governance on, with none of the settings it requires.
+    process.env.GOVERNANCE_SOURCE = "postgres";
+    process.env.LIBREDB_EMBEDDED_SAMPLE_PATH = path.join(tmpDir, "sample.libredb");
+    process.env.SQLITE_EMBEDDED_SAMPLE_PATH = path.join(tmpDir, "sample-employees.db");
+    delete process.env.LIBREDB_NO_BANNER;
+
+    const originalExit = process.exit;
+    const exitCalls: Array<number | undefined> = [];
+    process.exit = ((code?: number) => {
+      exitCalls.push(code);
+    }) as unknown as typeof process.exit;
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    let banner = "";
+    let output = "";
+    try {
+      await register();
+      // Read the recorded calls before mockRestore(): bun clears them on restore.
+      banner = errorSpy.mock.calls.flat().join("\n");
+      output = log.mock.calls.flat().join("\n");
+    } finally {
+      process.exit = originalExit;
+      errorSpy.mockRestore();
+      log.mockRestore();
+    }
+
+    expect(exitCalls).toEqual([1]);
+    expect(banner).toContain("GOVERNANCE_POSTGRES_URL is not set");
+    expect(banner).toContain("GOVERNANCE_INSTANCE_ID is not set");
+    // register() abandons the rest of boot: no sample is seeded and no welcome is printed.
+    expect(getSqliteSampleSeedState()).toBe("idle");
+    expect(fs.existsSync(path.join(tmpDir, "sample.libredb"))).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, "sample-employees.db"))).toBe(false);
+    expect(output).not.toContain("Star the project");
   });
 
   test("seeds the sample file on a nodejs boot", async () => {
@@ -235,22 +297,28 @@ describe("instrumentation register()", () => {
     expect(output).not.toContain("Star the project");
   });
 
-  test("logs a warning and keeps boot alive when seeding fails", async () => {
-    if (process.platform === "win32" || process.getuid?.() === 0) return; // perms not enforceable
-    process.env.NEXT_RUNTIME = "nodejs";
-    process.env.AUTH_BOOTSTRAP = "off";
-    const lockedDir = path.join(tmpDir, "locked");
-    fs.mkdirSync(lockedDir);
-    fs.chmodSync(lockedDir, 0o500);
-    process.env.LIBREDB_EMBEDDED_SAMPLE_PATH = path.join(lockedDir, "sample.libredb");
-    const warn = spyOn(logger, "warn").mockImplementation(() => {});
-    try {
-      await expect(register()).resolves.toBeUndefined();
-      expect(warn).toHaveBeenCalled();
-      expect(String(warn.mock.calls[0]?.[0])).toContain("seeding skipped");
-    } finally {
-      warn.mockRestore();
-      fs.chmodSync(lockedDir, 0o700);
-    }
-  });
+  // The failure is produced by a directory whose mode forbids writing, which nothing can arrange
+  // on Windows (chmod there only toggles the read-only bit) or as root (mode bits do not apply).
+  // Named in the title rather than returned early from the body: a bare `return` reports a pass on
+  // a machine that never ran the assertion, which is the same output a real pass gives.
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "logs a warning and keeps boot alive when seeding fails (POSIX non-root only: needs an unwritable directory)",
+    async () => {
+      process.env.NEXT_RUNTIME = "nodejs";
+      process.env.AUTH_BOOTSTRAP = "off";
+      const lockedDir = path.join(tmpDir, "locked");
+      fs.mkdirSync(lockedDir);
+      fs.chmodSync(lockedDir, 0o500);
+      process.env.LIBREDB_EMBEDDED_SAMPLE_PATH = path.join(lockedDir, "sample.libredb");
+      const warn = spyOn(logger, "warn").mockImplementation(() => {});
+      try {
+        await expect(register()).resolves.toBeUndefined();
+        expect(warn).toHaveBeenCalled();
+        expect(String(warn.mock.calls[0]?.[0])).toContain("seeding skipped");
+      } finally {
+        warn.mockRestore();
+        fs.chmodSync(lockedDir, 0o700);
+      }
+    },
+  );
 });

@@ -120,6 +120,67 @@ describe("config/auth-preflight verifyAuthEnvAtBoot", () => {
       restore();
     }
   });
+
+  describe("when nothing will produce a secret", () => {
+    const origBootstrap = process.env.AUTH_BOOTSTRAP;
+    const origNodeEnv = process.env.NODE_ENV;
+
+    function setEnv(name: "AUTH_BOOTSTRAP" | "NODE_ENV", value: string | undefined): void {
+      if (value === undefined) delete process.env[name];
+      else Object.defineProperty(process.env, name, { value, configurable: true, writable: true, enumerable: true });
+    }
+
+    afterEach(() => {
+      setEnv("AUTH_BOOTSTRAP", origBootstrap);
+      setEnv("NODE_ENV", origNodeEnv);
+    });
+
+    test("refuses to boot in production with bootstrap off and no secret", () => {
+      setSecret(undefined);
+      setEnv("AUTH_BOOTSTRAP", "off");
+      setEnv("NODE_ENV", "production");
+      const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+      const { exitCalls, restore } = stubProcessExit();
+
+      const result = verifyAuthEnvAtBoot();
+
+      expect(result).toBe(false);
+      expect(exitCalls).toEqual([1]);
+      const banner = errorSpy.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(banner).toContain("JWT_SECRET is not set");
+      expect(banner).toContain("AUTH_BOOTSTRAP is off");
+      restore();
+      errorSpy.mockRestore();
+    });
+
+    test("leaves bootstrap-on deployments alone: the first run generates one", () => {
+      setSecret(undefined);
+      setEnv("AUTH_BOOTSTRAP", undefined);
+      setEnv("NODE_ENV", "production");
+      const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+      const { exitCalls, restore } = stubProcessExit();
+
+      verifyAuthEnvAtBoot();
+
+      expect(exitCalls).toEqual([]);
+      restore();
+      errorSpy.mockRestore();
+    });
+
+    test("leaves development alone: getJwtSecret still has its fallback there", () => {
+      setSecret(undefined);
+      setEnv("AUTH_BOOTSTRAP", "off");
+      setEnv("NODE_ENV", "development");
+      const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+      const { exitCalls, restore } = stubProcessExit();
+
+      verifyAuthEnvAtBoot();
+
+      expect(exitCalls).toEqual([]);
+      restore();
+      errorSpy.mockRestore();
+    });
+  });
 });
 
 /**
@@ -260,6 +321,206 @@ describe("config/auth-preflight STORAGE_ENCRYPTION_KEY", () => {
     } finally {
       restore();
       errorSpy.mockRestore();
+    }
+  });
+
+  // ── AUTH_BOOTSTRAP=off with no secret (#908) ───────────────────────────────
+  //
+  // The setting is documented as turning off credential generation so an operator supplies
+  // their own. It also turns off SECRET generation, which was documented nowhere, and the
+  // failure was silent: the server started, the health probe answered "healthy", and every
+  // login returned 503. A monitor stayed green through all of it and the first report came
+  // from a user who could not sign in.
+});
+
+describe("config/auth-preflight AUTH_SESSION_TTL_SECONDS", () => {
+  const origTtl = process.env.AUTH_SESSION_TTL_SECONDS;
+  const origSecret = process.env.JWT_SECRET;
+
+  afterEach(() => {
+    if (origTtl === undefined) delete process.env.AUTH_SESSION_TTL_SECONDS;
+    else process.env.AUTH_SESSION_TTL_SECONDS = origTtl;
+    if (origSecret === undefined) delete process.env.JWT_SECRET;
+    else process.env.JWT_SECRET = origSecret;
+  });
+
+  function runPreflight(): { result: boolean; exitCalls: Array<number | undefined>; banner: string } {
+    const originalExit = process.exit;
+    const exitCalls: Array<number | undefined> = [];
+    process.exit = ((code?: number) => {
+      exitCalls.push(code);
+    }) as unknown as typeof process.exit;
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = verifyAuthEnvAtBoot();
+      return { result, exitCalls, banner: errorSpy.mock.calls.flat().join("\n") };
+    } finally {
+      process.exit = originalExit;
+      errorSpy.mockRestore();
+    }
+  }
+
+  test("AUTH_SESSION_TTL_SECONDS of 299, 86401 or abc stops the boot naming the variable", () => {
+    process.env.JWT_SECRET = "a-valid-secret-that-is-32-chars!";
+    for (const value of ["299", "86401", "abc"]) {
+      process.env.AUTH_SESSION_TTL_SECONDS = value;
+      const { result, exitCalls, banner } = runPreflight();
+      expect(result).toBe(false);
+      expect(exitCalls).toEqual([1]);
+      expect(banner).toContain("LibreDB Studio cannot start");
+      expect(banner).toContain("AUTH_SESSION_TTL_SECONDS");
+      expect(banner).toContain("300");
+      expect(banner).toContain("86400");
+    }
+  });
+
+  test("allows boot to continue when AUTH_SESSION_TTL_SECONDS is unset or inside the range", () => {
+    process.env.JWT_SECRET = "a-valid-secret-that-is-32-chars!";
+    for (const value of [undefined, "300", "28800", "86400"]) {
+      if (value === undefined) delete process.env.AUTH_SESSION_TTL_SECONDS;
+      else process.env.AUTH_SESSION_TTL_SECONDS = value;
+      const { result, exitCalls, banner } = runPreflight();
+      expect(result).toBe(true);
+      expect(exitCalls).toEqual([]);
+      expect(banner).toBe("");
+    }
+  });
+});
+
+/**
+ * STORAGE_POSTGRES_SCHEMA names the schema the PostgreSQL storage tables live in. A value that is
+ * not a plain lowercase identifier would otherwise surface only at the first storage request, after
+ * sign-in, as a failed sync, so the boot refuses it while that provider is selected.
+ */
+describe("config/auth-preflight STORAGE_POSTGRES_SCHEMA", () => {
+  const original = {
+    JWT_SECRET: process.env.JWT_SECRET,
+    STORAGE_PROVIDER: process.env.STORAGE_PROVIDER,
+    STORAGE_POSTGRES_SCHEMA: process.env.STORAGE_POSTGRES_SCHEMA,
+    STORAGE_ENCRYPTION_KEY: process.env.STORAGE_ENCRYPTION_KEY,
+  };
+
+  afterEach(() => {
+    for (const [name, value] of Object.entries(original)) setEnv(name, value);
+  });
+
+  function setEnv(name: string, value: string | undefined): void {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+
+  function run(provider: string | undefined, schema: string | undefined) {
+    setEnv("JWT_SECRET", "a-valid-secret-that-is-32-chars!");
+    setEnv("STORAGE_ENCRYPTION_KEY", undefined);
+    setEnv("STORAGE_PROVIDER", provider);
+    setEnv("STORAGE_POSTGRES_SCHEMA", schema);
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const originalExit = process.exit;
+    const exitCalls: Array<number | undefined> = [];
+    process.exit = ((code?: number) => {
+      exitCalls.push(code);
+    }) as unknown as typeof process.exit;
+    try {
+      const result = verifyAuthEnvAtBoot();
+      return { result, exitCalls, banner: errorSpy.mock.calls.flat().join("\n") };
+    } finally {
+      process.exit = originalExit;
+      errorSpy.mockRestore();
+    }
+  }
+
+  test("an invalid STORAGE_POSTGRES_SCHEMA stops the boot when STORAGE_PROVIDER=postgres", () => {
+    const { result, exitCalls, banner } = run("postgres", "Studio-Schema");
+    expect(result).toBe(false);
+    expect(exitCalls).toEqual([1]);
+    expect(banner).toContain("LibreDB Studio cannot start: STORAGE_POSTGRES_SCHEMA is invalid");
+    expect(banner).toContain(
+      'STORAGE_POSTGRES_SCHEMA must be a lowercase PostgreSQL schema name matching ^[a-z_][a-z0-9_]{0,62}$, got "Studio-Schema"',
+    );
+  });
+
+  test("a valid or unset STORAGE_POSTGRES_SCHEMA lets the postgres provider boot", () => {
+    for (const schema of ["studio", undefined]) {
+      const { result, exitCalls, banner } = run("postgres", schema);
+      expect(result).toBe(true);
+      expect(exitCalls).toEqual([]);
+      expect(banner).toBe("");
+    }
+  });
+
+  test("the variable is inert, and not checked, under any other storage provider", () => {
+    for (const provider of ["local", "sqlite", undefined]) {
+      const { result, exitCalls } = run(provider, "Studio-Schema");
+      expect(result).toBe(true);
+      expect(exitCalls).toEqual([]);
+    }
+  });
+});
+
+describe("config/auth-preflight OIDC_BEARER_AUDIENCE", () => {
+  const KEYS = ["OIDC_BEARER_AUDIENCE", "NEXT_PUBLIC_AUTH_PROVIDER", "OIDC_CLIENT_ID"] as const;
+  const saved: Record<string, string | undefined> = {};
+
+  afterEach(() => {
+    for (const key of KEYS) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  });
+
+  function run(env: Partial<Record<(typeof KEYS)[number], string>>) {
+    for (const key of KEYS) {
+      saved[key] = process.env[key];
+      if (env[key] === undefined) delete process.env[key];
+      else process.env[key] = env[key];
+    }
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const originalExit = process.exit;
+    const exitCalls: Array<number | undefined> = [];
+    process.exit = ((code?: number) => {
+      exitCalls.push(code);
+    }) as unknown as typeof process.exit;
+    try {
+      const result = verifyAuthEnvAtBoot();
+      return { result, exitCalls, banner: errorSpy.mock.calls.flat().join("\n") };
+    } finally {
+      process.exit = originalExit;
+      errorSpy.mockRestore();
+    }
+  }
+
+  test("an audience equal to OIDC_CLIENT_ID stops the boot naming the variable", () => {
+    const { result, exitCalls, banner } = run({
+      OIDC_BEARER_AUDIENCE: "studio-web",
+      NEXT_PUBLIC_AUTH_PROVIDER: "oidc",
+      OIDC_CLIENT_ID: "studio-web",
+    });
+    expect(result).toBe(false);
+    expect(exitCalls).toEqual([1]);
+    expect(banner).toContain("LibreDB Studio cannot start: OIDC_BEARER_AUDIENCE is invalid");
+    expect(banner).toContain("OIDC_BEARER_AUDIENCE must not equal OIDC_CLIENT_ID");
+  });
+
+  test("an audience without NEXT_PUBLIC_AUTH_PROVIDER=oidc stops the boot", () => {
+    const { result, exitCalls, banner } = run({
+      OIDC_BEARER_AUDIENCE: "studio-api",
+      NEXT_PUBLIC_AUTH_PROVIDER: "local",
+    });
+    expect(result).toBe(false);
+    expect(exitCalls).toEqual([1]);
+    expect(banner).toContain("bearer access tokens need NEXT_PUBLIC_AUTH_PROVIDER=oidc");
+  });
+
+  test("an unset audience, or a valid one under OIDC, lets the server boot", () => {
+    for (const audience of [undefined, "studio-api"]) {
+      const { result, exitCalls, banner } = run({
+        OIDC_BEARER_AUDIENCE: audience,
+        NEXT_PUBLIC_AUTH_PROVIDER: "oidc",
+        OIDC_CLIENT_ID: "studio-web",
+      });
+      expect(result).toBe(true);
+      expect(exitCalls).toEqual([]);
+      expect(banner).toBe("");
     }
   });
 });

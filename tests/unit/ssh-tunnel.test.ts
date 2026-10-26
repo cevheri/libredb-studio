@@ -1,6 +1,7 @@
 import "../setup";
 import { mock, describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { EventEmitter } from "events";
+import type { SSHTunnelConfig } from "@/lib/types";
 
 // --- Mock ssh2 Client ---
 // CI rests on this mock's FIDELITY to ssh2, and nothing here measures it. The handshake
@@ -15,9 +16,14 @@ class MockSSHClient extends EventEmitter {
   connectOptions: Record<string, unknown> | null = null;
   forwardOutCalls: Array<{ bindAddr: string; bindPort: number; host: string; port: number }> = [];
   ended = false;
+  /** What the tunnel last passed to `setNoDelay`, or undefined when it never called it. */
+  noDelay: boolean | undefined = undefined;
 
   connect(opts: Record<string, unknown>) {
     this.connectOptions = opts;
+    // ssh2 emits 'connect' once its TCP socket is up, before key exchange
+    // (node_modules/ssh2/lib/client.js, the socket's own 'connect' handler).
+    setTimeout(() => this.emit("connect"), 0);
     // Mirror ssh2's own handshake ordering: the verifier is called with the raw K_S blob
     // during key exchange, and returning false fails the handshake with exactly this
     // error (node_modules/ssh2/lib/protocol/kex.js: "Host denied (verification failed)").
@@ -41,6 +47,11 @@ class MockSSHClient extends EventEmitter {
     // Return a mock duplex stream
     const mockStream = new MockDuplexStream();
     cb(null, mockStream);
+  }
+
+  setNoDelay(noDelay: boolean) {
+    this.noDelay = noDelay;
+    return this;
   }
 
   end() {
@@ -129,6 +140,15 @@ const { createSSHTunnel, closeSSHTunnel, hasTunnel, getTunnelInfo, clearSSHHostK
   "@/lib/ssh/tunnel"
 );
 
+const BASTION: SSHTunnelConfig = {
+  enabled: true,
+  host: "bastion.example.com",
+  port: 22,
+  username: "admin",
+  authMethod: "password",
+  password: "pass",
+};
+
 // We need to clear the activeTunnels map between tests.
 // Since it's a module-level Map, we close tunnels in afterEach.
 let lastConnectionId: string | null = null;
@@ -177,6 +197,19 @@ describe("SSH Tunnel", () => {
         password: "secret123",
         hostVerifier: expect.any(Function),
       });
+    });
+
+    test("disables Nagle on the bastion socket once it connects", async () => {
+      // ssh2 1.17.0 never calls setNoDelay on the socket it dials. Under Node that put the
+      // 40 ms delayed-ACK stall on every small query through the tunnel: measured through
+      // Studio's query API against PostgreSQL behind OpenSSH, a SELECT 1 took a median
+      // 46 ms tunnelled against 3 ms direct.
+      const connId = "test-nodelay-" + Date.now();
+      lastConnectionId = connId;
+
+      await createSSHTunnel(connId, BASTION, "db.internal", 5432);
+
+      expect(mockSSHInstance.noDelay).toBe(true);
     });
 
     test("creates tunnel with privateKey auth", async () => {
@@ -260,41 +293,53 @@ describe("SSH Tunnel", () => {
       expect((mockSSHInstance.connectOptions as Record<string, unknown>)?.port).toBe(22);
     });
 
-    test("returns existing tunnel if already active", async () => {
+    // A pooled tunnel is keyed by the connection id AND the forward it was opened for -
+    // bastion route and far end (D86). Keyed by the id alone, the second provider on a live
+    // id was handed the forward the first one opened, whatever address it asked for, and
+    // nothing in `TunnelInfo` let the caller notice. The route half is driven in
+    // `tests/unit/lib/ssh/tunnel-pool-route.test.ts`.
+    test("returns the existing tunnel for the same connection id and the same far end", async () => {
       const connId = "test-cache-" + Date.now();
       lastConnectionId = connId;
 
-      const tunnel1 = await createSSHTunnel(
-        connId,
-        {
-          enabled: true,
-          host: "bastion.example.com",
-          port: 22,
-          username: "admin",
-          authMethod: "password",
-          password: "pass",
-        },
-        "db.internal",
-        5432,
-      );
+      const tunnel1 = await createSSHTunnel(connId, BASTION, "db.internal", 5432);
+      const tunnel2 = await createSSHTunnel(connId, BASTION, "db.internal", 5432);
 
-      const tunnel2 = await createSSHTunnel(
-        connId,
-        {
-          enabled: true,
-          host: "other-bastion.example.com",
-          port: 22,
-          username: "other",
-          authMethod: "password",
-          password: "other",
-        },
-        "other-db.internal",
-        3306,
-      );
-
-      // Should return the same cached tunnel
       expect(tunnel2).toBe(tunnel1);
       expect(tunnel2.localPort).toBe(tunnel1.localPort);
+    });
+
+    test("does not serve a pooled tunnel when the caller asks for a different far end", async () => {
+      const connId = "test-cache-other-far-end-" + Date.now();
+      lastConnectionId = connId;
+
+      const first = await createSSHTunnel(connId, BASTION, "db.internal", 5432);
+      const second = await createSSHTunnel(connId, BASTION, "other-db.internal", 3306);
+
+      expect(second).not.toBe(first);
+      expect(first.remoteHost).toBe("db.internal");
+      expect(first.remotePort).toBe(5432);
+      expect(second.remoteHost).toBe("other-db.internal");
+      expect(second.remotePort).toBe(3306);
+      // Both are pooled under the one id, and asking for either far end answers its own.
+      expect(getTunnelInfo(connId, { ssh: BASTION, farEnd: { host: "db.internal", port: 5432 } })).toBe(first);
+      expect(getTunnelInfo(connId, { ssh: BASTION, farEnd: { host: "other-db.internal", port: 3306 } })).toBe(second);
+      expect(hasTunnel(connId, { ssh: BASTION, farEnd: { host: "db.internal", port: 5432 } })).toBe(true);
+      expect(hasTunnel(connId, { ssh: BASTION, farEnd: { host: "third-db.internal", port: 5432 } })).toBe(false);
+    });
+
+    test("closing a connection id closes every far end pooled under it", async () => {
+      const connId = "test-close-all-far-ends-" + Date.now();
+
+      await createSSHTunnel(connId, BASTION, "db.internal", 5432);
+      await createSSHTunnel(connId, BASTION, "other-db.internal", 3306);
+      expect(hasTunnel(connId)).toBe(true);
+
+      await closeSSHTunnel(connId);
+
+      expect(hasTunnel(connId)).toBe(false);
+      expect(hasTunnel(connId, { ssh: BASTION, farEnd: { host: "db.internal", port: 5432 } })).toBe(false);
+      expect(hasTunnel(connId, { ssh: BASTION, farEnd: { host: "other-db.internal", port: 3306 } })).toBe(false);
     });
 
     // A one-shot tunnel (`shared: false`) is the transport for the routes that build a

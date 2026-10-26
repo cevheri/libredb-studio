@@ -2,14 +2,17 @@
 
 ## Supported Versions
 
-We actively support and provide security updates for the following versions of LibreDB Studio:
+<!-- No version number belongs in this section. A hardcoded minor here has no gate behind it:
+     nothing in CI reads it, so it silently rots every release and then reads as an abandoned
+     policy to the one auditor it exists for. State the rule instead; the releases page is the
+     source of truth. Pinned by tests/security/vulnerability-disclosure.test.ts. -->
 
-| Version  | Supported          |
-| -------- | ------------------ |
-| 0.10.x   | :white_check_mark: |
-| < 0.10.0 | :x:                |
+Security fixes are released against the **latest published release only**. There is no long-term
+support branch and no backport policy: if you are running an older version, the upgrade path to a
+fix is the current release.
 
-> **Note**: We recommend always using the latest version to ensure you have the most recent security patches.
+The releases page is the authority on what that currently is:
+<https://github.com/libredb/libredb-studio/releases>
 
 ## Reporting a Vulnerability
 
@@ -23,7 +26,7 @@ Instead, please report them via email to:
 
 **Email:** info@sekoya.tech
 
-Reports are handled by Sekoya Grup Bilişim ve Teknoloji Ltd. Şti., the
+Reports are handled by SEKOYA GRUP BİLİŞİM VE TEKNOLOJİ LİMİTED ŞİRKETİ, the
 maintainer of LibreDB Studio.
 
 ### What to Include
@@ -102,19 +105,26 @@ When using LibreDB Studio, please follow these security best practices:
 - Connection pooling is used to prevent connection exhaustion
 
 #### API Security
-- All API endpoints require authentication except `POST /api/auth/login`, `POST /api/auth/logout`,
-  `GET /api/auth/oidc/login`, `GET /api/auth/oidc/callback`, `GET /api/db/health` (for load
-  balancer probes), and `GET /api/storage/config` (which returns the storage mode only).
+- All API endpoints require authentication except `POST /api/auth/login`, `POST /api/auth/launch`, `POST /api/auth/passkey/sign-in`, `POST /api/auth/logout`,
+  `GET /api/auth/oidc/login`, `GET /api/auth/oidc/callback`, `GET /health`, `GET /api/health` and
+  `GET /api/db/health` (the three liveness paths, for load balancer probes; they depend on nothing
+  and return a fixed body), and `GET /api/storage/config` (which returns the storage mode only).
   `GET /api/auth/me` and `POST /api/db/health` each check for a session themselves and return 401
   without one, the same as every other endpoint.
 - Running arbitrary SQL against your connected database is the product's purpose, not an
   injection surface. Where the application builds SQL of its own — generated starter queries,
   schema browsing, inline cell edits — values are bound as parameters, and identifiers the
   application knows from schema metadata, column names and table names alike, are quoted for the
-  target dialect, since SQL has no parameter syntax for identifiers. The one identifier it infers
-  rather than knows — the table name behind an inline cell edit, read from a tab title or guessed
-  from the query text — is validated as a bare identifier instead, and the edit is refused when it
-  is not, because a guess cannot be safely quoted
+  target dialect, since SQL has no parameter syntax for identifiers. The one identifier it does not
+  read from schema metadata — the table behind an inline cell edit — is taken from the statement
+  that fetched the rows on screen, read under the connection's own dialect, and is refused
+  whenever that statement's rows have no single table or the reader cannot settle the name. An
+  unquoted name is validated as a bare identifier rather than quoted, because quoting changes its
+  case semantics; a quoted one is copied exactly as the query spells it. The key column the
+  `WHERE` is built on is inferred as well, from the result's own field names, so the apply asks
+  the engine whether that column addresses one row per value and refuses the whole apply when it
+  does not: a result carrying a foreign key instead of the table's own key made one cell edit
+  rewrite every row sharing that value
 - Login attempts, the AI endpoints and every database-reaching route (query execution, schema
   browsing, maintenance operations, and the admin fleet-health check) are rate limited in the
   application. The counters live in the application process, so with more than one replica the
@@ -181,8 +191,12 @@ When using LibreDB Studio, please follow these security best practices:
   risk has to be made again rather than inherited
 - The published container image is scanned daily and its findings are published
   to the Security tab. Most OS-package findings in any Debian-based image have no
-  fixed package available at the time they appear; the ones that do are taken by
-  bumping the base image
+  fixed package available at the time they appear, and those are reported rather
+  than gated. A CRITICAL one that does have a fix available fails the scan, so it
+  is taken by bumping the base image and cutting a release rather than carried
+  quietly; if the distribution has shipped the fix but the base image has not yet
+  picked it up, that wait is written down in `.trivyignore.yaml` with an expiry
+  like any other suppression
 - Every commit is scanned for credentials. The full history was swept once and
   classified: 24 matches across 753 commits, every one of them a fabricated test
   fixture, a documented example password or UI placeholder copy. **No credential
@@ -208,7 +222,34 @@ artefacts except the npm package. That runtime is the largest single binary in
 most of them, it is fetched by a shell script rather than resolved from a
 lockfile, and the SBOM's only `node`-named component is `pkg:npm/@types/node`, a
 type-declarations package with no relationship to the runtime that actually
-ships. This is a known gap, tracked in `docs/BACKLOG.md`.
+ships. This is a known gap. Until the SBOM covers it, the component is described
+by hand below so a reader of this document can still answer "which Node.js is
+inside, and where did it come from".
+
+#### Bundled Node.js runtime
+
+Maintained by hand, read from the two fetch scripts. `bun run test` fails if
+this table drifts from them.
+
+| | |
+| --- | --- |
+| Component | Node.js |
+| Version | **24.18.0** (Krypton LTS) |
+| Upstream | <https://nodejs.org/dist/v24.18.0/> |
+| Linux artefacts | `node-v24.18.0-linux-x64.tar.xz`, `node-v24.18.0-linux-arm64.tar.xz` |
+| Windows artefact | `node-v24.18.0-win-x64.zip` |
+| Fetched by | `packaging/linux/fetch-node.sh`, `packaging/windows/fetch-node.sh` |
+| Integrity | sha256, pinned in-repo in those scripts and verified after download |
+| Licence | MIT (Node.js), plus the licences of its own bundled dependencies |
+| Ships in | standalone tarballs, Windows zip, `.deb`, `.rpm`, snap, AppImage, desktop |
+| Does not ship in | the npm package, which uses the host's Node.js |
+
+The digests are pinned in the scripts rather than taken from the
+`SHASUMS256.txt` served alongside the download, so a compromised origin cannot
+supply a tampered tarball together with a matching checksum file. Both the
+version and the digests move together when the pin is bumped; `package.json`'s
+`engines.node` floor (`>=24.0.0`) is the lower bound the pin must stay at or
+above.
 
 Verify it:
 
@@ -233,9 +274,9 @@ trivy image --format cyclonedx --scanners license \
 ### Security Updates
 
 Security updates will be released as:
-- **Patch releases** (e.g., 0.5.4 → 0.5.5) for critical security fixes
-- **Minor releases** (e.g., 0.5.x → 0.6.0) for security improvements
-- **Security advisories** will be published in the GitHub Security tab
+- **Patch releases** for critical security fixes
+- **Minor releases** for security improvements
+- **Security advisories** published in the GitHub Security tab
 
 ### Security Audit
 

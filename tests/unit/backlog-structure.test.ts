@@ -18,12 +18,12 @@
  * listed are the sections present, each listed id exists, each range's endpoints are the real
  * extremes, and the trailing count is the real number of entries. The endpoints are checked as
  * extremes rather than as a canonical rendering because the file writes a prefix's entries as
- * `X2–X14` in one section and as bare ids in another, and both are legitimate. The examples in
+ * `X2–X12` in one section and as bare ids in another, and both are legitimate. The examples in
  * this file are illustrative rather than pinned: a closed entry changes them, so they are written
  * as shapes and the assertions derive the real ones from the document.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 
 const ROOT = path.resolve(import.meta.dir, "../..");
@@ -228,6 +228,11 @@ describe("every index line is derived from the entries it summarises", () => {
  * number of citations: that number falls every time an entry closes, and a floor under it would
  * become a floor under the backlog itself.
  *
+ * **The scan reads the index, not the disk** (#980). Drafts under the gitignored
+ * `docs/superpowers/` cite ids freely, and globbing the working tree turned them into failures on
+ * a maintainer's machine while CI, which checks out tracked files only, stayed green on the same
+ * commit. `gitTrackedFiles` carries the answer for the two shapes a missing git produces.
+ *
  * **The limit, stated rather than implied.** A THIRD form is not checked here and cannot be: the
  * bare parenthesised id, `(U22)`. 232 of those are in the tree and 47 distinct ids among them
  * name no live entry, but the shape is not the backlog's alone - `(S256)` is a PKCE
@@ -256,6 +261,57 @@ describe("no citation outlives the entry it names", () => {
   /** Which line a match index falls on, since a citation may not start on the line it names. */
   const lineOf = (text: string, index: number): number => text.slice(0, index).split("\n").length;
 
+  /**
+   * The index's answer, or `null` when git cannot give one (#980).
+   *
+   * The scan globbed the WORKING TREE, and `docs/superpowers/` is gitignored (`.gitignore:133`):
+   * a session's drafts sit on disk, cite ids freely, and are never in CI's checkout, so the same
+   * commit was red on a maintainer's machine and green in CI. The scan asks a question about the
+   * repository, so it enumerates the repository's files.
+   *
+   * Without git the previous, wider population is kept rather than an empty one: a wider scan can
+   * fail loudly, and an empty one passes vacuously, which is the failure this file exists
+   * against. The two shapes that reach it were measured in `build-azure-package.test.ts`: an
+   * absent binary makes `Bun.spawnSync` throw, and a git that runs but refuses exits non-zero.
+   */
+  /**
+   * A repository path with forward slashes, whichever separator it arrived with.
+   *
+   * `path.sep` is not enough: it is this platform's separator, so a POSIX
+   * machine leaves a backslash path alone and the mismatch this guards against
+   * is invisible there. Both separators are normalised so the comparison is the
+   * same on every platform, which is also what lets the test below stand in for
+   * Windows on a POSIX machine.
+   */
+  const toPosix = (file: string): string => file.replace(/\\/g, "/");
+
+  const gitTrackedFiles = (
+    run: (args: string[]) => {
+      readonly exitCode: number | null;
+      readonly stdout: { toString(): string };
+    } = (args) => Bun.spawnSync(["git", ...args], { cwd: ROOT, stdout: "pipe" }),
+  ): Set<string> | null => {
+    try {
+      const proc = run(["ls-files", "-z"]);
+      if (proc.exitCode !== 0) return null;
+      return new Set(
+        proc.stdout
+          .toString()
+          .split("\0")
+          .filter(Boolean)
+          // git reports POSIX separators on every platform; a glob reports the
+          // platform's own, so on Windows nothing would ever match.
+          .map(toPosix),
+      );
+    } catch {
+      return null;
+    }
+  };
+
+  /** Restrict a glob's output to the index's answer; `null` keeps the glob's own population. */
+  const trackedOnly = (files: readonly string[], tracked: ReadonlySet<string> | null): string[] =>
+    tracked === null ? [...files] : files.map(toPosix).filter((file) => tracked.has(file));
+
   const SCAN_ROOTS = [
     "src/**/*.{ts,tsx}",
     "tests/**/*.{ts,tsx}",
@@ -263,9 +319,11 @@ describe("no citation outlives the entry it names", () => {
     "scripts/**/*.mjs",
     ".github/**/*.yml",
   ];
-  const scanned = SCAN_ROOTS.flatMap((pattern) => [...new Bun.Glob(pattern).scanSync(ROOT)]).filter(
+  const globbed = SCAN_ROOTS.flatMap((pattern) => [...new Bun.Glob(pattern).scanSync(ROOT)]).filter(
     (file) => file !== BACKLOG_PATH,
   );
+  const tracked = gitTrackedFiles();
+  const scanned = trackedOnly(globbed, tracked);
 
   const present = new Set(sections.flatMap((section) => section.ids.map((entry) => entry.id)));
 
@@ -303,7 +361,8 @@ describe("no citation outlives the entry it names", () => {
 
   test("the scan reached the tree", () => {
     // A mistyped glob returns nothing, and an empty scan makes the assertion below pass for the
-    // wrong reason. The floor is on files in the repo, which does not shrink when an entry closes.
+    // wrong reason. The floor is on files in the repo, which does not shrink when an entry
+    // closes, and since #980 it counts the tracked population the scan actually reads.
     expect(scanned.length).toBeGreaterThan(200);
     expect(present.size).toBeGreaterThan(0);
   });
@@ -325,4 +384,210 @@ describe("no citation outlives the entry it names", () => {
     });
     expect([...dangling, ...asPr]).toEqual([]);
   });
+
+  test("a draft the index does not carry cannot reach the verdict", () => {
+    // #980: `docs/superpowers/` is gitignored, so a session's drafts sit on disk and are never in
+    // CI's checkout. Control first: the glob alone is what the old scan read...
+    const globbed = ["docs/AGENT.md", "docs/superpowers/draft.md"];
+    expect(globbed).toContain("docs/superpowers/draft.md");
+    // ...and the tracked answer drops it, without touching the file the index does carry.
+    expect(trackedOnly(globbed, new Set(["docs/AGENT.md"]))).toEqual(["docs/AGENT.md"]);
+  });
+
+  test("without git the scan keeps its previous population", () => {
+    // A courtesy for machines with no git. A wider population can fail loudly; an empty one
+    // passes vacuously, which is the failure this file exists against.
+    const globbed = ["docs/AGENT.md", "docs/superpowers/draft.md"];
+    expect(trackedOnly(globbed, null)).toEqual(globbed);
+  });
+
+  test("gitTrackedFiles answers both failure shapes with null, and reads the live index otherwise", () => {
+    expect(
+      gitTrackedFiles(() => {
+        throw new Error("git is not on PATH");
+      }),
+    ).toBeNull();
+    expect(gitTrackedFiles(() => ({ exitCode: 1, stdout: Buffer.from("") }))).toBeNull();
+    expect(gitTrackedFiles(() => ({ exitCode: 0, stdout: Buffer.from("src/a.ts\0tests/b.ts\0") }))).toEqual(
+      new Set(["src/a.ts", "tests/b.ts"]),
+    );
+    // The live answer: this file and the backlog are in the index, which is exactly what the
+    // without-git fallback would be missing on a machine that cannot ask.
+    const live = gitTrackedFiles();
+    expect(live).not.toBeNull();
+    expect(live?.has(BACKLOG_PATH)).toBe(true);
+    expect(live?.has("tests/unit/backlog-structure.test.ts")).toBe(true);
+  });
+
+  test("a Windows-shaped index still matches, and so does a Windows-shaped glob", () => {
+    // The failure this guards: git reports POSIX separators on every platform
+    // and a glob reports the platform's own, so on Windows `tracked.has(file)`
+    // was false for every file and the scan came back empty. CI's Windows leg
+    // caught it as `Expected: > 200, Received: 0`, and nothing on a POSIX
+    // machine could see it, which is what this case is for: the injected run
+    // stands in for the platform rather than for git.
+    const NUL = String.fromCharCode(0);
+    const windowsIndex = gitTrackedFiles(() => ({
+      exitCode: 0,
+      stdout: Buffer.from(["src\\a.ts", "tests\\unit\\b.ts", ""].join(NUL)),
+    }));
+    expect(windowsIndex).toEqual(new Set(["src/a.ts", "tests/unit/b.ts"]));
+    expect(trackedOnly(["src/a.ts", "tests/unit/b.ts"], windowsIndex)).toEqual(["src/a.ts", "tests/unit/b.ts"]);
+    // And a backslash-shaped glob against a POSIX index, the other half of the
+    // same mismatch.
+    const posixIndex = gitTrackedFiles(() => ({
+      exitCode: 0,
+      stdout: Buffer.from(["tests/b.ts", ""].join(NUL)),
+    }));
+    expect(trackedOnly(["tests\\b.ts"], posixIndex)).toEqual(["tests/b.ts"]);
+    expect(toPosix("tests\\unit\\b.ts")).toBe("tests/unit/b.ts");
+    expect(toPosix("tests/unit/b.ts")).toBe("tests/unit/b.ts");
+  });
+});
+
+/**
+ * A `grep` command an entry PRINTS is a claim, and it has to answer what the entry says it answers.
+ *
+ * `X15` shipped the sentence "`grep -rn 'role="tabpanel"' src/` now returns exactly one hit,
+ * `src/components/object-source/ObjectSourceView.tsx:347`". The FACT was true: that file carries the
+ * only `tabpanel` role in the tree and neither shell carries one. The COMMAND was false, and by two
+ * characters: the role is written as an object property, `{ role: "tabpanel", ... }`, not as a JSX
+ * attribute, so the quoted form matches zero lines. Whoever ran the printed command got nothing and
+ * had to decide whether the entry or the tree was wrong. That is the dead-pointer failure the
+ * citation guard above exists to prevent, one level down: the pointer resolves and the BASIS does
+ * not, and the whole purpose of that sentence was to hand the next reader a re-runnable basis.
+ *
+ * So every backticked `grep` in the file is executed here, from the repository root, and its hit
+ * count is compared with the outcome the sentence states. The accepted phrasings are a closed set on
+ * purpose - "returns nothing", "returns exactly one hit", "returns exactly N hits" - and a command
+ * followed by anything else fails BY NAME rather than being skipped, because a claim nothing checks
+ * is the shape this whole file was written against.
+ *
+ * What this deliberately does NOT check: the `file:line` an entry names beside a single hit. That
+ * would tie the backlog to a line number in a file it does not own, so an unrelated edit one line
+ * above would turn this red, and a guard that cries wolf is a guard people learn to skip. The
+ * reviewer verified that location by hand and so did I; what a machine holds from here is the count.
+ */
+describe("a quoted grep command answers what the entry says it answers", () => {
+  /** The command span, plus the prose up to the next code span, which is where the outcome is. */
+  const CLAIM = /`(grep [^`]+)`([^`]{0,200})/g;
+  /** `grep -rn 'pattern' path [path...]`: the only shape this guard knows how to run. */
+  const SHAPE = /^grep (-[a-zA-Z]+) '([^']+)' (\S+(?: +\S+)*)$/;
+  /** The closed set of outcomes. `nothing`, `no hit` and `no hits` are the same zero. */
+  const OUTCOME = /^[\s,;:]*(?:now |still )?returns (nothing|no hits?|exactly one hit|exactly \d+ hits)\b/;
+
+  const expectedHits = (prose: string): number | null => {
+    const match = OUTCOME.exec(prose.replace(/\s+/g, " "));
+    if (match === null) return null;
+    if (match[1] === "exactly one hit") return 1;
+    const counted = /^exactly (\d+) hits$/.exec(match[1]);
+    return counted === null ? 0 : Number(counted[1]);
+  };
+
+  /** Its own copy rather than the citation guard's, so that guard is not edited to share it. */
+  const lineAt = (index: number): number => BACKLOG.slice(0, index).split("\n").length;
+
+  const claims = [...BACKLOG.matchAll(CLAIM)].map((match) => ({
+    command: match[1],
+    prose: match[2],
+    where: `${BACKLOG_PATH}:${lineAt(match.index)}`,
+  }));
+
+  /**
+   * Every file `grep -r` would read under this path, relative to ROOT.
+   *
+   * A symlink met inside the tree is skipped, which is what `-r` does (only `-R` follows one), and
+   * the WORKING TREE is what is walked rather than the index: entries cite paths that are
+   * gitignored, so a tracked-files listing would answer a different question.
+   */
+  const filesUnder = (target: string): string[] => {
+    if (!statSync(path.join(ROOT, target)).isDirectory()) return [target];
+    return readdirSync(path.join(ROOT, target), { withFileTypes: true }).flatMap((child) => {
+      if (child.isDirectory()) return filesUnder(`${target}/${child.name}`);
+      return child.isFile() ? [`${target}/${child.name}`] : [];
+    });
+  };
+
+  /**
+   * The quoted pattern as a JS regex.
+   *
+   * grep reads a POSIX BASIC regular expression, where `+ ? | ( ) { }` are literal characters and
+   * JS reads every one of them as syntax - so handing the raw pattern to `new RegExp` would answer
+   * a different question than the sentence claims. Backslash escapes and bracket expressions are
+   * not translated at all: a command that uses one fails by name here rather than being run under
+   * the wrong dialect, which is the same discipline as the SHAPE above.
+   */
+  const toRegExp = (pattern: string): RegExp => {
+    if (/[\\[]/.test(pattern)) {
+      throw new Error(
+        `${BACKLOG_PATH} quotes a grep whose pattern this guard does not translate ` +
+          `(no backslash escapes, no bracket expressions): ${pattern}`,
+      );
+    }
+    // The backslash is in the escape class as well, although the refusal above means one
+    // never reaches this line: a translation that escapes some metacharacters and not the
+    // escape character itself is only correct while its caller is, and this one should be
+    // correct on its own terms. `. * ^ $` are deliberately NOT escaped: BRE and JS read
+    // those the same way, so escaping them would change the question the entry asks.
+    return new RegExp(pattern.replaceAll(/[\\+?|(){}]/g, "\\$&"));
+  };
+
+  /**
+   * The command, run in process.
+   *
+   * It used to be `Bun.spawnSync(["grep", ...])`, which made the whole guard depend on a binary a
+   * PowerShell session does not have - Git for Windows keeps grep.exe in usr\bin, which is not on
+   * that PATH - and `Bun.spawnSync` THROWS there ("Executable not found in $PATH", measured in this
+   * worktree) rather than returning a non-zero exit code, so every claim test died at the first
+   * command. Searching here also removes the GNU/BSD divergence for any flag a future entry uses.
+   */
+  const run = (command: string): number => {
+    const shape = SHAPE.exec(command);
+    if (shape === null) throw new Error(`${BACKLOG_PATH} quotes a grep this guard cannot run: ${command}`);
+    // -n counts matched LINES and -l counts matched FILES; anything else (a -i, a non-recursive
+    // grep over a directory) would need its own modelling, so it is refused instead of guessed.
+    if (!/^-r[nl]$/.test(shape[1])) {
+      throw new Error(`${BACKLOG_PATH} quotes a grep with flags this guard does not model: ${command}`);
+    }
+    const pattern = toRegExp(shape[2]);
+    let hits = 0;
+    for (const file of shape[3].split(/ +/).flatMap(filesUnder)) {
+      const lines = readFileSync(path.join(ROOT, file), "utf8").split("\n");
+      // A trailing newline ends the last line, it does not start an empty one.
+      if (lines.at(-1) === "") lines.pop();
+      const matched = lines.filter((line) => pattern.test(line)).length;
+      hits += shape[1].includes("l") ? Math.min(matched, 1) : matched;
+    }
+    return hits;
+  };
+
+  test("the extractor found every grep the file quotes", () => {
+    // test.each over an empty list registers no test at all, so the parse is pinned against the
+    // raw text first. The pin counts every `grep -` in the document rather than every backticked
+    // one, so a command written in a fenced block, or with no backticks at all, is a failure here
+    // rather than a claim that quietly escapes the check. `grepping` in prose is not one.
+    expect(claims.length).toBe([...BACKLOG.matchAll(/grep -/g)].length);
+    expect(claims.length).toBeGreaterThan(0);
+  });
+
+  test("the runner counts what grep counts", () => {
+    // Paired controls. A runner that always answers zero would make every "returns nothing" claim
+    // pass, and one that always answers the same number would make every count claim pass.
+    expect(run(`grep -rn 'Every ID is unique across the whole file' ${BACKLOG_PATH}`)).toBe(1);
+    expect(run("grep -rn 'no-such-string-in-this-repository-8f3a' src/")).toBe(0);
+  });
+
+  test.each(claims.map((claim) => [claim.where, claim] as const))(
+    "the grep quoted at %s answers what the entry says",
+    (where, claim) => {
+      const expected = expectedHits(claim.prose);
+      if (expected === null) {
+        throw new Error(
+          `${where} quotes \`${claim.command}\` and states no outcome this guard can check. ` +
+            `Follow it with "returns nothing", "returns exactly one hit" or "returns exactly N hits".`,
+        );
+      }
+      expect(run(claim.command)).toBe(expected);
+    },
+  );
 });

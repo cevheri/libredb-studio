@@ -1,15 +1,21 @@
-import { describe, test, expect, mock, beforeEach } from "bun:test";
+import { describe, test, expect, mock, beforeEach, afterEach, spyOn } from "bun:test";
 import { createMockRequest, parseResponseJSON } from "../../helpers/mock-next";
 import { createMockProvider } from "../../helpers/mock-provider";
-import { DatabaseConfigError } from "@/lib/db/errors";
+import { DatabaseConfigError, TimeoutError } from "@/lib/db/errors";
+import { TransportError } from "@/lib/db/http/node-transport";
 import { clearRateLimitState } from "@/lib/api/rate-limit";
+import { logger } from "@/lib/logger";
+import type { QueryWarning } from "@/lib/types";
 
 // ─── Create mock objects ────────────────────────────────────────────────────
 const mockProvider = createMockProvider();
-const mockCreateDatabaseProvider = mock(async (connection?: unknown) => {
-  // The parameter is declared so `mock.calls` carries the connection the route built the
-  // provider from - that argument is what proves the SSH tunnel endpoint was used (#457).
+const mockCreateDatabaseProvider = mock(async (connection?: unknown, options?: unknown, execution?: unknown) => {
+  // The parameters are declared so `mock.calls` carries what the route built the provider from:
+  // the connection proves the SSH tunnel endpoint was used (#457), and the execution context
+  // proves which file-access posture the handle opens under (non-admin DuckDB file access).
   void connection;
+  void options;
+  void execution;
   return mockProvider;
 });
 
@@ -18,7 +24,13 @@ const mockCreateDatabaseProvider = mock(async (connection?: unknown) => {
  * (#498). Null by default: every engine but LibreDB is in that state.
  */
 const borrowedProvider = createMockProvider();
-const mockFindOpenSingleWriterProvider = mock((): unknown => null);
+const mockFindOpenSingleWriterProvider = mock((connection?: unknown, allowExternalFileAccess?: boolean): unknown => {
+  void connection;
+  void allowExternalFileAccess;
+  return null;
+});
+/** Whether a handle of ANY file-access posture holds the file (non-admin DuckDB file access). False by default. */
+const mockIsSingleWriterFileOpen = mock((): boolean => false);
 
 const mockGetSession = mock(
   async (): Promise<{ role: string; username: string } | null> => ({ role: "admin", username: "admin" }),
@@ -27,6 +39,10 @@ const mockGetSession = mock(
 // ─── Mock auth + seed resolution BEFORE importing route ─────────────────────
 mock.module("@/lib/auth", () => ({
   getSession: mockGetSession,
+  readSession: mock(async () => {
+    const s = await mockGetSession();
+    return s ? { kind: "authenticated", session: s } : { kind: "anonymous" };
+  }),
   signJWT: mock(async () => "mock-token"),
   verifyJWT: mock(async () => null),
   login: mock(async () => {}),
@@ -74,6 +90,7 @@ const mockWithOneShotTunnel = mock(
 mock.module("@/lib/db/factory", () => ({
   createDatabaseProvider: mockCreateDatabaseProvider,
   findOpenSingleWriterProvider: mockFindOpenSingleWriterProvider,
+  isSingleWriterFileOpen: mockIsSingleWriterFileOpen,
   withOneShotTunnel: mockWithOneShotTunnel,
   getOrCreateProvider: mock(async () => mockProvider),
   removeProvider: mock(async () => {}),
@@ -106,6 +123,8 @@ describe("POST /api/db/test-connection", () => {
     (mockProvider.getHealth as ReturnType<typeof mock>).mockClear();
     mockFindOpenSingleWriterProvider.mockClear();
     mockFindOpenSingleWriterProvider.mockImplementation(() => null);
+    mockIsSingleWriterFileOpen.mockClear();
+    mockIsSingleWriterFileOpen.mockImplementation(() => false);
     for (const method of ["connect", "disconnect", "getHealth"] as const) {
       (borrowedProvider[method] as ReturnType<typeof mock>).mockClear();
     }
@@ -162,6 +181,282 @@ describe("POST /api/db/test-connection", () => {
     expect(data.success).toBe(true);
     expect(data.message).toBe("Connection successful");
     expect(typeof data.latency).toBe("number");
+    // A provider that reports no connect cautions adds no key to the answer.
+    expect("warnings" in data).toBe(false);
+  });
+
+  describe("what the server cautioned while the connection opened (#1401)", () => {
+    // Materialize v26.44.1's own startup NOTICE, measured 2026-10-04.
+    const caution = { message: 'session database "nosuchdb" does not exist', code: "MZ004", severity: "NOTICE" };
+    const withCautions = mockProvider as typeof mockProvider & { connectWarnings?: () => unknown[] };
+
+    afterEach(() => {
+      delete withCautions.connectWarnings;
+    });
+
+    test("rides along with a successful answer", async () => {
+      withCautions.connectWarnings = () => [caution];
+      const res = await POST(
+        createMockRequest("/api/db/test-connection", { method: "POST", body: validConnection }) as never,
+      );
+      const data = await parseResponseJSON<{ success: boolean; warnings?: unknown[] }>(res);
+
+      expect(data.success).toBe(true);
+      expect(data.warnings).toEqual([caution]);
+    });
+
+    test("rides along with a degraded answer too", async () => {
+      withCautions.connectWarnings = () => [caution];
+      (mockProvider.getHealth as ReturnType<typeof mock>).mockImplementation(async () => {
+        throw new Error("no health here");
+      });
+      const res = await POST(
+        createMockRequest("/api/db/test-connection", { method: "POST", body: validConnection }) as never,
+      );
+      const data = await parseResponseJSON<{ degraded?: boolean; warnings?: unknown[] }>(res);
+
+      expect(data.degraded).toBe(true);
+      expect(data.warnings).toEqual([caution]);
+    });
+
+    test("is left out when the provider has the channel and the server said nothing", async () => {
+      withCautions.connectWarnings = () => [];
+      const res = await POST(
+        createMockRequest("/api/db/test-connection", { method: "POST", body: validConnection }) as never,
+      );
+      expect("warnings" in (await parseResponseJSON<Record<string, unknown>>(res))).toBe(false);
+    });
+  });
+
+  describe("the extra checks a provider runs only on Test Connection", () => {
+    // Shapes, not any engine's words: the route carries whatever the provider hands it.
+    const connectCaution = { message: "a fact connect() learned" };
+    const probeCaution = { message: "a fact only a Test Connection probe finds" };
+    const probing = mockProvider as typeof mockProvider & {
+      connectWarnings?: () => QueryWarning[];
+      testConnectionWarnings?: () => Promise<QueryWarning[]>;
+    };
+    const lending = borrowedProvider as typeof borrowedProvider & {
+      testConnectionWarnings?: () => Promise<QueryWarning[]>;
+    };
+    const CHECKS_DID_NOT_FINISH =
+      "The extra checks Test Connection runs for this connection did not finish, so a caution they would give may be missing.";
+    const post = async () =>
+      parseResponseJSON<{
+        success: boolean;
+        degraded?: boolean;
+        message: string;
+        latency?: number;
+        warnings?: unknown[];
+      }>(await POST(createMockRequest("/api/db/test-connection", { method: "POST", body: validConnection }) as never));
+    // A rejection is logged; the spy keeps that log out of the run's output and is restored
+    // even when an assertion fails.
+    let logged: ReturnType<typeof spyOn<typeof logger, "error">>;
+
+    beforeEach(() => {
+      logged = spyOn(logger, "error").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      logged.mockRestore();
+      delete probing.connectWarnings;
+      delete probing.testConnectionWarnings;
+      delete lending.testConnectionWarnings;
+    });
+
+    test("appends its cautions after connectWarnings()'s, on a successful answer", async () => {
+      probing.connectWarnings = () => [connectCaution];
+      probing.testConnectionWarnings = async () => [probeCaution];
+
+      const data = await post();
+
+      expect(data.success).toBe(true);
+      expect(data.message).toBe("Connection successful");
+      expect(data.warnings).toEqual([connectCaution, probeCaution]);
+    });
+
+    test("runs after connect() and connectWarnings() and before getHealth(), once", async () => {
+      const order: string[] = [];
+      (mockProvider.connect as ReturnType<typeof mock>).mockImplementation(async () => {
+        order.push("connect");
+      });
+      probing.connectWarnings = () => {
+        order.push("connectWarnings");
+        return [];
+      };
+      probing.testConnectionWarnings = async () => {
+        order.push("testConnectionWarnings");
+        return [];
+      };
+      (mockProvider.getHealth as ReturnType<typeof mock>).mockImplementation(async () => {
+        order.push("getHealth");
+        return {
+          activeConnections: 1,
+          databaseSize: "1 KB",
+          cacheHitRatio: "N/A",
+          slowQueries: [],
+          activeSessions: [],
+        };
+      });
+
+      await post();
+
+      expect(order).toEqual(["connect", "connectWarnings", "testConnectionWarnings", "getHealth"]);
+    });
+
+    test("a method that finds nothing adds no warnings key, so the dialog stays green", async () => {
+      probing.connectWarnings = () => [];
+      probing.testConnectionWarnings = async () => [];
+
+      const data = await post();
+
+      expect(data.success).toBe(true);
+      expect("warnings" in data).toBe(false);
+    });
+
+    test("its cautions alone make the warnings key, with no connectWarnings() declared", async () => {
+      probing.testConnectionWarnings = async () => [probeCaution];
+
+      expect((await post()).warnings).toEqual([probeCaution]);
+    });
+
+    test("its cautions ride along with a degraded answer too", async () => {
+      probing.connectWarnings = () => [connectCaution];
+      probing.testConnectionWarnings = async () => [probeCaution];
+      (mockProvider.getHealth as ReturnType<typeof mock>).mockImplementation(async () => {
+        throw new Error("no health here");
+      });
+
+      const data = await post();
+
+      expect(data.success).toBe(true);
+      expect(data.degraded).toBe(true);
+      expect(data.warnings).toEqual([connectCaution, probeCaution]);
+    });
+
+    test("a rejection becomes one caution of the route's own and the connection still counts as tested", async () => {
+      probing.connectWarnings = () => [connectCaution];
+      probing.testConnectionWarnings = async () => {
+        throw new Error("socket hang up at 10.0.0.7:8443");
+      };
+
+      const data = await post();
+
+      expect(data.success).toBe(true);
+      expect(data.message).toBe("Connection successful");
+      expect(typeof data.latency).toBe("number");
+      // The route's own sentence, never the thrown text: a rejection here is a provider
+      // defect, and its message is not a caution the provider chose to show.
+      expect(data.warnings).toEqual([connectCaution, { message: CHECKS_DID_NOT_FINISH }]);
+      expect(JSON.stringify(data)).not.toContain("socket hang up");
+      expect(mockProvider.getHealth).toHaveBeenCalledTimes(1);
+      expect(mockProvider.disconnect).toHaveBeenCalledTimes(1);
+      // The log is the only place the thrown text survives, and it carries no connection field.
+      expect(logged).toHaveBeenCalledTimes(1);
+      expect(logged.mock.calls[0][0]).toBe("Test Connection checks rejected");
+      expect(logged.mock.calls[0][2]).toEqual({ route: "api/db/test-connection", provider: mockProvider.type });
+    });
+
+    test("a rejection with a non-Error is the same one caution", async () => {
+      probing.testConnectionWarnings = () => Promise.reject("not an Error");
+
+      const data = await post();
+
+      expect(data.success).toBe(true);
+      expect(data.warnings).toEqual([{ message: CHECKS_DID_NOT_FINISH }]);
+    });
+
+    test("a resolution that is not an array is the same one caution, not a failed test", async () => {
+      // The published type forbids it, but a JavaScript implementer or a cast can still resolve
+      // undefined; spreading it would throw outside the method's try and turn a connection that
+      // connected into a 500.
+      probing.testConnectionWarnings = async () => undefined as unknown as QueryWarning[];
+
+      const data = await post();
+
+      expect(data.success).toBe(true);
+      expect(data.message).toBe("Connection successful");
+      expect(data.warnings).toEqual([{ message: CHECKS_DID_NOT_FINISH }]);
+      expect(logged).toHaveBeenCalledTimes(1);
+      expect(logged.mock.calls[0][2]).toEqual({ route: "api/db/test-connection", provider: mockProvider.type });
+    });
+
+    test.each([
+      ["null", null],
+      ["a single caution object", { message: "one caution, not a list" }],
+    ])("a resolution of %s is the same one caution, after connectWarnings()'s", async (_, resolved) => {
+      probing.connectWarnings = () => [connectCaution];
+      probing.testConnectionWarnings = async () => resolved as unknown as QueryWarning[];
+
+      const data = await post();
+
+      expect(data.success).toBe(true);
+      expect(data.warnings).toEqual([connectCaution, { message: CHECKS_DID_NOT_FINISH }]);
+      expect(logged).toHaveBeenCalledTimes(1);
+    });
+
+    test("a rejection followed by a failed health read is a degraded success carrying the caution", async () => {
+      probing.testConnectionWarnings = async () => {
+        throw new Error("probe failed");
+      };
+      (mockProvider.getHealth as ReturnType<typeof mock>).mockImplementation(async () => {
+        throw new Error("no health here");
+      });
+
+      const data = await post();
+
+      expect(data.success).toBe(true);
+      expect(data.degraded).toBe(true);
+      expect(data.warnings).toEqual([{ message: CHECKS_DID_NOT_FINISH }]);
+      expect(mockProvider.disconnect).toHaveBeenCalledTimes(1);
+    });
+
+    test("is never called when connect() fails", async () => {
+      const probe = mock(async () => [probeCaution]);
+      probing.testConnectionWarnings = probe;
+      (mockProvider.connect as ReturnType<typeof mock>).mockImplementation(async () => {
+        throw new Error("ECONNREFUSED");
+      });
+
+      const res = await POST(
+        createMockRequest("/api/db/test-connection", { method: "POST", body: validConnection }) as never,
+      );
+
+      expect(res.status).toBe(500);
+      expect(probe).not.toHaveBeenCalled();
+    });
+
+    test("is never called on a borrowed provider, which is not this route's fresh one", async () => {
+      // The live handle of a single-writer file is the editor's own session, not a provider
+      // this click built, so its probes are not this route's to run.
+      mockFindOpenSingleWriterProvider.mockImplementation(() => borrowedProvider);
+      const probe = mock(async () => [probeCaution]);
+      lending.testConnectionWarnings = probe;
+
+      const data = await parseResponseJSON<{ success: boolean; warnings?: unknown[] }>(
+        await POST(
+          createMockRequest("/api/db/test-connection", {
+            method: "POST",
+            body: { ...validConnection, type: "libredb", database: "/data/sample.libredb" },
+          }) as never,
+        ),
+      );
+
+      expect(data.success).toBe(true);
+      expect(probe).not.toHaveBeenCalled();
+      expect("warnings" in data).toBe(false);
+    });
+
+    test("a provider without the method answers exactly as before", async () => {
+      const data = await post();
+
+      expect(data.success).toBe(true);
+      expect(data.message).toBe("Connection successful");
+      expect("warnings" in data).toBe(false);
+      expect(mockProvider.connect).toHaveBeenCalledTimes(1);
+      expect(mockProvider.getHealth).toHaveBeenCalledTimes(1);
+      expect(mockProvider.disconnect).toHaveBeenCalledTimes(1);
+    });
   });
 
   test("returns 400 when connection type is missing", async () => {
@@ -224,6 +519,40 @@ describe("POST /api/db/test-connection", () => {
     expect(res.status).toBe(500);
     expect(data.error).toBe("ECONNREFUSED");
     expect(data.code).toBe("INTERNAL_ERROR");
+  });
+
+  describe("a server that never answers", () => {
+    const post = async () => {
+      const res = await POST(
+        createMockRequest("/api/db/test-connection", { method: "POST", body: validConnection }) as never,
+      );
+      return { res, data: await parseResponseJSON<{ error: string; code: string; retryable?: boolean }>(res) };
+    };
+
+    test("a connect that never completed answers 503 with the host, port and seconds, never a query", async () => {
+      const sentence =
+        "No answer from 10.255.255.1:6443 after 10 seconds: check the address, the port and the network path.";
+      (mockProvider.connect as ReturnType<typeof mock>).mockImplementation(async () => {
+        throw new TransportError("unreachable", sentence);
+      });
+      const { res, data } = await post();
+      expect(res.status).toBe(503);
+      expect(data.error).toBe(sentence);
+      expect(data.code).toBe("CONNECTION_ERROR");
+    });
+
+    test("a deadline in the connect answers 503 with the connection's sentence, which a browser does not resend", async () => {
+      (mockProvider.connect as ReturnType<typeof mock>).mockImplementation(async () => {
+        throw new TimeoutError("The API server did not answer the request within 10 s.", "kubernetes", 10000);
+      });
+      const { res, data } = await post();
+      expect(res.status).toBe(503);
+      expect(data.error).toMatch(
+        /^The connection got no answer after \d+(?:\.\d)? seconds?: check the address, the port, the network path and that the server is running\.$/,
+      );
+      expect(data.error.toLowerCase()).not.toContain("query");
+      expect(data.code).toBe("CONNECTION_ERROR");
+    });
   });
 
   /*
@@ -459,5 +788,72 @@ describe("POST /api/db/test-connection", () => {
     expect(mockCreateDatabaseProvider).toHaveBeenCalledTimes(1);
     expect(mockProvider.connect).toHaveBeenCalledTimes(1);
     expect(mockProvider.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  // Since the non-admin DuckDB file-access change, a DuckDB handle is borrowed only under the
+  // caller's own posture, so a file can be open under the OTHER posture with nothing to borrow. A
+  // second read-write handle there checkpoints its own view over the file when it closes; the test
+  // handle opens read-only.
+
+  test("opens its own handle read-only when a handle of the other posture holds the file", async () => {
+    mockIsSingleWriterFileOpen.mockImplementation(() => true);
+
+    const req = createMockRequest("/api/db/test-connection", {
+      method: "POST",
+      body: { ...validConnection, type: "duckdb", database: "/data/held.duckdb" },
+    });
+
+    const data = await parseResponseJSON<{ success: boolean }>(await POST(req as never));
+
+    expect(data.success).toBe(true);
+    expect(mockCreateDatabaseProvider).toHaveBeenCalledTimes(1);
+    expect(mockCreateDatabaseProvider.mock.calls[0]).toEqual([
+      expect.objectContaining({ type: "duckdb", database: "/data/held.duckdb" }),
+      { queryTimeout: 10000 },
+      { readOnly: true },
+    ]);
+    // Still this route's own handle, so it is still closed.
+    expect(mockProvider.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  test("opens its own handle under the caller's posture when nothing holds the file", async () => {
+    const req = createMockRequest("/api/db/test-connection", {
+      method: "POST",
+      body: { ...validConnection, type: "duckdb", database: "/data/free.duckdb" },
+    });
+
+    await POST(req as never);
+
+    // The admin session of this file, on an inline connection: the requester decides.
+    expect(mockCreateDatabaseProvider.mock.calls[0]?.[2]).toEqual({ allowExternalFileAccess: true });
+    expect(mockFindOpenSingleWriterProvider.mock.calls[0]).toEqual([
+      expect.objectContaining({ database: "/data/free.duckdb" }),
+      true,
+    ]);
+  });
+});
+
+// A JSON `null` body or one that is not JSON at all answered 500 INTERNAL_ERROR with the runtime's own text ("null is not an object (evaluating 'body.connectionId')").
+// Any body that is not a JSON object is the caller's malformed request, answered before any connection resolves.
+describe("POST /api/db/test-connection: a body that is not a JSON object", () => {
+  test.each<[string, string]>([
+    ["null", "null"],
+    ["an array", "[]"],
+    ["a number", "7"],
+    ["a string", '"x"'],
+    ["text that is not JSON", "{not json"],
+  ])("a body that is %s answers 400 and opens no provider", async (_label, raw) => {
+    mockCreateDatabaseProvider.mockClear();
+    const res = await POST(
+      new Request("http://localhost:3000/api/db/test-connection", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: raw,
+      }) as never,
+    );
+
+    expect(res.status).toBe(400);
+    expect(await parseResponseJSON(res)).toEqual({ success: false, error: "Invalid request body" });
+    expect(mockCreateDatabaseProvider).not.toHaveBeenCalled();
   });
 });

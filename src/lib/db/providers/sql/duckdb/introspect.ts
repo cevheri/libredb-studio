@@ -34,7 +34,6 @@ import type {
   IndexStats,
   SlowQueryStats,
   StorageStats,
-  TableSchema,
   TableStats,
 } from "@/lib/db/types";
 import { formatBytes } from "@/lib/db/utils/pool-manager";
@@ -121,7 +120,7 @@ const DATABASE_PATH_SQL = `SELECT path FROM duckdb_databases()
 // ============================================================================
 
 /**
- * Every 64-bit column arrives as a decimal STRING through `getRowObjectsJson()`, which
+ * Every 64-bit column arrives as a decimal STRING through `getRowsJson()`, which
  * is why the numeric fields below are typed `unknown` and read through `readCount`
  * rather than typed `number` and trusted.
  */
@@ -129,24 +128,6 @@ interface TableRow {
   schema_name: string;
   table_name: string;
   estimated_size: unknown;
-}
-
-interface ColumnRow {
-  schema_name: string;
-  table_name: string;
-  column_name: string;
-  data_type: string;
-  is_nullable: boolean;
-  column_default: string | null;
-}
-
-interface ConstraintRow {
-  schema_name: string;
-  table_name: string;
-  constraint_type: string;
-  constraint_column_names: string[];
-  referenced_table: string | null;
-  referenced_column_names: string[];
 }
 
 interface IndexRow {
@@ -278,106 +259,6 @@ async function readRowCounts(
 // Schema
 // ============================================================================
 
-/**
- * The full object tree: tables and views, with columns, primary keys, foreign keys and
- * indexes attached.
- *
- * Five catalog reads plus ONE counting statement, and no per-object sweep. The count is
- * `count(*)` and never `estimated_size`, which is an estimate a DELETE leaves wrong -
- * DuckDB answers `count(*)` out of row-group metadata, so a whole catalog is counted in
- * one statement in milliseconds (see `readRowCounts`).
- *
- * Views appear with their columns and no row count: `duckdb_views()` publishes no
- * cardinality and counting one would mean running it.
- */
-export async function readSchema(client: DuckDBClient): Promise<TableSchema[]> {
-  const [tables, views, columns, constraints, indexes] = await Promise.all([
-    client.run(TABLES_SQL),
-    client.run(VIEWS_SQL),
-    client.run(COLUMNS_SQL),
-    client.run(CONSTRAINTS_SQL),
-    client.run(INDEXES_SQL),
-  ]);
-
-  const rowCounts = await readRowCounts(client, tables.rows as unknown as TableRow[]);
-
-  const primaryKeys = new Map<string, Set<string>>();
-  const foreignKeys = new Map<string, TableSchema["foreignKeys"]>();
-  for (const row of constraints.rows as unknown as ConstraintRow[]) {
-    const id = tableKey(row.schema_name, row.table_name);
-    if (row.constraint_type === "PRIMARY KEY") {
-      primaryKeys.set(id, new Set(row.constraint_column_names));
-      continue;
-    }
-    // A composite foreign key is one constraint over several columns; the product's
-    // `ForeignKeySchema` is per column, so the pairs are zipped out.
-    const existing = foreignKeys.get(id) ?? [];
-    row.constraint_column_names.forEach((columnName, index) => {
-      existing.push({
-        columnName,
-        // Spelled exactly as the tree node it points at. DuckDB refuses a foreign key
-        // across schemas ("Binder Error: Creating foreign keys across different schemas
-        // or catalogs is not supported", measured), so the target lives in the
-        // constraint's own schema - and the bare name would link a non-default schema's
-        // foreign key to a same-named table in `main`.
-        referencedTable: row.referenced_table === null ? "" : displayName(row.schema_name, row.referenced_table),
-        referencedColumn: row.referenced_column_names[index] ?? "",
-      });
-    });
-    foreignKeys.set(id, existing);
-  }
-
-  const indexesByTable = new Map<string, TableSchema["indexes"]>();
-  for (const row of indexes.rows as unknown as IndexRow[]) {
-    const id = tableKey(row.schema_name, row.table_name);
-    const existing = indexesByTable.get(id) ?? [];
-    existing.push({ name: row.index_name, columns: row.index_columns ?? [], unique: row.is_unique });
-    indexesByTable.set(id, existing);
-  }
-
-  const columnsByTable = new Map<string, TableSchema["columns"]>();
-  for (const row of columns.rows as unknown as ColumnRow[]) {
-    const id = tableKey(row.schema_name, row.table_name);
-    const existing = columnsByTable.get(id) ?? [];
-    existing.push({
-      name: row.column_name,
-      type: row.data_type,
-      nullable: row.is_nullable,
-      isPrimary: primaryKeys.get(id)?.has(row.column_name) === true,
-      ...(row.column_default === null ? {} : { defaultValue: row.column_default }),
-    });
-    columnsByTable.set(id, existing);
-  }
-
-  const schemas: TableSchema[] = [];
-
-  for (const row of tables.rows as unknown as TableRow[]) {
-    const id = tableKey(row.schema_name, row.table_name);
-    const rowCount = rowCounts.get(id);
-    schemas.push({
-      name: displayName(row.schema_name, row.table_name),
-      // Absent rather than estimated: `TableSchema.rowCount` is optional, and a table
-      // this provider could not count publishes no count at all.
-      ...(rowCount === undefined ? {} : { rowCount }),
-      columns: columnsByTable.get(id) ?? [],
-      indexes: indexesByTable.get(id) ?? [],
-      foreignKeys: foreignKeys.get(id) ?? [],
-    });
-  }
-
-  for (const row of views.rows as unknown as { schema_name: string; view_name: string }[]) {
-    const id = tableKey(row.schema_name, row.view_name);
-    schemas.push({
-      name: displayName(row.schema_name, row.view_name),
-      columns: columnsByTable.get(id) ?? [],
-      indexes: [],
-      foreignKeys: [],
-    });
-  }
-
-  return schemas;
-}
-
 // ============================================================================
 // Sizes
 // ============================================================================
@@ -391,6 +272,30 @@ export interface DuckDBDatabaseSize {
   totalBlocks?: number;
   usedBlocks?: number;
   freeBlocks?: number;
+}
+
+/**
+ * The database's files as the filesystem measures them (#1449). This file reads only SQL,
+ * so the provider stats the files and hands the sizes in. Each is `undefined` when its file
+ * cannot be stat'd: a `.wal` does not exist at all after a checkpoint.
+ */
+export interface DuckDBFileSizes {
+  mainBytes: number | undefined;
+  walBytes: number | undefined;
+}
+
+/**
+ * The database size, with the files on disk standing in where the engine answers 0 (#1449).
+ *
+ * Before its first checkpoint a file database keeps every row in its `.wal`, and
+ * `pragma_database_size()` answers database_size "0 bytes" over it: measured on v1.5.5 with
+ * 1,000 rows, a 12,288-byte main file beside a 32,083-byte `.wal`. That 0 is not the size
+ * of the database, so the main file plus its `.wal` is published instead. An in-memory
+ * database never reaches this: it publishes no `databaseSizeBytes` and has no files.
+ */
+export function withFileSizes(size: DuckDBDatabaseSize, files: DuckDBFileSizes | undefined): DuckDBDatabaseSize {
+  if (size.databaseSizeBytes !== 0 || files?.mainBytes === undefined) return size;
+  return { ...size, databaseSizeBytes: files.mainBytes + (files.walBytes ?? 0) };
 }
 
 /**
@@ -504,12 +409,13 @@ async function readCatalog(client: DuckDBClient): Promise<{ catalogName: string;
   return { catalogName: row.catalog_name ?? DEFAULT_SCHEMA, version: row.version ?? "unknown" };
 }
 
-export async function readOverview(client: DuckDBClient): Promise<DatabaseOverview> {
-  const [{ version }, size, counts] = await Promise.all([
+export async function readOverview(client: DuckDBClient, files?: DuckDBFileSizes): Promise<DatabaseOverview> {
+  const [{ version }, engineSize, counts] = await Promise.all([
     readCatalog(client),
     readDatabaseSize(client),
     client.run(COUNTS_SQL),
   ]);
+  const size = withFileSizes(engineSize, files);
   const row = (counts.rows[0] ?? {}) as Record<string, unknown>;
 
   return {
@@ -531,8 +437,8 @@ export async function readOverview(client: DuckDBClient): Promise<DatabaseOvervi
   };
 }
 
-export async function readHealth(client: DuckDBClient): Promise<HealthInfo> {
-  const size = await readDatabaseSize(client);
+export async function readHealth(client: DuckDBClient, files?: DuckDBFileSizes): Promise<HealthInfo> {
+  const size = withFileSizes(await readDatabaseSize(client), files);
 
   return {
     activeConnections: 1,
@@ -587,7 +493,7 @@ export async function readTableStats(client: DuckDBClient): Promise<TableStats[]
   const stats: TableStats[] = [];
   for (const row of tables.rows as unknown as TableRow[]) {
     // `TableStats.rowCount` is required, so absence is not expressible here as it is on
-    // `TableSchema`. The counted figure is the answer; `estimated_size` is the fallback
+    // a row count. The counted figure is the answer; `estimated_size` is the fallback
     // only when the count could not be read at all, because of the two numbers
     // available it is the closer one - a 0 would draw an empty table over real rows.
     const rowCount = rowCounts.get(tableKey(row.schema_name, row.table_name)) ?? readCount(row.estimated_size) ?? 0;
@@ -640,7 +546,7 @@ export async function readIndexStats(client: DuckDBClient): Promise<IndexStats[]
   }));
 }
 
-export async function readStorageStats(client: DuckDBClient): Promise<StorageStats[]> {
+export async function readStorageStats(client: DuckDBClient, files?: DuckDBFileSizes): Promise<StorageStats[]> {
   const [size, pathResult, tempFiles] = await Promise.all([
     readDatabaseSize(client),
     client.run(DATABASE_PATH_SQL),
@@ -653,6 +559,10 @@ export async function readStorageStats(client: DuckDBClient): Promise<StorageSta
   // its data in memory, where `memory_usage` is the figure that measures it (283.0 MiB
   // over 10 million rows, measured, against a database_size of "0 bytes").
   const location = ((pathResult.rows[0] ?? {}) as { path?: string | null }).path ?? null;
+  // The main file's own bytes where the engine answered 0 over rows still in the `.wal`
+  // (#1449, see `withFileSizes`). The `.wal` gets its own row below, so it is not added here.
+  const mainBytes =
+    size.databaseSizeBytes === 0 && files?.mainBytes !== undefined ? files.mainBytes : size.databaseSizeBytes;
   const stats: StorageStats[] = [
     location === null
       ? {
@@ -664,13 +574,27 @@ export async function readStorageStats(client: DuckDBClient): Promise<StorageSta
       : {
           name: "Main Database",
           location,
-          size: size.databaseSizeBytes === undefined ? "N/A" : formatBytes(size.databaseSizeBytes),
-          sizeBytes: size.databaseSizeBytes ?? 0,
+          size: mainBytes === undefined ? "N/A" : formatBytes(mainBytes),
+          sizeBytes: mainBytes ?? 0,
           ...(size.walSizeBytes === undefined
             ? {}
             : { walSize: formatBytes(size.walSizeBytes), walSizeBytes: size.walSizeBytes }),
         },
   ];
+
+  // The `.wal` as a row of its own, when there is one (#1449). The Storage tab's WAL tile
+  // reads the row NAMED "WAL", the same shape `sqlite.ts` publishes, so a size carried
+  // only on the main row above left that tile reading "N/A" beside a `.wal` holding data.
+  if (location !== null && files?.walBytes !== undefined) {
+    stats.push({
+      name: "WAL",
+      location: `${location}.wal`,
+      size: formatBytes(files.walBytes),
+      sizeBytes: files.walBytes,
+      walSize: formatBytes(files.walBytes),
+      walSizeBytes: files.walBytes,
+    });
+  }
 
   // Only when there is one. DuckDB spills to disk under memory pressure and reports
   // nothing at all when it did not, so an always-present row of zeroes would claim a

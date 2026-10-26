@@ -40,7 +40,7 @@ generic components render LibreDB-appropriate wording.
 
 | `DatabaseProvider` slot | LibreDB realisation | Mechanism |
 |-------------------------|---------------------|-----------|
-| "Table" (`TableSchema`) | A **cataloged namespace** (relational table / document collection) or, for uncataloged keys, a **key prefix** (e.g. `user:*`) | `catalog(db)` for cataloged kinds; `kv.range` scan + prefix grouping for raw kv |
+| "Table" (the relation kind) | A **cataloged namespace** (relational table / document collection) or, for uncataloged keys, a **key prefix** (e.g. `user:*`) | `catalog(db)` for cataloged kinds; `kv.range` scan + prefix grouping for raw kv |
 | "Row" | A **key** | — |
 | `query(input)` | A command (`get`/`put`/`delete`/`prefix`/`range`) | `kv` lens methods |
 | `getHealth()` / `getOverview()` | File stats | `fs.statSync` + prefix count |
@@ -106,8 +106,8 @@ out in parallel.
 ### 2.4 Registration & lifecycle
 
 The factory wires LibreDB in via a dynamic import so the `@libredb/libredb` driver is only loaded
-when a LibreDB connection is actually opened
-([`factory.ts:100`](../../src/lib/db/factory.ts)):
+when a LibreDB connection is actually opened by `createDatabaseProvider()`
+([`factory.ts`](../../src/lib/db/factory.ts)):
 
 ```ts
 case 'libredb': {
@@ -140,11 +140,29 @@ file path — the same pattern used by the SQLite provider. A missing `database`
 closes. This offers no durable value for a GUI tool, so the provider explicitly requires a file
 path and throws rather than silently opening an in-memory database.
 
+SQLite's in-memory name is refused too (#1450). `:memory:` used to go through `path.resolve()` like
+any path, so Test Connection answered "Connected successfully" and left a 0-byte file literally
+named `:memory:` in the server's working directory; `validate()` now throws a `DatabaseConfigError`
+saying LibreDB has no in-memory mode.
+
+A relative path is resolved against the server's working directory, which is where the built-in
+sample connection lives (`./data/sample.libredb` under the default data directory). A path whose
+parent directory does not exist is refused before the file is opened, with "The directory <dir>
+does not exist": the kernel opens its `.lock` sidecar first, so that case used to read as an ENOENT
+about a `<file>.libredb.lock` the user never named. The directory is not created, unlike the SQLite
+provider, because a connection setting should not make directories on the server.
+
+A path that exists and is not a regular file is refused before the kernel opens anything, by `assertRegularFilesOrMissing` ([`regular-file.ts`](../../src/lib/db/utils/regular-file.ts)), shared with the SQLite and DuckDB providers.
+It asks `stat`, which never opens the path and follows a symlink: the kernel opened a FIFO, took a `.lock` beside it and Test Connection answered "Connected" (measured on bun 1.4.2), while the same FIFO froze the DuckDB provider.
+The kernel's `<path>.lock` is checked the same way, and the error then names the `.lock`: `lock()` reads a lock it finds taken to judge whether it is stale, and that read of a FIFO `.lock` waited for a writer on the server's own thread, so the connect never returned (measured on bun 1.4.2).
+The answer is the open failure in [§10](#10-error-handling), for example `Failed to open LibreDB file: /data/app.libredb is a named pipe (FIFO), not a regular file`, or `a socket`, `a character device`, `a block device` or `a directory` in place of the FIFO.
+A regular file and a symlink to one open as before, and a missing file is created as before.
+
 ### 3.3 Catalog-aware schema, with key-prefix grouping as the raw-kv fallback
 
 Since `@libredb/libredb` 0.0.2 a `.libredb` file carries a persisted **catalog**: the lenses
 record, under a reserved key prefix, which lens (`document` / `relational`) each namespace belongs
-to and — for a relational table — its declared column schema. `getSchema()` reads `catalog(db)`
+to and — for a relational table — its declared column schema. the object surface reads `catalog(db)`
 and renders a faithful per-kind view:
 
 - **Relational** namespace: the table's **real columns** and types from the catalog schema, with
@@ -156,7 +174,7 @@ and renders a faithful per-kind view:
 - **Uncataloged** (raw kv) namespace: the historical `key` (string, primary) + `value` (string,
   nullable) columns.
 
-Studio's `TableSchema` has no dedicated "kind" field, so the kind is signalled by the columns
+The object shape has no dedicated "kind" field, so the kind is signalled by the columns
 themselves: real columns ⇒ relational, `id`/`document` ⇒ document, `key`/`value` ⇒ raw kv.
 
 `groupName()` ([`libredb.ts`](../../src/lib/db/providers/embedded/libredb.ts)) still drives the raw
@@ -171,8 +189,8 @@ the `user:*` group, and a key with no colon (e.g. `config`) becomes its own sing
 upgrades the group to its catalog-aware columns. Cataloged namespaces with no scanned rows yet
 (an empty table/collection) are still emitted, with `rowCount: 0`.
 
-`getSchema()` scans up to `MAX_SCAN = 10000` keys via `kv.range('', '\u{10FFFF}')` — a half-open
-interval that covers the entire keyspace. The resulting `TableSchema` list is sorted by descending
+the object surface scans up to `MAX_SCAN = 10000` keys via `kv.range('', '\u{10FFFF}')` — a half-open
+interval that covers the entire keyspace. The resulting object list is sorted by descending
 row count so the largest groups appear first.
 
 ### 3.3.1 Reserved namespace is excluded from every user-facing view
@@ -180,7 +198,7 @@ row count so the largest groups appear first.
 The database stores internal metadata (the catalog, and any future internal sub-namespace) under a
 reserved key prefix — `RESERVED_MARKER` (U+0000, the lowest byte). Because U+0000 sorts below all
 user data, those keys fall inside the provider's full-keyspace scan. They are internal, so the
-provider filters them out in **both** `getSchema()` grouping **and** the `range`/`prefix` query
+provider filters them out in **both** the object surface grouping **and** the `range`/`prefix` query
 result rendering (`toRows`). Without the filter, a file written via `doc()`/`table()` would leak a
 junk `\x00libredb:*` pseudo-table and catalog rows into results.
 
@@ -211,6 +229,24 @@ The tokenizer is `private tokenize()` in the provider class.
 re-serialized with `JSON.stringify(parsed, null, 2)` for readability in the grid. Non-JSON
 strings are returned as-is. This mirrors how the Redis provider handles structured values.
 
+**A value holding a number the round trip would change is returned as stored, not pretty-printed.**
+`JSON.parse` rounds such a number with no error, so the round trip would print a different one.
+Measured on 0.2.2 on 2026-10-04:
+
+| Stored | Pretty-printed through `JSON.parse` |
+|---|---|
+| `{"n":9007199254740993}` | `"n": 9007199254740992` |
+| `{"amount":12345678901234567890.12}` | `"amount": 12345678901234567000` |
+| `{"ratio":0.1234567890123456789}` | `"ratio": 0.12345678901234568` |
+| `{"huge":1e400}` | `"huge": null` |
+
+Copy, every export and an edit-and-`put` cycle then carried the changed value while the file held the
+right one. `renderValue()` therefore asks
+[`carriesLossyNumber`](../../src/lib/db/utils/json-integers.ts) first, which compares every number
+literal outside a string with its own `JSON.stringify(JSON.parse(literal))`, and returns the stored
+text unchanged when any of them differs. A spelling the trip would merely change, such as `1.0`,
+keeps the stored text too. Every other JSON value is pretty-printed as before.
+
 ### 3.7 Monitoring is file-stat-based
 
 Unlike Redis (`INFO`) or PostgreSQL (system catalogs), LibreDB has no server introspection API.
@@ -232,7 +268,7 @@ fields are ignored.
 
 | Field | Required | Notes |
 |-------|----------|-------|
-| `database` | Yes | Absolute path to the `.libredb` file on the Studio server's filesystem. Throws `DatabaseConfigError` if absent. |
+| `database` | Yes | Path to the `.libredb` file on the Studio server's filesystem, absolute or relative to the server's working directory; its directory must exist ([§3.2](#32-no-in-memory-connections)). Throws `DatabaseConfigError` if absent or `:memory:`. |
 
 No `host`, `port`, `user`, `password`, or `connectionString` fields are used. The `supportsConnectionString`
 capability is `false`.
@@ -286,7 +322,7 @@ condition as a clear `ConnectionError` (see [§10](#10-error-handling)):
     lost its schema capture to the lock. A `ConnectionError` becomes an *unavailable* capture rather
     than a failure, so every plan run on a LibreDB connection was silently ungrounded from the
     moment anyone browsed it in the sidebar.
-  - `POST /api/db/schema-snapshot` answered HTTP 503 with the same message, so the Schema Diff tab's
+  - `POST /api/db/objects/inventory` answered HTTP 503 with the same message, so the Schema Diff tab's
     **Snapshot** button — its only caller — could not read a schema the sidebar was listing at that
     moment. Measured in the browser against the released 0.13.4 image on 2026-08-25.
 
@@ -321,6 +357,16 @@ package inside libredb-platform.
 |----------|---------|-------|
 | `LIBREDB_EMBEDDED_SAMPLE` | `true` | Set to `"false"` to disable the sample connection entirely. |
 | `LIBREDB_EMBEDDED_SAMPLE_PATH` | `<data dir>/sample.libredb` | Optional override for the path of the generated sample file. |
+
+### Connection string
+
+`libredb` has no connection string scheme, no `readTls` and no seed load check: every field of its row in `CONNECTION_STRING` is `null` ([`libredb-connection-string.ts`](../../src/lib/db/providers/embedded/libredb-connection-string.ts)).
+LibreDB is embedded in the process, so there is no address to write a scheme for.
+
+### Execution UI
+
+The rolled-back notice names `COMMIT` as the keyword that keeps an open transaction, and `libredb` has no consent deadline, so the agent's consent card shows no deadline chip or sentence for it.
+Its row in `EXECUTION_UI` is declared in [`libredb-execution-ui.ts`](../../src/lib/db/providers/embedded/libredb-execution-ui.ts).
 
 ---
 
@@ -367,9 +413,10 @@ Rules:
 | `range` | `key`, `value` | one row per key in `[start, end)` |
 
 JSON values in the `value` column are pretty-printed with two-space indentation when they parse
-successfully. Non-JSON strings are left as-is.
+successfully. Non-JSON strings are left as-is, and so is a JSON value holding a number that
+pretty-printing would round or re-spell ([§3.6](#36-json-pretty-printing-for-values)).
 
-The command grammar is **unchanged** by the catalog work — only the schema *view* (`getSchema()`)
+The command grammar is **unchanged** by the catalog work — only the schema *view* (the object surface)
 became catalog-aware. `get`/`put`/`delete`/`prefix`/`range` still operate on the raw kv keyspace
 exactly as before. The one behavioural refinement: `prefix` and `range` results filter out any key in the reserved
 namespace (via the package's `isReservedKey` predicate), so a full-keyspace `range` no longer leaks
@@ -436,20 +483,45 @@ a plausible, runnable `delete billing:2024` one **Run Selected** away (only `get
 `firstCommandLine()` takes the first line). Auto-executing the note alone runs nothing and reports
 *No command to run (only comments or blank lines)* (U11).
 
-Two menu actions are **not offered** on this provider. `Profile Table` and `Generate Test Data`
-address an object and insert rows into it; a `users:*` row is a prefix grouping this server derived
-from one bounded scan (`tablesAreDerivedGroupings`, see 9), not an object any command can be given,
-so both are hidden rather than left to answer HTTP 400 (#427). The per-row `Analyze` and `Vacuum`
-items are hidden for the same reason — they call `onOpenMaintenance("tables", <row>)` and there is no
-such row to name; the row menu reads no maintenance capability of its own. `Generate Code`
+Three menu actions are **not offered** on this provider.
+`Profile Table` and `Generate Test Data` address an object and insert rows into it; a `users:*` row is a prefix grouping this server derived from one bounded scan (`tablesAreDerivedGroupings`, see 9), not an object any command can be given, so both are hidden rather than left to answer HTTP 400 (#427).
+Since #1085 each is withheld by its own declaration: Profile by that flag and by the language gate `offersColumnProfiling`, because the profile route refuses JSON in a dialect of its own, and Generate Test Data by the row-write rule both row menus ask (decision D-M), because no kind here declares `acceptsRowWrites` and the engine declares `supportsTestDataGeneration: false` (#1468).
+`Generate Count Query` is the third, withheld by `offersCountQuery` (#702): the five-verb grammar has no count, and a derived grouping has nothing to count.
+The per-row `Analyze` and `Vacuum`
+items are hidden as well: they call `onOpenMaintenance("tables", <row>)` and there is no
+such row to name, and the engine declares no maintenance operation (`supportsMaintenance: false`), which `maintenanceControl` reads for both row menus. `Generate Code`
 stays: it names the row, it does not address it, and it sanitises the name into an identifier that
 is legal in every target language (`users:*` -> `User`), keeping Unicode letters intact.
 
+### 5.4 `endOpenQueryTransaction()` is absent, and which absence it is (D75)
+
+The optional provider surface that ends a transaction a statement left open on the session
+`query()` runs on ([`types.ts`](../../src/lib/db/types.ts), implemented on `postgres`, `sqlite`,
+`duckdb` and `redis`) is **not implemented here, because the engine has no transaction to leave open.**
+
+The command grammar (§5.1) is a closed set of five verbs and the dispatcher refuses everything else
+by name. Measured 2026-09-15 through this provider against `@libredb/libredb`: `begin`, `commit`,
+`rollback`, `transact` and `start transaction` are each refused with *"Unknown command `<verb>`.
+Supported: get, put, delete, prefix, range"*, and a `put` straight afterwards still writes. The
+kernel's own `transact()` is a single atomic call rather than a session that stays open (§13), and
+no verb reaches it.
+
+So the surface would have nothing to report, and the absence is a declared boundary rather than a
+fallback: the caller shape-checks for the method and this provider does not answer it.
+
 ---
+
+### 5.5 SQL grammar
+
+How this engine's statement text is read is declared once, in [`src/lib/db/providers/embedded/libredb-sql-grammar.ts`](../../src/lib/db/providers/embedded/libredb-sql-grammar.ts), the `libredb` row of the SQL grammar registry in `src/lib/db/sql-grammar/`.
+Its grammar is `DEFAULT_SQL_GRAMMAR`, the compatibility default, because no rule was established for the command grammar, not because it agrees with the default.
+`readsSqlText` is `true` although the provider declares `queryLanguage: "json"`: the store was never listed as an engine whose text is not SQL, so its text reaches the SQL readers under that default.
+This is the one exception `tests/isolated/sql-grammar-reads-sql-text.test.ts` records between the two facts, and the test fails if a second engine splits them.
+Redaction is `none`, since the engine has no grammar of its own: a redacted statement is stored as `?`, because a reader guessing where a literal ends can store the literal.
 
 ## 6. Schema introspection
 
-`getSchema()` returns one `TableSchema` per namespace, made catalog-aware:
+the object surface answers one object per namespace, made catalog-aware:
 
 ```
 1. registry = catalog(db)                  <- which namespaces are relational / document, + schemas
@@ -484,7 +556,380 @@ were written through the raw `kv` lens are never cataloged, so they keep the hon
 `key`/`value` view. The reserved-namespace keys are excluded from the schema (see
 [§3.3.1](#331-reserved-namespace-is-excluded-from-every-user-facing-view)).
 
+### 6.1 The object surface (#789)
+
+the object surface above answers one flat namespace list. The object surface answers a lazy,
+kind-tagged tree through four methods, and on this engine they live in the provider class:
+there is no statement layer to split out, because the catalog here is a `Map` the package
+hands over.
+
+#### The measurement, first, because nothing external describes this engine
+
+Every other provider in this repo was written from published documentation and then measured.
+LibreDB is our own embedded store, published as `@libredb/libredb`, and no external source
+describes its object surface at all. So the declaration below is the output of a measurement
+rather than a reading, and the measurement is recorded here so nobody has to repeat it.
+
+**Measured on `@libredb/libredb` 0.2.2**, two ways: the package's entire export surface, and a
+database opened cold after being written through every lens it publishes.
+
+The whole export surface is twelve names:
+
+```
+CATALOG_PREFIX  LibreDbError  RESERVED_MARKER  catalog  doc  isReservedKey
+kv  nodeFileSystem  open  readonlyFileSystem  table  version
+```
+
+A `Database` handle publishes exactly `close` and `transact`. A `Kv` publishes
+`get/set/delete/prefix/range`, a `DocCollection` publishes `get/put/delete/find/all`, and a
+`Table` publishes `get/insert/delete/select/where/join/all`.
+
+**There is no view, no routine, no procedure, no trigger, no index, no sequence and no
+constraint anywhere in it.** None of those is declared, and none is declared-and-zero: a kind
+the engine cannot have draws a folder whose zero badge reads as a measurement of an empty
+database rather than as the absence of the concept (standing ruling 4). The same fact is
+already stated on the monitoring side, where the Indexes panel is ABSENT with its own sentence
+rather than empty ([§7.2](#72-the-two-panels-that-are-absent-and-the-one-that-is-empty)).
+
+**But the answer is NOT "keys and nothing else", which is what it would have been before
+0.0.2.** Read cold, a database carries a persisted catalog, and that catalog is a registry of
+NAMED objects. Written through all three lenses and reopened:
+
+```
+catalog:     articles=document, employees=relational, notes=document, vacancies=relational
+raw keys:    \0libredb:catalog:articles   = {"kind":"document"}
+             \0libredb:catalog:employees  = {"kind":"relational","schema":{"primaryKey":"id","columns":{...}}}
+             cache:a = 1
+             cache:b = 2
+             employees:e1 = {"id":"e1","name":"Ada","salary":100,"active":true}
+             notes = a bare key whose name a cataloged collection also answers to
+             standalone = single-value
+```
+
+So there are **three kinds**: the two the catalog names, and the one this server derives.
+
+| Kind | Role | Catalog | Count is |
+|---|---|---|---|
+| `table` | `relation` | `catalog(db)` entries with `kind: "relational"` | a population |
+| `collection` | `relation` | `catalog(db)` entries with `kind: "document"` | a population |
+| `keyspace` | `relation` | the bounded key scan, collapsed per `:`-prefix, minus every cataloged namespace | a population below the scan cap, a FLOOR above it |
+
+Three further facts were measured and each one shapes the declaration:
+
+- A **relational table is cataloged when `table()` records its schema**, so an empty table is a
+  real, listable object: `vacancies` holds no rows and the catalog still names it, which is why
+  a `{ count: 0 }` here is the engine answering none.
+- A **document collection is cataloged on its FIRST WRITE**, not when `doc()` hands back a
+  handle. An unwritten collection therefore does not exist, and none is invented for one.
+- A **raw `kv` write never touches the catalog**, which is what keeps the third kind's rows
+  disjoint from the first two.
+
+#### The `kv` arm nobody writes, and why the mapping is total
+
+`CatalogEntry.kind` is published as `"kv" | "document" | "relational"` and only the last two are
+ever recorded: measured, the two lens constructors are the catalog's only writers and a raw `kv`
+write leaves it untouched. `objectKindFor` still maps **totally** rather than matching the two
+arms that exist. A namespace whose catalog entry this declaration does not model keeps its keys
+in the derived `keyspace` grouping, where they are counted, listed and describable, instead of
+falling out of both the count and the listing the day a release adds an arm. Standing ruling 5a
+names that shape as the worst defect in this epic, because every conformance check still passes
+while the object is invisible, and the vocabulary here is therefore derived from the package's
+exported TYPE rather than from what the fixture happens to hold. It is pinned by a test that
+writes such an entry through the raw lens, which is the only way to produce an arm the engine's
+own type publishes and its writers do not yet emit.
+
+A total mapping is only half of the guarantee, and the other half is the step AHEAD of it.
+`scanGroups` injects every cataloged namespace the bounded key scan never reached, which is what
+makes the empty table `vacancies` a listable object, and that injection is total as well: it
+filters no arm out before the mapping is asked. It used to skip `kind: "kv"`, so a cataloged
+entry of an unmodelled arm holding zero keys fell out of both the count and the listing while an
+empty table or collection was injected and shown - ruling 5a's shape exactly, invisible in the
+tree with the badge agreeing with the folder. Both cases are pinned by tests now: one where the
+unmodelled entry holds a key, and one where it holds none.
+
+#### No container level, and that is the engine
+
+A LibreDB database is ONE FILE holding one flat namespace. There is no catalog above it, no
+schema inside it and no numbered database to select, so `containerLevels` is absent,
+`containerDepth()` reads that as 0, `listContainers()` answers `[]`, and every object is
+addressed at the root container. Absent and `[]` are the same fact and only `containerDepth()`
+is allowed to decide it.
+
+#### Where the count and the listing meet
+
+Standing ruling 5f says the listing must contain exactly what the count counted. On a SQL engine
+that is a warning about two `WHERE` clauses; here there is no statement layer at all, so **the
+seam is a method**. `enumerate()` reads the catalog and walks the keyspace once, and
+`countObjects()`, `listObjects()` and `describeObject()` all read what it returned and nothing
+else. A count is the LENGTH of the array its own kind was given, so there is no second scan with
+a different bound for the badge and the folder to disagree in. It reads through `scanGroups()`,
+the same pass the object surface and `getTableStats()` make, so the flat model and the object model
+cannot report different inventories of one file while both surfaces are live.
+
+#### One count is a sample, and the type says so
+
+`table` and `collection` are enumerated from `catalog(db)`, which the package reads whole as an
+eager snapshot, so those two counts are **populations** however far the key walk got. `keyspace` is
+enumerated from the scan bounded at `LIBREDB_MAX_KEY_SCAN` (10 000 keys), so once that scan stops
+early its count is a **floor**, and every object's `rowCount` on all three kinds is a sample in the
+same way.
+
+`KindCount` carries a fourth state for exactly this, `{ count, sampledFrom }`, and this engine is
+what makes it PER KIND rather than a per-provider flag: one answer holds two populations and one
+floor. Measured on the object fixture with 10 500 filler keys written under `bulk:`:
+
+```
+countObjects([]) -> {"table":{"count":3},
+                    "collection":{"count":2},
+                    "keyspace":{"count":1,"sampledFrom":"the first 10,000 keys of a bounded key scan"}}
+```
+
+The tree badges that folder **`1+`** and titles it *"At least 1: counted from the first 10,000 keys
+of a bounded key scan"*. One, on a file whose derived groupings are four: the walk spent its whole
+budget inside `bulk:` and never reached `cache:*`, `notes` or `standalone`, which sort after it. A
+bare `1` there is a wrong fact rather than an imprecise one, and that is the defect the state closes.
+
+Only a scan that actually stopped short is marked. Below the cap the walk reached every key in the
+file, so the count is a measurement and the badge stays a bare number. It is the same `truncated`
+flag `getTableStats()` reads for `LIBREDB_TABLE_STATS_TRUNCATED`, out of the same pass.
+
+There is no `{ unavailable }` state on this engine at all, and that is a measurement rather than
+an omission: every kind is counted from ONE read, made on a handle this process already holds.
+There is no per-kind command a deployment might not have, the way `FUNCTION LIST` is missing on
+three Redis-wire relatives. A failure of that read is a kernel storage condition, and this
+provider's settled answer to one is to let it propagate with the kernel's own code intact.
+
+#### Object identity: every object is addressed by its GROUP
+
+Every object here, cataloged or derived, is ADDRESSED by the group `scanGroups()` put it in: the
+`table` `employees` is `["employees:*"]`, the collection `notes` is `["notes:*"]`, the derived
+prefix grouping is `["cache:*"]` and a bare key is `["standalone"]`. The LABEL is the same string,
+so the two now agree; ruling 2 still allows them to differ and nothing here needs them to.
+
+**It was the catalog name until #789's join guard, and that was wrong.** `employees` is the string
+the catalog keys the table under and the one `table()` and `doc()` take, which is a true fact about
+the ENGINE'S API and the wrong answer for this address. Standing ruling 2 says the last path
+segment is the identifier that is **unique within its parent**, and a catalog name cannot be:
+the catalog and the raw keyspace are one namespace, so a raw key may be spelled exactly like a
+cataloged one. The group name is unique by construction instead, because every group comes from
+one grouping pass over one keyspace and the injected `<name>:*` for a cataloged namespace the scan
+never reached is only pushed when that group is absent.
+
+This is ruling 2's routine precedent rather than an exception to it. Where an engine's bare name is
+not unique within its parent, the path carries the disambiguated form the engine itself tells them
+apart by, the way a PostgreSQL routine's segment carries its argument type list. Here the engine
+tells them apart by the key pattern: `prefix employees:` reaches the table's rows and `get
+employees` reads a key of that exact name.
+
+The object surface spells a cataloged namespace `employees:*`, and that spelling is what a generated
+command needs: `prefix employees:` reaches the table's rows while `get employees` reads a key nobody
+stored (#518, and see [§5.3](#53-schema-explorer-menu-actions)).
+
+**Two objects, one string, measured.** A cataloged collection `notes` and a bare key `notes`
+coexist in one file: `assertUserName` forbids a namespace name containing `:`, and nothing forbids
+a raw key equal to a namespace name. They are two objects rather than one listed twice, measured
+against a live `@libredb/libredb` 0.2.2 handle: `doc(db, "notes").all()` yields `n1` and not the
+bare key, and `kv.get("notes")` answers the bare value with the collection intact. Under the old
+address both were published at `["notes"]` under two kinds that are BOTH `role: "relation"`, so
+neither the kind filter nor a container could separate them and the flat reading resolved to
+neither. Ruling 3 permits path reuse across kinds and is right for MySQL, where a table sits beside
+a procedure and the two kinds have different roles; it is not enough where the kinds share one.
+They are now `["notes:*"]` and `["notes"]`.
+
+`describeObject()` still takes the kind, and nothing in the object surface reads a name to work out
+what it is holding: a group is mapped to a kind by the CATALOG, never by its spelling.
+
+#### What `describeObject()` answers
+
+The kind decides, and the columns come from `schemaForGroup()`, the same builder the object surface
+uses, so the flat model and the object model cannot describe one object two ways. The column
+shapes are the table in [§6](#6-schema-introspection) above.
+
+`indexes` and `foreignKeys` are empty for every kind, and both are facts about the engine rather
+than unfinished reads: the kernel is one ordered keyspace where a key's own byte order is the
+only index there is, and the catalog records a namespace's lens and a table's columns and nothing
+that references another namespace (`declaresForeignKeys: false`).
+
+All three kinds declare `hasColumns`, so the object tree draws a column twisty on every object row
+this engine produces and no kind abstains, because `columnsForGroup()` has one arm per kind and none
+of them can answer an empty list; the conformance suite states that as `noAbstainingKinds`, since
+invariant 8's other direction has nothing to iterate here.
+
+An object the current read no longer holds **raises** rather than answering an empty shape, on
+all three kinds alike. Unlike Redis, where one kind can be described without asking, every kind
+here comes out of the same read, so checking costs nothing, and an empty shape would claim a
+table that was never cataloged or a grouping whose last key is gone.
+
+#### What `describeObjects()` answers, and the two bounds it reports
+
+`describeObjects(container, kind, limit?)` is the bulk column read (#789): every object of one
+kind in one container, in ONE enumeration.
+
+**One pass for a whole folder, and on this engine that is the whole point.** There is no
+statement layer here, so the N+1 the inventory route removed would not come back as 5,000 round
+trips but as 5,000 KEY WALKS: `describeObject()` calls `enumerate()`, so a body looping it would
+scan the file once per object. The suite counts the passes with a spy on `scanGroups` rather than
+comparing times, because an embedded engine is fast enough that a timing comparison would pass
+either way.
+
+**No kind here answers an empty batch for want of columns.** The reference implementation's
+fourth guard covers a routine, a trigger or a sequence, and this store has none: all three
+declared kinds are `role: "relation"` and `schemaForGroup()` answers real columns for each - a
+cataloged table's declared schema, a collection's `id`/`document` pair, a raw grouping's
+`key`/`value` pair. There is no early return to write here, and writing one would be a branch
+nothing can reach.
+
+**One mapper, shared with the single read.** `objectDetailOf()` builds both answers, so the two
+cannot spell the same table's columns differently. Every column set the bulk read answers is
+byte-identical to `describeObject()` for the same path, asserted for every object of every kind
+in the fixture.
+
+**Two bounds, and the answer names whichever bit.**
+
+| Bound | Applies to | `truncated.limit` | `truncated.reason` |
+| --- | --- | --- | --- |
+| The caller's `limit` | every kind | the caller's own number | `the bulk column read was bounded at N objects by its caller` |
+| The key walk's cap | `keyspace` only | the number of objects answered | `the key walk stopped at the first 10,000 keys of a bounded key scan` |
+| Both | `keyspace` | the caller's own number | the two joined with `, and ` |
+
+The second is a bound this provider did not choose on the call and the caller never asked for, so
+it is reported on an unbounded read as readily as on a bounded one: a cap nobody can see is the
+defect `truncated` exists to prevent. It is reported on the DERIVED kind alone, which is the same
+rule `countObjects()` applies to `KindCount.sampledFrom` and for the same measured reason -
+`catalog()` is read whole as an eager snapshot, so `table` and `collection` are populations
+however far the key walk got. One file can therefore answer a truncated `keyspace` batch and two
+untruncated cataloged ones from one pass.
+
+A limit that is not a positive whole number **raises** rather than being clamped: a `0` would
+answer nothing while reporting a truncation the caller never asked for. The guard runs after the
+declaration check and after the container check, so a caller gets the strongest true statement
+first.
+
+**The cut is OURS and the walk is the ENGINE's, which is the reverse of every SQL engine in
+#789.** There is no `LIMIT` to push down: `scanGroups()` has to reach the end of the keyspace
+before it knows which GROUPS exist, and it appends a cataloged namespace the walk never saw after
+that. So the enumeration is sorted with `comparePaths` and cut afterwards, and the membership of
+a bounded read is this provider's order rather than the kernel's.
+
+Those two orders are not the same one, and the fixture can show it. Task 26a-2 measured across
+five SQL engines that a server's own `ORDER BY` is the UTF-8 BYTE order while `comparePaths`
+compares UTF-16 code units, and that the two answer the REVERSE for `U+E000` against `U+1F600`.
+The same holds here, measured on @libredb/libredb 0.2.2:
+
+```
+# keys U+E000 (bytes ee 80 80) and U+1F600 (bytes f0 9f 98 80) in one file
+range \u{E000} \u{10FFFF}      ->  U+E000, U+1F600      the kernel's own walk, byte order
+describeObjects([], "keyspace") ->  U+1F600, U+E000      comparePaths, UTF-16 code units
+```
+
+so `describeObjects([], "keyspace", 1)` keeps the emoji where a server-side cut would have kept
+the private-use character. The suite pins both halves; the `range` control is what keeps the
+assertion from passing vacuously.
+
+#### The derived-grouping refusal, and the declaration that carries it
+
+`tablesAreDerivedGroupings: true` ([§9](#9-capabilities--labels)) stays. It is a refusal about
+the `keyspace` rows: `cache:*` is a prefix this server derived from a bounded scan, not an object
+anybody named, and no command can be given that row. The flat row menu read the flag directly;
+the object model's menu is driven by the KIND, so the refusal needed somewhere to live, and it
+splits the same three ways Task 20 split it for Redis:
+
+- **Row writes.** No kind declares `acceptsRowWrites`, so Generate Test Data and the folder's
+  create item are withheld by the kinds. That is not a workaround: the grammar is
+  `get` / `put` / `delete` / `prefix` / `range` and has no INSERT for the generator to emit, and
+  the provider declares no `createTable`.
+- **Maintenance.** `supportsMaintenance` is false ([§8](#8-maintenance)), so `maintenanceControl`
+  withholds the per-row links by the declaration that already governed them.
+- **Profile** has no kind-level declaration behind it, so `rowActions` reads the engine-wide flag,
+  exactly as the flat menu did. [`row-actions.ts`](../../src/components/object-tree/row-actions.ts)
+  says so at the top of the file.
+
+**The flag costs the two CATALOGED kinds their Profile item too, and measured, that costs nothing.**
+`POST /api/db/profile` has no arm for this engine: it profiles SQL and a MongoDB `aggregate` document only, and since #1085 it refuses JSON in a dialect of its own before sending anything, with a 400 that names the language.
+Both row menus read the same refusal through `offersColumnProfiling` in `src/lib/db/types.ts`, so the language withholds Profile here as well as the flag.
+The pipeline the route sent before that refusal existed is what the grammar answers, run against the fixture:
+
+```
+Unknown command "{collection:employees,operation:aggregate,pipeline:[...]}".
+Supported: get, put, delete, prefix, range
+```
+
+So Profile could not work on any kind here, and withholding it is the honest menu rather than a
+cost of reusing Redis's gate.
+
+**Generate Query is NOT withheld**, which is the same call Task 20 made. The generator answers
+`prefix employees:` for a namespace and `get standalone` for a bare key
+([§5.3](#53-schema-explorer-menu-actions)), both runnable against exactly the keys the row
+summarises, and the row click that opens data runs the same thing.
+
+#### Nothing here opens a second handle
+
+This is the one engine that declares `singleWriterFile`: `open({ path })` takes an exclusive
+`<path>.lock` sidecar and a second open of the same file throws `LOCKED`. Every object read goes
+through the `this.db` / `this.kv` handle `connect()` already holds, and nothing in the object
+surface calls `open` at all. A second handle for an object read would lock the session out of its
+own database (`findOpenSingleWriterProvider`). The suite pins it: it asserts that a second `open`
+of the fixture throws while the provider holds it, then drives all four object methods and a
+the object surface through the held handle.
+
+#### Object source (#789): the absence is measured, and one of the three kinds is interesting
+
+No kind declares `hasSource`, this provider implements no `readObjectSource`, and
+`assertObjectSurface` certifies that pairing directly: a declaration with no method behind it fails
+the suite by name. The provider's own suite pins the same absence from the other side, kind by kind
+and through `kindHasSource()`, which is the derivation the route and the row menu read.
+
+**The measurement was re-run for #789 rather than carried over**, because a version bump could have
+changed the answer and the whole value of this section is that the absence is measured instead of
+assumed. Against `@libredb/libredb` **0.2.2**, the exact version this repository resolves:
+
+- The package's whole export surface is **twelve names** - `CATALOG_PREFIX`, `LibreDbError`,
+  `RESERVED_MARKER`, `catalog`, `doc`, `isReservedKey`, `kv`, `nodeFileSystem`, `open`,
+  `readonlyFileSystem`, `table`, `version`.
+- A `Database` handle publishes `close` and `transact`. The `kv` lens publishes `get`, `set`,
+  `delete`, `prefix`, `range`; the `doc` lens `get`, `put`, `delete`, `find`, `all`; the `table` lens
+  `get`, `insert`, `delete`, `all`, `select`, `where`, `join`, `name`.
+- There is no view, no routine, no procedure, no trigger, no index, no sequence and no constraint
+  anywhere in any of them, and **nothing takes or returns a definition text**. Every reader answers
+  keys, documents or rows.
+
+That covers `collection` and `keyspace` outright, and each for its own reason. A cataloged document
+namespace records `{ kind: "document" }` and nothing else - documents are schemaless, so existence
+and kind are all there is to record - and a `keyspace` row is a prefix this server DERIVED from a
+bounded key scan rather than an object anybody named
+([the derived-grouping refusal](#the-derived-grouping-refusal-and-the-declaration-that-carries-it)),
+so there is no authored anything for it to have.
+
+**`table` is the one that needed a decision, and the answer is still no.** A relational table's
+catalog entry does carry a structure, and it is genuinely persisted: `recordRelational` writes a
+`CatalogEntry` as JSON under the reserved catalog key, and `catalog(db)` reads it back as
+`{ primaryKey, columns }`. So the flat claim "nothing here is written down" would be too strong.
+Three measured facts keep it out of the source surface anyway:
+
+- **It is already on screen, as itself.** That same map is exactly what `describeObject()` answers as
+  the table's columns ([above](#what-describeobject-answers)). A Source tab over it would be a second
+  rendering of a panel that already shows it in the form the user wants it in.
+- **Nothing could re-apply an edited one.** #789 is the read half of #778, which is editing a
+  definition, and this engine has no statement to submit an edit through: the grammar is
+  `get` / `put` / `delete` / `prefix` / `range` ([§5.1](#51-command-grammar)), the provider
+  declares no `createTable`, and the package itself refuses the operation - `recordRelational` validates a passed
+  schema against the persisted one and **throws on mismatch**, because there is no schema migration
+  in 0.2.x. A Source tab that can only ever be read is a worse answer than no tab.
+- **Showing it as a statement would mean inventing one.** There is no `CREATE TABLE` in this engine,
+  so any statement-shaped rendering would be a sentence no one can run against the database it claims
+  to describe, which is the fabrication the `origin` arms exist to prevent.
+
+So the absence here is a CANNOT-usefully rather than a not-yet, and it is recorded in this file
+rather than filed, because there is no deferred work behind it: the day this package grows a routine,
+a view or a schema-altering statement is the day the question is worth reopening.
+
 ---
+
+#### Object edit (#789): nothing to write, for the same reason there is nothing to read
+
+The embedded store declares no source-bearing kind at all, so there is no definition text to edit and no plan to build.
+That absence is measured rather than assumed, and the section above records what the export surface carries instead of a definition.
+No kind here declares `acceptsSourceEdits`, and `tests/isolated/object-edit-declarations.test.ts` is what holds that absence and this section together: it asserts the absence over EVERY kind this provider declares, not only over the ones that would carry a definition.
 
 ## 7. Monitoring & health
 
@@ -493,16 +938,16 @@ There is no embedded stats API.
 
 | Method | Source | Returns |
 |--------|--------|---------|
-| `getHealth()` | `fs.statSync` | `activeConnections: 1`, file size as `databaseSize`, `cacheHitRatio: "N/A"` |
-| `getOverview()` | `fs.statSync` + schema scan | `version`, file size, namespace count as `tableCount`, `indexCount: 0` |
+| `getHealth()` | `fs.statSync` | `activeConnections: 1`, file size as `databaseSize` (`"N/A"` when unmeasurable — [§7.3](#73-when-the-file-size-is-not-measurable)), `cacheHitRatio: "N/A"` |
+| `getOverview()` | `fs.statSync` + schema scan | `version`, file size, namespace count as `tableCount`, `indexCount: 0`; `databaseSizeBytes` is **omitted** and `databaseSize` stays `"N/A"`, never a `0`, when the stat fails — [§7.3](#73-when-the-file-size-is-not-measurable) |
 | `getPerformanceMetrics()` | — | `{}` — nothing is measurable here |
 | `getSlowQueries()` | — | `[]`; the Queries panel renders `slowQueriesEmptyState` |
 | `getActiveSessions()` | — | **throws** `LIBREDB_ACTIVE_SESSIONS_REFUSAL` — no session registry exists |
-| `getStorageStats()` | `fs.statSync` | one entry: file path + size |
+| `getStorageStats()` | `fs.statSync` | one entry: file path + size; `sizeBytes` is a **required** number, so it stays `0` (never absent) when the stat fails — [§7.3](#73-when-the-file-size-is-not-measurable) |
 | `getTableStats()` | the schema tree's scan | one row per namespace: lens as `schemaName`, key count as `rowCount`, no bytes |
 | `getIndexStats()` | — | **throws** `LIBREDB_INDEX_STATS_REFUSAL` — no index object exists |
 
-`getOverview().tableCount` calls `getSchema()` internally — it is a full scan, so it honors the
+`getOverview().tableCount` calls the object surface internally — it is a full scan, so it honors the
 10 000-key cap and may undercount for very large files.
 
 Because `getPerformanceMetrics()` returns an empty object, every card on the Overview and Performance
@@ -531,7 +976,7 @@ it reported *zero tables* on a database with tables. Measured before the change,
 separately:
 
 - **`getTableStats()` — implemented.** A namespace's rows *are* its keys (`employees:1`,
-  `articles:a1`), which is exactly what `getSchema()` already counts, so the panel now reports one
+  `articles:a1`), which is exactly what the object surface already counts, so the panel now reports one
   row per namespace from that same scan (`scanGroups()` is shared, so the tree and the panel can
   never disagree). `schemaName` carries the namespace's **lens** — `relational` / `document` / `kv`
   — because LibreDB has no schema namespace and the lens is the one thing the catalog declares about
@@ -565,6 +1010,30 @@ that request, so a throwing health check would lock the embedded engine out of t
 (the lesson of [#455](https://github.com/libredb/libredb-studio/issues/455)). A monitoring panel has
 the opposite obligation — it is the surface that must say what it could not read.
 
+### 7.3 When the file size is not measurable
+
+`fileSizeBytes()`, the one place every size figure in this file comes from, reads `fs.statSync(this.dbPath).size`.
+Through 0.16.2 it returned `0` both when there was no `dbPath` at all and when `statSync` threw for any
+reason, so `getOverview()` published a measured-looking zero indistinguishable from a genuinely empty
+database (#546). `DatabaseOverview.databaseSizeBytes` is optional precisely so this can be said instead
+— *"absence and zero are different facts"*, its docblock in
+[`src/lib/db/types.ts`](../../src/lib/db/types.ts) — and until now this provider could not say it.
+
+The monitoring **Storage** tab
+([`src/components/monitoring/tabs/StorageTab.tsx`](../../src/components/monitoring/tabs/StorageTab.tsx))
+is what the difference buys: it keys its whole breakdown off `databaseSizeBytes !== undefined`, so on
+the absence it renders "No storage size information available" instead of a breakdown drawn over a
+file this provider never measured. `getHealth()`'s `databaseSize` string moves with the same absence —
+`fileSizeHuman()` reads `"N/A"` rather than formatting a zero it was never given.
+
+**`StorageStats.sizeBytes` does not get the same treatment, because it cannot.** Unlike
+`DatabaseOverview.databaseSizeBytes` it is a *required* `number` with no optional counterpart
+(`src/lib/db/types.ts`), so `getStorageStats()` coerces `fileSizeBytes()`'s absence back to `0` at its
+own call site — the one place in this file that keeps the old fallback, because its type leaves it no
+other honest answer. `size`, the formatted string beside it, still reads `"N/A"` through the same
+`fileSizeHuman()` every other caller uses, so the row is not internally consistent between its two size
+fields on a failed read — a required-field limitation, not an oversight.
+
 ---
 
 ## 8. Maintenance
@@ -582,8 +1051,8 @@ unsupported (issue #272) — and, on the same reading, its *Vacuum* summary card
 *Not supported* rather than the `0` over green **OK** that a bloat count over no rows produced, which
 was a clean bill of health for an operation this provider does not offer — and the admin
 **Operations** tab hides its whole Global Operations group and its per-table buttons (issue #282). Neither offers a control that could only
-answer HTTP 400. The schema explorer's own per-row `Analyze`/`Vacuum` items are hidden here too, but
-for a different reason — the rows are derived groupings, see 5.3.
+answer HTTP 400. The schema explorer's own per-row `Analyze`/`Vacuum` items are hidden here too, by this same declaration through `maintenanceControl`, and
+for a second reason: the rows are derived groupings, see 5.3.
 
 ---
 
@@ -597,17 +1066,21 @@ for a different reason — the rows are derived groupings, see 5.3.
 | `queryDialect` | `libredb` (routes the client query generators to LibreDB command output; see 5.3) |
 | `supportsExplain` | `false` |
 | `supportsExternalQueryLimiting` | `false` |
-| `supportsCreateTable` | `false` |
+| `createTable` | absent |
 | `supportsInlineRowEdit` | `false` — the command grammar (`get`/`put`/`delete`/`prefix`/`range`) has no `UPDATE ... SET` for the results grid's inline editor to emit |
+| `supportsTestDataGeneration` | `false` - no kind here declares a row write, and the command grammar has no multi-row insert for the Generate Test Data dialog to emit |
+| `supportsResultPagination` | `false` — this provider adds no `prepareQuery` override, so it inherits the base one, which echoes the requested offset back while applying nothing. A `true` here would render a control whose every click re-reads page one (#816) |
 | `supportsTransactions` | `false` — the command grammar has no transaction verb at all, so the trio and SANDBOX are not offered (#464) |
 | `declaresForeignKeys` | `false` — the catalog declares namespaces and columns and nothing that references another namespace, so there is no foreign key to read |
 | `tablesAreDerivedGroupings` | `true` — the namespaces come from a bounded `kv.range` over 10000 keys, grouped by prefix, so they are this server's summary of what one scan reached rather than objects the engine declares. The agent layer states this to a plan run in one sentence |
-| `singleWriterFile` | `true` — `lib.open({ path })` takes an exclusive `<path>.lock`, so this file admits ONE handle and a second open throws `LOCKED`. The three callers that used to open a second one reuse the open handle instead ([§4.2.1](#421-on-disk-format-locking-and-version-compatibility-02x)). The only engine that declares it: SQLite, the other file engine, takes its locks per transaction rather than at open |
+| `singleWriterFile` | `true` — `lib.open({ path })` takes an exclusive `<path>.lock`, so this file admits ONE handle and a second open throws `LOCKED`. The three callers that used to open a second one reuse the open handle instead ([§4.2.1](#421-on-disk-format-locking-and-version-compatibility-02x)). DuckDB declares it too. SQLite, the third file engine here, does not: it takes its locks per transaction rather than at open |
 | `supportsMaintenance` | `false` |
 | `maintenanceOperations` | `[]` |
 | `supportsConnectionString` | `false` |
 | `defaultPort` | `null` |
 | `schemaRefreshPattern` | `\\b(put\|delete)\\b` |
+| `containerPathShapes` | `exact`: the declaration names no container level (`containerLevels` is absent), so only the empty path `[]` addresses a container and any segment is refused, by the object routes over HTTP and by this provider for a caller that reaches it directly (#1147) |
+| `objectKinds` | `table`, `collection`, `keyspace` ([§6.1](#61-the-object-surface-789)) |
 
 `schemaRefreshPattern` tells the UI which executed commands should trigger a schema (key-pattern)
 refresh — `put` and `delete` both add or remove keys.
@@ -642,6 +1115,18 @@ Queries panel is always empty here — and this label is why that emptiness is a
 the Sessions and Indexes panels refuse instead. Its sentence was hardcoded to PostgreSQL's
 `pg_stat_statements` advice (#463).
 
+### SQL writing
+
+[`embedded/libredb-sql-writing.ts`](../../src/lib/db/providers/embedded/libredb-sql-writing.ts) declares how a generated statement spells a literal, a name and a bind for this engine, and it is this engine's row of `SQL_WRITING` ([`src/lib/db/sql-writing/index.ts`](../../src/lib/db/sql-writing/index.ts)), which the readers in [`src/lib/sql/values.ts`](../../src/lib/sql/values.ts) and [`src/lib/sql/identifier.ts`](../../src/lib/sql/identifier.ts) look up.
+A literal is written by `literalStandard` and read back by `unquoteStandard`: the quote is doubled and a backslash is data.
+A name is quoted by `identifierDoubleQuoted`, the SQL standard form: a double-quoted name with an inner double quote doubled.
+There is no placeholder (`placeholder: null`), so a generator quotes the value with `quoteLiteral` instead of emitting a bind.
+This engine declares `queryLanguage: "json"`, so no statement is ever built for it to read; what a generator emits for such a connection is portable SQL meant to run elsewhere, and the standard form is the only thing it can claim.
+Inline row editing reads a key column's kind through the shared `INSTANT_TYPE_NAMES`, `FLOAT64_TYPE_NAMES` and `EXACT_DECIMAL_TYPE_NAMES` of the module's `inlineEdit`, and binds every edit as typed.
+
+The module's `export` field writes a result export's CREATE TABLE and INSERT from the shared building blocks alone: `STANDARD_DDL_TYPES` for the column types, `NOTHING_STANDS_ALONE` and `NO_BARE_SPELLING`, so every bare declared name is re-spelled from its family, `NULL_NON_FINITE` for NaN and the infinities, and `binaryStandardHex` for a binary cell (`X'0102'`).
+The engine declares `queryLanguage: "json"`, so no SQL statement is ever built for it to read, and a file exported from it is meant to run somewhere else: every bare name in it is re-spelled portably rather than kept as one engine's private word.
+
 ---
 
 ## 10. Error handling
@@ -655,6 +1140,7 @@ The provider raises the shared error classes from
 | `@libredb/libredb` package not installed | `DatabaseConfigError` — install instructions in message |
 | Operation before `connect()` | `DatabaseConfigError` (via `ensureConnected()`) |
 | `connect()` fails to open the file | `ConnectionError` |
+| `connect()` on a path, or a `<path>.lock`, that exists and is not a regular file ([§3.2](#32-no-in-memory-connections)) | `ConnectionError`: *"Failed to open LibreDB file: <path> is a named pipe (FIFO), not a regular file"*, naming the `.lock` when it is the one, or the file's other kind |
 | Empty command | `QueryError` — *"Empty command"* |
 | Unknown verb | `QueryError` — lists supported verbs |
 | Wrong argument count for a verb | `QueryError` — usage hint (e.g. *"Usage: get <key>"*) |
@@ -701,7 +1187,7 @@ cross-contamination.
 ### 11.2 Coverage
 
 The suite covers: validation (missing path), connect/disconnect (real file + idempotent
-disconnect), capabilities, labels, `getSchema` (prefix grouping, column definition, sort order),
+disconnect), capabilities, labels, the object reads (prefix grouping, column definition, sort order),
 all five query commands (`get` found, `get` missing, `prefix`, `range`, `put`, `delete`),
 multi-word values, error paths (unknown verb, unmatched quote), and monitoring (`getOverview` file
 size + group count, `getStorageStats` path + size, `runMaintenance` unsupported).
@@ -716,13 +1202,13 @@ and `getIndexStats()` reject with their own sentences while `getHealth()` still 
 `errors`, the Tables panel populated.
 
 A dedicated **catalog-aware schema** suite seeds a file with a relational table (`table()`) and a
-document collection (`doc()`) alongside the raw kv keys, then asserts: (a) `getSchema()` and
+document collection (`doc()`) alongside the raw kv keys, then asserts: (a) the object surface and
 `range`/`prefix` queries never surface the reserved catalog prefix; (b) the relational table shows
 its real declared columns with the primary key marked (the relational signal); (c) the document
 collection shows the generic `id`/`document` columns (the document signal); and (d) raw kv
 namespaces still group as `key`/`value` pseudo-tables.
 
-The **single-writer reuse** (D3/B49) is asserted in `tests/unit/db/factory.test.ts` rather than
+The **single-writer reuse** (D3/B49) is asserted in `tests/isolated/factory.test.ts` rather than
 here, because it is the factory's behaviour and it needs the real factory — which this file cannot
 import, since `tests/api/db/test-connection.test.ts` replaces `@/lib/db/factory` process-wide with
 `mock.module`. Two suites there run on the real package and real temp files: *single-writer file
@@ -742,7 +1228,47 @@ and left byte-for-byte untouched with no lock held; a newer-format file is refus
 `QueryError` without poisoning the open handle. Test temp-file cleanup removes the `.lock`
 sidecars alongside the database files.
 
-### 11.3 Run it
+### 11.3 The object-surface fixture
+
+LibreDB is embedded: there is no image to pull and no service in `database-compose.yml`, so the
+fixture is a module rather than a compose mount. It is
+[`docker/libredb-init/01-object-fixture.ts`](../../docker/libredb-init/01-object-fixture.ts), it
+lives beside the other engines' fixtures, and it is part of the deliverable rather than
+scaffolding (standing ruling 5i): the object-surface tests import `buildObjectFixture` from it,
+so the objects they reason about are created BY the fixture and not by hand in the test.
+
+Run it to get a durable file you can open in Studio:
+
+```bash
+bun docker/libredb-init/01-object-fixture.ts                     # ./.libredb-fixture/object-fixture.libredb
+bun docker/libredb-init/01-object-fixture.ts /tmp/demo.libredb   # anywhere else
+```
+
+It is re-runnable: the target file and its `.lock` sidecar are removed first, so a second run
+produces a database identical to the first rather than one holding both runs' keys. Point a
+connection at the path it prints, with the file path in the `database` field
+([§4.1](#41-configuration-fields)).
+
+What it holds, and why each piece is there:
+
+| Namespace | Lens | Rows | Why |
+|---|---|---|---|
+| `employees` | relational | 2 | a cataloged table with a real column schema |
+| `vacancies` | relational | 0 | a cataloged table holding nothing, so `{ count: 0 }` is the engine answering none |
+| `applicants` | relational | 0 | sorts BEFORE `employees` while the enumerator reaches it AFTER, so an unsorted listing is observable |
+| `articles` | document | 2 | a cataloged collection |
+| `notes` | document | 1 | its name is ALSO a bare key, so two objects are spelled one way and must not share an address |
+| `cache:a`, `cache:b` | raw kv | 2 keys | an uncataloged prefix grouping |
+| `standalone` | raw kv | 1 key | a bare key, its own grouping |
+| `notes` | raw kv | 1 key | the collision above, from the raw side |
+
+That is `table: 3`, `collection: 2`, `keyspace: 3`. `applicants` is the row worth explaining:
+`scanGroups()` appends a cataloged namespace the key scan never saw AFTER the groups it did see,
+and the scan walks the keyspace in byte order, so without a name that sorts early every natural
+order in the fixture is already the sorted one and deleting the sort changes nothing anybody can
+observe. It was added after a mutation run showed exactly that.
+
+### 11.4 Run it
 
 ```bash
 # Just this file
@@ -811,7 +1337,8 @@ await provider.query('delete session:abc');
 // -> { rows: [{ changed: 1 }], rowCount: 1, fields: ['changed'] }
 
 // Browse the schema (prefix groups as tables)
-const schema = await provider.getSchema();
+const objects = await provider.listObjects(container, 'table');
+const { details } = await provider.describeObjects(container, 'table');
 // -> [{ name: 'user:*', rowCount: 3, columns: [{name:'key',...},{name:'value',...}] }, ...]
 
 await provider.disconnect();
@@ -831,10 +1358,10 @@ await provider.disconnect();
   command grammar in v1. Deferred to a future release.
 - **No in-memory connections.** A missing `database` path throws rather than silently opening an
   ephemeral in-memory store, which would be discarded on disconnect and offer no durable value.
-- **Catalog-aware views are now live (since `@libredb/libredb` 0.0.2).** `getSchema()` reads
+- **Catalog-aware views are now live (since `@libredb/libredb` 0.0.2).** the object surface reads
   `catalog(db)` and presents real relational tables (with their declared columns) and document
   collections; only namespaces written through the raw `kv` lens fall back to the prefix-grouped
-  `key`/`value` view. Studio's `TableSchema` has no dedicated "kind" field, so the kind is
+  `key`/`value` view. The object shape has no dedicated "kind" field, so the kind is
   signalled by the columns rather than a label. The reserved catalog namespace is excluded from
   all user-facing views (schema and query results).
 - **Schema scan capped at 10 000 keys.** Prefix groups that only appear beyond the cap won't show
@@ -852,6 +1379,18 @@ await provider.disconnect();
 
 ---
 
+## Migration DDL
+
+[`LIBREDB_MIGRATION_DDL`](../../src/lib/db/providers/embedded/libredb-migration-ddl.ts) is what the schema-diff migration generator writes for `libredb`, read through `migrationDdlFor` in `src/lib/db/migration-ddl/`.
+It declines the whole diff: `refusal` is the one line the migration prints after its header, in place of any DDL, and `transactionWrapper` is `null`.
+The embedded engine speaks a JSON command grammar, so there is no table DDL to wrap (#284).
+
+The refusal reason it prints, verbatim:
+
+- "The embedded engine speaks a JSON command grammar, not SQL DDL."
+
+---
+
 ## 14. References
 
 - Driver: [`@libredb/libredb`](https://github.com/libredb/libredb-database)
@@ -861,3 +1400,9 @@ await provider.disconnect();
 - Errors: [`src/lib/db/errors.ts`](../../src/lib/db/errors.ts)
 - Tests: [`tests/integration/db/libredb-provider.test.ts`](../../tests/integration/db/libredb-provider.test.ts)
 - API contract: [`docs/API_DOCS.md`](../API_DOCS.md)
+
+
+Connection targets reserve Studio's storage database, its WAL/SHM files and bootstrap
+credentials (including backups and temporary files). This applies to every role.
+Checks normalize paths, resolve symbolic links and compare existing file identities
+so hard links cannot alias reserved files. Other user database files beside them remain usable.

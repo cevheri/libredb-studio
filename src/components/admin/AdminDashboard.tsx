@@ -1,10 +1,12 @@
 "use client";
 
+import { appFetch } from "@/lib/config/base-path";
+import { releaseAccountWorkspace } from "@/lib/storage/sign-out";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import type { ReactNode } from "react";
 import { Button } from "@/components/ui/button";
-import { LogOut, ArrowLeft, LayoutDashboard, Wrench, Activity, Shield, FileText } from "lucide-react";
+import { LogOut, ArrowLeft, LayoutDashboard, Wrench, Activity, Shield, FileText, Users } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { ADMIN_SECTIONS, adminSectionFromPathname, adminSectionPath, type AdminSection } from "@/lib/admin-sections";
@@ -14,6 +16,7 @@ const SECTION_NAV: Record<AdminSection, { label: string; icon: typeof LayoutDash
   operations: { label: "Operations", icon: Wrench },
   monitoring: { label: "Monitoring", icon: Activity },
   security: { label: "Security", icon: Shield },
+  accounts: { label: "Accounts", icon: Users },
   audit: { label: "Audit", icon: FileText },
 };
 
@@ -27,10 +30,31 @@ export default function AdminDashboard({ children }: AdminDashboardProps) {
   const activeSection = adminSectionFromPathname(pathname);
 
   const handleLogout = async () => {
-    await fetch("/api/auth/logout", { method: "POST" });
+    // In server storage mode the browser copy belongs to the signed-in account and is cleared once
+    // the session ended.
+    let data: { redirectUrl?: string };
+    try {
+      const { signedOut, response } = await releaseAccountWorkspace(() =>
+        appFetch("/api/auth/logout", { method: "POST" }),
+      );
+      if (!signedOut) throw new Error("Sign-out did not complete");
+      data = response ? await response.json() : {};
+    } catch {
+      toast.error("Failed to logout");
+      return;
+    }
     toast.success("Logged out successfully");
-    router.push("/login");
-    router.refresh();
+
+    // In OIDC mode the route answers with the provider's end_session URL. The local cookie is gone
+    // either way, but the provider session only ends if the browser visits that URL, so dropping it
+    // here left an admin signed in at the IdP while the app looked signed out. Same handling as
+    // src/hooks/use-auth.ts, which is the other caller of this route.
+    if (data.redirectUrl) {
+      window.location.href = data.redirectUrl;
+    } else {
+      router.push("/login");
+      router.refresh();
+    }
   };
 
   return (
@@ -54,7 +78,7 @@ export default function AdminDashboard({ children }: AdminDashboardProps) {
             <Button
               variant="outline"
               size="sm"
-              className="border-red-500/20 text-red-400 hover:bg-red-500/10 hover:text-red-300"
+              className="border-danger-tint/20 text-danger hover:bg-danger-tint/10 hover:text-danger-bright"
               onClick={handleLogout}
             >
               <LogOut className="mr-2 h-3.5 w-3.5" />
@@ -82,10 +106,8 @@ export default function AdminDashboard({ children }: AdminDashboardProps) {
                     // whitespace-nowrap keeps the longest labels on one line inside the
                     // h-11 row; the nav's overflow-x-auto then scrolls instead of wrapping.
                     "flex flex-1 items-center justify-center gap-2 px-3 sm:px-4 h-11 border-b-2 text-xs sm:text-sm whitespace-nowrap transition-colors",
-                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-400/60",
-                    isActive
-                      ? "border-blue-400 text-blue-400"
-                      : "border-transparent text-fg-muted hover:text-fg-secondary",
+                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand/60",
+                    isActive ? "border-brand text-brand" : "border-transparent text-fg-muted hover:text-fg-secondary",
                   )}
                 >
                   <Icon className="h-4 w-4" strokeWidth={1.5} />

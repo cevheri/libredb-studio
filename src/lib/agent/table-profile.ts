@@ -25,13 +25,15 @@
  *    that matched never leave it. Neither test establishes that a column holds
  *    personal data; both establish that it is worth a human looking. The shape tests
  *    are PER-DIALECT predicates rather than one shared operator, because the shapes
- *    worth suspecting are not all expressible in the intersection of the two
+ *    worth suspecting are not all expressible in the intersection of the three
  *    grammars (B26; see `PROFILE_SHAPES`).
  */
 
 import { quoteIdentifier } from "@/lib/sql/identifier";
-import type { ColumnSchema, DatabaseType, TableSchema } from "@/lib/types";
-import { AgentComposedSqlError, MAX_CATALOG_SELECTOR_LENGTH } from "./composed-sql";
+import type { ColumnSchema, DatabaseType } from "@/lib/types";
+import { AgentComposedSqlError, MAX_CATALOG_SELECTOR_LENGTH } from "./composed-sql-primitives";
+import { engineServerDialect } from "./languages/engines/server";
+import type { AgentInventoryObject } from "./types";
 
 /**
  * How deeply one profile reads. Each level is the one before it plus more, so a
@@ -90,13 +92,29 @@ const PII_NAME_WORDS: readonly string[] = Object.freeze([
   "zip",
 ]);
 
-/** Declared types this module is willing to apply a text shape test to. */
+/**
+ * Types this module is willing to apply a text shape test to.
+ *
+ * It matches a SPELLING, which makes it only as good as the spelling it is handed, and
+ * the DECLARED one is not always usable. On SQL Server an ALIAS type is reported by its
+ * own name, so `Person.PersonPhone.PhoneNumber` is declared `Phone` and
+ * `Person.Person.FirstName` is `Name` (measured on AdventureWorks2022 via `sys.columns`,
+ * where `TYPE_NAME(user_type_id)` answers `Phone` and `TYPE_NAME(system_type_id)` answers
+ * `nvarchar`), and no pattern over a name the schema's author invented can tell a text
+ * alias from a numeric one.
+ *
+ * So the fix is where the type is READ rather than here, and it landed: the mssql
+ * provider reports the base type beside the declared one (`ColumnSchema.baseType`), and
+ * every type test in this file matches `decidableType` below, which prefers it. An
+ * alias-typed column therefore gets its shape tests. Measured end to end after that
+ * change: the provider reports `PhoneNumber` as `{type: Phone, baseType: nvarchar}` and
+ * the composed profile carries its `shaped_1` and `digits_1` counts, which it did not
+ * before. Where an engine draws no such distinction there is no `baseType` to prefer and
+ * the declared spelling is still what this matches, unchanged.
+ */
 const TEXTUAL_TYPE = /char|text|string|clob|varying/i;
 
-/** Dialects with a verified profile composition; enforced by `composeTableProfile`. */
-type ProfileDialect = "postgres" | "sqlite";
-
-/** Something, an `@`, something, a `.`, something. Both engines spell `LIKE` alike. */
+/** Something, an `@`, something, a `.`, something. All three dialects spell `LIKE` alike. */
 const EMAIL_SHAPE = "%_@_%._%";
 
 /**
@@ -109,8 +127,52 @@ const EMAIL_SHAPE = "%_@_%._%";
  */
 export const DIGIT_RUN_LENGTH = 9;
 
-/** SQLite has no quantifier, so the run is spelled out one class at a time. */
-const SQLITE_DIGIT_RUN = `*${"[0-9]".repeat(DIGIT_RUN_LENGTH)}*`;
+/**
+ * How one engine composes a profile: the server dialect member `profileComposition`, which each SQL engine's overlay
+ * in `languages/sql/engines/` supplies or declares `"unsupported"`. The core passes the shapes' own constants into the
+ * shape tests, so an overlay needs nothing from this module but its types.
+ */
+export interface AgentProfileComposition {
+  /** The shape tests, each over an already-quoted column reference, in this engine's spelling (see `PROFILE_SHAPES`). */
+  readonly shapeTests: {
+    readonly email: (quotedColumn: string, likePattern: string) => string;
+    readonly digitRun: (quotedColumn: string, runLength: number) => string;
+  };
+  /**
+   * Types with no equality operator, so `count(DISTINCT …)` refuses them.
+   *
+   * PostgreSQL answers `could not identify an equality operator for type json` — and
+   * because one unsupported column aborts the WHOLE aggregate, a single `json` column
+   * would have failed distribution and pattern profiling for the entire table. Found
+   * by review on #345.
+   *
+   * An exclusion rather than an allowlist of comparable types, deliberately: the
+   * comparable set is open (every domain, every enum, every extension type), so an
+   * allowlist would refuse to count things it simply had not heard of. This list is
+   * the closed set that genuinely has no default equality.
+   */
+  readonly incomparableType: RegExp;
+  /**
+   * Types the engine refuses to COUNT at all, so the column is left out whole.
+   *
+   * Stronger than `incomparableType`, and therefore its own set: an incomparable type
+   * still has a presence count and only loses its distinct count, while a column of one
+   * of these types cannot be projected at all. SQL Server answers
+   * "Operand data type text is invalid for count operator" (Msg 8117) for a plain
+   * `count([col])` on `text`, `ntext` and `image` - measured on 2022 CU26, one probe
+   * column per type. Because the whole profile is ONE aggregate over one scan, a single
+   * such column would fail the statement and with it every other column's statistics, so
+   * the column contributes no presence, no distinct count and no shape test. That reads
+   * back as "the engine was not asked about this column", which is exactly true: a
+   * column the composer left out is absent from the profile rather than reported as
+   * empty (see `readTableProfile`).
+   *
+   * Only SQL Server has such a set. PostgreSQL and SQLite count presence for every type
+   * this module has met, including the ones they refuse to count DISTINCT, so an entry
+   * for them would be an assertion nothing measured.
+   */
+  readonly uncountableType?: RegExp;
+}
 
 /** One value shape, and how each engine spells the test for it. */
 interface ProfileShape {
@@ -118,41 +180,39 @@ interface ProfileShape {
   readonly alias: string;
   /** The app's own words for the shape, read back into a `suspected_pii` finding. */
   readonly words: string;
-  /** The predicate, per dialect, over an already-quoted column reference. */
-  readonly predicate: Readonly<Record<ProfileDialect, (quotedColumn: string) => string>>;
+  /** The predicate, in the engine's own shape tests, over an already-quoted column reference. */
+  readonly test: (shapeTests: AgentProfileComposition["shapeTests"], quotedColumn: string) => string;
 }
 
 /**
  * The shapes tested inside the database, so no matching value ever leaves it.
  *
  * PER-DIALECT predicates rather than one shared `LIKE` (B26). `LIKE` is the only
- * pattern operator both engines spell the same way, and `_` in it means "any
+ * pattern operator all three dialects spell the same way, and `_` in it means "any
  * character" rather than "any digit" — so a digit run cannot be expressed in the
  * intersection at all, and an earlier draft's `LIKE '%_________%'` would have
  * reported `suspected_pii` for essentially every text column. PostgreSQL spells the
- * run `~ '[0-9]{9,}'` and SQLite spells it `GLOB '*[0-9]…*'`.
+ * run `~ '[0-9]{9,}'`, SQLite spells it `GLOB '*[0-9]…*'` and T-SQL spells it as the
+ * character class repeated inside a `LIKE`.
  *
- * Both spellings were run against live engines over the same four rows and returned
- * the same counts — PostgreSQL 18 and SQLite 3.53 — so the two dialects agree about
- * what a run is rather than merely both being accepted. The SQLite arm is executed
- * end to end in `tests/unit/lib/agent/table-profile.test.ts`.
+ * Every spelling was run against a live engine and returned the same counts, so the
+ * dialects agree about what a run is rather than each merely being accepted: PostgreSQL
+ * 18 and SQLite 3.53 over the same four rows, and the T-SQL pair replayed on SQL Server
+ * 2022 CU26 over four values (a nine-digit run, an eight-digit one, an email and a plain
+ * string), which counted the nine-digit run once and the email once. The SQLite arm is
+ * executed end to end in `tests/unit/lib/agent/table-profile.test.ts`.
  */
 const EMAIL_SHAPE_TEST: ProfileShape = Object.freeze({
   alias: "shaped",
   words: "an email address",
-  predicate: Object.freeze({
-    postgres: (quoted: string) => `${quoted} LIKE '${EMAIL_SHAPE}'`,
-    sqlite: (quoted: string) => `${quoted} LIKE '${EMAIL_SHAPE}'`,
-  }),
+  test: (shapeTests: AgentProfileComposition["shapeTests"], quoted: string) => shapeTests.email(quoted, EMAIL_SHAPE),
 });
 
 const DIGIT_RUN_SHAPE_TEST: ProfileShape = Object.freeze({
   alias: "digits",
   words: `a run of ${DIGIT_RUN_LENGTH} or more digits`,
-  predicate: Object.freeze({
-    postgres: (quoted: string) => `${quoted} ~ '[0-9]{${DIGIT_RUN_LENGTH},}'`,
-    sqlite: (quoted: string) => `${quoted} GLOB '${SQLITE_DIGIT_RUN}'`,
-  }),
+  test: (shapeTests: AgentProfileComposition["shapeTests"], quoted: string) =>
+    shapeTests.digitRun(quoted, DIGIT_RUN_LENGTH),
 });
 
 const PROFILE_SHAPES: readonly ProfileShape[] = Object.freeze([EMAIL_SHAPE_TEST, DIGIT_RUN_SHAPE_TEST]);
@@ -213,31 +273,49 @@ function assertProfileTable(value: string): string {
   return trimmed;
 }
 
-/** The qualified target, quoted per dialect. Both engines here quote with `"`. */
-function quoteTarget(dialect: DatabaseType, schema: string | undefined, table: string): string {
-  const quotedTable = quoteIdentifier(assertProfileTable(table), dialect);
-  if (schema === undefined) return quotedTable;
-  return `${quoteIdentifier(assertProfileTable(schema), dialect)}.${quotedTable}`;
+/**
+ * The resolved address, one quoted identifier per SEGMENT, each in the DIALECT's own quote:
+ * `"` on PostgreSQL and SQLite, `[…]` on SQL Server (`quoteIdentifier`).
+ *
+ * A schema and a table was enough while a resolution produced at most those two, and it is
+ * not any more: an address is as deep as the object read made it, and joining its leading
+ * segments into one string before quoting it composes `"shop.sales"."orders"` - a single
+ * identifier no engine holds, assembled from two that it does (#789). Quoting segment by
+ * segment is the only shape that cannot invent one. An empty address composes nothing: there
+ * is no name in it to profile.
+ */
+function quoteTarget(dialect: DatabaseType, segments: readonly string[]): string {
+  if (segments.length === 0) {
+    throw new AgentComposedSqlError("a profile needs one table name of a usable length", "INVALID_SELECTOR");
+  }
+  return segments.map((segment) => quoteIdentifier(assertProfileTable(segment), dialect)).join(".");
 }
 
-const isTextual = (column: ColumnSchema): boolean => TEXTUAL_TYPE.test(column.type);
-
 /**
- * Declared types with no equality operator, so `count(DISTINCT …)` refuses them.
+ * The spelling a TYPE TEST must match against, which is not always the declared one.
  *
- * PostgreSQL answers `could not identify an equality operator for type json` — and
- * because one unsupported column aborts the WHOLE aggregate, a single `json` column
- * would have failed distribution and pattern profiling for the entire table. Found
- * by review on #345.
+ * SQL Server alias types are why: `Person.PersonPhone.PhoneNumber` is declared `Phone`,
+ * an alias over `nvarchar`, and `Person.Person.FirstName` is `Name` over the same. The
+ * declared name is what a person wants to see and what `type` carries; it is a name the
+ * schema's author invented, so every regex below would match nothing against it, and the
+ * one column in that table the PII shapes exist to find got no shape test at all. Worse,
+ * an alias over `text` would slip past `uncountableType` and fail the whole table's
+ * profile with Msg 8117.
  *
- * An exclusion rather than an allowlist of comparable types, deliberately: the
- * comparable set is open (every domain, every enum, every extension type), so an
- * allowlist would refuse to count things it simply had not heard of. This list is
- * the closed set that genuinely has no default equality.
+ * `baseType` is the provider's answer to that, absent wherever an engine draws no such
+ * distinction, so this falls back to the declared type and every other engine is unchanged.
  */
-const INCOMPARABLE_TYPE = /\b(jsonb?|xml|point|line|lseg|box|path|polygon|circle)\b/i;
+const decidableType = (column: ColumnSchema): string => column.baseType ?? column.type;
 
-const isComparable = (column: ColumnSchema): boolean => !INCOMPARABLE_TYPE.test(column.type);
+const isTextual = (column: ColumnSchema): boolean => TEXTUAL_TYPE.test(decidableType(column));
+
+const isComparable = (column: ColumnSchema, composition: AgentProfileComposition): boolean =>
+  !composition.incomparableType.test(decidableType(column));
+
+const isCountable = (column: ColumnSchema, composition: AgentProfileComposition): boolean => {
+  const refused = composition.uncountableType;
+  return refused === undefined || !refused.test(decidableType(column));
+};
 
 /**
  * One statement covering the whole table, rather than one per statistic.
@@ -246,17 +324,24 @@ const isComparable = (column: ColumnSchema): boolean => !INCOMPARABLE_TYPE.test(
  * on a single table. Everything here is an aggregate over one scan, which is also
  * the shape an engine can plan best.
  *
- * The shape tests are applied only to columns whose DECLARED type reads as textual:
+ * The shape tests are applied only to columns whose type reads as textual - the base
+ * type where the engine reports one, the declared type otherwise (`decidableType`):
  * comparing an integer column to a string pattern is an error on PostgreSQL, and
  * casting every column to text to avoid that would turn a bounded read into a full
  * conversion of the table.
+ *
+ * A column of a type the engine will not count is left out of the projection entirely
+ * (`uncountableType`). Because everything is one aggregate, one such column would
+ * otherwise cost the table its whole profile. A table made only of them still composes:
+ * the row count is a profile, a smaller one than was asked for.
  */
 export function composeTableProfile(
   dialect: DatabaseType,
-  selector: { readonly schema?: string; readonly table: string; readonly depth: AgentProfileDepth },
+  selector: { readonly segments: readonly string[]; readonly depth: AgentProfileDepth },
   columns: readonly ColumnSchema[],
 ): string {
-  if (dialect !== "postgres" && dialect !== "sqlite") {
+  const composition = engineServerDialect(dialect).profileComposition;
+  if (composition === "unsupported") {
     throw new AgentComposedSqlError(
       `no verified profile composition for provider type "${dialect}"`,
       "UNSUPPORTED_DIALECT",
@@ -268,23 +353,26 @@ export function composeTableProfile(
 
   const parts = ["count(*) AS row_count"];
   columns.forEach((column, index) => {
+    // A type the engine refuses to count contributes NOTHING: one such column in the
+    // projection fails the single aggregate and takes the whole table's profile with it.
+    if (!isCountable(column, composition)) return;
     const quoted = quoteIdentifier(column.name, dialect);
     parts.push(`count(${quoted}) AS ${alias("present", index)}`);
     // A type with no equality operator is skipped rather than counted: its absence
     // reads as "the engine did not report this", which is exactly true.
-    if (selector.depth !== "basic" && isComparable(column)) {
+    if (selector.depth !== "basic" && isComparable(column, composition)) {
       parts.push(`count(DISTINCT ${quoted}) AS ${alias("distinct", index)}`);
     }
     if (selector.depth === "pattern" && isTextual(column)) {
       // Counted inside the database: the rows that matched are never returned.
       for (const shape of PROFILE_SHAPES) {
-        const test = shape.predicate[dialect](quoted);
+        const test = shape.test(composition.shapeTests, quoted);
         parts.push(`count(CASE WHEN ${test} THEN 1 END) AS ${alias(shape.alias, index)}`);
       }
     }
   });
 
-  return `SELECT ${parts.join(", ")} FROM ${quoteTarget(dialect, selector.schema, selector.table)}`;
+  return `SELECT ${parts.join(", ")} FROM ${quoteTarget(dialect, selector.segments)}`;
 }
 
 // ─── reading the result back ────────────────────────────────────────────────
@@ -303,6 +391,13 @@ const count = (row: Record<string, unknown>, key: string): number | undefined =>
  * Turns the one aggregate row into a profile. A statistic the engine did not
  * report is ABSENT rather than zero: zero present values is a finding, and "the
  * engine said nothing" is not.
+ *
+ * A COLUMN the engine did not report is absent the same way, and for the same reason.
+ * The composer leaves an uncountable column out of the projection whole
+ * (`uncountableType`), and reading its missing presence count back as zero would make
+ * a `text` column on SQL Server arrive as `high_null` at 100% - a finding derived from
+ * a question nobody asked. The aliases carry the column's own index, so dropping one
+ * column cannot shift another's statistics onto it.
  */
 export function readTableProfile(
   table: string,
@@ -315,23 +410,35 @@ export function readTableProfile(
   const rowCount = count(row, "row_count");
   if (rowCount === undefined) return null;
 
-  const profiled: AgentColumnProfile[] = columns.map((column, index) => {
+  const profiled: AgentColumnProfile[] = [];
+  columns.forEach((column, index) => {
+    const present = count(row, alias("present", index));
+    if (present === undefined) return;
     const distinct = count(row, alias("distinct", index));
     const shaped = count(row, alias(EMAIL_SHAPE_TEST.alias, index));
     const digitRun = count(row, alias(DIGIT_RUN_SHAPE_TEST.alias, index));
-    return {
+    profiled.push({
       column: column.name,
-      present: count(row, alias("present", index)) ?? 0,
+      present,
       ...(distinct === undefined ? {} : { distinct }),
       ...(shaped === undefined ? {} : { shaped }),
       ...(digitRun === undefined ? {} : { digitRun }),
-    };
+    });
   });
 
-  return { table, depth, rowCount, columns: profiled, findings: deriveFindings(rowCount, columns, profiled) };
+  return { table, depth, rowCount, columns: profiled, findings: deriveFindings(rowCount, profiled) };
 }
 
-const ratio = (part: number, whole: number): string => `${Math.round((part / whole) * 100)}%`;
+/**
+ * A share as a whole percent, never rounded up onto 100% it has not reached: 999 of 1000 is "over 99%". A live
+ * assessment on 2026-10-17 was told a column held "100% of 1000 rows" with no value while the profile counted one,
+ * and both engines' reports then called the column completely empty. Every finding that states a share is gated at
+ * half or more, so the other end, a share rounded down to 0%, is never stated.
+ */
+const ratio = (part: number, whole: number): string => {
+  const percent = Math.round((part / whole) * 100);
+  return percent === 100 && part < whole ? "over 99%" : `${percent}%`;
+};
 
 function namesPersonalData(column: string): boolean {
   const lowered = column.toLowerCase();
@@ -368,15 +475,10 @@ function matchedShapes(profile: AgentColumnProfile): readonly string[] {
  * Order is stable and by column, so two profiles of the same table produce the same
  * list — a finding set that reordered between runs would read as having changed.
  */
-function deriveFindings(
-  rowCount: number,
-  columns: readonly ColumnSchema[],
-  profiles: readonly AgentColumnProfile[],
-): readonly AgentProfileFinding[] {
+function deriveFindings(rowCount: number, profiles: readonly AgentColumnProfile[]): readonly AgentProfileFinding[] {
   const findings: AgentProfileFinding[] = [];
 
-  profiles.forEach((profile, index) => {
-    const declared = columns[index];
+  for (const profile of profiles) {
     const missing = rowCount - profile.present;
 
     if (rowCount >= MIN_ROWS_FOR_RATIO_FINDINGS && missing / rowCount >= HIGH_NULL_RATIO) {
@@ -407,7 +509,7 @@ function deriveFindings(
     }
 
     const shapes = matchedShapes(profile);
-    if (declared !== undefined && (namesPersonalData(profile.column) || shapes.length > 0)) {
+    if (namesPersonalData(profile.column) || shapes.length > 0) {
       findings.push({
         code: "suspected_pii",
         column: profile.column,
@@ -417,7 +519,7 @@ function deriveFindings(
             : "The column's name suggests personal data. Its values were not inspected to establish this.",
       });
     }
-  });
+  }
 
   return findings;
 }
@@ -448,7 +550,8 @@ function deriveFindings(
  * cannot be regrouped into the key they belong to, and a covering test over the
  * wrong grouping would be an answer about a key that does not exist.
  */
-export function findUnindexedForeignKeys(table: TableSchema): readonly AgentProfileFinding[] {
+export function findUnindexedForeignKeys(table: AgentInventoryObject): readonly AgentProfileFinding[] {
+  if (!Array.isArray(table.indexes)) return [];
   const keys = table.foreignKeys ?? [];
   // More than one edge from a table is where a composite key becomes
   // indistinguishable from several single-column ones on PostgreSQL.

@@ -68,23 +68,76 @@ import {
   type AgentCuratedReadInput,
   type CuratedOperationKind,
   agentCuratedReadInput,
+  isStatementReadOperation,
 } from "@/lib/db/operations/descriptors";
 import { actorLabel, executeAuditedOperation } from "@/lib/db/operations/execution";
-import { inspectAgentStatement } from "@/lib/db/operations/statement-guard";
 import type { ExecutionActor, ExecutionPolicy, PolicyDenyCode, TargetScope } from "@/lib/db/operations/policy";
 import type { OperationRegistry } from "@/lib/db/operations/registry";
-import type { DatabaseProvider, ProviderCapabilities, ProviderLabels } from "@/lib/db/types";
+import type {
+  Container,
+  DatabaseObject,
+  KindCount,
+  DatabaseProvider,
+  ObjectDetail,
+  ObjectKindSpec,
+  ProviderCapabilities,
+  ProviderLabels,
+  ReadOnlyStatementMode,
+} from "@/lib/db/types";
+import type { ContainerEnumeration } from "@/lib/db/container-walk";
+import {
+  enumerationOf,
+  kindsByContainer,
+  scopeGroundingContainers,
+  scopeReadsUnder,
+  sessionDefaultContainer,
+} from "@/lib/db/container-walk";
+import {
+  applicableKinds,
+  containerDepth,
+  enumerableKinds,
+  isCountSampled,
+  isCountUnavailable,
+  kindCountIsListing,
+  kindNamesWithheld,
+} from "@/lib/db/object-kinds";
+import { pathKey } from "@/lib/db/object-path";
+import { machineColumns } from "@/lib/db/detailed-object";
+// The inventory route's bounds, and now nobody's second copy of them: one owner, so the
+// agent's grounding walk and `POST /api/db/objects/inventory` cannot come to disagree about
+// how much of a database an inventory is. They used to be declared again here, because
+// `object-route.ts` imports `next/server` at its top level and the agent tree must not
+// (#789). Both are stated again in `docs/AGENT.md`.
+import {
+  INVENTORY_LIMIT,
+  INVENTORY_PAIR_LIMIT,
+  INVENTORY_TRUNCATION_REASON,
+  PAIR_TRUNCATION_REASON,
+} from "@/lib/db/inventory-bounds";
 import { asBytes, binaryText } from "@/lib/export/binary";
+import { nonFiniteWord } from "@/lib/non-finite";
 import { hasOptimizerHint } from "@/lib/sql/optimizer-hints";
+import {
+  AGENT_LANGUAGE_COPY,
+  type AgentStatementArgument,
+  type AgentStatementLanguageId,
+  type AgentWorkflowVariant,
+  PLAN_ESTIMATE_OPERATIONS,
+  requiredVariant,
+} from "./agent-manifest";
 import { connectionIdentity, heldSnapshotForConnection } from "./context-snapshot";
 import { offersRefusalExamples } from "./models";
-import type { ColumnSchema, DatabaseConnection, QueryResult, TableSchema } from "@/lib/types";
+import type { ColumnSchema, DatabaseConnection, QueryResult } from "@/lib/types";
+import { type ProfileTargetResolution, type ResolvedProfileTarget, resolveProfileTarget } from "./inventory-address";
+import { addressableObjects } from "./inventory-objects";
+import type { AgentInventory, AgentInventoryObject, AgentUnlistedParent, AgentUnlistedParentsNotNamed } from "./types";
+import { composeCatalogRead, composeEstimatingExplain } from "./composed-sql";
 import {
   type AgentCatalogKind,
+  type AgentCatalogRead,
   AgentComposedSqlError,
-  composeCatalogRead,
-  composeEstimatingExplain,
-} from "./composed-sql";
+  type AgentEstimatingExplain,
+} from "./composed-sql-primitives";
 import type { AgentDeadlineDenyCode, AgentRunDeadline } from "./deadline";
 import {
   AGENT_EXECUTION_PROFILE,
@@ -94,17 +147,42 @@ import {
 } from "./execution-policy";
 import type { AgentRepairDenyCode, AgentRepairLedger } from "./repair-ledger";
 import { fingerprintStatement } from "./repair-ledger";
+import { statementFamilyOf } from "./languages/client";
+import { engineServerDialect, runServerPack } from "./languages/engines/server";
+import type { AgentFamilyOperationIds, AgentRecommendationCard } from "./languages/pack";
+import {
+  CURATED_CALL_LANGUAGE,
+  LANGUAGE_BASE_DEFINITIONS,
+  REFERENCE_RECOMMEND_CHANGE,
+  REFERENCE_RECOMMENDATION_CARD,
+  REFERENCE_STATEMENT_DEFINITIONS,
+  languageServer,
+  languageServerPack,
+} from "./languages/server";
 import { evaluateAutoExecute } from "./auto-execute";
 import { summarisePlan } from "./plan-summary";
 import {
   MAX_PROFILE_COLUMNS,
   type AgentProfileDepth,
-  type AgentProfileFinding,
   type AgentTableProfile,
   composeTableProfile,
   findUnindexedForeignKeys,
   readTableProfile,
 } from "./table-profile";
+import {
+  AGENT_ANSWER_CONTRACT,
+  AGENT_EVIDENCE_CONTRACT,
+  READING_REFUSAL_TEXT,
+  UNAVAILABLE_TEXT,
+  capturedSnapshot,
+  catalogSelectorSchema,
+  describeFindings,
+  evidenceSchema,
+  handoverText,
+  presentAnswerSchema,
+  profileSelectorSchema,
+  unavailable,
+} from "./tool-contracts";
 import type {
   AgentArtifactReference,
   AgentChartSpec,
@@ -136,12 +214,16 @@ export type AgentToolName =
   | "recommend_change"
   /** Operations only: one curated reading of what the engine says about itself. */
   | "inspect_operations"
+  /** Resource efficiency on a cluster: container usage against requests and limits in one namespace. */
+  | "inspect_usage"
+  /** Cluster health: one namespace's workloads, their readiness, restarts, missing resources and probes, and events. */
+  | "profile_workloads"
   /**
    * Which result IS the answer, and how it should be shown. Reaches no database.
    *
-   * Offered by no workflow yet: the record below is the one place a tool set is
-   * decided, and this slice decides that nothing may call it until the workflow that
-   * asks for an answer exists.
+   * Offered to `data-analysis` alone: the workflow variants in `agent-manifest.ts` are
+   * the one place a tool set is decided, and only that workflow's verdict asks for an
+   * answer.
    */
   | "present_answer";
 
@@ -153,11 +235,6 @@ export type AgentToolName =
  * require-approval for it.
  */
 export type AgentOperationId =
-  | "sql.query.read"
-  | "sql.explain.estimate"
-  | "sql.explain.analyze"
-  /** Bounded per-table profiling; #330 T3 reopened the three-descriptor decision. */
-  | "sql.table.profile"
   /**
    * A curated operational reading. The one operation on this list that carries no
    * statement — see `dbOperationsReadDescriptor` for why it needs its own id.
@@ -169,7 +246,9 @@ export type AgentOperationId =
    * this list because the audited path types every operation it runs through it, not
    * because a model can ask for it.
    */
-  | "db.schema.read";
+  | "db.schema.read"
+  /** Every family's own operations, one row per family in `AgentFamilyOperationIds`. */
+  | AgentFamilyOperationIds[AgentStatementLanguageId];
 
 export interface AgentToolDefinition {
   readonly name: AgentToolName;
@@ -214,6 +293,11 @@ export interface AgentToolContext {
    * body could contribute one.
    */
   readonly workflowType: AgentRunWorkflowType;
+  /**
+   * The run's PERSISTED statement language, absent for `sql`. Like `workflowType`, it
+   * can only have come from the run record, never from the live connection.
+   */
+  readonly statementLanguage?: AgentStatementLanguageId;
   /** The persisted actor — the sole authority for authorizing this call. */
   readonly actor: AgentRunActor;
   readonly connection: DatabaseConnection;
@@ -267,8 +351,49 @@ export type AgentToolUnavailableCode =
   | "TABLE_QUALIFIER_UNKNOWN"
   /** The named table is not in the inventory this run captured. */
   | "TABLE_NOT_INVENTORIED"
+  /**
+   * More than one inventoried object answers to the spelling, so there is nothing to profile
+   * YET and nothing missing either.
+   *
+   * Split from `TABLE_NOT_INVENTORIED` for the reason the other two were split from it, and
+   * this is the sharpest case of it: the run read BOTH objects and answered that it had read
+   * neither. Measured against an inventory of ten relations holding `public.orders` and
+   * `sales.orders`, a call naming `orders` was told the table was not in the inventory at
+   * all and then offered the first six profilable names, neither of which was a candidate.
+   * A model can repair an ambiguity by qualifying its spelling and can do nothing at all
+   * about an absence, so the candidates travel as the detail (#789).
+   */
+  | "TABLE_SPELLING_AMBIGUOUS"
+  /**
+   * The named object IS inventoried, and its declared kind is not one with rows to count.
+   *
+   * Split from `TABLE_NOT_INVENTORIED` for the reason `TABLE_QUALIFIER_UNKNOWN` was split
+   * from it: the inventory a run reads carries the schema's views, sequences and functions
+   * beside its tables (#789), and a model told "that table is not in the inventory" about a
+   * name it can SEE in the inventory has been told something it can check and disbelieve.
+   * Measured on the qualifier case, it then repeats the identical call rather than changing
+   * it. This one confirms the object and refuses the action.
+   */
+  | "OBJECT_NOT_PROFILABLE"
+  /**
+   * A catalog KIND the engine does not serve, refused with the reason and the reading that DOES serve it.
+   *
+   * Split from `OBJECT_NOT_PROFILABLE` because the two refuse different things: that one refuses an ACTION on an
+   * object the inventory holds, and this one refuses a KIND the engine's catalog never answers - MongoDB's
+   * `relations`, for one, because the engine declares no foreign key at all and an empty block would read as an
+   * absence it never stated.
+   */
+  | "KIND_REFUSED"
   /** A catalog read matched no object at all, so there is nothing to inspect or cite. */
   | "CATALOG_MATCHED_NOTHING"
+  /**
+   * The object exists, and the documents sampled from it held no field, so there is nothing to describe.
+   *
+   * Split from `CATALOG_MATCHED_NOTHING` because the two say opposite things about the object: an engine whose fields
+   * are inferred from a sample of its documents (MongoDB) answers an empty collection, or a view whose sample is
+   * empty, with no field at all, and "there is no object of that name" would be false of it.
+   */
+  | "CATALOG_OBJECT_EMPTY"
   /**
    * An index or relation inventory that exists and declares nothing.
    *
@@ -285,6 +410,8 @@ export type AgentToolUnavailableCode =
   | "IDENTICAL_PLANS"
   /** The statement does not match the card it is offered under. */
   | "RECOMMENDATION_SHAPE_MISMATCH"
+  /** A document index whose keys the captured inventory already lists for that collection. */
+  | "INDEX_ALREADY_EXISTS"
   /** The plan was this run's, and its rows are no longer held to be read. */
   | "PLAN_RESULT_RELEASED"
   /** This run has already recorded an answer, and a run answers once. */
@@ -305,6 +432,12 @@ export type AgentToolUnavailableCode =
   | "CHART_TOO_FEW_ROWS"
   /** The chart type does not fit the columns named. */
   | "CHART_SHAPE_MISMATCH"
+  /**
+   * The language's own reader refused the statement before the policy pipeline saw it, and its sentence is the
+   * detail. The pipeline's input stage keeps only a reason code, so without this a model refused for `exec` would read
+   * only that its read had the wrong shape. SQL has no such reader and never meets it.
+   */
+  | "STATEMENT_NOT_ADMITTED"
   | AgentDeadlineDenyCode
   | AgentRepairDenyCode;
 
@@ -347,8 +480,16 @@ export type AgentPlanComparisonOutcome =
     }
   | AgentToolUnavailable;
 
-/** Everything a `recommendation` event carries except when it happened. */
-export type AgentRecommendation = Omit<Extract<AgentRunEvent, { kind: "recommendation" }>, "kind" | "atMs">;
+/**
+ * Everything a `recommendation` event carries except when it happened, arm by arm: `Omit` over the union itself would
+ * keep only the fields both arms share, and lose the statement of one and the container of the other.
+ */
+export type AgentRecommendation =
+  Extract<AgentRunEvent, { kind: "recommendation" }> extends infer Arm
+    ? Arm extends unknown
+      ? Omit<Arm, "kind" | "atMs">
+      : never
+    : never;
 
 export type AgentRecommendationOutcome =
   | { readonly kind: "recommended"; readonly recommendation: AgentRecommendation; readonly modelText: string }
@@ -372,10 +513,30 @@ export interface AgentOperationRequest {
   readonly operationId: AgentOperationId;
   /** The statement as it will be evaluated — composed by the server for two of the tools. */
   readonly sql: string;
+  /**
+   * The key the descriptor's input carries the statement under: `sql` for `sql.query.read`, `statement` for
+   * `kubectl.query.read`, `command` for `mongo.query.read`. Absent reads as `sql`, so every server-composed SQL read
+   * is unchanged. The request keeps `sql` as its own field name because it is this server's text, not the model's
+   * argument - which is also why a mongo command arrives here as JSON TEXT: the model wrote an object, the language's
+   * `canonicalize` wrote it out in the order the model wrote it, and every layer from the descriptor to the provider
+   * reads that one text.
+   */
+  readonly argument?: AgentStatementArgument;
   /** Prose naming what the result is, for the untrusted-content header. */
   readonly label?: string;
   /** Declared target dimensions, so a scope allowlist can bound them. */
   readonly target?: { readonly catalog?: string; readonly schema?: string };
+  /**
+   * What the provider is being asked to do with `sql`: run it, or answer with the
+   * engine's ESTIMATE of how it would run it. Absent means run it.
+   *
+   * Only `inspect_plan` sets it, and only because an estimating plan is not a
+   * statement prefix on every engine. `ReadOnlyStatementMode` in `db/types.ts`
+   * carries that argument. It rides on the REQUEST rather than on the descriptor
+   * because it is a property of the one call, not of the operation: the same
+   * `sql.explain.estimate` descriptor governs both spellings.
+   */
+  readonly mode?: ReadOnlyStatementMode;
   /**
    * Marks this call as the SERVER's own grounding read rather than a tool the model
    * asked for — the one thing that may reach a database outside agent mode.
@@ -400,17 +561,6 @@ export interface AgentOperationRequest {
 // Tool definitions and server-side selection
 // ============================================================================
 
-const catalogSelectorSchema = z.strictObject({
-  /**
-   * Which inventory to read. Absent means the column inventory, which is what a
-   * bare catalog inspection has always meant — so a model that never sends this
-   * field gets exactly the behaviour it got before the field existed.
-   */
-  kind: z.enum(["columns", "relations", "indexes"]).optional(),
-  schema: z.string().optional(),
-  table: z.string().optional(),
-});
-
 /**
  * The same selector, plus the one kind the model is not offered.
  *
@@ -424,74 +574,6 @@ const groundingSelectorSchema = catalogSelectorSchema.extend({
   kind: z.enum(["columns", "relations", "indexes", "statistics"]).optional(),
 });
 
-const readStatementSchema = z.strictObject({
-  sql: z.string().min(1),
-  /**
-   * Why the model wrote this statement. Accepted here and NOT recorded at this
-   * commit: the `statement-drafted` event that carries it (`types.ts`) is emitted by
-   * the run service, which does not exist yet. It is in the declared contract so the
-   * model is asked for it from the first run rather than having the tool's shape
-   * change under it later. Deliberately no `min(1)`: refusing an otherwise valid read
-   * because its rationale came back blank would be a disproportionate refusal.
-   */
-  rationale: z.string().optional(),
-});
-
-const planStatementSchema = z.strictObject({ sql: z.string().min(1) });
-
-const evidenceSchema = z.discriminatedUnion("source", [
-  z.strictObject({
-    source: z.literal("artifact"),
-    correlationId: z.string().min(1),
-    locator: z.string().min(1).optional(),
-  }),
-  z.strictObject({
-    source: z.literal("context-snapshot"),
-    fingerprint: z.string().min(1),
-    locator: z.string().min(1).optional(),
-  }),
-]);
-
-/**
- * ONE citation, rendered as the object the schema above accepts (#350).
- *
- * A function rather than a pair of string constants, because the same two calls
- * produce both things that have to agree: the EXAMPLE a description shows, with a
- * placeholder where the id goes, and the CONCRETE citation a completed step hands
- * over with the id filled in. A model that copies what it was shown is producing
- * what the parser was going to accept, because the same code wrote both.
- *
- * `satisfies AgentEvidenceReference` is what ties them to the durable contract, and
- * `tests/unit/lib/agent/tools.test.ts` closes the loop from the other side: it lifts
- * every literal object out of each description and parses it through that tool's own
- * `inputSchema`, so a description offering a shape the schema refuses fails there
- * rather than in a run.
- *
- * Why it exists at all: the evidence contract is a two-arm discriminated union, and
- * two live runs (#350) inferred it wrong from the serialized JSON schema alone — the
- * ledger records the model asking itself whether an evidence item is "an array of
- * table row objects or strings?" and spending a database round trip on the question.
- * Nothing it was TOLD named `source`, `correlationId` or `fingerprint`.
- */
-const citeArtifact = (correlationId: string): string =>
-  JSON.stringify({ source: "artifact", correlationId } satisfies AgentEvidenceReference);
-
-export const citeSnapshot = (fingerprint: string): string =>
-  JSON.stringify({ source: "context-snapshot", fingerprint } satisfies AgentEvidenceReference);
-
-/**
- * The evidence contract in one sentence, said identically wherever it is said.
- *
- * Exported because `investigation.ts` states it too — in the run's opening rules —
- * and two wordings of the same contract would be two things to keep equal, with the
- * one that drifted being the one a model followed into a refusal.
- */
-export const AGENT_EVIDENCE_CONTRACT = [
-  `Each evidence item is ONE object: ${citeArtifact("<the artifact id a completed step reported>")} for a result this run read,`,
-  `or ${citeSnapshot("<the fingerprint of the schema snapshot this run captured>")} for that inventory.`,
-  'Add "locator" only to point at a part of it.',
-].join(" ");
-
 const reportSchema = z.strictObject({
   claims: z.array(z.strictObject({ claim: z.string().min(1), evidence: z.array(evidenceSchema).min(1) })).min(1),
 });
@@ -504,75 +586,9 @@ const reportSchema = z.strictObject({
  * label would let a comparison attribute a plan to a statement that never produced
  * it — the exact mislabelling a before/after claim rests on not doing.
  */
-/**
- * A profile names a TABLE, never columns and never SQL. The columns come from the
- * run's own captured inventory, so a profile cannot be aimed at something the run
- * never established exists — the same rule `compare_plans` follows about plans.
- */
-const profileSelectorSchema = z.strictObject({
-  /*
-    Described, because an undescribed optional string next to a fingerprint-heavy set of
-    rules is an invitation. `qwen3:8b` filled it with the snapshot fingerprint
-    (`ctx_3b6b…`), which resolved to nothing and cost it the run. Omitting the field
-    entirely is the right answer whenever the inventory names a table bare, so the
-    description leads with that rather than with what a schema is.
-  */
-  schema: z
-    .string()
-    .describe(
-      "Omit this unless the inventory qualifies the table as schema.table. It is a database schema name — never an artifact id or a snapshot fingerprint.",
-    )
-    .optional(),
-  table: z.string().min(1),
-  depth: z.enum(["basic", "distribution", "pattern"]).optional(),
-  /** Where in the table's column list to start. The server bounds how many follow. */
-  fromColumn: z.number().int().min(0).optional(),
-});
-
 const planComparisonSchema = z.strictObject({
   before: z.string().min(1),
   after: z.string().min(1),
-});
-
-/**
- * The chart types a spec may ask for, as a total record over the durable union.
- *
- * A record rather than a bare list, for the reason `EVENT_KINDS` is one: the compiler
- * is the exhaustiveness check. A type added to `AgentChartSpec` and not offered here
- * would be a type the ledger can hold and the model is never told about.
- */
-const CHART_TYPES: Readonly<Record<AgentChartSpec["type"], true>> = Object.freeze({
-  bar: true,
-  line: true,
-  area: true,
-  pie: true,
-  scatter: true,
-  "stacked-bar": true,
-});
-
-const CHART_TYPE_NAMES = Object.keys(CHART_TYPES) as [AgentChartSpec["type"], ...AgentChartSpec["type"][]];
-
-const chartSpecSchema = z.strictObject({
-  type: z.enum(CHART_TYPE_NAMES),
-  x: z.string().min(1),
-  y: z.array(z.string().min(1)).min(1),
-  caption: z.string().min(1),
-});
-
-/**
- * An answer names ONE artifact and how to show it, and nothing else.
- *
- * Deliberately no statement text, for the reason `compare_plans` takes none: the
- * ledger already records which statement produced which result, so the server joins
- * them itself. A model-supplied statement would let an answer hand the user a
- * statement that produced something other than the result on screen.
- */
-const presentAnswerSchema = z.strictObject({
-  artifact: z.string().min(1),
-  presentation: z.discriminatedUnion("kind", [
-    z.strictObject({ kind: z.literal("table") }),
-    z.strictObject({ kind: z.literal("chart"), spec: chartSpecSchema }),
-  ]),
 });
 
 /**
@@ -596,17 +612,18 @@ const presentAnswerSchema = z.strictObject({
  *
  * At the CALL BOUNDARY rather than inside the schema, and that placement is the whole of what
  * makes it safe. Wrapping the field in `z.preprocess` instead would produce a `ZodPipe`, and the
- * SDK derives the model's copy of the contract from this same object with
+ * model's copy of the contract is derived from this same object with
  * `toJSONSchema(schema, { target: 'draft-7', io: 'input' })`
- * (node_modules/@ai-sdk/provider-utils/src/schema.ts:251, reached from `declaredTools()` in
- * src/lib/agent/investigation.ts) — where a `ZodPipe` is not counted as a required key. Measured
- * over every entry of `AGENT_TOOL_DEFINITIONS` with that wrapper in place, `present_answer` was
- * the ONLY tool whose two contracts disagreed: runtime `[artifact, presentation]` against
- * advertised `[artifact]`, while all eight others matched exactly. So a model that OBEYED the
- * advertised contract would send `artifact` alone and be refused — and because this tool is
- * ledger-only, its refusal records no event and the run is scored `no-answer` with nothing saying
- * why: the same invisible failure this fix exists to remove, re-created for correct models instead
- * of sloppy ones. Reading here leaves the advertised schema byte-identical to what it always was.
+ * (`modelToolJsonSchema()` in src/lib/agent/model-tool-schema.ts, the SDK's own `zod4Schema()`
+ * conversion reached from `declaredTools()` in src/lib/agent/investigation.ts) — where a `ZodPipe` is not counted as a
+ * required key. Measured over every entry of `AGENT_TOOL_DEFINITIONS` with that wrapper in place,
+ * `present_answer` was the ONLY tool whose two contracts disagreed: runtime
+ * `[artifact, presentation]` against advertised `[artifact]`, while all eight others matched
+ * exactly. So a model that OBEYED the advertised contract would send `artifact` alone and be
+ * refused — and because this tool is ledger-only, its refusal records no event and the run is
+ * scored `no-answer` with nothing saying why: the same invisible failure this fix exists to remove,
+ * re-created for correct models instead of sloppy ones. Reading here leaves the advertised schema
+ * byte-identical to what it always was.
  *
  * That placement puts a dependency between this read and the run loop, and it is worth naming
  * because it is invisible from here. The SDK validates the model's arguments against this same
@@ -614,12 +631,171 @@ const presentAnswerSchema = z.strictObject({
  * `ai@7.0.59`, `doParseToolCall` throws, the SDK catches it, re-parses the raw JSON without a
  * schema and enqueues the tool-call part anyway with `invalid: true`. So this function is reached
  * only because `takeTurn` dispatches every tool-call part without consulting that flag
- * (src/lib/agent/investigation.ts:1042). Hardening that line to `!part.invalid` would drop the call
- * before it arrives here and silently undo this fix — and it is a plausible edit rather than an
- * imagined one, because `capability-probe.ts:279` already treats the flag as meaningful
- * (`part.invalid !== true`). `tests/isolated/agent-investigation.test.ts` drives the whole path
- * through the real SDK so that edit fails a test rather than a run.
+ * (src/lib/agent/investigation.ts). Hardening that dispatch to `!part.invalid` would
+ * drop the call before it arrives here and silently undo this fix — and it is a plausible edit
+ * rather than an imagined one, because `observeProbe()` in `src/lib/agent/capability-probe.ts`
+ * already treats the flag as meaningful (`part.invalid !== true`).
+ * `tests/isolated/agent-investigation.test.ts` drives the whole path through the real SDK so that
+ * edit fails a test rather than a run.
  */
+/**
+ * A claims array a model sent as a STRING of JSON, read back once before validation.
+ *
+ * The same encoding `readSerializedPresentation` was written for, on the tool that ENDS a run.
+ * That one costs a presentation; this one costs everything the run did.
+ *
+ * Measured on `llama3.1:8b` — the most-pulled tool-capable model on Ollama — five operate runs
+ * produced SEVENTY `INVALID_TOOL_INPUT` declines and every one was the same line:
+ *
+ *     the fields that did not match — claims: expected array, received string
+ *
+ * The model serialized the array rather than nesting it, roughly fourteen times per run, until
+ * the turn limit ended the run. By then the sentence is complete — it names the field, the type
+ * expected and the type that arrived — and the model still cannot act on it. A message can only
+ * do so much; this is the other half, and the repository already decided that half is worth
+ * having when it wrote the sibling.
+ *
+ * Every bound the sibling states holds here unchanged and for the same reasons: read ONCE and
+ * never recursively, so this accepts a serialization the model chose rather than inventing a
+ * second encoding; at the CALL BOUNDARY rather than in the schema, so the contract the SDK
+ * advertises stays byte-identical; and the value still goes through the same strict schema, so a
+ * string holding the wrong shape is refused exactly as the object would have been. Nothing is
+ * admitted here that would not have been admitted written properly.
+ */
+/** Whether `claims` arrived as a string that is not JSON, which no read here can recover. */
+function claimsArrivedAsUnparseableText(input: unknown): boolean {
+  if (typeof input !== "object" || input === null) return false;
+  const { claims } = input as { claims?: unknown };
+  if (typeof claims !== "string") return false;
+  try {
+    JSON.parse(claims);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * What a run is told when its claims arrived as text that is not JSON.
+ *
+ * `readSerializedClaims` recovers the case a model serialized properly. This is the case it
+ * cannot: measured on `llama3.1:8b`, the claims arrive as a PYTHON repr — single quotes
+ * throughout — with the claim true, the source right and the correlation id one the run actually
+ * produced. Only the quote character is wrong. Converting it here would be inventing an encoding
+ * rather than reading one the model chose, and it breaks on the first apostrophe in a sentence.
+ *
+ * What was wrong was the sentence. `claims: expected array, received string` is true and, to a
+ * model that believes it sent an array, unusable — across five assess runs it re-sent the
+ * identical bytes THIRTY times. This names the fault and what a JSON array requires, and quotes
+ * nothing the model wrote: the rule the refusals here are bounded by is that a server sentence
+ * carries the path and the shape, never the value.
+ */
+const AGENT_CLAIMS_NOT_JSON =
+  "Your claims argument arrived as TEXT rather than as an array, and it is not JSON either. Send the array itself as the argument value — not a string containing it. If your tooling can only send a string, it must be JSON: double quotes around every key and every string value, never single quotes.";
+
+function readSerializedClaims(input: unknown): unknown {
+  if (typeof input !== "object" || input === null) return input;
+  const { claims } = input as { claims?: unknown };
+  if (typeof claims !== "string") return input;
+  try {
+    return { ...input, claims: JSON.parse(claims) };
+  } catch {
+    // Left as the string it was, for the sibling's reason: the schema refuses it, and reporting a
+    // parse failure here would replace the contract's own wording with this function's.
+    return input;
+  }
+}
+
+/**
+ * A key that is the schema's own name wearing an affix, moved onto the field it names.
+ *
+ * `renamesAmong` works this pairing out already and has stated it in the refusal since #4xx -
+ * "rename artifact_id to artifact" - and the models kept re-sending the same key. Measured twice:
+ * `llama3.1:8b` had `present_answer` declined in all five analyze runs, never once on the value it
+ * carried, and the 2026-09-17 argument capture found the same call again, five of seventeen
+ * refusals, `{"artifact_id": "<a real id>"}` with nothing wrong but the key.
+ *
+ * Naming it left the model two sentences - a field absent AND a field surplus - for what is one
+ * displaced key plus, here, one genuine omission. Reading the key leaves one sentence about the one
+ * thing actually missing, which is the difference between a refusal a model can act on and a wall.
+ *
+ * The pairing rule is `renamesAmong`'s, deliberately: the two names must be the same word once
+ * punctuation and case are set aside, one possibly carrying an affix the other does not, and each
+ * side is claimed once so two surplus keys can never both land on one field. A confident rename to
+ * the WRONG field would be worse than the two sentences it replaces.
+ */
+function readNearMissKeys(input: unknown, keys: readonly string[]): unknown {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return input;
+  const read = { ...(input as Record<string, unknown>) };
+  const bare = (name: string): string => name.toLowerCase().replaceAll(/[^a-z0-9]/g, "");
+  const absent = keys.filter((key) => read[key] === undefined);
+  const claimed = new Set<string>();
+  for (const key of Object.keys(read)) {
+    if (keys.includes(key)) continue;
+    const match = absent.find(
+      (name) => !claimed.has(name) && (bare(key).includes(bare(name)) || bare(name).includes(bare(key))),
+    );
+    if (match === undefined) continue;
+    claimed.add(match);
+    read[match] = read[key];
+    delete read[key];
+  }
+  return read;
+}
+
+/**
+ * The two ways a run that HAS its answer fails to say how to show it.
+ *
+ * Measured 2026-09-19 with the argument capture left on for a whole sweep: 206 of 221 refused calls
+ * are these two, and both belong to the two models whose `data-analysis` cell sits at 0/5. Neither
+ * is a model that failed to do the work - both read the data, produced the artifact, and lost the
+ * run at the rendering.
+ *
+ *   A SPEC ON A TABLE. 113 refusals, all one model, all shaped like
+ *   `{"kind":"table","spec":{"x":"total_rows","y":9488,"caption":"Total rows"}}`. It is not a chart
+ *   and could not become one - no `type`, and `y` holds a number where a list of columns goes. It
+ *   is a caption the model wanted to hang on a table. `kind` is explicit, so the surplus goes and
+ *   the table stays: a decoration is not a reason to discard the answer.
+ *
+ *   NO PRESENTATION AT ALL. 93 refusals of `{"artifact":"<a real id>"}`. This reverses the line
+ *   drawn on 2026-09-17, when the same call was left refused because defaulting it would be the
+ *   server choosing how the user's answer is displayed. The measurement is what changed the
+ *   reading: a table is not a choice between renderings, it is this contract's own statement that
+ *   a result shown as itself is a complete answer - and the alternative on offer was never a better
+ *   rendering, it was no answer at all.
+ *
+ * Bounded to an ABSENT presentation. One that arrived and failed to validate is a model saying
+ * something specific, and overriding that would be the server choosing: `{"kind":"spreadsheet"}`
+ * stays refused.
+ */
+function readMisrenderedPresentation(input: unknown): unknown {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return input;
+  const read = { ...(input as Record<string, unknown>) };
+  if (read["artifact"] === undefined) return read;
+
+  const { presentation } = read;
+  if (presentation === undefined) return { ...read, presentation: { kind: "table" } };
+  if (typeof presentation !== "object" || presentation === null || Array.isArray(presentation)) return read;
+
+  const shown = presentation as Record<string, unknown>;
+  /*
+    A table keeps `kind` and nothing else.
+
+    The first version dropped `spec` by name and left three more surplus keys that models use for
+    the same purpose - 47 further refusals in one sweep: `data` holding the row, `rows` holding the
+    list, `columns` holding name/value pairs. The model is pasting the RESULT into the presentation,
+    which it never needs to: the artifact beside it already names those rows and `presentation` only
+    says how to show them. Dropping by name is the mistake that produced the second round.
+
+    Safe because a table takes no options at all. A CHART is left untouched - its `spec` IS the
+    instruction, and discarding an unrecognised key there could change the picture silently.
+  */
+  if (shown["kind"] === "table") {
+    return Object.keys(shown).length === 1 ? read : { ...read, presentation: { kind: "table" } };
+  }
+  return read;
+}
+
 function readSerializedPresentation(input: unknown): unknown {
   if (typeof input !== "object" || input === null) return input;
   const { presentation } = input as { presentation?: unknown };
@@ -632,42 +808,6 @@ function readSerializedPresentation(input: unknown): unknown {
     return input;
   }
 }
-
-/** ONE presentation, rendered as the object `presentAnswerSchema` accepts for its `presentation`. */
-const showAs = (presentation: AgentAnswerPresentation): string => JSON.stringify(presentation);
-
-/**
- * The presentation contract in one place, said identically wherever it is said.
- *
- * The `AGENT_EVIDENCE_CONTRACT` pattern, and it exists for the same reason: the
- * EXAMPLE the description shows and the object the parser accepts are produced by the
- * same call, so the two cannot disagree. `tests/unit/lib/agent/tools.test.ts` closes
- * the loop from the other side — it lifts every literal object out of the description
- * and parses it through this tool's own `inputSchema`.
- *
- * Exported, and it was module-private until the `data-analysis` workflow arrived:
- * that workflow's opening rules state the contract too, and the whole point of one
- * string is that the description and the rules cannot tell a model two different
- * bars for one tool. It is stated in a second file by importing this, never by
- * copying it.
- */
-export const AGENT_ANSWER_CONTRACT = [
-  `"presentation" is ONE object: ${showAs({ kind: "table" })} for a table,`,
-  `or ${showAs({
-    kind: "chart",
-    spec: {
-      type: "bar",
-      x: "<a column of that result>",
-      y: ["<a numeric column of that result>"],
-      caption: "<what the chart shows, in your own words>",
-    },
-  })} for a chart.`,
-  `"type" is one of: ${CHART_TYPE_NAMES.join(", ")}. For several series, name several y columns: there is no separate series field.`,
-  "Every column a chart names must be a column of THAT result, spelled as the result spells it, and every y column must hold numbers.",
-  "A chart needs at least two rows; a pie takes exactly one y; a scatter needs a numeric x as well.",
-  "Present a table when the result is a single number, has one row, or has no numeric column: that is a complete answer, not a lesser one.",
-  "When the objective asks for a chart and the result can carry one, chart it: the user named the shape of the answer they wanted.",
-].join(" ");
 
 /**
  * The one-line skeleton of the `present_answer` CALL, for failures in the wrapper rather than
@@ -698,53 +838,15 @@ function isAnswerShapeFailure(problems: string): boolean {
   return /\bartifact:|arguments object:|^presentation: |\bpresentation: expected/.test(problems);
 }
 
-const recommendationSchema = z.strictObject({
-  change: z.enum(["index", "rewrite"]),
-  statement: z.string().min(1),
-  rationale: z.string().min(1),
-  evidence: z.array(evidenceSchema).min(1),
-});
-
 export const AGENT_TOOL_DEFINITIONS: Readonly<Record<AgentToolName, AgentToolDefinition>> = Object.freeze({
-  inspect_schema: {
-    name: "inspect_schema",
-    description:
-      "Read the database's own catalog, optionally narrowed to one schema or table. Pass kind to choose the inventory: columns (the default: tables and their columns), relations (foreign keys) or indexes. The statement is composed by the server; you supply only the selector. On a large database pass a schema or table selector: the result is subject to the same row budget as any read and is refused, not truncated, if it overflows.",
-    inputSchema: catalogSelectorSchema,
-    operationId: "sql.query.read",
-  },
-  run_read_query: {
-    name: "run_read_query",
-    description:
-      "Run one bounded read-only SQL statement. Writes, DDL and multi-statement text are refused before the database is reached.",
-    inputSchema: readStatementSchema,
-    operationId: "sql.query.read",
-  },
-  inspect_plan: {
-    name: "inspect_plan",
-    description:
-      "Ask the engine for the ESTIMATED plan of one read-only statement. The plan is described, never executed, so no timings are produced.",
-    inputSchema: planStatementSchema,
-    operationId: "sql.explain.estimate",
-  },
-  profile_table: {
-    name: "profile_table",
-    description:
-      "Profile one table the run has already inventoried. The server chooses the columns from the captured schema and composes the aggregates; you supply only the table and how deep to go. Depth basic counts rows and missing values, distribution adds distinct counts, pattern adds a shape test for personal data. Only COUNTS are returned — no value is ever read out of a column.",
-    inputSchema: profileSelectorSchema,
-    operationId: "sql.table.profile",
-  },
+  ...REFERENCE_STATEMENT_DEFINITIONS,
   compare_plans: {
     name: "compare_plans",
     description:
       "Record a before/after comparison of two ESTIMATED plans this run already inspected. Pass the artifact ids of two inspect_plan results; the server reads both plans itself and states how each reaches its rows. Nothing is executed, and no timings exist — the executing form of EXPLAIN is refused by policy.",
     inputSchema: planComparisonSchema,
   },
-  recommend_change: {
-    name: "recommend_change",
-    description: `Propose one index or one rewrite for the user to apply themselves. The statement is never executed by this run; it is offered to the user's editor. Every recommendation must cite evidence this run produced. ${AGENT_EVIDENCE_CONTRACT}`,
-    inputSchema: recommendationSchema,
-  },
+  recommend_change: REFERENCE_RECOMMEND_CHANGE,
   inspect_operations: {
     name: "inspect_operations",
     description:
@@ -752,6 +854,7 @@ export const AGENT_TOOL_DEFINITIONS: Readonly<Record<AgentToolName, AgentToolDef
     inputSchema: agentCuratedReadInput,
     operationId: "db.operations.read",
   },
+  ...LANGUAGE_BASE_DEFINITIONS,
   present_answer: {
     name: "present_answer",
     description: `Record that one result you have already read IS the answer, and how it should be shown. Only a result of a run_read_query you drafted can be the answer: a plan describes a statement without running it and a profile returns counts about a table, so neither may be presented — both may still be cited as evidence. Pass the artifact id that read reported; the statement behind it comes from this run's own ledger, so you do not supply it. The columns a chart names are checked against that result's real columns and refused if they do not match. Your report must then cite this same artifact in at least one claim: the presentation shows the result and the claims say what it means, so a report resting on other evidence entirely leaves the run scored as not having answered. ${AGENT_ANSWER_CONTRACT}`,
@@ -764,109 +867,54 @@ export const AGENT_TOOL_DEFINITIONS: Readonly<Record<AgentToolName, AgentToolDef
   },
 } satisfies Record<AgentToolName, AgentToolDefinition>);
 
-const AGENT_MODE_TOOLS: readonly AgentToolDefinition[] = Object.freeze([
-  AGENT_TOOL_DEFINITIONS.inspect_schema,
-  AGENT_TOOL_DEFINITIONS.run_read_query,
-  AGENT_TOOL_DEFINITIONS.inspect_plan,
-  AGENT_TOOL_DEFINITIONS.compose_report,
-]);
+/**
+ * The definition a run of `workflow` in `language` is offered for the tool `name`.
+ *
+ * Every SQL run, and every run recorded before languages existed, reads the record above unchanged, which is what
+ * keeps the SQL tool schemas byte-identical. A workflow on a later language overrides only the entries whose argument
+ * it names differently; the lookup is here so that the run loop's offer and its dispatch read the same definition.
+ */
+export function agentToolDefinition(
+  language: AgentStatementLanguageId | undefined,
+  workflow: AgentRunWorkflowType,
+  name: AgentToolName,
+): AgentToolDefinition {
+  return (
+    languageServerPack(statementFamilyOf(language)).toolOverrides[workflow]?.[name] ?? AGENT_TOOL_DEFINITIONS[name]
+  );
+}
 
 /** Planning is toolless. Not "filtered to nothing" — there is nothing to filter. */
 const NO_TOOLS: readonly AgentToolDefinition[] = Object.freeze([]);
 
 /**
- * Workflow type → the tools that workflow may use (#330 T2).
+ * Workflow type → the tools that workflow may use (#330 T2), read from the workflow's
+ * variant in `agent-manifest.ts`, which is the one place a tool set is decided.
  *
- * A total record, so a workflow type added to the contract stops this file compiling
- * until somebody decides what it may do. All three name the same set today, and that
- * is the honest state rather than a placeholder: M3's two templates are about what
- * the model is ASKED to produce and how the run is JUDGED, and the tools that would
- * distinguish them — bounded per-table profiling, a monitor snapshot — arrive with
- * the templates themselves (#330 T3). What exists now is the seam, in the one place
- * a tool set may be decided, so widening one workflow later cannot become a second
- * decision about where that decision lives.
+ * Memoised per VARIANT, not per workflow or language, so a run is handed the same
+ * frozen array on every turn, as it was when each set was a constant here, and so two
+ * variants of one workflow can never share a set by accident.
  */
-/**
- * The optimization template's own two, on top of the read-class four.
- *
- * Offered to ONE workflow rather than added to `AGENT_MODE_TOOLS`, which is what
- * makes the axis load-bearing: an investigation that calls `compare_plans` is told
- * there is no such tool, because for that run there is not.
- */
-const QUERY_OPTIMIZATION_TOOLS: readonly AgentToolDefinition[] = Object.freeze([
-  ...AGENT_MODE_TOOLS,
-  AGENT_TOOL_DEFINITIONS.compare_plans,
-  AGENT_TOOL_DEFINITIONS.recommend_change,
-]);
+const VARIANT_TOOLS = new WeakMap<AgentWorkflowVariant, readonly AgentToolDefinition[]>();
 
-/** The assessment template's own tool, on top of the read-class four. */
-const DATABASE_ASSESSMENT_TOOLS: readonly AgentToolDefinition[] = Object.freeze([
-  ...AGENT_MODE_TOOLS,
-  AGENT_TOOL_DEFINITIONS.profile_table,
-]);
+function workflowTools(
+  language: AgentStatementLanguageId | undefined,
+  workflow: AgentRunWorkflowType,
+): readonly AgentToolDefinition[] {
+  const variant = requiredVariant(language, workflow);
+  let tools = VARIANT_TOOLS.get(variant);
+  if (tools === undefined) {
+    tools = Object.freeze(variant.tools.map((name) => agentToolDefinition(language, workflow, name)));
+    VARIANT_TOOLS.set(variant, tools);
+  }
+  return tools;
+}
 
 /**
- * The operations template's tools, and the ONLY set that is not built on the
- * read-class four.
+ * The tools this run may use, decided from its persisted mode, workflow type and
+ * statement language and nothing else.
  *
- * Deliberately not `[...AGENT_MODE_TOOLS, inspect_operations]`, which is what every
- * other template does. All three of the read-class tools this leaves out —
- * `inspect_schema`, `run_read_query`, `inspect_plan` — reach the database through
- * `provider.queryReadOnly`, which only PostgreSQL and SQLite implement. Offering any
- * of them here would reintroduce, tool by tool, the exact engine restriction this
- * workflow exists to escape: the run would open on MySQL, be offered a tool, call it,
- * and be answered by an acquisition that refuses the engine.
- *
- * `inspect_schema` was checked rather than assumed, per the spec's condition:
- * `inspectSchemaTool` composes a statement and hands it to `executeAgentOperation`,
- * whose invoke callback is `runStatement`, which calls `provider.queryReadOnly`. It
- * depends on it, so it is left out.
- *
- * `recommend_change` is here and `compare_plans` is not: a comparison names two
- * `inspect_plan` artifacts this run cannot produce, so offering it would be offering
- * a tool that can only ever refuse.
- */
-const OPERATIONS_TOOLS: readonly AgentToolDefinition[] = Object.freeze([
-  AGENT_TOOL_DEFINITIONS.inspect_operations,
-  AGENT_TOOL_DEFINITIONS.recommend_change,
-  AGENT_TOOL_DEFINITIONS.compose_report,
-]);
-
-/**
- * The analysis template's two tools, on top of the read-class four.
- *
- * `present_answer` is the one this workflow's verdict requires, and it is offered
- * HERE and nowhere else for exactly that reason: a tool a run's bar never asks for is
- * a tool that can only distract it.
- *
- * `profile_table` is borrowed from the assessment template rather than duplicated,
- * and it is borrowed at the design's cheapest recommendation (§5.4). The schema
- * carries no row counts, so a 400 M-row fact table and a 12-row lookup table are
- * indistinguishable in the inventory, and a `shipped_at` that is 80% null and a
- * `placed_at` that is fully populated say which date column the business actually
- * fills. Basic depth answers both, costs one statement per table, and reads no value
- * out of any column — which is what makes pointing it at a table of personal data
- * acceptable at all.
- */
-const DATA_ANALYSIS_TOOLS: readonly AgentToolDefinition[] = Object.freeze([
-  ...AGENT_MODE_TOOLS,
-  AGENT_TOOL_DEFINITIONS.profile_table,
-  AGENT_TOOL_DEFINITIONS.present_answer,
-]);
-
-const WORKFLOW_TOOLS: Readonly<Record<AgentRunWorkflowType, readonly AgentToolDefinition[]>> = Object.freeze({
-  investigation: AGENT_MODE_TOOLS,
-  "query-optimization": QUERY_OPTIMIZATION_TOOLS,
-  "database-assessment": DATABASE_ASSESSMENT_TOOLS,
-  operations: OPERATIONS_TOOLS,
-  "data-analysis": DATA_ANALYSIS_TOOLS,
-} satisfies Record<AgentRunWorkflowType, readonly AgentToolDefinition[]>);
-
-/**
- * The tools this run may use, decided from its persisted mode and workflow type and
- * nothing else.
- *
- * The parameter is the run record (narrowed to the two fields that matter) rather
+ * The parameter is the run record (narrowed to the three fields that matter) rather
  * than bare strings, so the values can only have come from persisted state. There is
  * no parameter through which a request body could contribute a tool, which is what
  * "a client-supplied tool list is ignored, not merged" means here.
@@ -875,129 +923,15 @@ const WORKFLOW_TOOLS: Readonly<Record<AgentRunWorkflowType, readonly AgentToolDe
  * contract whatever it is for, so a workflow type is never a way to give a planning
  * run a tool.
  */
-export function selectAgentTools(run: Pick<AgentRunRecord, "mode" | "workflowType">): readonly AgentToolDefinition[] {
-  return run.mode === "agent" ? WORKFLOW_TOOLS[run.workflowType] : NO_TOOLS;
+export function selectAgentTools(
+  run: Pick<AgentRunRecord, "mode" | "workflowType" | "statementLanguage">,
+): readonly AgentToolDefinition[] {
+  return run.mode === "agent" ? workflowTools(run.statementLanguage, run.workflowType) : NO_TOOLS;
 }
 
 // ============================================================================
 // Model-facing text
 // ============================================================================
-
-const UNAVAILABLE_TEXT: Readonly<Record<AgentToolUnavailableCode, string>> = Object.freeze({
-  // "Produce a plan in prose" until 2026-08-15, when the plan-mode design made the
-  // deliverable ONE runnable statement (or an explicit `NO STATEMENT:` refusal) for
-  // every workflow but `operations`. This sentence is said to a model that has just
-  // reached for a tool, which is exactly the moment it must not be handed a second,
-  // looser contract than the one its rules state: two wordings of one contract is how
-  // #350 happened. So it says what is true here — nothing can be called — and leaves
-  // what to produce to the rules that already say it.
-  MODE_HAS_NO_TOOLS:
-    "This run is in planning mode, which has no tools at all: no database call is possible from here. Answer with what your instructions asked you to produce.",
-  // Said by every tool, including the two that reach no database and compose no SQL,
-  // so it may not promise a statement (#350). `recommend_change` and `compose_report`
-  // shared a sentence written for the SQL-composing tools, and a model that got an
-  // evidence object wrong was answered with a sentence about statements.
-  INVALID_TOOL_INPUT:
-    "The arguments did not match the shape this tool declares, so nothing was done. Correct them and call the tool again.",
-  /*
-    The true sentence for an inventory that exists and is empty.
-
-    Split from `CATALOG_MATCHED_NOTHING` because that one denies the OBJECT, and here the
-    objects are present and simply carry nothing. "No secondary index" answers an optimization
-    question; it is not a missing name. The old sentence sent 79 of 133 measured optimization
-    runs looking for a misspelling on their opening turn.
-
-    It also closes the door rather than leaving it ajar: the run is told the inventory it was
-    already handed carries the same fact, so there is nothing further to read and no reason to
-    ask again with a different spelling.
-  */
-  CATALOG_INVENTORY_EMPTY:
-    "That inventory is empty: the objects exist and declare none of these, so nothing was inspected. This database has no secondary index and no declared foreign key beyond what the schema inventory in this conversation already shows — reading it again with another spelling will return the same nothing. Treat the absence as a finding: it is an answer about how this database is built, and you may state it in a claim citing that inventory.",
-  CATALOG_MATCHED_NOTHING:
-    "There is no object of that name in this database, so nothing was inspected. Check the inventory this run was given and inspect a name it lists — a name from the objective may be the name of a query or a report rather than of a table.",
-  UNVERIFIABLE_EVIDENCE: `At least one evidence reference does not match anything this run produced. Cite an artifact this run actually read, or the schema snapshot it captured. ${AGENT_EVIDENCE_CONTRACT}`,
-  UNVERIFIABLE_PLAN:
-    "At least one of those references is not an estimated plan this run produced. Inspect the plan of each statement first, then compare the two artifacts those inspections returned.",
-  /*
-    Offers names instead of a tool, and the tool it used to offer is the reason.
-
-    This said "Call inspect_schema for it first" — and the comment just below, written for
-    the sibling refusal, already states why that is wrong: the `no-table-profile` hold
-    narrows a run to `profile_table` and `compose_report`, so `inspect_schema` is gone. The
-    measured sequence was two dead refusals in a row: held and narrowed, asked for a
-    profile, names a table slightly wrong, told to call a tool it no longer holds, calls
-    it, told there is no such tool.
-
-    The inventory is in hand at the refusal site, so the call site appends names from it.
-    Not gated on whether the run was narrowed: a run that cannot spell a table is helped by
-    seeing the spellings either way.
-  */
-  TABLE_NOT_INVENTORIED:
-    "That table is not in the schema inventory this run captured, so nothing was profiled. Profile one the inventory lists, spelled the way it spells it.",
-  // Says what to change, which is the whole of it: the call this replaces was repeated
-  // verbatim three times because the sentence it got named nothing that could be edited.
-  // It also may not send the model to `inspect_schema` — a held run has been narrowed out
-  // of holding it, and the fix does not need it, since the table is already inventoried.
-  TABLE_QUALIFIER_UNKNOWN:
-    "The table is in this run's inventory, but not under the schema you named — this run's inventory has no such schema, so nothing was profiled. Call profile_table again with the same table and NO schema field at all: the inventory's own name for it is what this tool matches. The schema field takes a database schema name, never an artifact id or a snapshot fingerprint.",
-  NO_COLUMNS_AT_OFFSET:
-    "That column offset is past the end of the table, so there is nothing there to profile. Start from an earlier column, or profile a different table.",
-  PROFILE_UNREADABLE:
-    "The profile ran but its result could not be read as counts. Try a shallower depth, or profile a different table.",
-  IDENTICAL_PLANS:
-    "Both sides of that comparison name the same plan, so there is no before and no after. Inspect the plan of your rewrite as well, then compare the two.",
-  RECOMMENDATION_SHAPE_MISMATCH:
-    "That statement is not the kind of change the card claims. An index recommendation must be one CREATE INDEX statement; a rewrite must be one bounded read.",
-  PLAN_RESULT_RELEASED:
-    "That plan was this run's, but its rows are no longer held and cannot be read again. Inspect the plan once more if the comparison still matters.",
-  // The answer refusals each restate the half of the contract they enforce, and each
-  // one names the way out. A description is read by a model that is not yet confused;
-  // these are read by one that demonstrably is, and a table is almost always a correct
-  // answer it can give instead.
-  //
-  // This first one is the exception to that shape: nothing about the arguments was
-  // wrong, so there is no contract half to restate and no second attempt to invite.
-  // The only thing left for the run to do is say what the answer MEANS.
-  ANSWER_ALREADY_RECORDED:
-    "This run has already recorded its answer, and a run answers once: nothing was changed and no second answer was composed. If that answer was the wrong one, say so in your claims. Now call compose_report — the presentation shows the result, the claims are the answer.",
-  ANSWER_ARTIFACT_UNKNOWN:
-    "That is not the id of a result this run read, so there is nothing to present. Pass the artifact id a completed read reported in this run, or read the data first.",
-  ANSWER_NOT_A_DATA_READ:
-    "That result is this run's, and it is not a reading of the data, so it cannot be the answer: a plan DESCRIBES a statement without running it, and a profile returns counts the server composed about a table. Present the result of a run_read_query you drafted — run the read first if you have not. A plan or a profile can still be cited as evidence in your report.",
-  ANSWER_STATEMENT_UNKNOWN:
-    "That result was not produced by a statement you wrote, so there is no statement to put behind the answer. Answer with a read you drafted yourself.",
-  ANSWER_RESULT_RELEASED:
-    "That result was this run's, but its rows are no longer held, so a chart's columns cannot be checked against them. Read it again, or present the answer as a table.",
-  CHART_COLUMN_NOT_IN_RESULT:
-    "A chart may only name columns of the result it presents, and at least one of these is not one. The result's own column names follow: spell them exactly as they are spelled there, or present the answer as a table.",
-  CHART_COLUMN_NOT_NUMERIC:
-    "Every y column of a chart has to hold numbers in the rows that were delivered, and at least one of these does not. Chart a column that holds numbers, or present the answer as a table — a table is a complete answer.",
-  CHART_TOO_FEW_ROWS:
-    "A chart needs at least two rows and this result has fewer, so a chart of it would render an empty state. Present the answer as a table: one row is a complete answer, not a lesser one.",
-  CHART_SHAPE_MISMATCH:
-    "That chart type does not fit the columns named: a pie takes exactly one y column, and a scatter needs a numeric x as well as a numeric y. Choose a type that fits the columns, or present the answer as a table.",
-  /*
-    Both of these name `compose_report`, and that is the whole correction.
-
-    They used to end "Stop calling tools and finish with what has already been established"
-    and "Ask for something cheaper, or finish now." Finishing IS a tool call: `compose_report`
-    is ledger-only, reaches no database, and is short-circuited before the deadline gate is
-    consulted, so it is still available to a run with nothing left. A model that reads those
-    sentences literally answers in prose instead, and prose is scored `no-report` — the
-    largest single shortfall measured, blocking 28 of the cells that do not lock.
-
-    So each says which call still works, and why it works, rather than telling a run to stop
-    doing the only thing that can still end it well.
-  */
-  RUN_DEADLINE_EXCEEDED:
-    "The run has spent its whole time budget, so no further reading is possible. Call compose_report now with what has already been established: it needs no time budget, because it reaches no database. A run that ends without a report answers nothing at all.",
-  INSUFFICIENT_TIME_REMAINING:
-    "Too little time is left in the run for a call of this size. Ask for something cheaper, or call compose_report now with what you have — it needs no time budget, because it reaches no database.",
-  STATEMENT_ALREADY_FAILED:
-    "This exact statement has already failed in this run. Draft a different statement rather than sending the same one again.",
-  REPAIR_BUDGET_EXHAUSTED:
-    "This run has used all of its repair attempts. Stop drafting statements and report what has been established.",
-});
 
 /**
  * What a denial tells the model it may try next. Three answers, because the codes
@@ -1066,50 +1000,26 @@ const DENIAL_ADVICE_TEXT: Record<DenialAdvice, string> = {
  * The version is the one that DECIDED — the run's own workflow policy — rather than a
  * module-level constant, so what the model is told and what an operator can trace the
  * denial back to are the same string.
+ *
+ * A shape denial is told in the statement language's own words where the language has
+ * them: a kubectl read is neither valid nor invalid SQL. SQL keeps its sentence (D6).
  */
-function denialText(reasonCode: PolicyDenyCode, policyVersion: string): string {
+function denialText(reasonCode: PolicyDenyCode, policyVersion: string, language: AgentStatementLanguageId): string {
+  const advice = DENIAL_ADVICE[reasonCode];
   return [
     `The database operation layer refused this call: ${reasonCode} (policy ${policyVersion}).`,
-    DENIAL_ADVICE_TEXT[DENIAL_ADVICE[reasonCode]],
+    advice === "shape"
+      ? (languageServer(language).shapeAdvice ?? DENIAL_ADVICE_TEXT.shape)
+      : DENIAL_ADVICE_TEXT[advice],
     "Choose a different approach that stays inside a bounded read-only inspection.",
   ].join(" ");
 }
-
-/**
- * What a refused curated reading tells the model, and both sentences are advice it
- * can actually act on.
- *
- * `READING_OVER_BUDGET`'s advice is only worth giving because `limit` is applied by
- * the projection for EVERY kind rather than only by the two provider methods that
- * take one — see `runCuratedRead`. Advice a tool cannot honour is worse than none:
- * the model would spend its statement budget re-asking for a reading it can never be
- * given.
- */
-const READING_REFUSAL_TEXT: Record<AgentReadingDenyCode, string> = {
-  KIND_UNSUPPORTED_BY_PROVIDER:
-    "This database serves no reading of that kind, so nothing was read. Ask for a different kind, or report what the other readings established — including that this one is unavailable here.",
-  READING_OVER_BUDGET:
-    "That reading came back larger than this run may carry, so none of it was kept: a partial reading would be a misleading one. Ask again with a smaller limit; it bounds every kind of reading, not only the ones the engine limits itself.",
-};
 
 function approvalText(operationId: string): string {
   return [
     `The operation ${operationId} is default-denied and needs a human approval this run does not carry, so nothing was executed.`,
     "Use the estimating plan inspection instead; it describes a plan without running the statement.",
   ].join(" ");
-}
-
-function unavailable(
-  reasonCode: AgentToolUnavailableCode,
-  detail?: string,
-): AgentToolOutcome & { kind: "unavailable" } {
-  const base = UNAVAILABLE_TEXT[reasonCode];
-  return {
-    kind: "unavailable",
-    reasonCode,
-    modelText: detail === undefined ? base : `${base} (${detail})`,
-    ...(detail === undefined ? {} : { detail }),
-  };
 }
 
 /**
@@ -1156,7 +1066,11 @@ function isShapeFailure(problems: string): boolean {
   return /claims(\.\d+)?: expected (object|array)/.test(problems) || /claims: expected array/.test(problems);
 }
 
-function invalidEvidenceInput(problems: string, example?: string): AgentToolOutcome & { kind: "unavailable" } {
+function invalidEvidenceInput(
+  problems: string,
+  example?: string,
+  shape?: string,
+): AgentToolOutcome & { kind: "unavailable" } {
   return {
     kind: "unavailable",
     reasonCode: "INVALID_TOOL_INPUT",
@@ -1185,6 +1099,9 @@ function invalidEvidenceInput(problems: string, example?: string): AgentToolOutc
       // Before the evidence contract, because a run that sent prose where an object goes has
       // not reached the evidence yet — and the contract answers a question it did not ask.
       ...(isShapeFailure(problems) ? [AGENT_CLAIM_SHAPE] : []),
+      // The caller's own shape, on the same rule and in the same position: only
+      // `recommendChangeTool` passes one, so no other tool's refusal changes a character.
+      ...(shape === undefined ? [] : [shape]),
       AGENT_EVIDENCE_CONTRACT,
       ...(example === undefined ? [] : [`A call this run could make right now: ${example}`]),
     ].join(" "),
@@ -1204,38 +1121,11 @@ function invalidEvidenceInput(problems: string, example?: string): AgentToolOutc
 function exampleCompareCall(events: readonly AgentRunEvent[]): string | undefined {
   const plans: string[] = [];
   for (const event of events) {
-    if (event.kind === "tool-completed" && event.artifact.operationId === "sql.explain.estimate")
+    if (event.kind === "tool-completed" && PLAN_ESTIMATE_OPERATIONS.has(event.artifact.operationId))
       plans.push(event.artifact.correlationId);
   }
   if (plans.length < 2) return undefined;
   return JSON.stringify({ before: plans.at(-2), after: plans.at(-1) });
-}
-
-/**
- * A minimal, VALID `recommend_change` call for this run, or nothing when it holds no plan.
- *
- * The index arm, because that is the one an optimization verdict accepts without a comparison:
- * a run holding ONE plan satisfies its bar by recommending an index that cites that plan, and
- * that is exactly the call one evaluated model failed on the shape of four times in a single run
- * while its prose showed it knew what to say.
- *
- * The statement is a placeholder naming no table on purpose. This layer knows which plan the
- * run holds; it does not know which column the model thinks should be indexed, and inventing
- * one would be this server writing a recommendation and attributing it to the model.
- */
-function exampleRecommendCall(events: readonly AgentRunEvent[]): string | undefined {
-  let plan: string | undefined;
-  for (const event of events) {
-    if (event.kind === "tool-completed" && event.artifact.operationId === "sql.explain.estimate")
-      plan = event.artifact.correlationId;
-  }
-  if (plan === undefined) return undefined;
-  return JSON.stringify({
-    change: "index",
-    statement: "CREATE INDEX <name> ON <table> (<column>)",
-    rationale: "<why this index answers the objective>",
-    evidence: [{ source: "artifact", correlationId: plan }],
-  });
 }
 
 /**
@@ -1248,11 +1138,15 @@ function exampleRecommendCall(events: readonly AgentRunEvent[]): string | undefi
  * this looks for a completed data read with a statement of the model's behind it, which is
  * exactly what the tool accepts, and offers nothing when there is none.
  */
-function presentableArtifact(events: readonly AgentRunEvent[]): string | undefined {
+export function presentableArtifact(events: readonly AgentRunEvent[]): string | undefined {
   const drafted = new Set(events.flatMap((event) => (event.kind === "statement-drafted" ? [event.stepId] : [])));
   let latest: string | undefined;
   for (const event of events) {
-    if (event.kind === "tool-completed" && event.artifact.operationId === ANSWER_OPERATION && drafted.has(event.stepId))
+    if (
+      event.kind === "tool-completed" &&
+      isStatementReadOperation(event.artifact.operationId) &&
+      drafted.has(event.stepId)
+    )
       latest = event.artifact.correlationId;
   }
   return latest;
@@ -1303,6 +1197,8 @@ function renderRows(rows: readonly Record<string, unknown>[]): string {
     .map((row) =>
       JSON.stringify(row, (_key, value) => {
         if (typeof value === "bigint") return value.toString();
+        // NaN and the infinities as words: left to `JSON.stringify` they read as SQL NULL.
+        if (typeof value === "number") return nonFiniteWord(value) ?? value;
         const bytes = asBytes(value);
         return bytes === undefined ? value : binaryText(bytes);
       }),
@@ -1367,26 +1263,27 @@ function auditDeadlineRefusal(
  * Note which classes are deliberately NOT here, because both look like they belong
  * and both would re-break the repair loop:
  *
- * - **`AuthenticationError`** covers two unrelated events. `mapDatabaseError` answers
- *   it for anything matching `password`/`authentication`/`access denied`/
- *   `permission denied` (`errors.ts:270-277`), which folds a wrong agent credential
- *   together with `permission denied for table secrets`. The second is routine on the
- *   least-privilege `agentUser` this programme recommends — per-table `SELECT` grants
- *   are what bound an agent's reads — so it is the model's first probe of an ungranted
- *   object, and reading a different table is exactly the repair that helps. They are
- *   indistinguishable by class but not by PHASE, which is what `runStatement` splits
- *   on: a credential failure happens while connecting, a grant failure while running.
- * - **`QueryCancelledError`** is what a PostgreSQL statement timeout arrives as, and
- *   this layer is what CAUSES it: the clamped budget becomes `SET LOCAL
- *   statement_timeout` (`postgres.ts:892`), the engine says `canceling statement due
- *   to statement timeout`, and `mapDatabaseError` matches `canceling statement`
- *   BEFORE its timeout branch (`errors.ts:280-293`) — so the timeout never arrives as
- *   `TimeoutError` on this engine at all. Narrowing the read is the repair that helps.
- *   The message that would distinguish an operator cancel is discarded by the mapper
- *   (`docs/BACKLOG.md` B4), so this cannot be split on text.
- *   FOR T7: a run cancellation must therefore be enforced by the run loop's own
- *   persisted state between tool calls, NOT by expecting a driver cancel to propagate
- *   out of this layer — after this commit it does not.
+ * - **`PermissionDeniedError`**, which `mapDatabaseError` answers for a privilege the
+ *   credential lacks (`src/lib/db/errors.ts`), such as `permission denied for table
+ *   secrets`. It is routine on the least-privilege `agentUser` this programme recommends,
+ *   whose per-table `SELECT` grants are what bound an agent's reads, so it is the model's
+ *   first probe of an ungranted object, and reading a different table is exactly the
+ *   repair that helps. A refused credential, `AuthenticationError`, stays out as it was
+ *   when it also carried those refusals: it happens while connecting, a phase
+ *   `runStatement` propagates whatever the class.
+ * - **`QueryCancelledError`** covers an OPERATOR cancel (`pg_cancel_backend`,
+ *   `canceling statement due to user request`) and stays repairable at the query
+ *   phase for the same reason a `TimeoutError` is: narrowing the read is a rewrite
+ *   the model can make. Since #1145 a PostgreSQL `statement_timeout` — the budget
+ *   this layer itself installs via the `SET LOCAL statement_timeout` in
+ *   `PostgresProvider.queryReadOnly()` (`src/lib/db/providers/sql/postgres.ts`)
+ *   — no longer arrives here: `mapDatabaseError` now recognises `canceling statement
+ *   due to statement timeout` BEFORE its cancellation branch and returns a
+ *   `TimeoutError` (`errors.ts`), which is also repairable at this phase, so the
+ *   repair loop is unchanged. Both classes stay OUT of `ENVIRONMENT_FAILURES`.
+ *   FOR T7: a run cancellation must still be enforced by the run loop's own
+ *   persisted state between tool calls, NOT by expecting a driver cancel to
+ *   propagate out of this layer — it does not.
  *
  * HONEST LIMIT: this split is only as sharp as `mapDatabaseError`'s classification,
  * which is SUBSTRING matching on the engine's message, and it is imprecise in BOTH
@@ -1413,13 +1310,13 @@ const ENVIRONMENT_FAILURES = [ConnectionError, PoolExhaustedError, DatabaseConfi
  *
  * Classified BY EXCLUSION rather than by naming the repairable classes, and that is
  * the load-bearing part. `mapDatabaseError` is what every profiled provider routes a
- * driver error through, and its fall-through is the BASE `DatabaseError`
- * (`errors.ts:332`) — so an enumeration of `QueryError | TimeoutError` missed the most
- * canonical repairable failure of all: `no such table: ordrs` on SQLite, and
- * PostgreSQL's `operator does not exist`, `invalid input syntax for type …`,
- * `function … does not exist` and `division by zero`. Each of those escaped this
- * layer as a raw throw instead of becoming a repairable refusal, which killed the
- * repair loop for exactly the errors it exists to serve.
+ * driver error through, and its fall-through is the BASE `DatabaseError` (the final
+ * fallback in `mapDatabaseError()` in `src/lib/db/errors.ts`) — so an enumeration of
+ * `QueryError | TimeoutError` missed the most canonical repairable failure of all:
+ * `no such table: ordrs` on SQLite, and PostgreSQL's `operator does not exist`,
+ * `invalid input syntax for type …`, `function … does not exist` and `division by zero`.
+ * Each of those escaped this layer as a raw throw instead of becoming a repairable
+ * refusal, which killed the repair loop for exactly the errors it exists to serve.
  *
  * Exclusion also fails in the right direction as `mapDatabaseError` grows: a new
  * message pattern that lands on the base class is treated as the model's problem and
@@ -1429,7 +1326,7 @@ const ENVIRONMENT_FAILURES = [ConnectionError, PoolExhaustedError, DatabaseConfi
  * answer is right — it says so itself.
  *
  * `ExecutionProfileError` needs no entry: it does not extend `DatabaseError` at all
- * (`errors.ts:177`), so it is outside this predicate by construction — and it is
+ * (`src/lib/db/errors.ts`), so it is outside this predicate by construction — and it is
  * raised during acquisition, which propagates everything anyway.
  */
 function isStatementFailure(error: unknown): error is DatabaseError {
@@ -1454,6 +1351,8 @@ async function runStatement(
   validatedInput: unknown,
   budget: ExecutionBudget,
   phase: { statementSent: boolean },
+  argument: AgentStatementArgument,
+  mode?: ReadOnlyStatementMode,
 ): Promise<QueryResult> {
   const provider = await context.acquireProvider(context.connection, AGENT_EXECUTION_PROFILE);
   if (typeof provider.queryReadOnly !== "function") {
@@ -1470,7 +1369,7 @@ async function runStatement(
     // was asked for, so it is a note rather than a second guard.
     throw new Error("agent tool layer: the acquired provider exposes no read-only execution path");
   }
-  const { sql } = validatedInput as { readonly sql: string };
+  const sql = (validatedInput as Readonly<Record<string, string>>)[argument];
   // Set immediately before the statement leaves, and never reset. This flag is the
   // whole phase discriminator: anything that threw while we were still connecting
   // cannot be a statement the model could repair, whatever class it carries, so the
@@ -1478,11 +1377,15 @@ async function runStatement(
   // separates a wrong agent credential from `permission denied for table secrets`
   // without inspecting message text.
   phase.statementSent = true;
-  return provider.queryReadOnly(sql, {
-    statementTimeoutMs: budget.statementTimeoutMs,
-    maxResultRows: budget.maxResultRows,
-    maxResultBytes: budget.maxResultBytes,
-  });
+  return provider.queryReadOnly(
+    sql,
+    {
+      statementTimeoutMs: budget.statementTimeoutMs,
+      maxResultRows: budget.maxResultRows,
+      maxResultBytes: budget.maxResultBytes,
+    },
+    mode,
+  );
 }
 
 /**
@@ -1497,16 +1400,19 @@ export async function executeAgentOperation(
   context: AgentToolContext,
   request: AgentOperationRequest,
 ): Promise<AgentToolOutcome> {
+  const argument = request.argument ?? "sql";
   return runAuditedAgentCall(context, {
     operationId: request.operationId,
     // The statement IS the identity of a SQL call: two calls sending the same text
     // are the same call however the model worded its way to them.
     fingerprintSource: request.sql,
-    input: { sql: request.sql },
+    fingerprintLanguage: statementFamilyOf(context.statementLanguage),
+    input: { [argument]: request.sql },
     ...(request.label === undefined ? {} : { label: request.label }),
     ...(request.target === undefined ? {} : { target: request.target }),
     ...(request.grounding === undefined ? {} : { grounding: request.grounding }),
-    invoke: (validatedInput, budget, phase) => runStatement(context, validatedInput, budget, phase),
+    invoke: (validatedInput, budget, phase) =>
+      runStatement(context, validatedInput, budget, phase, argument, request.mode),
   });
 }
 
@@ -1520,11 +1426,16 @@ export async function executeAgentOperation(
  * clamp, the audited execution, the artifact — is written once here, because a
  * second copy of a gate order is a second thing that can be got wrong quietly.
  */
-interface AuditedAgentCall {
+export interface AuditedAgentCall {
   readonly operationId: AgentOperationId;
   /** Canonical text this call is identified by in the repair ledger. */
   readonly fingerprintSource: string;
-  /** The input the DESCRIPTOR validates. `{sql}` for a statement, the selector for a curated read. */
+  /**
+   * The language `fingerprintSource` is written in, set by statement calls only. A curated call leaves it unset and
+   * keeps the SQL fingerprint of its own `operations:...` or `objects:...` key, which is no statement in any language.
+   */
+  readonly fingerprintLanguage?: AgentStatementLanguageId;
+  /** The input the DESCRIPTOR validates. `{sql}` or `{statement}` for a statement, the selector for a curated read. */
   readonly input: unknown;
   readonly label?: string;
   readonly target?: { readonly catalog?: string; readonly schema?: string };
@@ -1547,8 +1458,12 @@ interface AuditedAgentCall {
  * the audit records an execution, so the step settles like every other reach that
  * happened.
  */
-class AgentCuratedReadError extends Error {
-  constructor(readonly reasonCode: AgentReadingDenyCode) {
+export class AgentCuratedReadError extends Error {
+  constructor(
+    readonly reasonCode: AgentReadingDenyCode,
+    /** The sentence the model reads, where this reading's advice differs from the generic one. */
+    readonly modelText?: string,
+  ) {
     super(reasonCode);
     this.name = "AgentCuratedReadError";
   }
@@ -1576,19 +1491,62 @@ function columnsThatExist(message: string, connection: DatabaseConnection): stri
   // taking the first two would look up "e" and find nothing. Measured — the only database error
   // this fix could have answered in a whole sweep had that shape, and the first version missed it.
   const qualified = /no such column:\s*(?:\w+\.)*?(\w+)\.(\w+)\s*$/i.exec(message.trim());
-  if (qualified === null) return undefined;
-  const [, qualifier, missing] = qualified;
   const snapshot = heldSnapshotForConnection(connectionIdentity(connection));
   if (snapshot === null) return undefined;
+  /*
+    The column named with NO table in front of it, which is what a model writes most of the time.
+
+    The qualified form is what this function was built for and it leaves the commonest shape
+    unanswered: `no such column: dept_name`. Measured 2026-09-23 on `granite4:3b` - two drafts in
+    one run, `dept_name` then `dept_no`, both bare, both answered with the engine's four words and
+    nothing else; the run then offered its table profile as the answer and was refused 121 times
+    across the sweep. That cell, data-analysis 0/5, is the only one between that model and 30/30.
+
+    With no qualifier there is no table whose columns to list, so what is named is WHERE the column
+    lives. That is the half that moves a model anyway - a join it can write, rather than a fact
+    about a table it did not ask about. A name that is nowhere in the inventory produces nothing:
+    saying "no table has it" is true and leads nowhere, and the inventory is already in the prompt.
+  */
+  if (qualified === null) {
+    const bare = /no such column:\s*(\w+)\s*$/i.exec(message.trim());
+    if (bare === null) return undefined;
+    const [, missing] = bare;
+    const holders = snapshot.objects
+      .filter((entry) => entry.columns.some((column) => column.name.toLowerCase() === missing.toLowerCase()))
+      .slice(0, 6)
+      .map((entry) => entry.name);
+    if (holders.length === 0) return undefined;
+    return `${missing} is in ${holders.join(", ")} — join through one of those, or qualify it.`;
+  }
+  const [, qualifier, missing] = qualified;
   // The inventory names a table as the engine qualifies it — `public.engineering` on
   // PostgreSQL — while the error names it as the statement wrote it, usually bare. So the last
   // segment is compared as well, which is what makes the two spellings meet.
   const wanted = qualifier.toLowerCase();
-  const table = snapshot.tables.find((entry) => {
+  const table = snapshot.objects.find((entry) => {
     const name = entry.name.toLowerCase();
     return name === wanted || name.split(".").at(-1) === wanted;
   });
-  if (table === undefined || table.columns.length === 0) return undefined;
+  /*
+    A qualifier that is an ALIAS still gets the half of the answer that does not need it.
+
+    This returned nothing here, on the reasoning that resolving `e` to `employee` needs the FROM
+    clause and inventing a mapping is worse than silence. The silence is worse. Measured
+    2026-09-23 on `granite4:3b`: told where a bare `dept_name` lived, it rewrote the statement
+    with the right join and hit `no such column: e.dept_no` — then sent the identical statement
+    three more times, because that refusal carried nothing. Its columns cannot be listed without
+    knowing the table; WHERE the column lives needs no alias at all, and that is the half a model
+    can act on.
+  */
+  if (table === undefined || table.columns.length === 0) {
+    const holders = snapshot.objects
+      .filter((entry) => entry.columns.some((column) => column.name.toLowerCase() === missing.toLowerCase()))
+      .slice(0, 6)
+      .map((entry) => entry.name);
+    return holders.length === 0
+      ? undefined
+      : `${missing} is in ${holders.join(", ")} — "${qualifier}" is not one of them.`;
+  }
   // Bounded: a wide table's whole column list would bury the sentence that carries it.
   const named = table.columns.slice(0, 12).map((column) => column.name);
   /*
@@ -1598,7 +1556,7 @@ function columnsThatExist(message: string, connection: DatabaseConnection): stri
     answer a model looking for a join key — `emp_no` exists, in dept_emp, employee, salary and
     title — and the whole inventory is already in hand.
   */
-  const elsewhere = snapshot.tables
+  const elsewhere = snapshot.objects
     .filter(
       (entry) => entry !== table && entry.columns.some((column) => column.name.toLowerCase() === missing.toLowerCase()),
     )
@@ -1618,25 +1576,34 @@ function columnsThatExist(message: string, connection: DatabaseConnection): stri
  *
  * Takes no connection: neither branch reads our own state. They are derived from the shape of the
  * engine's message and from the engine this connection IS, which is why neither can be free.
+ *
+ * The row-budget sentence is the statement language's own, since the way to ask for fewer rows is
+ * written in that language. The catalog branch is the language's own too, and only SQL has one (its pack's
+ * `catalogAdvice`): a foreign catalog is a SQL mistake.
  */
-function otherStatementAdvice(message: string, engine: string): string | undefined {
+function otherStatementAdvice(
+  message: string,
+  engine: string,
+  statement: string,
+  language: AgentStatementLanguageId,
+): string | undefined {
   const overBudget = /row budget: \d+ rows > (\d+) allowed/.exec(message);
-  if (overBudget !== null) {
-    return `Ask for fewer rows: add LIMIT ${overBudget[1]} (or an aggregate that returns one row) and run it again.`;
-  }
-  if (/information_schema|pg_catalog/i.test(message) || /no such table: \w+\./i.test(message)) {
-    return `That catalog belongs to another engine — this connection is ${engine}. Call inspect_schema for this database's tables and columns rather than querying a catalog directly.`;
-  }
-  return undefined;
+  if (overBudget !== null) return languageServer(language).rowCapAdvice(statement, overBudget[1]);
+  return languageServerPack(language).catalogAdvice?.(message, engine);
 }
 
-async function runAuditedAgentCall(context: AgentToolContext, call: AuditedAgentCall): Promise<AgentToolOutcome> {
+export async function runAuditedAgentCall(
+  context: AgentToolContext,
+  call: AuditedAgentCall,
+): Promise<AgentToolOutcome> {
   // Outside agent mode only a grounding read passes, and the flag is set by nothing
   // the model can reach: `selectAgentTools` still hands a planning run an empty tool
   // set, so no dispatch of a model's tool call ever arrives here with it.
   if (context.mode !== "agent" && call.grounding !== true) return unavailable("MODE_HAS_NO_TOOLS");
 
-  const fingerprint = fingerprintStatement(call.fingerprintSource);
+  const fingerprint = languageServer(call.fingerprintLanguage ?? CURATED_CALL_LANGUAGE).fingerprint(
+    call.fingerprintSource,
+  );
   const repairAdmission = context.repairs.admit(fingerprint);
   if (!repairAdmission.admitted) return unavailable(repairAdmission.reasonCode);
 
@@ -1761,7 +1728,7 @@ async function runAuditedAgentCall(context: AgentToolContext, call: AuditedAgent
         },
         // The server's own words: nothing an engine wrote is in this sentence, so it
         // is not fenced.
-        modelText: READING_REFUSAL_TEXT[error.reasonCode],
+        modelText: error.modelText ?? READING_REFUSAL_TEXT[error.reasonCode],
       };
     }
     // The phase gate comes FIRST and is unconditional. A failure raised before the
@@ -1793,7 +1760,14 @@ async function runAuditedAgentCall(context: AgentToolContext, call: AuditedAgent
       applies. `columnsThatExist` is computed once and used for both rather than called twice.
     */
     const columns = columnsThatExist(error.message, context.connection);
-    const advice = columns ?? otherStatementAdvice(error.message, context.connection.type);
+    const advice =
+      columns ??
+      otherStatementAdvice(
+        error.message,
+        context.connection.type,
+        call.fingerprintSource,
+        call.fingerprintLanguage ?? CURATED_CALL_LANGUAGE,
+      );
     const answered = columns !== undefined;
     context.repairs.recordFailure(fingerprint, answered ? "database-error-answered" : "database-error");
     return {
@@ -1847,7 +1821,7 @@ async function runAuditedAgentCall(context: AgentToolContext, call: AuditedAgent
       return {
         kind: "refused",
         refusal: { class: "policy-denied", reasonCode: decision.reasonCode },
-        modelText: denialText(decision.reasonCode, policy.version),
+        modelText: denialText(decision.reasonCode, policy.version, call.fingerprintLanguage ?? CURATED_CALL_LANGUAGE),
       };
     }
     context.repairs.recordFailure(fingerprint, "approval-required");
@@ -1873,6 +1847,18 @@ async function runAuditedAgentCall(context: AgentToolContext, call: AuditedAgent
       elapsedMs: result.executionTime,
     },
   };
+  const warnings = result.warnings ?? [];
+  // What the provider said about its own answer (an applied tail, a defaulted container) is part of the answer: a
+  // model that cannot see it reads 100 lines as the whole log. Fenced like the rows, because a provider may quote
+  // engine text in one. Absent when there is none, so a result with no warnings reads exactly as it always did.
+  const warned =
+    warnings.length === 0
+      ? ""
+      : `\n${fenceUntrustedContent(warnings.map((warning) => warning.message).join("\n"), {
+          label: `${call.label ?? "result"} warnings`,
+          operationId: artifact.operationId,
+          reference: artifact.correlationId,
+        })}`;
   return {
     kind: "completed",
     artifact,
@@ -1886,13 +1872,9 @@ async function runAuditedAgentCall(context: AgentToolContext, call: AuditedAgent
       label: `${call.label ?? "result"}, ${result.rowCount} row(s)`,
       operationId: artifact.operationId,
       reference: artifact.correlationId,
-    })}`,
+    })}${warned}`,
   };
 }
-
-/** What a completed reach says about the artifact it just produced. */
-export const handoverText = (correlationId: string): string =>
-  `Stored as artifact ${correlationId}. To use it in a claim, cite it as ${citeArtifact(correlationId)}.`;
 
 // ============================================================================
 // The four tools
@@ -1926,19 +1908,6 @@ const CATALOG_LABELS: Readonly<Record<AgentCatalogKind, string>> = Object.freeze
 });
 
 /**
- * The schema name to DECLARE as the policy target, given what the composer accepted.
- *
- * Only SQLite needs the fold: `main` is its whole schema set and the composer matches
- * it case-insensitively, so the canonical spelling is the one a scope allowlist can be
- * written against. PostgreSQL is left exactly as supplied — `information_schema`
- * compares `table_schema` case-sensitively, so folding it would declare a target that
- * is not the one the composed statement reads.
- */
-function normalizeDeclaredSchema(context: AgentToolContext, schema: string): string {
-  return context.connection.type === "sqlite" ? schema.toLowerCase() : schema;
-}
-
-/**
  * Parses a tool's arguments against the schema the tool DECLARES, so the declaration
  * is load-bearing rather than advisory.
  *
@@ -1949,14 +1918,49 @@ function normalizeDeclaredSchema(context: AgentToolContext, schema: string): str
  * failure returns the same `INVALID_TOOL_INPUT` as a composition refusal: from the
  * model's side both mean "these arguments cannot become a statement".
  */
-function parseToolInput<T>(
+export function parseToolInput<T>(
   schema: z.ZodType<T>,
   input: unknown,
+  /**
+   * Tools whose own refusal this run would meet if it followed the order, so the order is not
+   * offered. See `TOOL_OWNING_FIELD` and the comment on the clause it changes.
+   */
+  wouldRefuse?: ReadonlySet<string>,
 ): { ok: true; value: T } | { ok: false; problems: string } {
   const parsed = schema.safeParse(input);
   return parsed.success
     ? { ok: true, value: parsed.data }
-    : { ok: false, problems: describeIssues(parsed.error.issues) };
+    : { ok: false, problems: describeIssues(parsed.error.issues, input, wouldRefuse) };
+}
+
+/**
+ * The TYPE that arrived where a type was expected, read off the arguments the tool was handed.
+ *
+ * The other half of a comparison this layer was only ever stating one side of, and by a wide
+ * margin the largest single refusal measured here. Across twelve hours of sweeps `compose_report`
+ * was declined 1530 times and ONE issue is 1110 of them — `claims: expected array` — with models
+ * from three vendors sending the same bytes again after reading it. They are not ignoring the
+ * message: a model that serialized `claims` as a JSON STRING agrees with "expected array", because
+ * what it sent IS an array as far as it can tell. Nothing in the sentence contradicts it.
+ *
+ * Bounded by the rule the message already carries and stated in `describeIssues`: what crosses
+ * over is server-authored — the path, and the type or rule — and never the VALUE. A type is
+ * structural in exactly the way a field name is. `string` is not the model's text; it is the
+ * shape of it, which is the thing the model got wrong and the one thing it was not told.
+ *
+ * Read from the input rather than from the issue because Zod 4 no longer carries `received`.
+ * `null` is named as itself: `typeof null` is `object`, which would send a model looking for a
+ * field it did not omit.
+ */
+function arrivedAt(input: unknown, path: readonly PropertyKey[]): string {
+  let value: unknown = input;
+  for (const key of path) {
+    if (value === null || typeof value !== "object") return "nothing";
+    value = (value as Record<PropertyKey, unknown>)[key];
+  }
+  if (value === null) return "null";
+  if (value === undefined) return "nothing";
+  return Array.isArray(value) ? "array" : typeof value;
 }
 
 /**
@@ -1982,12 +1986,235 @@ function parseToolInput<T>(
  * Three at most, because a model that got the shape wrong is not helped by a fourth, and a
  * long list read as prose is how a refusal becomes another wall.
  */
-function describeIssues(issues: readonly z.core.$ZodIssue[]): string {
-  const named = issues.slice(0, 3).map((issue) => {
-    const where = issue.path.length === 0 ? "the arguments object" : issue.path.join(".");
-    if (issue.code === "invalid_type") return `${where}: expected ${issue.expected}`;
-    if (issue.code === "unrecognized_keys") return `${where}: remove ${issue.keys.join(", ")}`;
+/**
+ * The tool each field belongs to, for a surplus key that is misfiled rather than stray.
+ *
+ * Measured 2026-09-17 on `granite4-3b`, one cell short of the whole model. Its analyze cell lost
+ * 5/5, every loss `report-composed` with `no-answer`, and the captured arguments show a run that
+ * had both halves of the answer and filed one on the wrong tool:
+ *
+ *     present_answer   {"artifact": "bfe7ca93-..."}
+ *     compose_report   {"claims": [...], "presentation": {"kind": "table"}}
+ *
+ * Six refusals of the first for a missing `presentation`, three of the second CARRYING it. What the
+ * server said to the second was `the arguments object: remove presentation`, so the model removed
+ * the only presentation it ever composed, and the run was then scored for not having one.
+ *
+ * `remove` stays the right word for a key that belongs nowhere. For a key that is a field of
+ * another tool this run holds, the true sentence is where it goes — and only the sentence: moving
+ * a half-call from one tool to another would be the server making a call the model never made.
+ */
+const TOOL_OWNING_FIELD: Readonly<Record<string, string>> = Object.freeze({
+  claims: "compose_report",
+  presentation: "present_answer",
+  artifact: "present_answer",
+  change: "recommend_change",
+  statement: "recommend_change",
+  rationale: "recommend_change",
+  recommendations: "recommend_change",
+  before: "compare_plans",
+  after: "compare_plans",
+});
+
+/**
+ * The `source` each evidence field belongs to, for a citation sent under the wrong branch.
+ *
+ * `evidenceSchema` is a discriminated union on `source`, so a model holding an artifact id that
+ * declares `context-snapshot` is validated against the snapshot branch: it is told its
+ * `correlationId` is surplus and a `fingerprint` is missing. Both halves are true of that branch
+ * and neither is the remedy, which is to name the branch the field it sent belongs to.
+ *
+ * Measured 2026-10-09 on `gemma4:e2b` investigation: 101 refusals in one five-run cell, all this
+ * mistake, the cell at 0/5 with two runs spending seven minutes re-sending the same call. The same
+ * refusal appears in `laguna-xs-2.1:latest` and `devstral-small-2:24b`. It is the shape
+ * `TOOL_OWNING_FIELD` already answers one level up: the server can see which branch was meant
+ * because the key is in the input, and `remove` is the one instruction that loses it.
+ */
+const EVIDENCE_SOURCE_OWNING_FIELD: Readonly<Record<string, string>> = Object.freeze({
+  correlationId: "artifact",
+  fingerprint: "context-snapshot",
+});
+
+/** The field the OTHER branch requires, so the half-truth about it can be dropped. */
+const EVIDENCE_SIBLING_FIELD: Readonly<Record<string, string>> = Object.freeze({
+  correlationId: "fingerprint",
+  fingerprint: "correlationId",
+});
+
+function describeIssues(
+  issues: readonly z.core.$ZodIssue[],
+  input: unknown,
+  wouldRefuse: ReadonlySet<string> = new Set(),
+): string {
+  const renames = renamesAmong(issues, input);
+  const renamedTo = new Set(renames.values());
+  // A citation under the wrong branch: the path of every evidence object that sent one branch's
+  // field, mapped to that field, so the sibling's "expected string, received nothing" can be
+  // dropped where it would contradict the instruction being given.
+  const misbranched = new Map<string, string>();
+  for (const issue of issues) {
+    if (issue.code !== "unrecognized_keys") continue;
+    for (const key of issue.keys) {
+      if (EVIDENCE_SOURCE_OWNING_FIELD[key] !== undefined) misbranched.set(issue.path.join("."), key);
+    }
+  }
+  const named = [
+    ...[...renames].map(([from, to]) => `rename ${from} to ${to}`),
+    ...issues.flatMap((issue) => {
+      const where = issue.path.length === 0 ? "the arguments object" : issue.path.join(".");
+      // Both halves of a rename are dropped here rather than filtered out of `issues` above,
+      // because an `unrecognized_keys` issue can carry keys a rename did not claim and those
+      // still have to be named.
+      if (issue.code === "invalid_type" && issue.path.length === 1 && renamedTo.has(String(issue.path[0]))) return [];
+      if (issue.code === "unrecognized_keys") {
+        const surplus = issue.keys.filter((key) => !renames.has(key));
+        if (surplus.length === 0) return [];
+        // A key this tool does not take but a SIBLING does is not surplus, it is misfiled, and
+        // `remove` is the one instruction that loses it. See `TOOL_OWNING_FIELD`.
+        const misfiled = surplus.flatMap((key) => {
+          const owner = TOOL_OWNING_FIELD[key];
+          /*
+            THE ORDER, not just the destination.
+
+            `send it there` was measured on `qwen2.5:3b-instruct` data-analysis, 2026-10-05:
+            FIFTY-FIVE refusals in one five-run cell, every one this exact sentence, the model
+            re-sending the same call each time until the runs ended having reported nothing. The
+            cell scored 0/5.
+
+            Reading the whole message explains the loop. The wrapper says `Correct them and call
+            the tool again`; this clause said `send it there`. Those are two different
+            instructions about two different tools, in one sentence, and the model followed the
+            first - correctly, by its own lights. A destination is not a sequence.
+
+            So the clause now carries the sequence, which is the only part that was missing: the
+            other call, first, and this one again without the field. It stays outside
+            `refusalExamples` under the rule `present_answer` already follows one layer down - a
+            whole worked call crowds a small model's turn, a short concrete value does not, and
+            being told a field lives `somewhere` is not the same instruction as being told what
+            to call.
+          */
+          if (owner === undefined) return [];
+          /*
+            THE ORDER IS ONLY AN INSTRUCTION WHERE THE OTHER CALL CAN SUCCEED.
+
+            The sentence above was measured as a fix and shipped as one. It is now the single most
+            frequent refusal in the ledger - 382 deliveries, beside 188
+            `present_answer: ANSWER_NOT_A_DATA_READ`, and the two numbers are one loop. A run that
+            has drafted no read holds nothing presentable, so the tool it is sent to refuses it, and
+            it returns here with the same argument. `granite4:1b` analyze lost its one failing run
+            to FIFTY refusals on 2026-10-11 while its passing runs finished in under ninety seconds.
+
+            This tool does not need the field. Where the run could satisfy the other call the order
+            stands; where it could not, the only move that ends the loop is to drop the field, and
+            saying so is the difference between an instruction and a wall.
+          */
+          return wouldRefuse.has(owner)
+            ? [
+                `${key} is not an argument of this tool and this run has nothing ${owner} would accept — call this tool again without it`,
+              ]
+            : [`${key} belongs to ${owner} — call ${owner} with it first, then call this tool again without it`];
+        });
+        // A key that belongs to the OTHER BRANCH of this union is not surplus either: the model
+        // sent the right id under the wrong `source`, and `remove` loses the id. See
+        // `EVIDENCE_SOURCE_OWNING_FIELD`.
+        const misbranchedHere = surplus.flatMap((key) => {
+          const source = EVIDENCE_SOURCE_OWNING_FIELD[key];
+          return source === undefined
+            ? []
+            : [`${where}: ${key} belongs to source "${source}" — set source to "${source}" and keep ${key}`];
+        });
+        const strays = surplus.filter(
+          (key) => TOOL_OWNING_FIELD[key] === undefined && EVIDENCE_SOURCE_OWNING_FIELD[key] === undefined,
+        );
+        return [
+          ...misfiled,
+          ...misbranchedHere,
+          ...(strays.length === 0 ? [] : [`${where}: remove ${strays.join(", ")}`]),
+        ];
+      }
+      // The sibling branch's required field, where the model sent this branch's: naming it would
+      // contradict the instruction above, which tells the model to keep what it sent.
+      if (issue.code === "invalid_type" && issue.path.length > 0) {
+        const parent = issue.path.slice(0, -1).join(".");
+        const sent = misbranched.get(parent);
+        if (sent !== undefined && EVIDENCE_SIBLING_FIELD[sent] === String(issue.path.at(-1))) return [];
+      }
+      return [describeIssue(issue, where, input)];
+    }),
+  ].slice(0, 3);
+  return `the fields that did not match — ${named.join("; ")}`;
+}
+
+/**
+ * The pairs of issues that are one mistake wearing two names.
+ *
+ * A model that sends `artifact_id` where the schema says `artifact` is refused twice over:
+ * the field is missing AND a field is surplus. Both sentences are true, neither says they
+ * are the same field, and the value the model sent was never wrong — only the key was. What
+ * it reads is that something is absent and something is extra, and the repair that suggests
+ * itself is to send the extra field again with more of it. That is the loop every other
+ * refusal in this file exists to end, arriving by a route none of them cover.
+ *
+ * Measured on `llama3.1:8b`, the most-pulled tool-capable model on Ollama: five analyze runs,
+ * `present_answer` declined in every one, never once on the value it carried. `artifact_id`
+ * is not an exotic guess — it is what the field is called in most APIs that have one.
+ *
+ * A near miss and nothing looser: the two names have to be the same word once punctuation and
+ * case are set aside, one of them possibly carrying an affix the other does not. Anything
+ * broader would start pairing fields that are genuinely different, and a confident rename to
+ * the WRONG field is worse than the two sentences it replaced.
+ *
+ * The rule the message is bounded by is untouched. Both names are keys — the model's and the
+ * schema's — which are structural exactly as a path is, and the value never crosses over.
+ */
+function renamesAmong(issues: readonly z.core.$ZodIssue[], input: unknown): ReadonlyMap<string, string> {
+  const absent = issues.flatMap((issue) =>
+    issue.code === "invalid_type" && issue.path.length === 1 && arrivedAt(input, issue.path) === "nothing"
+      ? [String(issue.path[0])]
+      : [],
+  );
+  const surplus = issues.flatMap((issue) => (issue.code === "unrecognized_keys" ? issue.keys : []));
+  const bare = (name: string): string => name.toLowerCase().replaceAll(/[^a-z0-9]/g, "");
+  const pairs = new Map<string, string>();
+  for (const key of surplus) {
+    // First match wins and each side is claimed once, so two surplus keys cannot both rename
+    // onto one absent field and leave the model choosing between them.
+    const match = absent.find(
+      (name) =>
+        !new Set(pairs.values()).has(name) && (bare(key).includes(bare(name)) || bare(name).includes(bare(key))),
+    );
+    if (match !== undefined && !pairs.has(key)) pairs.set(key, match);
+  }
+  return pairs;
+}
+
+/** One issue in this layer's words; see `describeIssues`, which owns the rules. */
+function describeIssue(issue: z.core.$ZodIssue, where: string, input: unknown): string {
+  if (issue.code === "invalid_type") {
+    const arrived = arrivedAt(input, issue.path);
     /*
+      THE TWO BIGGEST REFUSAL LOOPS IN THE LEDGER, and both were type reports.
+
+      Counted 2026-10-09 across the sweep: `claims.N.evidence: expected array, received nothing`
+      140 times and `expected array, received object` 127 times - 267 refusals, in the cell that is
+      unlocked on fifteen of the sixteen rows in the candidate table. `cogito:3b` was refused thirty
+      times in ONE optimize cell, `qwen3.5:0.8b` twenty-two, `gemma4:e2b` a hundred and one, and
+      what those cells record as their loss is `model-timeout` with `no-report`: the consequence of
+      spending a deadline re-sending a call nobody told them how to fix.
+
+      Naming the types is not naming the move. A model that sent one citation where a list of one
+      belongs needs to be told to wrap what it sent; a model that sent nothing needs to be told the
+      field is required, which "received nothing" reports without saying. Both remedies are in hand
+      at the point of refusal, which is the rule this file already turns on one branch down - a
+      closed set gets its values, a refused call gets a worked example, a misfiled field gets the
+      order of the two calls.
+    */
+    if (issue.expected === "array" && arrived !== "nothing")
+      return `${where}: expected array, received one ${arrived} — wrap it in an array: [ the value you sent ]`;
+    if (arrived === "nothing") return `${where}: expected ${issue.expected}, received nothing — this field is required`;
+    return `${where}: expected ${issue.expected}, received ${arrived}`;
+  }
+  /*
       A closed set is named, because "invalid value" was not something a model could act on.
 
       One evaluated model was refused `recommend_change` thirty-two times in one run on this
@@ -2000,8 +2227,8 @@ function describeIssues(issues: readonly z.core.$ZodIssue[]): string {
       example does it, the citable-id list does it — and a closed set is its cheapest case:
       the permitted values are in the schema, already in hand at the point of refusal.
     */
-    if (issue.code === "invalid_value") return `${where}: expected one of ${issue.values.join(", ")}`;
-    /*
+  if (issue.code === "invalid_value") return `${where}: expected one of ${issue.values.join(", ")}`;
+  /*
       A DISCRIMINATED union lands here, and it is deliberately left alone.
 
       `claims.0.evidence.2.source: invalid union` looks like the same fault as the two cases above
@@ -2016,9 +2243,7 @@ function describeIssues(issues: readonly z.core.$ZodIssue[]): string {
       the full sentence — is a reporting gap, not a blocked run, and pretending otherwise would
       have put dead code in front of a model that was never short of the answer.
     */
-    return `${where}: ${issue.code.replaceAll("_", " ")}`;
-  });
-  return `the fields that did not match — ${named.join("; ")}`;
+  return `${where}: ${issue.code.replaceAll("_", " ")}`;
 }
 
 /**
@@ -2072,7 +2297,7 @@ export async function readCatalogForGrounding(
 }
 
 /**
- * The provider schema read overran the time this call was granted.
+ * The provider object read overran the time this call was granted.
  *
  * A sentinel rather than a refusal code, for the same reason `AgentCuratedReadError`
  * is one: `executeAuditedOperation` owns the invoke callback's result type and there
@@ -2083,91 +2308,149 @@ export async function readCatalogForGrounding(
  */
 class AgentSchemaReadTimeout extends Error {
   constructor(readonly grantedMs: number) {
-    super(`the provider schema read did not answer within ${grantedMs}ms`);
+    super(`the provider object read did not answer within ${grantedMs}ms`);
     this.name = "AgentSchemaReadTimeout";
   }
 }
 
 /**
- * What the server's provider schema read produced. `tables` is the inventory itself.
+ * The inventory an object-surface read produced: what was listed, what the kinds MEAN,
+ * and whether it is all of it.
  *
- * No artifact reference travels with it, and that is not an oversight: the artifact is
- * still produced, still lands in the run's store and still reaches the audit stream, so
- * the call is as citable as any other. What the CALLER does with the reading is build a
- * snapshot from the structure, and it has no use for a handle to a projection of it.
+ * `kinds` carries more than the provider's `ObjectKindSpec` because three facts that decide
+ * whether the model is being told the truth are not on the spec: `sampledFrom`, which
+ * makes every count and listing of that kind a FLOOR, `derivedGroupings`, which says
+ * the rows are groupings this server derived rather than objects anybody named, and
+ * `unavailable`, which says the kind could not be read at all, so none of it is listed
+ * (#1089 4.7).
  */
-export type AgentProviderSchemaRead =
-  | { readonly kind: "completed"; readonly tables: readonly TableSchema[] }
-  | { readonly kind: "timed-out"; readonly grantedMs: number }
-  | { readonly kind: "unavailable"; readonly modelText: string };
+export type AgentObjectInventoryRead =
+  | {
+      readonly kind: "completed";
+      readonly inventory: AgentInventory;
+      /**
+       * The container the session is in, where the walk could say (#789).
+       *
+       * Beside the inventory rather than on it, because it is a fact about the READ and
+       * not about what was read: it breaks a tie in `context-snapshot.ts`'s join and is
+       * not part of the snapshot the run reasons over or fingerprints.
+       */
+      readonly defaultContainer?: readonly string[];
+    }
+  /** This engine declares no object kinds, so there is nothing to tag and nothing was read. */
+  | { readonly kind: "unsupported" }
+  | { readonly kind: "unavailable"; readonly modelText: string }
+  | { readonly kind: "timed-out"; readonly grantedMs: number };
 
 /**
- * The ENGINE'S OWN schema inspection, taken by the server while it grounds a run
- * (#414) — the same reading the sidebar performs when it lists your tables.
- *
- * The sibling of `readCatalogForGrounding`, for the engines that one cannot serve.
- * A catalog read is a statement the server composes per dialect, and it is composed
- * for two of the fourteen; everywhere else a run had no inventory at all and was told
- * so. This is the other reading the product already knows how to take, brought inside
- * the same pipeline rather than called beside it: `runAuditedAgentCall` applies the
- * mode check, the repair ledger, the deadline admission, the budget clamp, the
- * audited execution and the artifact exactly as it does for every statement, so there
- * is still no second, unaudited path to an engine — which is the objection
- * `context-snapshot.ts`'s own docblock opens with.
- *
- * **It acquires `AGENT_OPERATIONS_PROFILE`, and that is not interchangeable with the
- * read-only one.** `agent-read-only` sets `requiresReadOnlyStatements: true`, and
- * `factory.ts` refuses acquisition outright for a provider with no `queryReadOnly` —
- * which is every engine this function exists to reach. Acquired under that profile
- * this call would throw `PROFILE_UNSUPPORTED_BY_PROVIDER` before it ever reached a
- * provider, on all nine. The operations profile is the honest one here for the same
- * reason `runCuratedRead` takes it: no statement is sent that an engine has to plan,
- * so there is no statement for a read-only transaction to bound.
- *
- * **It returns the `TableSchema[]` itself.** The artifact carries a model-facing
- * PROJECTION — one row per table: its name, how many columns, how many indexes — so
- * the call is citable and showable like any other reach, but the inventory does not
- * round-trip through it. The catalog path deliberately does the opposite, reading its
- * rows back out of the artifact store, and the difference is not inconsistency: there
- * the rows ARE the reading, so a released artifact must yield no snapshot rather than
- * a reconstruction from model-facing text. Here the provider handed back a structure,
- * there is no text to reconstruct from, and a round trip through the store would only
- * introduce a way to lose it.
+ * Whether a run's object-inventory grounding is taken under the execution profile its statements are sent under: an
+ * agent-mode run of a workflow that sends statements, on an engine whose statement language is its own (`kubectl`,
+ * `mongo`). Such a run is refused at its grounding exactly where its first statement would be. A PostgreSQL or SQLite
+ * run grounds through the composed catalog (its overlay's `catalogCapture`), under the read-only profile already; the other SQL
+ * engines ground through `readObjectInventoryForGrounding` under the operations profile, which refuses only what their
+ * own read-only open refuses, such as SQL Server's privileged principal (#1744's D345). Plan mode and the operations
+ * workflow send no statement of the model's and ground under the operations profile.
  */
-export async function readProviderSchemaForGrounding(context: AgentToolContext): Promise<AgentProviderSchemaRead> {
-  let tables: readonly TableSchema[] = [];
+export function groundsUnderExecutionProfile(context: AgentToolContext): boolean {
+  return context.mode === "agent" && context.workflowType !== "operations" && context.statementLanguage !== undefined;
+}
 
+/**
+ * The engine's own OBJECT inventory, taken by the server while it grounds a run (#789).
+ *
+ * The third grounding reading, beside the composed catalog and the provider schema
+ * inspection, and the one that answers a question neither of the other two can: WHAT KIND
+ * each entry is. A composed `information_schema.columns` read returns a view's columns
+ * beside a table's with nothing to tell them apart, and `getSchema()` answers one flat
+ * list on every engine, so a run was handed a view, a materialized view, a Redis key
+ * grouping and a Druid datasource under one word. #414 measured what a model does with
+ * that.
+ *
+ * TAKEN ON THE PROVIDER GROUNDING PATH ONLY, which is what makes the profile below the right
+ * one (#789 fix round 2). The walk reaches the four curated provider methods, and each sends
+ * its catalog statement through `provider.query`: nothing routes them through `queryReadOnly`,
+ * so no read-only transaction can contain them. That matches the path that grounds through
+ * the flat provider inspection this replaced took exactly - that whole grounding was a curated
+ * call under this same profile - and it does not match a dialect that supplies a `catalogCapture`, where every
+ * statement of the run arrives inside `BEGIN READ ONLY` and this read would have been the one
+ * that left it.
+ *
+ * The dialects that do not take it are NOT the dialects without kinds (#789 fix round 3). A
+ * composed path composes the kind as well: its statement selects the engine's own word for the
+ * relation and `context-snapshot.ts` maps that onto the id the provider declares, so PostgreSQL
+ * and SQLite are kinded without a provider call and without leaving the envelope.
+ * `context-snapshot.ts` is where both halves of that are written, beside the two paths it
+ * chooses between.
+ *
+ * It costs ONE statement out of the run's budget, which is a charge for the READING rather
+ * than a measure of its traffic: inside that one statement the walk issues a
+ * `listContainers` per container level, a `countObjects` per container and a `listObjects`
+ * per container-and-kind pair, up to the pair bound below. It is charged and audited
+ * exactly like the other two, under the same `db.schema.read` descriptor: it is a schema read, an operator
+ * denying that descriptor means to deny this too, and a second canonical descriptor for
+ * the same fact would let the two be governed apart by accident. Its fingerprint source
+ * differs from the schema read's, so the repair ledger does not read the two as one
+ * attempt.
+ *
+ * IT READS COLUMNS TOO, and that is what makes it the WHOLE grounding on these engines rather
+ * than half of it. Columns used to come from a second, flat reading (`getSchema()`) joined onto
+ * this one by qualified NAME, which cost an object its columns whenever its name contained a dot
+ * and matched nothing at all on an engine whose flat name and object path disagree. The flat
+ * reading is gone, and `describeObjects` answers a whole container-and-kind folder in ONE round
+ * trip, so the columns arrive with the identity and are joined on the PATH, which both halves
+ * spell the same way because both came from the same call. The N+1 that got `includeColumns`
+ * removed from the inventory route was one `describeObject` PER OBJECT; this is one call per
+ * PAIR, bounded by the same pair limit the listing already obeys.
+ *
+ * `countObjects` is called per container before any listing, which is one extra provider
+ * call per container and pays for itself twice: a kind the engine answers `{ count: 0 }`
+ * for is not listed at all, and a kind whose count is SAMPLED is marked, which is the only
+ * way this read can know its own listing is a floor. `listObjects` reports no bound of its
+ * own, so without the count a Redis keyspace listing bounded by a 1,000-key `SCAN` would
+ * reach the model as the whole keyspace.
+ */
+export async function readObjectInventoryForGrounding(context: AgentToolContext): Promise<AgentObjectInventoryRead> {
+  // The kinds the object surface enumerates: a kind only the Keys panel enumerates is declared and
+  // never walked, so no key name reaches the capture (#1089 3.4).
+  const declared = enumerableKinds(context.capabilities);
+  // Asked before anything is acquired, charged or audited: an engine that declares no
+  // kinds has nothing to answer, and spending a statement to be told so would charge
+  // every run on such an engine for a reading that cannot exist.
+  if (declared.length === 0) return { kind: "unsupported" };
+
+  let inventory: AgentInventory = { objects: [], kinds: [] };
+  let defaultContainer: readonly string[] | undefined;
   let outcome: AgentToolOutcome;
   try {
     outcome = await runAuditedAgentCall(context, {
       operationId: "db.schema.read",
-      // The connection IS the identity of this call: it takes no input, so two
-      // requests for it on one run are the same request and the repair ledger should
-      // say so rather than admitting the second as a fresh attempt.
-      fingerprintSource: `schema:${context.connection.id}`,
+      fingerprintSource: `objects:${context.connection.id}`,
       input: {},
-      label: "provider schema inventory",
+      label: "provider object inventory",
       grounding: true,
       invoke: async (_validatedInput, budget, phase) => {
-        // No "can this provider describe itself" check, deliberately: `getSchema()` is
-        // a REQUIRED member of `DatabaseProvider`, so every provider `acquireProvider`
-        // can return has one, and a guard for its absence would be a refusal code, a
-        // sentence and a headline for a state that cannot occur. What CAN happen is a
-        // `getSchema()` that rejects, and that is the case handled below.
-        const provider = await context.acquireProvider(context.connection, AGENT_OPERATIONS_PROFILE);
+        // Which profile grounds the run, decided by what the run is (`groundsUnderExecutionProfile`): a
+        // statement-sending agent run on an engine with a statement language grounds under ITS OWN boundary, so the
+        // acquisition opens the execution profile, whose connect proves the engine and the principal, and a run
+        // whose boundary cannot open is refused at its grounding. The drive then ends it before its first model turn
+        // (`runInvestigation`), as it ends a composed-catalog engine's run whose read-only grounding is refused. Plan
+        // mode and the operations workflow keep the operations profile: they send no statement of the model's, so
+        // their acquisition proves nothing on an engine that proves its boundary only for one that does. SQL Server
+        // still refuses a privileged principal under the operations profile too, which #1744's D345 records as its
+        // debt. Kubernetes changes profile here with no behaviour change: its profiled connect verifies nothing, its
+        // boundary is per-request, and its tests hold that.
+        const groundingProfile = groundsUnderExecutionProfile(context)
+          ? AGENT_EXECUTION_PROFILE
+          : AGENT_OPERATIONS_PROFILE;
+        const provider = await context.acquireProvider(context.connection, groundingProfile);
         const startedAtMs = context.clock?.() ?? Date.now();
-        // Set immediately before the call leaves, for the same reason the statement
-        // path sets it: anything that threw while we were still connecting is not
-        // something the model could have written differently.
         phase.statementSent = true;
 
-        // HONEST LIMIT, stated because the alternative reading of this race is
-        // wrong: `getSchema()` takes no budget on any provider, so what this bounds
-        // is THE RUN and not the database. The driver call is not cancelled — it goes
-        // on reading until the engine or the driver ends it — and this run simply
-        // stops waiting for it. The clamp that reaches an engine on the statement
-        // path (PostgreSQL's `SET LOCAL statement_timeout`) has no counterpart here.
-        // Without the race there is no bound at all, which is the only worse answer.
+        // THE HONEST LIMIT, stated because the alternative reading of this race is wrong: no
+        // provider method here takes a budget, so what this bounds is THE RUN and not the
+        // database. The walk is not cancelled - it goes on reading until the engine or the
+        // driver ends it - and this run simply stops waiting for it. Without the race there is
+        // no bound at all, which is the only worse answer.
         let timer: ReturnType<typeof setTimeout> | undefined;
         const overran = new Promise<never>((_resolve, reject) => {
           timer = setTimeout(
@@ -2176,26 +2459,25 @@ export async function readProviderSchemaForGrounding(context: AgentToolContext):
           );
         });
         try {
-          tables = await Promise.race([provider.getSchema(), overran]);
+          const walked = await Promise.race([walkObjectInventory(provider, context.capabilities, declared), overran]);
+          inventory = walked.inventory;
+          defaultContainer = walked.defaultContainer;
         } catch (error) {
           if (error instanceof AgentSchemaReadTimeout) throw error;
-          // Same wrap as the curated path, for the same measured reason: these
-          // provider methods do not map their driver's errors uniformly, so a raw
-          // `MongoServerError` can reach this seam and would otherwise propagate out
-          // of the tool layer and kill the run on the engines this exists to reach.
           throw asReadingFailure(error, context.connection.type);
         } finally {
           clearTimeout(timer);
         }
 
-        const rows = tables.map((table) => ({
-          table: table.name,
-          columns: table.columns.length,
-          indexes: table.indexes.length,
+        // The projection is one row per object naming its kind, so the artifact a claim
+        // cites shows the same kinds the prompt was given rather than a bare name list.
+        const rows = inventory.objects.map((object) => ({
+          object: object.name,
+          kind: object.kind ?? "",
         }));
         return {
           rows,
-          fields: ["table", "columns", "indexes"],
+          fields: ["object", "kind"],
           rowCount: rows.length,
           executionTime: (context.clock?.() ?? Date.now()) - startedAtMs,
         };
@@ -2207,7 +2489,304 @@ export async function readProviderSchemaForGrounding(context: AgentToolContext):
   }
 
   if (outcome.kind !== "completed") return { kind: "unavailable", modelText: outcome.modelText };
-  return { kind: "completed", tables };
+  return defaultContainer === undefined
+    ? { kind: "completed", inventory }
+    : { kind: "completed", inventory, defaultContainer };
+}
+
+/**
+ * The walk itself: every container, every kind the object surface enumerates, under both bounds.
+ *
+ * `declared` is `enumerableKinds()` and never `declaredKinds()`: a kind only the Keys panel
+ * enumerates is declared so its Source tab and edit resolve, and walking it would put one entry per
+ * key in the capture and in plan mode's prompt (#1089 3.4, E13).
+ *
+ * Written as one flat pair loop for the reason the route states: two nested loops need a
+ * label to leave both, and a check in the outer one re-enters for every later container.
+ * The counts are taken first because they decide which pairs are worth listing at all.
+ *
+ * A kind whose COUNT was refused is still listed. A refusal to count is not a refusal to
+ * list, because on more than one engine the count is an aggregate over a catalog the listing
+ * does not need, and skipping it would drop objects the engine would have named, which is the
+ * absence this epic exists to prevent. A kind the engine counted as zero is skipped,
+ * because that IS the engine's answer and listing it would cost a round trip to be told
+ * the same thing.
+ *
+ * THE ONE EXCEPTION is a kind that declares `countIsListing` (`kindCountIsListing()`, #1089 4.7):
+ * its count and its listing are one read, so a refused count IS a refused listing, and listing it
+ * anyway would meet the same refusal and lose the whole capture, which is how every plan run on an
+ * etcd connection that is not root would start with no inventory at all. For such a kind the walk
+ * sends no listing and carries the provider's sentence as the kind's `unavailable`, which
+ * `inventoryNotes` in `context-snapshot.ts` tells the run; a kind that declares nothing is listed
+ * exactly as before.
+ */
+async function walkObjectInventory(
+  provider: DatabaseProvider,
+  capabilities: ProviderCapabilities,
+  declared: readonly ObjectKindSpec[],
+): Promise<{ readonly inventory: AgentInventory; readonly defaultContainer?: readonly string[] }> {
+  const listObjects = provider.listObjects.bind(provider);
+  const describeObjects = provider.describeObjects.bind(provider);
+
+  // A provider that declares a walk scope is read in its session-default container and the ones it names; the
+  // rest are counted, and a parent the scope reads nothing below whose listing failed is named, so the inventory
+  // can say what it did not read.
+  const grounding = await enumerateGroundingContainers(provider, capabilities);
+  const { unlistedParents, unlistedParentsNotNamed } = grounding;
+  const scoped = scopeGroundingContainers(grounding.enumeration, capabilities.agentWalkScope, grounding.parentDefault);
+  const enumeration = scoped.enumeration;
+  const { containers, defaultContainer } = enumeration;
+  // A container that names its kinds is walked for those alone: asking it for another would meet the
+  // provider's refusal and end the whole capture.
+  const kindsOf = kindsByContainer(enumeration);
+  const sampledFrom = new Map<string, string>();
+  /** The provider's sentence for each `countIsListing` kind whose count was refused, never listed. */
+  const unavailable = new Map<string, string>();
+  /** What each kind whose names are withheld counted, summed over the containers read; none of it is listed. */
+  const withheld = new Map<string, number>();
+  /** The kinds whose names are withheld that some container read answered no count for. */
+  const withheldUncounted = new Set<string>();
+  const objects: AgentInventoryObject[] = [];
+  let truncated: AgentInventory["truncated"];
+
+  let pairs = 0;
+  for (const container of containers) {
+    const counts = await countForGrounding(provider, container);
+    for (const spec of applicableKinds(declared, kindsOf.get(JSON.stringify(container)))) {
+      const count = Object.hasOwn(counts, spec.id) ? counts[spec.id] : undefined;
+      if (count !== undefined && !isCountUnavailable(count) && count.count === 0) continue;
+      // A kind whose names are withheld is counted and never listed, so no name of it reaches a model.
+      if (kindNamesWithheld(spec)) {
+        if (count === undefined) withheldUncounted.add(spec.id);
+        else if (isCountUnavailable(count)) unavailable.set(spec.id, count.unavailable);
+        else {
+          withheld.set(spec.id, (withheld.get(spec.id) ?? 0) + count.count);
+          if (isCountSampled(count)) sampledFrom.set(spec.id, count.sampledFrom);
+        }
+        continue;
+      }
+      // The exception the docblock names: the refusal this count met is the refusal the listing
+      // would meet, so no listing is sent and the sentence travels on the kind (#1089 4.7).
+      if (count !== undefined && isCountUnavailable(count) && kindCountIsListing(capabilities, spec.id)) {
+        unavailable.set(spec.id, count.unavailable);
+        continue;
+      }
+      if (count !== undefined && isCountSampled(count)) sampledFrom.set(spec.id, count.sampledFrom);
+      if (pairs >= INVENTORY_PAIR_LIMIT) {
+        truncated = { limit: INVENTORY_PAIR_LIMIT, reason: PAIR_TRUNCATION_REASON };
+        break;
+      }
+      pairs += 1;
+      const listed: DatabaseObject[] = [];
+      for (const object of await listObjects(container, spec.id)) {
+        if (objects.length + listed.length >= INVENTORY_LIMIT) {
+          // Overwrites a pair-limit reason where both bit, the same way the route resolves
+          // it: the object limit is the one a reader can see reflected in what they hold.
+          truncated = { limit: INVENTORY_LIMIT, reason: INVENTORY_TRUNCATION_REASON };
+          break;
+        }
+        listed.push(object);
+      }
+
+      // One bulk read for the whole folder, bounded by what is left of the object budget, and
+      // only where the folder held something: describing a pair that named nothing would buy a
+      // round trip for an empty answer.
+      let details: readonly ObjectDetail[] = [];
+      if (listed.length > 0) {
+        const batch = await describeObjects(container, spec.id, listed.length);
+        details = batch.details;
+        // The provider's own bound in the provider's own words. Reported even when the listing
+        // fitted, because a complete list of objects whose columns were cut is still an
+        // incomplete reading, and a model told otherwise reads a missing column as an absent one.
+        if (batch.truncated !== undefined) truncated = batch.truncated;
+      }
+      const byPath = new Map(details.map((detail) => [pathKey(detail.path), detail]));
+      for (const object of listed) {
+        const detail = byPath.get(pathKey(object.path));
+        objects.push({
+          path: object.path,
+          name: object.name,
+          kind: object.kind,
+          // Empty rather than absent where the folder answered no detail for this object, which
+          // is a true reading on both of its arms: a kind that has no columns at all, and a
+          // bulk read the provider bounded before it reached this object. Neither may be shown
+          // to a model as a column list that was read and found empty, which is why `truncated`
+          // above travels with the inventory.
+          // A column the engine only inferred from sampled data is named by the data, so it never enters the
+          // inventory a model is grounded on.
+          columns: machineColumns(detail?.columns ?? []),
+          indexes: detail?.indexes ?? [],
+          foreignKeys: detail?.foreignKeys ?? [],
+          // `rowCount` and `sizeBytes` are deliberately NOT carried, and the reason is the
+          // fingerprint: a snapshot's identity is over the schema, so a row estimate on it
+          // would change identity every time somebody inserted a row, and a resumed run
+          // could no longer tell whether it was looking at the schema its earlier claims
+          // were made about. Each engine means something different by the number anyway.
+          // The ranges a grant reads are NOT carried either, since a piece may name a key (E13): only
+          // the mark that they do not cover the object, so plan mode does not draft a read of all of it.
+          ...(object.readRanges === undefined ? {} : { partlyReadable: true }),
+        });
+      }
+      if (truncated !== undefined) break;
+    }
+    if (truncated !== undefined) break;
+  }
+
+  const kinds = declared.map((spec) => ({
+    id: spec.id,
+    role: spec.role,
+    label: spec.label,
+    labelPlural: spec.labelPlural,
+    ...(sampledFrom.has(spec.id) ? { sampledFrom: sampledFrom.get(spec.id) } : {}),
+    ...(unavailable.has(spec.id) ? { unavailable: unavailable.get(spec.id) } : {}),
+    ...(withheld.has(spec.id) ? { withheldCount: withheld.get(spec.id) } : {}),
+    ...(withheldUncounted.has(spec.id) ? { withheldUncounted: true as const } : {}),
+    // The refusal `tablesAreDerivedGroupings` carries is about the rows of the inventory,
+    // which are the relation kinds: a Redis Function Library is a named object and a Redis
+    // key pattern is not, and both are declared by the one provider that sets the flag.
+    ...(capabilities.tablesAreDerivedGroupings === true && spec.role === "relation" ? { derivedGroupings: true } : {}),
+  }));
+
+  // The deepest level's words, because the scope keeps or skips containers at that level.
+  const level = capabilities.containerLevels?.[containerDepth(capabilities) - 1];
+  const inventory: AgentInventory = {
+    objects,
+    kinds,
+    ...(truncated === undefined ? {} : { truncated }),
+    ...((scoped.unread > 0 || unlistedParents.length > 0) && level !== undefined
+      ? {
+          unreadContainers: {
+            count: scoped.unread,
+            label: level.label,
+            labelPlural: level.labelPlural,
+            read: containers.map((path) => path.join(".")),
+            ...(unlistedParents.length === 0 ? {} : { unlistedParents }),
+            ...(unlistedParentsNotNamed === undefined ? {} : { unlistedParentsNotNamed }),
+          },
+        }
+      : {}),
+  };
+  return defaultContainer === undefined ? { inventory } : { inventory, defaultContainer };
+}
+
+/**
+ * Every container the inventory covers, derived from the declared depth, and the SESSION
+ * DEFAULT among them.
+ *
+ * `containerDepth()` decides, never `containerLevels.length`, and a zero-level engine has
+ * exactly one container: the empty path, which is trivially the session's as well.
+ *
+ * The default is read off this walk and carried out of it because the join downstream ties
+ * without it (#789). A bare `orders` in the flat reading answers two databases on any
+ * MySQL server holding `app` beside `app_test`, and the object side of the join walks both
+ * while the flat side is a reading of ONE. `sessionDefaultContainer` is the shared rule for
+ * which container that is, taken at the DEEPEST level only under ruling 5a2, and `enumerationOf`
+ * reads it, with each container's kinds, off that level. This walk calls it rather than
+ * `enumerateContainers` for one reason: the depth here comes from the capabilities the RUN
+ * CONTEXT holds, not from `provider.getCapabilities()`.
+ *
+ * `parentDefault` is the default the level above the deepest marks, read by the same rule, for a walk scope that
+ * declares `whenNoDefault`; it is absent on an engine of one level.
+ *
+ * A failed listing ends the walk, and with it the capture, with one exception: under a walk scope, a parent the scope
+ * reads nothing below (`scopeReadsUnder`) whose listing failed with the provider's own answer, a `DatabaseError`. Such
+ * a parent is carried in `unlistedParents` with the provider's sentence, and the walk goes on, because a configured
+ * catalog the engine cannot load, or one too large for the provider to walk, would otherwise leave every run on the
+ * connection with no inventory over containers it would never have read. Any other failure, including one below
+ * a parent the scope reads, ends the walk as before, and a walk whose listings all answer is unchanged. Past the first
+ * `UNLISTED_PARENTS_NAMED_MAX` such parents, in walk order, the rest are counted in `unlistedParentsNotNamed` and not
+ * named, and every one of them is still asked.
+ */
+async function enumerateGroundingContainers(
+  provider: DatabaseProvider,
+  capabilities: ProviderCapabilities,
+): Promise<{
+  readonly enumeration: ContainerEnumeration;
+  readonly parentDefault?: readonly string[];
+  readonly unlistedParents: readonly AgentUnlistedParent[];
+  readonly unlistedParentsNotNamed?: AgentUnlistedParentsNotNamed;
+}> {
+  const depth = containerDepth(capabilities);
+  if (depth === 0) return { enumeration: { containers: [[]], defaultContainer: [] }, unlistedParents: [] };
+  const listContainers = provider.listContainers.bind(provider);
+  const levels = capabilities.containerLevels ?? [];
+
+  let level = await listContainers();
+  let parentDefault: readonly string[] | undefined;
+  const unlistedParents: AgentUnlistedParent[] = [];
+  let unlistedParentsNotNamed: AgentUnlistedParentsNotNamed | undefined;
+  for (let below = 1; below < depth; below += 1) {
+    parentDefault = sessionDefaultContainer(level);
+    const { label, labelPlural } = levels[below - 1];
+    const next: Container[] = [];
+    for (const parent of level) {
+      try {
+        next.push(...(await listContainers(parent.path)));
+      } catch (error) {
+        if (!(error instanceof DatabaseError) || scopeReadsUnder(capabilities.agentWalkScope, parent)) throw error;
+        if (unlistedParents.length < UNLISTED_PARENTS_NAMED_MAX) {
+          unlistedParents.push({ path: parent.path.join("."), label, reason: unlistedReason(error.message) });
+        } else {
+          unlistedParentsNotNamed = { count: (unlistedParentsNotNamed?.count ?? 0) + 1, label, labelPlural };
+        }
+      }
+    }
+    level = next;
+  }
+
+  const enumeration = enumerationOf(level);
+  return {
+    enumeration,
+    ...(parentDefault === undefined ? {} : { parentDefault }),
+    unlistedParents,
+    ...(unlistedParentsNotNamed === undefined ? {} : { unlistedParentsNotNamed }),
+  };
+}
+
+/**
+ * How much of a provider's sentence for a parent it could not list reaches the inventory, in code points: the 200
+ * the capability probe allows untrusted text in a message, since this sentence is read inside every packing of the
+ * inventory and recorded with the snapshot.
+ */
+const UNLISTED_REASON_MAX_CHARS = 200;
+
+/**
+ * How many of the parents it could not list the walk names, each with the provider's sentence; the rest are counted.
+ * Each note is read inside every packing of the inventory, and beside the parent's own name it is at most about 470
+ * characters, the sentence cut and its quoting bounded by `unlistedReason`, so this many of them stay well inside
+ * `AGENT_CONTEXT_PACK_MAX_CHARS` and leave the packing room for its rows however many configured catalogs cannot load.
+ * The inventory route names as many unlisted containers in a refusal before it counts the rest (`UNLISTED_ECHO_LIMIT`).
+ */
+const UNLISTED_PARENTS_NAMED_MAX = 5;
+
+/**
+ * A provider's sentence as `AgentUnlistedParent.reason` carries it: on one line, so it cannot read as a line of the
+ * inventory, and cut at `UNLISTED_REASON_MAX_CHARS` code points with the cut marked, so no surrogate pair is split.
+ * A control character is read as a space and a lone surrogate as U+FFFD, because the note quotes the sentence as JSON,
+ * which writes either as six characters: so quoted, a sentence at the cut stays near its own length.
+ */
+function unlistedReason(message: string): string {
+  const line = message
+    .toWellFormed()
+    .replace(/[\s\p{Cc}]+/gu, " ")
+    .trim();
+  let end = 0;
+  let count = 0;
+  for (const point of line) {
+    if (count === UNLISTED_REASON_MAX_CHARS) return `${line.slice(0, end)}...`;
+    end += point.length;
+    count += 1;
+  }
+  return line;
+}
+
+/** One container's counts, or none where the provider declares no counting. */
+async function countForGrounding(
+  provider: DatabaseProvider,
+  container: readonly string[],
+): Promise<Record<string, KindCount>> {
+  const countObjects = provider.countObjects?.bind(provider);
+  return countObjects === undefined ? {} : await countObjects(container);
 }
 
 /**
@@ -2247,7 +2826,9 @@ async function readCatalog(
   } catch (error) {
     return composedSqlOutcome(error);
   }
-  const outcome = await executeAgentOperation(context, {
+  // Supplied: `composeCatalogRead` refuses an engine whose catalog read is unsupported.
+  const { declaredSchema, retry } = engineServerDialect(context.connection.type).catalogRead as AgentCatalogRead;
+  const request: AgentOperationRequest = {
     operationId: "sql.query.read",
     sql,
     grounding,
@@ -2277,8 +2858,27 @@ async function readCatalog(
     // accepts SQLite's `main` case-insensitively while `withinAllowlist` compares
     // case-sensitively, so declaring a raw `MAIN` would compose fine and then be
     // denied against a `["main"]` allowlist.
-    ...(selector.schema === undefined ? {} : { target: { schema: normalizeDeclaredSchema(context, selector.schema) } }),
-  });
+    // The engine's `declaredSchema` is that fold, and an engine without one declares the
+    // name as written.
+    ...(selector.schema === undefined
+      ? {}
+      : { target: { schema: declaredSchema === undefined ? selector.schema : declaredSchema(selector.schema) } }),
+  };
+  let outcome = await executeAgentOperation(context, request);
+
+  // The engine's one retry, when it declares one: PostgreSQL's drops the ownership
+  // tests on an engine without the catalogs they join against (`languages/sql/engines/postgres.ts`).
+  if (
+    retry !== undefined &&
+    outcome.kind === "refused" &&
+    outcome.refusal.class === "database-error" &&
+    retry.matches(outcome.refusal.message)
+  ) {
+    const fallback = retry.rewrite(sql);
+    if (fallback !== sql) {
+      outcome = await executeAgentOperation(context, { ...request, sql: fallback });
+    }
+  }
   /*
     A catalog read that matched NO OBJECT is a refusal, not a result.
 
@@ -2333,14 +2933,44 @@ async function readCatalog(
   return outcome;
 }
 
-/** One bounded read the model drafted. The statement guard is what bounds it. */
+/**
+ * One bounded read the model drafted, in the run's language. The statement guard is what bounds it.
+ *
+ * The input is unknown because it is re-validated here against the definition the run was offered, whose argument
+ * the language names (`sql`, `statement` or `command`).
+ */
 export async function runReadQueryTool(
   context: AgentToolContext,
-  input: { readonly sql: string; readonly rationale?: string },
+  input: unknown,
+  snapshot: AgentContextSnapshot | null = null,
 ): Promise<AgentToolOutcome> {
-  const parsed = parseToolInput(readStatementSchema, input);
+  const language = statementFamilyOf(context.statementLanguage);
+  const definition = agentToolDefinition(language, context.workflowType, "run_read_query");
+  const parsed = parseToolInput(definition.inputSchema, input);
   if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT", parsed.problems);
-  return executeAgentOperation(context, { operationId: "sql.query.read", sql: parsed.value.sql, label: "read result" });
+  const argument = AGENT_LANGUAGE_COPY[language].argument;
+  const server = languageServer(language);
+  // The text every server layer reads - the descriptor's input, the ledger's statement, the repair identity, the
+  // provider's parse - is the language's own reading of the argument, made once here: a mongo command arrives as a
+  // JSON OBJECT and is written out in the order the model wrote it, and the other languages' arguments are text
+  // already and pass through untouched.
+  const statement = server.canonicalize((parsed.value as Readonly<Record<string, unknown>>)[argument]);
+  if (statement === null) return unavailable("INVALID_TOOL_INPUT", `The ${argument} is empty, and nothing was sent.`);
+  // The reader's own sentence, before the policy pipeline: the pipeline's input stage keeps only a reason code, so
+  // without this a model refused for `exec` would read only that its read had the wrong shape. SQL keeps its generic
+  // shape advice (no `admit`), which the golden snapshot holds.
+  const refusal = server.admit?.(statement) ?? null;
+  if (refusal !== null) return unavailable("STATEMENT_NOT_ADMITTED", refusal.message);
+  // After the reader, so a malformed command meets the reader's sentence first; before the pipeline, because what it
+  // catches the engine would answer with an empty result rather than an error.
+  const problem = server.inventoryProblem?.(statement, snapshot) ?? null;
+  if (problem !== null) return unavailable("STATEMENT_NOT_ADMITTED", problem);
+  return executeAgentOperation(context, {
+    operationId: server.readOperation,
+    sql: statement,
+    argument,
+    label: "read result",
+  });
 }
 
 // ============================================================================
@@ -2380,6 +3010,16 @@ interface CuratedReading {
   readonly fields: readonly string[];
   /** The projected column `input.schema` narrows on, or absent when the reading has no schema dimension. */
   readonly schemaColumn?: string;
+  /**
+   * What the rows ARE, when the provider declares that its answer is only part of what the engine
+   * holds, read off the run's labels. It goes in the header the model reads the rows under, as
+   * "estimated" does for the statistics inventory. The Prometheus table list is the metrics with the
+   * most head series, and 50 of them under "table statistics, 50 row(s)" read as the count of every
+   * table. That is a cap read as a count, the defect #513 closed for this run's own bounds in
+   * `runCuratedRead`; a provider's own ranked list never meets those bounds, so only the provider's
+   * declaration can say so (#1085 6.2).
+   */
+  readonly scope?: (labels: ProviderLabels) => string | undefined;
   readonly read: (
     provider: DatabaseProvider,
     input: AgentCuratedReadInput,
@@ -2441,6 +3081,7 @@ const CURATED_READINGS: Readonly<Record<CuratedOperationKind, CuratedReading>> =
     label: "table statistics",
     method: "getTableStats",
     schemaColumn: "schemaName",
+    scope: (labels) => labels.tableStatsCaption,
     fields: [
       "schemaName",
       "tableName",
@@ -2458,7 +3099,7 @@ const CURATED_READINGS: Readonly<Record<CuratedOperationKind, CuratedReading>> =
       (await provider.getTableStats(input.schema === undefined ? {} : { schema: input.schema })).map((table) => ({
         schemaName: table.schemaName,
         tableName: table.tableName,
-        rowCount: table.rowCount,
+        rowCount: table.rowCount ?? null,
         deadRowCount: table.deadRowCount ?? null,
         tableSize: table.tableSize,
         tableSizeBytes: table.tableSizeBytes,
@@ -2683,13 +3324,15 @@ export async function inspectOperationsTool(context: AgentToolContext, input: un
   const parsed = parseToolInput(agentCuratedReadInput, input);
   if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT", parsed.problems);
   const selector = parsed.value;
+  const reading = CURATED_READINGS[selector.kind];
+  const scope = reading.scope?.(context.labels);
   return runAuditedAgentCall(context, {
     operationId: "db.operations.read",
     // The reading, not a statement — canonical so that two identical requests are one
     // call to the repair ledger however the model ordered its arguments.
     fingerprintSource: `operations:${selector.kind}:${selector.limit ?? ""}:${selector.schema ?? ""}`,
     input: selector,
-    label: CURATED_READINGS[selector.kind].label,
+    label: scope === undefined ? reading.label : `${reading.label} (${scope})`,
     invoke: (validatedInput, budget, phase) => runCuratedRead(context, validatedInput, budget, phase),
     ...(selector.schema === undefined ? {} : { target: { schema: selector.schema } }),
   });
@@ -2703,15 +3346,20 @@ export async function inspectPlanTool(
   context: AgentToolContext,
   input: { readonly sql: string },
 ): Promise<AgentToolOutcome> {
-  const parsed = parseToolInput(planStatementSchema, input);
+  const parsed = parseToolInput(REFERENCE_STATEMENT_DEFINITIONS.inspect_plan.inputSchema, input);
   if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT", parsed.problems);
-  let sql: string;
+  let plan: AgentEstimatingExplain;
   try {
-    sql = composeEstimatingExplain(context.connection.type, parsed.value.sql);
+    plan = composeEstimatingExplain(context.connection.type, parsed.value.sql);
   } catch (error) {
     return composedSqlOutcome(error);
   }
-  return executeAgentOperation(context, { operationId: "sql.explain.estimate", sql, label: "query plan" });
+  return executeAgentOperation(context, {
+    operationId: "sql.explain.estimate",
+    sql: plan.sql,
+    mode: plan.mode,
+    label: "query plan",
+  });
 }
 
 /**
@@ -2739,7 +3387,10 @@ function estimatedPlansOf(events: readonly AgentRunEvent[]): ReadonlyMap<string,
   }
   const plans = new Map<string, { stepId: string; sql: string }>();
   for (const event of events) {
-    if (event.kind !== "tool-completed" || event.artifact.operationId !== "sql.explain.estimate") continue;
+    // Every language's plan-estimate operation (`PLAN_ESTIMATE_OPERATIONS`), not one id: the
+    // notion a comparison or the auto-execute gate holds - "the run inspected the plan of a
+    // statement" - is about the KIND of artifact, not the language it was asked in.
+    if (event.kind !== "tool-completed" || !PLAN_ESTIMATE_OPERATIONS.has(event.artifact.operationId)) continue;
     const sql = sqlByStep.get(event.stepId);
     if (sql !== undefined) plans.set(event.artifact.correlationId, { stepId: event.stepId, sql });
   }
@@ -2773,86 +3424,21 @@ function readPlanSide(
 }
 
 /**
- * The findings, in the server's own words.
+ * The same resolution as a table or nothing, for the two probes that ask only WHETHER a
+ * spelling would resolve.
  *
- * A column NAME is untrusted database content, so it is fenced rather than spliced
- * into a sentence the model would read as the server speaking. The finding codes
- * and the counts are this repository's own.
+ * Both of them are asking a yes-or-no question about a spelling the caller did not send, so
+ * a third outcome would have nothing to say: "would this have resolved without the
+ * qualifier?" is answered no by an ambiguity just as it is by an absence.
  */
-function describeFindings(findings: readonly AgentProfileFinding[]): string {
-  if (findings.length === 0) return "Nothing crossed a finding threshold.";
-  return fenceUntrustedContent(
-    findings.map((finding) => `${finding.column}: ${finding.code} — ${finding.detail}`).join("\n"),
-    { label: `${findings.length} profile finding(s)`, operationId: "sql.table.profile", reference: "server-derived" },
-  );
-}
-
-/**
- * The table the run already inventoried, found by the name the model gave.
- *
- * Matched against the snapshot's own naming, which differs by engine: PostgreSQL
- * qualifies as `schema.table`, SQLite does not. A model that names either form of
- * a table it has seen is answered; one that names a table the run never captured
- * is refused rather than sent to the database on a guess.
- */
-/**
- * A table the run inventoried, and the schema/table pair the RESOLUTION produced.
- *
- * The pair matters as much as the entry. An earlier version composed from the
- * model's own spelling, so an unqualified `orders` that resolved to `sales.orders`
- * composed `FROM "orders"` — leaving PostgreSQL's `search_path` to decide which
- * relation was actually read while the ledger said `sales.orders` had been
- * profiled. Found by review on #345; the profile now targets what it resolved.
- */
-interface ResolvedProfileTarget {
-  readonly entry: TableSchema;
-  readonly schema?: string;
-  readonly table: string;
-}
-
 function inventoriedTable(
-  snapshot: AgentContextSnapshot,
+  objects: readonly AgentInventoryObject[],
   schema: string | undefined,
   table: string,
+  preferredContainer: readonly string[] | undefined,
 ): ResolvedProfileTarget | null {
-  if (schema !== undefined) {
-    // A schema was named, so it is part of the answer. Matching a BARE inventory
-    // entry here would accept `{schema: "other", table: "orders"}` against SQLite's
-    // unqualified `orders` and then target `other.orders` — a table the run never
-    // inventoried. Found by review on #345.
-    const entry = snapshot.tables.find((candidate) => candidate.name === `${schema}.${table}`);
-    return entry === undefined ? null : { entry, schema, table };
-  }
-
-  const bare = snapshot.tables.find((candidate) => candidate.name === table);
-  if (bare !== undefined) return { entry: bare, table };
-
-  // An unqualified name against a qualified inventory. PostgreSQL's capture names
-  // tables `schema.table` and SQLite's does not, so a model that has read either
-  // inventory may reasonably name a table without its schema. Resolved only when
-  // exactly ONE table ends that way: two schemas holding the same table name is
-  // precisely when a guess would profile the wrong one.
-  const suffix = `.${table}`;
-  const matches = snapshot.tables.filter((candidate) => candidate.name.endsWith(suffix));
-  const only = matches.length === 1 ? matches[0] : undefined;
-  if (only === undefined) return null;
-  // Derived by removing the suffix rather than by splitting on a dot: exact, and it
-  // cannot misread a name that carries one.
-  return { entry: only, schema: only.name.slice(0, only.name.length - suffix.length), table };
-}
-
-/**
- * The most recent inventory this run captured, read off its own ledger.
- *
- * The LAST one, because a run may capture more than once and the newest is the one
- * its later statements were drafted against.
- */
-function capturedSnapshot(events: readonly AgentRunEvent[]): AgentContextSnapshot | null {
-  let snapshot: AgentContextSnapshot | null = null;
-  for (const event of events) {
-    if (event.kind === "context-captured" && event.snapshot !== undefined) snapshot = event.snapshot;
-  }
-  return snapshot;
+  const resolution = resolveProfileTarget(objects, schema, table, preferredContainer);
+  return resolution.kind === "resolved" ? resolution.target : null;
 }
 
 /**
@@ -2902,7 +3488,26 @@ export function planTableProfile(
   if (!parsed.ok) return unavailable("INVALID_TOOL_INPUT", parsed.problems);
 
   const snapshot = capturedSnapshot(run.events);
-  const target = snapshot === null ? null : inventoriedTable(snapshot, parsed.value.schema, parsed.value.table);
+  // What a profile may target is the declared ROLE and nothing else (#789). The statement
+  // this composes is `SELECT count(*) ...` over the resolved name, and the inventory a run
+  // reads carries the schema's views, sequences and functions beside its tables, so
+  // resolving over all of them would compose a count over a sequence. `addressableObjects`
+  // also refuses a kind whose rows are groupings this server derived, which is the refusal
+  // the old flat row menu carried on `tablesAreDerivedGroupings`.
+  const profilable = snapshot === null ? [] : addressableObjects(snapshot);
+  const resolution: ProfileTargetResolution =
+    snapshot === null
+      ? { kind: "absent" }
+      : resolveProfileTarget(profilable, parsed.value.schema, parsed.value.table, snapshot.defaultContainer);
+  // Asked BEFORE the three questions below, because none of them is about this failure: the
+  // qualifier is not unknown, the object is not un-profilable and the table is not missing.
+  // The run read every candidate and cannot say which the caller meant, and the candidates
+  // are the only thing that repairs it, so they are what is said. They are this inventory's
+  // own addresses, so a model can copy one back verbatim.
+  if (resolution.kind === "ambiguous") {
+    return unavailable("TABLE_SPELLING_AMBIGUOUS", resolution.candidates.map((entry) => entry.name).join(", "));
+  }
+  const target = resolution.kind === "resolved" ? resolution.target : null;
   if (target === null) {
     /*
       Two different failures used to share one sentence, and the wire recording of a
@@ -2924,12 +3529,29 @@ export function planTableProfile(
       This only asks the second question once the first has failed — would this table have
       resolved unqualified? — and, when it would, says so and gives the name to use.
     */
-    const unqualified = snapshot !== null && inventoriedTable(snapshot, undefined, parsed.value.table) !== null;
+    const unqualified =
+      snapshot !== null &&
+      inventoriedTable(profilable, undefined, parsed.value.table, snapshot.defaultContainer) !== null;
     if (unqualified) return unavailable("TABLE_QUALIFIER_UNKNOWN");
+    // The third question, and it is asked over the WHOLE inventory: a name that resolves
+    // there and not among the profilable ones is an object this run has been shown and may
+    // not profile, which is a different thing to tell a model than "no such table". The
+    // engine's own word for the kind travels as the detail, because the kinds are the
+    // provider's and this sentence may not enumerate them.
+    const listed =
+      snapshot === null
+        ? null
+        : inventoriedTable(snapshot.objects, parsed.value.schema, parsed.value.table, snapshot.defaultContainer);
+    if (listed !== null) {
+      const kind = (snapshot?.kinds ?? []).find((declared) => declared.id === listed.entry.kind);
+      return unavailable("OBJECT_NOT_PROFILABLE", kind === undefined ? undefined : `it is listed under ${kind.label}`);
+    }
     // The first few names, not all of them: the inventory can hold hundreds, and a refusal
     // that turns into a catalog dump is a wall of its own. Enough to show the spelling
-    // convention this database uses, which is what a misspelling needs.
-    const offer = (snapshot?.tables ?? []).slice(0, 6).map((entry) => entry.name);
+    // convention this database uses, which is what a misspelling needs. Only names this
+    // tool would ACCEPT: offering one it would then refuse is the two-dead-refusals
+    // sequence the qualifier split was written to end.
+    const offer = profilable.slice(0, 6).map((entry) => entry.name);
     return unavailable("TABLE_NOT_INVENTORIED", offer.length === 0 ? undefined : `it lists ${offer.join(", ")}`);
   }
 
@@ -3003,7 +3625,7 @@ export async function profileTableTool(
         operationId: "sql.table.profile",
         reference: outcome.artifact.correlationId,
       }),
-      describeFindings(findings),
+      describeFindings(findings, "sql.table.profile"),
     ].join(" "),
   };
 }
@@ -3073,70 +3695,54 @@ export function recommendChangeTool(
     throw new Error("agent tool layer: the recommendation's run record does not belong to this run");
   }
 
-  const parsed = parseToolInput(recommendationSchema, input);
+  const definition = agentToolDefinition(context.statementLanguage, context.workflowType, "recommend_change");
+  /*
+    The card that owns the offered schema reads the call: the run family's own card where its workflow offers it, and
+    the reference statement card otherwise, which every SQL run's definition is. Only the hooks that card declares
+    apply, because the statement card's readings and refusal copy are about a statement: the displaced-field repair
+    moves SQL between fields, and the shape sentence describes a CREATE INDEX or a SELECT. Neither says anything true
+    about another card. A schema neither card owns is a pack defect, and it fails by name.
+  */
+  const family = statementFamilyOf(context.statementLanguage);
+  const card: AgentRecommendationCard | undefined = [
+    languageServerPack(family).recommendationCard,
+    REFERENCE_RECOMMENDATION_CARD,
+  ].find((owner) => owner?.inputSchema === definition.inputSchema);
+  if (card === undefined) {
+    throw new Error(
+      `agent tool layer: no recommendation card owns the recommend_change schema ${family} offers for ${context.workflowType}`,
+    );
+  }
+  const parsed = parseToolInput(card.inputSchema, card.prepare === undefined ? input : card.prepare(input));
   if (!parsed.ok) {
-    return invalidEvidenceInput(
-      parsed.problems,
-      offersRefusalExamples(context.modelId) ? exampleRecommendCall(run.events) : undefined,
-    );
+    const advice = card.refuseParse?.(input, parsed.problems, run.events, context.modelId);
+    return invalidEvidenceInput(parsed.problems, advice?.example, advice?.shape);
   }
-  if (!matchesCard(parsed.value.change, parsed.value.statement)) {
-    /*
-      With a worked call where the model has earned one. One model hit this refusal five times
-      in a single optimization run — the card said `index` and the statement was not a CREATE
-      INDEX, or the reverse — and the sentence above names the rule without showing either
-      shape. It is the one evidence-bearing refusal that carried no example.
-    */
-    return unavailable(
-      "RECOMMENDATION_SHAPE_MISMATCH",
-      offersRefusalExamples(context.modelId) ? exampleRecommendCall(run.events) : undefined,
-    );
-  }
+  const refused = card.refuseBeforeEvidence?.(parsed.value, run.events, context.modelId);
+  if (refused !== undefined) return refused;
   if (!parsed.value.evidence.every((reference) => verifiedAgainst(run.events, reference))) {
-    // Both evidence-bearing tools name what is citable, because a model that guessed an id
-    // here will guess the same one at `compose_report` a turn later — and both now name
-    // WHICH citation failed, for the same reason.
+    // Every card's evidence is checked here, after the card's own early refusal and before it records anything, so
+    // every card refuses an unverifiable citation in the same words. Both evidence-bearing tools name what is
+    // citable, because a model that guessed an id here will guess the same one at `compose_report` a turn later —
+    // and both now name WHICH citation failed, for the same reason.
     return unavailable(
       "UNVERIFIABLE_EVIDENCE",
       unverifiableCitation(run.events, [{ evidence: parsed.value.evidence }]),
     );
   }
-
-  return {
-    kind: "recommended",
-    recommendation: {
-      change: parsed.value.change,
-      statement: parsed.value.statement,
-      rationale: parsed.value.rationale,
-      // Carried by the schema's `.min(1)`, which the type system cannot see; an
-      // unreachable emptiness guard would be a line no test could cover.
-      evidence: parsed.value.evidence as [AgentEvidenceReference, ...AgentEvidenceReference[]],
-    },
-    modelText: `Recommendation recorded: one ${parsed.value.change}, offered to the user and not executed. It is theirs to apply.`,
-  };
+  return card.record(run.events, parsed.value);
 }
-
-const CREATE_INDEX_STATEMENT = /^\s*CREATE\s+(UNIQUE\s+)?INDEX\b/i;
 
 /**
- * Does the statement match the card it is offered under? Found by review on #344.
- *
- * The headline the rail renders — "Index recommended" — is the APP's own words, and
- * it has to be true. Without this, a model could file a `DROP TABLE` under an index
- * card, and the rail would assert the app's claim over it and offer the statement to
- * the user's editor. Nothing here executes anything, so this is not a security
- * boundary; it is the app refusing to say something it cannot support.
- *
- * The structural checks are the SHARED guard's rather than a second parser: one
- * determinate statement, no second statement after a terminator. `NON_READ_STATEMENT`
- * is the only violation an index card may carry, because a `CREATE INDEX` is by
- * definition not a read.
+ * The event kinds that carry an artifact this run produced. A set rather than two comparisons, so a later reading
+ * that produces an artifact of its own is added here once and is citable everywhere `producedArtifact` is read.
  */
-function matchesCard(change: "index" | "rewrite", statement: string): boolean {
-  const violation = inspectAgentStatement(statement);
-  if (change === "rewrite") return violation === null;
-  return (violation === null || violation === "NON_READ_STATEMENT") && CREATE_INDEX_STATEMENT.test(statement);
-}
+const ARTIFACT_EVENTS: ReadonlySet<AgentRunEvent["kind"]> = new Set([
+  "tool-completed",
+  "table-profiled",
+  "usage-read",
+  "workloads-profiled",
+]);
 
 /**
  * The artifact this run produced under that id, or null.
@@ -3153,49 +3759,11 @@ function matchesCard(change: "index" | "rewrite", statement: string): boolean {
  */
 function producedArtifact(events: readonly AgentRunEvent[], correlationId: string): AgentArtifactReference | null {
   for (const event of events) {
-    const artifact = event.kind === "tool-completed" || event.kind === "table-profiled" ? event.artifact : null;
+    const artifact = ARTIFACT_EVENTS.has(event.kind) && "artifact" in event ? event.artifact : null;
     if (artifact !== null && artifact.correlationId === correlationId) return artifact;
   }
   return null;
 }
-
-/**
- * The one operation whose result may be an ANSWER (#373 review).
- *
- * `producedArtifact` above asks "did this run produce that?", which is the right
- * question for a CITATION and the wrong one for an answer. A claim may rest on a plan
- * the run read — that is what `recommend_change` is built on — so narrowing that path
- * would make an honest report uncomposable. An answer is a different act: it nominates
- * one result as WHAT THE QUESTION ASKED FOR, hands its statement to the rail, and is
- * what `agent-data-analysis.1` counts. Without this, a run could present a
- * `sql.explain.estimate` artifact — the engine's DESCRIPTION of a statement, with no
- * data read, no rows and no measured duration — and satisfy the workflow's verdict
- * without ever having read the data it was opened to analyse.
- *
- * **A profile is excluded too, and that is a decision rather than a side effect.** A
- * profile IS a real reading of data, so the question is honest. Three things settle it:
- * it returns COUNTS the server composed from the run's own inventory rather than rows
- * the model asked for, so what would be shown is not an answer to the user's question
- * but an aggregate about a table; its statement is the server's, so there is nothing of
- * the model's to hand to an editor, which is why it could never have been presented
- * anyway (`statementBehind` returns null for it, and today that is the refusal it
- * gets); and its single aggregate row fails `CHART_TOO_FEW_ROWS` on every chart. So
- * admitting it would only change which refusal it is given — and the refusal it is
- * given now is the true one, which is the whole point of moving this check ahead of
- * the statement.
- *
- * The check goes BEFORE `statementBehind`, because a plan step DOES carry a drafted
- * statement: a check placed after it would have accepted the plan outright.
- *
- * One consequence, recorded rather than left to be discovered: the auto-execute gate's
- * first condition — "this run executed that exact statement" — can no longer FAIL from
- * this layer, because the only artifact presentable is a read whose own drafted
- * statement is by construction among `executedStatements`. Presenting a plan was the
- * one way to reach it. The condition stays in `auto-execute.ts` anyway: it is pure and
- * enumerated over every combination there, and a gate guarding an unbounded execution
- * path must not depend on which artifacts some other layer happens to admit.
- */
-const ANSWER_OPERATION: AgentOperationId = "sql.query.read";
 
 /** Does this reference name something the run actually produced? */
 /**
@@ -3233,31 +3801,80 @@ function verifiedAgainst(events: readonly AgentRunEvent[], reference: AgentEvide
 }
 
 /**
- * The id is one this run produced — under the OTHER source. Says which, in the words of
- * the object that would have worked.
+ * A citation whose id names something this run holds under the OTHER source, read as what it is.
  *
- * Measured on `cogito:8b`: five database-investigation runs, all five `turn-limit` with
- * `no-report`, each holding the same `compose_report` call sent about forty times. Its two
- * claims were correct and its two citations carried the SAME id, one filed as a
- * `context-snapshot` and one as an `artifact`. The refusal said "at least one evidence
- * reference does not match" and then offered the id the model was already using, so nothing
- * in the answer distinguished the good citation from the bad one and the model resent it
- * until the turns ran out.
+ * The refusal this case used to get was exact: it named the
+ * failing position and hands back the object that would have worked, character for character. It
+ * was then measured for thirty hours on `cogito:8b`'s investigate cell - 26 runs, 936 refusals, as
+ * many as thirty-six inside a single run, every one identical, every run ending at the turn limit
+ * with no report. The cell reads 0/5.
  *
- * Deliberately narrow: it fires only when the id names something this run REALLY holds
- * under the other source. An invented id gets the offer of what is citable and no sentence
- * about where it belongs, because there is nowhere it belongs.
+ * A model that re-sends the same bytes thirty-six times against a perfect instruction will not be
+ * told its way out. And it does not need to be: the id is this run's own snapshot fingerprint, this
+ * function recognises it well enough to rewrite the reference itself, and citing the snapshot is
+ * something the run is entitled to do. The only thing wrong is which key the id sits under - which
+ * is the fault `readSerializedClaims` reads one field over, at this same boundary.
+ *
+ * The BAR does not move. A snapshot citation is worth what it was already worth, and
+ * `verifyOperationsGoal` still refuses a report resting on one: such a run now earns `no-reading`
+ * honestly rather than dying holding a call the server could read. An id that names nothing is
+ * untouched - there is nowhere for it to belong - and still meets the refusal.
  */
-function misfiledSource(events: readonly AgentRunEvent[], reference: AgentEvidenceReference): string | undefined {
-  if (reference.source === "artifact") {
-    const snapshot = events.find(
-      (event) => event.kind === "context-captured" && event.fingerprint === reference.correlationId,
-    );
-    if (snapshot === undefined) return undefined;
-    return `that id is this run's schema snapshot and belongs under a different source: {"source": "context-snapshot", "fingerprint": "${reference.correlationId}"}`;
-  }
-  if (producedArtifact(events, reference.fingerprint) === null) return undefined;
-  return `that id is a result this run read and belongs under a different source: {"source": "artifact", "correlationId": "${reference.fingerprint}"}`;
+/**
+ * Whether a snapshot citation can satisfy this surface at all, which is what decides whether the
+ * reader below should read a misfiled one or leave the refusal in place.
+ *
+ * Three verdicts require `source === "artifact"`: query-optimization wants a plan, data-analysis
+ * wants the read it answered with, operations wants any reading. On those a snapshot citation is a
+ * report that CANNOT score, so refusing it is worth more than accepting it - the refusal buys the
+ * run another turn, and that turn is the only thing that can still change the outcome.
+ *
+ * Measured both ways on one day. Reading the citation ended `cogito:8b`'s investigate loop (936
+ * refusals, 0/5 to 5/5) and cost `mistral-small3.2:24b` its analyze cell (0/5): there the model
+ * reported citing the snapshot, the reader made that valid, the report composed and the run ended
+ * `no-answer` - where before it had been refused and had gone back with a turn in hand.
+ */
+const AGENT_WORKFLOW_ACCEPTS_SNAPSHOT_CITATION: Readonly<Record<AgentRunWorkflowType, boolean>> = Object.freeze({
+  investigation: true,
+  "query-optimization": false,
+  "database-assessment": true,
+  operations: false,
+  "data-analysis": false,
+} satisfies Record<AgentRunWorkflowType, boolean>);
+
+function readMisfiledEvidence(
+  input: unknown,
+  events: readonly AgentRunEvent[],
+  workflowType: AgentRunWorkflowType,
+): unknown {
+  if (!AGENT_WORKFLOW_ACCEPTS_SNAPSHOT_CITATION[workflowType]) return input;
+  if (typeof input !== "object" || input === null) return input;
+  const { claims } = input as { claims?: unknown };
+  if (!Array.isArray(claims)) return input;
+  const readReference = (reference: unknown): unknown => {
+    if (typeof reference !== "object" || reference === null) return reference;
+    const { source, correlationId, fingerprint } = reference as Record<string, unknown>;
+    if (source === "artifact" && typeof correlationId === "string") {
+      const snapshot = events.some((event) => event.kind === "context-captured" && event.fingerprint === correlationId);
+      return snapshot ? { source: "context-snapshot", fingerprint: correlationId } : reference;
+    }
+    if (source === "context-snapshot" && typeof fingerprint === "string") {
+      const read = events.some(
+        (event) => event.kind === "tool-completed" && event.artifact.correlationId === fingerprint,
+      );
+      return read ? { source: "artifact", correlationId: fingerprint } : reference;
+    }
+    return reference;
+  };
+  return {
+    ...input,
+    claims: claims.map((claim) => {
+      if (typeof claim !== "object" || claim === null) return claim;
+      const { evidence } = claim as { evidence?: unknown };
+      if (!Array.isArray(evidence)) return claim;
+      return { ...claim, evidence: evidence.map(readReference) };
+    }),
+  };
 }
 
 /**
@@ -3265,7 +3882,7 @@ function misfiledSource(events: readonly AgentRunEvent[], reference: AgentEviden
  *
  * `citableEvidence` alone answers neither: it names what the run holds, which a model that
  * has already cited one of those ids reads as agreement. The path is what makes the answer
- * actionable when a report carries several claims, and `misfiledSource` is what ends the
+ * actionable when a report carries several claims, and `readMisfiledEvidence` above is what ends the
  * loop when the id was right all along.
  */
 function unverifiableCitation(
@@ -3280,12 +3897,11 @@ function unverifiableCitation(
       // as a path, even for a single claim — it is the field name the model has to look at,
       // and "the citation" would leave a two-claim report guessing again.
       const path = `claims.${claimIndex}.evidence.${evidenceIndex}`;
-      const misfiled = misfiledSource(events, reference);
+      // No "it belongs under the other source" arm any more: `readMisfiledEvidence` resolves that
+      // case at the call boundary, so a reference reaching here names nothing this run holds under
+      // EITHER source. What is left to offer is what IS citable.
       const offer = citableEvidence(events);
-      return [
-        `${path} does not match anything this run produced`,
-        misfiled ?? (offer === undefined ? undefined : offer),
-      ]
+      return [`${path} does not match anything this run produced`, offer]
         .filter((part) => part !== undefined)
         .join(" — ");
     }
@@ -3397,7 +4013,7 @@ function executedStatements(events: readonly AgentRunEvent[]): readonly string[]
   }
   const executed: string[] = [];
   for (const event of events) {
-    if (event.kind !== "tool-completed" || event.artifact.operationId !== "sql.query.read") continue;
+    if (event.kind !== "tool-completed" || !isStatementReadOperation(event.artifact.operationId)) continue;
     const sql = sqlByStep.get(event.stepId);
     if (sql !== undefined) executed.push(sql);
   }
@@ -3564,7 +4180,10 @@ export function presentAnswerTool(
     return unavailable("ANSWER_ALREADY_RECORDED");
   }
 
-  const parsed = parseToolInput(presentAnswerSchema, readSerializedPresentation(input));
+  const parsed = parseToolInput(
+    presentAnswerSchema,
+    readMisrenderedPresentation(readNearMissKeys(readSerializedPresentation(input), ["artifact", "presentation"])),
+  );
   if (!parsed.ok) {
     /*
       The same worked example the report refusal carries, for the same measured reason and one
@@ -3612,7 +4231,44 @@ export function presentAnswerTool(
 
   const artifact = producedArtifact(run.events, parsed.value.artifact);
   if (artifact === null) return unavailable("ANSWER_ARTIFACT_UNKNOWN");
-  if (artifact.operationId !== ANSWER_OPERATION) {
+  /*
+    Only a statement read may be the ANSWER (#373 review): `isStatementReadOperation`, which is
+    the language's `readOperation` and nothing else - neither a language's plan nor its profile.
+
+    `producedArtifact` asks "did this run produce that?", which is the right
+    question for a CITATION and the wrong one for an answer. A claim may rest on a plan
+    the run read (that is what `recommend_change` is built on), so narrowing that path
+    would make an honest report uncomposable. An answer is a different act: it nominates
+    one result as WHAT THE QUESTION ASKED FOR, hands its statement to the rail, and is
+    what `agent-data-analysis.1` counts. Without this, a run could present a
+    `sql.explain.estimate` artifact, the engine's DESCRIPTION of a statement, with no
+    data read, no rows and no measured duration, and satisfy the workflow's verdict
+    without ever having read the data it was opened to analyse.
+
+    **A profile is excluded too, and that is a decision rather than a side effect.** A
+    profile IS a real reading of data, so the question is honest. Three things settle it:
+    it returns COUNTS the server composed from the run's own inventory rather than rows
+    the model asked for, so what would be shown is not an answer to the user's question
+    but an aggregate about a table; its statement is the server's, so there is nothing of
+    the model's to hand to an editor, which is why it could never have been presented
+    anyway (`statementBehind` returns null for it, and today that is the refusal it
+    gets); and its single aggregate row fails `CHART_TOO_FEW_ROWS` on every chart. So
+    admitting it would only change which refusal it is given, and the refusal it is
+    given now is the true one, which is the whole point of moving this check ahead of
+    the statement.
+
+    The check goes BEFORE `statementBehind`, because a plan step DOES carry a drafted
+    statement: a check placed after it would have accepted the plan outright.
+
+    One consequence, recorded rather than left to be discovered: the auto-execute gate's
+    first condition, "this run executed that exact statement", can no longer FAIL from
+    this layer, because the only artifact presentable is a read whose own drafted
+    statement is by construction among `executedStatements`. Presenting a plan was the
+    one way to reach it. The condition stays in `auto-execute.ts` anyway: it is pure and
+    enumerated over every combination there, and a gate guarding an unbounded execution
+    path must not depend on which artifacts some other layer happens to admit.
+  */
+  if (!isStatementReadOperation(artifact.operationId)) {
     /*
       And WHICH result would have been taken, when the run is holding one.
 
@@ -3631,10 +4287,17 @@ export function presentAnswerTool(
       different instructions.
     */
     const instead = presentableArtifact(run.events);
-    return unavailable(
-      "ANSWER_NOT_A_DATA_READ",
-      instead === undefined ? undefined : `this run already read ${instead} — present that`,
-    );
+    // Captured beside the schema failures, because this refusal is reached AFTER the schema and so
+    // was invisible to a dump that only fires on a parse failure. `granite4:3b` loses its analyze
+    // cell to this code 28 times a sweep, and the two readings it could have - nothing readable
+    // existed, or the named alternative was ignored - call for opposite fixes. The cited operation
+    // and whether an alternative was offered are what tell them apart.
+    const detail = instead === undefined ? undefined : `this run already read ${instead}, present that`;
+    const reason = runServerPack(context.statementLanguage, context.connection.type).answerNotADataRead;
+    return {
+      ...unavailable("ANSWER_NOT_A_DATA_READ", detail),
+      modelText: detail === undefined ? reason : `${reason} (${detail})`,
+    };
   }
   const sql = statementBehind(run.events, artifact.correlationId);
   if (sql === null) return unavailable("ANSWER_STATEMENT_UNKNOWN");
@@ -3693,12 +4356,27 @@ export function composeReportTool(
     throw new Error("agent tool layer: the report's run record does not belong to this run");
   }
 
-  const parsed = parseToolInput(reportSchema, input);
-  if (!parsed.ok)
+  /*
+    Named before the schema is asked, because the schema's own answer here is the one a model
+    cannot act on: it reports `claims: expected array, received string`, which a model that
+    serialized an array agrees with. Reached only where the read above could not recover the
+    value, so a properly serialized array never sees this.
+  */
+  if (claimsArrivedAsUnparseableText(input)) return unavailable("INVALID_TOOL_INPUT", AGENT_CLAIMS_NOT_JSON);
+  const parsed = parseToolInput(
+    reportSchema,
+    readMisfiledEvidence(readSerializedClaims(input), run.events, context.workflowType),
+    // `present_answer` refuses a run holding no data read of its own - `ANSWER_NOT_A_DATA_READ`,
+    // 188 of them beside the 382 deliveries of the sentence that sends models there. Naming it as
+    // the destination for `presentation` is only an instruction where it could accept the call.
+    presentableArtifact(run.events) === undefined ? new Set(["present_answer"]) : undefined,
+  );
+  if (!parsed.ok) {
     return invalidEvidenceInput(
       parsed.problems,
       offersRefusalExamples(context.modelId) ? exampleReportCall(run.events) : undefined,
     );
+  }
 
   const claims: AgentReportClaim[] = [];
   for (const claim of parsed.value.claims) {
@@ -3708,6 +4386,10 @@ export function composeReportTool(
     if (!claim.evidence.every((reference) => verifiedAgainst(run.events, reference))) {
       // Asked of the WHOLE claim list rather than this one claim, so the path it names is
       // the one the model sent — a per-claim reader would say `claims.0` for every claim.
+      // Captured for the same reason the schema failures are: this refusal NAMES the citable ids
+      // and models go on citing something else - one `granite4.2:3b` optimize run was refused here
+      // fourteen times and spent its whole 450-second budget in the loop. The paths cannot say
+      // what it cited instead, and that is the only thing that would explain the loop.
       return unavailable("UNVERIFIABLE_EVIDENCE", unverifiableCitation(run.events, parsed.value.claims));
     }
     claims.push({

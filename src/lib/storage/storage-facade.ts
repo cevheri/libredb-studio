@@ -8,10 +8,19 @@ import { DatabaseConnection, QueryHistoryItem, SavedQuery, SchemaSnapshot, Saved
 import { type AuditEvent } from "../audit";
 import { DEFAULT_MASKING_CONFIG, type MaskingConfig } from "../data-masking";
 import { DEFAULT_THRESHOLDS, type ThresholdConfig } from "../monitoring-thresholds";
-import { readJSON, writeJSON, readString, writeString, remove } from "./local-storage";
-import type { StorageCollection } from "./types";
+import {
+  activeCatalogKey,
+  readJSON,
+  writeJSON,
+  readString,
+  writeString,
+  remove,
+  removeWorkspaceTabs,
+} from "./local-storage";
+import type { ConnectionGroup, StorageCollection } from "./types";
 
 const MAX_HISTORY_ITEMS = 500;
+
 const MAX_SNAPSHOTS = 50;
 const MAX_AUDIT_EVENTS = 1000;
 
@@ -81,6 +90,68 @@ export const storage = {
     const filtered = connections.filter((c) => c.id !== id);
     writeJSON("connections", filtered);
     dispatchChange("connections", filtered);
+
+    const favorites = storage.getFavoriteConnectionIds();
+    if (favorites.includes(id)) {
+      const nextFavorites = favorites.filter((favId) => favId !== id);
+      writeJSON("favorite_connections", nextFavorites);
+      dispatchChange("favorite_connections", nextFavorites);
+    }
+
+    const order = storage.getConnectionOrder();
+    if (order.includes(id)) {
+      const nextOrder = order.filter((orderedId) => orderedId !== id);
+      writeJSON("connection_order", nextOrder);
+      dispatchChange("connection_order", nextOrder);
+    }
+
+    const groups = storage.getConnectionGroups();
+    if (groups.some((group) => group.connectionIds.includes(id))) {
+      const nextGroups = groups.map((group) => ({
+        ...group,
+        connectionIds: group.connectionIds.filter((memberId) => memberId !== id),
+      }));
+      writeJSON("connection_groups", nextGroups);
+      dispatchChange("connection_groups", nextGroups);
+    }
+
+    // The SQL the user typed for this connection is still under its own key; nothing in the UI
+    // can reach it once the connection is gone (#1448).
+    removeWorkspaceTabs(id);
+    remove(activeCatalogKey(id));
+  },
+
+  getFavoriteConnectionIds: (): string[] => {
+    return readJSON<string[]>("favorite_connections") ?? [];
+  },
+
+  /** Flips the connection's favorite state and returns the updated id list. */
+  toggleFavoriteConnection: (id: string): string[] => {
+    const current = storage.getFavoriteConnectionIds();
+    const next = current.includes(id) ? current.filter((favId) => favId !== id) : [...current, id];
+    writeJSON("favorite_connections", next);
+    dispatchChange("favorite_connections", next);
+    return next;
+  },
+
+  getConnectionOrder: (): string[] => {
+    return readJSON<string[]>("connection_order") ?? [];
+  },
+
+  /** Replaces the persisted order wholesale — callers hand over the full id list they want. */
+  setConnectionOrder: (order: string[]) => {
+    writeJSON("connection_order", order);
+    dispatchChange("connection_order", order);
+  },
+
+  getConnectionGroups: (): ConnectionGroup[] => {
+    return readJSON<ConnectionGroup[]>("connection_groups") ?? [];
+  },
+
+  /** Replaces the persisted groups wholesale — callers hand over the full ordered list. */
+  setConnectionGroups: (groups: ConnectionGroup[]) => {
+    writeJSON("connection_groups", groups);
+    dispatchChange("connection_groups", groups);
   },
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -134,6 +205,27 @@ export const storage = {
     const filtered = queries.filter((q) => q.id !== id);
     writeJSON("saved_queries", filtered);
     dispatchChange("saved_queries", filtered);
+  },
+
+  importSavedQueries: (incoming: readonly SavedQuery[]) => {
+    const existing = storage.getSavedQueries();
+    const ids = new Set(existing.map((query) => query.id));
+    const added: SavedQuery[] = [];
+    const collisions: string[] = [];
+    for (const query of incoming) {
+      if (ids.has(query.id)) {
+        collisions.push(query.id);
+      } else {
+        ids.add(query.id);
+        added.push(query);
+      }
+    }
+    if (added.length > 0) {
+      const merged = [...existing, ...added];
+      if (!writeJSON("saved_queries", merged)) throw new Error("Could not save imported queries.");
+      dispatchChange("saved_queries", merged);
+    }
+    return { imported: added.length, collisions };
   },
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -211,6 +303,14 @@ export const storage = {
     }
     dispatchChange("active_connection_id", id);
   },
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Active database of a server-level connection (#1530)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  getActiveCatalog: (connectionId: string): string | null => readString(activeCatalogKey(connectionId)),
+
+  setActiveCatalog: (connectionId: string, catalog: string) => writeString(activeCatalogKey(connectionId), catalog),
 
   // ═══════════════════════════════════════════════════════════════════════════
   // Audit Log (consolidated from audit.ts)

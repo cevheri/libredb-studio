@@ -93,14 +93,26 @@ const mockResolveConnection = mock(
 const mockQueryReadOnly = mock(async (_sql: string, _budget: ReadOnlyStatementBudget) => RESULT);
 const mockQuery = mock(async (_sql: string) => RESULT);
 const mockAcquire = mock(
-  async (_connection: unknown, _profile: string): Promise<ProfiledProvider> => ({
+  async (
+    _connection: unknown,
+    _profile: string,
+    _options?: unknown,
+    _requester?: unknown,
+  ): Promise<ProfiledProvider> => ({
     queryReadOnly: mockQueryReadOnly,
     query: mockQuery,
   }),
 );
 
 function installMocks(): void {
-  mock.module("@/lib/auth", () => ({ ...realAuth, getSession: mockGetSession }));
+  mock.module("@/lib/auth", () => ({
+    ...realAuth,
+    getSession: mockGetSession,
+    readSession: mock(async () => {
+      const s = await mockGetSession();
+      return s ? { kind: "authenticated", session: s } : { kind: "anonymous" };
+    }),
+  }));
   mock.module("@/lib/agent/runtime", () => ({
     getAgentRunService: mock(async () => ({ status: mockStatus })),
     driveAgentRun: mock(async () => ({ runId: "arun_1", status: "succeeded" })),
@@ -164,6 +176,20 @@ describe("POST /api/agent/runs/[runId]/handover", () => {
     expect(body.result.rows).toEqual(RESULT.rows);
   });
 
+  // The editor grid this feeds would otherwise show NULL for a stored NaN, as on `/api/db/query`.
+  test("hands back NaN and the infinities as words, not as null", async () => {
+    mockQueryReadOnly.mockResolvedValue({
+      ...RESULT,
+      rows: [{ f: Number.NaN, r: Number.POSITIVE_INFINITY, n: Number.NEGATIVE_INFINITY, z: null }] as never,
+    });
+
+    const res = await POST(request(), params());
+    const body = await parseResponseJSON<{ result: { rows: unknown[] } }>(res);
+
+    expect(res.status).toBe(200);
+    expect(body.result.rows).toEqual([{ f: "NaN", r: "Infinity", n: "-Infinity", z: null }]);
+  });
+
   test("the statement comes from the run, never from the request", async () => {
     // The whole reason this is a run-scoped route rather than a read-only `/query`:
     // a body naming its own SQL is a general "run this without a timeout" endpoint,
@@ -205,6 +231,27 @@ describe("POST /api/agent/runs/[runId]/handover", () => {
     expect(mockAcquire.mock.calls[0][0]).toEqual(SEED_CONNECTION);
   });
 
+  test("a run on a server-level connection hands over in the database it read (#1530)", async () => {
+    runs.set("arun_1", { ...fakeRun(), catalog: "shop" } as ReturnType<typeof fakeRun>);
+    const response = await POST(request(), params());
+
+    expect(mockAcquire.mock.calls[0][0]).toEqual({ ...SEED_CONNECTION, database: "shop" });
+    expect((await response.json()).catalog).toBe("shop");
+  });
+
+  test("the run's persisted actor decides the file-access posture of the hand-over handle", async () => {
+    // As it decides the connection above: SQLite opens only for a trusted requester, on this
+    // profile as in the editor, so the route passes the posture the editor would derive for the
+    // run's own actor, never a constant and never the replaying browser's.
+    await POST(request(), params());
+    expect(mockAcquire.mock.calls[0][3]).toEqual({ allowExternalFileAccess: false });
+
+    mockAcquire.mockClear();
+    runs.set("arun_1", { ...fakeRun(), actor: { sessionId: "ada", role: "admin" } });
+    await POST(request(), params());
+    expect(mockAcquire.mock.calls[0][3]).toEqual({ allowExternalFileAccess: true });
+  });
+
   test("a run whose gate declined is refused, and told so", async () => {
     runs.set("arun_1", fakeRun([answerEvent({ handover: "applied", handoverWarning: "the plan reads as expensive" })]));
 
@@ -223,6 +270,38 @@ describe("POST /api/agent/runs/[runId]/handover", () => {
 
     expect(res.status).toBe(409);
     expect(mockAcquire).not.toHaveBeenCalled();
+  });
+
+  test("a Kubernetes run's answer, recorded with no hand-over, is never replayed on the cluster", async () => {
+    // Every kubectl variant refuses auto-execute, so its answer is recorded `none`. The route must
+    // refuse it on that record alone, before it resolves the cluster or reaches its read path.
+    mockResolveConnection.mockResolvedValue({ id: "seed:cluster", name: "Cluster", type: "kubernetes" });
+    try {
+      runs.set("arun_1", {
+        ...fakeRun([
+          answerEvent({
+            sql: "get pods -n shop",
+            handover: "none",
+            artifact: {
+              correlationId: "corr-answer",
+              runId: "arun_1",
+              operationId: "kubectl.query.read",
+              summary: { rowCount: 2, columnNames: ["NAME", "STATUS"], elapsedMs: 4 },
+            },
+          }),
+        ]),
+        autoExecute: false,
+        connectionId: "seed:cluster",
+      });
+
+      const res = await POST(request(), params());
+
+      expect(res.status).toBe(409);
+      expect(mockQueryReadOnly).not.toHaveBeenCalled();
+      expect(mockAcquire).not.toHaveBeenCalled();
+    } finally {
+      mockResolveConnection.mockResolvedValue(SEED_CONNECTION);
+    }
   });
 
   test("a run that composed no answer has nothing to replay", async () => {

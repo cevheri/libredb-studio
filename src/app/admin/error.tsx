@@ -1,5 +1,6 @@
 "use client";
 
+import { withBasePath } from "@/lib/config/base-path";
 import { useEffect } from "react";
 
 export default function AdminError({ error, reset }: { error: Error & { digest?: string }; reset: () => void }) {
@@ -18,13 +19,13 @@ export default function AdminError({ error, reset }: { error: Error & { digest?:
         <div className="flex gap-3 justify-center">
           <button
             onClick={reset}
-            className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium transition-colors"
+            className="px-5 py-2.5 bg-brand-solid hover:bg-brand-solid-active text-white rounded-lg text-sm font-medium transition-colors"
           >
             Try Again
           </button>
           <button
             onClick={() => {
-              window.location.href = "/";
+              window.location.href = withBasePath("/");
             }}
             className="px-5 py-2.5 border border-edge hover:border-edge-hover text-fg-secondary rounded-lg text-sm font-medium transition-colors"
           >

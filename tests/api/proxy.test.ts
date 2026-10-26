@@ -1,3 +1,4 @@
+import { withBasePathEnv } from "../helpers/base-path";
 import { describe, test, expect, spyOn } from "bun:test";
 import { readFileSync } from "node:fs";
 import { NextRequest } from "next/server";
@@ -5,6 +6,7 @@ import { SignJWT } from "jose";
 import { config, proxy } from "@/proxy";
 import { AGENT_DRIVE_HEADER, AGENT_DRIVE_PATH, mintAgentDriveToken } from "@/lib/agent/drive-token";
 import { clearRateLimitState } from "@/lib/api/rate-limit";
+import { resetLaunchConfigWarning } from "@/lib/launch/config";
 
 // ─── JWT helpers ────────────────────────────────────────────────────────────
 
@@ -35,6 +37,34 @@ function getRedirectLocation(response: Response): string | null {
   return response.headers.get("location");
 }
 
+/** The session-required answer an API path gets instead of a redirect to the sign-in page (#1420). */
+async function expectSessionRequired(response: Response, error: string) {
+  expect(response.status).toBe(401);
+  expect(response.headers.get("location")).toBeNull();
+  expect(response.headers.get("content-type")).toContain("application/json");
+  expect(await response.json()).toEqual({ error, code: "AUTH_REQUIRED" });
+}
+
+/** Runs one case with NEXT_PUBLIC_AUTH_PROVIDER and OIDC_AUTO_REDIRECT set, restoring both afterwards. */
+async function withAutoRedirectEnv(
+  provider: string,
+  autoRedirect: string | undefined,
+  action: () => Promise<void>,
+): Promise<void> {
+  const saved = [process.env.NEXT_PUBLIC_AUTH_PROVIDER, process.env.OIDC_AUTO_REDIRECT] as const;
+  process.env.NEXT_PUBLIC_AUTH_PROVIDER = provider;
+  if (autoRedirect === undefined) delete process.env.OIDC_AUTO_REDIRECT;
+  else process.env.OIDC_AUTO_REDIRECT = autoRedirect;
+  try {
+    await action();
+  } finally {
+    if (saved[0] === undefined) delete process.env.NEXT_PUBLIC_AUTH_PROVIDER;
+    else process.env.NEXT_PUBLIC_AUTH_PROVIDER = saved[0];
+    if (saved[1] === undefined) delete process.env.OIDC_AUTO_REDIRECT;
+    else process.env.OIDC_AUTO_REDIRECT = saved[1];
+  }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 describe("proxy", () => {
@@ -57,6 +87,27 @@ describe("proxy", () => {
       expect(isRedirect(res)).toBe(false);
     });
 
+    // A health path that answers with a redirect to the login screen reads as HEALTHY to
+    // any check that follows redirects, which is worse than a 404 (#909). All three have to
+    // be reachable without a credential or the check is measuring the login page.
+    test("/health passes through without redirect", async () => {
+      expect(isRedirect(await proxy(createNextRequest("/health")))).toBe(false);
+    });
+
+    test("/api/health passes through without redirect", async () => {
+      expect(isRedirect(await proxy(createNextRequest("/api/health")))).toBe(false);
+    });
+
+    // The readiness probe (docs/GOVERNANCE.md#freshness-and-readiness) carries no session either, and a 401 or a
+    // redirect would read as not ready or, worse, as ready.
+    test("/api/ready passes without a session", async () => {
+      const res = await proxy(createNextRequest("/api/ready"));
+
+      expect(isRedirect(res)).toBe(false);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-middleware-next")).toBe("1");
+    });
+
     test("/_next/static/chunk.js passes through without redirect", async () => {
       const req = createNextRequest("/_next/static/chunk.js");
       const res = await proxy(req);
@@ -69,6 +120,117 @@ describe("proxy", () => {
       const res = await proxy(req);
 
       expect(isRedirect(res)).toBe(false);
+    });
+
+    // The launch page creates the session, so a visitor without one must reach it, and a visitor who
+    // already has one must reach it too, so the launch route can refresh the same account or answer 409
+    // for another one.
+    test("/launch passes through without redirect, with or without a session", async () => {
+      expect(isRedirect(await proxy(createNextRequest("/launch")))).toBe(false);
+      expect(isRedirect(await proxy(createNextRequest("/launch", await createToken("user"))))).toBe(false);
+    });
+
+    test("/launch carries the document security headers", async () => {
+      const res = await proxy(createNextRequest("/launch"));
+
+      expect(res.headers.get("x-frame-options")).toBe("DENY");
+      expect(res.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+    });
+
+    // Under OIDC no launch can sign anyone in, so the page answers what POST /api/auth/launch answers
+    // instead of loading a form that can only fail.
+    test("/launch answers 503 with the problem while launch sign-in is unavailable, as under OIDC", async () => {
+      const saved = process.env.NEXT_PUBLIC_AUTH_PROVIDER;
+      process.env.NEXT_PUBLIC_AUTH_PROVIDER = "oidc";
+      const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const res = await proxy(createNextRequest("/launch"));
+
+        expect(res.status).toBe(503);
+        expect(await res.text()).toBe("Launch sign-in is not available when NEXT_PUBLIC_AUTH_PROVIDER=oidc.");
+        expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+        expect(res.headers.get("cache-control")).toBe("no-store");
+        expect(res.headers.get("x-frame-options")).toBe("DENY");
+      } finally {
+        if (saved === undefined) delete process.env.NEXT_PUBLIC_AUTH_PROVIDER;
+        else process.env.NEXT_PUBLIC_AUTH_PROVIDER = saved;
+        errorSpy.mockRestore();
+        resetLaunchConfigWarning();
+      }
+    });
+
+    test("/launch answers 503 with the problem while the launch configuration is broken", async () => {
+      const names = ["LAUNCH_TOKEN_SECRET", "LAUNCH_TOKEN_AUDIENCE", "LAUNCH_TOKEN_ISSUER"] as const;
+      const saved = names.map((name) => process.env[name]);
+      process.env.LAUNCH_TOKEN_SECRET = "too-short";
+      process.env.LAUNCH_TOKEN_AUDIENCE = "studio-1";
+      process.env.LAUNCH_TOKEN_ISSUER = "platform";
+      const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const res = await proxy(createNextRequest("/launch"));
+
+        expect(res.status).toBe(503);
+        expect(await res.text()).toBe(
+          "LAUNCH_TOKEN_SECRET must be at least 32 characters: launch sign-in is unavailable until it is fixed.",
+        );
+        expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+        expect(res.headers.get("cache-control")).toBe("no-store");
+        expect(res.headers.get("x-frame-options")).toBe("DENY");
+      } finally {
+        names.forEach((name, index) => {
+          const value = saved[index];
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        });
+        errorSpy.mockRestore();
+        resetLaunchConfigWarning();
+      }
+    });
+
+    // Governance mode has no launch sign-in (docs/GOVERNANCE.md), so the page answers as if launch sign-in did not
+    // exist, before the launch configuration is read, with or without a session and whatever the launch variables say.
+    // An unknown GOVERNANCE_SOURCE counts as on, so the page fails closed under a typo too.
+    test("/launch answers 404 under governance", async () => {
+      const names = [
+        "GOVERNANCE_SOURCE",
+        "NEXT_PUBLIC_AUTH_PROVIDER",
+        "LAUNCH_TOKEN_SECRET",
+        "LAUNCH_TOKEN_AUDIENCE",
+        "LAUNCH_TOKEN_ISSUER",
+      ] as const;
+      const saved = names.map((name) => process.env[name]);
+      process.env.LAUNCH_TOKEN_SECRET = "l".repeat(48);
+      process.env.LAUNCH_TOKEN_AUDIENCE = "studio-1";
+      process.env.LAUNCH_TOKEN_ISSUER = "platform";
+      const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        for (const [source, provider] of [
+          ["postgres", "oidc"],
+          ["postgress", "local"],
+        ] as const) {
+          process.env.GOVERNANCE_SOURCE = source;
+          process.env.NEXT_PUBLIC_AUTH_PROVIDER = provider;
+          for (const token of [undefined, await createToken("user")]) {
+            const res = await proxy(createNextRequest("/launch", token));
+
+            expect(res.status).toBe(404);
+            expect(await res.text()).toBe("Launch sign-in is not enabled on this server.");
+            expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+            expect(res.headers.get("cache-control")).toBe("no-store");
+            expect(res.headers.get("x-frame-options")).toBe("DENY");
+          }
+        }
+        // The launch configuration was never read, so its OIDC problem was never logged.
+        expect(errorSpy).not.toHaveBeenCalled();
+      } finally {
+        names.forEach((name, index) => {
+          const value = saved[index];
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        });
+        errorSpy.mockRestore();
+        resetLaunchConfigWarning();
+      }
     });
   });
 
@@ -112,6 +274,107 @@ describe("proxy", () => {
 
       expect(isRedirect(res)).toBe(false);
     });
+
+    test("a signed-in visitor goes to the page next names, as the sign-in form would", async () => {
+      const token = await createToken("user");
+      const res = await proxy(createNextRequest("/login?next=%2F%3Fconnection%3Dseed%253Aorders", token));
+
+      expect(getRedirectLocation(res)).toBe("http://localhost:3000/?connection=seed%3Aorders");
+    });
+
+    test("a next that would leave this application is ignored for the role's landing page", async () => {
+      const token = await createToken("admin");
+      const res = await proxy(createNextRequest("/login?next=%2F%2Fevil.example", token));
+
+      expect(getRedirectLocation(res)).toBe("http://localhost:3000/admin");
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Automatic redirect from /login to the identity provider (OIDC_AUTO_REDIRECT)
+  // ───────────────────────────────────────────────────────────────────────────
+
+  describe("/login auto-redirect to the identity provider", () => {
+    test("GET /login under oidc with OIDC_AUTO_REDIRECT=true redirects to /api/auth/oidc/login and keeps a safe next", async () => {
+      await withAutoRedirectEnv("oidc", "true", async () => {
+        const res = await proxy(createNextRequest("/login?next=%2F%3Fconnection%3Dseed%253Aorders"));
+
+        expect(res.status).toBe(307);
+        expect(getRedirectLocation(res)).toBe(
+          "http://localhost:3000/api/auth/oidc/login?next=%2F%3Fconnection%3Dseed%253Aorders",
+        );
+        expect(res.headers.get("x-frame-options")).toBe("DENY");
+      });
+    });
+
+    test("GET /login without next redirects to /api/auth/oidc/login with no next", async () => {
+      await withAutoRedirectEnv("oidc", "yes", async () => {
+        const res = await proxy(createNextRequest("/login"));
+
+        expect(res.status).toBe(307);
+        expect(getRedirectLocation(res)).toBe("http://localhost:3000/api/auth/oidc/login");
+      });
+    });
+
+    test("an unsafe next is dropped from the redirect", async () => {
+      await withAutoRedirectEnv("oidc", "true", async () => {
+        const res = await proxy(createNextRequest("/login?next=%2F%2Fevil.example"));
+
+        expect(res.status).toBe(307);
+        expect(getRedirectLocation(res)).toBe("http://localhost:3000/api/auth/oidc/login");
+      });
+    });
+
+    test("an invalid auth-token still redirects to the identity provider", async () => {
+      await withAutoRedirectEnv("oidc", "true", async () => {
+        const res = await proxy(createNextRequest("/login", "invalid-token-garbage"));
+
+        expect(res.status).toBe(307);
+        expect(getRedirectLocation(res)).toBe("http://localhost:3000/api/auth/oidc/login");
+      });
+    });
+
+    test("a valid auth-token still goes to the role's landing page", async () => {
+      await withAutoRedirectEnv("oidc", "true", async () => {
+        const res = await proxy(createNextRequest("/login", await createToken("admin")));
+
+        expect(getRedirectLocation(res)).toBe("http://localhost:3000/admin");
+      });
+    });
+
+    // Every OIDC failure lands on /login?error=..., so skipping the redirect there is what keeps it from looping.
+    test("GET /login?error=oidc_failed with OIDC_AUTO_REDIRECT=true renders the login page", async () => {
+      await withAutoRedirectEnv("oidc", "true", async () => {
+        const res = await proxy(createNextRequest("/login?error=oidc_failed"));
+
+        expect(isRedirect(res)).toBe(false);
+        expect(res.status).toBe(200);
+      });
+    });
+
+    test("the local provider ignores the flag", async () => {
+      await withAutoRedirectEnv("local", "true", async () => {
+        const res = await proxy(createNextRequest("/login"));
+
+        expect(isRedirect(res)).toBe(false);
+      });
+    });
+
+    test("with the flag unset under oidc the login page renders", async () => {
+      await withAutoRedirectEnv("oidc", undefined, async () => {
+        const res = await proxy(createNextRequest("/login"));
+
+        expect(isRedirect(res)).toBe(false);
+      });
+    });
+
+    test("a method other than GET is not redirected", async () => {
+      await withAutoRedirectEnv("oidc", "true", async () => {
+        const res = await proxy(new NextRequest("http://localhost:3000/login", { method: "HEAD" }));
+
+        expect(isRedirect(res)).toBe(false);
+      });
+    });
   });
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -141,6 +404,24 @@ describe("proxy", () => {
 
       expect(isRedirect(res)).toBe(true);
       expect(getRedirectLocation(res)).toContain("/login");
+    });
+
+    test("a signed-out deep link goes to sign in with its address in next", async () => {
+      const res = await proxy(createNextRequest("/?connection=seed%3Aorders"));
+
+      expect(getRedirectLocation(res)).toBe("http://localhost:3000/login?next=%2F%3Fconnection%3Dseed%253Aorders");
+    });
+
+    test("next carries the page's whole query, also when the session has expired", async () => {
+      const res = await proxy(createNextRequest("/admin?tab=audit&page=2", "expired-or-invalid-token"));
+
+      expect(getRedirectLocation(res)).toBe("http://localhost:3000/login?next=%2Fadmin%3Ftab%3Daudit%26page%3D2");
+    });
+
+    test("the bare root goes to sign in without next", async () => {
+      const res = await proxy(createNextRequest("/"));
+
+      expect(getRedirectLocation(res)).toBe("http://localhost:3000/login");
     });
   });
 
@@ -243,12 +524,125 @@ describe("proxy", () => {
       expect(isRedirect(res)).toBe(false);
     });
 
-    test("/api/db/query without token redirects to /login", async () => {
-      const req = createNextRequest("/api/db/query");
-      const res = await proxy(req);
+    // A fetch follows a redirect to /login and gets the sign-in page's HTML, which every client
+    // caller failed to parse ("Unexpected token '<'") with nothing sending the user to sign in.
+    test("/api/db/query without token answers 401 JSON, not a redirect", async () => {
+      const res = await proxy(createNextRequest("/api/db/query"));
+
+      await expectSessionRequired(res, "Authentication required");
+    });
+
+    test("/api/db/query with an expired token answers 401 JSON, not a redirect", async () => {
+      const res = await proxy(createNextRequest("/api/db/query", await createToken("user", "-1h")));
+
+      await expectSessionRequired(res, "Session expired. Sign in again.");
+    });
+
+    test("/api/db/query with a token that does not verify answers 401 JSON", async () => {
+      const res = await proxy(createNextRequest("/api/db/query", "forged-token"));
+
+      await expectSessionRequired(res, "Session expired. Sign in again.");
+    });
+
+    test("the 401 carries the security headers a redirect did", async () => {
+      const res = await proxy(createNextRequest("/api/admin/audit"));
+
+      expect(res.status).toBe(401);
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    });
+
+    test("a page path that merely starts with api still redirects", async () => {
+      const res = await proxy(createNextRequest("/apidocs"));
 
       expect(isRedirect(res)).toBe(true);
       expect(getRedirectLocation(res)).toContain("/login");
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // The account a tab claimed the browser copy for (X-LibreDB-Workspace-Owner)
+  // ───────────────────────────────────────────────────────────────────────────
+
+  describe("workspace owner header", () => {
+    async function tokenFor(username: string) {
+      return await new SignJWT({ role: "user", username })
+        .setProtectedHeader({ alg: "HS256" })
+        .setIssuedAt()
+        .setExpirationTime("1h")
+        .sign(JWT_SECRET);
+    }
+
+    function request(pathname: string, token: string, owner: string | null, method = "GET"): NextRequest {
+      const headers = new Headers({
+        cookie: `auth-token=${token}`,
+        host: "localhost:3000",
+        origin: "http://localhost:3000",
+      });
+      if (owner !== null) headers.set("X-LibreDB-Workspace-Owner", owner);
+      return new NextRequest(`http://localhost:3000${pathname}`, { method, headers });
+    }
+
+    /** NextResponse.next() marks the response so the route runs; a refusal never carries it. */
+    const reachesRoute = (response: Response) => response.headers.get("x-middleware-next") === "1";
+
+    async function expectOwnerMismatch(response: Response) {
+      expect(response.status).toBe(409);
+      expect(reachesRoute(response)).toBe(false);
+      expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+      const body = (await response.json()) as { code?: string };
+      expect(body.code).toBe("WORKSPACE_OWNER_MISMATCH");
+    }
+
+    test("a request whose owner is the signed-in account reaches the route", async () => {
+      const token = await tokenFor("ana@libredb.org");
+      const res = await proxy(request("/api/storage", token, encodeURIComponent("ana@libredb.org")));
+
+      expect(reachesRoute(res)).toBe(true);
+    });
+
+    test("a request whose owner is a different account answers 409 with the code", async () => {
+      const token = await tokenFor("bob@libredb.org");
+
+      await expectOwnerMismatch(await proxy(request("/api/storage", token, encodeURIComponent("ana@libredb.org"))));
+    });
+
+    test("an owner that does not decode is not the signed-in account", async () => {
+      const token = await tokenFor("ana@libredb.org");
+
+      await expectOwnerMismatch(await proxy(request("/api/storage", token, "%E0%A4%A")));
+    });
+
+    test("a request without the header behaves as before", async () => {
+      const token = await tokenFor("ana@libredb.org");
+
+      expect(reachesRoute(await proxy(request("/api/storage", token, null)))).toBe(true);
+      expect(reachesRoute(await proxy(request("/", token, null)))).toBe(true);
+    });
+
+    test("a storage write carrying another account's owner is refused before the route runs", async () => {
+      const token = await tokenFor("bob@libredb.org");
+      const put = request("/api/storage/connections", token, encodeURIComponent("ana@libredb.org"), "PUT");
+
+      await expectOwnerMismatch(await proxy(put));
+      const own = request("/api/storage/connections", token, encodeURIComponent("bob@libredb.org"), "PUT");
+      expect(reachesRoute(await proxy(own))).toBe(true);
+    });
+
+    test("public routes are not checked, so a tab can still ask which account is signed in", async () => {
+      const token = await tokenFor("bob@libredb.org");
+      const stale = encodeURIComponent("ana@libredb.org");
+
+      expect(reachesRoute(await proxy(request("/api/auth/me", token, stale)))).toBe(true);
+      expect(reachesRoute(await proxy(request("/api/auth/logout", token, stale, "POST")))).toBe(true);
+      expect(reachesRoute(await proxy(request("/api/db/health", token, stale)))).toBe(true);
+    });
+
+    test("without a session the answer is still the session-required 401", async () => {
+      const req = new NextRequest("http://localhost:3000/api/storage", {
+        headers: { "X-LibreDB-Workspace-Owner": "ana%40libredb.org" },
+      });
+
+      await expectSessionRequired(await proxy(req), "Authentication required");
     });
   });
 
@@ -262,12 +656,22 @@ describe("proxy", () => {
   // ───────────────────────────────────────────────────────────────────────────
 
   describe("agent drive path", () => {
-    test("the public-path list is exactly the five it has always been", () => {
+    test("the public-path list is exactly the nine it names", () => {
       const source = readFileSync(new URL("../../src/proxy.ts", import.meta.url), "utf8");
       const block = source.slice(source.indexOf("// Allow public routes"), source.indexOf("if (!token)"));
       const literals = [...block.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
 
-      expect(literals).toEqual(["/api/auth", "/_next", "/favicon.ico", "/api/db/health", "/api/storage/config"]);
+      expect(literals).toEqual([
+        "/api/auth",
+        "/_next",
+        "/favicon.ico",
+        "/health",
+        "/api/health",
+        "/api/db/health",
+        "/api/ready",
+        "/api/storage/config",
+        "/launch",
+      ]);
     });
 
     test("no unlisted path reaches the app without a credential", () => {
@@ -275,13 +679,17 @@ describe("proxy", () => {
       // (`isStaticAsset` already is one), so this is the behavioural half. Every
       // path here is one the matcher genuinely routes through proxy() - see the
       // test below for the ones it does not.
-      const unlisted = ["/api/agent/runs", "/api/agent/drive", "/api/db/query", "/admin", "/"];
+      const unlistedApis = ["/api/agent/runs", "/api/agent/drive", "/api/db/query", "/api"];
+      const unlistedPages = ["/admin", "/"];
 
-      return Promise.all(
-        unlisted.map(async (pathname) => {
+      return Promise.all([
+        ...unlistedApis.map(async (pathname) => {
+          expect((await proxy(createNextRequest(pathname))).status).toBe(401);
+        }),
+        ...unlistedPages.map(async (pathname) => {
           expect(isRedirect(await proxy(createNextRequest(pathname)))).toBe(true);
         }),
-      );
+      ]);
     });
 
     test("the workflow runtime's own callback path would sit OUTSIDE this middleware entirely", () => {
@@ -299,11 +707,18 @@ describe("proxy", () => {
       expect(matcher.test(AGENT_DRIVE_PATH)).toBe(true);
     });
 
-    test("the drive path is not public: no credential redirects to /login", async () => {
+    test("the matcher routes both MCP paths through proxy(), so an edit that drops them fails here", () => {
+      const matcher = new RegExp(`^${config.matcher[0]}$`);
+      expect(matcher.test("/api/mcp")).toBe(true);
+      expect(matcher.test("/api/mcp/token")).toBe(true);
+      // The control: the same compiled matcher skips a dotted path.
+      expect(matcher.test("/.well-known/oauth-protected-resource")).toBe(false);
+    });
+
+    test("the drive path is not public: no credential answers 401", async () => {
       const res = await proxy(createNextRequest(AGENT_DRIVE_PATH));
 
-      expect(isRedirect(res)).toBe(true);
-      expect(getRedirectLocation(res)).toContain("/login");
+      await expectSessionRequired(res, "Authentication required");
     });
 
     test("a valid drive token passes the drive path through", async () => {
@@ -317,7 +732,7 @@ describe("proxy", () => {
       const req = createNextRequest(AGENT_DRIVE_PATH);
       req.headers.set(AGENT_DRIVE_HEADER, await createToken("admin"));
 
-      expect(isRedirect(await proxy(req))).toBe(true);
+      expect((await proxy(req)).status).toBe(401);
     });
 
     test("a drive token opens the drive path and nothing else", async () => {
@@ -326,8 +741,84 @@ describe("proxy", () => {
         const req = createNextRequest(pathname);
         req.headers.set(AGENT_DRIVE_HEADER, token);
 
-        expect(isRedirect(await proxy(req))).toBe(true);
+        const res = await proxy(req);
+        expect(pathname === "/admin" ? isRedirect(res) : res.status === 401).toBe(true);
       }
+    });
+  });
+});
+
+describe("proxy under a nested basePath", () => {
+  for (const [path, role, destination] of [
+    ["/admin", undefined, "/login?next=%2Fadmin"],
+    ["/login", "admin", "/admin"],
+    ["/login", "user", "/"],
+    ["/admin", "user", "/"],
+    ["/", "expired", "/login"],
+  ] as const) {
+    test(`${path} (${role ?? "anonymous"}) redirects inside the mount`, async () => {
+      await withBasePathEnv("/~/libredb", async () => {
+        const token = role ? await createToken(role, role === "expired" ? "-1h" : "1h") : undefined;
+        const request = new NextRequest(`http://localhost:3000/~/libredb${path}`, {
+          headers: token ? { cookie: `auth-token=${token}` } : {},
+          nextConfig: { basePath: "/~/libredb" },
+        });
+        expect(request.nextUrl.pathname).toBe(path);
+        expect((await proxy(request)).headers.get("location")).toBe(`http://localhost:3000/~/libredb${destination}`);
+      });
+    });
+  }
+  test("a deep link opened signed out comes back to the same address inside the mount", async () => {
+    await withBasePathEnv("/~/libredb", async () => {
+      const options = { nextConfig: { basePath: "/~/libredb" } };
+      const signedOut = await proxy(
+        new NextRequest("http://localhost:3000/~/libredb/?connection=seed%3Aorders", options),
+      );
+      expect(signedOut.headers.get("location")).toBe(
+        "http://localhost:3000/~/libredb/login?next=%2F%3Fconnection%3Dseed%253Aorders",
+      );
+
+      const token = await createToken("user");
+      const signedIn = await proxy(
+        new NextRequest("http://localhost:3000/~/libredb/login?next=%2F%3Fconnection%3Dseed%253Aorders", {
+          ...options,
+          headers: { cookie: `auth-token=${token}` },
+        }),
+      );
+      expect(signedIn.headers.get("location")).toBe("http://localhost:3000/~/libredb/?connection=seed%3Aorders");
+    });
+  });
+  test("the automatic redirect to the identity provider stays inside the mount", async () => {
+    await withBasePathEnv("/~/libredb", async () => {
+      await withAutoRedirectEnv("oidc", "true", async () => {
+        const request = new NextRequest("http://localhost:3000/~/libredb/login?next=%2Fadmin", {
+          nextConfig: { basePath: "/~/libredb" },
+        });
+        expect((await proxy(request)).headers.get("location")).toBe(
+          "http://localhost:3000/~/libredb/api/auth/oidc/login?next=%2Fadmin",
+        );
+      });
+    });
+  });
+  test("a prefixed API path answers 401 JSON inside the mount, not a redirect", async () => {
+    await withBasePathEnv("/~/libredb", async () => {
+      const request = new NextRequest("http://localhost:3000/~/libredb/api/db/query", {
+        nextConfig: { basePath: "/~/libredb" },
+      });
+      await expectSessionRequired(await proxy(request), "Authentication required");
+    });
+  });
+  test("prefixed health is public and prefixed API writes still reject hostile origins", async () => {
+    await withBasePathEnv("/tools/libredb", async () => {
+      const url = "http://localhost:3000/tools/libredb/api/db/health";
+      const options = { nextConfig: { basePath: "/tools/libredb" } };
+      expect((await proxy(new NextRequest(url, options))).status).toBe(200);
+      const request = new NextRequest(url, {
+        ...options,
+        method: "POST",
+        headers: { host: "localhost:3000", origin: "https://evil.example" },
+      });
+      expect((await proxy(request)).status).toBe(403);
     });
   });
 });

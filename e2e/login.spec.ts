@@ -13,7 +13,18 @@ test.describe("Login Flow", () => {
     await expect(page.locator("text=LibreDB Studio").first()).toBeVisible();
     await expect(page.locator('input[type="email"]').first()).toBeVisible();
     await expect(page.locator('input[type="password"]').first()).toBeVisible();
-    await expect(page.locator('button:has-text("Sign In")').first()).toBeVisible();
+    await expect(page.locator('button:has-text("Sign in")').first()).toBeVisible();
+  });
+
+  test("the sign-in form arrives in the page's first HTML, never in a streamed segment a script moves later", async ({
+    request,
+  }) => {
+    // React outlined the form's Suspense boundary into a hidden S:0 segment that a script moves into place; on a loaded
+    // CI runner the client drew the form first and the hidden copy stayed, so the page held two input#email (Functional
+    // Smoke, run 37022597426, a strict-mode locator refused to choose).
+    const html = await (await request.get("/login")).text();
+    expect(html).not.toMatch(/<div hidden id="S:\d+">/);
+    expect(html.match(/id="email"/g)).toHaveLength(1);
   });
 
   test("admin login redirects to /admin", async ({ page }) => {
@@ -120,18 +131,21 @@ test.describe("Login showcase", () => {
     // item carries an "(embedded)" marker after its label: the hero claims the external
     // engines only, and this is the marker that tells a reader which pill the claim leaves
     // out. The `embedded` flag comes from the same module the page renders from, so the
-    // expectation still names no engine.
+    // expectation still names no engine. Each label is escaped into the pattern, because a label
+    // such as "InfluxDB (InfluxQL)" holds parentheses that a pattern would read as a group.
     const expected = listShowcaseDatabases();
+    const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     await expect(engines.getByRole("listitem")).toHaveCount(expected.length);
     await expect(engines.getByRole("listitem")).toHaveText(
-      expected.map((db) => new RegExp(`^${db.label}\\s*${db.embedded ? "\\(embedded\\)" : ""}$`)),
+      expected.map((db) => new RegExp(`^${literal(db.label)}\\s*${db.embedded ? "\\(embedded\\)" : ""}$`)),
     );
   });
 
   test("hero names every wire-compatible relative, with the registry's own count", async ({ page }) => {
     // The gap this closes: the hero named the shipped drivers and stopped, while the product
-    // connects to forty named products. The twenty-six relatives were published in
-    // README.md and the docs compatibility table but on no surface a visitor sees first.
+    // also connects to every wire-compatible relative in WIRE_COMPATIBLE_ENGINES. Those relatives
+    // were published in README.md and the docs compatibility table but on no surface a visitor
+    // sees first.
     const line = page.getByTestId("wire-compatible-desktop");
     await expect(line).toBeVisible();
     await expect(line).toContainText(`${WIRE_COMPATIBLE_ENGINES.length}`);
@@ -200,5 +214,54 @@ test.describe("Login showcase", () => {
     // The hero is display:none at this width, not merely off-screen.
     await expect(page.getByTestId("database-showcase-desktop")).toBeHidden();
     await expect(page.getByTestId("hero-proof")).toBeHidden();
+  });
+
+  // Issue #541: the relatives line above pushed the hero column past 800px at 1280x800 with
+  // zero slack to absorb it, scrolling the whole page. Pinned at the sizes #541 measured as
+  // "no scroll" before that line existed, so a future addition to the hero that
+  // reopens the gap fails here instead of shipping unnoticed.
+  const NO_SCROLL_DESKTOP_VIEWPORTS = [
+    { width: 1280, height: 800 },
+    { width: 1366, height: 768 },
+    { width: 1440, height: 900 },
+    { width: 1920, height: 1080 },
+  ];
+
+  test("hero fits without a vertical scrollbar at every no-scroll desktop size", async ({ page }) => {
+    for (const viewport of NO_SCROLL_DESKTOP_VIEWPORTS) {
+      await page.setViewportSize(viewport);
+      const scrollHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+      expect(scrollHeight, `${viewport.width}x${viewport.height}`).toBeLessThanOrEqual(viewport.height);
+
+      // The sign-in card is the page's one interactive element; it staying reachable without
+      // scrolling is the actual user-facing consequence of the hero overflowing.
+      const emailBox = await page.locator('input[type="email"]').first().boundingBox();
+      expect(emailBox?.y, `${viewport.width}x${viewport.height}`).toBeLessThan(viewport.height);
+    }
+  });
+  // Issue #553: every pixel number above is measured in whatever face the page actually renders,
+  // so those numbers only mean something if that face is Geist. Before the @theme inline fix,
+  // globals.css mapped --font-sans inside a plain @theme block, which Tailwind emits at :root,
+  // where next/font's body-scoped --font-geist-sans does not exist; the reference resolved to
+  // nothing, both faces sat at "unloaded", and body rendered Tailwind's preflight system stack.
+  test("hero renders in Geist, not the system font", async ({ page }) => {
+    const fonts = await page.evaluate(async () => {
+      await document.fonts.ready;
+      const status: Record<string, string> = {};
+      document.fonts.forEach((face) => {
+        status[face.family] = face.status;
+      });
+      const heading = document.querySelector("h1");
+      if (!heading) throw new Error("login page has no h1");
+      return {
+        status,
+        body: getComputedStyle(document.body).fontFamily,
+        heading: getComputedStyle(heading).fontFamily,
+      };
+    });
+    expect(fonts.status.GeistSans).toBe("loaded");
+    expect(fonts.status.GeistMono).toBe("loaded");
+    expect(fonts.body).toMatch(/^GeistSans\b/);
+    expect(fonts.heading).toMatch(/^GeistSans\b/);
   });
 });

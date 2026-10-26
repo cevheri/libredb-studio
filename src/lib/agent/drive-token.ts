@@ -8,9 +8,10 @@
  * The credential exists now because the seam it guards had to be designed with the
  * boundary, not bolted onto it afterwards.
  *
- * `src/proxy.ts` exempts exactly four things — the auth paths, static assets, the
- * health GET and the storage-config GET — and this milestone's constraint is that
- * the drive path does NOT join them. An exemption is path-shaped: anyone who can
+ * `src/proxy.ts` lets a short list of public paths through without a session
+ * (the block under its `// Allow public routes` comment, pinned by
+ * `tests/api/proxy.test.ts`), and this milestone's constraint is that the
+ * drive path does NOT join them. An exemption is path-shaped: anyone who can
  * reach the port gets in. So the drive path is guarded by a credential instead, and
  * this module is that credential:
  *
@@ -27,6 +28,10 @@
  *    admin", i.e. an ordinary user of the whole application. Separate keys make
  *    that unreachable instead of relying on every future reader to check a claim.
  *
+ * The MCP endpoint (`/api/mcp`, #246) is the second path the proxy treats this way: it verifies a
+ * scoped bearer token of its own (`src/lib/mcp/token.ts`), derived from JWT_SECRET under another
+ * label, so neither credential verifies as the other or as a session.
+ *
  * What this token does NOT decide is what the run may do. Authorization for a tool
  * call is read from the run's own persisted actor (`run-store.ts`), never from this
  * token and never from a request body — the token says which run to drive, and the
@@ -35,7 +40,7 @@
 
 import { SignJWT, jwtVerify } from "jose";
 import { getJwtSecret } from "@/lib/config/auth-env";
-import { AGENT_RUN_ID_PATTERN } from "./run-store";
+import { AGENT_RUN_ID_PATTERN } from "./run-id";
 
 /** The one path this credential opens. */
 export const AGENT_DRIVE_PATH = "/api/agent/drive";

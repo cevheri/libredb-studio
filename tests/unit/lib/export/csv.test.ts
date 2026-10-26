@@ -2,6 +2,14 @@ import { describe, test, expect } from "bun:test";
 import { csvRow, toCsv } from "@/lib/export/csv";
 
 describe("csvRow", () => {
+  test.each([";", "\t"] as const)("uses the chosen delimiter and quotes it inside a value (%s)", (delimiter) => {
+    expect(csvRow([`left${delimiter}right`, 'say "hi"', "line1\nline2", "=1+1", -12.5, null], delimiter)).toBe(
+      [`"left${delimiter}right"`, '"say ""hi"""', '"line1\nline2"', '"\'=1+1"', "-12.5", ""].join(delimiter),
+    );
+    expect(toCsv([{ amount: "1,5", name: "雪" }], ["name", "amount"], delimiter)).toBe(
+      `name${delimiter}amount\n雪${delimiter}1,5`,
+    );
+  });
   test("leaves a value that needs no quoting bare", () => {
     expect(csvRow(["id", "name", 42])).toBe("id,name,42");
   });
@@ -50,6 +58,15 @@ describe("csvRow", () => {
     // A Postgres `numeric` reaches the export as a string, so the exemption is on the
     // TEXT and not on the JavaScript type.
     expect(csvRow(["-12.5", "-1e3", "+7", "-.5", "-1E+03"])).toBe("-12.5,-1e3,+7,-.5,-1E+03");
+  });
+
+  test("writes negative infinity plain when the cell is a number or sits in a numeric column", () => {
+    expect(csvRow([Number.NEGATIVE_INFINITY, "-Infinity", "-Infinity"], ",", [false, true, false])).toBe(
+      `-Infinity,-Infinity,"'-Infinity"`,
+    );
+    expect(toCsv([{ f: "-Infinity", t: "-Infinity" }], ["f", "t"], ",", new Set(["f"]))).toBe(
+      `f,t\n-Infinity,"'-Infinity"`,
+    );
   });
 
   test("neutralises a value that only starts out numeric", () => {

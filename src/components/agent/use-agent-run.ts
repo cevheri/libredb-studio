@@ -1,7 +1,9 @@
 "use client";
 
+import { appFetch } from "@/lib/config/base-path";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { isAgentModelCapability } from "@/lib/agent/capability-labels";
+import { AGENT_THREAD_KEY, holdsAccountWorkspace } from "@/lib/storage/local-storage";
 // Type-only, so nothing of the probe — or of the AI SDK it runs — reaches this bundle.
 import type { AgentModelCapability } from "@/lib/agent/capability-probe";
 import type { AgentLedgerEntry } from "@/lib/agent/run-store";
@@ -82,6 +84,8 @@ export interface AgentRunStartInput {
   readonly previousRunId?: string;
   readonly objective: string;
   readonly connectionId: string;
+  /** The database the run reads on a server-level connection (#1530); the server requires it there. */
+  readonly catalog?: string;
 }
 
 export interface AgentRunFollower {
@@ -113,6 +117,11 @@ export interface AgentRunFollower {
    */
   readonly isStopping: boolean;
   readonly timeline: AgentRunTimeline;
+  /**
+   * The connection the run being followed was opened on, or null before the server opened one. The rail reads it
+   * to tell a refusal of THIS connection's user from one of a connection the shell has since left.
+   */
+  readonly openedOn: string | null;
   /** The app's own words about why the last attempt did not continue. */
   readonly error: string | null;
   /**
@@ -152,6 +161,10 @@ export interface AgentRunFollower {
    *          caller leave two runs executing against the same connection (#407 review).
    */
   readonly cancel: () => Promise<boolean>;
+  /** Asks the run to pause; the server accepts only a RUNNING run. */
+  readonly pause: () => Promise<boolean>;
+  /** Asks the run to resume; the server accepts only a PAUSED run. */
+  readonly resume: () => Promise<boolean>;
 }
 
 interface StartResponse {
@@ -197,14 +210,15 @@ const isStartRefusalCode = (value: unknown): value is AgentStartRefusalCode => v
 /**
  * Where this browser remembers which conversation it was in.
  *
- * localStorage only, and per browser rather than per user: it is a resumption hint, not
- * user data, so it must never reach the storage layer or a server — the rule
- * `lib/community/star-prompt.ts` states for the same reason. Every access is wrapped, and
+ * localStorage only: it is a resumption hint, not user data, so it must never reach the
+ * storage layer or a server: the rule `lib/community/star-prompt.ts` states for the same
+ * reason. It is part of the signed-in account's browser copy all the same, so in server
+ * storage mode signing out clears it (`clearAccountWorkspace`). Every access is wrapped, and
  * every failure degrades to "nothing was interrupted", which is the behaviour before this
  * existed: a rail that cannot say a conversation ended is strictly better than one that
  * cannot open a run (#518).
  */
-const THREAD_STORAGE_KEY = "libredb_agent_thread";
+const THREAD_STORAGE_KEY = AGENT_THREAD_KEY;
 
 /** A conversation this browser was in and is no longer following. */
 export interface AgentInterruptedThread {
@@ -283,9 +297,13 @@ function parseStoredThread(raw: string | null): AgentInterruptedThread | null {
   return { threadId: candidate.threadId, steps: candidate.steps };
 }
 
-/** Remember the conversation this run belongs to, or forget the one that no longer applies. */
+/**
+ * Remember the conversation this run belongs to, or forget the one that no longer applies. Only
+ * while the browser copy is still the account this tab claimed it for (`holdsAccountWorkspace`).
+ */
 function rememberThread(thread: AgentThreadContext | null): void {
   try {
+    if (!holdsAccountWorkspace()) return;
     // Removed rather than left standing when a run belongs to no conversation: a stale
     // entry would tell the next mount a conversation was interrupted that had already ended.
     if (thread === null) localStorage.removeItem(THREAD_STORAGE_KEY);
@@ -367,9 +385,11 @@ export interface AgentModelRefusal {
    * The mode the refused start asked for, and the only mode this verdict is about.
    *
    * The gate probes a model because an AGENT run needs tools; planning is toolless by
-   * contract and returns `allowed` on its first line (`capability-gate.ts`), so it is
-   * never probed and never refused. A verdict left standing over a mode it was never
-   * about would be a false statement, which is why it is recorded rather than assumed.
+   * contract and is never probed (`capability-gate.ts`), so it never gets this verdict.
+   * Its model is still built, and an `LLM_MODEL_EFFORT` the model refuses answers 503 in
+   * either mode, a configuration error rather than this verdict. A verdict left standing
+   * over a mode it was never about would be a false statement, which is why it is
+   * recorded rather than assumed.
    */
   readonly mode: AgentRunMode;
 }
@@ -425,6 +445,7 @@ function messageFor(error: unknown): string {
 
 export function useAgentRun(): AgentRunFollower {
   const [runId, setRunId] = useState<string | null>(null);
+  const [openedOn, setOpenedOn] = useState<string | null>(null);
   const [thread, setThread] = useState<AgentThreadContext | null>(null);
   const storedThread = useSyncExternalStore(subscribeStoredThread, storedThreadSnapshot, serverThreadSnapshot);
   const [entries, setEntries] = useState<readonly AgentLedgerEntry[]>([]);
@@ -443,7 +464,7 @@ export function useAgentRun(): AgentRunFollower {
   );
 
   const follow = useCallback(async (id: string, signal: AbortSignal): Promise<void> => {
-    const res = await fetch(`/api/agent/runs/${encodeURIComponent(id)}/stream`, { signal });
+    const res = await appFetch(`/api/agent/runs/${encodeURIComponent(id)}/stream`, { signal });
     if (!res.ok) {
       const body = (await res.json().catch(() => ({}))) as StartResponse;
       throw new Error(
@@ -495,11 +516,12 @@ export function useAgentRun(): AgentRunFollower {
       setRefusal(null);
       setEntries([]);
       setRunId(null);
+      setOpenedOn(null);
 
       let openedRunId: string;
       let openedThread: AgentThreadContext | null = null;
       try {
-        const res = await fetch("/api/agent/runs", {
+        const res = await appFetch("/api/agent/runs", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(input),
@@ -545,6 +567,7 @@ export function useAgentRun(): AgentRunFollower {
       }
 
       setRunId(openedRunId);
+      setOpenedOn(input.connectionId);
       setThread(openedThread);
       // Written from what the SERVER said this run belongs to, like everything else about
       // the thread. The notice this feeds is about the ABSENCE of a run, so nothing has to
@@ -578,7 +601,7 @@ export function useAgentRun(): AgentRunFollower {
       // controller: aborting is how this component stops following a run, and a
       // stop request is the opposite — the run is expected to keep reporting until
       // its loop reaches a checkpoint.
-      const res = await fetch(`/api/agent/runs/${encodeURIComponent(runId)}`, {
+      const res = await appFetch(`/api/agent/runs/${encodeURIComponent(runId)}`, {
         method: "DELETE",
         signal: abortRef.current?.signal,
       });
@@ -600,6 +623,42 @@ export function useAgentRun(): AgentRunFollower {
       return false;
     }
   }, [runId]);
+
+  const patchRun = useCallback(
+    async (action: "pause" | "resume"): Promise<boolean> => {
+      // Nothing is open, so there was nothing to ask. Answered `false` for the
+      // same reason `cancel` does: a caller deciding whether the run moved.
+      if (runId === null) return false;
+
+      setError(null);
+      try {
+        const res = await appFetch(`/api/agent/runs/${encodeURIComponent(runId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action }),
+          signal: abortRef.current?.signal,
+        });
+        if (!res.ok) {
+          const body = (await res.json().catch(() => ({}))) as StartResponse;
+          throw new Error(
+            typeof body.error === "string" ? body.error : `The run could not be ${action}d (${res.status})`,
+          );
+        }
+        // Nothing is set on success: the stream delivers the ledger entry, so the
+        // rail shows what the durable record says rather than what this call hoped.
+        return true;
+      } catch (patchError) {
+        if (abortRef.current?.signal.aborted !== true) {
+          setError(messageFor(patchError));
+        }
+        return false;
+      }
+    },
+    [runId],
+  );
+
+  const pause = useCallback(async (): Promise<boolean> => patchRun("pause"), [patchRun]);
+  const resume = useCallback(async (): Promise<boolean> => patchRun("resume"), [patchRun]);
 
   /*
     Memoised on the entries alone, which is the whole of the fold's input. Without
@@ -634,5 +693,20 @@ export function useAgentRun(): AgentRunFollower {
   */
   const interrupted = runId === null && !isBusy ? storedThread : null;
 
-  return { runId, thread, interrupted, isBusy, isStopping, timeline, error, errorCode, refusal, start, cancel };
+  return {
+    runId,
+    thread,
+    interrupted,
+    isBusy,
+    isStopping,
+    timeline,
+    openedOn,
+    error,
+    errorCode,
+    refusal,
+    start,
+    cancel,
+    pause,
+    resume,
+  };
 }

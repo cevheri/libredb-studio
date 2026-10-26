@@ -17,7 +17,10 @@
 # The runtime keep-list documented in scripts/build-standalone-payload.sh
 # (server.js, package.json, .next, node_modules, public, data) must always
 # survive this step; LICENSE and README.md are deliberately kept too
-# (release-artifact convention; the MIT notice travels with the payload).
+# (release-artifact convention; the MIT notice travels with the payload),
+# and so is THIRD_PARTY_NOTICES.txt, which carries the db2-node addon's
+# MIT text and its compiled crates' notices (#786) and which
+# build-standalone-payload.sh relies on finding here.
 #
 # Usage: prune-standalone-payload.sh <payload-dir>
 # ==============================================================================
@@ -56,32 +59,39 @@ PRUNE_LIST=(
   conductor
   deploy
   desktop
+  # The channel inventory. Scripts and the showcase generator read it; the
+  # server reads src/lib/distribution/channels.generated.ts, never this.
+  distribution
   docker
   docs
   e2e
   loop
   packaging
+  # The agent-failure study (paper sources, Python scripts). No compiled
+  # code reads it; shipped, it made namcap demand python for the AUR (#971).
+  research
   scripts
   snap
   src
   tests
+  # The VS Code extension: its node_modules, its bundles and its .vscode-test/ downloads.
+  vscode-extension
   artifacthub-repo.yml
   biome.json
   bun.lock
   bunfig.toml
   CLAUDE.md
+  codecov.yml
   CODE_OF_CONDUCT.md
   components.json
   CONTRIBUTING.md
   database-compose.yml
-  Dockerfile
   docker-entrypoint.sh
   DOCKERHUB.md
   eslint.config.mjs
   fly.toml
   knip.json
   next.config.ts
-  playwright.config.ts
   postcss.config.mjs
   render.yaml
   SECURITY.md
@@ -108,12 +118,18 @@ for entry in "${PRUNE_LIST[@]}"; do
   rm -rf "${PAYLOAD_DIR:?}/${entry:?}"
 done
 
-# Pattern entries: deploy manifests (docker-compose.yml,
+# Pattern entries: the image variants (Dockerfile, Dockerfile.alpine,
+# Dockerfile.alpine-slim - #840; a glob rather than three literals, because
+# the literal `Dockerfile` entry covered one of the three the day the other
+# two landed), the Playwright harnesses (the bare `playwright.config.ts` was
+# a literal while base-path, channel and smoke shipped), deploy manifests
+# (docker-compose.yml,
 # docker-compose.example.yml, ...), locally built snap binaries
 # (libredb-studio_<version>_<arch>.snap), packed tarballs, logs, and
 # key/cert files. An unmatched glob stays literal and rm -f ignores it.
 # Leading-dot entries (.gitignore, .github, .npmrc, ...) never get traced
 # into the standalone output in the first place - only non-dot repo-root
 # files need pruning.
-rm -f "$PAYLOAD_DIR"/docker-compose*.yml "$PAYLOAD_DIR"/docker-compose*.yaml \
+rm -f "$PAYLOAD_DIR"/Dockerfile* "$PAYLOAD_DIR"/playwright*.config.ts \
+  "$PAYLOAD_DIR"/docker-compose*.yml "$PAYLOAD_DIR"/docker-compose*.yaml \
   "$PAYLOAD_DIR"/*.snap "$PAYLOAD_DIR"/*.tgz "$PAYLOAD_DIR"/*.log "$PAYLOAD_DIR"/*.pem

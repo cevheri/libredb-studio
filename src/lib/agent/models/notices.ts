@@ -36,6 +36,12 @@ export const BASELINE_NOTICES: AgentNotices = Object.freeze({
     "Call compose_report now with what you established.",
     CITATION_RULE,
   ].join(" "),
+  turnCutOff: [
+    "Your last turn was cut off at this server's per-call limit and nothing from it was kept: whatever you were working out has not reached this run, and this run cannot see it.",
+    "The run itself is not over. It has most of its time and nearly all of its steps left, and it ends only when you file something.",
+    "Do not work that turn out again — a turn cut for taking too long will be cut again. Act in ONE short move now: if you already know what you would say, call compose_report with what this conversation established; otherwise make one tool call and nothing else.",
+    CITATION_RULE,
+  ].join(" "),
   planStatement: [
     "Your plan describes the database but names no statement, and a plan is scored on what the user can run: it must end either with a fenced code block holding one statement for this engine, or with an explicit refusal.",
     `Write the statement in a fenced block now, or begin a line with ${PLAN_NO_STATEMENT_MARKER} and say what the database does not support.`,
@@ -46,7 +52,34 @@ export const BASELINE_NOTICES: AgentNotices = Object.freeze({
   ].join(" "),
   unreadStop: [
     "You have stopped without reading anything, and there is nobody to reply to you: this run has no correspondent, so a request for information ends it with nothing established.",
+    /*
+      The sentence that answers the question these runs actually ask.
+
+      "Read it yourself" answers "how do I read". Measured 2026-10-04, the question was WHICH
+      statement: `devstral-small-2:24b` holds five of six surfaces at 5/5 and loses optimize the
+      same way five times out of five - zero tools, stopped in nine to thirteen seconds with "I
+      need the query text to investigate why it is slow. Please provide the employee listing query
+      you are asking about." Told to call `inspect_plan` "for how a statement will run", it asked
+      again: `inspect_plan` takes a statement, and it had none.
+
+      It never would. The objective names a query in prose - this repository's own optimize
+      objective is "Why is the employee listing query slow?" - and the sample holds no
+      `employee_listing` object, which `composedSql`'s docblock records as the shape three other
+      families tripped on from the other side, calling `inspect_schema` for it and citing the empty
+      result. No run on any surface is handed SQL; every one drafts its own from the inventory it
+      was given. Saying so is what turns a reasonable question into a next step.
+    */
+    "No statement was given to you and none is coming: write the one you need from the schema inventory in this conversation, then inspect its plan.",
     "Read it yourself. Call inspect_schema for the tables and their columns, and inspect_plan for how a statement will run, then call compose_report with what you found.",
     CITATION_RULE,
+  ].join(" "),
+  toolCallAsText: [
+    "Your last turn was a tool CALL written into the message text, so no tool ran: this server executes calls that arrive through the tool channel and reads the message text as words.",
+    "Make the same call again as a tool call, through the tool interface your client offers, rather than writing the call out as a message.",
+  ].join(" "),
+  unreadableToolCall: [
+    "Your last tool call could not be read: this server's model endpoint refused to parse its arguments, so no tool ran and nothing about it reached this run.",
+    "The arguments of a tool call must be a JSON object and nothing else. Do not write your reasoning, a sentence, or a code fence in the argument field — send only the object, starting at its opening brace.",
+    "Make the call again, arguments only.",
   ].join(" "),
 });

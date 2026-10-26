@@ -2,8 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { getOrCreateProvider } from "@/lib/db";
 import type { MonitoringOptions } from "@/lib/db/types";
 import { createErrorResponse } from "@/lib/api/errors";
+import { INVALID_REQUEST_BODY, isJsonObject } from "@/lib/api/json-object-body";
 import { resolveConnection } from "@/lib/seed/resolve-connection";
-import { guardRoute } from "@/lib/api/require-session";
+import { auditRoleDenial, guardRoute, adminRequiredResponse } from "@/lib/api/require-session";
+import { requestCatalog } from "@/lib/db/catalog-scope";
+import { editorProvider } from "@/lib/api/editor-provider";
+import { governanceEnabled } from "@/lib/governance/config";
 
 /**
  * POST /api/db/monitoring
@@ -15,6 +19,15 @@ export async function POST(req: NextRequest) {
   // denial audit instead of a 400 that never reached the guard.
   const guard = await guardRoute({ route: "POST /api/db/monitoring", bucket: "query", request: req });
   if ("response" in guard) return guard.response;
+
+  // Under governance (docs/GOVERNANCE.md#grants-and-the-connection-list) users who share a read principal would see
+  // each other's statements in `pg_stat_activity`, so monitoring is admin-only there. The refusal comes before the body
+  // is read and before a connection is resolved, and is audited as the maintenance route's is. Without governance every
+  // session keeps the access it always had.
+  if (governanceEnabled() && guard.session.role !== "admin") {
+    auditRoleDenial({ route: "POST /api/db/monitoring", user: guard.session.username, request: req });
+    return adminRequiredResponse();
+  }
 
   try {
     // Handle empty or aborted requests
@@ -28,18 +41,39 @@ export async function POST(req: NextRequest) {
     } catch {
       return NextResponse.json({ error: "Invalid JSON in request body" }, { status: 400 });
     }
+    // JSON that is not an object (`null`, an array, a number) is a malformed request as well, refused before any
+    // connection resolves: a `null` one answered 500 with the runtime's own destructuring error.
+    if (!isJsonObject(body)) {
+      return NextResponse.json({ error: INVALID_REQUEST_BODY }, { status: 400 });
+    }
 
-    const connection = await resolveConnection(body, guard.session);
+    // A present `options` that is not an object is refused in the query route's words: a `null` one reached the
+    // provider's destructuring and answered 500 with the runtime's own text.
     const { options } = body as { options?: MonitoringOptions };
+    if (options !== undefined && !isJsonObject(options)) {
+      return NextResponse.json({ error: "options must be an object" }, { status: 400 });
+    }
+    const connection = await resolveConnection(body, guard.session);
 
     if (!connection.type) {
       return NextResponse.json({ error: "Valid connection configuration is required" }, { status: 400 });
     }
 
-    const provider = await getOrCreateProvider(connection);
+    const provider = await editorProvider(guard.session, connection, requestCatalog(body));
     const monitoringData = await provider.getMonitoringData(options);
+    // The maintenance this connected server accepts (#1387). Read here, off the provider the
+    // panels came from, because `POST /api/db/provider-meta` never connects and can only answer
+    // the type id's declaration, which offers PostgreSQL's and MySQL's whole sets to every
+    // wire-compatible engine.
+    const { maintenanceOperations, maintenanceOperationSpecs } = provider.getCapabilities();
 
-    return NextResponse.json(monitoringData);
+    return NextResponse.json({
+      ...monitoringData,
+      maintenance: {
+        maintenanceOperations,
+        ...(maintenanceOperationSpecs === undefined ? {} : { maintenanceOperationSpecs }),
+      },
+    });
   } catch (error) {
     // Ignore aborted requests (client cancelled)
     if (

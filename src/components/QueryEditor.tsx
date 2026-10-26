@@ -1,27 +1,46 @@
 "use client";
 
 import React, { useRef, useEffect, useState, useMemo, forwardRef, useImperativeHandle } from "react";
+import { SHORTCUTS, shortcutLabel, monacoKeybinding } from "@/lib/keyboard-shortcuts";
 import Editor from "@monaco-editor/react";
 import type * as Monaco from "monaco-editor";
 import { Zap, LoaderCircle, TextAlignStart, Trash2, Copy, Play, Hash } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { format } from "sql-formatter";
+import { DIALECT_EDITORS, formatterForLanguage, registerDialectConsoles } from "@/lib/editor/dialect-editors";
 import { registerSQLCompletionProvider } from "@/lib/editor/sql-completions";
 import type { SchemaCompletionCache, SchemaColumnItem } from "@/lib/editor/sql-completions";
 import { registerMongoDBCompletionProvider } from "@/lib/editor/mongodb-completions";
 import { registerLibreDBLanguage } from "@/lib/editor/libredb-language";
 import { registerRedisLanguage } from "@/lib/editor/redis-language";
+import { registerEtcdLanguage } from "@/lib/editor/etcd-language";
+import { registerOxiaLanguage } from "@/lib/editor/oxia-language";
+import { registerKubectlLanguage } from "@/lib/editor/kubectl-language";
+import { registerS3Language, S3_LANGUAGE_ID } from "@/lib/editor/s3-language";
+import { registerS3CompletionProvider, s3CompletionBucketsOf } from "@/lib/editor/s3-completions";
+import { FIRESTORE_LANGUAGE_ID, registerFirestoreLanguage } from "@/lib/editor/firestore-language";
+import {
+  firestoreCompletionCollectionsOf,
+  registerFirestoreCompletionProvider,
+} from "@/lib/editor/firestore-completions";
+import { registerPromqlLanguage } from "@/lib/editor/promql-language";
+import { CYPHER_LANGUAGE_ID, registerCypherLanguage } from "@/lib/editor/cypher-language";
+import { cypherCompletionSchemaOf, registerCypherCompletionProvider } from "@/lib/editor/cypher-completions";
+import { INFLUXQL_LANGUAGE_ID, registerInfluxqlLanguage } from "@/lib/editor/influxql-language";
+import { influxqlCompletionSchemaOf, registerInfluxqlCompletionProvider } from "@/lib/editor/influxql-completions";
+import { graphPolicyProfileOf } from "@/lib/db/graph-policy-profiles";
 import { configureMonacoLoader } from "@/lib/editor/monaco-loader";
+import { defineStudioThemes, STUDIO_THEME_DARK, STUDIO_THEME_LIGHT } from "@/lib/editor/monaco-theme";
 import { useEffectiveTheme } from "@/hooks/use-effective-theme";
 import { useMonacoInstance } from "@/hooks/use-monaco-instance";
 import { logger } from "@/lib/logger";
 import { setLineNumbersPreference, useLineNumbersPreference } from "@/hooks/use-line-numbers-preference";
 import { writeToClipboard } from "@/components/copy-button";
 import { toast } from "sonner";
-import { splitStatements } from "@/lib/sql/statement-splitter";
+import { cursorTarget, selectionTarget } from "@/lib/sql/run-target";
 import { resolveSqlGrammar } from "@/lib/sql/grammar";
 import type { DatabaseType } from "@/lib/types";
+import { containerSpellingOf, quoteIdentifier } from "@/lib/query-generators";
 
 // Serve Monaco from our own origin rather than @monaco-editor/react's jsdelivr default.
 // Runs at module load so it is in place before the first <Editor> mounts.
@@ -31,6 +50,11 @@ configureMonacoLoader();
 // precondition when the menu opens, so the key — not the mounting render — decides whether
 // the affordance is offered (see the explain-capability gate below).
 const CAN_EXPLAIN_CONTEXT_KEY = "libredbCanExplain";
+
+// Context key gating the "Format SQL" context-menu action and its keybinding, on the same
+// principle: the action's label is fixed when onMount registers it, so the key decides where the
+// entry is offered, which is an SQL tab only (see the format gate below).
+const CAN_FORMAT_SQL_CONTEXT_KEY = "libredbCanFormatSql";
 
 export interface QueryEditorRef {
   getSelectedText: () => string;
@@ -44,12 +68,41 @@ export interface QueryEditorRef {
 interface QueryEditorProps {
   /** Initial value for the editor. Changes to this prop will update the editor content. */
   value: string;
+  /**
+   * Which document `value` belongs to, so that switching documents is an event and not a
+   * string comparison. The tab id in both hosts.
+   *
+   * Without it the editor cannot see a switch to a tab whose text happens to equal the
+   * string it was already holding, and a new tab therefore opens showing the previous
+   * tab's text (#808): the parent mirrors typing one render behind, so at the moment a
+   * new empty tab arrives `value` can still be the empty string it started as, and a
+   * prop that never changed cannot announce anything.
+   *
+   * Optional: a host that renders a single document never switches, and omitting it
+   * leaves the text-only reconciliation below in charge.
+   */
+  documentId?: string;
   /** Optional callback for value changes. Only called on blur, execute, or explicit sync - NOT on every keystroke. */
   onChange?: (val: string) => void;
   /** Called when content changes in real-time. Use sparingly as it triggers on every keystroke. */
   onContentChange?: (val: string) => void;
   onExplain?: () => void;
-  language?: "sql" | "json" | "libredb" | "redis";
+  language?:
+    | "sql"
+    | "json"
+    | "libredb"
+    | "redis"
+    | "promql"
+    | "etcd"
+    | "graph-cypher"
+    | "milvus"
+    | "qdrant"
+    | "influxql"
+    | "oxia"
+    | "s3"
+    | "kubectl"
+    | "firestore"
+    | "mtconnect";
   /**
    * The connected engine, whose grammar decides where a statement ends.
    *
@@ -59,11 +112,32 @@ interface QueryEditorProps {
   databaseType?: DatabaseType;
   schemaContext?: string;
   capabilities?: import("@/lib/db/types").ProviderCapabilities;
+  /**
+   * The container the session resolves a bare name in, as the object inventory reported it.
+   * A table outside it completes to its qualified address (#1397); absent, every table keeps
+   * the bare name it always had, because a default nobody reported cannot be assumed.
+   */
+  defaultContainer?: readonly string[];
+}
+
+/**
+ * What the Format button's tooltip names, for each language that has a formatter: JSON for MongoDB and Kafka, a
+ * request of its dialect for a tab whose editor record carries a console language (vector-family spec 3.5; the dialect id
+ * is the engine's name in lower case, so `qdrant` reads "Qdrant request"), and SQL for the rest, the only other
+ * formatter. Read from the records, so no engine is named here.
+ */
+function formatTitleNoun(language: QueryEditorProps["language"]): string {
+  if (language === "json") return "JSON";
+  const consoleSpec = Object.values(DIALECT_EDITORS).find((editor) => editor.monacoId === language)?.console?.spec;
+  if (consoleSpec === undefined) return "SQL";
+  return `${consoleSpec.id.charAt(0).toUpperCase()}${consoleSpec.id.slice(1)} request`;
 }
 
 interface ParsedTable {
   name: string;
-  rowCount?: number;
+  /** The object's address; Cypher completion reads a label or relationship type from its last segment. */
+  path?: string[];
+  rowCount?: number | null;
   columns?: Array<{
     name: string;
     type: string;
@@ -109,16 +183,28 @@ const getEditorOptions = (showLineNumbers: boolean) => ({
 
 export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
   (
-    { value, onChange, onContentChange, onExplain, language = "sql", databaseType, schemaContext, capabilities },
+    {
+      value,
+      documentId,
+      onChange,
+      onContentChange,
+      onExplain,
+      language = "sql",
+      databaseType,
+      schemaContext,
+      capabilities,
+      defaultContainer,
+    },
     ref,
   ) => {
     const monaco = useMonacoInstance();
     const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
     const [hasSelection, setHasSelection] = useState(false);
 
-    // Both themes are defined in `beforeMount`; this only picks which is applied.
+    // Both themes are defined in `beforeMount`, from `@/lib/editor/monaco-theme`; this only picks
+    // which is applied.
     // Monaco re-reads the `theme` prop on change, so the switch needs no remount.
-    const editorTheme = useEffectiveTheme() === "light" ? "db-light" : "db-dark";
+    const editorTheme = useEffectiveTheme() === "light" ? STUDIO_THEME_LIGHT : STUDIO_THEME_DARK;
 
     // Explain capability gate, shared by the toolbar button and the context-menu action.
     const canExplain = Boolean(onExplain) && Boolean(capabilities?.supportsExplain);
@@ -135,28 +221,86 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
       canExplainKeyRef.current?.set(canExplain);
     }, [canExplain, onExplain]);
 
+    // Format gate for the "Format SQL" context-menu action (#1085). Its label is fixed at
+    // registration, so it is offered on an SQL tab only: a JSON tab formats through its toolbar
+    // button and the shortcut, and a PromQL, Redis or LibreDB tab has no formatter. It also asks
+    // the dialect registry, as the toolbar does, so the entry is never offered where SQL's record
+    // gives no formatter. Read at invocation time for the reason the explain gate above gives.
+    const canFormatSql =
+      language === "sql" && capabilities?.supportsSqlFormat !== false && formatterForLanguage(language) !== undefined;
+    const canFormatSqlRef = useRef(canFormatSql);
+    const canFormatSqlKeyRef = useRef<Monaco.editor.IContextKey<boolean> | null>(null);
+
+    useEffect(() => {
+      canFormatSqlRef.current = canFormatSql;
+      // Null until the editor mounts; onMount seeds the key from the ref instead.
+      canFormatSqlKeyRef.current?.set(canFormatSql);
+    }, [canFormatSql]);
+
     // Line numbers toggle. The store keeps the default SSR-stable and applies the stored
     // value at hydration, so there is no local default left that could overwrite it.
     const showLineNumbers = useLineNumbersPreference();
 
-    // Track last synced value to detect external changes
-    const lastSyncedValueRef = useRef<string>(value);
-    const isInternalChangeRef = useRef<boolean>(false);
+    /*
+      Every text this editor has handed up through `onContentChange` and has not yet seen
+      come back down as `value`, oldest first, plus the document they belong to.
 
-    // Sync editor content when value prop changes externally (e.g., tab switch)
+      The parent mirrors the buffer: it writes each change into the tab's query and feeds
+      that straight back in as `value`, one render behind. An incoming `value` is
+      therefore one of two completely different things, and only one of them may touch
+      the model:
+
+        - OUR OWN text, arriving late. Writing it back rewrites the buffer with an older
+          string and moves the caret, which is the "typing scrambles, cursor jumps to
+          line 1" bug (#808).
+        - Somebody ELSE's text: another tab, a query loaded from history or the saved
+          list, a generated statement. That has to land.
+
+      An outstanding text is ours by construction, so this tells them apart by identity.
+      Asking instead whether the buffer has moved since the last sync can only infer it,
+      and an external write that arrives while the user is typing looks exactly like a
+      late echo under that reading.
+
+      Two equal strings need no tie-break: if an external write happens to carry text this
+      editor just sent up, applying it or skipping it leaves the same buffer.
+    */
+    const echoesRef = useRef<{ documentId?: string; values: string[] }>({ documentId, values: [] });
+
+    // The ONE path that pushes an external value change into the model, now that
+    // <Editor> is uncontrolled (defaultValue) and the library's own controlled-value
+    // effect stays at its early return.
     useEffect(() => {
-      if (editorRef.current && value !== lastSyncedValueRef.current) {
-        const currentEditorValue = editorRef.current.getValue();
-        // Only update if the new value is different from current editor content
-        // This prevents unnecessary updates when we're the source of the change
-        if (value !== currentEditorValue) {
-          isInternalChangeRef.current = true;
-          editorRef.current.setValue(value);
-          lastSyncedValueRef.current = value;
-          isInternalChangeRef.current = false;
-        }
+      const editor = editorRef.current;
+      if (!editor) return;
+
+      const echoes = echoesRef.current;
+
+      // A different document is in front of the user now: its text is authoritative
+      // whatever the buffer holds, and nothing the editor sent up belongs to it.
+      if (documentId !== echoes.documentId) {
+        echoesRef.current = { documentId, values: [] };
+        if (value !== editor.getValue()) editor.setValue(value);
+        return;
       }
-    }, [value]);
+
+      const echoIndex = echoes.values.indexOf(value);
+      if (echoIndex !== -1) {
+        // Ours, arriving late. Drop it and everything older with it: the parent moves
+        // through our texts in order, so a render carrying one of those cannot follow.
+        echoes.values.splice(0, echoIndex + 1);
+        return;
+      }
+
+      // Nobody here wrote this, so it came from outside: a query loaded from history or
+      // the saved list, a generated statement. It replaces the buffer, which makes every
+      // outstanding echo a description of text that no longer exists.
+      //
+      // Equal text is still a no-op: re-applying an incoming `value` the buffer already
+      // holds would replace the model's content, dropping the undo stack and moving the
+      // caret for nothing. The document-change arm above makes the same distinction.
+      echoes.values = [];
+      if (value !== editor.getValue()) editor.setValue(value);
+    }, [value, documentId]);
 
     // Update editor options when line numbers toggle changes
     useEffect(() => {
@@ -184,13 +328,30 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
       const columnMap = new Map<string, SchemaColumnItem[]>();
       const allColumns = new Map<string, SchemaColumnItem>();
 
+      const defaultKey = defaultContainer === undefined ? undefined : JSON.stringify(defaultContainer);
       parsedSchema.forEach((table) => {
         const tableLower = table.name.toLowerCase();
+        const path = table.path;
+        const container = path && path.length > 0 ? path.slice(0, -1) : undefined;
         tableItems.push({
           label: table.name,
           labelLower: tableLower,
-          rowCount: table.rowCount || 0,
+          // Absent stays absent: the detail line says "(0 rows)" only for a measured zero (#1397).
+          // `== null` so a null count from the JSON is as absent as a missing one.
+          ...(table.rowCount == null ? {} : { rowCount: table.rowCount }),
           columnNames: table.columns?.map((c) => c.name).join(", ") || "",
+          ...(container === undefined
+            ? {}
+            : {
+                container,
+                segment: path![path!.length - 1],
+                qualify:
+                  container.length > 0 &&
+                  (defaultKey === undefined
+                    ? capabilities?.tablesNeedContainer === true
+                    : JSON.stringify(container) !== defaultKey),
+                ...(capabilities?.tablesNeedContainer ? { labelQualified: true } : {}),
+              }),
         });
 
         const tableColumns: SchemaColumnItem[] = [];
@@ -209,39 +370,44 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
             allColumns.set(col.name, colItem);
           }
         });
-        columnMap.set(tableLower, tableColumns);
+        // A bare name belongs to the default container's table; otherwise the first one listed.
+        const inDefault = defaultKey !== undefined && JSON.stringify(container) === defaultKey;
+        if (inDefault || !columnMap.has(tableLower)) columnMap.set(tableLower, tableColumns);
+        // Also by full path, so `dataset.table` finds this table when other datasets reuse its name.
+        if (path && path.length > 1) columnMap.set(path.join(".").toLowerCase(), tableColumns);
       });
 
-      return { tableItems, columnMap, allColumns };
-    }, [parsedSchema]);
+      return {
+        tableItems,
+        columnMap,
+        allColumns,
+        ...(capabilities === undefined
+          ? {}
+          : {
+              quoteSegment: (segment: string) => quoteIdentifier(segment, capabilities),
+              // Only an engine that spells a container segment itself has one; every other engine
+              // keeps writing a qualified name segment by segment.
+              containerSpelling: containerSpellingOf(capabilities),
+            }),
+      };
+    }, [parsedSchema, defaultContainer, capabilities]);
+
+    // The formatter of the tab's language, from its `DIALECT_EDITORS` record: SQL's, the JSON one MongoDB and
+    // Kafka share, or none, in which case the toolbar draws no Format button and the shortcut does nothing.
+    // A provider that declares `supportsSqlFormat: false` gets none either, so its tabs show no Format button and the
+    // shortcut does nothing.
+    const formatter = capabilities?.supportsSqlFormat === false ? undefined : formatterForLanguage(language);
 
     const handleFormat = () => {
       if (!editorRef.current) return;
       const currentValue = editorRef.current.getValue();
       if (!currentValue) return;
+      if (formatter === undefined) return;
 
       try {
-        let formatted: string;
-        if (language === "json") {
-          // JSON formatting for MongoDB queries
-          const parsed = JSON.parse(currentValue);
-          formatted = JSON.stringify(parsed, null, 2);
-        } else if (language === "sql") {
-          formatted = format(currentValue, {
-            language: "postgresql",
-            keywordCase: "upper",
-            dataTypeCase: "upper",
-            indentStyle: "tabularLeft",
-            logicalOperatorNewline: "before",
-            expressionWidth: 100,
-            tabWidth: 2,
-            linesBetweenQueries: 2,
-          });
-        } else {
-          return;
-        }
+        // The connection's grammar names the SQL formatter's language (Snowflake's keeps QUALIFY a clause, SF-041).
+        const formatted = formatter(currentValue, resolveSqlGrammar(databaseType));
         editorRef.current.setValue(formatted);
-        lastSyncedValueRef.current = formatted;
         onChange?.(formatted);
       } catch (e) {
         logger.warn("Statement formatting failed; the editor text is left as written", {
@@ -266,45 +432,29 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
       const model = editorRef.current.getModel();
       if (!model) return { query: editorValue, range: null };
 
-      // 1. Check for explicit selection
+      // The rule is `runTarget`'s, in `src/lib/sql/run-target.ts`, which the VS Code channel's `query/target` shares.
+      const rule = {
+        editorLanguage: language,
+        statementTerminator: capabilities?.statementTerminator,
+        grammar: resolveSqlGrammar(databaseType),
+      };
+
+      // 1. A non-blank selection.
       const selection = editorRef.current.getSelection();
       if (selection) {
-        const selectedText = model.getValueInRange(selection);
-        if (selectedText && selectedText.trim().length > 0) {
-          return { query: selectedText, range: selection };
-        }
+        const query = selectionTarget(model.getValueInRange(selection), rule);
+        if (query !== null) return { query, range: selection };
       }
 
-      // 2. No selection: run the statement the cursor is in.
-      //
-      // Read through the shared splitter, under the connection's dialect. This used to be
-      // `lastIndexOf(";")` over the raw text - no spans, no dialect, not even a
-      // string-literal check - which made it the THIRD reader of "where does a statement
-      // end" and the only one whose answer is what gets SENT. Measured in Chrome on
-      // 2026-08-25 against postgres 18: a buffer PostgreSQL reads as one statement was
-      // cut at a `;` inside a nested comment, so what reached the engine was a line
-      // comment plus the SELECT, and the grid read 0 rows where psql answers 2. A `;`
-      // inside a literal (`SELECT 'a;b'`) cut the same way.
-      if (language === "sql") {
-        const position = editorRef.current.getPosition();
-        if (position) {
-          const fullText = model.getValue();
-          const cursorOffset = model.getOffsetAt(position);
-          const statements = splitStatements(fullText, resolveSqlGrammar(databaseType));
-          // The statement the cursor is inside or immediately after, which is what "run
-          // this one" means with the caret resting at a statement's end. Whitespace
-          // between two statements belongs to neither, so the last one that starts at or
-          // before the cursor wins - and with the caret before the first statement, that
-          // first one does.
-          const current =
-            [...statements].reverse().find((statement) => statement.start <= cursorOffset) ?? statements[0];
-
-          if (current) {
-            const startPos = model.getPositionAt(current.start);
-            const endPos = model.getPositionAt(current.end);
-            const range = new monaco.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column);
-            return { query: current.sql, range };
-          }
+      // 2. No selection: the statement the cursor is in, under the `sql` editor language.
+      const position = editorRef.current.getPosition();
+      if (position) {
+        const current = cursorTarget(model.getValue(), model.getOffsetAt(position), rule);
+        if (current) {
+          const startPos = model.getPositionAt(current.start);
+          const endPos = model.getPositionAt(current.end);
+          const range = new monaco.Range(startPos.lineNumber, startPos.column, endPos.lineNumber, endPos.column);
+          return { query: current.sql, range };
         }
       }
 
@@ -370,7 +520,6 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
       setValue: (newValue: string) => {
         if (editorRef.current) {
           editorRef.current.setValue(newValue);
-          lastSyncedValueRef.current = newValue;
         }
       },
       focus: () => editorRef.current?.focus(),
@@ -392,7 +541,6 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
     const handleClear = () => {
       if (editorRef.current) {
         editorRef.current.setValue("");
-        lastSyncedValueRef.current = "";
         onChange?.("");
       }
     };
@@ -411,10 +559,22 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
     }, []);
 
     const handleBeforeMount = (monacoInstance: typeof Monaco) => {
-      // Register the LibreDB and Redis command languages (both idempotent) so
-      // their tabs highlight correctly instead of being treated as JSON (#427).
+      // Register the LibreDB, Redis, etcd, Oxia, S3, kubectl and Firestore command languages, PromQL, Cypher and
+      // InfluxQL (each idempotent) so their tabs highlight correctly instead of being treated as JSON or SQL
+      // (#427, #1085, #1089, #424, Neo4j spec 6.5, InfluxDB spec 6.7).
       registerLibreDBLanguage(monacoInstance);
       registerRedisLanguage(monacoInstance);
+      registerPromqlLanguage(monacoInstance);
+      registerEtcdLanguage(monacoInstance);
+      registerOxiaLanguage(monacoInstance);
+      registerS3Language(monacoInstance);
+      registerKubectlLanguage(monacoInstance);
+      registerFirestoreLanguage(monacoInstance);
+      registerCypherLanguage(monacoInstance);
+      registerInfluxqlLanguage(monacoInstance);
+      // Every console dialect's language, from its editor record (vector-family spec 3.5): the records are the
+      // only input, so nothing here names a dialect.
+      registerDialectConsoles(monacoInstance);
 
       // Suppress Monaco's "Canceled" errors in console (with cleanup tracking)
       if (!originalConsoleErrorRef.current) {
@@ -429,95 +589,96 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
         };
       }
 
-      monacoInstance.editor.defineTheme("db-dark", {
-        base: "vs-dark",
-        inherit: true,
-        rules: [
-          { token: "keyword", foreground: "569cd6", fontStyle: "bold" },
-          { token: "function", foreground: "dcdcaa" },
-          { token: "string", foreground: "ce9178" },
-          { token: "number", foreground: "b5cea8" },
-          { token: "comment", foreground: "6a9955" },
-          { token: "operator", foreground: "d4d4d4" },
-          { token: "identifier", foreground: "9cdcfe" },
-        ],
-        colors: {
-          "editor.background": "#050505",
-          "editor.foreground": "#d4d4d4",
-          "editorCursor.foreground": "#569cd6",
-          "editor.lineHighlightBackground": "#111111",
-          "editorLineNumber.foreground": "#333333",
-          "editorLineNumber.activeForeground": "#666666",
-          "editor.selectionBackground": "#264f78",
-          "editor.inactiveSelectionBackground": "#3a3d41",
-          "editorIndentGuide.background": "#1a1a1a",
-          "editorIndentGuide.activeBackground": "#333333",
-        },
-      });
-
-      /*
-       * Monaco paints its own canvas and knows nothing about the CSS token layer,
-       * so the editor is the one surface that needs the palette written twice.
-       * Same syntax hues either side — they are chosen for contrast against the
-       * CODE, not against the chrome — with only the ground and the guides moved.
-       * `editor.background` mirrors `--studio-canvas` in both themes so the pane
-       * sits flush with the shell it lives in.
-       */
-      monacoInstance.editor.defineTheme("db-light", {
-        base: "vs",
-        inherit: true,
-        rules: [
-          { token: "keyword", foreground: "0000ff", fontStyle: "bold" },
-          { token: "function", foreground: "795e26" },
-          { token: "string", foreground: "a31515" },
-          { token: "number", foreground: "098658" },
-          { token: "comment", foreground: "008000" },
-          { token: "operator", foreground: "3f3f46" },
-          { token: "identifier", foreground: "001080" },
-        ],
-        colors: {
-          "editor.background": "#f4f4f5",
-          "editor.foreground": "#27272a",
-          "editorCursor.foreground": "#0000ff",
-          "editor.lineHighlightBackground": "#e4e4e7",
-          "editorLineNumber.foreground": "#a1a1aa",
-          "editorLineNumber.activeForeground": "#52525b",
-          "editor.selectionBackground": "#add6ff",
-          "editor.inactiveSelectionBackground": "#e5ebf1",
-          "editorIndentGuide.background": "#e4e4e7",
-          "editorIndentGuide.activeBackground": "#a1a1aa",
-        },
-      });
+      // Both themes come from one owner so this mount and the read-only source viewer
+      // paint identically (#789).
+      defineStudioThemes(monacoInstance);
     };
 
     // SQL completion provider
     useEffect(() => {
       if (monaco && language === "sql") {
-        const disposable = registerSQLCompletionProvider(monaco, schemaCompletionCache);
+        const disposable = registerSQLCompletionProvider(monaco, schemaCompletionCache, databaseType);
         return () => disposable.dispose();
       }
-    }, [monaco, language, schemaCompletionCache]);
+    }, [monaco, language, schemaCompletionCache, databaseType]);
 
-    // MongoDB JSON completion provider
+    // MongoDB JSON completion provider, for MongoDB's JSON only (#1088). A json editor also holds
+    // JSON of a dialect of its own, a Kafka read request, and there the provider's snippets are
+    // MongoDB documents that dialect refuses, while its field items offer a topic's result columns
+    // as if they were keys of the request. So it registers only where the declared capabilities name
+    // no dialect, the rule `offersColumnProfiling` reads, and still where none are passed, as the
+    // published component's callers always had it.
+    const completesMongoDB = capabilities?.queryDialect === undefined;
     useEffect(() => {
-      if (monaco && language === "json") {
+      if (monaco && language === "json" && completesMongoDB) {
         const disposable = registerMongoDBCompletionProvider(monaco, schemaCompletionCache);
         return () => disposable.dispose();
       }
-    }, [monaco, language, schemaCompletionCache]);
+    }, [monaco, language, schemaCompletionCache, completesMongoDB]);
 
+    // Cypher completion provider (Neo4j spec 6.5, SR6). Its names are read from the schema objects'
+    // kind-qualified paths, never from the SQL cache's lowercased table names, and its CALL and SHOW
+    // allowlists from the connected engine's policy profile, looked up by type as the SQL provider
+    // gets its dialect.
+    const graphPolicy = graphPolicyProfileOf(databaseType);
+    useEffect(() => {
+      if (monaco && language === CYPHER_LANGUAGE_ID) {
+        const disposable = registerCypherCompletionProvider(
+          monaco,
+          cypherCompletionSchemaOf(parsedSchema),
+          graphPolicy,
+        );
+        return () => disposable.dispose();
+      }
+    }, [monaco, language, parsedSchema, graphPolicy]);
+
+    // InfluxQL completion provider (InfluxDB spec 6.7). Its sources and keys are read from the schema
+    // objects' `[database, measurement]` paths and typed columns, and every insert is quoted by the
+    // provider's own quoter, so an inserted name passes the read policy.
+    useEffect(() => {
+      if (monaco && language === INFLUXQL_LANGUAGE_ID) {
+        const disposable = registerInfluxqlCompletionProvider(monaco, influxqlCompletionSchemaOf(parsedSchema));
+        return () => disposable.dispose();
+      }
+    }, [monaco, language, parsedSchema]);
+
+    // S3 completion provider. It reads bucket names from the schema context only, never by a request, and an S3
+    // connection's schema holds no bucket, because S3 declares no relation kind, so it offers commands, flags and
+    // closed values only. Every insert is quoted by the shared shell quoter.
+    useEffect(() => {
+      if (monaco && language === S3_LANGUAGE_ID) {
+        const disposable = registerS3CompletionProvider(monaco, s3CompletionBucketsOf(parsedSchema));
+        return () => disposable.dispose();
+      }
+    }, [monaco, language, parsedSchema]);
+
+    // Firestore completion provider (Firestore spec 5.4): the chain's method names by state, the operator strings, and
+    // the collection ids the tree has already listed, read from the schema context on each request, so it sends no request.
+    useEffect(() => {
+      if (monaco && language === FIRESTORE_LANGUAGE_ID) {
+        const disposable = registerFirestoreCompletionProvider(monaco, () =>
+          firestoreCompletionCollectionsOf(parsedSchema),
+        );
+        return () => disposable.dispose();
+      }
+    }, [monaco, language, parsedSchema]);
+
+    // Every model change reaches here: a keystroke, and equally the writes Format, Clear
+    // and the imperative setValue make, since Monaco reports those through the same
+    // change event. All of them are this editor's own text, so all of them are recorded
+    // before they go up, and none of them may come back down into the buffer.
     const handleEditorChange = (val: string | undefined) => {
       const newValue = val || "";
-      // Only call onContentChange if provided (for real-time sync scenarios)
-      // This avoids the performance hit of updating parent state on every keystroke
-      onContentChange?.(newValue);
+      if (onContentChange) {
+        echoesRef.current.values.push(newValue);
+        onContentChange(newValue);
+      }
     };
 
     // Sync to parent on blur (when user leaves the editor)
     const handleEditorBlur = () => {
       if (editorRef.current) {
         const currentValue = editorRef.current.getValue();
-        lastSyncedValueRef.current = currentValue;
         onChange?.(currentValue);
       }
     };
@@ -526,7 +687,6 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
       // Sync current content to parent before executing
       if (editorRef.current) {
         const currentValue = editorRef.current.getValue();
-        lastSyncedValueRef.current = currentValue;
         onChange?.(currentValue);
       }
 
@@ -536,30 +696,55 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
       window.dispatchEvent(event);
     };
 
+    /*
+      The handlers onMount hands to Monaco, read when a shortcut or a menu entry is INVOKED
+      (#1085). `@monaco-editor/react` keeps `onMount` in `useRef(onMount)` and calls that first
+      copy once, so a closure registered there ran with the mounting render's `language`,
+      `databaseType`, `monaco` and `onChange` for as long as the editor lived, which is what #200
+      found for Explain. Both shells mount the editor on an SQL tab and retype it in an effect
+      once the connection's capabilities are known, so for a PromQL tab the mounting render was
+      the wrong one on every page load: in both, Shift+Alt+F and "Format SQL" ran the SQL
+      formatter over PromQL (`up == 0` became `up = = 0`, and setValue clears Monaco's undo
+      history). The Cmd+Enter half is the standalone shell's alone, because only
+      `use-query-execution.ts` listens for the `execute-query` event handleExecute dispatches and
+      the embedded `StudioWorkspace` registers no listener (docs/BACKLOG.md U47). There, after a
+      remount under PostgreSQL, Cmd+Enter cut an expression at a `;` inside its `#` comment, and
+      on an SQL tab the same closure held the `monaco === null` of a fresh load, so Cmd+Enter
+      sent the whole buffer rather than the statement at the caret.
+
+      Refreshed after every commit and not during render, like the latest-value refs in
+      `use-query-execution.ts`: every reader is a callback that runs after a commit, and the
+      `useRef` initializer already holds the first render's handlers.
+    */
+    const latestHandlersRef = useRef({ execute: handleExecute, format: handleFormat, blur: handleEditorBlur });
+    useEffect(() => {
+      latestHandlersRef.current = { execute: handleExecute, format: handleFormat, blur: handleEditorBlur };
+    });
+
     return (
       <div className="h-full w-full flex flex-col bg-canvas relative overflow-hidden group">
         {/* Dynamic Pro Toolbar - Hidden on mobile */}
         <div className="hidden md:flex items-center gap-1 px-4 py-1.5 bg-surface border-b border-hairline overflow-x-auto no-scrollbar scroll-smooth">
           {hasSelection && (
             <Button
-              variant="ghost"
+              variant="default"
               size="sm"
               // `text-white` is the label ON a blue button, not the top of the
               // text ramp: it must stay white in the light theme too.
-              className="h-7 text-xs font-medium text-white bg-blue-600 hover:bg-blue-500 hover:text-white gap-2 shadow-[0_0_10px_rgba(37,99,235,0.3)] animate-in fade-in zoom-in duration-200"
+              className="h-7 text-xs font-medium text-white bg-brand-solid hover:bg-brand-solid-hover hover:text-white gap-2 shadow-[0_0_10px_rgba(37,99,235,0.3)] animate-in fade-in zoom-in duration-200"
               onClick={handleExecute}
             >
-              <Play strokeWidth={1.5} className="w-3 h-3 fill-current" /> Run Sel
+              <Play strokeWidth={1.5} className="w-3 h-3 fill-current" /> Run Selected
             </Button>
           )}
 
-          {(language === "sql" || language === "json") && (
+          {formatter !== undefined && (
             <Button
               variant="ghost"
               size="sm"
               className="h-7 text-xs font-medium text-fg-muted hover:text-fg-bright gap-2"
               onClick={handleFormat}
-              title={language === "json" ? "Format JSON (Shift+Alt+F)" : "Format SQL (Shift+Alt+F)"}
+              title={`Format ${formatTitleNoun(language)} (${shortcutLabel(SHORTCUTS.formatQuery)})`}
             >
               <TextAlignStart strokeWidth={1.5} className="w-3 h-3" /> Format
             </Button>
@@ -577,7 +762,7 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 text-xs font-medium text-fg-muted hover:text-red-400 gap-2"
+            className="h-7 text-xs font-medium text-fg-muted hover:text-danger gap-2"
             onClick={handleClear}
           >
             <Trash2 strokeWidth={1.5} className="w-3 h-3" /> Clear
@@ -605,14 +790,17 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-7 text-xs font-medium text-amber-500 hover:text-amber-400 gap-2"
+                // The base absorbed this button's old hover value when the -500 text
+                // drift collapsed amber-500 onto the token, so the hover has to step
+                // up to keep any feedback of its own (#402).
+                className="h-7 text-xs font-medium text-warning hover:text-warning-bright gap-2"
                 onClick={onExplain}
               >
                 <Zap strokeWidth={1.5} className="w-3 h-3" /> Explain
               </Button>
             )}
             <kbd className="px-1.5 py-0.5 rounded bg-raised border border-hairline text-[0.5625rem] text-fg-subtle font-mono">
-              ⌘+Enter
+              {shortcutLabel(SHORTCUTS.executeQuery)}
             </kbd>
           </div>
         </div>
@@ -623,7 +811,17 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
             height="100%"
             language={language}
             theme={editorTheme}
-            value={value}
+            // `defaultValue`, not `value`: this editor owns its buffer, and the model is
+            // never driven by a prop. `@monaco-editor/react`'s controlled-`value` effect
+            // runs an `executeEdits` over the FULL model range whenever the prop differs
+            // from the buffer, and the prop is the parent's mirror of our own text, one
+            // render behind. A keystroke landing inside that window therefore made the
+            // library rewrite the whole buffer with older text and snap the caret to
+            // (1,1): the "typing scrambles / cursor jumps" bug (#808), easiest to hit
+            // where a render is slow. Passing `defaultValue` leaves that effect at its
+            // `t === void 0` early return, which makes the effect above the single place
+            // an outside change can reach the model.
+            defaultValue={value}
             beforeMount={handleBeforeMount}
             onChange={handleEditorChange}
             loading={
@@ -636,7 +834,7 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
 
               // Sync to parent when editor loses focus
               editor.onDidBlurEditorText(() => {
-                handleEditorBlur();
+                latestHandlersRef.current.blur();
               });
 
               editor.onDidChangeCursorSelection(() => {
@@ -645,23 +843,24 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
               });
 
               // Add custom keyboard shortcut
-              editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
-                handleExecute();
+              editor.addCommand(monacoKeybinding(SHORTCUTS.executeQuery, monaco), () => {
+                latestHandlersRef.current.execute();
               });
 
-              // Add format shortcut
-              editor.addCommand(monaco.KeyMod.Alt | monaco.KeyMod.Shift | monaco.KeyCode.KeyF, () => {
-                handleFormat();
+              // Add format shortcut. Not gated by the format key: a JSON tab formats through it,
+              // and on a tab with no formatter the current handleFormat returns.
+              editor.addCommand(monacoKeybinding(SHORTCUTS.formatQuery, monaco), () => {
+                latestHandlersRef.current.format();
               });
 
               // Context Menu Actions
               editor.addAction({
                 id: "run-query",
                 label: "Run Query",
-                keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter],
+                keybindings: [monacoKeybinding(SHORTCUTS.executeQuery, monaco)],
                 contextMenuGroupId: "navigation",
                 contextMenuOrder: 1,
-                run: () => handleExecute(),
+                run: () => latestHandlersRef.current.execute(),
               });
 
               canExplainKeyRef.current = editor.createContextKey<boolean>(
@@ -677,13 +876,18 @@ export const QueryEditor = forwardRef<QueryEditorRef, QueryEditorProps>(
                 run: () => explainHandlerRef.current?.(),
               });
 
+              canFormatSqlKeyRef.current = editor.createContextKey<boolean>(
+                CAN_FORMAT_SQL_CONTEXT_KEY,
+                canFormatSqlRef.current,
+              );
               editor.addAction({
                 id: "format-sql",
                 label: "Format SQL",
-                keybindings: [monaco.KeyMod.Alt | monaco.KeyMod.Shift | monaco.KeyCode.KeyF],
+                precondition: CAN_FORMAT_SQL_CONTEXT_KEY,
+                keybindings: [monacoKeybinding(SHORTCUTS.formatQuery, monaco)],
                 contextMenuGroupId: "modification",
                 contextMenuOrder: 1,
-                run: () => handleFormat(),
+                run: () => latestHandlersRef.current.format(),
               });
             }}
             options={getEditorOptions(showLineNumbers)}

@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
-import { getOrCreateProvider } from "@/lib/db";
+import { createDatabaseProvider, getOrCreateProvider } from "@/lib/db";
 import type { DatabaseConnection } from "@/lib/types";
 import { createErrorResponse } from "@/lib/api/errors";
 import { resolveConnection } from "@/lib/seed/resolve-connection";
-import { auditRoleDenial, guardRoute } from "@/lib/api/require-session";
+import { buildConnectionPayload } from "@/hooks/use-connection-payload";
+import { auditRoleDenial, guardRoute, adminRequiredResponse } from "@/lib/api/require-session";
+import { editorExecutionContext } from "@/lib/api/execution-context";
 import { logger } from "@/lib/logger";
 
 /**
@@ -20,10 +22,21 @@ export interface FleetHealthItem {
   connectionName: string;
   type: string;
   environment?: string;
-  status: "healthy" | "degraded" | "error";
+  /**
+   * `not-checked` is a connection whose provider declares `resumesBilledCompute`: a check would
+   * resume compute the engine bills for, so the route sends it nothing and `latencyMs` is 0.
+   */
+  status: "healthy" | "degraded" | "error" | "not-checked";
   latencyMs: number;
   activeConnections?: number;
   databaseSize?: string;
+  /**
+   * The provider's own byte figure from `getOverview()`, or absent when the provider publishes
+   * none (same absence-vs-zero contract as `DatabaseOverview.databaseSizeBytes`). The dashboard
+   * sums this directly instead of re-parsing `databaseSize`'s display string, which had no branch
+   * for "1 TB" or larger and silently counted such a database as 1 byte.
+   */
+  databaseSizeBytes?: number;
   error?: string;
 }
 
@@ -38,7 +51,7 @@ export async function POST(request: Request) {
 
   if (guard.session.role !== "admin") {
     auditRoleDenial({ route: "POST /api/admin/fleet-health", user: guard.session.username, request });
-    return NextResponse.json({ error: "Unauthorized. Admin access required." }, { status: 403 });
+    return adminRequiredResponse();
   }
 
   try {
@@ -61,14 +74,48 @@ export async function POST(request: Request) {
       connections.map(async (conn): Promise<FleetHealthItem> => {
         const start = Date.now();
         try {
-          // Resolve managed seed connections (server-side credential injection)
-          const resolved =
-            conn.managed && conn.seedId
-              ? await resolveConnection({ connectionId: `seed:${conn.seedId}` }, guard.session)
-              : conn;
-          const provider = await getOrCreateProvider(resolved);
+          /*
+           * Every item goes through `resolveConnection`, the caller's own connections included: a
+           * managed seed by its id, which injects the operator's credentials on the server, and
+           * anything else as the inline record it is, which `resolveConnection` refuses while
+           * ALLOW_CUSTOM_CONNECTIONS is off and resolves from the seed file when its id claims the
+           * `seed:` namespace. This line used to hand an inline record straight to the factory, the
+           * one path in the product that opened a caller's connection without passing that gate. A
+           * refused item is reported as that item's error, beside the health of the rest.
+           */
+          const resolved = await resolveConnection(buildConnectionPayload(conn), guard.session);
+          const execution = editorExecutionContext(guard.session, resolved);
+          /*
+           * The capability is read off an unconnected provider, the provider-meta pattern: a
+           * connection that resumes billed compute (a suspended Databend Cloud warehouse wakes on
+           * any statement) is answered without a cached provider or a statement, since a check on
+           * every dashboard refresh would keep it awake and billed. The factory logs its
+           * "[DB] Creating <type> provider" line for this build, once per row on every refresh,
+           * as provider-meta does; the declaration is read each time because an edit of the
+           * connection can change it.
+           */
+          const unconnected = await createDatabaseProvider(resolved, {}, execution);
+          if (unconnected.getCapabilities().resumesBilledCompute) {
+            return {
+              connectionId: conn.id,
+              connectionName: conn.name,
+              type: conn.type,
+              environment: conn.environment,
+              status: "not-checked",
+              latencyMs: 0,
+            };
+          }
+          const provider = await getOrCreateProvider(resolved, {}, execution);
           const health = await provider.getHealth();
           const latencyMs = Date.now() - start;
+
+          // Best-effort and outside the latency measurement above: getOverview() is a second
+          // round-trip this route did not previously make, and a provider that cannot answer it
+          // (or has none of this data) must not turn a working connection into an error result.
+          const databaseSizeBytes = await provider
+            .getOverview()
+            .then((overview) => overview.databaseSizeBytes)
+            .catch(() => undefined);
 
           return {
             connectionId: conn.id,
@@ -79,6 +126,7 @@ export async function POST(request: Request) {
             latencyMs,
             activeConnections: health.activeConnections,
             databaseSize: health.databaseSize,
+            databaseSizeBytes,
           };
         } catch (err) {
           return {

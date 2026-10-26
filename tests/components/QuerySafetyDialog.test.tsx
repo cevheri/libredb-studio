@@ -4,8 +4,18 @@ import "../helpers/mock-navigation";
 
 import React from "react";
 import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { QuerySafetyDialog, isDangerousQuery } from "@/components/QuerySafetyDialog";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QuerySafetyDialog, isDangerousQuery, writesUnderGrammar } from "@/components/QuerySafetyDialog";
+import { KafkaProvider } from "@/lib/db/providers/stream/kafka/index";
+import { PrometheusProvider } from "@/lib/db/providers/timeseries/prometheus/index";
+import { generateSelectQuery, generateTableQuery } from "@/lib/query-generators";
+import { statementRefusal } from "@/lib/db/destructive-commands";
+import { INFLUXQL_POLICY_SENTENCES } from "@/lib/db/providers/timeseries/influxdb/influxql-policy";
+import type { TypedConfirmationAsk } from "@/lib/db/types";
+import { DEFAULT_SQL_GRAMMAR, type SqlGrammar } from "@/lib/sql/grammar";
+import { installStandInVocabulary, STAND_IN_TYPE } from "../helpers/stand-in-vocabulary";
+import { schemaContextOf } from "@/lib/db/detailed-object";
+import { SAMPLED_MARKER, sampledSchema } from "../fixtures/sampled-schema";
 
 function createStreamResponse({
   chunks,
@@ -56,6 +66,136 @@ describe("QuerySafetyDialog", () => {
       <QuerySafetyDialog isOpen={false} query="SELECT 1" schemaContext="" onClose={onClose} onProceed={onProceed} />,
     );
     expect(container.textContent).toBe("");
+  });
+
+  test("when open, getByRole alertdialog finds the dialog, and its accessible description contains the statement", () => {
+    const query = "DELETE FROM employee WHERE 1 = 0";
+    const { getByRole } = render(
+      <QuerySafetyDialog isOpen query={query} schemaContext="" onClose={onClose} onProceed={onProceed} />,
+    );
+    const dialog = getByRole("alertdialog", { name: "Query Safety Check" });
+    expect(dialog).not.toBeNull();
+    expect(document.querySelectorAll('[role="alertdialog"]').length).toBe(1);
+    const describedBy = dialog.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    const descriptionElement = document.getElementById(describedBy!);
+    expect(descriptionElement?.textContent).toContain(query);
+  });
+
+  test("document.activeElement is the Cancel button right after it opens", () => {
+    const { getByRole } = render(
+      <QuerySafetyDialog
+        isOpen
+        query="DELETE FROM employee WHERE 1 = 0"
+        schemaContext=""
+        onClose={onClose}
+        onProceed={onProceed}
+      />,
+    );
+    const dialog = getByRole("alertdialog", { name: "Query Safety Check" });
+    const cancelButton = within(dialog).getByRole("button", { name: "Cancel" });
+    expect(document.activeElement).toBe(cancelButton);
+  });
+
+  test("Escape calls onClose once and never onProceed", () => {
+    const { getByRole } = render(
+      <QuerySafetyDialog
+        isOpen
+        query="DELETE FROM employee WHERE 1 = 0"
+        schemaContext=""
+        onClose={onClose}
+        onProceed={onProceed}
+      />,
+    );
+    getByRole("alertdialog", { name: "Query Safety Check" });
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onProceed).not.toHaveBeenCalled();
+  });
+
+  test("Cancel calls onClose once and never onProceed", () => {
+    const { getByRole } = render(
+      <QuerySafetyDialog
+        isOpen
+        query="DELETE FROM employee WHERE 1 = 0"
+        schemaContext=""
+        onClose={onClose}
+        onProceed={onProceed}
+      />,
+    );
+    const dialog = getByRole("alertdialog", { name: "Query Safety Check" });
+    const cancelButton = within(dialog).getByRole("button", { name: "Cancel" });
+    fireEvent.click(cancelButton);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onProceed).not.toHaveBeenCalled();
+  });
+
+  test("Execute calls onProceed once and never onClose", async () => {
+    const { getByRole } = render(
+      <QuerySafetyDialog
+        isOpen
+        query="DELETE FROM employee WHERE 1 = 0"
+        schemaContext=""
+        onClose={onClose}
+        onProceed={onProceed}
+      />,
+    );
+    const dialog = getByRole("alertdialog", { name: "Query Safety Check" });
+    const executeButton = within(dialog).getByRole("button", { name: "Execute Query" });
+    await waitFor(() => expect(executeButton.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(executeButton);
+    expect(onProceed).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  // Radix hands focus back only to an AlertDialogTrigger, and the editor opens this dialog without
+  // one, so the element that had focus is what the dialog itself must return to.
+  test.each([
+    ["Escape", () => fireEvent.keyDown(document, { key: "Escape" })],
+    ["Cancel", () => fireEvent.click(screen.getByRole("button", { name: "Cancel" }))],
+  ])("after %s, focus is back where it was when the dialog opened", async (_label, dismiss) => {
+    function Editor() {
+      const [open, setOpen] = React.useState(false);
+      return (
+        <>
+          <button onClick={() => setOpen(true)}>RUN</button>
+          <QuerySafetyDialog
+            isOpen={open}
+            query="DELETE FROM employee WHERE 1 = 0"
+            schemaContext=""
+            onClose={() => setOpen(false)}
+            onProceed={onProceed}
+          />
+        </>
+      );
+    }
+    const { getByRole, queryByRole } = render(<Editor />);
+    const run = getByRole("button", { name: "RUN" });
+    run.focus();
+    fireEvent.click(run);
+    expect(document.activeElement?.textContent).toBe("Cancel");
+    dismiss();
+    await waitFor(() => expect(queryByRole("alertdialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(run));
+    expect(onProceed).not.toHaveBeenCalled();
+  });
+
+  test("keeps the primitive's phone gutter", () => {
+    // `max-w-lg` alone would replace the primitive's `max-w-[calc(100%-2rem)]`, and at 390px wide
+    // the dialog would touch both edges of the screen, where main kept 16px on each side.
+    const { getByRole } = render(
+      <QuerySafetyDialog
+        isOpen
+        query="DELETE FROM employee"
+        schemaContext=""
+        onClose={onClose}
+        onProceed={onProceed}
+      />,
+    );
+    const classes = getByRole("alertdialog").className.split(/\s+/);
+    expect(classes).toContain("max-w-[calc(100%-2rem)]");
+    expect(classes).toContain("sm:max-w-lg");
+    expect(classes).not.toContain("max-w-lg");
   });
 
   test("renders parsed high-risk analysis and caution action label", async () => {
@@ -136,6 +276,74 @@ describe("QuerySafetyDialog", () => {
     });
   });
 
+  test.each(["Cancel", "Execute Query"])("unconfigured AI keeps explicit query confirmation: %s", async (action) => {
+    const configError = "Gemini API key is required. Set LLM_API_KEY environment variable.";
+    globalThis.fetch = mock(async () =>
+      createStreamResponse({
+        chunks: [],
+        ok: false,
+        status: 503,
+        jsonBody: { error: configError, code: "LLM_UNCONFIGURED", statusCode: 503 },
+      }),
+    ) as unknown as typeof fetch;
+    const view = render(
+      <QuerySafetyDialog
+        isOpen
+        query="DROP TABLE users"
+        schemaContext=""
+        databaseType="postgres"
+        onClose={onClose}
+        onProceed={onProceed}
+      />,
+    );
+    await waitFor(() => expect(view.queryByText("Analyzing query safety...") === null).toBe(true));
+    expect(view.queryByText(configError) === null).toBe(true);
+    expect(
+      view.getByText(
+        "This statement may change data, database objects, or permissions. Review the query before proceeding.",
+      ),
+    ).toBeTruthy();
+    expect(view.getByText("DROP TABLE users")).toBeTruthy();
+    expect(isDangerousQuery("DROP TABLE users", "postgres")).toBe(true);
+    expect(onProceed).not.toHaveBeenCalled();
+    fireEvent.click(view.getByRole("button", { name: action }));
+    expect(onProceed).toHaveBeenCalledTimes(action === "Execute Query" ? 1 : 0);
+    expect(onClose).toHaveBeenCalledTimes(action === "Cancel" ? 1 : 0);
+  });
+
+  test.each([
+    "Invalid provider: gemni. Valid options: gemini, openai, ollama, custom",
+    "Model name is required for ollama provider.",
+    "Custom provider requires LLM_API_URL environment variable.",
+    'Model not found. Make sure "llama3" is pulled in Ollama.',
+  ])("a configured AI failure remains visible: %s", async (message) => {
+    globalThis.fetch = mock(async () =>
+      createStreamResponse({ chunks: [], ok: false, status: 503, jsonBody: { error: message, code: "LLM_CONFIG" } }),
+    ) as unknown as typeof fetch;
+    const view = render(
+      <QuerySafetyDialog isOpen query="DROP TABLE users" schemaContext="" onClose={onClose} onProceed={onProceed} />,
+    );
+    await waitFor(() => expect(view.queryByText("Analyzing query safety...") === null).toBe(true));
+    expect(view.queryByText(message) !== null).toBe(true);
+    expect(onProceed).not.toHaveBeenCalled();
+  });
+
+  test("an invalid configured AI key still reports its authentication error", async () => {
+    globalThis.fetch = mock(async () =>
+      createStreamResponse({
+        chunks: [],
+        ok: false,
+        status: 401,
+        jsonBody: { error: "Gemini API key is invalid", code: "LLM_AUTH" },
+      }),
+    ) as unknown as typeof fetch;
+    const view = render(
+      <QuerySafetyDialog isOpen query="DROP TABLE users" schemaContext="" onClose={onClose} onProceed={onProceed} />,
+    );
+    await waitFor(() => expect(view.queryByText("Gemini API key is invalid")).not.toBeNull());
+    expect(onProceed).not.toHaveBeenCalled();
+  });
+
   test("calls onClose and onProceed from action buttons", async () => {
     const safePayload = {
       riskLevel: "safe",
@@ -149,7 +357,7 @@ describe("QuerySafetyDialog", () => {
       createStreamResponse({ chunks: [JSON.stringify(safePayload)] }),
     ) as unknown as typeof fetch;
 
-    const { queryByText, container } = render(
+    const { queryByText, getByRole } = render(
       <QuerySafetyDialog isOpen query="SELECT * FROM users" schemaContext="" onClose={onClose} onProceed={onProceed} />,
     );
 
@@ -167,9 +375,9 @@ describe("QuerySafetyDialog", () => {
     fireEvent.click(proceedButton!);
     expect(onProceed).toHaveBeenCalled();
 
-    const closeIconButton = container.querySelector("button");
+    const closeIconButton = getByRole("button", { name: "Close" });
     expect(closeIconButton).not.toBeNull();
-    fireEvent.click(closeIconButton!);
+    fireEvent.click(closeIconButton);
     expect(onClose.mock.calls.length).toBeGreaterThan(1);
   });
 
@@ -187,13 +395,13 @@ describe("QuerySafetyDialog", () => {
       createStreamResponse({ chunks: [JSON.stringify(safePayload)] }),
     ) as unknown as typeof fetch;
 
-    const { container } = render(
+    const { getByText } = render(
       <QuerySafetyDialog isOpen query={longQuery} schemaContext="" onClose={onClose} onProceed={onProceed} />,
     );
 
-    const preElement = container.querySelector("pre");
+    const preElement = getByText(longQuery.substring(0, 300) + "...");
     expect(preElement).not.toBeNull();
-    const preText = preElement!.textContent || "";
+    const preText = preElement.textContent || "";
     expect(preText.length).toBeLessThanOrEqual(303); // 300 chars + '...'
     expect(preText.endsWith("...")).toBe(true);
     expect(preText).toBe(longQuery.substring(0, 300) + "...");
@@ -338,7 +546,7 @@ describe("QuerySafetyDialog", () => {
     });
   });
 
-  test("applies correct severity styling to warnings (critical=red, warning=amber, info=blue)", async () => {
+  test("applies correct severity styling to warnings (critical=danger, warning=warning, info=accent)", async () => {
     const payload = {
       riskLevel: "high",
       summary: "Multiple warnings.",
@@ -372,16 +580,16 @@ describe("QuerySafetyDialog", () => {
     });
 
     const criticalEl = queryByText("Critical warning")!.closest("div");
-    expect(criticalEl?.className).toContain("bg-red-500/5");
-    expect(criticalEl?.className).toContain("border-red-500/20");
+    expect(criticalEl?.className).toContain("bg-danger-tint/5");
+    expect(criticalEl?.className).toContain("border-danger-tint/20");
 
     const warningEl = queryByText("Warning level")!.closest("div");
-    expect(warningEl?.className).toContain("bg-amber-500/5");
-    expect(warningEl?.className).toContain("border-amber-500/20");
+    expect(warningEl?.className).toContain("bg-warning-tint/5");
+    expect(warningEl?.className).toContain("border-warning-tint/20");
 
     const infoEl = queryByText("Info level")!.closest("div");
-    expect(infoEl?.className).toContain("bg-blue-500/5");
-    expect(infoEl?.className).toContain("border-blue-500/20");
+    expect(infoEl?.className).toContain("bg-brand-tint/5");
+    expect(infoEl?.className).toContain("border-brand-tint/20");
   });
 
   test("uses onAnalyzeSafety adapter instead of fetch when provided", async () => {
@@ -530,7 +738,7 @@ describe("QuerySafetyDialog", () => {
     });
   });
 
-  test("high and critical risk buttons have red background class", async () => {
+  test("high and critical risk buttons carry the danger solid background token", async () => {
     // Test critical risk button
     const criticalPayload = {
       riskLevel: "critical",
@@ -559,7 +767,7 @@ describe("QuerySafetyDialog", () => {
     });
 
     const criticalButton = queryByText("Execute Anyway")!.closest("button");
-    expect(criticalButton?.className).toContain("bg-red-600");
+    expect(criticalButton?.className).toContain("bg-danger-solid");
 
     unmount();
     cleanup();
@@ -592,7 +800,7 @@ describe("QuerySafetyDialog", () => {
     });
 
     const highButton = result2.queryByText("Proceed with Caution")!.closest("button");
-    expect(highButton?.className).toContain("bg-red-600");
+    expect(highButton?.className).toContain("bg-danger-solid");
   });
 
   // ── Honesty about text the reading could not resolve (#297) ────────────────
@@ -749,9 +957,531 @@ describe("QuerySafetyDialog", () => {
     );
     expect(balanced.queryByText("Part of this statement could not be read")).toBeNull();
   });
+
+  // A lone carriage return in a `--` comment ends the comment on PostgreSQL and not on CockroachDB, which connects on
+  // the same type id, so the notice says why a statement that may read as a SELECT asks. A CR LF pair is an ordinary
+  // line end, and the notice stays silent.
+  test("says so for a line comment holding a lone carriage return", async () => {
+    globalThis.fetch = mock(async () =>
+      createStreamResponse({ chunks: [JSON.stringify(SAFE_PAYLOAD)] }),
+    ) as unknown as typeof fetch;
+
+    for (const databaseType of ["postgres", "mysql", "spark"] as const) {
+      const split = render(
+        <QuerySafetyDialog
+          isOpen
+          query={"SELECT 1 -- x\r; DELETE FROM t"}
+          schemaContext=""
+          databaseType={databaseType}
+          onClose={onClose}
+          onProceed={onProceed}
+        />,
+      );
+      expect(split.queryByText("Part of this statement could not be read")).not.toBeNull();
+      expect(split.queryByText(/lone carriage return/)).not.toBeNull();
+      split.unmount();
+      cleanup();
+    }
+
+    const paired = render(
+      <QuerySafetyDialog
+        isOpen
+        query={"SELECT 1 -- x\r\n; DELETE FROM t"}
+        schemaContext=""
+        databaseType="postgres"
+        onClose={onClose}
+        onProceed={onProceed}
+      />,
+    );
+    expect(paired.queryByText("Part of this statement could not be read")).toBeNull();
+  });
+
+  // A vocabulary that asks for a typed value, or keeps its statements from the analysis (#1089, section 5.5 and
+  // E10). These tests install a row of their own under a key no DatabaseType spells
+  // (tests/helpers/stand-in-vocabulary.ts), so each rule is pinned apart from any engine's grammar; etcd's row,
+  // the one shipped row that declares both fields, is pinned with its own commands in the describe after this one.
+  describe("a vocabulary's typed confirmation and its safety-analysis switch", () => {
+    const MISSING_NAME =
+      "This statement is confirmed by typing the connection's name, which this editor did not provide, so it cannot run from here.";
+    const LOCAL_ONLY =
+      "This editor checked the statement itself: statements for this engine are not sent to an AI provider for a risk analysis.";
+    const asks = (text: string): TypedConfirmationAsk | undefined => {
+      if (text === "wipe-prefix /App/") return { type: "text", text: "/App/" };
+      if (text === "wipe-prefix  a") return { type: "text", text: " a" };
+      if (text === "wipe-both /app/ /cfg/") {
+        return { type: "connection-name", targets: ["/app/ (prefix)", "/cfg/ (prefix)"] };
+      }
+      return undefined;
+    };
+    const proceed = () => screen.getByRole("button", { name: "Execute Query" }) as HTMLButtonElement;
+    let remove: () => void = () => {};
+
+    afterEach(() => {
+      remove();
+      remove = () => {};
+    });
+
+    test("a text ask holds Proceed disabled until the text is typed exactly", () => {
+      remove = installStandInVocabulary({ typedConfirmation: asks, safetyAnalysis: false });
+      render(
+        <QuerySafetyDialog
+          isOpen
+          query="wipe-prefix /App/"
+          schemaContext=""
+          databaseType={STAND_IN_TYPE}
+          onClose={onClose}
+          onProceed={onProceed}
+        />,
+      );
+
+      const field = screen.getByLabelText("Type /App/ to confirm") as HTMLInputElement;
+      expect(field.value).toBe("");
+      expect(proceed().disabled).toBe(true);
+      expect(proceed().className).toContain("opacity-50");
+      for (const wrong of ["/app/", " /App/", "/App/ ", "/APP/"]) {
+        fireEvent.change(field, { target: { value: wrong } });
+        expect({ wrong, disabled: proceed().disabled }).toEqual({ wrong, disabled: true });
+      }
+      fireEvent.click(proceed());
+      expect(onProceed).not.toHaveBeenCalled();
+
+      fireEvent.change(field, { target: { value: "/App/" } });
+      expect(proceed().disabled).toBe(false);
+      expect(proceed().className).not.toContain("opacity-50");
+      fireEvent.click(proceed());
+      expect(onProceed).toHaveBeenCalledTimes(1);
+    });
+
+    test("draws the text to type with its whitespace kept", () => {
+      remove = installStandInVocabulary({ typedConfirmation: asks, safetyAnalysis: false });
+      render(
+        <QuerySafetyDialog
+          isOpen
+          query="wipe-prefix  a"
+          schemaContext=""
+          databaseType={STAND_IN_TYPE}
+          onClose={onClose}
+          onProceed={onProceed}
+        />,
+      );
+
+      const shown = screen.getByRole("alertdialog").querySelector("label span") as HTMLElement;
+      expect(shown.textContent).toBe(" a");
+      expect(shown.className).toContain("whitespace-pre-wrap");
+      const field = screen.getByRole("textbox") as HTMLInputElement;
+      fireEvent.change(field, { target: { value: "a" } });
+      expect(proceed().disabled).toBe(true);
+      fireEvent.change(field, { target: { value: " a" } });
+      expect(proceed().disabled).toBe(false);
+    });
+
+    test("a reopened dialog starts empty, with Proceed disabled again", async () => {
+      remove = installStandInVocabulary({ typedConfirmation: asks, safetyAnalysis: false });
+      function Editor() {
+        const [open, setOpen] = React.useState(false);
+        return (
+          <>
+            <button onClick={() => setOpen(true)}>RUN</button>
+            <QuerySafetyDialog
+              isOpen={open}
+              query="wipe-prefix /App/"
+              schemaContext=""
+              databaseType={STAND_IN_TYPE}
+              onClose={() => setOpen(false)}
+              onProceed={onProceed}
+            />
+          </>
+        );
+      }
+      render(<Editor />);
+
+      fireEvent.click(screen.getByRole("button", { name: "RUN" }));
+      fireEvent.change(screen.getByLabelText("Type /App/ to confirm"), { target: { value: "/App/" } });
+      expect(proceed().disabled).toBe(false);
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+
+      fireEvent.click(screen.getByRole("button", { name: "RUN" }));
+      expect((screen.getByLabelText("Type /App/ to confirm") as HTMLInputElement).value).toBe("");
+      expect(proceed().disabled).toBe(true);
+      expect(onProceed).not.toHaveBeenCalled();
+    });
+
+    test("a different ask while the dialog is open starts its field empty", () => {
+      remove = installStandInVocabulary({ typedConfirmation: asks, safetyAnalysis: false });
+      const gate = (query: string) => (
+        <QuerySafetyDialog
+          isOpen
+          query={query}
+          schemaContext=""
+          databaseType={STAND_IN_TYPE}
+          onClose={onClose}
+          onProceed={onProceed}
+        />
+      );
+      const view = render(gate("wipe-prefix /App/"));
+      fireEvent.change(screen.getByLabelText("Type /App/ to confirm"), { target: { value: "/App/" } });
+      expect(proceed().disabled).toBe(false);
+
+      // What was typed for one ask is never carried to another.
+      view.rerender(gate("wipe-prefix  a"));
+      expect((screen.getByRole("textbox") as HTMLInputElement).value).toBe("");
+      expect(proceed().disabled).toBe(true);
+    });
+
+    test("a connection-name ask lists every target and asks for the connection's name", () => {
+      remove = installStandInVocabulary({ typedConfirmation: asks, safetyAnalysis: false });
+      render(
+        <QuerySafetyDialog
+          isOpen
+          query="wipe-both /app/ /cfg/"
+          schemaContext=""
+          databaseType={STAND_IN_TYPE}
+          connectionName="prod-etcd"
+          onClose={onClose}
+          onProceed={onProceed}
+        />,
+      );
+
+      const dialog = screen.getByRole("alertdialog");
+      expect(dialog.textContent).toContain("Targets");
+      expect(Array.from(dialog.querySelectorAll("li")).map((item) => item.textContent)).toEqual([
+        "/app/ (prefix)",
+        "/cfg/ (prefix)",
+      ]);
+      const field = screen.getByLabelText("Type prod-etcd to confirm");
+      expect(proceed().disabled).toBe(true);
+      fireEvent.change(field, { target: { value: "Prod-etcd" } });
+      expect(proceed().disabled).toBe(true);
+      fireEvent.change(field, { target: { value: "prod-etcd" } });
+      expect(proceed().disabled).toBe(false);
+    });
+
+    test.each<[string, string | undefined]>([
+      ["no connectionName", undefined],
+      ["an empty connectionName", ""],
+    ])(
+      "with %s, a connection-name ask shows the refusal in place of the field, and Proceed stays disabled",
+      (_label, connectionName) => {
+        remove = installStandInVocabulary({ typedConfirmation: asks, safetyAnalysis: false });
+        render(
+          <QuerySafetyDialog
+            isOpen
+            query="wipe-both /app/ /cfg/"
+            schemaContext=""
+            databaseType={STAND_IN_TYPE}
+            connectionName={connectionName}
+            onClose={onClose}
+            onProceed={onProceed}
+          />,
+        );
+
+        const dialog = screen.getByRole("alertdialog");
+        expect(dialog.textContent).toContain(MISSING_NAME);
+        expect(within(dialog).queryByRole("textbox")).toBeNull();
+        // The targets are still named: they are what the refusal is about.
+        expect(dialog.textContent).toContain("/cfg/ (prefix)");
+        expect(proceed().disabled).toBe(true);
+        fireEvent.click(proceed());
+        expect(onProceed).not.toHaveBeenCalled();
+      },
+    );
+
+    test("a name that disappears while the dialog is open takes Proceed back", () => {
+      remove = installStandInVocabulary({ typedConfirmation: asks, safetyAnalysis: false });
+      const gate = (connectionName: string) => (
+        <QuerySafetyDialog
+          isOpen
+          query="wipe-both /app/ /cfg/"
+          schemaContext=""
+          databaseType={STAND_IN_TYPE}
+          connectionName={connectionName}
+          onClose={onClose}
+          onProceed={onProceed}
+        />
+      );
+      const view = render(gate("prod-etcd"));
+      fireEvent.change(screen.getByLabelText("Type prod-etcd to confirm"), { target: { value: "prod-etcd" } });
+      expect(proceed().disabled).toBe(false);
+
+      view.rerender(gate(""));
+      expect(screen.getByRole("alertdialog").textContent).toContain(MISSING_NAME);
+      expect(proceed().disabled).toBe(true);
+    });
+
+    test("a text ask needs no connection name", () => {
+      remove = installStandInVocabulary({ typedConfirmation: asks, safetyAnalysis: false });
+      render(
+        <QuerySafetyDialog
+          isOpen
+          query="wipe-prefix /App/"
+          schemaContext=""
+          databaseType={STAND_IN_TYPE}
+          onClose={onClose}
+          onProceed={onProceed}
+        />,
+      );
+
+      expect(screen.getByLabelText("Type /App/ to confirm")).toBeTruthy();
+      expect(screen.getByRole("alertdialog").textContent).not.toContain(MISSING_NAME);
+    });
+
+    test("a row that keeps its statements from the analysis posts nothing, calls no adapter, and says so", () => {
+      remove = installStandInVocabulary({ safetyAnalysis: false });
+      const fetchMock = mock(async () => createStreamResponse({ chunks: [JSON.stringify(SAFE_PAYLOAD)] }));
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+      const onAnalyzeSafety = mock(async () => ({ ...SAFE_PAYLOAD, riskLevel: "safe" as const }));
+      render(
+        <QuerySafetyDialog
+          isOpen
+          query="wipe everything"
+          schemaContext=""
+          databaseType={STAND_IN_TYPE}
+          onClose={onClose}
+          onProceed={onProceed}
+          onAnalyzeSafety={onAnalyzeSafety}
+        />,
+      );
+
+      // The analysis would have been asked for while the dialog rendered: both calls start before its first await.
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(onAnalyzeSafety).not.toHaveBeenCalled();
+      expect(screen.queryByText("Analyzing query safety...")).toBeNull();
+      expect(screen.getByText(LOCAL_ONLY)).toBeTruthy();
+      expect(
+        screen.getByText(
+          "This statement may change data, database objects, or permissions. Review the query before proceeding.",
+        ),
+      ).toBeTruthy();
+      // The statement preview stays.
+      expect(screen.getByRole("alertdialog").textContent).toContain("wipe everything");
+      expect(proceed().disabled).toBe(false);
+      fireEvent.click(proceed());
+      expect(onProceed).toHaveBeenCalledTimes(1);
+    });
+
+    test("a row that asks for a typed value and allows the analysis gets both, and the field still holds Proceed", async () => {
+      remove = installStandInVocabulary({ typedConfirmation: asks });
+      const fetchMock = mock(async () => createStreamResponse({ chunks: [JSON.stringify(SAFE_PAYLOAD)] }));
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+      render(
+        <QuerySafetyDialog
+          isOpen
+          query="wipe-prefix /App/"
+          schemaContext=""
+          databaseType={STAND_IN_TYPE}
+          onClose={onClose}
+          onProceed={onProceed}
+        />,
+      );
+
+      await waitFor(() => expect(screen.queryByText("Safe")).not.toBeNull());
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText(LOCAL_ONLY)).toBeNull();
+      expect(proceed().disabled).toBe(true);
+      fireEvent.change(screen.getByLabelText("Type /App/ to confirm"), { target: { value: "/App/" } });
+      expect(proceed().disabled).toBe(false);
+    });
+
+    test("an engine whose row declares neither field keeps today's dialog", async () => {
+      const fetchMock = mock(async () => createStreamResponse({ chunks: [JSON.stringify(SAFE_PAYLOAD)] }));
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+      render(
+        <QuerySafetyDialog
+          isOpen
+          query="FLUSHALL"
+          schemaContext=""
+          databaseType="redis"
+          connectionName="cache"
+          onClose={onClose}
+          onProceed={onProceed}
+        />,
+      );
+
+      await waitFor(() => expect(screen.queryByText("Safe")).not.toBeNull());
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(screen.queryByRole("textbox")).toBeNull();
+      expect(screen.queryByText(LOCAL_ONLY)).toBeNull();
+      expect(proceed().disabled).toBe(false);
+    });
+  });
+
+  // etcd's own row (#1089, section 5.5 and E10), as the editor's gate meets it: guard.ts reads the text with the
+  // provider's parser, so the dialog asks what the command really is.
+  describe("etcd's row", () => {
+    const MISSING_NAME =
+      "This statement is confirmed by typing the connection's name, which this editor did not provide, so it cannot run from here.";
+    const LOCAL_ONLY =
+      "This editor checked the statement itself: statements for this engine are not sent to an AI provider for a risk analysis.";
+    const proceed = () => screen.getByRole("button", { name: "Execute Query" }) as HTMLButtonElement;
+
+    test("a prefix delete holds Proceed disabled on /app/ and enables it on /App/, the prefix as typed", () => {
+      render(
+        <QuerySafetyDialog
+          isOpen
+          query="del /App/ --prefix"
+          schemaContext=""
+          databaseType="etcd"
+          connectionName="prod-etcd"
+          onClose={onClose}
+          onProceed={onProceed}
+        />,
+      );
+
+      const field = screen.getByLabelText("Type /App/ to confirm") as HTMLInputElement;
+      fireEvent.change(field, { target: { value: "/app/" } });
+      expect(proceed().disabled).toBe(true);
+      fireEvent.change(field, { target: { value: "/App/" } });
+      expect(proceed().disabled).toBe(false);
+    });
+
+    test("a reopened dialog starts empty, with Proceed disabled again", async () => {
+      function Editor() {
+        const [open, setOpen] = React.useState(false);
+        return (
+          <>
+            <button onClick={() => setOpen(true)}>RUN</button>
+            <QuerySafetyDialog
+              isOpen={open}
+              query="del /App/ --prefix"
+              schemaContext=""
+              databaseType="etcd"
+              connectionName="prod-etcd"
+              onClose={() => setOpen(false)}
+              onProceed={onProceed}
+            />
+          </>
+        );
+      }
+      render(<Editor />);
+
+      fireEvent.click(screen.getByRole("button", { name: "RUN" }));
+      fireEvent.change(screen.getByLabelText("Type /App/ to confirm"), { target: { value: "/App/" } });
+      expect(proceed().disabled).toBe(false);
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+
+      fireEvent.click(screen.getByRole("button", { name: "RUN" }));
+      expect((screen.getByLabelText("Type /App/ to confirm") as HTMLInputElement).value).toBe("");
+      expect(proceed().disabled).toBe(true);
+    });
+
+    test.each<[string, string | undefined]>([
+      ["no connectionName", undefined],
+      ["an empty connectionName", ""],
+    ])(
+      "a txn with two destructive targets and %s shows the refusal, with Proceed disabled",
+      (_label, connectionName) => {
+        expect(() =>
+          render(
+            <QuerySafetyDialog
+              isOpen
+              query={"txn\n\ndel /app/ --prefix\ndel /cfg/ --prefix\n\n"}
+              schemaContext=""
+              databaseType="etcd"
+              connectionName={connectionName}
+              onClose={onClose}
+              onProceed={onProceed}
+            />,
+          ),
+        ).not.toThrow();
+
+        const dialog = screen.getByRole("alertdialog");
+        expect(dialog.textContent).toContain(MISSING_NAME);
+        expect(within(dialog).queryByRole("textbox")).toBeNull();
+        expect(Array.from(dialog.querySelectorAll("li")).map((item) => item.textContent)).toEqual([
+          "/app/ (prefix)",
+          "/cfg/ (prefix)",
+        ]);
+        expect(proceed().disabled).toBe(true);
+      },
+    );
+
+    test("no etcd statement is posted for an AI analysis, a put's value included (E10)", () => {
+      const fetchMock = mock(async () => createStreamResponse({ chunks: [JSON.stringify(SAFE_PAYLOAD)] }));
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+      const onAnalyzeSafety = mock(async () => ({ ...SAFE_PAYLOAD, riskLevel: "safe" as const }));
+      render(
+        <QuerySafetyDialog
+          isOpen
+          query="put /app/token s3cr3t-value"
+          schemaContext=""
+          databaseType="etcd"
+          connectionName="prod-etcd"
+          onClose={onClose}
+          onProceed={onProceed}
+          onAnalyzeSafety={onAnalyzeSafety}
+        />,
+      );
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(onAnalyzeSafety).not.toHaveBeenCalled();
+      expect(screen.getByText(LOCAL_ONLY)).toBeTruthy();
+      // A single-key write asks one click and no typed text (#1089 5.1.3).
+      expect(screen.queryByRole("textbox")).toBeNull();
+      expect(proceed().disabled).toBe(false);
+    });
+  });
 });
 
 describe("isDangerousQuery", () => {
+  // A procedural body is one statement to the runner since #1312, and its own keyword is
+  // BEGIN or CREATE. The writes inside it still ask, as they did when the splitter cut them.
+  test("a write inside a procedural body still asks", () => {
+    expect(isDangerousQuery("BEGIN x := 1; DELETE FROM emp; END;", "oracle")).toBe(true);
+    expect(isDangerousQuery("CREATE TRIGGER t AFTER INSERT ON a BEGIN SELECT 1; DELETE FROM b; END", "sqlite")).toBe(
+      true,
+    );
+    expect(isDangerousQuery("BEGIN x := 1; SELECT 1 INTO y FROM dual; END;", "oracle")).toBe(false);
+  });
+
+  // The block's FIRST statement is the write, so the fragment the gate reads starts with
+  // the block's own word. Before #1312 Oracle refused that fragment; now the block runs.
+  test.each([
+    ["oracle", "BEGIN DELETE FROM emp; END;"],
+    ["oracle", "BEGIN IF 1=1 THEN DELETE FROM emp; END IF; END;"],
+    ["oracle", "DECLARE v NUMBER; BEGIN DELETE FROM emp; END;"],
+    ["oracle", "BEGIN NULL; EXCEPTION WHEN OTHERS THEN DROP TABLE t; END;"],
+    ["oracle", "<<outer>> BEGIN TRUNCATE TABLE t; END outer;"],
+    ["mssql", "IF @@ROWCOUNT > 0 DELETE FROM t"],
+    ["mssql", "DECLARE @n INT = 1; WHILE @n > 0 BEGIN DELETE TOP (1) FROM t; SET @n = 0; END"],
+  ] as const)("a write that opens a block asks on %s: %s", (type, sql) => {
+    expect(isDangerousQuery(sql, type)).toBe(true);
+  });
+
+  test.each([
+    "BEGIN EXECUTE IMMEDIATE 'DROP TABLE t PURGE'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -942 THEN RAISE; END IF; END;",
+    "BEGIN EXECUTE IMMEDIATE 'TRUNCATE TABLE t'; END;",
+    "DECLARE c INTEGER := DBMS_SQL.OPEN_CURSOR; BEGIN DBMS_SQL.PARSE(c, 'DROP TABLE t', DBMS_SQL.NATIVE); END;",
+  ])("dynamic SQL in a block asks, its text being a literal the gate cannot read: %s", (sql) => {
+    expect(isDangerousQuery(sql, "oracle")).toBe(true);
+  });
+
+  test("a variable or a FOR UPDATE lock clause named like a write does not ask", () => {
+    expect(isDangerousQuery("DECLARE @alter INT = 1; SELECT @alter", "mssql")).toBe(false);
+    expect(isDangerousQuery("DECLARE @drop INT = 1, @update INT = 2, @delete INT = 3; SELECT @drop", "mssql")).toBe(
+      false,
+    );
+    expect(
+      isDangerousQuery("DECLARE CURSOR c IS SELECT id FROM emp FOR UPDATE; BEGIN OPEN c; CLOSE c; END;", "oracle"),
+    ).toBe(false);
+    // The exception names only those two shapes: a real write after them still asks.
+    expect(isDangerousQuery("DECLARE @alter INT = 1; IF @alter = 1 DELETE FROM t", "mssql")).toBe(true);
+    expect(isDangerousQuery("BEGIN SELECT 1 INTO x FROM t FOR UPDATE; UPDATE t SET a = 1; END;", "oracle")).toBe(true);
+  });
+
+  test("a block that only reads, or a word inside a literal, does not ask", () => {
+    expect(isDangerousQuery("BEGIN SELECT 'delete' INTO x FROM dual; END;", "oracle")).toBe(false);
+    expect(isDangerousQuery("IF @x > 0 SELECT 1", "mssql")).toBe(false);
+    // A procedure call cannot be read into: what it does is the server's, as before.
+    expect(isDangerousQuery("EXEC sp_cleanup", "mssql")).toBe(false);
+  });
+
+  test("a write after a separator line asks", () => {
+    expect(isDangerousQuery("SELECT 1\nGO\nDROP TABLE t", "mssql")).toBe(true);
+    expect(isDangerousQuery("SELECT 1 FROM dual\n/\nDROP TABLE t", "oracle")).toBe(true);
+  });
+
   test("detects dangerous DML and DDL statements", () => {
     expect(isDangerousQuery("DELETE FROM users")).toBe(true);
     expect(isDangerousQuery("DROP TABLE users")).toBe(true);
@@ -819,8 +1549,231 @@ describe("isDangerousQuery", () => {
     expect(isDangerousQuery("WITH moved AS (UPDATE t SET a = 1 RETURNING *) SELECT * FROM moved")).toBe(true);
   });
 
+  /**
+   * `DELETE`, `MERGE` and `INSERT` are the rest of the data-modifying set the
+   * `UPDATE … SET` probe above already covers for `UPDATE` (#1862). They count as
+   * the first word of a CTE body, or as the keyword that operates a body opening
+   * with `WITH`. The statement need not lead with `WITH`. The same words inside a
+   * string or a comment do not ask, and a plain `WITH … SELECT` does not either.
+   * CockroachDB is the postgres type-id, so it shares the grammar.
+   */
+  test.each<[string, string]>([
+    ["a DELETE", "WITH d AS (DELETE FROM users RETURNING *) SELECT count(*) FROM d"],
+    [
+      "a MERGE that deletes",
+      "WITH m AS (MERGE INTO users u USING (SELECT 1 id) s ON u.id=s.id WHEN MATCHED THEN DELETE RETURNING u.id) SELECT * FROM m",
+    ],
+    ["an INSERT", "WITH i AS (INSERT INTO users(id) VALUES (1) RETURNING id) SELECT * FROM i"],
+    ["a nested WITH that deletes", "WITH x AS (WITH y AS (SELECT 1) DELETE FROM t RETURNING *) SELECT * FROM x"],
+    [
+      "a nested WITH that inserts",
+      "WITH x AS (WITH y AS (SELECT 1) INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM x",
+    ],
+    ["a parenthesised WITH that deletes", "(WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d)"],
+    ["a CREATE TABLE whose query deletes", "CREATE TABLE t2 AS WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"],
+  ])("prompts for a data-modifying CTE that carries %s", (_label, query) => {
+    expect(isDangerousQuery(query, "postgres")).toBe(true);
+  });
+
+  test("prompts for a data-modifying CTE on cockroachdb, which shares the PostgreSQL grammar", () => {
+    expect(isDangerousQuery("WITH d AS (DELETE FROM users RETURNING *) SELECT count(*) FROM d", "postgres")).toBe(true);
+  });
+
+  test.each<[string, string]>([
+    ["DELETE inside a string", "WITH d AS (SELECT 'DELETE FROM users') SELECT count(*) FROM d"],
+    [
+      "MERGE and DELETE inside a comment",
+      "WITH m AS (SELECT 1 /* MERGE INTO users WHEN MATCHED THEN DELETE */) SELECT * FROM m",
+    ],
+    ["INSERT inside a line comment", "WITH i AS (SELECT 1) SELECT * FROM i -- INSERT INTO users VALUES (1)"],
+  ])("does not prompt for a WITH that only names %s", (_label, query) => {
+    expect(isDangerousQuery(query, "postgres")).toBe(false);
+  });
+
+  test("does not prompt for a plain WITH … SELECT", () => {
+    expect(isDangerousQuery("WITH cte AS (SELECT 1) SELECT * FROM cte", "postgres")).toBe(false);
+    expect(isDangerousQuery("WITH x AS (WITH y AS (SELECT 1) SELECT * FROM y) SELECT * FROM x", "postgres")).toBe(
+      false,
+    );
+    expect(isDangerousQuery("(WITH d AS (SELECT 1) SELECT * FROM d)", "postgres")).toBe(false);
+    expect(isDangerousQuery("CREATE TABLE t2 AS WITH d AS (SELECT 1) SELECT * FROM d", "postgres")).toBe(false);
+  });
+
+  // DELETE, INSERT and MERGE are non-reserved, so a name spelled that way is not a write.
+  test.each<[string, string]>([
+    ["merge", "WITH a AS (SELECT merge FROM audit) SELECT * FROM a"],
+    ["delete", "WITH a AS (SELECT delete FROM audit) SELECT * FROM a"],
+    ["insert", "WITH a AS (SELECT insert FROM audit) SELECT * FROM a"],
+    ["merge in a MATERIALIZED CTE", "WITH a AS MATERIALIZED (SELECT merge FROM audit) SELECT * FROM a"],
+    ["delete in a NOT MATERIALIZED CTE", "WITH a AS NOT MATERIALIZED (SELECT delete FROM audit) SELECT * FROM a"],
+    ["merge", "WITH merge AS (SELECT 1 FROM audit) SELECT * FROM merge"],
+    ["delete", "WITH delete AS (SELECT 1 FROM audit) SELECT * FROM delete"],
+    ["insert", "WITH insert AS (SELECT 1 FROM audit) SELECT * FROM insert"],
+    ["merge in a column list", "WITH a (merge) AS (SELECT 1) SELECT * FROM a"],
+    ["merge aliased as delete", "WITH a AS (SELECT merge AS delete FROM audit) SELECT * FROM a"],
+    ["delete inside a nested WITH", "WITH x AS (WITH y AS (SELECT delete FROM audit) SELECT * FROM y) SELECT * FROM x"],
+    ["delete in a parenthesised WITH", "(WITH a AS (SELECT delete FROM audit) SELECT * FROM a)"],
+    ["delete in a CREATE TABLE AS WITH", "CREATE TABLE t2 AS WITH a AS (SELECT delete FROM audit) SELECT * FROM a"],
+  ])("does not prompt for a column or CTE named %s", (_label, query) => {
+    expect(isDangerousQuery(query, "postgres")).toBe(false);
+  });
+
+  test.each<[string, string]>([
+    [
+      "DELETE after MATERIALIZED",
+      "WITH d AS /* hint */ MATERIALIZED /* body */ (/* open */ DELETE FROM users RETURNING *) SELECT count(*) FROM d",
+    ],
+    [
+      "INSERT after NOT MATERIALIZED",
+      "WITH i AS NOT MATERIALIZED (INSERT INTO users(id) VALUES (1) RETURNING id) SELECT * FROM i",
+    ],
+    [
+      "MERGE after MATERIALIZED",
+      "WITH m AS MATERIALIZED (MERGE INTO users u USING (SELECT 1 id) s ON u.id=s.id WHEN MATCHED THEN DELETE RETURNING u.id) SELECT * FROM m",
+    ],
+    [
+      "a later DELETE",
+      "WITH a AS (SELECT merge FROM audit), d AS MATERIALIZED (DELETE FROM users RETURNING *) SELECT * FROM d",
+    ],
+  ])("prompts for a data-modifying CTE that opens with %s", (_label, query) => {
+    expect(isDangerousQuery(query, "postgres")).toBe(true);
+  });
+
   test("prompts for a destructive statement a CTE list only precedes", () => {
     expect(isDangerousQuery("WITH x AS (SELECT id FROM t) DELETE FROM t USING x WHERE t.id = x.id")).toBe(true);
+  });
+
+  /**
+   * PostgreSQL executes the statement under `EXPLAIN ANALYZE`, in the legacy spelling and in a parenthesised
+   * option list. The operative keyword is `EXPLAIN`, so the gate reads the statement that remains once the
+   * options are stripped (#1863). `ANALYZE` is off only for a boolean false (`false`, `off`, `no`, `0` and their
+   * accepted prefixes) or an integer literal of value 0, and so is a plain `EXPLAIN`. `0x1`, `0b1`, `0o1` and `0_1`
+   * are the integer 1, so they execute.
+   * CockroachDB is the postgres type-id and shares the grammar. A dialect that does not set
+   * `explainExecutesWithAnalyze` is unchanged: MySQL's `EXPLAIN ANALYZE` is outside this row.
+   */
+  test.each<[string, string]>([
+    ["a DELETE", "EXPLAIN ANALYZE DELETE FROM users"],
+    ["a DROP TABLE", "EXPLAIN ANALYZE DROP TABLE users"],
+    ["an UPDATE under a parenthesised option list", "EXPLAIN (ANALYZE, BUFFERS) UPDATE users SET id = 0"],
+    ["a DELETE under ANALYZE VERBOSE", "EXPLAIN ANALYZE VERBOSE DELETE FROM users"],
+    ["the British ANALYSE spelling", "EXPLAIN ANALYSE DELETE FROM users"],
+    ["ANALYZE with no space before the option list", "EXPLAIN(ANALYZE)DELETE FROM users"],
+    ["ANALYZE written in any case", "explain analyze delete from users"],
+    ["a comment between EXPLAIN and ANALYZE", "EXPLAIN /* plan */ ANALYZE DELETE FROM users"],
+    ["a note above the EXPLAIN", "-- profile\nEXPLAIN ANALYZE DELETE FROM users"],
+    ["ANALYZE after other options", "EXPLAIN (BUFFERS, ANALYZE) DELETE FROM users"],
+    ["ANALYZE true", "EXPLAIN (ANALYZE true) DELETE FROM users"],
+    ["ANALYZE on", "EXPLAIN (ANALYZE on) DELETE FROM users"],
+    ["ANALYZE 1", "EXPLAIN (ANALYZE 1) DELETE FROM users"],
+    ["ANALYZE 0x1, a hexadecimal 1", "EXPLAIN (ANALYZE 0x1) DELETE FROM users"],
+    ["ANALYZE 0b1, a binary 1", "EXPLAIN (ANALYZE 0b1) DELETE FROM users"],
+    ["ANALYZE 0o1, an octal 1", "EXPLAIN (ANALYZE 0o1) DELETE FROM users"],
+    ["ANALYZE 0_1, a decimal 1 with a separator", "EXPLAIN (ANALYZE 0_1) DELETE FROM users"],
+    ["ANALYZE 0X1", "EXPLAIN (ANALYZE 0X1) DELETE FROM users"],
+    ["ANALYZE 0B1", "EXPLAIN (ANALYZE 0B1) DELETE FROM users"],
+    ["ANALYZE 0O1", "EXPLAIN (ANALYZE 0O1) DELETE FROM users"],
+    ["ANALYZE 0x_1", "EXPLAIN (ANALYZE 0x_1) DELETE FROM users"],
+    ["ANALYZE 0o_1", "EXPLAIN (ANALYZE 0o_1) DELETE FROM users"],
+    ["ANALYZE 0b_1", "EXPLAIN (ANALYZE 0b_1) DELETE FROM users"],
+    ["ANALYZE 0x10", "EXPLAIN (ANALYZE 0x10) DELETE FROM users"],
+    ["ANALYZE 2", "EXPLAIN (ANALYZE 2) DELETE FROM users"],
+    ["ANALYZE +1", "EXPLAIN (ANALYZE +1) DELETE FROM users"],
+    ["ANALYZE -1", "EXPLAIN (ANALYZE -1) DELETE FROM users"],
+    ["ANALYZE +0x1", "EXPLAIN (ANALYZE +0x1) DELETE FROM users"],
+    ["ANALYZE 0.0, a float rather than the integer 0", "EXPLAIN (ANALYZE 0.0) DELETE FROM users"],
+    ["ANALYZE 0e0", "EXPLAIN (ANALYZE 0e0) DELETE FROM users"],
+    ["ANALYZE 0e+1", "EXPLAIN (ANALYZE 0e+1) DELETE FROM users"],
+    ["ANALYZE 0e+", "EXPLAIN (ANALYZE 0e+) DELETE FROM users"],
+    ["ANALYZE 0e-", "EXPLAIN (ANALYZE 0e-) DELETE FROM users"],
+    ["ANALYZE 0x, which is not an integer", "EXPLAIN (ANALYZE 0x) DELETE FROM users"],
+    ["ANALYZE 0x_", "EXPLAIN (ANALYZE 0x_) DELETE FROM users"],
+    ["ANALYZE 0o", "EXPLAIN (ANALYZE 0o) DELETE FROM users"],
+    ["ANALYZE 0b", "EXPLAIN (ANALYZE 0b) DELETE FROM users"],
+    ["ANALYZE 0b2, trailing junk on a binary literal", "EXPLAIN (ANALYZE 0b2) DELETE FROM users"],
+    ["ANALYZE 0x1g, trailing junk", "EXPLAIN (ANALYZE 0x1g) DELETE FROM users"],
+    ["ANALYZE 0.1a", "EXPLAIN (ANALYZE 0.1a) DELETE FROM users"],
+    ["ANALYZE 1e2a", "EXPLAIN (ANALYZE 1e2a) DELETE FROM users"],
+    ["ANALYZE falsehood, which is not the boolean", "EXPLAIN (ANALYZE falsehood) DELETE FROM users"],
+    ["ANALYZE note, which is not the boolean", "EXPLAIN (ANALYZE note) DELETE FROM users"],
+    ["ANALYZE offside", "EXPLAIN (ANALYZE offside) DELETE FROM users"],
+    ["a bare o, which is not a unique prefix", "EXPLAIN (ANALYZE o) DELETE FROM users"],
+    ["ANALYZE yes", "EXPLAIN (ANALYZE yes) DELETE FROM users"],
+    ["ANALYZE t, a prefix of true", "EXPLAIN (ANALYZE t) DELETE FROM users"],
+    ["a sign that is not followed by a number", "EXPLAIN (ANALYZE +false) DELETE FROM users"],
+    ["a sign with no number after it", "EXPLAIN (ANALYZE +) DELETE FROM users"],
+    ["ANALYZE 'true'", "EXPLAIN (ANALYZE 'true') DELETE FROM users"],
+    ["a parenthesised ANALYSE", "EXPLAIN (ANALYSE, VERBOSE) DROP TABLE users"],
+    ["FORMAT before ANALYZE", "EXPLAIN (FORMAT JSON, ANALYZE) DELETE FROM users"],
+    ["a data-modifying CTE under the EXPLAIN", "EXPLAIN ANALYZE WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"],
+    ["a nested EXPLAIN ANALYZE", "EXPLAIN ANALYZE EXPLAIN ANALYZE DELETE FROM users"],
+    ["a DELETE in a later statement", "EXPLAIN ANALYZE SELECT 1; DELETE FROM users"],
+    ["a ) inside an option string, which does not close the list", "EXPLAIN (ANALYZE ')') DELETE FROM users"],
+    ["an equals sign, which is not the off spelling", "EXPLAIN (ANALYZE = false) DELETE FROM users"],
+    ["an off value that is only a comment", "EXPLAIN (ANALYZE /* false */) DELETE FROM users"],
+    ["ANALYZE on after an ANALYZE off", "EXPLAIN (ANALYZE false, ANALYZE) DELETE FROM users"],
+    ["a quoted name where a boolean would be", 'EXPLAIN (ANALYZE "off") DELETE FROM users'],
+  ])("prompts for EXPLAIN ANALYZE of %s", (_label, query) => {
+    expect(isDangerousQuery(query, "postgres")).toBe(true);
+  });
+
+  test("prompts for EXPLAIN ANALYZE on cockroachdb, which shares the PostgreSQL grammar", () => {
+    expect(isDangerousQuery("EXPLAIN ANALYZE DELETE FROM users", "postgres")).toBe(true);
+    expect(isDangerousQuery("EXPLAIN ANALYZE DROP TABLE users", "postgres")).toBe(true);
+  });
+
+  test.each<[string, string]>([
+    ["ANALYZE false", "EXPLAIN (ANALYZE false) DELETE FROM users"],
+    ["ANALYZE off", "EXPLAIN (ANALYZE off) DELETE FROM users"],
+    ["ANALYZE no", "EXPLAIN (ANALYZE no) DELETE FROM users"],
+    ["ANALYZE 0", "EXPLAIN (ANALYZE 0) DELETE FROM users"],
+    ["ANALYZE 'false'", "EXPLAIN (ANALYZE 'false') DELETE FROM users"],
+    ["ANALYZE 'no'", "EXPLAIN (ANALYZE 'no') DELETE FROM users"],
+    ["ANALYZE '0'", "EXPLAIN (ANALYZE '0') DELETE FROM users"],
+    ["ANALYZE f, a prefix of false", "EXPLAIN (ANALYZE f) DELETE FROM users"],
+    ["ANALYZE n, a prefix of no", "EXPLAIN (ANALYZE n) DELETE FROM users"],
+    ["ANALYZE of, a prefix of off", "EXPLAIN (ANALYZE of) DELETE FROM users"],
+    ["ANALYZE 00", "EXPLAIN (ANALYZE 00) DELETE FROM users"],
+    ["ANALYZE 0x0", "EXPLAIN (ANALYZE 0x0) DELETE FROM users"],
+    ["ANALYZE 0b0", "EXPLAIN (ANALYZE 0b0) DELETE FROM users"],
+    ["ANALYZE 0o0", "EXPLAIN (ANALYZE 0o0) DELETE FROM users"],
+    ["ANALYZE 0_0", "EXPLAIN (ANALYZE 0_0) DELETE FROM users"],
+    ["ANALYZE 0X0", "EXPLAIN (ANALYZE 0X0) DELETE FROM users"],
+    ["ANALYZE 0x_0", "EXPLAIN (ANALYZE 0x_0) DELETE FROM users"],
+    ["ANALYZE +0", "EXPLAIN (ANALYZE +0) DELETE FROM users"],
+    ["ANALYZE -0", "EXPLAIN (ANALYZE -0) DELETE FROM users"],
+    ["ANALYZE +0x0", "EXPLAIN (ANALYZE +0x0) DELETE FROM users"],
+    ["ANALYZE 0.., the integer 0 with the range operator given back", "EXPLAIN (ANALYZE 0..) DELETE FROM users"],
+    ["a plain EXPLAIN of a DELETE", "EXPLAIN DELETE FROM users"],
+    ["a plain EXPLAIN of an UPDATE … SET", "EXPLAIN UPDATE users SET id = 0"],
+    ["ANALYZE false around an UPDATE … SET", "EXPLAIN (ANALYZE false) UPDATE users SET id = 0"],
+    ["EXPLAIN ANALYZE of a SELECT", "EXPLAIN ANALYZE SELECT 1"],
+    ["EXPLAIN VERBOSE, which does not execute", "EXPLAIN VERBOSE DELETE FROM users"],
+    ["a parenthesised list with no ANALYZE", "EXPLAIN (BUFFERS) DELETE FROM users"],
+    ["FORMAT JSON and no ANALYZE", "EXPLAIN (FORMAT JSON) DELETE FROM users"],
+    ["ANALYZE only inside a comment", "EXPLAIN /* ANALYZE */ DELETE FROM users"],
+    ["a nested comment hiding ANALYZE", "EXPLAIN /* outer /* ANALYZE */ still */ DELETE FROM users"],
+    ["ANALYZE commented out inside the option list", "EXPLAIN (/* ANALYZE */ VERBOSE) DELETE FROM users"],
+    ["DROP inside the explained SELECT's string", "EXPLAIN ANALYZE SELECT 'DROP TABLE users'"],
+    ["DELETE inside a comment of the explained SELECT", "EXPLAIN ANALYZE SELECT 1 /* DELETE FROM users */"],
+    ["ANALYZE written as a string, not an option", "EXPLAIN 'ANALYZE DELETE FROM users'"],
+    ["the option name written as a string", "EXPLAIN ('ANALYZE') DELETE FROM users"],
+    ["an unclosed option list", "EXPLAIN (ANALYZE DELETE FROM users"],
+    ["ANALYZE with no statement after it", "EXPLAIN ANALYZE"],
+    ["a DO block that is only planned", "EXPLAIN DO $$ BEGIN DELETE FROM t; END $$"],
+    ["ANALYZE false around a DO block", "EXPLAIN (ANALYZE false) DO $$ BEGIN DELETE FROM t; END $$"],
+    ["a nested EXPLAIN that does not analyze", "EXPLAIN ANALYZE EXPLAIN DELETE FROM users"],
+  ])("does not prompt for %s", (_label, query) => {
+    expect(isDangerousQuery(query, "postgres")).toBe(false);
+  });
+
+  test("does not prompt for EXPLAIN ANALYZE on a dialect whose EXPLAIN does not execute", () => {
+    expect(isDangerousQuery("EXPLAIN ANALYZE DELETE FROM users", "mysql")).toBe(false);
+    expect(isDangerousQuery("EXPLAIN ANALYZE DELETE FROM users")).toBe(false);
+  });
+
+  test("prompts for a DO block EXPLAIN ANALYZE will execute", () => {
+    expect(isDangerousQuery("EXPLAIN ANALYZE DO $$ BEGIN DELETE FROM t; END $$", "postgres")).toBe(true);
   });
 
   // ── Nothing to read ─────────────────────────────────────────────────────
@@ -842,32 +1795,46 @@ describe("isDangerousQuery", () => {
    *
    * This is the boundary of #297's rule, which is about text no reader can RESOLVE:
    * here every character was read, and the shape it spells is an incomplete
-   * statement rather than a run hiding what is written inside it. The keyword inside
-   * the unclosed list is a CTE-body write, which the row above pins as not prompting
-   * even when the list DOES close - so the answer is inherited from that gap, not
-   * from the reading stopping early.
+   * statement rather than a run hiding what is written inside it. The same keyword
+   * inside a list that DOES close asks (#1862). This one does not, because the list
+   * cannot be crossed and the probe refuses to guess.
    */
   test("does not prompt when the statement's shape cannot be typed", () => {
     expect(isDangerousQuery("WITH t AS (DELETE FROM x")).toBe(false);
   });
 
   /**
-   * The gaps this predicate does NOT close, pinned so each stays a decision and so
-   * `docs/editor/query-optimization.md` cannot drift from them.
+   * Answers pinned so a regression is silence, and so `docs/editor/query-optimization.md`
+   * cannot drift from them.
    *
-   * The write-inside-a-read probe looks for `UPDATE … SET` only, because widening it
-   * to the other write keywords would make every read whose code names one of them
-   * prompt.
+   * A `DELETE`, `MERGE` or `INSERT` that opens a CTE body whose list can be read asks
+   * (#1862), including a body that opens with `WITH` and a `WITH` that is not the
+   * statement's first word. Those words stay out of the unanchored `UPDATE … SET`
+   * pair: widening that pair would make every read whose code names one of them prompt.
    *
-   * The gap this list used to record beside it - "the whole editor text is read as one
-   * statement, so a destructive statement later in a script is only caught by that same
-   * unanchored probe" - is closed (S1): the predicate now reads the SAME fragments
-   * `/api/db/multi-query` will run, so a later `DROP` is answered by its own fragment's
-   * keyword rather than by luck. The row below is kept, with the answer it now has,
-   * because a regression there is silence on a script's second statement.
+   * The multi-statement rows closed an older gap (S1): the predicate reads the SAME
+   * fragments `/api/db/multi-query` will run, so a later `DROP` is answered by its
+   * own fragment's keyword rather than by luck. A regression there is silence on a
+   * script's second statement.
    */
   test.each<[string, string, boolean]>([
-    ["a DELETE hidden in a CTE body", "WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone", false],
+    ["a DELETE hidden in a CTE body", "WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone", true],
+    [
+      "a DELETE that operates a nested WITH",
+      "WITH x AS (WITH y AS (SELECT 1) DELETE FROM t RETURNING *) SELECT * FROM x",
+      true,
+    ],
+    [
+      "an INSERT that operates a nested WITH",
+      "WITH x AS (WITH y AS (SELECT 1) INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM x",
+      true,
+    ],
+    ["a parenthesised WITH that deletes", "(WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d)", true],
+    [
+      "a CREATE TABLE whose query deletes",
+      "CREATE TABLE t2 AS WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+      true,
+    ],
     ["a DROP after a leading SELECT", "SELECT 1; DROP TABLE users", true],
     ["an UPDATE after a leading SELECT", "SELECT 1;\nUPDATE t SET x = 1", true],
   ])("answers %s with %p", (_label, query, expected) => {
@@ -926,10 +1893,10 @@ describe("isDangerousQuery", () => {
   /**
    * The most frequent prompt this rule buys, named rather than left to be
    * discovered: `\'` is MySQL's OWN escape for an apostrophe, and `spans.ts` reports
-   * any closing quote behind an odd backslash run as undeterminable whatever the
-   * dialect - backslash semantics are deliberately not a fact the grammar record
-   * carries yet, because fixtures across this milestone rest on the undeterminable
-   * reading. So an everyday MySQL read asks, and naming the dialect does not narrow
+   * a closing quote behind an odd backslash run as undeterminable for every dialect
+   * whose grammar row does not declare `backslashAlwaysEscapes`. Only Databend's row
+   * declares it; MySQL's is false, because `NO_BACKSLASH_ESCAPES` changes its reading
+   * per session. So an everyday MySQL read asks, and naming MySQL does not narrow
    * it: this is the one cost the channel cannot resolve today.
    */
   test("prompts for a literal escaping its apostrophe with a backslash, under either dialect", () => {
@@ -1035,6 +2002,145 @@ describe("isDangerousQuery", () => {
   test("still prompts for a destructive keyword under a non-SQL type", () => {
     expect(isDangerousQuery("DROP TABLE users", "mongodb")).toBe(true);
   });
+
+  // ── PromQL is never read as SQL (#1085, section 2) ───────────────────────
+  //
+  // A PromQL expression can start with a metric name, and the name is the server's data: a
+  // recording rule or an exporter may legally call a metric `update`, `delete` or `drop`.
+  // Read as SQL, the selector the tree runs for such a metric was a DELETE or an UPDATE, so
+  // the dialog asked, and sent the text for AI analysis, before an expression whose only
+  // destination is the provider's query endpoint, which cannot write. The capabilities are
+  // the provider's own, so the text below is exactly what a click in the tree and "Generate
+  // Query" put in the editor. Each negative is paired with the dialect-less SQL reading of
+  // the same text, the grammar prometheus text used to be read under, which must still ask.
+
+  const prometheusCapabilities = new PrometheusProvider({
+    id: "prometheus-gate",
+    name: "Prometheus",
+    type: "prometheus",
+    host: "localhost",
+    createdAt: new Date(0),
+  }).getCapabilities();
+
+  test.each<[string]>([
+    ["update"],
+    ["delete"],
+    ["drop"],
+    ["alter"],
+    ["truncate"],
+    ["grant"],
+    ["revoke"],
+    ["Update"],
+    ["DROP"],
+  ])("does not prompt when the tree runs a metric named %s on prometheus", (name) => {
+    const click = generateTableQuery([name], prometheusCapabilities);
+    const buffer = generateSelectQuery([name], [], prometheusCapabilities);
+    // The premise: the click runs the bare name, and both texts read as a write under SQL.
+    expect(click).toBe(name);
+    expect(isDangerousQuery(click)).toBe(true);
+    expect(isDangerousQuery(buffer)).toBe(true);
+
+    expect(isDangerousQuery(click, "prometheus")).toBe(false);
+    expect(isDangerousQuery(buffer, "prometheus")).toBe(false);
+  });
+
+  test.each<[string, string]>([
+    ["a selector with a matcher", 'delete{job="x"}'],
+    ["a recording-rule name", "drop:rate5m"],
+    ["a selector with an offset", "update offset 5m"],
+    ["arithmetic on such a metric", "delete / 2"],
+    ["label names that spell UPDATE ... SET", 'x{update="a", set="b"}'],
+    ["a grouping by the same two labels", "sum by (update, set) (x)"],
+  ])("does not prompt for %s on prometheus", (_label, query) => {
+    expect(isDangerousQuery(query)).toBe(true);
+    expect(isDangerousQuery(query, "prometheus")).toBe(false);
+  });
+
+  // The change is prometheus's own row, not a new order for every non-SQL type: the SQL
+  // keyword test still reads a Redis buffer in front of the Redis vocabulary, as the
+  // MongoDB row above pins for MongoDB.
+  test("still prompts for a destructive keyword under redis", () => {
+    expect(isDangerousQuery("DROP TABLE users", "redis")).toBe(true);
+  });
+
+  // ── InfluxQL is read by its own lexer, and what it refuses never runs (InfluxDB spec 5.7, A.11) ──
+  //
+  // The `influxdb` row decides alone: the browser-safe InfluxQL policy the provider runs reads the text, so a
+  // regex holding `\/` and a backslash escape inside a string or an identifier, which a SQL span reader reads
+  // as an unterminated quote, close where the server closes them and ask nothing. What the policy refuses is
+  // refused by the row's `refuse` before the run, so the dialog is never shown for it; on 1.x and 2.x that
+  // policy is the only boundary before `DROP DATABASE`.
+
+  test.each<[string, string, boolean]>([
+    ["a regex holding an escaped slash", String.raw`SELECT * FROM cpu WHERE host =~ /a\/b/`, false],
+    ["a regex holding a quote", String.raw`SELECT * FROM cpu WHERE host =~ /it's/`, true],
+    ["a backslash escape in a string", String.raw`SELECT * FROM cpu WHERE host = 'it\'s'`, true],
+    ["a backslash escape in an identifier", String.raw`SELECT * FROM "we\"ird" WHERE time > now() - 1h`, true],
+  ])("does not prompt for %s on influxdb, and the policy allows it", (_label, query, sqlAsks) => {
+    // The premise: the SQL reading of the same text, where it differs, asks.
+    expect(isDangerousQuery(query)).toBe(sqlAsks);
+    expect(isDangerousQuery(query, "influxdb")).toBe(false);
+    expect(statementRefusal(query, "influxdb")).toBeUndefined();
+  });
+
+  test("DROP DATABASE on influxdb is refused by the row's refuse before the run, alone or after a read", () => {
+    expect(statementRefusal("DROP DATABASE x", "influxdb")).toBe(INFLUXQL_POLICY_SENTENCES.notARead("DROP"));
+    expect(statementRefusal("SHOW DATABASES; DROP DATABASE x", "influxdb")).toBe(
+      INFLUXQL_POLICY_SENTENCES.multipleStatements(1, 15),
+    );
+    // A `\r` ends a `--` comment and a line, so the `;` below is a separator the server reads, at line 2 column 1.
+    expect(statementRefusal("SHOW DATABASES -- c\r; DROP DATABASE x", "influxdb")).toBe(
+      INFLUXQL_POLICY_SENTENCES.multipleStatements(2, 1),
+    );
+  });
+
+  test("65,537 bytes of text is refused on influxdb before the run, and 65,536 bytes is not", () => {
+    const head = "SELECT * FROM cpu -- ";
+    const over = head + "x".repeat(65_537 - head.length);
+    // Three-byte characters, so the bound is counted in UTF-8 bytes and not in characters.
+    const atBound = `${head} ${"\u20ac".repeat((65_536 - head.length - 1) / 3)}`;
+    expect(new TextEncoder().encode(over).length).toBe(65_537);
+    expect(new TextEncoder().encode(atBound).length).toBe(65_536);
+
+    expect(statementRefusal(over, "influxdb")).toBe(
+      "The statement is 65537 bytes in UTF-8, over the 65536-byte limit for this connection type. Shorten it to run it.",
+    );
+    expect(statementRefusal(atBound, "influxdb")).toBeUndefined();
+  });
+
+  // ── A Kafka read request only reads (#1088, section 2) ───────────────────
+  //
+  // A topic may legally be called `delete`, `drop` or `update`: a Kafka topic name is any run of
+  // a-z, A-Z, 0-9, ".", "_" and "-". The texts the tree writes for such a topic, the read request a
+  // click runs and the one Generate Read Request opens, can only read it, and the capabilities are
+  // the provider's own, so the texts below are exactly what the tree puts in the editor. Each
+  // negative is paired with the reading the same text met before a dialect named it, MongoDB's
+  // (the #427 class), which finds no operation in a read request and asks.
+
+  const kafkaCapabilities = new KafkaProvider({
+    id: "kafka-gate",
+    name: "Kafka",
+    type: "kafka",
+    host: "localhost",
+    port: 9092,
+    createdAt: new Date(0),
+  }).getCapabilities();
+
+  test.each<[string]>([["delete"], ["drop"], ["update"], ["truncate"], ["DROP"]])(
+    "does not prompt when the tree reads a topic named %s on kafka",
+    (name) => {
+      const click = generateTableQuery([name], kafkaCapabilities);
+      const buffer = generateSelectQuery([name], [], kafkaCapabilities);
+      // The premise: both texts are read requests naming the topic, and neither is a MongoDB command.
+      expect(JSON.parse(click).topic).toBe(name);
+      expect(JSON.parse(buffer).topic).toBe(name);
+      expect(isDangerousQuery(click, "mongodb")).toBe(true);
+      expect(isDangerousQuery(buffer, "mongodb")).toBe(true);
+
+      expect(isDangerousQuery(click, "kafka")).toBe(false);
+      expect(isDangerousQuery(buffer, "kafka")).toBe(false);
+    },
+  );
 
   // ── The dialect decides what the statement says (#292) ──────────────────
   //
@@ -1207,7 +2313,7 @@ describe("isDangerousQuery", () => {
    */
   test.each<[string, string]>([
     ["a no-break space", " DROP TABLE users"],
-    ["a line separator", " DROP TABLE users"],
+    ["a line separator", "\u2028DROP TABLE users"],
   ])("still prompts for a destructive statement behind %s", (_label, query) => {
     expect(isDangerousQuery(query, "mysql")).toBe(true);
     expect(isDangerousQuery(query)).toBe(true);
@@ -1234,16 +2340,54 @@ describe("isDangerousQuery", () => {
    * The statement below leads with `SELECT` on purpose: a leading `UPDATE` is
    * answered by the vocabulary test without the probe ever running, so it would
    * guard nothing.
+   *
+   * WHAT IS ASSERTED IS THE SHAPE, NOT A CPU BUDGET, and the defect is what decides
+   * that. Quadratic is a statement about GROWTH, so the same predicate is timed at
+   * 35 KB and at ten times that, and the question is what the tenfold text costs:
+   * linear answers about ten, and the quadratic pattern this replaced answers about a
+   * hundred, which is what its own numbers above say (2.5x the text, 6.25x the time).
+   * The absolute `< 200ms` this replaces measured the machine as much as the code -
+   * it is one sample on a shared box, and a test process descheduled for 200ms of
+   * its own turn reports a performance regression that is not there.
+   *
+   * Best of nine, interleaved: preemption only ever ADDS time, so the minimum of a
+   * run is its least-polluted sample, and alternating the two sizes keeps a slow
+   * patch of the machine from landing on one of them alone. Measured here on 20 cores:
+   * 10.3x idle, worst of 40 concurrent processes 17.8x, worst of 64 25.1x, so the
+   * ceiling of 40 sits above every load this suite is run under and well below the
+   * defect.
+   *
+   * Both answers are asserted on every sample, so a predicate that returned early
+   * cannot pass this by being fast for a reason the ratio cannot see.
    */
-  test("answers in bounded time on a statement holding many UPDATE words and no SET", () => {
-    const query = `SELECT ${"UPDATE ".repeat(20000)}(`;
+  test("answers in time that grows with the statement, not with its square", () => {
+    const manyUpdates = (repeats: number) => `SELECT ${"UPDATE ".repeat(repeats)}(`;
+    const small = manyUpdates(5_000); // 35 KB
+    const large = manyUpdates(50_000); // 350 KB, ten times the text
 
-    const started = performance.now();
-    const dangerous = isDangerousQuery(query);
-    const elapsed = performance.now() - started;
+    const timeOne = (query: string) => {
+      const started = performance.now();
+      const dangerous = isDangerousQuery(query);
+      const elapsed = performance.now() - started;
+      expect(dangerous).toBe(false);
+      return elapsed;
+    };
 
-    expect(dangerous).toBe(false);
-    expect(elapsed, `took ${elapsed.toFixed(1)}ms`).toBeLessThan(200);
+    let smallBest = Number.POSITIVE_INFINITY;
+    let largeBest = Number.POSITIVE_INFINITY;
+    for (let round = 0; round < 9; round += 1) {
+      smallBest = Math.min(smallBest, timeOne(small));
+      largeBest = Math.min(largeBest, timeOne(large));
+    }
+
+    const ratio = largeBest / smallBest;
+    const measured = `${smallBest.toFixed(1)}ms at 35KB, ${largeBest.toFixed(1)}ms at 350KB, ${ratio.toFixed(1)}x`;
+    expect(ratio, measured).toBeLessThan(40);
+    // And a ceiling the ratio cannot see: a rewrite that is uniformly slow keeps its
+    // shape while costing a second per execute. 17.4ms measured here, 6406ms for the
+    // pattern this replaced, so 2000ms separates the two without measuring the
+    // machine the way the old absolute budget did.
+    expect(largeBest, measured).toBeLessThan(2000);
   });
 
   // ── The gate reads what the RUNNER will run (S1) ─────────────────────────
@@ -1327,5 +2471,661 @@ describe("isDangerousQuery", () => {
     // And the everyday read that motivated the narrowing still does not prompt: the
     // SQL inside the filter is a value, and `find` is not in the vocabulary.
     expect(isDangerousQuery('{"operation":"find","filter":{"note":"; drop table t"}}', "mongodb")).toBe(false);
+  });
+});
+
+describe("QuerySafetyDialog and a column the engine only inferred from sampled data", () => {
+  const QUERY = "DELETE FROM articles WHERE category = 'x'";
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    cleanup();
+  });
+
+  test("the safety analysis request carries no byte of it", async () => {
+    const fetchMock = mock(async () => createStreamResponse({ chunks: ["Plain text analysis output"] }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    render(
+      <QuerySafetyDialog
+        isOpen
+        query={QUERY}
+        schemaContext={schemaContextOf(sampledSchema)}
+        databaseType="postgres"
+        onClose={() => {}}
+        onProceed={() => {}}
+      />,
+    );
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalled();
+    });
+    const body = String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body);
+    expect(body).toContain("category");
+    expect(body).not.toContain(SAMPLED_MARKER);
+  });
+
+  test("the host's onAnalyzeSafety receives no byte of it", async () => {
+    const onAnalyzeSafety = mock(async () => ({
+      riskLevel: "low" as const,
+      summary: "Deletes the rows of one category.",
+      warnings: [],
+      affectedRows: "unknown",
+      cascadeEffects: "none",
+      recommendation: "Proceed.",
+    }));
+    render(
+      <QuerySafetyDialog
+        isOpen
+        query={QUERY}
+        schemaContext={schemaContextOf(sampledSchema)}
+        databaseType="postgres"
+        onClose={() => {}}
+        onProceed={() => {}}
+        onAnalyzeSafety={onAnalyzeSafety}
+      />,
+    );
+    await waitFor(() => {
+      expect(onAnalyzeSafety).toHaveBeenCalled();
+    });
+    const argument = (onAnalyzeSafety.mock.calls[0] as unknown as [{ query: string; schemaContext: string }])[0];
+    expect(argument.schemaContext).toContain("category");
+    expect(argument.schemaContext).not.toContain(SAMPLED_MARKER);
+  });
+});
+
+describe("Snowflake's confirmation forms", () => {
+  const FORMS = [
+    "CREATE OR REPLACE TABLE t AS SELECT 1",
+    "INSERT OVERWRITE INTO t SELECT 1",
+    "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
+    "COPY INTO @s FROM t",
+    "REMOVE @s/a",
+    "RM @s/a",
+    "EXECUTE IMMEDIATE 'SELECT 1'",
+    "EXECUTE TASK t",
+    "CALL p()",
+    "CREATE WAREHOUSE w",
+    "CREATE TASK t AS SELECT 1",
+    "CREATE USER u",
+    "CREATE ROLE r",
+    "CREATE NETWORK POLICY n",
+    "CREATE OR ALTER TABLE t (a INT)",
+    "EXECUTE ALERT a",
+    "EXECUTE NOTEBOOK n()",
+    "EXECUTE JOB SERVICE IN COMPUTE POOL p FROM SPECIFICATION $$ spec: {} $$",
+    "EXECUTE DBT PROJECT p",
+    "CREATE COMPUTE POOL p MIN_NODES = 1 MAX_NODES = 1 INSTANCE_FAMILY = GPU_NV_L",
+    "CREATE SERVICE s IN COMPUTE POOL p FROM SPECIFICATION $$ spec: {} $$",
+    "CREATE DYNAMIC TABLE d TARGET_LAG = '1 minute' WAREHOUSE = w AS SELECT 1",
+    "CREATE TRANSIENT DYNAMIC TABLE d TARGET_LAG = '1 minute' WAREHOUSE = w AS SELECT 1",
+    "CREATE ALERT a WAREHOUSE = w SCHEDULE = '1 MINUTE' IF (EXISTS (SELECT 1)) THEN SELECT 1",
+    "CREATE MATERIALIZED VIEW mv AS SELECT 1",
+    "CREATE SECURE MATERIALIZED VIEW mv AS SELECT 1",
+    "CREATE PIPE p AUTO_INGEST = TRUE AS COPY INTO t FROM @s",
+    "CREATE EXTERNAL ACCESS INTEGRATION i ALLOWED_NETWORK_RULES = (r) ENABLED = TRUE",
+    "CREATE API INTEGRATION i API_PROVIDER = AWS_API_GATEWAY API_AWS_ROLE_ARN = 'arn:aws:iam::1:role/r' API_ALLOWED_PREFIXES = ('https://example.com') ENABLED = TRUE",
+    "CREATE NETWORK RULE r MODE = EGRESS TYPE = HOST_PORT VALUE_LIST = ('example.com')",
+    "CREATE REPLICATION GROUP g OBJECT_TYPES = DATABASES ALLOWED_DATABASES = d ALLOWED_ACCOUNTS = o.a",
+    "CREATE FAILOVER GROUP g OBJECT_TYPES = DATABASES ALLOWED_DATABASES = d ALLOWED_ACCOUNTS = o.a",
+    "CREATE CORTEX SEARCH SERVICE s ON c WAREHOUSE = w TARGET_LAG = '1 hour' AS SELECT c FROM t",
+    "CREATE DYNAMIC ICEBERG TABLE d TARGET_LAG = '1 minute' WAREHOUSE = w AS SELECT 1",
+    // SF-013: forms that change who can sign in, move data out of the account or create a billed account.
+    "CREATE SECURITY INTEGRATION D_GATE_SI TYPE = D_INVALID_NOPE",
+    "CREATE NOTIFICATION INTEGRATION n TYPE = QUEUE NOTIFICATION_PROVIDER = AWS_SNS ENABLED = TRUE",
+    "CREATE STORAGE INTEGRATION s TYPE = EXTERNAL_STAGE STORAGE_PROVIDER = 'S3' ENABLED = TRUE",
+    "CREATE ACCOUNT D_GATE_ACCT ADMIN_NAME = a ADMIN_PASSWORD = 'p' EMAIL = 'a@example.com' EDITION = STANDARD",
+    "CREATE MANAGED ACCOUNT r ADMIN_NAME = a, ADMIN_PASSWORD = 'p', TYPE = READER",
+    "CREATE SHARE sh",
+    "CREATE STAGE E_NO_STAGE_X URL = 's3://bucket/path/'",
+    "CREATE STAGE IF NOT EXISTS s STORAGE_INTEGRATION = i URL = 'azure://a.blob.core.windows.net/c'",
+    "CREATE TEMPORARY STAGE s URL = 'gcs://bucket/'",
+    "CREATE TEMP STAGE s /* external */ URL='s3://bucket/'",
+  ];
+
+  test.each(FORMS)("asks for %s, in any case and behind any comment", (sql) => {
+    for (const text of [sql, sql.toLowerCase()]) {
+      for (const lead of ["", "-- x\n", "// x\n", "/* x */ "]) {
+        expect(isDangerousQuery(`${lead}${text}`, "snowflake")).toBe(true);
+      }
+    }
+  });
+
+  test("a form's later words may sit behind comments and line breaks, and a cut-off form does not ask", () => {
+    expect(isDangerousQuery("CREATE /* x */ OR ALTER TABLE t (a INT)", "snowflake")).toBe(true);
+    expect(isDangerousQuery("CREATE -- x\nOR\n  ALTER TABLE t (a INT)", "snowflake")).toBe(true);
+    expect(isDangerousQuery("EXECUTE // x\n ALERT a", "snowflake")).toBe(true);
+    expect(isDangerousQuery("CREATE OR", "snowflake")).toBe(false);
+    expect(isDangerousQuery("CREATE OR /* x */", "snowflake")).toBe(false);
+    expect(isDangerousQuery("EXECUTE 'ALERT'", "snowflake")).toBe(false);
+  });
+
+  test("a form after a read, inside a block, behind a procedure definition or a SYSTEM$ call asks", () => {
+    expect(isDangerousQuery("SELECT 1; EXECUTE IMMEDIATE 'SELECT 2'", "snowflake")).toBe(true);
+    expect(isDangerousQuery("BEGIN CREATE OR REPLACE TABLE t AS SELECT 1; END", "snowflake")).toBe(true);
+    expect(isDangerousQuery("BEGIN COPY INTO @s FROM t; END", "snowflake")).toBe(true);
+    expect(isDangerousQuery("BEGIN CREATE OR ALTER TABLE t (a INT); END", "snowflake")).toBe(true);
+    expect(isDangerousQuery("SELECT 1; EXECUTE ALERT a", "snowflake")).toBe(true);
+    expect(isDangerousQuery("BEGIN CREATE API INTEGRATION i ENABLED = TRUE; END", "snowflake")).toBe(true);
+    expect(isDangerousQuery("BEGIN CREATE STAGE s URL = 's3://b/'; END", "snowflake")).toBe(true);
+    expect(isDangerousQuery("SELECT 1; CREATE SHARE sh", "snowflake")).toBe(true);
+    // ALTER SESSION does not ask, but a write beside it still does, and so does any other ALTER (SF-030).
+    expect(isDangerousQuery("ALTER SESSION SET QUERY_TAG = 'e'; DELETE FROM t", "snowflake")).toBe(true);
+    expect(isDangerousQuery("BEGIN ALTER SESSION SET QUERY_TAG = 'e'; DROP TABLE t; END", "snowflake")).toBe(true);
+    expect(isDangerousQuery("ALTER SESSIONS_T RENAME TO x", "snowflake")).toBe(true);
+    expect(isDangerousQuery("ALTER TABLE session SET COMMENT = 'x'", "snowflake")).toBe(true);
+    expect(isDangerousQuery("ALTER USER u SET DEFAULT_ROLE = r", "snowflake")).toBe(true);
+    // A session policy is an account object that outlives the statement, so altering one asks.
+    expect(isDangerousQuery("ALTER SESSION POLICY p SET SESSION_IDLE_TIMEOUT_MINS = 600", "snowflake")).toBe(true);
+    expect(isDangerousQuery("ALTER SESSION POLICY IF EXISTS p UNSET SESSION_IDLE_TIMEOUT_MINS", "snowflake")).toBe(
+      true,
+    );
+    expect(isDangerousQuery("ALTER /* x */ SESSION POLICY p RENAME TO q", "snowflake")).toBe(true);
+    expect(isDangerousQuery("BEGIN ALTER SESSION POLICY p SET SESSION_IDLE_TIMEOUT_MINS = 600; END", "snowflake")).toBe(
+      true,
+    );
+    expect(
+      isDangerousQuery(
+        "WITH p AS PROCEDURE () RETURNS INT LANGUAGE SQL AS $$ BEGIN RETURN 1; END $$ CALL p()",
+        "snowflake",
+      ),
+    ).toBe(true);
+    expect(isDangerousQuery("SELECT SYSTEM$CLUSTERING_INFORMATION('t')", "snowflake")).toBe(true);
+    expect(isDangerousQuery("select system$clustering_information('t')", "snowflake")).toBe(true);
+    // A quoted upper-case name resolves as the bare name does, so a quoted SYSTEM$ call asks too.
+    expect(isDangerousQuery('SELECT "SYSTEM$WAIT"(10)', "snowflake")).toBe(true);
+    expect(isDangerousQuery('SELECT "SYSTEM$WAIT" /* x */ (10)', "snowflake")).toBe(true);
+    expect(isDangerousQuery('SELECT SNOWFLAKE.."SYSTEM$WAIT"(10)', "snowflake")).toBe(true);
+  });
+
+  // `$` is a name character and `$$` the only dollar-quoted form (M64), and a backslash inside `"…"` is part of the
+  // name (M61), so neither hides the code written after it.
+  test("a `$` inside a name and a backslash inside a quoted name hide nothing written after them", () => {
+    expect(isDangerousQuery("SELECT 1 AS a$b$c; DELETE FROM t", "snowflake")).toBe(true);
+    expect(isDangerousQuery('SELECT 1 AS "a\\", SYSTEM$CANCEL_ALL_QUERIES(1) --"', "snowflake")).toBe(true);
+  });
+
+  test.each([
+    "SELECT 'MERGE INTO t'",
+    "SELECT 'SYSTEM$X'",
+    'SELECT "SYSTEM$X" FROM t',
+    'SELECT "system$wait"(10)',
+    'SELECT "SYSTEM$X" AS a, f(1) FROM t',
+    "SELECT 1 /* CALL p() */",
+    "SHOW TABLES",
+    "CREATE TABLE t2 CLONE t",
+    "UNDROP TABLE t",
+    "SELECT 1 AS a // note; DROP TABLE t",
+    "// MERGE INTO t\nSELECT 1",
+    "SELECT my_system$x FROM t",
+    "BEGIN SELECT 1; END",
+    // An internal stage keeps its files in the account, so only a stage with a URL asks (SF-013).
+    "CREATE STAGE s",
+    "CREATE TEMPORARY STAGE s FILE_FORMAT = (TYPE = CSV) COMMENT = 'URL = s3://not/a/url'",
+    "CREATE STAGE s -- URL = 's3://b/'",
+    "BEGIN CREATE STAGE s; END",
+    "SELECT url FROM t",
+    // Each Snowflake statement runs in its own session, so a session setting cannot outlive it (SF-030).
+    "ALTER SESSION SET QUERY_TAG = 'e'",
+    "alter session unset query_tag",
+    "-- tag\nALTER /* x */ SESSION SET TIMEZONE = 'UTC'",
+    "BEGIN ALTER SESSION SET QUERY_TAG = 'e'; END",
+  ])("does not ask for %s", (sql) => {
+    expect(isDangerousQuery(sql, "snowflake")).toBe(false);
+  });
+
+  // Today's answers on four other engines, measured before the forms existed, so the forms reach no other dialect.
+  // MERGE asks on every engine, as shared vocabulary rather than a Snowflake form.
+  test.each([
+    ["postgres", false],
+    ["mssql", false],
+    ["databend", false],
+    ["bigquery", false],
+  ] as const)("%s keeps its verdicts", (type, expected) => {
+    expect(isDangerousQuery("CREATE OR REPLACE VIEW v AS SELECT 1", type)).toBe(expected);
+    expect(isDangerousQuery("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", type)).toBe(true);
+    expect(isDangerousQuery("CALL p()", type)).toBe(expected);
+    expect(isDangerousQuery("COPY INTO t FROM @s", type)).toBe(expected);
+    expect(isDangerousQuery("SELECT SYSTEM$X()", type)).toBe(expected);
+    expect(isDangerousQuery("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = 1", type)).toBe(true);
+  });
+
+  // Another engine's session can outlive the statement (a pooled Oracle session keeps it), so only Snowflake's row
+  // exempts ALTER SESSION (SF-030).
+  test.each(["postgres", "mysql", "oracle", "mssql", "databend"] as const)(
+    "%s still asks for ALTER SESSION",
+    (type) => {
+      expect(isDangerousQuery("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY'", type)).toBe(true);
+    },
+  );
+
+  test("SQL Server's procedure call still runs unasked", () => {
+    expect(isDangerousQuery("EXEC sp_cleanup", "mssql")).toBe(false);
+  });
+});
+
+// The `wordThenLiteral` code form, read before any row declares it: a code word whose next code, past whitespace and
+// comments, is a string literal. Spark's row declares `{ wordThenLiteral: "USING" }` for
+// `TRANSFORM ... USING '<command>'`.
+describe("a confirmCodeForms word followed by a string literal", () => {
+  const FORM: SqlGrammar = {
+    ...DEFAULT_SQL_GRAMMAR,
+    blockComment: "nesting",
+    backslashAlwaysEscapes: true,
+    rawStrings: true,
+    confirmCodeForms: [{ wordThenLiteral: "USING" }],
+  };
+
+  test.each([
+    "SELECT TRANSFORM(a) USING 'cat' FROM t",
+    "SELECT TRANSFORM(a) using 'cat' AS (b) FROM t",
+    'SELECT TRANSFORM(a) USING "cat" FROM t',
+    "SELECT TRANSFORM(a) USING /* c */ r'cat' FROM t",
+    "SELECT TRANSFORM(a) USING -- c\n 'cat' FROM t",
+    "FROM t MAP a USING 'cat'",
+    "FROM t REDUCE a USING 'cat' AS (b)",
+    // A `USING` that no literal follows does not end the reading: a later one still asks.
+    "WITH s AS (SELECT * FROM a JOIN b USING (id)) SELECT TRANSFORM(id) USING 'cat' FROM s",
+  ])("asks for %j", (sql) => {
+    expect(writesUnderGrammar(sql, FORM)).toBe(true);
+  });
+
+  test.each([
+    "SELECT * FROM a JOIN b USING (id)",
+    "CREATE TABLE t (a INT) USING parquet",
+    "CREATE TABLE t (a INT) USING `parquet`",
+    "SELECT TRANSFORM(a) USING $$cat$$ FROM t",
+    "SELECT 1 /* USING 'cat' */",
+    "SELECT 'USING', 'cat'",
+    "SELECT using_col FROM t WHERE x = 'cat'",
+    // A literal inside a comment between the word and its next code is not the literal that follows it.
+    "SELECT * FROM a JOIN b USING /* 'cat' */ (id)",
+  ])("does not ask for %j", (sql) => {
+    expect(writesUnderGrammar(sql, FORM)).toBe(false);
+  });
+
+  test("absent: the same text asks nothing", () => {
+    expect(writesUnderGrammar("SELECT TRANSFORM(a) USING 'cat' FROM t", DEFAULT_SQL_GRAMMAR)).toBe(false);
+  });
+});
+
+// The `quotedCall` code form, read before any row declares it: a terminated quoted name whose text is the form's name,
+// compared without case, that a `(` follows past whitespace and comments. Spark's row declares one per reflection
+// function, since Spark resolves `` `reflect`(...) `` as `reflect(...)`.
+describe("a confirmCodeForms quoted name called as a function", () => {
+  const FORM: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, confirmCodeForms: [{ quotedCall: "REFLECT" }] };
+
+  test.each([
+    "SELECT `reflect`('a', 'b')",
+    "SELECT `REFLECT`('a')",
+    "SELECT \"Reflect\"('a')",
+    "SELECT `reflect` /* c */ ('a')",
+    "SELECT `reflect` -- c\n('a')",
+    "SELECT s.`reflect`('a')",
+    // A quoted name no `(` follows does not end the reading: a later one still asks.
+    "SELECT `reflect` AS c, `reflect`('a') FROM t",
+  ])("asks for %j", (sql) => {
+    expect(writesUnderGrammar(sql, FORM)).toBe(true);
+  });
+
+  test.each([
+    "SELECT `reflect` FROM t",
+    "SELECT `reflect`.a FROM t",
+    "SELECT `reflection`('a')",
+    "SELECT `re``flect`('a')",
+    "SELECT 'reflect'('a')",
+    "SELECT 1 /* `reflect`('a') */",
+    // The bare word is the word sequence's to ask for, not this form's.
+    "SELECT reflect('a')",
+    // A quoted name that never closes is not read as a call here; `isDangerousQuery` asks for it as unreadable text.
+    "SELECT `reflect('a')",
+  ])("does not ask for %j", (sql) => {
+    expect(writesUnderGrammar(sql, FORM)).toBe(false);
+  });
+});
+
+// The `computedCall` code form, read before any row declares it: a code word, then a parenthesised run, then a `(`, past
+// whitespace and comments, which calls a function whose name the run computes. Spark's row declares
+// `{ computedCall: "IDENTIFIER" }` for `IDENTIFIER(<expr>)(...)`.
+describe("a confirmCodeForms word whose parenthesised run names the function called", () => {
+  const FORM: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, confirmCodeForms: [{ computedCall: "IDENTIFIER" }] };
+
+  test.each([
+    "SELECT IDENTIFIER('f')('a', 'b')",
+    "SELECT identifier('f' || 'g')(1)",
+    "SELECT IDENTIFIER /* c */ (concat('f', ')')) -- c\n (1)",
+    "SELECT IDENTIFIER(f(g(1), '('))(2)",
+    // An IDENTIFIER whose name is not called does not end the reading: a later one still asks.
+    "SELECT IDENTIFIER('c') FROM t WHERE IDENTIFIER('f')(1) > 0",
+  ])("asks for %j", (sql) => {
+    expect(writesUnderGrammar(sql, FORM)).toBe(true);
+  });
+
+  test.each([
+    "SELECT * FROM IDENTIFIER('t')",
+    "SELECT IDENTIFIER('c') FROM t",
+    "SELECT identifier FROM t",
+    "SELECT IDENTIFIER('f'",
+    "SELECT 'IDENTIFIER(f)(1)'",
+    "SELECT 1 /* IDENTIFIER('f')(1) */",
+  ])("does not ask for %j", (sql) => {
+    expect(writesUnderGrammar(sql, FORM)).toBe(false);
+  });
+});
+
+// The `dollarQuoted` code form, read before any row declares it: a dollar-quoted run, `$$` or a tagged opener, at a code
+// position as the span reader reads one at each character. Spark's row declares it, since Spark 4.2 reads such a run as
+// a metric view's YAML definition, which the gate does not read.
+describe("a confirmCodeForms dollar-quoted run", () => {
+  const FORM: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, confirmCodeForms: [{ dollarQuoted: true }] };
+
+  test.each([
+    "SELECT $$x$$",
+    "SELECT $tag$x$tag$",
+    "SELECT 1 /* c */, $$x$$ FROM t",
+    // The run is read at each character, as Spark's lexer reads it: Spark's names hold no `$`, so a `$$` right after a
+    // name's letters opens a run.
+    "SELECT a$$x$$",
+    // A run that never closes asks too; `isDangerousQuery` asks for it as unreadable text as well.
+    "SELECT $$x",
+  ])("asks for %j", (sql) => {
+    expect(writesUnderGrammar(sql, FORM)).toBe(true);
+  });
+
+  test.each(["SELECT '$$x$$'", "SELECT `$$x$$`", "SELECT 1 -- $$x$$", "SELECT 1 /* $t$x$t$ */", "SELECT $1"])(
+    "does not ask for %j",
+    (sql) => {
+      expect(writesUnderGrammar(sql, FORM)).toBe(false);
+    },
+  );
+});
+
+// The `confirmConfigKeys` fact, read before any row declares it: a SET or RESET of a listed session key asks, and so
+// does a RESET with no key, which restores every key. Spark's row lists variable substitution and the catalog keys.
+describe("a confirmConfigKeys key set or reset", () => {
+  const KEYS: SqlGrammar = {
+    ...DEFAULT_SQL_GRAMMAR,
+    confirmConfigKeys: ["spark.sql.variable.substitute", "spark.sql.defaultCatalog", "spark.sql.catalog."],
+  };
+
+  test.each([
+    "SET spark.sql.variable.substitute=true",
+    "SET spark.sql.variable.substitute = true",
+    "set SPARK.SQL.VARIABLE.SUBSTITUTE=TRUE",
+    "SET `spark.sql.variable.substitute`=true",
+    "SET /* c */ spark.sql.variable.substitute=true",
+    "-- note\nSET spark.sql.variable.substitute=true",
+    "RESET spark.sql.variable.substitute",
+    "SET spark.sql.defaultCatalog=lake",
+    "SET spark.sql.catalog.lake=org.apache.iceberg.spark.SparkCatalog",
+    "SET spark.sql.catalog.lake.uri=thrift://metastore:9083",
+    "RESET",
+    "RESET;",
+  ])("asks for %j", (sql) => {
+    expect(writesUnderGrammar(sql, KEYS)).toBe(true);
+  });
+
+  test.each([
+    "SET spark.sql.shuffle.partitions=8",
+    "SET spark.sql.catalogImplementation=hive",
+    "SET spark.sql.variable.substitute.depth=40",
+    "SET TIME ZONE 'UTC'",
+    "SET VAR x = 1",
+    "SET CATALOG 'lake'",
+    "SET PATH = DEFAULT_PATH",
+    "SET -v",
+    "SET",
+    "RESET spark.sql.shuffle.partitions",
+    "SELECT 'SET spark.sql.variable.substitute=true'",
+    // A SET without `=` only shows the key's value.
+    "SET spark.sql.variable.substitute",
+    "SET spark.sql.defaultCatalog;",
+  ])("does not ask for %j", (sql) => {
+    expect(writesUnderGrammar(sql, KEYS)).toBe(false);
+  });
+
+  test("absent: a RESET and a listed key ask nothing", () => {
+    expect(writesUnderGrammar("RESET", DEFAULT_SQL_GRAMMAR)).toBe(false);
+    expect(writesUnderGrammar("SET spark.sql.variable.substitute=true", DEFAULT_SQL_GRAMMAR)).toBe(false);
+  });
+
+  // Spark takes an unquoted key from the text after the keyword through `String.trim`, which removes every character
+  // at or below U+0020. A key in backticks, or in double quotes where Spark reads double quotes as identifier quotes
+  // (`spark.sql.ansi.enabled` and `spark.sql.ansi.doubleQuotedIdentifiers` both on), is one token, and the white space
+  // and comments around it are hidden (`SparkSqlParser.scala`, `parsers.scala` and `SqlBaseLexer.g4`, v4.2.0), so the
+  // key is read the same way here.
+  test.each([
+    "SET\u0001spark.sql.variable.substitute=true",
+    "RESET spark.sql.variable.substitute\u001f",
+    "RESET\u0001",
+    'SET "spark.sql.variable.substitute"=true',
+    'RESET "spark.sql.defaultCatalog"',
+    "SET `spark.sql.variable.substitute`/**/=true",
+    "SET `spark.sql.variable.substitute`/**/=`true`",
+    "RESET `spark.sql.variable.substitute`-- note",
+    "RESET `spark.sql.defaultCatalog`/**/",
+    "SET `spark.sql.variable.substitute`=true",
+    "SET　`spark.sql.defaultCatalog`=`lake`",
+    'SET "spark.sql.variable.substitute"/**/=true',
+  ])("asks for %j, the key read as Spark reads it", (sql) => {
+    expect(writesUnderGrammar(sql, KEYS)).toBe(true);
+  });
+
+  test.each([
+    "SET\u0001spark.sql.shuffle.partitions=8",
+    'SET "spark.sql.variable.substitute.depth"=40',
+    // A quoted key with no `=` after it, past white space and comments, only shows the value; Spark refuses the last.
+    "SET `spark.sql.variable.substitute`",
+    "SET `spark.sql.variable.substitute` /* c */;",
+    "SET `spark.sql.defaultCatalog`x=lake",
+  ])("does not ask for %j, the key read as Spark reads it", (sql) => {
+    expect(writesUnderGrammar(sql, KEYS)).toBe(false);
+  });
+
+  test("a doubled quote inside a quoted key is one quote, as Spark reads it", () => {
+    const QUOTED: SqlGrammar = { ...DEFAULT_SQL_GRAMMAR, confirmConfigKeys: ["a`b", 'a"b'] };
+    expect(writesUnderGrammar("SET `a``b`=1", QUOTED)).toBe(true);
+    expect(writesUnderGrammar('SET "a""b"=1', QUOTED)).toBe(true);
+    expect(writesUnderGrammar("SET `a````b`=1", QUOTED)).toBe(false);
+  });
+});
+
+// Spark's row: the forms that replace or overwrite data, load code, start a process, call a Java method, run text the
+// gate cannot read, drop partitions, rebind a catalog or switch variable substitution back on.
+describe("Apache Spark's confirmation forms", () => {
+  test.each([
+    "CREATE OR REPLACE TABLE t AS SELECT 1",
+    "CREATE OR REPLACE TEMPORARY VIEW v AS SELECT 1",
+    "REPLACE TABLE t (a INT) USING parquet",
+    "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
+    "LOAD DATA INPATH '/data/x.csv' OVERWRITE INTO TABLE t",
+    "CALL lake.system.rewrite_data_files('db.t')",
+    "EXECUTE IMMEDIATE 'SELECT 1'",
+    "ADD JAR '/opt/lib/udf.jar'",
+    "ADD ARCHIVES '/opt/lib/a.zip'",
+    "INSERT OVERWRITE TABLE t SELECT 1",
+    "FROM s INSERT INTO u SELECT a INSERT OVERWRITE TABLE t SELECT a",
+    "INSERT INTO t REPLACE WHERE a = 1 SELECT 1",
+    "INSERT INTO t REPLACE USING (a) SELECT 1",
+    // Spark 4.2's INSERT forms: WITH SCHEMA EVOLUTION before OVERWRITE, and REPLACE ON with a condition.
+    "INSERT WITH SCHEMA EVOLUTION OVERWRITE TABLE t SELECT * FROM s",
+    "FROM s INSERT INTO u SELECT a INSERT WITH SCHEMA EVOLUTION OVERWRITE t SELECT a",
+    "INSERT INTO t REPLACE ON t.id = s.id SELECT * FROM s",
+    "INSERT WITH SCHEMA EVOLUTION INTO t AS x BY NAME REPLACE ON x.id = s.id (SELECT * FROM u) AS s",
+    "CREATE FUNCTION f AS 'com.example.F' USING JAR '/opt/lib/udf.jar'",
+    "CREATE TEMPORARY FUNCTION f AS 'com.example.F' USING FILE '/opt/lib/f.py'",
+    "CREATE FUNCTION f AS 'com.example.F' USING ARCHIVE '/opt/lib/a.zip'",
+    "MSCK REPAIR TABLE t DROP PARTITIONS",
+    "REPAIR TABLE t SYNC PARTITIONS",
+    "SELECT TRANSFORM(a) USING 'cat' AS (b) FROM t",
+    'SELECT TRANSFORM(a) USING "cat" FROM t',
+    "SELECT TRANSFORM(a) USING /* c */ r'cat' FROM t",
+    "SELECT reflect('java.util.UUID', 'randomUUID')",
+    "SELECT java_method('java.util.UUID', 'randomUUID')",
+    "SELECT try_reflect('java.util.UUID', 'randomUUID')",
+    // Spark resolves a function name without case, quoted or not, and IDENTIFIER(<expr>) computes the name it calls.
+    "SELECT `reflect`('java.util.UUID', 'randomUUID')",
+    "SELECT `java_method`('java.util.UUID', 'randomUUID')",
+    "SELECT `try_reflect`('java.util.UUID', 'randomUUID')",
+    "SELECT system.builtin.`REFLECT` /* c */ ('java.util.UUID', 'randomUUID')",
+    "SELECT \"Java_Method\"('java.util.UUID', 'randomUUID')",
+    "SELECT IDENTIFIER('reflect')('java.util.UUID', 'randomUUID')",
+    "SELECT identifier -- c\n('java' || '_method') /* d */ ('java.util.UUID', 'randomUUID')",
+    // A dollar-quoted body is code the gate does not read: Spark 4.2 reads it as a metric view's YAML definition.
+    "CREATE VIEW mv WITH METRICS LANGUAGE YAML AS $$\nversion: 0.1\nsource: s\nmeasures:\n  - name: total\n    expr: SUM(amount)\n$$",
+    "SET spark.sql.variable.substitute=true",
+    "SET spark.sql.defaultCatalog=lake",
+    "SET spark.sql.catalog.lake=org.apache.iceberg.spark.SparkCatalog",
+    "RESET",
+    // A quoted key is one token, read past the white space and comments Spark hides.
+    "SET `spark.sql.variable.substitute`/**/=true",
+    "SET `spark.sql.variable.substitute`/**/=`true`",
+    "RESET `spark.sql.variable.substitute`-- note",
+    "RESET `spark.sql.defaultCatalog`/**/",
+    "SET `spark.sql.variable.substitute`=true",
+    "SET　`spark.sql.defaultCatalog`=`lake`",
+    'SET "spark.sql.variable.substitute"/**/=true',
+  ])("asks for %j", (sql) => {
+    expect(isDangerousQuery(sql, "spark")).toBe(true);
+  });
+
+  test("a CTE-led DELETE asks with a raw string or a hint in its CTE list, and so does a later statement", () => {
+    expect(isDangerousQuery("WITH x AS (SELECT r'C:\\' AS a) DELETE FROM t", "spark")).toBe(true);
+    expect(isDangerousQuery("WITH x AS (SELECT /*+ REPARTITION(2) */ a FROM u) DELETE FROM t", "spark")).toBe(true);
+    expect(isDangerousQuery("SELECT 1; SET spark.sql.variable.substitute=true", "spark")).toBe(true);
+    // A comment that holds `/*+` ends at its first `*/`, so the DROP after it is code.
+    expect(isDangerousQuery("SELECT 1 /* x /*+ */ ; DROP TABLE t; -- */", "spark")).toBe(true);
+    expect(isDangerousQuery("BEGIN SELECT r'\\'; DROP TABLE t; SELECT '\\''; END", "spark")).toBe(true);
+  });
+
+  test("a CTE-led DELETE after a `--` comment a backslash continues asks, as Spark reads it", () => {
+    // Spark reads `WITH c AS (SELECT 1 ) DELETE FROM u`: the backslash carries the comment over `) SELECT 1 --`.
+    expect(isDangerousQuery("WITH c AS (SELECT 1 -- note \\\n) SELECT 1 --\n) DELETE FROM u", "spark")).toBe(true);
+  });
+
+  test("a CTE-led INSERT OVERWRITE on the line after a lone carriage return asks, as Spark reads it", () => {
+    // Spark ends the `--` comment at the carriage return and reads `WITH c AS (SELECT 1) INSERT OVERWRITE TABLE u
+    // SELECT 1`; a comment read on to the line feed leaves `WITH c AS (SELECT 1) SELECT 1`, which does not ask.
+    expect(isDangerousQuery("WITH c AS (SELECT 1) -- note\rINSERT OVERWRITE TABLE u\nSELECT 1", "spark")).toBe(true);
+  });
+
+  test("a CTE-led DELETE after a hint closed right before `*` asks: `*/*` is the hint's closer and a `*`", () => {
+    expect(isDangerousQuery("WITH c AS (SELECT /*+ H */* FROM t) DELETE FROM u -- */", "spark")).toBe(true);
+  });
+
+  test("schema evolution and a REPLACE ask only where the INSERT overwrites or replaces rows", () => {
+    expect(isDangerousQuery("INSERT WITH SCHEMA EVOLUTION /* note */ OVERWRITE t SELECT 1", "spark")).toBe(true);
+    expect(isDangerousQuery("INSERT INTO t REPLACE -- note\nON t.id = 1 SELECT 1", "spark")).toBe(true);
+    expect(isDangerousQuery("INSERT WITH SCHEMA EVOLUTION INTO t SELECT 1", "spark")).toBe(false);
+    expect(isDangerousQuery("CREATE VIEW v WITH SCHEMA EVOLUTION AS SELECT 1", "spark")).toBe(false);
+    expect(isDangerousQuery("SELECT replace(a, 'x', 'y') FROM t JOIN u ON t.id = u.id", "spark")).toBe(false);
+  });
+
+  test("a quoted reflection name asks only where a `(` follows it, and IDENTIFIER only where its name is called", () => {
+    expect(isDangerousQuery("SELECT `Reflect` ('java.util.UUID', 'randomUUID')", "spark")).toBe(true);
+    expect(isDangerousQuery("SELECT `reflect`, `java_method` FROM t", "spark")).toBe(false);
+    expect(isDangerousQuery("SELECT `reflection`('a') FROM t", "spark")).toBe(false);
+    expect(isDangerousQuery("SELECT * FROM IDENTIFIER('t') WHERE IDENTIFIER('c') > 1", "spark")).toBe(false);
+    // The text cannot tell a column list from a call's arguments, so a table IDENTIFIER names before one asks too.
+    expect(isDangerousQuery("CREATE TABLE IDENTIFIER('t') (a INT)", "spark")).toBe(true);
+  });
+
+  test("a dollar-quoted body asks only where it stands at a code position", () => {
+    expect(isDangerousQuery("CREATE VIEW mv WITH METRICS LANGUAGE YAML AS $m$ source: s $m$", "spark")).toBe(true);
+    expect(isDangerousQuery("SELECT '$$x$$', `$$y$$` FROM t -- $$z$$", "spark")).toBe(false);
+  });
+
+  test.each([
+    "SELECT transform(arr, x -> x + 1) FROM t",
+    "SELECT map(1, 2)",
+    "SELECT reflection FROM t",
+    "SELECT * FROM a JOIN b USING (id)",
+    "CREATE TABLE t (a INT) USING parquet",
+    "SET spark.sql.shuffle.partitions=8",
+    "SET TIME ZONE 'UTC'",
+    "SELECT /*+ MERGE(t) */ * FROM t JOIN u ON t.id = u.id",
+    "SELECT r'C:\\' AS a",
+    "INSERT INTO t VALUES (1)",
+    "USE NAMESPACE studio",
+    "SET CATALOG 'lake'",
+    "CACHE TABLE t",
+    // A SET without `=` only shows the key's value, and these forms name no listed key.
+    "SET spark.sql.variable.substitute",
+    "SET `spark.sql.defaultCatalog`",
+    "SET VAR x = 1",
+    "SET PATH = DEFAULT_PATH",
+    "SET -v",
+  ])("does not ask for %j", (sql) => {
+    expect(isDangerousQuery(sql, "spark")).toBe(false);
+  });
+
+  test.each(["postgres", "databend", "snowflake"] as const)("%s keeps its verdicts", (type) => {
+    expect(isDangerousQuery("SELECT reflect('a', 'b')", type)).toBe(false);
+    expect(isDangerousQuery("SELECT try_reflect('a', 'b')", type)).toBe(false);
+    expect(isDangerousQuery("SELECT `reflect`('a', 'b')", type)).toBe(false);
+    expect(isDangerousQuery("SELECT IDENTIFIER('reflect')('a', 'b')", type)).toBe(false);
+    expect(isDangerousQuery("SET spark.sql.variable.substitute=true", type)).toBe(false);
+    expect(isDangerousQuery("SELECT TRANSFORM(a) USING 'cat' FROM t", type)).toBe(false);
+  });
+});
+
+// MERGE writes rows on every engine that has it, whichever WHEN branches it carries, so it is a shared keyword like
+// UPDATE and DELETE rather than a form each row declares.
+describe("MERGE asks on every SQL engine", () => {
+  test.each([
+    ["MERGE t USING s ON 1=1 WHEN MATCHED THEN DELETE;", "mssql"],
+    ["MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "postgres"],
+    ["merge into t using s on t.id = s.id when not matched then insert values (s.id)", "postgres"],
+    ["WITH s AS (SELECT 1 AS id) MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "postgres"],
+    ["-- sync\nMERGE INTO t USING s ON (t.id = s.id) WHEN MATCHED THEN DELETE WHERE 1 = 1", "oracle"],
+    ["BEGIN MERGE INTO t USING s ON (t.id = s.id) WHEN MATCHED THEN DELETE WHERE 1 = 1; END;", "oracle"],
+    ["MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "db2"],
+    ["MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "duckdb"],
+    ["MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "trino"],
+    ["MERGE ds.t USING ds.s ON t.id = s.id WHEN MATCHED THEN DELETE", "bigquery"],
+    ["MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "databend"],
+    ["MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "snowflake"],
+    ["MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "spark"],
+    ["SELECT 1; MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "postgres"],
+  ] as const)("%j on %s", (sql, type) => {
+    expect(isDangerousQuery(sql, type)).toBe(true);
+  });
+
+  test("a name or a literal that only spells the word does not ask", () => {
+    expect(isDangerousQuery("SELECT * FROM merge_log", "postgres")).toBe(false);
+    expect(isDangerousQuery("SELECT 'MERGE INTO t' AS note", "mssql")).toBe(false);
+  });
+});
+
+// PostgreSQL's DO runs an anonymous block whose body is a literal the gate does not read, so it asks whatever the body
+// does; the DO of ON CONFLICT and of CREATE RULE is followed by a word, never by a body, and does not.
+describe("a PostgreSQL DO block asks", () => {
+  test.each([
+    "DO $$ BEGIN DELETE FROM t; END $$",
+    "DO $body$ BEGIN DROP TABLE t; END $body$",
+    "do /* c */ $$ BEGIN RAISE NOTICE 'x'; END $$",
+    "DO 'BEGIN DELETE FROM t; END'",
+    "DO LANGUAGE plpgsql $$ BEGIN DELETE FROM t; END $$",
+    "SELECT 1; DO $$ BEGIN DELETE FROM t; END $$",
+  ])("%j", (sql) => {
+    expect(isDangerousQuery(sql, "postgres")).toBe(true);
+  });
+
+  test.each([
+    "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",
+    "BEGIN; INSERT INTO t VALUES (1) ON CONFLICT (id) DO NOTHING; COMMIT;",
+    "CREATE RULE r AS ON INSERT TO t DO INSTEAD NOTHING",
+    "SELECT 'DO $$ BEGIN DELETE FROM t; END $$' AS note",
+    "SELECT do FROM t WHERE do = 'x'",
+  ])("does not ask for %j", (sql) => {
+    expect(isDangerousQuery(sql, "postgres")).toBe(false);
+  });
+
+  test("MySQL's DO, which evaluates expressions, is not read as a block", () => {
+    expect(isDangerousQuery("DO SLEEP(1)", "mysql")).toBe(false);
+    expect(isDangerousQuery("DO 'x'", "mysql")).toBe(false);
   });
 });

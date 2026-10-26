@@ -7,6 +7,7 @@ import {
   type LLMConfig,
   type LLMStreamOptions,
 } from "@/lib/llm/types";
+import { NO_BACKOFF } from "../../helpers/llm-no-backoff";
 
 // ============================================================================
 // Import module under test (no mock.module needed — OpenAI uses globalThis.fetch)
@@ -93,23 +94,23 @@ describe("OpenAIProvider", () => {
 
   describe("constructor", () => {
     test("creates with valid config", () => {
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       expect(provider.name).toBe("openai");
       expect(provider.config.model).toBe("gpt-4o");
     });
 
     test("uses default OpenAI URL", () => {
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       expect(provider.config.apiUrl).toBeUndefined();
     });
 
     test("uses custom apiUrl when provided", () => {
-      const provider = new OpenAIProvider(makeConfig({ apiUrl: "https://custom.openai.com/v1" }));
+      const provider = new OpenAIProvider(makeConfig({ apiUrl: "https://custom.openai.com/v1" }), NO_BACKOFF);
       expect(provider.config.apiUrl).toBe("https://custom.openai.com/v1");
     });
 
     test("throws without apiKey", () => {
-      expect(() => new OpenAIProvider(makeConfig({ apiKey: undefined }))).toThrow(LLMConfigError);
+      expect(() => new OpenAIProvider(makeConfig({ apiKey: undefined }), NO_BACKOFF)).toThrow(LLMConfigError);
     });
   });
 
@@ -122,7 +123,7 @@ describe("OpenAIProvider", () => {
       const sseData = [makeSSEChunk("Hi"), "data: [DONE]\n\n"];
       fetchSpy.mockResolvedValueOnce(createSSEResponse(sseData));
 
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       await provider.stream(makeStreamOptions());
 
       expect(fetchSpy).toHaveBeenCalledTimes(1);
@@ -141,11 +142,38 @@ describe("OpenAIProvider", () => {
       expect(body.messages[0].role).toBe("user");
     });
 
+    test("sends LLM_MODEL_EFFORT as reasoning_effort when one is configured", async () => {
+      fetchSpy.mockResolvedValueOnce(createSSEResponse([makeSSEChunk("Hi"), "data: [DONE]\n\n"]));
+
+      const provider = new OpenAIProvider(makeConfig({ modelEffort: "high" }), NO_BACKOFF);
+      await provider.stream(makeStreamOptions());
+
+      const [url, opts] = fetchSpy.mock.calls[0] as [string, RequestInit];
+      // Still Chat Completions: this surface offers no tools, so nothing about it needs Responses.
+      expect(url).toContain("/chat/completions");
+      expect(JSON.parse(opts.body as string).reasoning_effort).toBe("high");
+    });
+
+    test("sends no reasoning_effort at all when none is configured", async () => {
+      fetchSpy.mockResolvedValueOnce(createSSEResponse([makeSSEChunk("Hi"), "data: [DONE]\n\n"]));
+
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
+      await provider.stream(makeStreamOptions());
+
+      const [, opts] = fetchSpy.mock.calls[0] as [string, RequestInit];
+      expect(Object.keys(JSON.parse(opts.body as string))).not.toContain("reasoning_effort");
+    });
+
+    test("an unknown effort is refused when the provider is built, before any request", () => {
+      expect(() => new OpenAIProvider(makeConfig({ modelEffort: "turbo" }), NO_BACKOFF)).toThrow(LLMConfigError);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
     test("returns ReadableStream with SSE parsed content", async () => {
       const sseData = [makeSSEChunk("Hello"), makeSSEChunk(" World"), "data: [DONE]\n\n"];
       fetchSpy.mockResolvedValueOnce(createSSEResponse(sseData));
 
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       const stream = await provider.stream(makeStreamOptions());
 
       expect(stream).toBeInstanceOf(ReadableStream);
@@ -157,7 +185,7 @@ describe("OpenAIProvider", () => {
       const sseData = [makeSSEChunk("ok"), "data: [DONE]\n\n"];
       fetchSpy.mockResolvedValueOnce(createSSEResponse(sseData));
 
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       await provider.stream(makeStreamOptions({ temperature: 0.7, maxTokens: 1000 }));
 
       const body = JSON.parse(fetchSpy.mock.calls[0][1]!.body as string);
@@ -169,7 +197,7 @@ describe("OpenAIProvider", () => {
       const sseData = [makeSSEChunk("ok"), "data: [DONE]\n\n"];
       fetchSpy.mockResolvedValueOnce(createSSEResponse(sseData));
 
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       await provider.stream(makeStreamOptions({ model: "gpt-3.5-turbo" }));
 
       const body = JSON.parse(fetchSpy.mock.calls[0][1]!.body as string);
@@ -186,35 +214,35 @@ describe("OpenAIProvider", () => {
       // Use mockImplementation so every retry also gets 401
       fetchSpy.mockImplementation(async () => createJsonResponse({ error: { message: "Invalid key" } }, 401));
 
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       await expect(provider.stream(makeStreamOptions())).rejects.toBeInstanceOf(LLMAuthError);
     });
 
     test("403 throws LLMAuthError", async () => {
       fetchSpy.mockImplementation(async () => createJsonResponse({ error: { message: "Forbidden" } }, 403));
 
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       await expect(provider.stream(makeStreamOptions())).rejects.toBeInstanceOf(LLMAuthError);
     });
 
     test("429 throws LLMRateLimitError", async () => {
       fetchSpy.mockImplementation(async () => createJsonResponse({ error: { message: "Rate limit" } }, 429));
 
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       await expect(provider.stream(makeStreamOptions())).rejects.toBeInstanceOf(LLMRateLimitError);
     });
 
     test("500 throws LLMStreamError", async () => {
       fetchSpy.mockImplementation(async () => createJsonResponse({ error: { message: "Internal Server Error" } }, 500));
 
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       await expect(provider.stream(makeStreamOptions())).rejects.toBeInstanceOf(LLMStreamError);
     });
 
     test("error body parsed as JSON", async () => {
       fetchSpy.mockImplementation(async () => createJsonResponse({ error: { message: "Custom error detail" } }, 500));
 
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       try {
         await provider.stream(makeStreamOptions());
         expect(true).toBe(false); // should not reach here
@@ -235,7 +263,7 @@ describe("OpenAIProvider", () => {
         throw new TypeError("fetch failed");
       });
 
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       try {
         await provider.stream(makeStreamOptions());
         expect(true).toBe(false);
@@ -250,7 +278,7 @@ describe("OpenAIProvider", () => {
         throw new Error("Something unexpected");
       });
 
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       await expect(provider.stream(makeStreamOptions())).rejects.toBeInstanceOf(LLMStreamError);
     });
 
@@ -259,7 +287,7 @@ describe("OpenAIProvider", () => {
         throw "string error";
       });
 
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       await expect(provider.stream(makeStreamOptions())).rejects.toBeInstanceOf(LLMStreamError);
     });
   });
@@ -273,7 +301,7 @@ describe("OpenAIProvider", () => {
       const sseData = [makeSSEChunk("ok"), "data: [DONE]\n\n"];
       fetchSpy.mockResolvedValueOnce(createSSEResponse(sseData));
 
-      const provider = new OpenAIProvider(makeConfig());
+      const provider = new OpenAIProvider(makeConfig(), NO_BACKOFF);
       await provider.stream(
         makeStreamOptions({
           messages: [
@@ -292,5 +320,53 @@ describe("OpenAIProvider", () => {
       expect(body.messages[2]).toEqual({ role: "assistant", content: "Hi there!" });
       expect(body.messages[3]).toEqual({ role: "user", content: "How are you?" });
     });
+  });
+});
+
+// A caller that bounds its wait (the query safety route does) hands a signal in, and a signal that never
+// reaches fetch bounds nothing: the request would keep the endpoint busy after the caller gave up.
+describe("OpenAIProvider abort signal", () => {
+  let fetchSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    fetchSpy = spyOn(globalThis, "fetch");
+  });
+
+  afterEach(() => {
+    fetchSpy.mockRestore();
+  });
+
+  test("hands the caller's signal to fetch", async () => {
+    fetchSpy.mockResolvedValueOnce(createSSEResponse([makeSSEChunk("Hi"), "data: [DONE]\n\n"]));
+    const controller = new AbortController();
+    await new OpenAIProvider(makeConfig(), NO_BACKOFF).stream(makeStreamOptions({ signal: controller.signal }));
+    expect((fetchSpy.mock.calls[0][1] as RequestInit).signal).toBe(controller.signal);
+  });
+
+  test("a request whose signal already aborted is never sent", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      new OpenAIProvider(makeConfig(), NO_BACKOFF).stream(makeStreamOptions({ signal: controller.signal })),
+    ).rejects.toThrow();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("an abort during the retry backoff sends no second request", async () => {
+    // THE ONE CASE HERE THAT KEEPS THE REAL BACKOFF, because the backoff is what it asserts: the
+    // abort has to land inside the wait, and `NO_BACKOFF` leaves no wait to land in. With a zero
+    // delay the second attempt goes out before the 10 ms abort and `toHaveBeenCalledTimes(1)`
+    // reads 3 (MEASURED - all four provider files failed exactly this case).
+    const controller = new AbortController();
+    fetchSpy.mockImplementation(async () => {
+      setTimeout(() => controller.abort(), 10);
+      throw new TypeError("fetch failed");
+    });
+    const started = Date.now();
+    await expect(
+      new OpenAIProvider(makeConfig()).stream(makeStreamOptions({ signal: controller.signal })),
+    ).rejects.toThrow();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(Date.now() - started).toBeLessThan(900);
   });
 });

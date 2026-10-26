@@ -8,6 +8,12 @@ import {
   OracleIcon,
   MSSQLIcon,
   LibreDBIcon,
+  ModbusIcon,
+  MtconnectIcon,
+  NetconfIcon,
+  SparkplugIcon,
+  OpcuaIcon,
+  SnmpIcon,
   CouchbaseIcon,
   ClickHouseIcon,
   DruidIcon,
@@ -17,278 +23,267 @@ import {
   CassandraIcon,
   LibSQLIcon,
   DuckDBIcon,
+  PrometheusIcon,
+  KafkaIcon,
+  EtcdIcon,
+  Db2Icon,
+  Neo4jIcon,
+  QdrantIcon,
+  MilvusIcon,
+  InfluxDBIcon,
+  OxiaIcon,
+  DatabendIcon,
+  BigQueryIcon,
+  S3Icon,
+  MqttIcon,
+  FirestoreIcon,
+  RabbitMQIcon,
+  KubernetesIcon,
+  SnowflakeIcon,
+  SparkIcon,
 } from "@/components/icons/db-icons";
+import type { HostUriScheme } from "@/lib/connection-host-uri";
+import type { ConnectionField } from "@/lib/db/connection-fields";
+import { CONNECTION_FORM, type ConnectionFormSpec, type FieldPlacementDeclaration } from "@/lib/db/connection-form";
 import type { DatabaseType } from "@/lib/types";
+
+export {
+  connectionFieldHint,
+  connectionFieldLabel,
+  connectionFieldPlaceholder,
+  connectionFieldPlacement,
+  connectionFieldRefusal,
+  connectionFieldShown,
+  DATABEND_FIELD_HINTS,
+  DATABEND_FIELD_RULES,
+  type FieldPlacementDeclaration,
+  KUBERNETES_FIELD_HINTS,
+  KUBERNETES_FIELD_RULES,
+  offersSslPanel,
+  RABBITMQ_FIELD_HINTS,
+  RABBITMQ_FIELD_RULES,
+  readOnlyHint,
+  S3_FIELD_HINTS,
+  S3_FIELD_RULES,
+  SNOWFLAKE_FIELD_HINTS,
+  SNOWFLAKE_FIELD_RULES,
+  SPARK_FIELD_HINTS,
+  SPARK_FIELD_RULES,
+} from "@/lib/db/connection-form";
 
 // DB brand icons share the same interface as LucideIcon (className + SVG props)
 export type DBIcon = LucideIcon | React.FC<React.SVGAttributes<SVGSVGElement> & { className?: string }>;
 
-export interface DatabaseUIConfig {
+/** The connection dialog's entry for one engine: its form data (src/lib/db/connection-form.ts), its icon and its colour. */
+export interface DatabaseUIConfig extends ConnectionFormSpec {
   icon: DBIcon;
   color: string;
-  label: string;
-  defaultPort: string;
-  showConnectionStringToggle: boolean;
-  connectionFields: (
-    | "host"
-    | "port"
-    | "user"
-    | "password"
-    | "database"
-    | "connectionString"
-    | "serviceName"
-    | "instanceName"
-    // Cassandra only, and it is REQUIRED rather than advanced: `cassandra-driver`
-    // refuses to construct a load-balancing policy without a local data centre, so a
-    // connection with this empty cannot open at all.
-    | "localDataCenter"
-    // MongoDB only: the database its credentials live in, which the driver otherwise
-    // assumes is the one being opened.
-    | "authSource"
-  )[];
 }
 
-/** One addressing field, named by the same list that decides whether a save writes it. */
-export type ConnectionField = DatabaseUIConfig["connectionFields"][number];
+export type { ConnectionField } from "@/lib/db/connection-fields";
 
-export const DB_UI_CONFIG: Record<DatabaseType, DatabaseUIConfig> = {
-  postgres: {
-    icon: PostgreSQLIcon,
-    color: "text-blue-400",
-    label: "PostgreSQL",
-    defaultPort: "5432",
-    showConnectionStringToggle: false,
-    connectionFields: ["host", "port", "user", "password", "database"],
-  },
-  mysql: {
-    icon: MySQLIcon,
-    color: "text-amber-400",
-    label: "MySQL",
-    defaultPort: "3306",
-    showConnectionStringToggle: false,
-    connectionFields: ["host", "port", "user", "password", "database"],
-  },
-  sqlite: {
-    icon: SQLiteIcon,
-    color: "text-cyan-400",
-    label: "SQLite",
-    defaultPort: "",
-    showConnectionStringToggle: false,
-    connectionFields: ["database"],
-  },
-  duckdb: {
-    icon: DuckDBIcon,
-    // DuckDB's own mark is a bright yellow (#FFF000), and `text-yellow-400` is already
-    // ClickHouse's. yellow-300 is the nearest free shade, and the distinct-colour
-    // assertion in tests/unit/lib/db-ui-config.test.ts rules a duplicate out.
-    color: "text-yellow-300",
-    label: "DuckDB",
-    // Embedded: nothing is listening anywhere, so there is no port to default.
-    defaultPort: "",
-    // No URI scheme exists to paste - DuckDB's own tooling takes a path - so the
-    // provider declares `supportsConnectionString: false` and this toggle stays off.
-    showConnectionStringToggle: false,
-    // Exactly `["database"]`, which is the shape `isFileBased()` below tests for: it
-    // is what makes ConnectionModal render "Database File Path" instead of a
-    // host/user/password section. One extra field here would silently take the file
-    // input away.
-    connectionFields: ["database"],
-  },
-  libsql: {
-    icon: LibSQLIcon,
-    // Turso's own mark is a bright mint green (#4FF8D2). emerald-300 is the nearest
-    // free shade - emerald-400 is MongoDB's, both teals are taken by Couchbase and
-    // Elasticsearch, and the distinct-colour assertion in
-    // tests/unit/lib/db-ui-config.test.ts rules a duplicate out.
-    color: "text-emerald-300",
-    // The protocol's name rather than the product's: one connection here reaches a
-    // self-hosted libSQL server OR Turso Cloud, and naming the managed product would
-    // read as though the self-hosted one belonged somewhere else.
-    label: "libSQL",
-    // sqld's own default HTTP port. A Turso Cloud connection names no port at all -
-    // it is TLS on 443, which the transport picks up from the ssl setting.
-    defaultPort: "8080",
-    // `libsql://<database>-<org>.turso.io?authToken=<jwt>` is the URL Turso's CLI
-    // prints, so there IS a canonical form to paste - unlike Trino's JDBC URL.
-    showConnectionStringToggle: true,
-    // No `user`: libSQL has no user names at all, and the credential is a token the
-    // server mints. No `database` either - the database IS the host on Turso Cloud,
-    // and a self-hosted server serves one per namespace hostname. The form labels
-    // `password` "Auth Token" (see ConnectionModal.tsx), because a field labelled
-    // Password invites a password that no libSQL server has.
-    connectionFields: ["host", "port", "password", "connectionString"],
-  },
-  mongodb: {
-    icon: MongoDBIcon,
-    color: "text-emerald-400",
-    label: "MongoDB",
-    defaultPort: "27017",
-    showConnectionStringToggle: true,
-    connectionFields: ["host", "port", "user", "password", "database", "connectionString", "authSource"],
-  },
-  redis: {
-    icon: RedisIcon,
-    color: "text-rose-400",
-    label: "Redis",
-    defaultPort: "6379",
-    showConnectionStringToggle: false,
-    // `user` is the Redis 6 ACL user. It belongs here because `RedisProvider.connect()`
-    // authenticates with it (as ioredis's `username`) and docs/providers/redis.md has
-    // documented it as a connection field all along - this list was the one place that
-    // disagreed, and since it decides what a save WRITES, the value never reached the
-    // driver that #502 taught to send it.
-    connectionFields: ["host", "port", "user", "password", "database"],
-  },
-  oracle: {
-    icon: OracleIcon,
-    color: "text-red-400",
-    label: "Oracle",
-    defaultPort: "1521",
-    showConnectionStringToggle: false,
-    connectionFields: ["host", "port", "user", "password", "database", "serviceName"],
-  },
-  mssql: {
-    icon: MSSQLIcon,
-    color: "text-sky-400",
-    label: "SQL Server",
-    defaultPort: "1433",
-    showConnectionStringToggle: false,
-    connectionFields: ["host", "port", "user", "password", "database", "instanceName"],
-  },
-  couchbase: {
-    icon: CouchbaseIcon,
-    color: "text-orange-400",
-    label: "Couchbase",
-    // Management port. The query ports are discovered from the cluster at connect
-    // time (issue #262, decision 3), so only this one is ever stored.
-    defaultPort: "8091",
-    showConnectionStringToggle: true,
-    connectionFields: ["host", "port", "user", "password", "database", "connectionString"],
-  },
-  clickhouse: {
-    icon: ClickHouseIcon,
-    color: "text-yellow-400",
-    label: "ClickHouse",
-    // The HTTP interface port. The provider speaks HTTP only, so the native
-    // protocol port 9000 is never a valid value here (issue #264).
-    defaultPort: "8123",
-    showConnectionStringToggle: true,
-    connectionFields: ["host", "port", "user", "password", "database", "connectionString"],
-  },
-  druid: {
-    icon: DruidIcon,
-    // Issue #265 specified text-sky-400, which mssql already owns; the distinct-colour
-    // assertion in tests/unit/lib/db-ui-config.test.ts rules a duplicate out. teal-400
-    // is the nearest free shade and is closer to Druid's own petrol-teal mark anyway.
-    color: "text-teal-400",
-    label: "Apache Druid",
-    // The Router port. The Broker on 8082 serves the identical POST /druid/v2/sql and
-    // needs no different configuration (live-verified, issue #265); the Router is the
-    // default only because it also fronts the console and the management-proxied APIs.
-    defaultPort: "8888",
-    // No URI convention exists for Druid's HTTP SQL API - its JDBC driver addresses
-    // Avatica (jdbc:avatica:remote:url=...), and http:// / https:// already resolve to
-    // ClickHouse in connection-string-parser.ts. There is nothing to paste.
-    showConnectionStringToggle: false,
-    // Deliberately no "database": INFORMATION_SCHEMA.SCHEMATA reports exactly one
-    // catalog, always named `druid`, so a database selector would be a control with no
-    // effect. Credentials stay offered because a cluster running druid-basic-security
-    // needs them; a default install ignores the Authorization header entirely.
-    connectionFields: ["host", "port", "user", "password"],
-  },
-  elasticsearch: {
-    icon: ElasticsearchIcon,
-    // The Elastic mark's own hues are teal (#00bfb3) and yellow (#fed10a); teal-400
-    // and yellow-400 are already owned by druid and clickhouse, and the distinct-colour
-    // assertion in tests/unit/lib/db-ui-config.test.ts rules a duplicate out. teal-300
-    // is the nearest free shade to the brand teal.
-    color: "text-teal-300",
-    label: "Elasticsearch",
-    // 9200 for both products and both schemes: a TLS deployment serves HTTPS on the
-    // SAME port rather than on a second well-known one, so unlike ClickHouse there is
-    // no 8443-shaped alternative (the provider's SEARCH_DEFAULT_PORT says the same).
-    defaultPort: "9200",
-    // No URI convention to paste: the provider is addressed by host and port like
-    // Druid, and http:// / https:// already resolve to ClickHouse in
-    // connection-string-parser.ts. Nothing was added there for these two ids.
-    showConnectionStringToggle: false,
-    // Deliberately no "database": an index has no namespace above it - measured, ES's
-    // SHOW TABLES reports only a catalog (the cluster name) and OpenSearch reports
-    // TABLE_SCHEM null, and the catalog is not addressable in a statement - so a
-    // database selector would be a control with no effect. Credentials stay offered
-    // because a cluster running the security plugin needs them; a stock node ignores
-    // the Authorization header entirely (measured).
-    connectionFields: ["host", "port", "user", "password"],
-  },
-  opensearch: {
-    icon: OpenSearchIcon,
-    // OpenSearch's Pacific Blue (#005EB8) is deeper and bluer than postgres' own
-    // blue-400, which already owns "blue" here; indigo-400 is the nearest free shade.
-    color: "text-indigo-400",
-    label: "OpenSearch",
-    // Same 9200 floor, same reason - the fork kept the port.
-    defaultPort: "9200",
-    showConnectionStringToggle: false,
-    connectionFields: ["host", "port", "user", "password"],
-  },
-  trino: {
-    icon: TrinoIcon,
-    // Trino's own mark is a magenta-pink (#DD00A1); pink-400 is the nearest free
-    // shade, and the distinct-colour assertion in tests/unit/lib/db-ui-config.test.ts
-    // rules a duplicate out.
-    color: "text-pink-400",
-    // The product's own name, with no vendor word in front of it: "Trino" is what the
-    // project calls itself, unlike "Apache Druid".
-    label: "Trino",
-    // The coordinator's HTTP port, and the SAME number under TLS: a secured cluster
-    // serves on whatever port its operator chose, so inventing a well-known HTTPS
-    // alternative would point credentials at a port nothing is listening on.
-    defaultPort: "8080",
-    // No URI to paste. Trino's canonical URL is a JDBC one
-    // (`jdbc:trino://host:port/catalog/schema`), which the shared parser does not
-    // accept, and http:// / https:// already resolve to ClickHouse in
-    // connection-string-parser.ts. Two engines cannot own one scheme.
-    showConnectionStringToggle: false,
-    // `database` IS offered here, which is where this id parts company with Druid and
-    // the two search engines: a coordinator fronts MANY catalogs (measured on 476,
-    // `SHOW CATALOGS` answers jmx, memory, system, tpcds, tpch) and a connection pins
-    // one, the way a PostgreSQL connection pins a database. The form labels it
-    // "Catalog" rather than "Database" - see ConnectionModal.tsx.
-    connectionFields: ["host", "port", "user", "password", "database"],
-  },
-  cassandra: {
-    icon: CassandraIcon,
-    // Cassandra's own mark is a mid-cyan eye (#1287B1). sky-400 is mssql's and the
-    // distinct-colour assertion in tests/unit/lib/db-ui-config.test.ts rules a
-    // duplicate out, so sky-300 is the nearest free shade.
-    color: "text-sky-300",
-    // The project's own name, vendor word included, exactly as "Apache Druid" is
-    // spelled here: the ASF name is how this engine is universally written.
-    label: "Apache Cassandra",
-    // The native protocol port. There is no second protocol to reach: the old Thrift
-    // port (9160) is gone from 4.0 onwards, and 7000/7001 are internode.
-    defaultPort: "9042",
-    // No URI to paste. The driver takes contact points plus a REQUIRED
-    // `localDataCenter`, and no URI convention in use carries the second; `cassandra://`
-    // is in no branch of connection-string-parser.ts, so the toggle would promise a
-    // paste the form cannot honour.
-    showConnectionStringToggle: false,
-    // `database` IS offered and it holds a KEYSPACE - the same mapping Trino makes
-    // onto a catalog. Measured on 5.0.9: with no keyspace pinned, `SELECT … FROM
-    // customers` answers "No keyspace has been specified. USE a keyspace, or
-    // explicitly specify keyspace.tablename", and a keyspace that does not exist
-    // fails the CONNECT rather than the first statement. The form labels it
-    // "Keyspace" - see ConnectionModal.tsx.
-    connectionFields: ["host", "port", "user", "password", "database", "localDataCenter"],
-  },
-  libredb: {
-    icon: LibreDBIcon,
-    color: "text-violet-400",
-    label: "LibreDB",
-    defaultPort: "",
-    showConnectionStringToggle: false,
-    connectionFields: ["database"],
-  },
+/**
+ * One engine's form entry with its icon and colour in front of it. Every property of the form entry is copied by its
+ * descriptor, so the `credentialWarnings` getter stays a getter, and the key order is `icon`, `color`, then the form's.
+ */
+function branded<F extends object>(form: F, icon: DBIcon, color: string): F & { icon: DBIcon; color: string } {
+  return Object.defineProperties({ icon, color }, Object.getOwnPropertyDescriptors(form)) as F & {
+    icon: DBIcon;
+    color: string;
+  };
+}
+
+export const DB_UI_CONFIG: {
+  [T in DatabaseType]: Omit<DatabaseUIConfig, "fieldPlacement"> & FieldPlacementDeclaration<T>;
+} = {
+  postgres: branded(CONNECTION_FORM.postgres, PostgreSQLIcon, "text-hue-blue"),
+  mysql: branded(CONNECTION_FORM.mysql, MySQLIcon, "text-hue-amber"),
+  sqlite: branded(CONNECTION_FORM.sqlite, SQLiteIcon, "text-hue-cyan"),
+  // DuckDB's own mark is a bright yellow (#FFF000), and `hue-yellow` is already
+  // ClickHouse's. `-alt` is the second step of that hue, kept apart from its base
+  // in both palettes; the distinct-colour assertion in
+  // tests/unit/lib/db-ui-config.test.ts rules a duplicate out.
+  duckdb: branded(CONNECTION_FORM.duckdb, DuckDBIcon, "text-hue-yellow-alt"),
+  // Turso's own mark is a bright mint green (#4FF8D2). emerald-300 is the nearest
+  // free shade - emerald-400 is MongoDB's, both teals are taken by Couchbase and
+  // Elasticsearch, and the distinct-colour assertion in
+  // tests/unit/lib/db-ui-config.test.ts rules a duplicate out.
+  libsql: branded(CONNECTION_FORM.libsql, LibSQLIcon, "text-hue-emerald-alt"),
+  mongodb: branded(CONNECTION_FORM.mongodb, MongoDBIcon, "text-hue-emerald"),
+  redis: branded(CONNECTION_FORM.redis, RedisIcon, "text-hue-rose"),
+  oracle: branded(CONNECTION_FORM.oracle, OracleIcon, "text-hue-red"),
+  db2: branded(CONNECTION_FORM.db2, Db2Icon, "text-hue-purple"),
+  mssql: branded(CONNECTION_FORM.mssql, MSSQLIcon, "text-hue-sky"),
+  couchbase: branded(CONNECTION_FORM.couchbase, CouchbaseIcon, "text-hue-orange"),
+  clickhouse: branded(CONNECTION_FORM.clickhouse, ClickHouseIcon, "text-hue-yellow"),
+  // Issue #265 specified sky, which mssql already owns; the distinct-colour
+  // assertion in tests/unit/lib/db-ui-config.test.ts rules a duplicate out.
+  // `hue-teal` was free and is closer to Druid's own petrol-teal mark anyway.
+  druid: branded(CONNECTION_FORM.druid, DruidIcon, "text-hue-teal"),
+  // The Elastic mark's own hues are teal (#00bfb3) and yellow (#fed10a); teal-400
+  // and yellow-400 are already owned by druid and clickhouse, and the distinct-colour
+  // assertion in tests/unit/lib/db-ui-config.test.ts rules a duplicate out. teal-300
+  // is the nearest free shade to the brand teal.
+  elasticsearch: branded(CONNECTION_FORM.elasticsearch, ElasticsearchIcon, "text-hue-teal-alt"),
+  // OpenSearch's Pacific Blue (#005EB8) is deeper and bluer than postgres' own
+  // blue-400, which already owns "blue" here; indigo-400 is the nearest free shade.
+  opensearch: branded(CONNECTION_FORM.opensearch, OpenSearchIcon, "text-hue-indigo"),
+  // Trino's own mark is a magenta-pink (#DD00A1); pink-400 is the nearest free
+  // shade, and the distinct-colour assertion in tests/unit/lib/db-ui-config.test.ts
+  // rules a duplicate out.
+  trino: branded(CONNECTION_FORM.trino, TrinoIcon, "text-hue-pink"),
+  // Cassandra's own mark is a mid-cyan eye (#1287B1). sky-400 is mssql's and the
+  // distinct-colour assertion in tests/unit/lib/db-ui-config.test.ts rules a
+  // duplicate out, so sky-300 is the nearest free shade.
+  cassandra: branded(CONNECTION_FORM.cassandra, CassandraIcon, "text-hue-sky-alt"),
+  // Prometheus's own mark is a flame orange (#E6522C), and `hue-orange` is Couchbase's. The
+  // theme has no second orange identity step, and adding one would be a palette change with a
+  // separation test of its own (tests/unit/theme-accent-contrast.test.ts); `hue-fuchsia` is a
+  // declared identity hue no engine here carries, and the distinct-colour assertion in
+  // tests/unit/lib/db-ui-config.test.ts rules a duplicate out.
+  prometheus: branded(CONNECTION_FORM.prometheus, PrometheusIcon, "text-hue-fuchsia"),
+  // Kafka's own mark is black, which is no identity hue at all. `hue-green` is a declared base
+  // identity hue no engine here carries (purple, the other free one, is VisualExplain's AI accent),
+  // and the distinct-colour assertion in tests/unit/lib/db-ui-config.test.ts rules a duplicate out.
+  kafka: branded(CONNECTION_FORM.kafka, KafkaIcon, "text-hue-green"),
+  // etcd's own mark is a mid blue (#419EDA). `hue-blue` is PostgreSQL's; its `-alt` step is a
+  // second identity only if it clears the separation test, which is why `blue` joined
+  // IDENTITY_ALTS in tests/unit/theme-accent-contrast.test.ts with this entry (KE9).
+  etcd: branded(CONNECTION_FORM.etcd, EtcdIcon, "text-hue-blue-alt"),
+  // A generic graph glyph, never Neo4j's logo (spec E12).
+  // No identity hue is free. `hue-fuchsia` is Prometheus's; its `-alt` step is a second identity only
+  // because it clears the separation test, which is why `fuchsia` joined IDENTITY_ALTS in
+  // tests/unit/theme-accent-contrast.test.ts with this entry, as `blue` did with etcd's.
+  neo4j: branded(CONNECTION_FORM.neo4j, Neo4jIcon, "text-hue-fuchsia-alt"),
+  // A mark drawn for Studio, never the project's logo or any vendor or Attu asset (vector-family spec 10.3).
+  // Milvus's own mark is a blue. `hue-blue` is PostgreSQL's and its `-alt` etcd's, and `hue-sky` and its `-alt`
+  // are taken; `hue-cyan-alt` fails the separation test and `hue-indigo-alt` clears it, which is why `indigo`
+  // joined IDENTITY_ALTS in tests/unit/theme-accent-contrast.test.ts with this entry (vector-family spec 10.3).
+  milvus: branded(CONNECTION_FORM.milvus, MilvusIcon, "text-hue-indigo-alt"),
+  // A mark drawn for Studio, never the vendor's logo (vector-family spec 10.3).
+  // Qdrant's own mark is a crimson. `hue-rose` is Redis's; its `-alt` step is a second identity only because it
+  // clears the separation test, which is why `rose` joined IDENTITY_ALTS in tests/unit/theme-accent-contrast.test.ts
+  // with this entry, as `fuchsia` did with Neo4j's.
+  qdrant: branded(CONNECTION_FORM.qdrant, QdrantIcon, "text-hue-rose-alt"),
+  // A generic time-series mark drawn for Studio, never InfluxData's logo (InfluxDB spec E19), shared by both types.
+  // `hue-purple` is Db2's; its `-alt` step is a second identity only because it clears the separation test, which
+  // is why `purple` joined IDENTITY_ALTS in tests/unit/theme-accent-contrast.test.ts with this entry.
+  influxdb: branded(CONNECTION_FORM.influxdb, InfluxDBIcon, "text-hue-purple-alt"),
+  // The same mark as the InfluxQL type: one product, two connection types.
+  // The first hue with no identity `-alt` before it whose `-alt` step clears the separation test, which is why
+  // `violet` joined IDENTITY_ALTS in tests/unit/theme-accent-contrast.test.ts with this entry (InfluxDB spec K-D4).
+  influxdb3: branded(CONNECTION_FORM.influxdb3, InfluxDBIcon, "text-hue-violet-alt"),
+  // A mark drawn for Studio, never Oxia's logo (DECISIONS O16).
+  // `hue-orange` is Couchbase's; its `-alt` step joins IDENTITY_ALTS with this entry, measured in
+  // tests/unit/theme-accent-contrast.test.ts next to InfluxDB's `purple-alt` and `violet-alt` (O16, O17).
+  oxia: branded(CONNECTION_FORM.oxia, OxiaIcon, "text-hue-orange-alt"),
+  // Databend's published icon in its own colours, at the Databend team's request (databendlabs/databend-docs#3512).
+  // `hue-red` is Oracle's; its `-alt` step joins IDENTITY_ALTS with this entry, the first of the hues with no
+  // identity `-alt` to clear tests/unit/theme-accent-contrast.test.ts. The icon has fixed fills, so this class no
+  // longer paints it; the entry still needs a distinct one.
+  databend: branded(CONNECTION_FORM.databend, DatabendIcon, "text-hue-red-alt"),
+  bigquery: branded(CONNECTION_FORM.bigquery, BigQueryIcon, "text-hue-cyan-alt"),
+  // A six-armed snowflake drawn for Studio, never the company's logo.
+  // Every chromatic hue and every `-alt` step was already an engine's, `lime-alt` RabbitMQ's last, so `mist`, the
+  // blue-tinted neutral, joined the identity palette with this entry: mist-700 in light and mist-400 in dark leave
+  // both closest pairs where they were (tests/unit/theme-accent-contrast.test.ts).
+  snowflake: branded(CONNECTION_FORM.snowflake, SnowflakeIcon, "text-hue-mist"),
+  // A stage DAG drawn for Studio, never the Apache Spark logo.
+  // Every chromatic hue, every `-alt` step, `mist` and `slate` were already an engine's, so `taupe`, the warm neutral
+  // nearest Spark's orange mark, joined the identity palette with this entry: taupe-700 in light and taupe-400 in dark
+  // leave both closest pairs where they were (tests/unit/theme-accent-contrast.test.ts).
+  spark: branded(CONNECTION_FORM.spark, SparkIcon, "text-hue-taupe"),
+  // A generic bucket drawn for Studio, never a vendor's logo.
+  // `hue-green` is Kafka's; of the hues with no identity `-alt` (amber, pink, green, cyan), `green-alt` left the light
+  // set's minimum where it was within 0.0006 and the dark one unchanged, which is why `green` joined IDENTITY_ALTS in
+  // tests/unit/theme-accent-contrast.test.ts with this entry.
+  s3: branded(CONNECTION_FORM.s3, S3Icon, "text-hue-green-alt"),
+  // A mark drawn for Studio, never the project's own logo.
+  // `hue-amber` is MySQL's; its `-alt` step joins IDENTITY_ALTS with this entry, measured in
+  // tests/unit/theme-accent-contrast.test.ts.
+  kubernetes: branded(CONNECTION_FORM.kubernetes, KubernetesIcon, "text-hue-amber-alt"),
+  // A mark drawn for Studio, never a product's logo: a node with the arcs of a broadcast.
+  // Every identity `-alt` theme.css declared was taken again, so `pink` joined IDENTITY_ALTS with this entry:
+  // of the two hues with none left (pink, cyan), `pink-alt` was tried first and cleared every test - it leaves
+  // both closest pairs exactly where Kubernetes's `amber-alt` left them, 0.0205 in light against 0.0160 in dark
+  // (tests/unit/theme-accent-contrast.test.ts). It is also the step nearest MQTT's own magenta mark.
+  mqtt: branded(CONNECTION_FORM.mqtt, MqttIcon, "text-hue-pink-alt"),
+  // A mark drawn for Studio, never the Firebase or Google Cloud logo: a document with a second one behind it.
+  // Every identity hue and every `-alt` step was an engine's already, so `lime` joined the identity palette with this
+  // entry: lime-800 in light and lime-400 in dark leave both closest pairs where they were (0.0205 in light, 0.0160 in
+  // dark), and the light step clears AA at 4.67 on every ground (tests/unit/theme-accent-contrast.test.ts).
+  firestore: branded(CONNECTION_FORM.firestore, FirestoreIcon, "text-hue-lime"),
+  // A mark drawn for Studio, never the project's own logo.
+  // Every base hue and every other identity `-alt` is an engine's, Firestore's `lime` among them, so `lime-alt`
+  // joined the identity steps with this entry (tests/unit/theme-accent-contrast.test.ts measures it).
+  rabbitmq: branded(CONNECTION_FORM.rabbitmq, RabbitMQIcon, "text-hue-lime-alt"),
+  // A mark drawn for Studio, never the OPC Foundation's logo: a root with two branches and a leaf.
+  // A NEW hue, for the second time: every identity hue carried two engines by the time this one
+  // registered, and while it was being built Firestore took `lime` and RabbitMQ its `-alt` step,
+  // so the palette gains `slate` here (#1677). A steel grey is also the one colour a plant's
+  // address space can carry without borrowing the mark of an engine beside it.
+  opcua: branded(CONNECTION_FORM.opcua, OpcuaIcon, "text-hue-slate"),
+  // A mark drawn for Studio, never the MTConnect Institute's logo: a baseline with three samples on it.
+  // The step this hue never had, rather than a new colour. MEASURED on theme.css at 90881379: of nineteen base
+  // hues exactly two carried no `-alt` in either theme, `mist` and `slate`, and `slate`'s base is OPC UA's. The
+  // pairing says nothing about a provider family, which the palette itself shows: `trino` and `mqtt` share a hue
+  // across two families, as do `mysql` and `kubernetes`. `slate-alt` joined the identity steps with this entry and
+  // leaves both closest identity pairs exactly where they were (tests/unit/theme-accent-contrast.test.ts).
+  mtconnect: branded(CONNECTION_FORM.mtconnect, MtconnectIcon, "text-hue-slate-alt"),
+  // A mark drawn for Studio, never the Modbus Organization's: a terminal block with three screws.
+  // A NEW hue. Every base hue and every `-alt` step was an engine's by the time this one registered -
+  // MTConnect took `slate-alt` while it was being built - so the palette gains `stone`. Of the four greys
+  // Tailwind ships that no identity used, `stone`, `neutral` and `zinc` clear every test at -700, -800 and
+  // -900 and `gray-800` does not clear AA in light, measured by running
+  // tests/unit/theme-accent-contrast.test.ts against all twelve. A warm grey was chosen of the three that
+  // pass because it stands furthest from `slate`, which is OPC UA's: those two are the industrial pair a
+  // reader is most likely to need to tell apart on one tree.
+  modbus: branded(CONNECTION_FORM.modbus, ModbusIcon, "text-hue-stone"),
+  // A mark drawn for Studio, never a vendor's: a device with the configuration tree it serves
+  // above it, forking once, because a datastore holds modules and a module holds nodes and those
+  // two levels are what the browser draws.
+  // A NEW hue, and the step was chosen by SEPARATION rather than contrast. `neutral-600`, `-700`
+  // and `-800` all clear AA in light by a wide margin (6.85, 9.12, 13.27), so contrast alone would
+  // have allowed any of them; in OKLab distance `neutral-700` sits 0.0166 from Snowflake's
+  // `mist-700`, nearer than the closest identity pair this palette had (0.0205), while
+  // `neutral-600` stands 0.0368 from its own nearest.
+  netconf: branded(CONNECTION_FORM.netconf, NetconfIcon, "text-hue-neutral"),
+  // A mark drawn for Studio: a trunk with three numbered stops descending from it, because an
+  // agent answers from a named tree and is read by walking it. Not a router silhouette, which
+  // would say what is being read rather than what the reading is.
+  // `mauve`, measured rather than chosen. Four grey hues were already spoken for by the time
+  // this registered (slate, mist, stone, neutral), and clearing AA stopped being the deciding
+  // test among them: `zinc`, `gray` and `taupe` all clear it and all sit closer to a
+  // neighbour. Against the declared identity set, `mauve-700` reads 9.51 on the worst light
+  // ground and leaves the closest pair in BOTH palettes exactly where it was, light 0.0166 and
+  // dark 0.0100, which none of the other three do. Putting `gray-800` in this slot instead
+  // fails the separation test (tests/unit/theme-accent-contrast.test.ts).
+  snmp: branded(CONNECTION_FORM.snmp, SnmpIcon, "text-hue-mauve"),
+  // A mark drawn for Studio, never the Eclipse Foundation's logo, and deliberately not a spark.
+  // A NEW hue, for the third time: every base hue and every `-alt` step theme.css declared was an
+  // engine's by the time this registered, so the palette gains `olive`. The step is `-600` rather than
+  // the -700/-800 the others use, and that is measured rather than stylistic: `olive-700` would clear
+  // AA more comfortably and fall to 0.0351 from `mist-700`, and `olive-800` to 0.0237 from `stone-800`.
+  // The unusual step is the separable one.
+  //
+  // THE SEPARATION FIGURE, RE-MEASURED against the palette as it now stands (42 identity tokens,
+  // holding stone, neutral, mauve and taupe, which it did not when the line above was written):
+  // `olive`'s nearest identity is `neutral` at 0.0373 in light and `taupe` at 0.0305 in dark, while
+  // the closest pair the palette already had without it is 0.0205 in light and 0.0076 in dark. So the
+  // hue tightens neither palette. Those figures are read from the hex values theme.css stores, which
+  // are 8-bit; the same pair measured from the installed palette's oklch, before that rounding, gives
+  // 0.0368. Two numbers, one distance, and neither is wrong - said here so a reader does not "correct"
+  // one of them. The earlier note said 0.0940, measured
+  // before stone, neutral, mauve and taupe joined;
+  // the figures that hold the palette are the separation assertions in
+  // tests/unit/theme-accent-contrast.test.ts, which read theme.css at run time and now see `olive`.
+  //
+  // This class resolved to NO RULE until theme.css declared `--studio-hue-olive`: the entry named a
+  // hue the stylesheet did not have, Tailwind emitted no `.text-hue-olive`, and the mark inherited
+  // the surrounding text colour. Nothing was red, because both completeness tests walked a list of
+  // hues kept by hand. The census that reads these entries closes that direction.
+  sparkplug: branded(CONNECTION_FORM.sparkplug, SparkplugIcon, "text-hue-olive"),
+  libredb: branded(CONNECTION_FORM.libredb, LibreDBIcon, "text-hue-violet"),
 };
 
 export function getDBConfig(type: DatabaseType): DatabaseUIConfig {
@@ -324,4 +319,35 @@ export function isFileBased(type: DatabaseType): boolean {
  */
 export function takesConnectionField(type: DatabaseType, field: ConnectionField): boolean {
   return DB_UI_CONFIG[type].connectionFields.includes(field);
+}
+
+const NO_HOST_URI_SCHEMES: readonly HostUriScheme[] = Object.freeze([]);
+
+/**
+ * The schemes the Host box takes as a whole address for this engine: its `hostAcceptsUri`, or none.
+ *
+ * One rule, two readers in `useConnectionForm`, as `offersSshTunnel` has: the host setter it returns, which
+ * splits a pasted address on arrival, and `buildConnection`, which splits one that was typed and which no path
+ * to a tested or saved connection bypasses. Loading a connection to edit reads neither, so its host shows as it
+ * was saved.
+ */
+export function hostUriSchemes(type: DatabaseType): readonly HostUriScheme[] {
+  return DB_UI_CONFIG[type].hostAcceptsUri ?? NO_HOST_URI_SCHEMES;
+}
+
+/**
+ * Whether this engine's connections may carry an SSH tunnel: false only where the entry
+ * declares `showSshTunnel: false`, which Kafka does, because a tunnel forwards one address and
+ * a Kafka client reaches every broker at the address the broker advertises.
+ *
+ * One rule, two readers, as `takesConnectionField` is: the connection modal renders the SSH
+ * toggle only when this says so, and `buildConnection` writes `sshTunnel` only when this says
+ * so. The second reader is the one that matters: the dialog keeps a tunnel switched on under
+ * another type in its state, and a hidden panel would leave no control to turn it off. A
+ * file-based engine answers true and has its panel hidden by `isFileBased` instead; a tunnel
+ * left in the dialog's state is saved on it but inert, because no tunnel opens for a
+ * connection without a host and port (docs/BACKLOG.md records the dialog's SSH state).
+ */
+export function offersSshTunnel(type: DatabaseType): boolean {
+  return DB_UI_CONFIG[type].showSshTunnel !== false;
 }

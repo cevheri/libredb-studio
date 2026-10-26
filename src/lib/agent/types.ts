@@ -44,9 +44,13 @@
 import type { Role } from "@/lib/auth";
 import type { LLMProviderType } from "@/lib/llm/types";
 
+import type { ExecutionProfileDenyCode } from "@/lib/db/errors";
 import type { PolicyDenyCode } from "@/lib/db/operations/policy";
 import type { AgentStatementViolation } from "@/lib/db/operations/statement-guard";
-import type { AgentChartSpec, DatabaseType, TableSchema } from "@/lib/types";
+import type { AgentChartSpec, ColumnSchema, DatabaseType, ForeignKeySchema, IndexSchema } from "@/lib/types";
+import type { ObjectRole } from "@/lib/db/types";
+import type { editorLanguageForTabType } from "@/lib/editor/tab-language";
+import type { AgentStatementLanguageId } from "./agent-manifest";
 import type { AgentContextCharge, AgentContextRowBudget, AgentContextUnavailableCode } from "./context-snapshot";
 import type { AgentGoalShortfall, AgentGoalVerifierId } from "./goal-verifier";
 import type { AgentToolName } from "./tools";
@@ -238,7 +242,7 @@ export const AGENT_WORKFLOW_PRESENTS_ANSWER: Readonly<Record<AgentRunWorkflowTyp
  * A property of the workflow, stated here beside `AGENT_WORKFLOW_PRESENTS_ANSWER`
  * rather than a list inside the route that refuses, and for the same reason: the set is
  * then explicit, total over the union, and pinned to the tool sets by a test instead of
- * being a claim a reader has to re-derive from `WORKFLOW_TOOLS`. A new workflow stops
+ * being a claim a reader has to re-derive from each variant's `tools` in `agent-manifest.ts`. A new workflow stops
  * this file compiling until somebody decides whether it drafts SQL, which is the
  * question that decides where it may run.
  *
@@ -281,7 +285,7 @@ export type AgentRunTerminalStatus = "succeeded" | "failed" | "cancelled";
  */
 export type AgentToolProtocol = "native" | "prompted";
 
-export type AgentRunStatus = "queued" | "running" | AgentRunTerminalStatus;
+export type AgentRunStatus = "queued" | "running" | "paused" | AgentRunTerminalStatus;
 
 /**
  * The terminal statuses as a set, EXHAUSTIVE by construction.
@@ -292,9 +296,9 @@ export type AgentRunStatus = "queued" | "running" | AgentRunTerminalStatus;
  * and on the follow-up path that is a legitimate conversation refused with a message
  * that names nothing — the caller is told only that the run may not be continued.
  *
- * `LIVE_STATUSES` in the rail is deliberately NOT derived from this: `queued | running`
- * is drift-safe on its own, since a new terminal status correctly reads as not live.
- * This one is the direction that needed pinning.
+ * The rail's `OPEN_STATUSES` is deliberately NOT derived from this: `queued |
+ * running | paused` is drift-safe on its own, since a new terminal status correctly
+ * reads as not open. This one is the direction that needed pinning.
  */
 const TERMINAL_STATUS_MEMBERS = {
   succeeded: true,
@@ -332,8 +336,8 @@ export type AgentRunFailureReason =
   /** The provider rejected the credentials. An operator fixes this; retrying does not. */
   | "model-unauthorized"
   /**
-   * The connection's engine has no database-native read-only execution profile, so
-   * this run could never have been permitted on it. A property of the connection the
+   * The connection's engine has no read-only statement path under a declared boundary,
+   * so this run could never have been permitted on it. A property of the connection the
    * user chose, not a fault of the server — which is why it is not `internal`.
    *
    * NARROWER for the `operations` workflow (#325), and narrower is all it is. That
@@ -350,10 +354,22 @@ export type AgentRunFailureReason =
    * profile whose acquisition would be refused is never the profile that capture asks for
    * on an engine that would refuse it.
    *
-   * ONLY the engine's own refusal, since B47: the other cause of the same error type
-   * is `agent-credential-unusable` below.
+   * ONLY the engine's own refusal, since B47: the other causes of the same error type
+   * are `agent-credential-unusable`, the three principal and server reasons and
+   * `profile-target-unsupported` below.
    */
   | "engine-unsupported"
+  /**
+   * The engine runs agent mode, and the profile cannot be granted against THIS target:
+   * a server on the engine's wire protocol whose read-only enforcement is not measured
+   * (FerretDB on the MongoDB wire, Percona on the MySQL wire), or an in-memory database.
+   *
+   * Split out of `engine-unsupported` because that sentence ("it offers no read-only
+   * execution profile") is false of the engine and sends the user away from one that
+   * works: the repair is to point the connection at the measured server itself, or at a
+   * database file. `PROFILE_UNSUPPORTED_TARGET` is the one code that reaches it.
+   */
+  | "profile-target-unsupported"
   /**
    * The connection's agent credential could not be applied, so the profile was
    * refused before any provider existed — on ANY engine, including the two the agent
@@ -368,6 +384,48 @@ export type AgentRunFailureReason =
    * already carried the distinction; this is where it becomes visible.
    */
   | "agent-credential-unusable"
+  /**
+   * The database principal this run would have executed as holds privileges the
+   * read-only boundary cannot contain, so the execution profile refused it. The engine
+   * IS supported and the credential WAS applied: what failed is the user it names.
+   *
+   * Split out of `engine-unsupported` the same way and for the same reason B47 split
+   * `agent-credential-unusable` out of it. `PROFILE_PRIVILEGES_TOO_BROAD` is the one code
+   * that reaches it: raised by PostgreSQL for a superuser, by SQL Server for a principal
+   * that is unverified or too broad, and by MongoDB for a user whose privileges reach past
+   * reads of the connection's own database. Folded into the engine reason, every one of
+   * those told the user to investigate a different connection while the fix was one user:
+   * measured on the SQL Server fixture, where `sa`, the only credential this repository's
+   * own `database-compose.yml` ships, is refused by the profile, and the least-privilege
+   * `libredb_agent` principal beside it is accepted.
+   *
+   * Ledgers written before the two reasons below existed recorded those causes here too,
+   * so this reason keeps its meaning for them: a user the profile would not run as.
+   */
+  | "agent-principal-refused"
+  /**
+   * The database principal this run would have executed as LACKS a privilege the
+   * read-only path itself needs, so the execution profile refused it rather than run
+   * without that layer: SQL Server's admission step compiles a candidate under
+   * `SHOWPLAN`, so a plain reader cannot be admitted. It also covers a MongoDB connection
+   * that authenticated no user at all, which holds no read privilege to run under.
+   *
+   * Its own reason because the repair is the opposite of `agent-principal-refused`'s:
+   * grant the user one privilege, or connect as a user, never narrow it.
+   * `PROFILE_PRIVILEGES_TOO_NARROW` is the one code that reaches it.
+   */
+  | "agent-principal-underprivileged"
+  /**
+   * The server does not enforce authorization, so no user is held read-only there and
+   * the profile refused the connection whoever its user is. Measured on MongoDB started
+   * without authorization: a user holding only the `read` role wrote, while its own
+   * privileges still read as read-only (issue #1614).
+   *
+   * Its own reason because neither principal repair helps: narrowing the user changes
+   * nothing on such a server, and granting it more is the wrong direction. The repair is
+   * the server's configuration. `PROFILE_SERVER_UNENFORCED` is the one code that reaches it.
+   */
+  | "server-authorization-off"
   /** The run's persisted connection no longer resolves on the server. */
   | "connection-unresolvable"
   /** Anything else. Deliberately unspecific; the log carries the detail. */
@@ -438,6 +496,18 @@ export type AgentEvidenceReference =
   | { readonly source: "artifact"; readonly correlationId: string; readonly locator?: string }
   | { readonly source: "context-snapshot"; readonly fingerprint: string; readonly locator?: string };
 
+/** CPU and memory as Kubernetes quantities, as the user would write them into a manifest. Either may be unset. */
+export interface AgentResourceQuantities {
+  readonly cpu?: string;
+  readonly memory?: string;
+}
+
+/** One container's requests and limits, the two halves a resources recommendation states before and after. */
+export interface AgentResourceSettings {
+  readonly requests: AgentResourceQuantities;
+  readonly limits: AgentResourceQuantities;
+}
+
 /**
  * One side of a before/after plan comparison (#330 T3).
  *
@@ -449,7 +519,7 @@ export type AgentEvidenceReference =
  * therefore already knows.
  */
 export interface AgentPlanSide {
-  /** The `sql.explain.estimate` artifact this side was read from. */
+  /** The artifact this side was read from, produced under a plan-estimate operation (`PLAN_ESTIMATE_OPERATIONS`). */
   readonly correlationId: string;
   /** The statement that was explained. */
   readonly sql: string;
@@ -474,19 +544,208 @@ export interface AgentReportClaim {
 export type { AgentChartSpec } from "@/lib/types";
 
 /**
+ * One entry of the inventory a run reasons over (#789).
+ *
+ * It was declared for a while as the old flat schema element widened with the facts that
+ * shape could not carry, which is what let the agent consumers move one at a time; they
+ * have all moved, so it declares its own fields and nothing in this tree names the flat
+ * type any more. The fields are the same ones, spelled `readonly`: an inventory is a
+ * READING, and a consumer that sorted or spliced an entry's columns in place was rewriting
+ * what the model had already been shown.
+ *
+ * `kind` is the whole point of the widening. An entry with no kind was handed to a model
+ * under whatever noun the engine's labels supplied, so a view arrived under the word
+ * "table" and a run drafted an `INSERT` against it, which is the class #414 measured on
+ * Redis. Absent means the object surface did not answer for this entry, and absent is
+ * rendered as nothing at all rather than as "table": a missing fact must not be filled in
+ * with the most common value.
+ *
+ * `path` ADDRESSES the object and `name` LABELS it, the same split `DatabaseObject`
+ * records. It is optional for exactly one reason: an entry read through the flat schema
+ * surface has a qualified NAME and no segments, and no reader may split that name to
+ * invent them. A table literally called `a.b` in `public` is why.
+ */
+export interface AgentInventoryObject {
+  /** The ADDRESS a statement can be written against, qualified wherever segments were read. */
+  readonly name: string;
+  readonly columns: readonly ColumnSchema[];
+  readonly indexes: readonly IndexSchema[] | { readonly unavailable: string };
+  /** Absent where the reading carries no relations at all, which is not the same as none. */
+  readonly foreignKeys?: readonly ForeignKeySchema[];
+  /** Only where the engine counts, and never a number this server derived. */
+  readonly rowCount?: number;
+  /** The engine's own rendering of the object's size, where it publishes one. */
+  readonly size?: string;
+  /** The object's segments, when the object surface supplied it. Never split from `name`. */
+  readonly path?: readonly string[];
+  /** The declared kind id this object was listed under, when one is known. */
+  readonly kind?: string;
+  /**
+   * The engine's own display label, present only where it differs from `name`.
+   *
+   * `name` is the ADDRESS a statement can be written against, qualified wherever the
+   * object surface supplied segments, because four consumers resolve a model's spelling
+   * against it: `planTableProfile` reads a bare name as an unqualified target and lets the
+   * engine's search path choose the relation (#345), and `er-diagram.ts` compares it to
+   * still-qualified foreign key targets. Ruling 2 of #789 lets the two differ - a
+   * PostgreSQL routine's last path segment carries its overload form while its label is
+   * the bare name - so the label is carried beside the address rather than instead of it.
+   */
+  readonly label?: string;
+  /**
+   * Present where this connection may read only part of the object, so a read of the whole object
+   * is refused: a listed object that carried `DatabaseObject.readRanges` (#1089 4.7), which is an
+   * etcd group the user's grants do not cover. Absent means only that the listing carried no
+   * `readRanges`: on etcd, the user's grants cover the group. No other engine declares a partial
+   * read, so on any other engine absence does not state that a read is granted.
+   *
+   * A mark and never the ranges: they are the connection's grants and a piece may name a key, so
+   * the walk derives this from them and copies none of them (E13).
+   */
+  readonly partlyReadable?: true;
+}
+
+/**
+ * A container above the deepest level whose children a scoped walk could not list, where the scope reads nothing
+ * below it (`scopeReadsUnder` in `src/lib/db/container-walk.ts`), so the walk went on without it rather than losing
+ * the whole capture.
+ */
+export interface AgentUnlistedParent {
+  /** Its path, dotted as `unreadContainers.read` is. */
+  readonly path: string;
+  /** Its level's own word, singular: "Catalog", "Database". */
+  readonly label: string;
+  /**
+   * The provider's sentence for the failed listing, on one line, a control character read as a space and a lone
+   * surrogate as U+FFFD, and cut at 200 code points, the cut marked "...".
+   */
+  readonly reason: string;
+}
+
+/**
+ * The parents a scoped walk could not list past the ones it names (`AgentUnlistedParent`), counted and not named, so
+ * that however many fail their notes leave a packing room for its rows.
+ */
+export interface AgentUnlistedParentsNotNamed {
+  readonly count: number;
+  /** Their level's own words, singular and plural: "Catalog" and "Catalogs". */
+  readonly label: string;
+  readonly labelPlural: string;
+}
+
+/**
+ * A kind the engine declared, as the run's prose needs it.
+ *
+ * The `ObjectKindSpec` fields a renderer needs, plus the three facts that decide whether
+ * what the model is told about this kind is TRUE, none of which lives on the spec:
+ *
+ *  - `sampledFrom` is the provider's own sentence from `KindCount`'s fourth state, and its
+ *    presence means every count and every listing of this kind is a FLOOR. Redis counts
+ *    its key groupings from a bounded `SCAN` and LibreDB its keyspaces from a bounded key
+ *    walk; a run told "17 key patterns" over either has been handed a sample as a
+ *    population, which is #414 in one number.
+ *  - `derivedGroupings` says the rows of this kind are prefix groupings this SERVER
+ *    derived, not objects anybody named, so no command can be given such a name. It is
+ *    `ProviderCapabilities.tablesAreDerivedGroupings`, which is still the flag that
+ *    carries the refusal (`src/components/object-tree/row-actions.ts` reads the same one),
+ *    resolved to a boolean at the edge and attached to the relation kinds it is about.
+ *  - `unavailable` is the provider's own sentence for a kind the walk could not read at all: a
+ *    kind that declares `countIsListing` and whose count was refused, so its listing was never
+ *    sent (#1089 4.7). Its presence means none of the kind is among the objects, and that
+ *    absence is no absence in the database; it is what lets plan mode ground an etcd user who
+ *    is not root, where listing that kind would have lost the whole capture.
+ */
+export interface AgentInventoryKind {
+  readonly id: string;
+  readonly role: ObjectRole;
+  /** The engine's own word, singular, rendered as-is: "Table", "Key Pattern". */
+  readonly label: string;
+  readonly labelPlural: string;
+  /** What a bounded read of this kind was counted from. Present means every number is a floor. */
+  readonly sampledFrom?: string;
+  /** These rows are groupings this server derived; nothing can be addressed by such a name. */
+  readonly derivedGroupings?: boolean;
+  /** The provider's sentence for a kind that could not be read. Present means none of it is listed. */
+  readonly unavailable?: string;
+  /**
+   * How many objects of a kind whose names are withheld from machine surfaces (`ObjectKindSpec.machineNames`) the
+   * walk counted. Present means none of the kind is listed, by design rather than by a refusal.
+   */
+  readonly withheldCount?: number;
+  /**
+   * A kind whose names are withheld that some container read gave no count for, so the walk skipped it there
+   * uncounted: `withheldCount`, where present, is then a floor, and where absent nothing of the kind was counted.
+   */
+  readonly withheldUncounted?: true;
+}
+
+/**
+ * The inventory itself: what was read, what the kinds MEAN, and whether it is all of it.
+ *
+ * `truncated` is the field that stops an absence being read as an absence in the database.
+ * The bulk inventory route bounds both the number of listings it issues and the number of
+ * objects it returns, and a saturated slice handed over as a complete inventory makes its
+ * reader treat a missing table as one that does not exist. It carries the same shape the
+ * route reports (`src/lib/api/object-route.ts`), so there is one incompleteness shape in
+ * the product rather than two.
+ */
+export interface AgentInventory {
+  readonly objects: readonly AgentInventoryObject[];
+  /**
+   * The kinds the objects were listed under.
+   *
+   * Optional, and absent means the same thing an empty list does: nothing here is kinded,
+   * so no renderer may name a kind. It is optional because a snapshot recorded in a run's
+   * ledger before this field existed still has to be READABLE: `reusableSnapshot` re-reads
+   * such an entry rather than trusting it, and it must be able to parse it to decide that.
+   */
+  readonly kinds?: readonly AgentInventoryKind[];
+  /** Present only where a bound actually bit. Absent is a claim of completeness. */
+  readonly truncated?: { readonly limit: number; readonly reason: string };
+  /**
+   * The containers a scoped walk did not read (`ProviderCapabilities.agentWalkScope`), counted and named by the
+   * deepest container level's own words, beside the dotted paths of the ones it did read: a read that lists no
+   * object names no container through its entries. Absent means every container was read.
+   */
+  readonly unreadContainers?: {
+    readonly count: number;
+    readonly label: string;
+    readonly labelPlural: string;
+    readonly read: readonly string[];
+    /**
+     * Each parent the walk could not list and that the scope reads nothing below, in walk order, the first
+     * `UNLISTED_PARENTS_NAMED_MAX` (tools.ts) it met. Its children were never listed, so none of them is in `count`,
+     * which is 0 where they are all the walk left out. Absent where every listing answered.
+     */
+    readonly unlistedParents?: readonly AgentUnlistedParent[];
+    /**
+     * The parents past the first `UNLISTED_PARENTS_NAMED_MAX` that the walk could not list either, counted. Absent
+     * where it named every one.
+     */
+    readonly unlistedParentsNotNamed?: AgentUnlistedParentsNotNamed;
+  };
+  /**
+   * The container the session is IN, where the reading that produced this knew it (#789).
+   *
+   * It is the tie-breaker for every consumer of the address rule, and it is carried on the
+   * inventory because the fact is read once, by the container walk, and needed later by a
+   * tool: `profile_table` resolved with no preferred container and refused a spelling the
+   * object browser resolves, in the same run, off the same two objects. Absent where the
+   * engine has no containers or marked no level `isSessionDefault`, and absent is not a
+   * default to invent: a tie with nothing to break it is refused, not guessed.
+   */
+  readonly defaultContainer?: readonly string[];
+}
+
+/**
  * The schema inventory a run reasons over, plus the fingerprint that decides
  * whether a refresh has to read anything at all.
- *
- * `tables` reuses the shipped `TableSchema` shape rather than introducing a
- * second schema vocabulary: the providers already produce it, the UI already
- * renders it, and it is serializable as it stands.
  */
-export interface AgentContextSnapshot {
+export interface AgentContextSnapshot extends AgentInventory {
   readonly connectionId: string;
   /** Stable across two identical inventories; changes when the inventory does. */
   readonly fingerprint: string;
   readonly capturedAtMs: number;
-  readonly tables: readonly TableSchema[];
   /**
    * WHICH of the two readings produced this inventory (#414).
    *
@@ -510,18 +769,24 @@ export interface AgentContextSnapshot {
 }
 
 /**
- * Why a curated reading that sends no statement was refused. Both are decided INSIDE
+ * Why a curated reading that sends no statement was refused. Each is decided INSIDE
  * the call, after the pipeline allowed it and the provider was acquired, which is
  * exactly why they are refusals rather than "the run decided not to ask": a statement
  * of the run's budget was charged and the execution was audited, so a settlement that
  * said nothing happened would contradict the ledger.
  *
- * The grounding schema read (#414) adds no third code. A provider that cannot describe
- * itself is not a state that exists — `getSchema()` is required on `DatabaseProvider`
- * — and the reachable failure, a `getSchema()` that rejects, is a database error the
- * reading path already reports as one.
+ * The grounding schema read (#414) adds no code of its own. A provider that cannot describe
+ * itself is not a state that exists — the four object-surface methods are required on
+ * `DatabaseProvider` (#789) — and the reachable failure, one of them rejecting, is a
+ * database error the reading path already reports as one. The declaration-shaped
+ * absence, an engine with no `objectKinds`, is answered before anything is charged, so
+ * it never reaches a settlement either.
+ *
+ * `METRICS_UNAVAILABLE` is the cluster usage reading's own: the cluster serves no metrics.k8s.io, or serves one whose
+ * backend does not answer. It is the cluster's fact rather than a failure of the read, so no rewording of the call
+ * could change it and it costs no repair attempt.
  */
-export type AgentReadingDenyCode = "KIND_UNSUPPORTED_BY_PROVIDER" | "READING_OVER_BUDGET";
+export type AgentReadingDenyCode = "KIND_UNSUPPORTED_BY_PROVIDER" | "READING_OVER_BUDGET" | "METRICS_UNAVAILABLE";
 
 /**
  * Why a tool call produced no result. The four variants are distinct in TYPE,
@@ -587,7 +852,19 @@ export type AgentToolRefusal =
        */
       readonly answered?: boolean;
     }
-  | { readonly class: "reading-refused"; readonly reasonCode: AgentReadingDenyCode; readonly elapsedMs?: number };
+  | { readonly class: "reading-refused"; readonly reasonCode: AgentReadingDenyCode; readonly elapsedMs?: number }
+  /**
+   * Refused by the tool itself before anything was sent: arguments that do not parse, a command the language's reader
+   * or the run's inventory refuses, a spent deadline, a repair ledger declining a fingerprint. `reasonCode` is the
+   * tool's own code (`AgentToolUnavailableCode`) and `detail` its sentence: the reason it named, or where it named
+   * none, the whole sentence the model was told. Required, because no ledger written before this class carries it.
+   *
+   * These used to settle nothing, which left a lone `tool-invoked` on the timeline with no outcome and no reason: the
+   * model was told why and the user was not. Measured 2026-10-17, MongoDB runs met 19 of their 21 refusals here (a
+   * command envelope is checked before the engine), against 2 on PostgreSQL. Nothing reached a database, so no
+   * statement and no repair attempt is counted for it.
+   */
+  | { readonly class: "not-sent"; readonly reasonCode: string; readonly detail: string };
 
 interface AgentRunEventBase {
   /** Epoch milliseconds. A number, not a Date: a Date does not round-trip. */
@@ -627,20 +904,56 @@ export type AgentGuidanceNotice =
   | "report-reminder"
   /**
    * A plan run whose prose named neither statement nor refusal. Delivered as a `user`
-   * message; bounded by the model's own `planStatementRetries`.
+   * message; bounded by the model's own `planStatementRetries` where it has a profile, and by
+   * one ask where it has none — absence is not a measurement, so an unmeasured model is asked.
    */
   | "plan-statement"
+  /**
+   * A turn the per-call ceiling cut off, on a run whose own clock still has room. Delivered as a
+   * `user` message and the turn is taken again; once per drive, so a resumed run is granted one
+   * again.
+   *
+   * The ceiling is documented as bounding one call and it ended the run instead. Measured on
+   * `qwen3.6:35b`, query-optimization: nine losses, all `model-timeout` with `no-report`, all
+   * near 100s of a 450s deadline with 34 of 36 turns unspent, while the same cell's longest
+   * PASSING run took 183s.
+   */
+  | "turn-cut-off"
   /**
    * A run within the turn or time reserve of a ceiling. Delivered as a `user` message
    * riding the turn about to be taken; once per run.
    */
   | "report-reserve"
   /**
+   * An optimization run that has just READ a plan, told what its report will be judged on.
+   * Delivered as a `user` message riding on the turn that was about to be taken, so it spends
+   * no turn of its own; once per run, and bounded across a resume by the ledger.
+   *
+   * Every other sentence about this bar is delivered by holding `compose_report`, and a hold
+   * inside the report reserve is suppressed - a run held with no turn left files no report at
+   * all. So a run that spends its turns reading is never told: `laguna-xs-2.1` lost this cell
+   * five times out of five holding THREE plans, everything a comparison needs, having heard
+   * nothing about what one was for.
+   */
+  | "plan-bar"
+  /**
+   * A resource-efficiency run that has just READ usage, told what its report will be judged on. The `plan-bar`
+   * pattern for the cluster's optimization: delivered as a `user` message riding on the turn about to be taken, once
+   * per run, and bounded across a resume by the ledger.
+   */
+  | "usage-bar"
+  /**
    * A run that stopped having read nothing, on a set holding both reading tools.
    * Delivered as a `user` message; once per run, and only where the model's profile
    * says the retry earned its turn.
    */
   | "unread-stop"
+  /**
+   * A tool call the model endpoint could not parse, answered rather than re-sent.
+   * Delivered as a `user` message; once per run, because a model that cannot comply
+   * with it should still fail fast.
+   */
+  | "tool-call-unreadable"
   /**
    * A `compose_report` on an answering workflow with a presentable read and no
    * presentation. Delivered as a TOOL RESULT instead of running the call, so it rides
@@ -656,7 +969,8 @@ export type AgentGuidanceNotice =
    * A `compose_report` from a run holding the two plans a comparison would use.
    * Delivered as a TOOL RESULT instead of running the call; once per run.
    */
-  | "compare-before-report";
+  | "compare-before-report"
+  | "tool-call-as-text";
 
 /**
  * The semantic events one run emits, in the vocabulary a user reads in the rail
@@ -672,6 +986,8 @@ export type AgentGuidanceNotice =
  */
 export type AgentRunEvent =
   | (AgentRunEventBase & { readonly kind: "run-started"; readonly mode: AgentRunMode })
+  | (AgentRunEventBase & { readonly kind: "run-paused" })
+  | (AgentRunEventBase & { readonly kind: "run-resumed" })
   | (AgentRunEventBase & {
       /**
        * What drove this stretch of the run: the model, and where its settings came from.
@@ -827,8 +1143,9 @@ export type AgentRunEvent =
        * (`docs/llms/setup.md`) and, for exactly the case an operator has to diagnose, it
        * was not: the refusal branch pushed a sentence into the prompt and returned, so a
        * plan run whose capture was refused left four events and nothing between the
-       * second and the third. The measured cost is B52 — 536 rows against a 200-row
-       * budget on a live AlloyDB Omni — where the reason code, the numbers and the
+       * second and the third. The measured cost at the time was the grounding refusal
+       * B52 later fixed — 536 rows against a 200-row budget on a live AlloyDB Omni —
+       * where the reason code, the numbers and the
        * catalog read were all computed, handed to the model, and then dropped. And a
        * missing event is worse here than missing telemetry: it reads as work that was
        * not needed rather than knowledge that was lost.
@@ -850,6 +1167,14 @@ export type AgentRunEvent =
       readonly detail: string;
       /** Present only when the row budget is what refused it. */
       readonly rowBudget?: AgentContextRowBudget;
+      /**
+       * The execution profile's own deny code, present only when the profile is what
+       * refused the capture. `reasonCode` stays `CATALOG_READ_REFUSED` for it, as it was
+       * written before this field existed, and `detail` carries the code's advice; this is
+       * the code itself, so a reader can tell a user holding too much from a server that
+       * enforces nothing without parsing a sentence.
+       */
+      readonly profileReasonCode?: ExecutionProfileDenyCode;
       /**
        * What the refused reading cost this run, measured off the tracker (B13).
        *
@@ -1074,6 +1399,15 @@ export type AgentRunEvent =
       readonly sql: string;
       /** The engine it was written for — the connection this drive was given. */
       readonly dialect: DatabaseType;
+      /**
+       * The editor language this connection's statements render in, resolved from the drive's
+       * capabilities by the ladder `tab-language.ts` walks (#1089).
+       *
+       * Recorded because the rail renders the answer card with no capabilities, so without it the
+       * card had only `guardApplicable` to go on and drew every etcd or PromQL draft as "unknown".
+       * OPTIONAL for the reason `guardApplicable` is: a ledger recorded before it carries none.
+       */
+      readonly language?: ReturnType<typeof editorLanguageForTabType>;
       readonly readOnly: boolean;
       /**
        * Whether the guard could read this draft's language at all (#414).
@@ -1102,9 +1436,9 @@ export type AgentRunEvent =
        * verifier requires: a run that recommends a rewrite without having compared
        * the plans has recommended it on the strength of its own opinion.
        *
-       * Both sides cite an artifact THIS run produced under `sql.explain.estimate`,
-       * checked against the ledger the way a report's citations are, so a comparison
-       * of two plans the run never asked for is inexpressible.
+       * Both sides cite an artifact THIS run produced under a plan-estimate operation
+       * (`PLAN_ESTIMATE_OPERATIONS`), checked against the ledger the way a report's citations
+       * are, so a comparison of two plans the run never asked for is inexpressible.
        */
       readonly kind: "plan-comparison";
       readonly before: AgentPlanSide;
@@ -1126,6 +1460,52 @@ export type AgentRunEvent =
       readonly change: "index" | "rewrite";
       readonly statement: string;
       readonly rationale: string;
+      readonly evidence: readonly [AgentEvidenceReference, ...AgentEvidenceReference[]];
+    })
+  | (AgentRunEventBase & {
+      /**
+       * A change to one container's CPU and memory requests and limits, proposed and NOT made.
+       *
+       * The same event kind as an index or a rewrite, because it is the same act: the run proposes, the user decides.
+       * It carries no `statement`, since there is nothing to hand an editor: the change is to a workload's manifest,
+       * which this runtime never writes. `current` and `proposed` are Kubernetes quantities the schema validated as
+       * such, and the owner is named so the user knows which manifest to edit. Its kind is whatever owns the pod, a
+       * database operator's custom resource included, so it is any non-empty kind and not a closed list.
+       */
+      readonly kind: "recommendation";
+      readonly change: "resources";
+      readonly namespace: string;
+      readonly ownerKind: string;
+      readonly ownerName: string;
+      readonly container: string;
+      readonly current: AgentResourceSettings;
+      readonly proposed: AgentResourceSettings;
+      readonly rationale: string;
+      readonly evidence: readonly [AgentEvidenceReference, ...AgentEvidenceReference[]];
+    })
+  | (AgentRunEventBase & {
+      /**
+       * One MongoDB index, proposed and NOT created (issue #1614).
+       *
+       * The same event kind as a statement's index recommendation, because it is the same act: the run proposes, the
+       * user decides. Its own `change`, as the resources card has, so every reader tells the three cards apart by that
+       * one field. It carries no `statement`, for the reason the resources card carries none - there is nothing to
+       * hand an editor, because the editor's command envelope runs reads and writes on documents and creates no
+       * index. The change is stated as DATA the user reads and applies in their own tool: the collection, the keys
+       * in the engine's own form (`{"field": 1}`), and any options. `keys` and `options` are validated by the card's
+       * schema, not by this type, which says only that they are records - the engine's spelling of a key is its own.
+       *
+       * `database` is stamped by the server, never written by the model: the database the run's captured inventory
+       * read the collection in, or, for a spelling the inventory does not resolve, the session's database where the
+       * capture read one. It is absent when neither is known.
+       */
+      readonly kind: "recommendation";
+      readonly change: "document-index";
+      readonly collection: string;
+      readonly database?: string;
+      readonly keys: Record<string, string | number>;
+      readonly options?: Record<string, unknown>;
+      readonly rationale?: string;
       readonly evidence: readonly [AgentEvidenceReference, ...AgentEvidenceReference[]];
     })
   | (AgentRunEventBase & {
@@ -1152,6 +1532,44 @@ export type AgentRunEvent =
        */
       readonly artifact: AgentArtifactReference;
       readonly profile: AgentTableProfile;
+    })
+  | (AgentRunEventBase & {
+      /**
+       * Container usage in one namespace was read against requests and limits, so a report or a resources
+       * recommendation can CITE it.
+       *
+       * Its own kind for the reason `table-profiled` has one: the artifact is this reading's evidence, and the
+       * resource-efficiency verdict asks for a usage reading by kind rather than for any read. The namespace and the
+       * selector are what the reading covered, recorded so a resumed run is told what it already measured.
+       */
+      readonly kind: "usage-read";
+      readonly artifact: AgentArtifactReference;
+      readonly namespace: string;
+      readonly selector?: string;
+    })
+  | (AgentRunEventBase & {
+      /**
+       * The cluster serves no usage metrics for this namespace: metrics.k8s.io is absent, or its backend
+       * (metrics-server) does not answer.
+       *
+       * A fact about the cluster, recorded as one, rather than only a refused step: the verdict reads it to say the
+       * run could not measure usage and why, which a refusal code alone cannot tell apart from a reading the run
+       * chose not to keep.
+       */
+      readonly kind: "usage-unavailable";
+      readonly namespace: string;
+    })
+  | (AgentRunEventBase & {
+      /**
+       * One namespace's workloads were profiled, so a report can CITE the profile.
+       *
+       * Its own kind for the reason `usage-read` has one: the cluster-health verdict asks for a workload profile by
+       * kind rather than for any read. The namespace is what the profile covered, recorded so a resumed run is told
+       * what it already profiled.
+       */
+      readonly kind: "workloads-profiled";
+      readonly artifact: AgentArtifactReference;
+      readonly namespace: string;
     })
   | (AgentRunEventBase & {
       /**
@@ -1426,6 +1844,27 @@ export interface AgentRunRecord {
    */
   readonly toolProtocol?: AgentToolProtocol;
   /**
+   * The statement language this run writes in, which picks its workflow variant in `agent-manifest.ts`.
+   *
+   * Decided once at open from the manifest and carried here for the reason `toolProtocol` is: tool
+   * selection, narrowing, the prompt, the verifier and a resumed drive all read it from the record, never
+   * from the live connection, so a run is the same run in a process that cannot reach its database.
+   *
+   * Optional, and absent reads as `sql`: every ledger written before this field was an SQL run.
+   */
+  readonly statementLanguage?: AgentStatementLanguageId;
+  /**
+   * The rule this run is judged against, decided once at open from its workflow variant.
+   *
+   * On the record for the same reason as `statementLanguage`: the verdict a resumed drive records must be
+   * measured against the bar the run was opened under, read from the ledger rather than re-derived from a
+   * manifest that may have changed since.
+   *
+   * Optional, and absent reads as the verifier of the run's variant (for a ledger written before this field,
+   * the SQL workflow's verifier), which is what judged every run written then.
+   */
+  readonly verifier?: AgentGoalVerifierId;
+  /**
    * The conversation this run belongs to.
    *
    * Required HERE and optional on the ledger header, which is the whole
@@ -1463,10 +1902,56 @@ export interface AgentRunRecord {
    * user the conversation they were having.
    */
   readonly connectionIdentity?: string;
+  /** The database a run on a server-level connection reads, fixed when it opens (#1530). */
+  readonly catalog?: string;
   /** The user's own question, in their words. */
   readonly objective: string;
   readonly createdAtMs: number;
   readonly updatedAtMs: number;
   /** The run's ledger, in order. The only history there is. */
   readonly events: readonly AgentRunEvent[];
+}
+
+/**
+ * One step of a finished conversation, as the history surface needs it.
+ *
+ * Carried by `AgentConversationSummary` rather than by the run record itself: a
+ * conversation's steps are separate runs, each with its own ledger, and the history
+ * surface needs one projection of them it can list without reading N ledgers.
+ *
+ * Inert by construction, like every contract here: identifiers, enumerated strings
+ * and numbers. It is what `src/lib/agent/history.ts` folds out of the history index
+ * stream, and the route returns it to the owner verbatim.
+ */
+export interface AgentConversationStep {
+  readonly runId: string;
+  readonly objective: string;
+  readonly workflowType: AgentRunWorkflowType;
+  readonly mode: AgentRunMode;
+  readonly status: AgentRunTerminalStatus;
+  /**
+   * Whether the run ANSWERED, in the verifier's own verdict — `null` when no verdict
+   * exists, which is the case for a run that never entered the loop (it ended before
+   * it began, so there is nothing to judge).
+   */
+  readonly answered: boolean | null;
+  /** The connection the step was opened on; single-connection by thread induction. */
+  readonly connectionId: string;
+  readonly createdAtMs: number;
+  /** When the step finished, not when it was opened. */
+  readonly updatedAtMs: number;
+}
+
+/**
+ * One finished conversation, whole: every step that belongs to it, oldest first.
+ *
+ * The steps are the conversation — the thread is a linked list in the run headers,
+ * and the history index records the same links as a flat, append-only stream. This
+ * shape carries no derived "latest" fields, because a derived figure beside the
+ * components it was derived from is two answers to one question and they can
+ * disagree; the latest step is `steps.at(-1)`.
+ */
+export interface AgentConversationSummary {
+  readonly threadId: string;
+  readonly steps: readonly AgentConversationStep[];
 }

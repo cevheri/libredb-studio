@@ -1,0 +1,24 @@
+# WHY THE OPC UA read-only check STEP IS NOT IN THIS FILE ANY MORE.
+#
+# This file used to carry the step itself, staged here because five engines were landing in
+# one round and five sessions editing one workflow would have been that round's merge in
+# miniature. Whoever owned the workflow was to paste it in. MEASURED 19 October 2026: the
+# paste never happened for any of the six engines, so none of the nineteen workflow files
+# mentioned this fixture and the live check ran only by hand.
+#
+# The step now lives in `.github/workflows/ci.yml`, in the `functional-smoke` job, named
+# `OPC UA read-only check`. It is not duplicated here on purpose: the pin this fixture runs is held equal to
+# the compose fragment's by a test, and a pin that lives in a third file nobody compares is a
+# third pin. What stays here is the reasoning the step is too short to carry.
+#
+# The fixture is the one `tests/fixtures/opcua/README.md` records, with the same flags, because the
+# flags ARE the fixture: `--hn` is what adds the one historized node, and the node counts every
+# comment under `src/lib/db/providers/industrial/opcua/` carries were measured against this exact
+# command line.
+#
+# WHY TWO READINESS CHECKS, AND WHY NEITHER IS A TCP CONNECT. A published port answers as soon as
+# Docker's proxy binds it, which is before the server behind it can speak, so `/dev/tcp` or `nc`
+# measures Docker rather than the fixture. The two below are independent of each other and of the
+# proxy: the first reads what the SERVER says about itself, the second speaks the protocol.
+# Both were run against this image on 15 Oct 2026 and both answered: the log line appears, and
+# GetEndpoints returned 7 endpoints.

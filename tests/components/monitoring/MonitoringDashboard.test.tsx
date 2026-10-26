@@ -4,6 +4,7 @@ import "../../helpers/mock-navigation";
 
 import { mock } from "bun:test";
 import { setupRechartssMock, setupFramerMotionMock } from "../../helpers/mock-monaco";
+import { DEFAULT_THRESHOLDS } from "@/lib/monitoring-thresholds";
 
 setupRechartssMock();
 setupFramerMotionMock();
@@ -53,6 +54,7 @@ mock.module("@/hooks/use-monitoring-data", () => ({
 
 mock.module("@/lib/storage", () => ({
   storage: {
+    getThresholdConfig: mock(() => DEFAULT_THRESHOLDS),
     getConnections: mock(() => [
       {
         id: "c1",
@@ -75,6 +77,9 @@ mock.module("@/lib/storage", () => ({
     ]),
     getActiveConnectionId: mock(() => "c1"),
     getDismissedSeeds: mock(() => []),
+    // Read by the real useCatalogs on a server-level connection (#1530).
+    getActiveCatalog: mock(() => null),
+    setActiveCatalog: mock(() => {}),
   },
 }));
 
@@ -136,12 +141,27 @@ mock.module("@/components/monitoring/tabs/QueriesTab", () => ({
   },
 }));
 
+// Captures the props the dashboard hands the sessions tab, for the Terminate wiring (#1424).
+const sessionsTabProps: Array<Record<string, unknown>> = [];
+
 mock.module("@/components/monitoring/tabs/SessionsTab", () => ({
-  SessionsTab: () => {
+  SessionsTab: (props: Record<string, unknown>) => {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const React = require("react");
+    sessionsTabProps.push(props);
     return React.createElement("div", { "data-testid": "monitoring-sessionstab" }, "SessionsTab");
   },
+}));
+
+// The signed-in role `useAuth` answers; beforeEach puts the admin back (#1424).
+let currentRole = "admin";
+
+mock.module("@/hooks/use-auth", () => ({
+  useAuth: () => ({
+    user: { role: currentRole },
+    isAdmin: currentRole === "admin",
+    handleLogout: mock(async () => {}),
+  }),
 }));
 
 // Captures the props the dashboard hands the tables tab, so the capability wiring
@@ -161,7 +181,6 @@ const mockCapabilities = {
   queryLanguage: "sql",
   supportsExplain: true,
   supportsExternalQueryLimiting: true,
-  supportsCreateTable: true,
   supportsMaintenance: true,
   maintenanceOperations: ["vacuum", "analyze"],
   supportsConnectionString: true,
@@ -181,12 +200,22 @@ const mockLabels = {
 // assert the lookup follows the selection rather than firing on null.
 const providerMetadataCalls: Array<{ id?: string } | null> = [];
 
+// The capabilities the metadata mock answers with; a test swaps in its own declaration and
+// beforeEach puts the shared one back.
+let currentCapabilities: Record<string, unknown> = mockCapabilities;
+// While true the declaration is still being read, so the dashboard knows nothing of the connection yet.
+let metadataPending = false;
+// While set, the declaration read failed with this message.
+let metadataFailure: string | null = null;
+
 mock.module("@/hooks/use-provider-metadata", () => ({
   useProviderMetadata: mock((connection: { id?: string } | null) => {
     providerMetadataCalls.push(connection);
+    if (metadataPending) return { metadata: null, isLoading: true, error: null };
+    if (metadataFailure !== null) return { metadata: null, isLoading: false, error: metadataFailure };
     return {
       metadata: {
-        capabilities: mockCapabilities,
+        capabilities: currentCapabilities,
         labels: mockLabels,
       },
       isLoading: false,
@@ -211,11 +240,12 @@ mock.module("@/components/monitoring/tabs/PoolTab", () => ({
 }));
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { render, act, cleanup, waitFor } from "@testing-library/react";
+import { render, act, cleanup, waitFor, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import React from "react";
 
 import { mockRouterPush } from "../../helpers/mock-navigation";
+import { mockGlobalFetch, restoreGlobalFetch } from "../../helpers/mock-fetch";
 
 // Dynamic import AFTER the mock.module() calls above: a static import would be
 // hoisted and evaluate the real tab modules, poisoning coverage with all-zero
@@ -238,6 +268,8 @@ describe("MonitoringDashboard", () => {
     mockSetRefreshInterval.mockClear();
     mockUseMonitoringData.mockImplementation(monitoringDataDefaults);
     selectCallbacks.clear();
+    currentCapabilities = mockCapabilities;
+    currentRole = "admin";
   });
 
   test("renders monitoring title", async () => {
@@ -321,6 +353,32 @@ describe("MonitoringDashboard", () => {
     expect(autoRefreshButton).not.toBeNull();
   });
 
+  test("shows the billing sentence beside auto-refresh when the capability is declared, and none otherwise", async () => {
+    // A provider whose compute resumes on any statement and is billed until it suspends (a Databend
+    // Cloud warehouse) declares `resumesBilledCompute`: every auto-refresh tick keeps it awake.
+    const sentence = "Each refresh runs statements on this connection, which keeps its billed compute running.";
+
+    let renderResult: ReturnType<typeof render>;
+    await act(async () => {
+      renderResult = render(<MonitoringDashboard />);
+    });
+    expect(renderResult!.queryByText(sentence)).toBeNull();
+    expect(
+      renderResult!.container.querySelector('[title="Pause auto-refresh"]')?.hasAttribute("aria-describedby"),
+    ).toBe(false);
+    cleanup();
+
+    currentCapabilities = { ...mockCapabilities, resumesBilledCompute: true };
+    await act(async () => {
+      renderResult = render(<MonitoringDashboard />);
+    });
+    const note = renderResult!.queryByText(sentence);
+    expect(note).not.toBeNull();
+    // The toggle names the sentence as its description, so a screen reader hears the cost on it.
+    const toggle = renderResult!.container.querySelector('[title="Pause auto-refresh"]');
+    expect(toggle?.getAttribute("aria-describedby")).toBe(note!.id);
+  });
+
   test("no connection shows empty state", async () => {
     // Override storage to return empty connections
     const storageModule = await import("@/lib/storage");
@@ -338,6 +396,18 @@ describe("MonitoringDashboard", () => {
 
     // Restore
     (storageModule.storage as unknown as Record<string, unknown>).getConnections = originalGetConnections;
+  });
+
+  test("back button remains named when its responsive text is hidden", async () => {
+    mockRouterPush.mockClear();
+    let view: ReturnType<typeof render>;
+    await act(async () => {
+      view = render(<MonitoringDashboard />);
+    });
+    // Model the small-screen CSS state in the DOM test environment.
+    view!.getByText("Back").style.display = "none";
+    fireEvent.click(view!.getByRole("button", { name: "Back" }));
+    expect(mockRouterPush).toHaveBeenCalledWith("/");
   });
 
   test("isEmbedded=true hides back button", async () => {
@@ -464,6 +534,31 @@ describe("MonitoringDashboard", () => {
     expect(queriesTabProps[queriesTabProps.length - 1].labels).toEqual(mockLabels);
   });
 
+  test("hands the selected connection's own labels to the tables tab", async () => {
+    // Without them the tab cannot say that a provider's list is only part of the database, and
+    // counts it as the database's tables (#1085 6.2): the caption is the tab's, the metadata the
+    // dashboard's, as for the queries tab above.
+    const user = userEvent.setup();
+    tablesTabProps.length = 0;
+
+    let renderResult: ReturnType<typeof render>;
+    await act(async () => {
+      renderResult = render(<MonitoringDashboard />);
+    });
+    const { queryByTestId, container } = renderResult!;
+
+    const allTriggers = container.querySelectorAll('[role="tab"]');
+    const tablesTrigger = Array.from(allTriggers).find((t) => t.textContent?.includes("Tables")) as HTMLElement;
+    await user.click(tablesTrigger);
+
+    await waitFor(() => {
+      expect(queryByTestId("monitoring-tablestab")).not.toBeNull();
+    });
+
+    expect(tablesTabProps.length).toBeGreaterThan(0);
+    expect(tablesTabProps[tablesTabProps.length - 1].labels).toEqual(mockLabels);
+  });
+
   test("hands the selected connection's declared capabilities to the tables tab", async () => {
     const user = userEvent.setup();
     tablesTabProps.length = 0;
@@ -496,5 +591,199 @@ describe("MonitoringDashboard", () => {
     });
 
     expect(providerMetadataCalls[providerMetadataCalls.length - 1]?.id).toBe("c2");
+  });
+
+  test("tells the tables tab whether the connection is read-only (#1418)", async () => {
+    const openTables = async () => {
+      const user = userEvent.setup();
+      tablesTabProps.length = 0;
+      let renderResult: ReturnType<typeof render>;
+      await act(async () => {
+        renderResult = render(<MonitoringDashboard />);
+      });
+      const { queryByTestId, container } = renderResult!;
+      const tablesTrigger = Array.from(container.querySelectorAll('[role="tab"]')).find((t) =>
+        t.textContent?.includes("Tables"),
+      ) as HTMLElement;
+      await user.click(tablesTrigger);
+      await waitFor(() => {
+        expect(queryByTestId("monitoring-tablestab")).not.toBeNull();
+      });
+      return tablesTabProps[tablesTabProps.length - 1].readOnly;
+    };
+
+    // The file's default connections carry no readOnly.
+    expect(await openTables()).toBe(false);
+    cleanup();
+
+    const storageModule = await import("@/lib/storage");
+    const storage = storageModule.storage as unknown as Record<string, unknown>;
+    const originalGetConnections = storage.getConnections;
+    storage.getConnections = mock(() => [
+      { id: "c1", name: "Guarded", type: "postgres", host: "localhost", readOnly: true, createdAt: new Date() },
+    ]);
+    try {
+      expect(await openTables()).toBe(true);
+    } finally {
+      storage.getConnections = originalGetConnections;
+    }
+  });
+
+  test("hands the hook's previewMaintenance to the tables tab (spec 3.11)", async () => {
+    const user = userEvent.setup();
+    const previewMaintenance = mock(async () => ({ summary: "Loads users.", facts: [] }));
+    const withPreview = { ...monitoringDataDefaults(), previewMaintenance };
+    mockUseMonitoringData.mockImplementation(() => withPreview);
+    tablesTabProps.length = 0;
+
+    let renderResult: ReturnType<typeof render>;
+    await act(async () => {
+      renderResult = render(<MonitoringDashboard />);
+    });
+    const { queryByTestId, container } = renderResult!;
+    const tablesTrigger = Array.from(container.querySelectorAll('[role="tab"]')).find((t) =>
+      t.textContent?.includes("Tables"),
+    ) as HTMLElement;
+    await user.click(tablesTrigger);
+    await waitFor(() => {
+      expect(queryByTestId("monitoring-tablestab")).not.toBeNull();
+    });
+
+    expect(tablesTabProps[tablesTabProps.length - 1].onPreviewMaintenance).toBe(previewMaintenance);
+  });
+
+  // The route refuses maintenance and `kill` to a non-admin, so both tabs are told the signed-in role (#1424).
+  test("tells the sessions and tables tabs whether the signed-in user is an admin", async () => {
+    const openTab = async (name: string) => {
+      const user = userEvent.setup();
+      let renderResult: ReturnType<typeof render>;
+      await act(async () => {
+        renderResult = render(<MonitoringDashboard />);
+      });
+      const trigger = Array.from(renderResult!.container.querySelectorAll('[role="tab"]')).find((t) =>
+        t.textContent?.includes(name),
+      ) as HTMLElement;
+      await user.click(trigger);
+      cleanup();
+    };
+    const lastIsAdmin = async () => {
+      sessionsTabProps.length = 0;
+      tablesTabProps.length = 0;
+      await openTab("Sessions");
+      await openTab("Tables");
+      return [sessionsTabProps.at(-1)?.isAdmin, tablesTabProps.at(-1)?.isAdmin];
+    };
+
+    expect(await lastIsAdmin()).toEqual([true, true]);
+    currentRole = "user";
+    expect(await lastIsAdmin()).toEqual([false, false]);
+  });
+
+  test("hands the sessions tab the declared capabilities with the connected maintenance over them (#1424)", async () => {
+    const user = userEvent.setup();
+    // The connected server refused `kill` where the type id declares it, as CockroachDB's narrowing can (#1387).
+    currentCapabilities = { ...mockCapabilities, maintenanceOperations: ["analyze", "kill"] };
+    const connected = { ...monitoringDataDefaults() };
+    connected.data = {
+      ...(connected.data as Record<string, unknown>),
+      maintenance: { maintenanceOperations: ["analyze"] },
+    };
+    mockUseMonitoringData.mockImplementation(() => connected);
+    sessionsTabProps.length = 0;
+
+    let renderResult: ReturnType<typeof render>;
+    await act(async () => {
+      renderResult = render(<MonitoringDashboard />);
+    });
+    const trigger = Array.from(renderResult!.container.querySelectorAll('[role="tab"]')).find((t) =>
+      t.textContent?.includes("Sessions"),
+    ) as HTMLElement;
+    await user.click(trigger);
+
+    const capabilities = sessionsTabProps.at(-1)?.capabilities as { maintenanceOperations: string[] };
+    expect(capabilities.maintenanceOperations).toEqual(["analyze"]);
+  });
+});
+
+/** A server-level connection's panels are one database's, and nothing is read before that database is known (#1530). */
+describe("MonitoringDashboard on a server-level connection", () => {
+  const SERVER_LEVEL = {
+    ...mockCapabilities,
+    catalogSessions: true,
+    containerLevels: [{ id: "catalog" }, { id: "schema" }],
+  };
+  const databases = {
+    json: [
+      { path: ["analytics"], name: "analytics", level: 0 },
+      { path: ["shop"], name: "shop", level: 0 },
+    ],
+  };
+  /** The connection and database of every monitoring read the dashboard asked for, in order. */
+  const reads = () =>
+    (mockUseMonitoringData.mock.calls as unknown[][]).map((call) => ({ connection: call[0], catalog: call[2] }));
+
+  beforeEach(() => {
+    mockUseMonitoringData.mockClear();
+    mockUseMonitoringData.mockImplementation(monitoringDataDefaults);
+    currentCapabilities = mockCapabilities;
+    metadataPending = false;
+    metadataFailure = null;
+  });
+
+  afterEach(() => {
+    cleanup();
+    restoreGlobalFetch();
+    metadataPending = false;
+    metadataFailure = null;
+  });
+
+  test("a declaration that failed to read does not hold the page: it reads the connection as before", async () => {
+    metadataFailure = "provider-meta refused";
+    await act(async () => {
+      render(<MonitoringDashboard />);
+    });
+    await waitFor(() => expect(reads().some((read) => read.connection !== null)).toBe(true));
+    expect(reads().find((read) => read.connection !== null)?.catalog).toBeUndefined();
+  });
+
+  test("nothing is read while the declaration is pending, and the first read names the database", async () => {
+    metadataPending = true;
+    await act(async () => {
+      render(<MonitoringDashboard />);
+    });
+    expect(reads().length).toBeGreaterThan(0);
+    expect(reads().every((read) => read.connection === null)).toBe(true);
+    cleanup();
+
+    metadataPending = false;
+    currentCapabilities = SERVER_LEVEL;
+    mockGlobalFetch({ "/api/db/objects/containers": databases });
+    mockUseMonitoringData.mockClear();
+    await act(async () => {
+      render(<MonitoringDashboard />);
+    });
+    await waitFor(() => expect(reads().some((read) => read.connection !== null)).toBe(true));
+    expect(reads().find((read) => read.connection !== null)?.catalog).toBe("analytics");
+  });
+
+  test("a database list the server refuses is the page's error, and Try Again reads it again", async () => {
+    currentCapabilities = SERVER_LEVEL;
+    // Held, the real hook has no data to show; the error panel stands in for it.
+    mockUseMonitoringData.mockImplementation(() => ({ ...monitoringDataDefaults(), data: null }));
+    mockGlobalFetch({ "/api/db/objects/containers": { ok: false, status: 500, text: "not json" } });
+    let view: ReturnType<typeof render>;
+    await act(async () => {
+      view = render(<MonitoringDashboard />);
+    });
+    expect(await view!.findByText("Failed to list the server's databases")).toBeTruthy();
+    expect(reads().every((read) => read.connection === null)).toBe(true);
+    expect(mockRefresh).not.toHaveBeenCalled();
+
+    mockGlobalFetch({ "/api/db/objects/containers": databases });
+    await act(async () => {
+      fireEvent.click(view!.getByText("Try Again"));
+    });
+    await waitFor(() => expect(reads().some((read) => read.connection !== null)).toBe(true));
+    expect(reads().find((read) => read.connection !== null)?.catalog).toBe("analytics");
   });
 });

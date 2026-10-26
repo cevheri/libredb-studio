@@ -17,8 +17,10 @@
  * Apart from the error type this file is purely structural: no I/O.
  */
 
+import type { NetworkFailureKind } from "@/lib/db/http/fetch-failure";
+
 /**
- * One result row.
+ * One result row, keyed by the names in `fieldNames`.
  *
  * Unlike Couchbase SQL++ - where `SELECT RAW` yields bare scalars and the
  * equivalent declaration is a known unsoundness - ClickHouse has no projection
@@ -42,6 +44,11 @@ export interface ClickHouseQueryResult {
    * describe the rows (see `rawText`). Declared order matters: it is the only
    * way to render columns the way the statement projected them, since object
    * keys of an all-null first row cannot be trusted to be complete.
+   *
+   * Every name is unique, and it is the key each row and `columnTypes` use: a
+   * name the server declares twice (a join can qualify a column into a name the
+   * statement already has, `b.x`) is numbered with `uniqueFieldNames`, and its
+   * value read by position, because two values under one key would leave one.
    */
   fieldNames: string[] | null;
 
@@ -70,7 +77,8 @@ export interface ClickHouseQueryResult {
 
   /**
    * The result verbatim as text, set only when the statement produced something
-   * other than JSON.
+   * other than the `JSONCompact` the transport asks for (an explicit `FORMAT JSON`
+   * included).
    *
    * Live-verified (spec 1.2): an explicit `FORMAT` clause in the user's own SQL
    * wins over the format the transport asks for, so `SELECT 1 FORMAT TSV`
@@ -114,6 +122,16 @@ export interface ClickHouseQueryOptions {
    * Neutral rather than HTTP-specific: any implementation can honour a deadline.
    */
   timeoutMs?: number;
+
+  /**
+   * The id this statement runs under on the server, so it can be stopped later by that id
+   * (`KILL QUERY WHERE query_id = ...`, which is how `cancelQuery` reaches it, #1364).
+   *
+   * Neutral rather than HTTP-specific: the id is the server's own handle for a running
+   * statement, listed in `system.processes`, whatever protocol submitted it. Left out, the
+   * server makes one up, which nothing outside it can know.
+   */
+  queryId?: string;
 }
 
 /**
@@ -187,12 +205,16 @@ const MONITORING_UNAVAILABLE_CODES: readonly number[] = [
  * symbol anyway - overriding the conventional class name - because it is the
  * vocabulary a ClickHouse user already reads in `clickhouse-client` output,
  * while the class itself stays recoverable through `instanceof`.
+ *
+ * `failure` says how a request that never got an answer failed (refused, timed
+ * out, ...). It is set only alongside code 0, where the server named nothing.
  */
 export class ClickHouseTransportError extends Error {
   constructor(
     message: string,
     public readonly code: number,
     name: string = CLICKHOUSE_UNKNOWN_ERROR_NAME,
+    public readonly failure?: NetworkFailureKind,
   ) {
     super(message);
     this.name = name;

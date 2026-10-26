@@ -10,9 +10,11 @@ This project and everyone participating in it is governed by our [Code of Conduc
 
 **Open an issue or a pull request in Chinese (中文) or Japanese (日本語) if that is easier for you.** You do not need fluent English to report a bug or propose a change, and a report we have to translate is far better than one you did not send. Maintainers will usually reply in English; say so if that does not work for you.
 
-This applies to the conversation, not to the repository. Everything that lands in the tree stays in English: code, comments, commit messages, documentation and the pull request title. The exceptions are the translated READMEs themselves ([README_zh.md](README_zh.md), [README_ja.md](README_ja.md)), which are maintained in their own language.
+This applies to the conversation, not to the repository. Everything that lands in the tree stays in English: code, comments, commit messages, documentation and the pull request title. The exceptions are the translated READMEs themselves ([README_es.md](README_es.md), [README_hi.md](README_hi.md), [README_ja.md](README_ja.md), [README_pt.md](README_pt.md), [README_ru.md](README_ru.md), [README_ur.md](README_ur.md), [README_zh.md](README_zh.md)), which are maintained in their own language.
 
 If you are updating a translated README, note that `bun run readme:check` enforces that its engine table and install commands match [README.md](README.md). Translations may cover fewer install channels, but a command must never be paraphrased - a reader copy-pastes it.
+
+Each translated README also carries a translation-lag banner: a blockquote above its first heading, in that file's own language, linking to [README.md](README.md) as the version that wins when the two disagree. `readme:check` enforces its presence, because the guard's other invariants cover the engine table, the install commands and one warning only - a translation can be stale in ways nothing in CI will report.
 
 ## How Can I Contribute?
 
@@ -37,18 +39,229 @@ Feature suggestions are welcome! Please provide:
 
 ### Pull Requests
 
-1. **Fork the repository** and create your branch from `main`
-2. **Follow the coding style** of the project
-3. **Write clear commit messages**
-4. **Update documentation** if needed
-5. **Test your changes** thoroughly
+1. **Start from an issue.** Open one or comment on an existing one before you write code, and
+   reference it from the PR (`Closes #123`). A PR with no linked issue is hard to review and, during
+   Hacktoberfest, does not count.
+2. **Fork the repository** and create your branch from `main`.
+3. **Write the failing test first, then the fix.** Every change that adds or alters executable
+   lines lands with its tests in the same PR. The CI gate is 100% line coverage
+   (`scripts/check-coverage.mjs` fails the required `Unit & Integration Tests` job below it), so a
+   PR without tests cannot merge no matter how small the change.
+4. **Run the checks locally when your environment supports them.** They mirror the required CI checks:
+
+   ```bash
+   (cd vscode-extension && npm ci --ignore-scripts)   # once, and again when its package-lock.json changes
+   bun run format && bun run lint && bun run typecheck && bun run knip \
+     && bun run readme:check && bun run chart:check && bun run channels:showcase:check \
+     && bun run security:check && bun run test && bun run build
+   ```
+
+   **CI is the merge gate.** If you cannot run a command locally, list that command and the reason
+   under a `Testing` heading in your PR body; submit the PR, and a maintainer will approve the fork's
+   workflow run so CI can verify it. You do not need to withdraw correct work because a local tool
+   is unavailable.
+
+   If your sandbox can reach the npm registry, `npm install -g bun` is another way to install Bun.
+   Helm is only needed to run the chart tests: without it `bun run test` leaves those files out and names them, and CI runs them.
+   The [devcontainer setup](#devcontainer--codespaces) below provides both tools.
+
+   Always `bun run test`, never bare `bun test` over a directory: the runner gives each test file its
+   own bun process, and `bun test tests/api` puts them all in one, where one file's `mock.module()`
+   becomes every file's. To run a single file, name it: `bun tests/run-tests.ts tests/unit/x.test.ts`.
+   `bun run test:coverage && bun run coverage:check` prints the exact uncovered `file:line` ranges.
+   `bun tests/run-tests.ts --jobs=N` lowers the concurrency, which by default is one job per available CPU: that follows CPU affinity and a cgroup CPU limit, but no memory limit, and a job peaks at roughly 60 to 340 MiB.
+   Use it in a memory-limited container that has no CPU limit, and when a file comes back as killed by SIGKILL from outside the runner, which on Linux is usually the OOM killer.
+   A flag meant for `bun test` goes past a `--` the runner can see, which means invoking the runner directly with a selector first: `bun tests/run-tests.ts tests/unit -- --bail`.
+   `bun run test -- --bail` does not work, because `bun run` removes the first `--` before the script sees it, and bun removes one that sits straight after the script path too.
+5. **Keep the provider triad in lockstep.** Anything under `src/lib/db/providers/**` has a matching
+   `docs/providers/<type-id>.md` and `tests/integration/db/<type-id>-provider.test.ts`; a change to
+   one moves the other two in the same PR.
+6. **Localized READMEs are guarded.** `README_es.md`, `README_hi.md`, `README_ja.md`, `README_pt.md`, `README_ru.md`, `README_ur.md`, and `README_zh.md` must list the same engines
+   as `README.md` and quote install commands verbatim; `bun run readme:check` enforces it.
+7. **Follow the coding style**, write clear commit messages, and update documentation with the code.
+
+### Keeping your branch current
+
+Set up the upstream remote once after cloning your fork:
+
+```bash
+git remote add upstream https://github.com/libredb/libredb-studio.git
+git remote -v
+```
+
+Refresh your feature branch before asking for review:
+
+```bash
+git status                      # commit or stash first; rebase refuses to run dirty
+git fetch upstream              # in a direct clone: git fetch origin
+git rebase upstream/main        # in a direct clone: git rebase origin/main
+git push --force-with-lease     # never plain --force
+```
+
+Rebase before review for three reasons that are specific to this repository.
+Required status checks are not strict, so a green run can be against a `main` that has already moved and GitHub will not force the branch to update.
+The [Security Scanning](#security-scanning) secret check scans the commits your branch adds, so deleting a credential in a later commit does not clear the finding; rewrite the commit that introduced it instead.
+A stale branch that edits a shared file can merge cleanly while restoring an older version of someone else's work, and rebasing surfaces that drift before review.
+
+`--force-with-lease` refuses the push when the remote branch has moved since your last fetch, which is the case where plain `--force` could delete someone else's commit.
+
+If rebase reports conflicts, resolve each file, then continue:
+
+```bash
+git add <file>
+git rebase --continue
+```
+
+Use `git rebase --abort` to return to where you started.
+
+Do not rebase after a maintainer has started reviewing unless they ask you to.
+Force-pushing replaces commit SHAs and loses the review's line anchors, so prefer new commits during review and rebase once at the end when asked.
+
+After a rebase, run the complete local gate from the **Run the checks locally** step again.
+The whole branch is re-verified from scratch, so do not rely on results from before the history rewrite.
+
+### Contributor programs
+
+The issues we have vetted for outside pickup are labeled
+[`good first issue`](https://github.com/libredb/libredb-studio/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+(small) and
+[`help wanted`](https://github.com/libredb/libredb-studio/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
+(medium). Each states what is wrong, where to look and what "done" looks like, and none needs a live
+database cluster or a cloud account. That list is the one to pick from during Hacktoberfest, Social
+Winter of Code, GSSoC or any other contributor program. Entries in `docs/BACKLOG.md` that carry no
+label have not been vetted for outside pickup; ask in an issue first if one interests you.
+
+- **Claim before you start.** Comment on the issue so two people do not build the same fix. A
+  claimed issue with no activity for two weeks is open again.
+- **A claim is a courtesy, not a lock.** It cannot reach somebody who already had the issue open,
+  because GitHub sends no notification for a comment on a page you are already reading. So two
+  people do occasionally arrive at the same issue, and when that happens neither of them did
+  anything wrong. We decide by the clock rather than by the claim: work that was already in flight
+  when the claim was posted is not queue-jumping, and a pull request that is already delivered is
+  reviewed on its merits. Nobody is asked to write the same change twice, so whoever does not land
+  it is offered the nearest open issue instead, and a review on the other pull request is credited
+  here the same as code.
+- **What counts.** A PR that references its issue, includes tests and passes the gate above. During
+  October we also add `hacktoberfest-accepted` to merged PRs from the labeled list, for participants
+  whose program still looks for it.
+- **What does not count.** PRs that only reformat, rename, fix a typo without an issue, add a
+  trailing comment or bump a version are closed with the `spam` or `invalid` label. Machine-generated
+  PRs that do not run the tests fall in the same bin.
+- **Maintainers:** the block pasted at the foot of a curated issue lives in
+  [`.github/curated-issue-footer.md`](.github/curated-issue-footer.md). Copy it from there rather
+  than retyping it; `tests/unit/curated-issue-footer.test.ts` holds its CI-gate paragraph to the
+  copy in step 4 above.
+
+The repository keeps the `hacktoberfest` topic for discoverability. Note that Hacktoberfest 2026
+itself is organised around in-person and online events and no longer counts pull requests; the
+labels above are how this repository welcomes contributors in any month.
+
+### The contributor ladder
+
+Every change here lands with its tests in the same pull request, under a hard 100% line-coverage
+gate and every check `main` requires. Clearing that bar says something about you, so we write down who
+cleared it and what it earns.
+
+**There is no threshold on this page, and that is deliberate.** We do not count merged pull
+requests, changed lines, closed issues or anything else. A count measures how often somebody showed
+up; it cannot see the care they took, the bug nobody else found, or the question they answered for
+a stranger at midnight. Five small changes and one careful one are not the same thing in either
+direction, and a number cannot tell you which is which. So these rungs are judgements, made by the
+maintainers and written down where you can read them and disagree.
+
+- **Contributor** — you landed a change. You are listed in [`CONTRIBUTORS.md`](CONTRIBUTORS.md) with
+  a link to it, so the entry is evidence rather than a thank-you. Use it wherever you need to show
+  what you have shipped.
+- **Trusted contributor** — someone we would hand an issue to without a conversation first. In
+  practice: assign yourself any open labeled issue without asking, and your review on someone else's
+  pull request is read as a review rather than a comment. Nothing to apply for and nothing to reach;
+  we put you here, and the reason is written beside your name.
+- **Area owner** — you own one area: a database provider, or a subsystem such as the Helm chart or
+  the SQL editor. For a provider that means the triad the repository is built on — the code under
+  `src/lib/db/providers/`, the doc under `docs/providers/` and the tests under
+  `tests/integration/db/` move together, and a change to your area is reviewed with you. Offered by
+  the maintainers, and offered to people who have already been answering questions about that area.
+- **Maintainer** — carries the project: the releases, the review, and the decisions nobody else can
+  make. Not a rung you climb to from the ones above it, which is why it is listed separately rather
+  than at the top of the same ladder.
+
+Maintainers are on [`CONTRIBUTORS.md`](CONTRIBUTORS.md) alongside everyone else. Keeping their work
+off the page would make it read as a guest list rather than a record, and the standard the page holds
+people to is one they are held to as well. Bots and coding agents are not listed: `dependabot`,
+`Copilot` and `claude` all appear in the commit history, none of them is a person, and putting them
+beside people would blur the only thing the page is for.
+
+Falling off a rung is not a thing. If you stop contributing, you keep what you earned.
+
+**Maintainers:** adding the contributor to `CONTRIBUTORS.md` is part of merging an external pull
+request, not a later sweep. `tests/unit/contributors-doc.test.ts` checks the page's shape and the
+ladder's two halves against each other, but it deliberately does not check that the list is
+complete — completeness cannot be measured in a shallow CI clone, so it stays a human step that is
+honest about being one.
 
 ## Development Setup
 
+### Devcontainer / Codespaces
+
+Open the repository in GitHub Codespaces, or use **Dev Containers: Reopen in Container** in VS Code
+with Docker running. [`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json) provides
+Node.js 24, Bun 1.4.2 and Helm 4.1.3, matching the required Node version and the Bun/Helm versions
+used by CI, plus 7-Zip for the packaging tests. The first creation installs the locked JavaScript
+dependencies and builds the chart's PostgreSQL dependency, so it needs access to the npm registry
+and the chart registries.
+
+JavaScript dependencies live in a container volume, keeping Linux native modules separate from
+any dependencies installed on your host and avoiding slow shared-filesystem installs on Docker Desktop.
+
+Once setup finishes, run the checks from step 4 in the container terminal. Start the app with
+`bun run dev`; the container forwards port 3000. Database containers are optional and are not
+started by this setup.
+
 ### Prerequisites
 
-- [Bun](https://bun.sh/) (recommended) or Node.js 24+
-- Git
+The suite runs on Linux, macOS and Windows, from whichever shell the platform gives you.
+`bun run test` is `bun tests/run-tests.ts`, a TypeScript runner rather than a shell script, and CI runs it on ubuntu-latest, macos-latest and windows-latest.
+
+| Tool | Version | Needed for |
+| --- | --- | --- |
+| [Bun](https://bun.sh/) | 1.4.2, the `packageManager` pin | Installing, the dev server, the build, and the test runner itself |
+| [Node.js](https://nodejs.org/) | 24+, the `engines` floor | The `scripts/*.mjs` gates, including `merge-lcov.mjs` and `check-coverage.mjs` |
+| Git | any | Cloning, and on Windows it is also where the POSIX tools below come from |
+| [Helm](https://helm.sh/) | 4.1.3, the version CI runs | Optional locally: the chart tests, see below |
+| A POSIX shell plus `tar`, `zip`, `unzip` and `7z` | any | The packaging tests, which run the `packaging/` shell scripts and unpack what they produce |
+
+Twelve of the thirteen `helm-chart-*.test.ts` files under `tests/unit/` spawn the `helm` binary; the exception is `helm-chart-readme-recipes.test.ts`, a static lint over the chart README.
+Each of the twelve opens with `// @requires helm`, and the runner reads that before it starts a file.
+Where `helm` is not on `PATH`, or the chart's PostgreSQL subchart is not built, `bun run test` does not start those files: it runs the rest, and its summary lists them under "Files not run on this machine" with the reason and the command that fixes it.
+Selecting only chart tests on such a machine is an error rather than an empty green run.
+CI sets `LIBREDB_REQUIRE_HELM=1`, which makes the same condition stop the run before anything starts, so the chart tests are never left out of a gate.
+If you change the chart, install Helm and run them before you push.
+A new test file that runs `helm` needs the marker too, and `tests/unit/test-runner-requirements.test.ts` fails until it has it.
+To run the chart tests, install Helm; the PostgreSQL subchart tarball is gitignored (`*.tgz`), so a fresh clone also needs:
+
+```bash
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm dependency build charts/libredb-studio --skip-refresh
+```
+
+Trap: a stale `docker login` can make that build fail with `401 Unauthorized` from `registry-1.docker.io` even though the chart is anonymously pullable. `docker logout` fixes it.
+
+A tool your platform does not have is not a failure here.
+The tests that need it become skips whose titles carry the reason, the summary lists every one of them under its file at the end of the run, and `bun run test` still ends green.
+So the table above is what you need to run the WHOLE suite; a machine without one of those tools runs the rest of it.
+
+On Windows the POSIX tools come from the Git for Windows installation the clone already needed, and the tests locate them through git itself rather than through `PATH`.
+PowerShell's `PATH` carries `git.exe` but not the `bin` and `usr\bin` directories beside it that hold `bash.exe`, `grep.exe` and `unzip.exe`, and where WSL is installed a bare `bash` does resolve, to `C:\Windows\System32\bash.exe`, a Linux shell that cannot read the Windows temp paths the fixtures hand it.
+So `tests/helpers/posix-tools.ts` asks the git binary for its exec path, derives the installation root from it, falls back to `%LOCALAPPDATA%\Programs\Git` and the two `Program Files` defaults, and spawns each tool by absolute path; 7-Zip is looked for at `C:\Program Files\7-Zip\7z.exe` as well as on `PATH`.
+Git for Windows carries no `zip`, so the tests that build the Azure package skip there whatever else you install (`docs/BACKLOG.md` D87).
+Assertions about POSIX file modes skip on Windows in every case: NTFS has no exec bit, and Windows cannot exec an extension-less `#!` script.
+
+macOS needs nothing of its own, and the one thing that used to stop it is gone: the old shell runner called `mapfile`, a bash 4 builtin that the system bash 3.2 does not have, and the runner is TypeScript now.
+The gap that remains is `7z`, which the tests look for by that name, so an installation that provides only `7zz` leaves the standalone-zip packaging tests skipped.
+`bash`, `tar`, `zip` and `unzip` come with the system, so everything else runs.
+
+You do not need a `.env` file or a `data/` directory to run the tests.
+`tests/setup.ts`, which `bunfig.toml` preloads into every test process, pins the credentials and settings the suite runs under, so a local `.env` cannot decide a test's outcome.
 
 ### Getting Started
 
@@ -59,6 +272,9 @@ cd libredb-studio
 
 # Install dependencies
 bun install
+
+# Install the VS Code extension's packages, which bun run knip reads
+(cd vscode-extension && npm ci --ignore-scripts)
 
 # Copy environment example
 cp .env.example .env.local
@@ -75,9 +291,9 @@ the password once to the dev-server output. Set them to pin known values instead
 (`USER_PASSWORD` additionally creates the optional non-admin account, which is
 never generated):
 ```env
-ADMIN_PASSWORD=admin123
-USER_PASSWORD=user123
-JWT_SECRET=your_32_character_random_string_here
+ADMIN_PASSWORD=
+USER_PASSWORD=
+JWT_SECRET=
 ```
 
 Optional (for AI features):
@@ -86,6 +302,19 @@ LLM_PROVIDER=gemini
 LLM_API_KEY=your_api_key
 LLM_MODEL=gemini-2.5-flash
 ```
+
+Any variable you add to `.env.example` whose name ends in `_PATH`, `_DIR` or `_FILE` must also
+be classified in [`bin/lib/launcher-utils.mjs`](bin/lib/launcher-utils.mjs), in one of two
+lists, or the required `Unit & Integration Tests` check fails:
+
+- `PATH_VARIABLES` — the value is a filesystem path, and the `npx @libredb/studio` launcher
+  resolves a relative value against the directory it was started from.
+- `URL_PATH_VARIABLES` — the name looks like a path but the value is not a file or directory
+  (a URL prefix or a mount name); the entry carries a one-line reason and the launcher leaves
+  the value alone.
+
+A guard test in [`tests/unit/launcher-utils.test.ts`](tests/unit/launcher-utils.test.ts)
+enforces this, so classify the variable when you add it rather than waiting for CI to flag it.
 
 ### Development Database
 
@@ -127,10 +356,21 @@ src/
 ### Available Scripts
 
 ```bash
-bun dev        # Start development server
-bun build      # Build for production
-bun start      # Start production server
-bun lint       # Run ESLint
+bun dev                  # development server (Turbopack)
+bun run build            # production build
+bun start                # production server
+bun run format           # Biome formatter check (format:fix to write)
+bun run lint             # oxlint, then ESLint 9
+bun run typecheck        # TypeScript strict
+bun run knip             # unused files, exports and dependencies (run npm ci in vscode-extension/ first)
+bun run test             # every test file, one bun process each; never bare `bun test`. Without Helm the chart tests are listed as not run, see Prerequisites
+bun run test:unit        # one layer; also test:api, test:integration, test:hooks, test:security, test:evals, test:components
+bun run test:coverage    # coverage report (merged lcov)
+bun run coverage:check   # enforce 100% line coverage on the merged lcov
+bun run readme:check     # localized README drift guard
+bun run chart:check      # Helm chart version sync guard
+bun run security:check   # security posture drift guard
+bun run build:lib        # @libredb/studio package dist (after changing anything under src/exports/)
 ```
 
 ### Security Scanning
@@ -139,14 +379,22 @@ Two checks run against every pull request. Both are reproducible locally, and
 reproducing them is faster than waiting for CI.
 
 **Committed secrets.** This one can fail your pull request. It scans only the
-commits your branch adds:
+commits your branch adds, and the command below works from a clone and from a
+git worktree alike:
 
 ```bash
-docker run --rm -v "$PWD:/repo:ro" -w /repo \
-  zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
-  git --no-banner --redact --config /repo/.gitleaks.toml \
+# In a worktree `.git` is a file that points into the main checkout's
+# `.git/worktrees/`, so that directory has to exist inside the container too.
+# In a clone the path is just "$PWD/.git".
+GIT_COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+docker run --rm \
+  -v "$PWD:$PWD:ro" -v "$GIT_COMMON_DIR:$GIT_COMMON_DIR:ro" -w "$PWD" \
+  ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+  git --no-banner --redact --config "$PWD/.gitleaks.toml" \
       --log-opts="--diff-merges=first-parent origin/main..HEAD"
 ```
+
+A scan that reports `0 commits scanned.` checked nothing, and is not a pass: either git could not open the repository, so a mount above is missing, or `origin/main..HEAD` holds no commits.
 
 If it reports a real credential, rotate it first — the value is already in every
 clone. If it reports a fixture or placeholder, copy the finding's own
@@ -175,7 +423,7 @@ fixed-version column `bun audit` lacks:
 
 ```bash
 docker run --rm -v "$PWD:/repo:ro" -w /repo \
-  aquasec/trivy@sha256:7cced7cae583819fc7806d4cbc0dbbc7cad18b99f7d3e235192e6da8c091045c \
+  ghcr.io/aquasecurity/trivy@sha256:7cced7cae583819fc7806d4cbc0dbbc7cad18b99f7d3e235192e6da8c091045c \
   fs --scanners vuln --ignorefile /repo/.trivyignore.yaml \
      --skip-dirs node_modules --skip-dirs .next --skip-dirs dist --skip-dirs coverage .
 ```

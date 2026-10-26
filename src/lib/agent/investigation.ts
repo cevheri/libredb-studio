@@ -44,7 +44,18 @@
  */
 
 import { createHash } from "node:crypto";
-import { type ModelMessage, Output, type ToolSet, streamText, tool } from "ai";
+import {
+  AGENT_LANGUAGE_COPY,
+  type AgentLanguageCopy,
+  type AgentStatementLanguageId,
+  PLAN_ESTIMATE_OPERATIONS,
+  planDeliverableOf,
+  planObjectiveOf,
+  requiredVariant,
+} from "./agent-manifest";
+import { logger } from "@/lib/logger";
+import { isRetryableError, isToolCallParseError, LLMConfigError } from "@/lib/llm/types";
+import { type AssistantModelMessage, type ModelMessage, Output, type ToolSet, streamText, tool } from "ai";
 import { z } from "zod";
 import {
   type AgentContextCapture,
@@ -62,20 +73,25 @@ import { BASELINE_NOTICES } from "./models/notices";
 import {
   ceilingFor,
   presentReminderLimitFor,
+  compareHoldLimitFor,
   verdictHoldLimitFor,
   retriesEmptyTurn,
-  retriesUnreadStop,
+  answersUnreadStop,
   suppressesAgentReasoning,
   suppressesPlanReasoning,
   turnTimeoutMsFor,
-  planStatementRetriesFor,
+  planStatementAsksFor,
   reportReminderLimitFor,
   samplingFor,
+  unreadStopAsksFor,
 } from "./models";
+import { mergeDisjoint } from "./disjoint-merge";
 import { erDetailForWorkflow, renderErDiagram } from "./er-diagram";
+import { recommendsIndex } from "./goal-claims";
 import { type AgentGoalShortfall, verifyRunGoal } from "./goal-verifier";
 import { type AgentInventoryNoun, inventoryNoun } from "./inventory-noun";
 import {
+  CALL_NAMING_KEYS,
   PROMPTED_ACTION_SHAPE,
   PROMPTED_PROTOCOL_REMINDER,
   promptedToolContract,
@@ -88,10 +104,19 @@ import { packSchemaStatistics, readSchemaStatistics } from "./schema-stats";
 import {
   AGENT_MODEL_TURN_TIMEOUT_MS,
   AGENT_REPORT_RESERVE_MS,
+  AGENT_TRANSPORT_TURN_RETRIES,
+  AGENT_UNREADABLE_TOOL_CALL_ANSWERS,
   AGENT_REPORT_RESERVE_TURNS,
   AGENT_WORKFLOW_BUDGETS,
 } from "./execution-policy";
-import { type AgentModel, mapAgentModelError } from "./model-adapter";
+import {
+  type AgentModel,
+  agentProviderOptions,
+  agentSamplingFor,
+  mapAgentModelError,
+  refusedEffortError,
+} from "./model-adapter";
+import { modelToolSchema } from "./model-tool-schema";
 import {
   type AgentRunInvocation,
   type AgentRunService,
@@ -100,45 +125,58 @@ import {
 } from "./run-service";
 import type { AgentSettledStepEvent } from "./run-store";
 import {
-  AGENT_ANSWER_CONTRACT,
-  AGENT_EVIDENCE_CONTRACT,
-  AGENT_TOOL_DEFINITIONS,
   type AgentToolContext,
   type AgentToolDefinition,
   type AgentToolName,
+  type AgentTableProfileOutcome,
   type AgentToolOutcome,
-  citeSnapshot,
+  agentToolDefinition,
   comparePlansTool,
   composeReportTool,
-  handoverText,
   inspectOperationsTool,
-  inspectPlanTool,
-  planTableProfile,
   presentAnswerTool,
-  profileTableTool,
   recommendChangeTool,
-  inspectSchemaTool,
   runReadQueryTool,
   selectAgentTools,
+  presentableArtifact,
 } from "./tools";
+import { AGENT_EVIDENCE_CONTRACT, capturedSnapshot, citeSnapshot, handoverText } from "./tool-contracts";
+import { statementFamilyOf } from "./languages/client";
+import { runServerPack } from "./languages/engines/server";
+import { AGENT_EVIDENCE_TOOLS, agentLanguagePack } from "./languages/index";
+import type { EvidenceToolName, ShortfallAdvice, ShortfallContext, ShortfallNotice } from "./languages/pack";
+import { LANGUAGE_SHORTFALL_NOTICES, LANGUAGE_USAGE_BAR_NOTICE, languageServer } from "./languages/server";
 import {
   AGENT_WORKFLOW_PRESENTS_ANSWER,
+  AGENT_WORKFLOW_SENDS_STATEMENTS,
   type AgentContextSnapshot,
   type AgentGuidanceNotice,
   type AgentReportClaim,
   type AgentRunEvent,
   type AgentRunMode,
   type AgentRunRecord,
+  type AgentRunStatus,
   type AgentRunStopReason,
   type AgentRunTerminalStatus,
   type AgentRunWorkflowType,
 } from "./types";
-import { UNTRUSTED_CONTENT_BEGIN, UNTRUSTED_CONTENT_END, fenceUntrustedContent } from "./untrusted-content";
+import {
+  UNTRUSTED_CONTENT_BEGIN,
+  UNTRUSTED_CONTENT_END,
+  fenceUntrustedContent,
+  neutraliseToolInput,
+  neutraliseUntrustedMarkers,
+} from "./untrusted-content";
+import { isStatementReadOperation } from "@/lib/db/operations/descriptors";
 import type { ProviderCapabilities } from "@/lib/db/types";
-import type { DatabaseType, TableSchema } from "@/lib/types";
+import { editorLanguageForTabType, resolveTabType } from "@/lib/editor/tab-language";
+import type { DatabaseType } from "@/lib/types";
 
 /** Everything a tool call needs EXCEPT what the run's own record decides. */
-export type AgentToolResources = Omit<AgentToolContext, "runId" | "modelId" | "mode" | "workflowType" | "actor">;
+export type AgentToolResources = Omit<
+  AgentToolContext,
+  "runId" | "modelId" | "mode" | "workflowType" | "statementLanguage" | "actor"
+>;
 
 export interface AgentInvestigationOptions {
   readonly service: AgentRunService;
@@ -161,10 +199,9 @@ export interface AgentInvestigationOptions {
  */
 export type AgentInvestigationStopReason = AgentRunStopReason;
 
-export interface AgentInvestigationResult {
+/** The fields every drive outcome carries, terminal or paused. */
+export interface AgentInvestigationResultBase {
   readonly runId: string;
-  readonly status: AgentRunTerminalStatus;
-  readonly stopReason: AgentInvestigationStopReason;
   /** Model turns this drive took. A resumed run counts its own, not the dead one's. */
   readonly turns: number;
   /** The model's last prose. A planning run's whole output; an agent run's aside. */
@@ -172,14 +209,29 @@ export interface AgentInvestigationResult {
 }
 
 /**
+ * What one drive ended with. The union keeps `status` and `stopReason` tied
+ * together: a terminal status always carries a stop reason, and `paused` never
+ * does, so a reader who narrows on the status knows from the type alone.
+ */
+export type AgentInvestigationResult =
+  | (AgentInvestigationResultBase & {
+      readonly status: AgentRunTerminalStatus;
+      readonly stopReason: AgentInvestigationStopReason;
+    })
+  | (AgentInvestigationResultBase & {
+      /** The drive stopped at the pause checkpoint; the run is left paused, not ended. */
+      readonly status: "paused";
+      readonly stopReason: null;
+    });
+
+/**
  * The tools that reach the database. The ledger-only ones are handled apart.
  *
- * Exclusion rather than enumeration, and that matters: `invokeDatabaseTool`'s
- * dispatch ends in a fall-through to `inspect_plan`, so a new tool name that is not
- * excluded here compiles and is silently routed to the wrong tool with a mis-cast
- * argument list. Adding a tool means deciding, here, which side it is on.
+ * Exclusion rather than enumeration, and that matters: the dispatch is a total record,
+ * so a new database tool stops this file compiling until it names its handler. Adding a
+ * tool means deciding, here, which side it is on.
  */
-type DatabaseToolName = Exclude<AgentToolName, LedgerOnlyToolName>;
+type DatabaseToolName = Exclude<AgentToolName, LedgerOnlyToolName | EvidenceToolName>;
 
 /**
  * Tools that do NOT go through `invokeDatabaseTool`.
@@ -234,20 +286,26 @@ const SHARED_RULES = [
 export const AGENT_CITATION_RULE =
   "Every claim must cite an artifact this run read or the schema snapshot it captured.";
 
-const AGENT_RULES = [
-  "You investigate a database read-only, through the tools you were given.",
-  "Every statement you send is bounded and read-only; writes and DDL are refused before the database is reached.",
-  "If a statement fails, draft a DIFFERENT one: the same statement is refused rather than retried, and your repair attempts are limited.",
-  "A refusal that names a policy decision is a boundary, not a defect in your SQL. Rewording will not change it.",
-  `Finish by calling compose_report. ${AGENT_CITATION_RULE}`,
-  AGENT_EVIDENCE_CONTRACT,
-].join(" ");
+/**
+ * The rules every agent-mode run reads, in its statement language's words. The SQL copy
+ * renders them exactly as they have always read, and the D6 golden file holds that.
+ */
+const agentRules = (copy: AgentLanguageCopy): string =>
+  [
+    `You investigate ${copy.subject} read-only, through the tools you were given.`,
+    `Every ${copy.noun} you send is bounded and read-only; ${copy.writes} are refused before ${copy.reached} is reached.`,
+    `If a ${copy.noun} fails, draft a DIFFERENT one: the same ${copy.noun} is refused rather than retried, and your repair attempts are limited.`,
+    `A refusal that names a policy decision is a boundary, not a defect in ${copy.defect}. Rewording will not change it.`,
+    `Finish by calling compose_report. ${AGENT_CITATION_RULE}`,
+    AGENT_EVIDENCE_CONTRACT,
+  ].join(" ");
 
 /**
- * What the run is told when it has come within the reserve of a ceiling (§1.5 of
- * `docs/AGENT_ANALYST_DESIGN.md`).
+ * What the run is told when it has come within the reserve of a ceiling (see "A run
+ * keeps its last turns back for its report" in the "What bounds a run" section of
+ * `docs/AGENT.md`).
  *
- * "Finish by calling compose_report" is already in `AGENT_RULES`; what nothing said
+ * "Finish by calling compose_report" is already in `agentRules`; what nothing said
  * until now is WHEN the room ran out. That is the #350 lesson applied ahead of time:
  * a rule the model is not told is a rule live runs fail, and a run that hits a
  * ceiling mid-thought leaves nothing behind at all.
@@ -258,6 +316,29 @@ const AGENT_RULES = [
  * event log — which is why it repeats `AGENT_CITATION_RULE` verbatim rather than
  * softening it: a forced report is a cited report or it is no report.
  */
+/**
+ * What an optimization run is told the moment it reads a plan.
+ *
+ * Every other sentence about this bar is delivered by HOLDING `compose_report`, and holds are
+ * suppressed inside the report reserve for a reason that is right: a run held on its last turn
+ * files no report at all, which is a worse verdict than the one the hold was avoiding. The
+ * consequence, unmeasured until now, is that a run which spends its turns READING is never told
+ * at all - the one sentence it needed is timed to arrive only after it can no longer be used.
+ *
+ * `laguna-xs-2.1` loses this cell five times out of five exactly there: eleven tool calls, THREE
+ * plans inspected, two reserve notices, a report, `no-plan-comparison`. It holds everything a
+ * comparison needs and stops, because nothing said a comparison was what the report rests on.
+ *
+ * So it is said when the plan arrives instead, riding on the turn that was about to be taken -
+ * the `report-reserve` pattern, which spends no turn and changes no rule. Early is safe here
+ * precisely because it costs nothing: the run that would have compared anyway loses nothing by
+ * being told, and the run that would not is told while it still has turns to act.
+ */
+const AGENT_PLAN_BAR_NOTICE = [
+  "You have a plan in hand, and this workflow is judged on a comparison rather than on the plan alone: a report answers when two plans have been compared, or when an index is recommended citing the plan whose access path it would change.",
+  "Neither is recorded yet. Before you call compose_report, either call inspect_plan on a rewritten form of the statement and then compare_plans with the two artifact ids, or call recommend_change for an index citing the plan artifact you already hold.",
+].join(" ");
+
 export const AGENT_REPORT_RESERVE_NOTICE = [
   "This run is nearly out of room: treat this as your last turn.",
   "Call compose_report now with what you have already established, and leave out what you have not.",
@@ -298,16 +379,28 @@ interface PlanningEngine {
    * none — which is all but the two search products. See the contract below.
    */
   readonly statementLanguage?: string;
+  /**
+   * The planning rules of the run's own server pack (`runServerPack`), empty where its `grounding` carries none. A
+   * MongoDB plan draft names a collection the way a command does, so plan mode is told the collection rule agent mode
+   * is told (`MONGO_COLLECTION_RULE` in `languages/mongo/server.ts`): without it, three of ten live plan drafts on 2026-10-17 named
+   * `"collection": "shop.orders"`, which the editor reads as a collection that does not exist and answers with no rows.
+   */
+  readonly planningRules: readonly string[];
+  /** The tool rules of the run's own server pack, per workflow; `workflowToolRules` reads the record's workflow. */
+  readonly toolRules: Readonly<Partial<Record<AgentRunWorkflowType, string>>>;
 }
 
 /** The engine facts a run's prose needs, taken from what its provider declared. */
 function planningEngine(context: AgentToolContext): PlanningEngine {
+  const server = runServerPack(context.statementLanguage, context.connection.type);
   return {
     type: context.connection.type,
     language: context.capabilities.queryLanguage,
     noun: inventoryNoun(context.labels),
     derivedGroupings: context.capabilities.tablesAreDerivedGroupings === true,
     ...(context.labels.statementLanguage === undefined ? {} : { statementLanguage: context.labels.statementLanguage }),
+    planningRules: server.grounding.planningRules ?? [],
+    toolRules: server.workflowToolRules,
   };
 }
 
@@ -360,8 +453,11 @@ function planningEngine(context: AgentToolContext): PlanningEngine {
  * only for SQL would push a model whose inventory cannot answer into inventing a table name
  * to satisfy it, which is the failure `verifyPlanningGoal` accepts refusals to avoid.
  *
- * Offered only where a profile asks for it (`planStatementRetriesFor`, 0 for every model but
- * one), so introducing it changed no other model's run.
+ * Offered to whoever needs it, because the ask is the server's own: `planStatementAsksFor` reads a
+ * measured profile's number when there is one and answers 1 when there is not, so a model nobody
+ * has measured is asked once rather than being refused a turn on the strength of its absence. A
+ * profile that states 0 is a measurement — that model was watched declining the ask — and it still
+ * decides for the model it was written about.
  */
 /**
  * What an answer-presenting run is told once when it would report without presenting.
@@ -440,6 +536,18 @@ function compareBeforeReportNotice(before: string, after: string): string {
 }
 
 /**
+ * The plans this run inspected, oldest first, by the artifact id a citation names: a completed step under any
+ * language's plan-estimate operation (`PLAN_ESTIMATE_OPERATIONS`), so a MongoDB plan counts wherever a plan does.
+ */
+function inspectedPlans(events: readonly AgentRunEvent[]): readonly string[] {
+  return events.flatMap((event) =>
+    event.kind === "tool-completed" && PLAN_ESTIMATE_OPERATIONS.has(event.artifact.operationId)
+      ? [event.artifact.correlationId]
+      : [],
+  );
+}
+
+/**
  * The shortfalls the report being submitted WOULD earn, asked of the verifier itself.
  *
  * The architectural form of every notice in this loop, and the reason it is worth having.
@@ -469,6 +577,8 @@ function shortfallsIfReported(
   return verifyRunGoal({
     mode: record.mode,
     workflowType: record.workflowType,
+    statementLanguage: record.statementLanguage,
+    verifier: record.verifier,
     // The status the run would end in, so the verdict is the one this report would earn
     // rather than one shaped by a `cancelled` arm that has not happened.
     status: "succeeded",
@@ -542,35 +652,44 @@ function tableToProfile(
 }
 
 /**
- * What a run is told about a shortfall it is one call away from fixing.
- *
- * `null` for every shortfall this cannot honestly ask about, and that list is the #350
- * rule applied per case: `no-report` is impossible here (a report is being submitted),
- * `cancelled` is not the model's to fix, and the shortfalls that already have a purpose-
- * written notice keep it, because those carry ids this generic sentence cannot.
+ * The shortfall notices the core speaks. A language's own are its pack's `shortfallNotices`.
  */
-interface ShortfallAdvice {
-  readonly said: string;
-  /**
-   * Whether narrowing the run to its verdict's tools would HELP this shortfall.
-   *
-   * False wherever the fix lies outside that set, and an eval caught the case immediately:
-   * the answer to `no-plan-evidence` is to call `inspect_plan`, which is a READING tool and
-   * so not among the tools the optimization verdict accepts. Narrowing there would have
-   * removed the very tool this notice asks for — telling a run to do something and taking
-   * away its means of doing it, which is the shape of mistake this file has already paid
-   * for twice.
-   */
-  readonly narrow: boolean;
-}
+const CORE_SHORTFALL_NOTICES: Readonly<Partial<Record<AgentGoalShortfall, ShortfallNotice>>> = Object.freeze({
+  /*
+    The shortfall this drive never spoke, and it is worth a whole cell.
 
-function shortfallNotice(
-  shortfall: AgentGoalShortfall,
-  table: string | undefined,
-  plansInspected: number,
-  readingsHeld: number,
-): ShortfallAdvice | null {
-  if (shortfall === "no-table-profile") {
+    Four shortfalls have an arm below and `no-answer` had none, so a data-analysis run that
+    reported without an answer fell through all of them. `present-before-report` does not reach
+    it either, and correctly: that hold is withheld from a run holding nothing presentable,
+    because a run told to present what it cannot present neither presents nor reports — the
+    mistake two tests in this suite exist to prevent.
+
+    So the run heard nothing at all. Measured on `mistral-small3.2:24b`, a 24B model otherwise
+    at 25/30 whose analyze cell read 0/5 across six rolls, naked and levered alike, every run
+    the same four events: three `inspect_schema` calls, a report resting on the inventory,
+    `no-answer`. It never drafts a read, because nothing ever says the answer has to be one.
+
+    The sentence this arm gives is the one that IS possible: draft a read, present that, report.
+    Only for a run holding nothing presentable — where the run holds one, the present notice is
+    the better sentence and owns the case.
+  */
+  "no-answer": (_table, { holdsPresentable }) => {
+    if (holdsPresentable) return null;
+    return {
+      said: [
+        "This workflow answers by PRESENTING a result you read yourself, and this run has drafted no read: a report resting on the inventory is scored as having answered nothing.",
+        "Your compose_report call was not run. Call run_read_query with a statement of your own that answers the objective, then present_answer with the artifact id it reports, and then call compose_report again.",
+      ].join(" "),
+      // NOT narrowed, and that is the whole care of this arm. The narrowed set for
+      // data-analysis is `compose_report` plus `present_answer`; `run_read_query` is not in
+      // it. Narrowing here would take away the very tool this sentence names, the run would
+      // call it, be answered "there is no such tool", and spend the turn the hold just bought
+      // — the #350/#356 defect, and the ledger of this test showed it happening: the held
+      // report was followed by a declined read.
+      narrow: false,
+    };
+  },
+  "no-table-profile": (table) => {
     const named = table === undefined ? "a table this run's inventory lists" : `"${table}"`;
     return {
       said: [
@@ -583,32 +702,30 @@ function shortfallNotice(
       // `run_read_query` three without ever profiling.
       narrow: true,
     };
-  }
-  if (shortfall === "no-reading") {
+  },
+  "no-reading": (_table, { readingsHeld }) => {
     // Only for a run that read NOTHING. A run holding artifacts and citing the inventory
     // instead earns the same verdict, but the useful sentence there is
     // `citeWhatYouReadNotice`, which can name the ids it actually has. Saying "this run has
     // taken no reading" to a run that took six is the false self-description this file
     // keeps catching — and three evals caught it here within a minute.
     if (readingsHeld > 0) return null;
-    /*
-      The hole `citeWhatYouReadNotice` deliberately leaves, and it is worth an entire cell.
-
-      That notice fires only when the run HOLDS a usable artifact, because a run with
-      nothing to cite would be asked for the impossible. Right — and it means a run that
-      took NO reading and reported off the captured inventory holds nothing, hears nothing,
-      and dies of `no-reading` never having been told the bar exists.
-
-      One evaluated model loses `operations` five times out of five, and all five ledgers are four
-      events long: started, context captured, report composed, finished, in five seconds. It
-      answers from the inventory it was handed and never calls `inspect_operations`. It is a
-      24B model that reads competently on other surfaces, so this is not capacity — it is a
-      run answering on turn one because nothing said the answer had to rest on a reading.
-
-      NOT narrowed, and that is load-bearing: `AGENT_NARROWED_EXTRA_TOOLS.operations` is
-      empty, so narrowing here would remove `inspect_operations` — the one tool this
-      sentence asks for. The same trap `no-plan-evidence` documents one branch below.
-    */
+    // The hole `citeWhatYouReadNotice` deliberately leaves, and it is worth an entire cell.
+    //
+    // That notice fires only when the run HOLDS a usable artifact, because a run with
+    // nothing to cite would be asked for the impossible. Right — and it means a run that
+    // took NO reading and reported off the captured inventory holds nothing, hears nothing,
+    // and dies of `no-reading` never having been told the bar exists.
+    //
+    // One evaluated model loses `operations` five times out of five, and all five ledgers are four
+    // events long: started, context captured, report composed, finished, in five seconds. It
+    // answers from the inventory it was handed and never calls `inspect_operations`. It is a
+    // 24B model that reads competently on other surfaces, so this is not capacity — it is a
+    // run answering on turn one because nothing said the answer had to rest on a reading.
+    //
+    // NOT narrowed, and that is load-bearing: the operations variant's `narrowedExtras` is
+    // empty, so narrowing here would remove `inspect_operations` — the one tool this
+    // sentence asks for. The same trap `no-plan-evidence` documents one branch below.
     return {
       said: [
         "This workflow is scored on what the ENGINE reports about itself, and this run has taken no reading: the schema inventory in this conversation was captured for you before your first turn and citing it establishes nothing about what the engine is doing.",
@@ -616,14 +733,26 @@ function shortfallNotice(
       ].join(" "),
       narrow: false,
     };
-  }
-  if (shortfall === "no-plan-comparison") {
-    // Only for a run holding NO plan. With one or two in hand the run is not missing the
-    // idea, it is one call short, and `compareBeforeReportNotice` says that better because
-    // it can name the ids. Saying "this run has inspected none" to a run that inspected two
-    // is worse than saying nothing — caught by the two gate evals that assert exactly that
-    // arc.
-    if (plansInspected > 0) return null;
+  },
+  "no-plan-comparison": (_table, { plans, holdsCompare, noun }) => {
+    const latest = plans.at(-1);
+    if (latest !== undefined) {
+      // With a plan in hand the run is not missing the idea, it is one call short. Where it
+      // holds `compare_plans`, `compareBeforeReportNotice` says that better because it can name
+      // the ids. Saying "this run has inspected none" to a run that inspected two is worse than
+      // saying nothing, caught by the two gate evals that assert exactly that arc.
+      if (holdsCompare) return null;
+      // Where it does not, nothing else would speak: that notice is gated on the tool. The one
+      // route its verdict accepts is the index arm, so the sentence names it and the plan it
+      // holds, and narrows to it: `recommend_change` is the variant's `narrowedExtras`.
+      return {
+        said: [
+          "This workflow answers with an index recommended because of a plan, and this run holds a plan and has recommended nothing, so the report would be scored as having established nothing.",
+          `Your compose_report call was not run. Call recommend_change for an index citing artifact "${latest}", the plan whose access path it would change, and then call compose_report.`,
+        ].join(" "),
+        narrow: true,
+      };
+    }
     /*
       The largest shortfall that had no sentence at all. It blocks NINE cells across the
       measured models, five of them losing to nothing else, and `shortfallNotice` returned
@@ -646,12 +775,16 @@ function shortfallNotice(
     return {
       said: [
         "This workflow is judged on plans: a report is scored on whether it shows HOW the engine reaches its rows, and this run has inspected none, so it would be scored as having established nothing.",
-        "Your compose_report call was not run. Call inspect_plan on the statement in question, then either recommend_change citing that plan's artifact id, or inspect_plan on a rewritten form and compare_plans on the two — and then call compose_report.",
+        // The comparison route only where the run holds the tool (#350): a variant with no
+        // `compare_plans` is told the one route it has.
+        holdsCompare
+          ? `Your compose_report call was not run. Call inspect_plan on the ${noun} in question, then either recommend_change citing that plan's artifact id, or inspect_plan on a rewritten form and compare_plans on the two, and then call compose_report.`
+          : `Your compose_report call was not run. Call inspect_plan on the ${noun} in question, then recommend_change for an index citing that plan's artifact id, and then call compose_report.`,
       ].join(" "),
       narrow: false,
     };
-  }
-  if (shortfall === "no-plan-evidence") {
+  },
+  "no-plan-evidence": (_table, { noun }) => {
     // Measured on `qwen3:8b` and `qwen3:14b`, same arc both times: `inspect_schema`, a
     // refused read, then `recommend_change` for an index and no `inspect_plan` anywhere.
     // The recommendation may well be right; it is simply not established, which is what
@@ -660,15 +793,34 @@ function shortfallNotice(
     return {
       said: [
         "Your index recommendation rests on no plan: this workflow judges a change by HOW the engine reaches its rows, and no plan has been inspected, so the report would be scored as having established nothing.",
-        "Your compose_report call was not run. Call inspect_plan on the slow statement, then call recommend_change again citing that plan's artifact id, and then call compose_report.",
+        `Your compose_report call was not run. Call inspect_plan on the slow ${noun}, then call recommend_change again citing that plan's artifact id, and then call compose_report.`,
       ].join(" "),
       // NOT narrowed: `inspect_plan` is a reading tool, and this verdict accepts only
       // `compare_plans` and `recommend_change`. Narrowing would take away the tool this very
       // sentence asks for.
       narrow: false,
     };
-  }
-  return null;
+  },
+});
+
+/** The core's notices and every pack's, as one table: a pack notice that shadowed a core one fails at load. */
+const SHORTFALL_NOTICES = mergeDisjoint([CORE_SHORTFALL_NOTICES, LANGUAGE_SHORTFALL_NOTICES], "SHORTFALL_NOTICES");
+
+/**
+ * What a run is told about a shortfall it is one call away from fixing.
+ *
+ * `null` for every shortfall this cannot honestly ask about, and that list is the #350
+ * rule applied per case: `no-report` is impossible here (a report is being submitted),
+ * `cancelled` is not the model's to fix, and the shortfalls that already have a purpose-
+ * written notice keep it, because those carry ids this generic sentence cannot.
+ */
+function shortfallNotice(
+  shortfall: AgentGoalShortfall,
+  table: string | undefined,
+  context: ShortfallContext,
+): ShortfallAdvice | null {
+  const notice = Object.hasOwn(SHORTFALL_NOTICES, shortfall) ? SHORTFALL_NOTICES[shortfall] : undefined;
+  return notice === undefined ? null : notice(table, context);
 }
 
 /**
@@ -716,6 +868,77 @@ function citedArtifactIds(input: unknown): readonly string[] {
  * asking for the impossible — the mistake the reverted `ANSWER_NOT_PRESENTED` refusal
  * made, which cost those runs their report as well as their answer.
  */
+/**
+ * Whether a stopping turn's TEXT is a tool call the run could have made.
+ *
+ * Measured on `llama3.1:8b`, the most-pulled tool-capable model on Ollama, whose analyze cell sat
+ * at 4/5 across eight rolls and lost the same run every time. The losing turn is not prose: it is
+ * `{"name":"present_answer","parameters":{...}}` - a complete call for a tool the run holds,
+ * naming an artifact this run produced - written into the assistant's text channel. Nothing runs,
+ * the drive sees a model that stopped talking, and the run ends `no-report` having done every part
+ * of the work except the transport.
+ *
+ * Recognised, never EXECUTED. A server that ran what a model typed would be taking a tool call
+ * from outside the channel the transport authenticates, and the ledger could no longer say where a
+ * call came from. All this decides is whether the model is told what happened to it.
+ *
+ * Narrow on purpose, but narrower than the fault for its first two months, and the widening is
+ * measured. Across the 2026-09-16 sweep: 69 stopping turns, 27 of them carrying a complete call
+ * for a tool the run held, 18 of those `compose_report` - the tool whose absence IS `no-report`.
+ * The reader saw none of the 27, because it asked two things the fault does not respect:
+ *
+ *   that the object say `name`. Twenty said `name`; SEVEN said `action`.
+ *
+ *   that the text parse. Not one of the 27 parsed. Twenty-four failed the same way,
+ *   `Expecting ',' delimiter`, on a claims array whose last member closes twice. Everything
+ *   else about those calls was right - true claims, populated evidence arrays, correlation
+ *   ids the run had genuinely produced. A model that writes a perfect call into the wrong
+ *   channel and drops one brace has made one mistake, and the brace is not it.
+ *
+ * So the JSON arm reads the NAMING rather than the document: a key that introduces a call, a
+ * colon, a quoted tool this run holds. Still not prose - prose does not write `"name": "x"` - and
+ * still nothing is executed or repaired. All this decides is whether the model is told what
+ * happened to its call.
+ */
+/*
+  One list, shared with the reader that RECOVERS these calls. They were written separately and
+  drifted: this path recognised `{"name": "compose_report", …}` well enough to tell the model it
+  had used the wrong channel, while `readPromptedAction` could not read it and the finished report
+  was discarded. A shape now either reads or is not recognised at all.
+*/
+const NAMING_KEY_PATTERN = CALL_NAMING_KEYS.join("|");
+
+function stoppedWithAToolCall(text: string, holds: (name: string) => boolean): boolean {
+  const body = text
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
+  if (body.startsWith("{")) {
+    const named = new RegExp(`"(?:${NAMING_KEY_PATTERN})"\\s*:\\s*"([A-Za-z_][A-Za-z0-9_]*)"`).exec(body);
+    return named !== null && holds(named[1] as string);
+  }
+  /*
+    The other dress the same mistake wears, and the FENCE is what makes it recognisable.
+
+    Measured on `cogito:8b`, investigate, five runs at one sitting with zero tools invoked between
+    them. The model does not narrate vaguely - it writes the calls out, fenced, one per block:
+    "```sql\ninspect_schema(kind=\"columns\")\n```" - and then reports "based on the schema
+    inspection" on a run that inspected nothing.
+
+    Only inside a fence, and only where the block's first token is a tool this run HOLDS followed
+    by an opening parenthesis. A fenced block is a deliberate emission of code; prose that merely
+    mentions a tool by name is a model thinking aloud, and telling that run it made a tool call
+    would be answering a sentence with a sentence. The test beside this one pins that line.
+  */
+  for (const block of text.matchAll(/```[a-z]*\s*\n?([\s\S]*?)```/gi)) {
+    const first = (block[1] ?? "").trim();
+    const called = /^([A-Za-z_][A-Za-z0-9_]*)\s*\(/.exec(first);
+    if (called !== null && holds(called[1] as string)) return true;
+  }
+  return false;
+}
+
 function citeWhatYouReadNotice(ids: readonly string[], everythingCitedWasEmpty: boolean): string {
   const named = ids
     .slice(0, 4)
@@ -926,42 +1149,6 @@ const PLANNING_NO_STATEMENT_RULE = [
 ].join(" ");
 
 /**
- * What a plan of each workflow is to produce (section 3 of the plan-mode design).
- *
- * A TOTAL record over `AgentRunWorkflowType`, for the reason `WORKFLOW_OBJECTIVES` and
- * `WORKFLOW_TOOL_RULES` are: a workflow added to the union stops this file compiling
- * until someone decides what a plan of it hands back. The alternative — one deliverable
- * sentence for every workflow — is what makes a plan of a query optimization ask for
- * "the statement that answers the question" when the objective already came with one.
- *
- * `operations` is the exception the owner ruled on, and it is a decision rather than an
- * omission. Two justifications have since been narrowed by what live runs did, and the
- * row survives both. The first expired with #411: the run IS grounded now, on the
- * engines whose catalog can be read, so "there is no schema to write a statement
- * against" is no longer why. The second was "an operational reading is not a statement",
- * which is true of Redis and MongoDB and false of PostgreSQL, where `pg_stat_activity`
- * and `pg_stat_user_indexes` are ordinary objects a user selects from — so the rule
- * built on it (`planningProseStatementRule`) states the condition instead of the
- * conclusion.
- *
- * What is left is why this row is prose and stays prose: no reading of this workflow can
- * be REQUIRED to be a statement, because the workflow deliberately runs on engines where
- * none is. Asking for a fenced statement would be a rule this workflow's own subject
- * matter cannot satisfy on half its engines, which is the #350 failure. So the plan is
- * judged as prose, is exempt from the planning statement rule, and may fence a statement
- * where the engine happens to express the reading as one.
- */
-type PlanDeliverable = { readonly kind: "statement"; readonly noun: string } | { readonly kind: "prose" };
-
-const PLAN_DELIVERABLES: Readonly<Record<AgentRunWorkflowType, PlanDeliverable>> = Object.freeze({
-  investigation: { kind: "statement", noun: "the statement that answers the question" },
-  "query-optimization": { kind: "statement", noun: "the rewritten statement" },
-  "database-assessment": { kind: "statement", noun: "the statement that measures the quality concern" },
-  "data-analysis": { kind: "statement", noun: "the statement that produces the answer" },
-  operations: { kind: "prose" },
-} satisfies Record<AgentRunWorkflowType, PlanDeliverable>);
-
-/**
  * The deliverable, said to a run that HAS an inventory.
  *
  * The fence tag is the connection's canonical type-id and not the word `sql`, because
@@ -978,14 +1165,14 @@ const PLAN_DELIVERABLES: Readonly<Record<AgentRunWorkflowType, PlanDeliverable>>
  * `language` arrived with #414 and every sentence that assumed SQL is now written
  * twice. The tag does NOT vary with it and that is the point of taking the language
  * separately: the tag is the canonical type-id in both arms, because it is what
- * `isQueryFenceTag` accepts (a total record over `DatabaseType`, so all seventeen pass)
+ * `isQueryFenceTag` accepts (a total record over `DatabaseType`, so every type-id passes)
  * and what `rich-text.tsx` and `readPlanStatement` key the editor hand-off on. A draft
  * a model fenced as ```` ```javascript ```` produces no `plan-statement-drafted` event
  * at all — the run would be scored as having drafted nothing while the user is looking
  * at a statement — so the one thing this contract cannot afford to leave to the model
  * is what the tag says.
  *
- * What the json arm has to say instead is that SQL is the wrong language, and it has
+ * What the arm for every other language has to say instead is that SQL is the wrong language, and it has
  * to say it: the objective is prose, the words "statement", "table" and "column" are
  * all over the conversation, and a model handed a MongoDB inventory under those words
  * will write SQL against it unless told not to. The second clause is about the same
@@ -1008,6 +1195,7 @@ const planningStatementContract = (deliverable: { readonly noun: string }, engin
     // message is the #350 failure — and it names what the language is NOT, because
     // naming only what it is did not survive contact with the model's prior.
     ...(engine.statementLanguage === undefined ? [] : [`Write it in ${engine.statementLanguage}.`]),
+    ...engine.planningRules,
     `Put it in a single fenced block tagged \`${engine.type}\` — three backticks, that tag, the statement, three backticks — and put nothing else inside that block.`,
     `Put the rationale AFTER the statement, and keep it brief: which ${engine.noun.plural} it reads, which joins it makes, and why that answers the objective.`,
     engine.language === "sql"
@@ -1076,17 +1264,17 @@ interface PlanningGrounding {
  * sentences say: no statement of the USER'S was run, nothing was written, and the
  * model has no tools.
  *
- * FOUR sentences since #414, over the same two axes as `PLANNING_SNAPSHOT_PREFACE`,
- * and this record was left one-dimensional when that one was made 2x2 — which put the
- * two halves of one conversation in direct contradiction on twelve of the fourteen
- * said the inventory came "through the same read-only catalog path the agent mode
- * uses" and the message under them said it came from the engine's own inspection.
- * Both halves of the first were false there: no catalog statement is composed on a
- * dialect `CATALOG_PLANS` does not serve, and agent mode cannot take a read-only path
- * on those engines at all — it is refused the profile and ends `engine-unsupported`,
- * which is the whole reason `readProviderSchemaForGrounding` exists. Telling a model
- * how the run came by what it knows and getting it wrong is the defect class #414 was
- * opened to close, so it may not be stated in the rules either.
+ * FOUR sentences since #414, over the same two axes as `PLANNING_SNAPSHOT_PREFACE`.
+ * This record was left one-dimensional when that one was made 2x2, which put the two
+ * halves of one conversation in direct contradiction on every engine whose overlay
+ * supplies no `catalogCapture`: the rules said the inventory came "through the same read-only
+ * catalog path the agent mode uses", and the message under them said it came from the
+ * engine's own inspection. Both halves of the first were false there: no catalog
+ * statement is composed on those engines, and at #414 agent mode took no read-only
+ * path on them at all. That is why the provider's own reading grounds them
+ * (`readObjectInventoryForGrounding` in `tools.ts`). Telling a model how the run came
+ * by what it knows and getting it wrong is the defect class #414 was opened to close,
+ * so it may not be stated in the rules either.
  *
  * The composed arms keep their reference to agent mode because it is true where they
  * are said: on PostgreSQL and SQLite the agent path takes exactly that read.
@@ -1313,7 +1501,7 @@ const planningProseEngineRule = (type: DatabaseType): string =>
  * `INFO`, `SLOWLOG GET`, `CLIENT LIST`, and on MongoDB a server-status command; there is
  * nothing to fence. So the rule states the CONDITION and lets the engine decide.
  *
- * What did NOT change, and must not: `PLAN_DELIVERABLES.operations` is still
+ * What did NOT change, and must not: the operations plan deliverable is still
  * `{ kind: "prose" }`. This is a permission and never a contract — no `noun`, no
  * `NO STATEMENT:` marker, no ledger fact (`recordPlanStatement` still records nothing
  * for this workflow), and no verdict that asks for a block. A plan with no block in it
@@ -1397,139 +1585,14 @@ const planningProseRulesUngrounded = (engine: PlanningEngine): string =>
     planningProseEngineRule(engine.type),
   ].join(" ");
 
-/**
- * What each workflow is FOR, said to the model (#330 T3).
- *
- * A total record, so a workflow added to the contract stops this file compiling
- * until someone decides what to ask of it. Appended to `AGENT_RULES` and never to a
- * planning run's rules: planning is toolless, and telling it to call tools would be
- * asking for something the mode cannot do. What a plan of each workflow produces
- * instead is `PLAN_DELIVERABLES`, which is total over the same union for the same
- * reason.
- *
- * The optimization block names `inspect_schema`'s index selector explicitly, and
- * that is not padding. A live run on 2026-08-12 reached for
- * `PRAGMA index_list('a'); PRAGMA index_list('b')` — multi-statement text, refused
- * by the statement guard before the database — because the obvious route to an
- * index inventory is closed and nothing had said which one is open.
- *
- * It also says what to do about an index INSTEAD of comparing plans, and that
- * sentence is the model's half of #356. The verifier now accepts a cited plan in
- * place of a comparison for an index; a rule the model is not told about is a rule
- * live runs fail, which is exactly how the evidence contract failed in #350.
- */
-/** What the run is FOR. Said in BOTH modes — a plan for an optimization is still about one. */
-const WORKFLOW_OBJECTIVES: Readonly<Record<AgentRunWorkflowType, string>> = Object.freeze({
-  investigation: "Your objective is a question about this database. Answer it from what you establish.",
-  "query-optimization":
-    "Your objective is a statement that is too slow. What matters is HOW the engine reaches its rows, and what change would make it reach them differently.",
-  "database-assessment":
-    "Your objective is the state of this database itself: where its data is incomplete, inconsistent or surprising.",
-  operations:
-    "Your objective is how this database is RUNNING right now: what is connected to it, what it is spending its time on, what is blocked, and where its space and its indexes are going.",
-  "data-analysis":
-    "Your objective is a question about the data in this database. Establish the answer from the data and produce something to show for it.",
-} satisfies Record<AgentRunWorkflowType, string>);
-
-/**
- * How to pursue the objective WITH THE TOOLS. Agent mode only, which is the whole
- * reason this is a second record rather than one.
- */
-const WORKFLOW_TOOL_RULES: Readonly<Record<AgentRunWorkflowType, string>> = Object.freeze({
-  investigation: "Report what the evidence supports, and nothing further.",
-  "query-optimization": [
-    'Read the existing indexes with inspect_schema and kind="indexes" — a multi-statement PRAGMA or SHOW is refused before the database.',
-    "Inspect the plan of the current statement, then of your rewrite, and call compare_plans with the two artifact ids. They must name two different plans.",
-    "An index cannot be compared that way: its second plan would need the index to already exist, and this run creates nothing. Recommend it instead, citing the inspect_plan artifact whose access path the index is meant to change.",
-    "Every plan you can obtain is an ESTIMATE: nothing is executed, and there are no timings. Say so rather than implying a measurement.",
-    "Propose changes with recommend_change. They are offered to the user and never applied by this run.",
-    // The verifier's rule, in the model's own terms — the same #350/#356 move the
-    // `operations` rules make, and the one this workflow was missing. Everything above
-    // describes how the two instruments WORK; none of it says the report is judged on
-    // having used one. Measured across 25 local models, 6 failed on
-    // `no-plan-comparison` with the arc the gate in `tests/evals/query-optimization`
-    // scripts: one `inspect_plan`, then a report. Two evaluated models and
-    // `qwen3.5:9b` produced identical ledgers — a correct diagnosis, and no
-    // `recommend_change` call at all. Stopping after the diagnosis is a reasonable
-    // reading of "explain why it is slow" when nothing has said otherwise, so this
-    // says otherwise, and names both routes because naming the tool is what made the
-    // assessment bar land: a bar phrased as an activity gets satisfied by hand.
-    "One plan on its own answers nothing: before you report, either inspect the plan of your rewrite too and call compare_plans with the two artifact ids, or call recommend_change for an index citing the inspect_plan artifact whose access path it would change.",
-  ].join(" "),
-  "database-assessment": [
-    "Profile the tables that matter with profile_table, deepening only where a shallower profile left a question: basic counts rows and missing values, distribution adds distinct counts, pattern tests for personal-data shapes.",
-    // The verifier's rule, in the model's own terms — the same #350/#356 move the
-    // `operations` rules make below, for the same reason and now on the evidence that
-    // it was needed here too. `verifyDatabaseAssessmentGoal` requires a
-    // `table-profiled` event, and the sentence above it states WHERE to look rather
-    // than what the report is judged by: "profile the tables that matter" reads as
-    // advice a run may take or leave. Measured across 25 local models, 18 failed this
-    // workflow on `no-table-profile`, and five of those composed a report having
-    // called no tool at all — not refusing to profile, just never told a profile was
-    // the condition. There is no honest exception to hedge: profiling an empty table
-    // still produces the event, so a run with a table to profile can always clear it.
-    //
-    // The bar NAMES THE TOOL, and that wording was measured rather than chosen. A first
-    // version said "profile at least one table", which reads as an activity: of the
-    // eight models it was measured on, one satisfied those words by writing
-    // eighteen `run_read_query` count statements by hand, and three more went to
-    // `inspect_schema` — none produced the event the verifier reads, so all four still
-    // failed while believing they had complied. The `operations` rule that works names
-    // its instrument the same way ("everything you read, you read with
-    // inspect_operations"). The second clause is here because a model that composes
-    // counts itself is being diligent, not lazy, and deserves to be told why that does
-    // not clear the bar rather than left to discover it in a verdict.
-    "You must call profile_table on at least one table before you report: this workflow answers with the counts that tool takes, and counts you compose yourself with run_read_query do not establish them.",
-    "Only COUNTS come back. No value is read out of any column, so do not claim what a column contains — claim what its counts show.",
-    "Grade what you find against completeness, uniqueness, consistency and validity, and say which of the four each finding speaks to.",
-  ].join(" "),
-  operations: [
-    // "and no schema inventory was captured for you" until #411, which captures one.
-    // Hedged rather than stated flatly because these rules are the same for every run
-    // of this workflow while the grounding is not. The CAUSE of that moved at #414: it
-    // was the dialect table — `CATALOG_PLANS` served two engines and this workflow
-    // deliberately runs on the others — and it is now a reading that can fail on any
-    // engine, since a dialect with no catalog plan asks its provider instead and
-    // usually gets an inventory. The hedge is unchanged, because an ungrounded
-    // operations run is still an ordinary thing. The per-run truth is in the opening
-    // note, which is built from what this drive actually established.
-    "You have NO SQL in this run: there is no inspect_schema, no run_read_query and no inspect_plan. Where this engine can be read, a schema inventory of table names and their indexes was captured for you before your first turn and the message opening this run says so; it is there to tell you what the engine names back at you.",
-    "Everything you read, you read with inspect_operations.",
-    "Take the readings your objective needs — sessions, slow-queries, table-stats, index-stats, storage, health — one call each, and narrow them with limit or schema rather than asking for everything.",
-    // The verifier's rule, in the model's own terms. A rule the model is never told is
-    // a rule live runs fail (#350, #356), so the bar and its honest exception are both
-    // said here, next to the tools that can satisfy them.
-    "Your report must cite at least one reading you took: this run answers with what the engine said about itself, not with what you expect of a database like this one.",
-    "A reading that comes back EMPTY is an answer, not a failure — no blocked session, no slow query, no unused index is what a healthy server looks like. Cite it and say what it shows.",
-    "If this engine serves no reading of a kind you asked for, you will be told so plainly. Try another kind rather than guessing: a report has to cite a reading you actually took, so a run that takes none can report nothing.",
-    "EVERY READING IS A MOMENT. A session list is who was connected as you looked; a slow-query list is what the engine has accumulated, not what it did today. Say what you saw and when, and never imply you measured a trend or watched something change.",
-    "recommend_change offers the user one index or one rewrite, and nothing else: an operational action — killing a session, vacuuming a table, dropping an index — has no card here, so state it as a claim in your report rather than filing it as a recommendation.",
-  ].join(" "),
-  // The model's half of `agent-data-analysis.1`. The verdict requires an
-  // `answer-composed` event on top of the baseline, so the sentence naming
-  // `present_answer` is what makes that bar reachable — #350's lesson, applied at the
-  // moment the rule is written rather than after a live run fails it. The contract
-  // itself is IMPORTED from the tool layer rather than paraphrased here: two wordings
-  // of one contract is how #350 happened.
-  "data-analysis": [
-    "Answer from data you have READ. The schema tells you where to look; only a result you ran can be the answer.",
-    "profile_table at basic depth is how you tell a fact table from a lookup one, and a date column the business fills from an audit column nobody does: it returns row counts and how many rows have a value, and reads no value out of any column. Go deeper only if a basic profile leaves a question.",
-    "When you have the answer, call present_answer with the artifact id of the read that IS the answer.",
-    // The tool layer's `ANSWER_OPERATION` rule, in the model's terms (#350). A plan
-    // step carries a drafted statement and settles like any other, so nothing in what
-    // the model sees distinguishes a plan artifact from a read one; a rule enforced
-    // only by a refusal is a rule the model meets by spending a turn on it.
-    "Only a result of run_read_query can be presented: a plan describes a statement without running it, and a profile counts a table rather than answering the question. Cite either as evidence, but present a read.",
-    "A chart names columns of THAT result: they are checked against the result's real column names and refused if they do not match.",
-    AGENT_ANSWER_CONTRACT,
-    "Then call compose_report. The presentation shows the result; the claims are what say what it means.",
-    // The third arm of `agent-data-analysis.1`, in the model's own terms. The verdict
-    // now requires the report to be ABOUT the result presented, and the model holds the
-    // id it needs — it passed that id to `present_answer` one turn earlier and was
-    // answered with it. A rule the model is never told is a rule live runs fail (#350).
-    "At least one of those claims must cite the artifact you presented: a report about other evidence entirely is prose beside a picture, and the run is scored as not having answered.",
-  ].join(" "),
-} satisfies Record<AgentRunWorkflowType, string>);
+/** The tool rules an agent-mode run is given. A language with no rules for the workflow is an error, never silence. */
+function workflowToolRules(record: AgentRunRecord, engine: PlanningEngine): string {
+  const language = statementFamilyOf(record.statementLanguage);
+  const rules: Partial<Record<AgentRunWorkflowType, string>> = engine.toolRules;
+  const own = Object.hasOwn(rules, record.workflowType) ? rules[record.workflowType] : undefined;
+  if (own === undefined) throw new Error(`no tool rules for ${record.workflowType} on ${language}`);
+  return own;
+}
 
 /**
  * What the run is FOR is said in both modes; how to pursue it with tools is said
@@ -1577,7 +1640,7 @@ function systemPrompt(record: AgentRunRecord, grounding: PlanningGrounding, engi
   // where the others are — the engine decides it and nothing else — so a prose run
   // that was told the grounded sentence on an engine that could not be read would be
   // pointed at an inventory it does not have.
-  const deliverable = PLAN_DELIVERABLES[record.workflowType];
+  const deliverable = planDeliverableOf(record.statementLanguage, record.workflowType);
   const planningDeliverableRules =
     deliverable.kind === "prose"
       ? grounding.schemaKnown
@@ -1587,19 +1650,35 @@ function systemPrompt(record: AgentRunRecord, grounding: PlanningGrounding, engi
         ? planningSchemaRules(grounding, deliverable, engine)
         : planningNoSchemaRules(deliverable, engine.noun);
   const planningRules = `${PLANNING_TOOLLESS_RULE} ${planningDeliverableRules}`;
-  const rules = record.mode === "agent" ? `${AGENT_RULES} ${WORKFLOW_TOOL_RULES[record.workflowType]}` : planningRules;
+  // The language sentence is said only where the engine declares a language of its own;
+  // no SQL agent engine does, so the SQL prompt is unchanged.
+  const languageSentence =
+    engine.statementLanguage === undefined ? "" : ` Write every statement in ${engine.statementLanguage}.`;
+  const rules =
+    record.mode === "agent"
+      ? `${agentRules(AGENT_LANGUAGE_COPY[statementFamilyOf(record.statementLanguage)])}${languageSentence} ${workflowToolRules(record, engine)}`
+      : planningRules;
   // Said only where it can happen, on all THREE counts. A planning run has no tools;
   // a run opened without the setting hands nothing anywhere; and a workflow that is
   // not offered `present_answer` has no way to make the presentation this rule is
   // about — it would be told to call `inspect_plan` "on the statement that IS the
   // answer before you present it" and then have no tool with which to present one.
   // The third check is the #350/#356 rule: never state a rule to a model whose tool
-  // set cannot satisfy it. `AGENT_WORKFLOW_PRESENTS_ANSWER` is the same record the
-  // rail and the route read, so the setting cannot be offered where it is unsaid.
+  // set cannot satisfy it. The variant's `canAutoExecute` is what the rail and the
+  // route read too, so the setting cannot be offered where it is unsaid; on SQL it
+  // equals `AGENT_WORKFLOW_PRESENTS_ANSWER`, and no kubectl variant hands over.
   const canHandOver =
-    record.mode === "agent" && record.autoExecute && AGENT_WORKFLOW_PRESENTS_ANSWER[record.workflowType];
+    record.mode === "agent" &&
+    record.autoExecute &&
+    requiredVariant(record.statementLanguage, record.workflowType).canAutoExecute;
   const handover = canHandOver ? ` ${AUTO_EXECUTE_RULE}` : "";
-  return `You are the LibreDB Studio database investigator. ${rules}${handover} ${WORKFLOW_OBJECTIVES[record.workflowType]} ${SHARED_RULES}`;
+  // An agent-mode run without its variant is an error; a plan reads `planObjectiveOf`,
+  // which never is, because planning is never gated by a language.
+  const objective =
+    record.mode === "agent"
+      ? requiredVariant(record.statementLanguage, record.workflowType).objective
+      : planObjectiveOf(record.statementLanguage, record.workflowType);
+  return `You are the LibreDB Studio database investigator. ${rules}${handover} ${objective} ${SHARED_RULES}`;
 }
 
 // ============================================================================
@@ -1619,17 +1698,9 @@ const snapshotHandoverText = (fingerprint: string): string =>
   `Cite that inventory in a claim as ${citeSnapshot(fingerprint)}.`;
 
 /**
- * What to do about the tables the packing left out, said only where it can be done.
- *
- * The omission notice is `packContextForTask`'s, and until #411 it ended with this
- * sentence unconditionally — including in plan mode, which holds no tools at all, and
- * for an operations run, which holds no `inspect_schema`. A rule stated to a run whose
- * tool set cannot satisfy it is the #350 failure, so the sentence lives with the
- * caller that knows its own tool set and is passed in by that caller alone.
+ * The SQL omission advice (`INSPECT_SCHEMA_OMISSION_ADVICE` in `languages/sql/server.ts`) for the relations block,
+ * whose selector is a kind rather than a table.
  */
-const INSPECT_SCHEMA_OMISSION_ADVICE = "Call inspect_schema with a table selector to read any of them.";
-
-/** The same sentence for the relations block, whose selector is a kind rather than a table. */
 const INSPECT_SCHEMA_RELATIONS_OMISSION_ADVICE = 'Call inspect_schema with kind="relations" for them.';
 
 /**
@@ -1638,15 +1709,21 @@ const INSPECT_SCHEMA_RELATIONS_OMISSION_ADVICE = 'Call inspect_schema with kind=
  * Handed to `packContextForTask` as its preface rather than concatenated here, so the
  * sentence is INSIDE the bound that function keeps rather than added on top of it.
  *
- * Every agent-mode caller of this holds `inspect_schema` — the one workflow that does
- * not, `operations`, goes through `packOperationsInventory` instead — so the omission
- * advice is passed here and nowhere else.
+ * Every agent-mode caller of this holds a tool that reads what the packing left out (the
+ * one workflow that does not, `operations`, goes through `packOperationsInventory` instead),
+ * so the caller passes the advice for its own language's tool (its pack's `grounding`).
  */
-function packSnapshotMessage(snapshot: AgentContextSnapshot, objective: string, noun: AgentInventoryNoun): string {
+function packSnapshotMessage(
+  snapshot: AgentContextSnapshot,
+  objective: string,
+  noun: AgentInventoryNoun,
+  grounding: { readonly omissionAdvice: string; readonly sampledFields?: boolean },
+): string {
   return packContextForTask(snapshot, objective, {
     preface: snapshotHandoverText(snapshot.fingerprint),
-    omissionAdvice: INSPECT_SCHEMA_OMISSION_ADVICE,
+    omissionAdvice: grounding.omissionAdvice,
     noun,
+    ...(grounding.sampledFields === true ? { sampledFields: true } : {}),
   });
 }
 
@@ -1728,8 +1805,13 @@ function packPlanningSnapshotMessage(
   objective: string,
   readBy: PlanningGrounding["readBy"],
   noun: AgentInventoryNoun,
+  sampledFields: boolean,
 ): string {
-  return packContextForTask(snapshot, objective, { preface: planningSnapshotPreface(snapshot, readBy, noun), noun });
+  return packContextForTask(snapshot, objective, {
+    preface: planningSnapshotPreface(snapshot, readBy, noun),
+    noun,
+    ...(sampledFields ? { sampledFields: true } : {}),
+  });
 }
 
 /**
@@ -1812,6 +1894,10 @@ function describeSettled(event: AgentSettledStepEvent, toolName: string): string
   if (refusal.class === "approval-required") {
     return `Step ${event.stepId} (${toolName}) needs a human approval that this run does not have: operation ${refusal.operationId}.`;
   }
+  if (refusal.class === "not-sent") {
+    const reason = /[.!?]$/.test(refusal.detail) ? refusal.detail : `${refusal.detail}.`;
+    return `Step ${event.stepId} (${toolName}) was refused before the database was reached, so nothing ran: ${reason} That exact call will not be sent again — change the arguments if you still need what it would have produced.`;
+  }
   if (refusal.class === "reading-refused") {
     // The reading was TAKEN — the run spent a statement on it — and the server
     // declined to deliver it. A resumed run is told that, rather than being told the
@@ -1828,6 +1914,22 @@ function describeSettled(event: AgentSettledStepEvent, toolName: string): string
     reference: refusal.statementFingerprint,
   });
   return `Step ${event.stepId} (${toolName}) failed at the database.\n${fenced}`;
+}
+
+/**
+ * A recommendation a resumed run already made, told apart by its `change`. Every name in it is the model's own
+ * argument to an earlier call (a container and its owner, a collection, a statement), so none of it is database text.
+ */
+function describePriorRecommendation(event: Extract<AgentRunEvent, { kind: "recommendation" }>): string {
+  switch (event.change) {
+    case "resources":
+      return `New requests and limits for container ${event.container} of ${event.ownerKind}/${event.ownerName} were already recommended and are recorded. Do not propose them a second time.`;
+    case "document-index":
+      return `An index was already recommended and is recorded: on collection ${event.collection}. Do not propose it a second time.`;
+    case "index":
+    case "rewrite":
+      return `A ${event.change} was already recommended and is recorded: ${event.statement}. Do not propose it a second time.`;
+  }
 }
 
 /**
@@ -1892,10 +1994,24 @@ function describePriorProgress(record: AgentRunRecord): string | null {
           },
         )}`,
       );
-    } else if (event.kind === "recommendation") {
+    } else if (event.kind === "usage-read") {
+      // Durable and non-terminal like the profile above: a resumed run that was not told would spend a statement
+      // measuring what it already measured, and could not cite the reading it holds. The namespace is a validated
+      // DNS label and the selector is the model's own argument, so neither is cluster content.
       lines.push(
-        `A ${event.change} was already recommended and is recorded: ${event.statement}. Do not propose it a second time.`,
+        `Container usage in namespace ${event.namespace}${event.selector === undefined ? "" : ` (selector ${event.selector})`} was already read, artifact ${event.artifact.correlationId}. That reading is recorded; read it again only for a different namespace or selector.`,
       );
+    } else if (event.kind === "workloads-profiled") {
+      // Durable and non-terminal like the usage reading above, and told for the same reason.
+      lines.push(
+        `The workloads of namespace ${event.namespace} were already profiled, artifact ${event.artifact.correlationId}. That profile is recorded; profile again only a different namespace.`,
+      );
+    } else if (event.kind === "usage-unavailable") {
+      lines.push(
+        `Usage could not be read in namespace ${event.namespace}: this cluster serves no usage metrics (metrics.k8s.io), because metrics-server is not installed or not answering. Asking again will not change that.`,
+      );
+    } else if (event.kind === "recommendation") {
+      lines.push(describePriorRecommendation(event));
     }
   }
 
@@ -1957,19 +2073,6 @@ function describeThreadContext(record: AgentRunRecord): string | null {
 const indeterminateText = (stepId: string, toolName: string): string =>
   `Step ${stepId} (${toolName}) was started before this run was interrupted and its outcome was never recorded, so whether it reached the database cannot be known. It will not be repeated. Draft a different call if you still need what it would have produced.`;
 
-/**
- * The same UNSETTLED ledger shape, said honestly for the other way it arises.
- *
- * A call the server refused before any database was reached — invalid arguments, a
- * spent deadline, a repair ledger declining a fingerprint — settles nothing, so it
- * is indistinguishable from a mid-flight death by ledger shape alone. It is not the
- * same thing to a model: nothing was attempted, so telling it the outcome "cannot
- * be known" would be false. The run loop knows which of the two happened in THIS
- * drive, and says so.
- */
-const refusedBeforeDatabaseText = (stepId: string, toolName: string): string =>
-  `Step ${stepId} (${toolName}) was refused before the database was reached, so nothing ran and nothing was recorded. That exact call will not be sent again — change the arguments if you still need what it would have produced.`;
-
 // ============================================================================
 // Steps
 // ============================================================================
@@ -2029,39 +2132,107 @@ function deriveStepId(toolName: string, input: unknown): string {
   return `step_${digest.slice(0, 32)}`;
 }
 
-/** The model's own SQL, when the arguments carry one. Used for the draft entry. */
-function draftedSql(input: unknown): { sql: string; rationale: string } | null {
-  if (input === null || typeof input !== "object") return null;
-  const { sql, rationale } = input as { sql?: unknown; rationale?: unknown };
-  if (typeof sql !== "string" || sql.length === 0) return null;
-  return { sql, rationale: typeof rationale === "string" && rationale.length > 0 ? rationale : "(none given)" };
+/**
+ * A tool call's arguments as its step identity reads them: the language's argument, when it arrived as an OBJECT,
+ * replaced by the text the language's `canonicalize` makes of it, and everything else as it came.
+ *
+ * Without it, `deriveStepId`'s key sort would reach inside a mongo command and make `{"b": 1, "a": 1}` and
+ * `{"a": 1, "b": 1}` one step, so the second sort would be answered with the first one's documents. Only an object
+ * argument is touched, so a SQL or kubectl call, whose argument is text, keeps the id it always had; and the text is
+ * the one the run executes, in the order the model wrote it, so one read is one step and two reads are two.
+ */
+function identifyingInput(input: unknown, language: AgentStatementLanguageId): unknown {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return input;
+  const { argument } = AGENT_LANGUAGE_COPY[language];
+  const raw = (input as Readonly<Record<string, unknown>>)[argument];
+  if (raw === null || typeof raw !== "object") return input;
+  const text = languageServer(language).canonicalize(raw);
+  return text === null ? input : { ...input, [argument]: text };
 }
 
 /**
- * Dispatches one database tool. Each of them re-validates the arguments against
- * the schema it declares, so an unchecked shape here becomes a typed
- * `INVALID_TOOL_INPUT` outcome rather than a throw.
+ * The model's own statement, when the arguments carry one under the language's argument. Used for the draft entry,
+ * whose field stays `sql` whatever the language calls its argument, so a persisted event reads the same.
+ *
+ * Read by the language's own `canonicalize`, the one the tool dispatch reads with (`runReadQueryTool`), so the draft,
+ * the ledger's statement, the repair identity and the provider's read are one text by construction: a mongo command
+ * arrives as a JSON OBJECT and is written out in the order the model wrote it.
  */
+export function draftedStatement(
+  input: unknown,
+  language: AgentStatementLanguageId,
+): { sql: string; rationale: string } | null {
+  if (input === null || typeof input !== "object") return null;
+  const { [AGENT_LANGUAGE_COPY[language].argument]: statement, rationale } = input as Readonly<Record<string, unknown>>;
+  const sql = languageServer(language).canonicalize(statement);
+  if (sql === null) return null;
+  return { sql, rationale: typeof rationale === "string" && rationale.length > 0 ? rationale : "(none given)" };
+}
+
+/** A tool a run was offered and has no arm for in its language: the server's own fault, said by name. */
+function missingArm(context: AgentToolContext, tool: AgentToolName): never {
+  throw new Error(`agent run loop: the ${statementFamilyOf(context.statementLanguage)} language has no ${tool} arm`);
+}
+
+/**
+ * The handler of each database tool, keyed by its name.
+ *
+ * Total over `DatabaseToolName`, so a database tool with no handler does not compile.
+ * The fall-through this replaced routed any unlisted name to `inspectPlanTool`, where
+ * an operational reading was re-parsed against a statement schema and answered
+ * INVALID_TOOL_INPUT forever. Each handler re-validates the arguments against the
+ * schema it declares, so the unchecked shape here becomes a typed `INVALID_TOOL_INPUT`
+ * outcome rather than a throw.
+ *
+ * The two tools whose execution differs by language run their language's arm
+ * (`agentLanguagePack`), chosen by the run's own persisted language, never by
+ * connection type: the same key the tool definitions are offered by
+ * (`agentToolDefinition`), so the offer and the execution cannot disagree about which
+ * arm serves a call. `snapshot` is the inventory the run captured, which a catalog arm
+ * resolves a spelling against.
+ */
+export const DATABASE_TOOL_HANDLERS: Readonly<
+  Record<
+    DatabaseToolName,
+    (context: AgentToolContext, input: unknown, snapshot: AgentContextSnapshot | null) => Promise<AgentToolOutcome>
+  >
+> = Object.freeze({
+  inspect_schema: (context, input, snapshot) =>
+    (
+      agentLanguagePack(statementFamilyOf(context.statementLanguage)).execution.arms.inspect_schema ??
+      missingArm(context, "inspect_schema")
+    ).run(context, input, snapshot),
+  run_read_query: (context, input, snapshot) => runReadQueryTool(context, input, snapshot),
+  inspect_plan: (context, input, snapshot) =>
+    (
+      agentLanguagePack(statementFamilyOf(context.statementLanguage)).execution.arms.inspect_plan ??
+      missingArm(context, "inspect_plan")
+    ).run(context, input, snapshot),
+  inspect_operations: (context, input) => inspectOperationsTool(context, input),
+});
+
+/** Dispatches one database tool through `DATABASE_TOOL_HANDLERS`. */
 function invokeDatabaseTool(
   context: AgentToolContext,
   name: DatabaseToolName,
   input: unknown,
+  snapshot: AgentContextSnapshot | null,
 ): Promise<AgentToolOutcome> {
-  if (name === "inspect_schema") return inspectSchemaTool(context, input as { schema?: string; table?: string });
-  if (name === "run_read_query") return runReadQueryTool(context, input as { sql: string; rationale?: string });
-  // Before the fall-through, which is the hazard the type above exists to make
-  // visible: an operational reading routed to `inspectPlanTool` would be re-parsed
-  // against a statement schema and answered INVALID_TOOL_INPUT forever.
-  if (name === "inspect_operations") return inspectOperationsTool(context, input);
-  return inspectPlanTool(context, input as { sql: string });
+  return DATABASE_TOOL_HANDLERS[name](context, input, snapshot);
 }
 
-function settlementOf(outcome: AgentToolOutcome): AgentRunStepSettlement {
+function settlementOf(
+  outcome: AgentToolOutcome | Exclude<AgentTableProfileOutcome, { readonly kind: "profiled" }>,
+): AgentRunStepSettlement {
   if (outcome.kind === "completed") return { kind: "completed", artifact: outcome.artifact };
   if (outcome.kind === "refused") return { kind: "refused", refusal: outcome.refusal };
-  // Nothing was attempted at the database, so nothing settles in the ledger. The
-  // step stays unsettled, which is why the same call may not be sent again.
-  return { kind: "not-attempted" };
+  // Refused by the tool before anything was sent. Settled as a refusal of its own class, so the timeline says it was
+  // refused and why, a replay is answered from the ledger, and a resumed run is not told the outcome is unknowable;
+  // the same call is still never sent again, because its step is settled.
+  return {
+    kind: "refused",
+    refusal: { class: "not-sent", reasonCode: outcome.reasonCode, detail: outcome.detail ?? outcome.modelText },
+  };
 }
 
 /** Collapses and bounds a tool name the model invented before it is quoted back. */
@@ -2123,38 +2294,6 @@ interface ModelTurn {
 */
 
 /**
- * What a narrowed run keeps BESIDES `compose_report`: whatever its own verdict requires.
- *
- * The narrowing exists for `no-report`, which is 37 of the 66 failing cells measured
- * across 25 models on six surfaces — more than the other ten shortfalls combined, and
- * the only one that appears on every surface. Those runs did not run out of room. They
- * ended `model-stopped` holding every tool they needed, having read and recorded
- * nothing, and when reminded they went back to reading rather than reporting. So the
- * reminded turn narrows the choice instead of repeating the instruction.
- *
- * The narrowing must not make a run's own bar unreachable, and this record is where that
- * is guaranteed rather than hoped for. An assessment is scored `no-table-profile` without
- * a `table-profiled` event and an optimization `no-plan-comparison` without a comparison
- * or a grounded index recommendation (`goal-verifier.ts`), so leaving those surfaces the
- * report alone would trade one shortfall for another — a different failure, not a smaller
- * one. Keeping the instruments the verdict accepts turns the mechanism from a muzzle into
- * a funnel: a narrowed run can only do the two or three things it is judged on.
- *
- * `investigation` and `operations` keep nothing extra because their bars are about the
- * report itself — claims resting on something read, which by then this run has.
- * `data-analysis` keeps `present_answer` because its verdict scores the answer
- * separately from the report, and narrowing it away would turn `no-report` into
- * `no-answer`.
- */
-const AGENT_NARROWED_EXTRA_TOOLS: Readonly<Record<AgentRunWorkflowType, readonly AgentToolName[]>> = Object.freeze({
-  investigation: [],
-  "query-optimization": ["compare_plans", "recommend_change"],
-  "database-assessment": ["profile_table"],
-  operations: [],
-  "data-analysis": ["present_answer"],
-} satisfies Record<AgentRunWorkflowType, readonly AgentToolName[]>);
-
-/**
  * The names a narrowed run may still call — the single source both the declaration and
  * the dispatch read.
  *
@@ -2167,19 +2306,52 @@ const AGENT_NARROWED_EXTRA_TOOLS: Readonly<Record<AgentRunWorkflowType, readonly
 function narrowedToolNames(record: AgentRunRecord, since = Number.POSITIVE_INFINITY): ReadonlySet<AgentToolName> {
   const held = new Set(selectAgentTools(record).map((definition) => definition.name));
   const kept = new Set<AgentToolName>();
-  for (const name of ["compose_report" as const, ...AGENT_NARROWED_EXTRA_TOOLS[record.workflowType]]) {
+  /*
+    The tool a narrowed analysis must not lose.
+
+    `present_answer` is the instrument this surface's verdict needs, and keeping it is right for a
+    run that HAS something to present. A run whose every call was `inspect_schema` has nothing:
+    that tool refuses a catalog artifact, because the statement behind one is the server's. So the
+    narrowing would hand such a run `compose_report` plus a tool it cannot use, and take away the
+    only one that could still change the outcome.
+
+    Measured on `mistral-small3.2:24b`, analyze 0/5 across nine rolls, the same ledger every time:
+    three catalog reads, the reminder (which narrows), a report held with "call run_read_query",
+    and then the model saying it would draft exactly that query - and stopping, because the
+    reminder had already taken the tool away. Being told to call a tool one no longer holds is the
+    #350/#356 defect, arriving here from the drive itself.
+
+    Only while nothing presentable exists, so the narrowing still closes on the run it was written
+    for: one that has read and is merely reading again.
+  */
+  const stillOwesARead =
+    AGENT_WORKFLOW_PRESENTS_ANSWER[record.workflowType] && presentableArtifact(record.events) === undefined;
+  for (const name of [
+    "compose_report" as const,
+    ...requiredVariant(record.statementLanguage, record.workflowType).narrowedExtras,
+    ...(stillOwesARead ? (["run_read_query"] as const) : []),
+  ]) {
     if (held.has(name) && !usedUp(record, name, since)) kept.add(name);
   }
   return kept;
 }
 
-/** What an instrument writes when it worked, so a narrowed run can be asked how often it has. */
-const AGENT_INSTRUMENT_RESULT: Readonly<Partial<Record<AgentToolName, AgentRunEvent["kind"]>>> = Object.freeze({
+/** What a core instrument writes when it worked. A pack's evidence tool writes the event its own row names. */
+const CORE_INSTRUMENT_RESULT: Readonly<Partial<Record<AgentToolName, AgentRunEvent["kind"]>>> = Object.freeze({
   recommend_change: "recommendation",
   compare_plans: "plan-comparison",
   profile_table: "table-profiled",
   present_answer: "answer-composed",
 });
+
+/** What an instrument writes when it worked, so a narrowed run can be asked how often it has. */
+const AGENT_INSTRUMENT_RESULT: Readonly<Partial<Record<AgentToolName, AgentRunEvent["kind"]>>> = mergeDisjoint(
+  [
+    CORE_INSTRUMENT_RESULT,
+    Object.fromEntries(Object.entries(AGENT_EVIDENCE_TOOLS).map(([name, evidence]) => [name, evidence.event])),
+  ],
+  "AGENT_INSTRUMENT_RESULT",
+);
 
 /**
  * Whether a narrowed run has used one of its kept instruments enough times to stop keeping it.
@@ -2234,19 +2406,10 @@ function toolSetOf(definitions: readonly AgentToolDefinition[]): ToolSet | undef
   return Object.fromEntries(
     definitions.map((definition) => [
       definition.name,
-      tool({ description: definition.description, inputSchema: definition.inputSchema }),
+      tool({ description: definition.description, inputSchema: modelToolSchema(definition.inputSchema) }),
     ]),
   );
 }
-
-/**
- * What a plan turn asks for when this model's thinking is the thing that loses the cell.
- *
- * A REQUEST FIELD and not a word in the prompt, which is the whole reason it is acceptable:
- * every planning rule above is wording a measured cell depends on, and nothing here touches
- * it. The in-prompt `/no_think` marker was tried first and abandoned - see the model's entry.
- */
-export const PLAN_NO_REASONING_EFFORT = "none";
 
 /**
  * One turn. The stream is read part by part rather than awaited as a result, for
@@ -2312,21 +2475,30 @@ async function takeTurn(
   */
   const sampling = samplingFor(agentModel.modelId, workflow);
   /*
-    Keyed `openai`, whatever this provider is called.
-
-    `provider-registry.ts` builds ollama, openai and custom through one `@ai-sdk/openai`
-    adapter, and that adapter reads its options under its OWN key. Keying them by the
-    provider's name passed the unit test - the scripted model is configured as `openai` - and
-    sent nothing at all on the first real ollama run, which then timed out at 94 seconds.
+    The options every call to a model sends come from one place, `agentProviderOptions`, so
+    the capability probe and the classifier send what a turn sends: `store: false` and the
+    configured effort on the `openai` kind, and on the three OpenAI-compatible kinds the quiet
+    switch below, which yields to `LLM_MODEL_EFFORT` on `openai`. Keyed `openai` whatever the
+    provider is called, for the reason that function records.
   */
   // Two switches, one per mode, and neither implies the other: a model measured needing quiet on
   // its plan turn was not measured needing it while holding tools. See both fields in `profile.ts`.
   const quiet =
     mode === "agent" ? suppressesAgentReasoning(agentModel.modelId) : suppressesPlanReasoning(agentModel.modelId);
+  const providerOptions = agentProviderOptions(agentModel, quiet);
+  // The `openai` kind's SDK drops `temperature`/`topP` for reasoning models and logs a warning; a
+  // call sends only what the SDK would keep, asked from its own offline `prepareRequest`. Every
+  // other kind keeps its sampling byte-identical.
+  const turnSampling = await agentSamplingFor(agentModel, providerOptions, sampling).catch((error: unknown) => {
+    // The build-time path raises an LLMConfigError for the same preparation failure, so a turn does
+    // too: a preparation that broke is a configuration refusal, not a transport retry.
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new LLMConfigError(`Cannot decide the ${agentModel.provider} sampling: ${detail}`, agentModel.provider);
+  });
   const stream = streamText({
     model: agentModel.model,
-    temperature: sampling.temperature,
-    topP: sampling.topP,
+    ...(turnSampling.temperature !== undefined ? { temperature: turnSampling.temperature } : {}),
+    ...(turnSampling.topP !== undefined ? { topP: turnSampling.topP } : {}),
     // Constrained decoding, where a shape was asked for. `Output.object` is what makes the
     // SDK send `response_format`, and it composes here precisely because this branch offers
     // no tools.
@@ -2337,7 +2509,7 @@ async function takeTurn(
     instructions,
     messages: [...messages],
     ...(tools === undefined ? {} : { tools }),
-    ...(quiet ? { providerOptions: { openai: { reasoningEffort: PLAN_NO_REASONING_EFFORT } } } : {}),
+    providerOptions,
     maxRetries: 0,
     // Real-time backstop for ONE call, sized by what the run has left. The
     // deadline object remains the authority — it is what the loop reads between
@@ -2356,7 +2528,15 @@ async function takeTurn(
 
   try {
     for await (const part of stream.fullStream) {
-      if (part.type === "text-delta") text += part.text;
+      if (part.type === "start-step") {
+        // The SDK drops an effort this model does not take and sends the turn at another one.
+        // Stopped here, before a word of that answer is read, and raised.
+        const refused = refusedEffortError(part.warnings, agentModel);
+        if (refused !== undefined) {
+          failure = refused;
+          break;
+        }
+      } else if (part.type === "text-delta") text += part.text;
       else if (part.type === "tool-call") {
         toolCalls.push({ toolCallId: part.toolCallId, toolName: part.toolName, input: part.input });
       } else if (part.type === "error") failure ??= part.error;
@@ -2385,8 +2565,47 @@ async function takeTurn(
     text,
     toolCalls,
     aborted: false,
-    assistantMessages: response.messages.filter((message) => message.role === "assistant"),
+    assistantMessages: neutraliseAssistantMessages(
+      response.messages.filter((message): message is AssistantModelMessage => message.role === "assistant"),
+    ),
   };
+}
+
+/**
+ * The assistant messages as they enter the transcript, with every marker defanged (B29).
+ *
+ * The SDK's own assistant messages carry the model's tool-call arguments verbatim, and
+ * those arguments are the model's words, not the server's. An attacker who can name a
+ * table controls the whole identifier, so a hostile name the model quotes back into its
+ * own arguments would enter the transcript unfenced. Text parts are defanged for the
+ * same reason: a model can quote a hostile identifier in prose as well as in tool
+ * arguments, and leaving the text untouched would leave the same injection vector open
+ * through a different part type. This copy is what gets pushed to the transcript;
+ * `toolCallId` and `toolName` are deliberately NOT touched, because the endpoint pairs a
+ * `tool` result with the assistant turn's `tool_call_id` and a mismatch would wedge every
+ * later turn of the run.
+ *
+ * Immutable: every branch returns a new object, so the SDK's own `response.messages`
+ * objects are never mutated. Reasoning parts pass through untouched, because signed
+ * thinking blocks cannot be rewritten.
+ */
+export function neutraliseAssistantMessages(messages: readonly AssistantModelMessage[]): AssistantModelMessage[] {
+  return messages.map((message) => {
+    if (typeof message.content === "string") {
+      return { ...message, content: neutraliseUntrustedMarkers(message.content) };
+    }
+    const content = (message.content ?? []).map((part) => {
+      if (part.type === "text") {
+        // Copy-on-write is the point here: the SDK's own part object is never mutated.
+        return Object.assign({}, part, { text: neutraliseUntrustedMarkers(part.text) });
+      }
+      if (part.type === "tool-call") {
+        return Object.assign({}, part, { input: neutraliseToolInput(part.input) });
+      }
+      return part;
+    });
+    return { ...message, content };
+  });
 }
 
 function toolResultMessage(call: { toolCallId: string; toolName: string }, value: string): ModelMessage {
@@ -2411,11 +2630,12 @@ function promptedResultMessage(call: { toolName: string }, value: string): Model
   return { role: "user", content: `The server ran ${call.toolName} and answers: ${value}` };
 }
 
-/** What handling one tool call did. `cancelled` and `reported` both end the run. */
+/** What handling one tool call did. `cancelled` and `reported` both end the run; `paused` leaves it paused. */
 type CallResult =
   | { readonly kind: "answered"; readonly text: string }
   | { readonly kind: "cancelled" }
-  | { readonly kind: "reported" };
+  | { readonly kind: "reported" }
+  | { readonly kind: "paused" };
 
 /**
  * Drives one investigation run to a conclusion, starting it or resuming it.
@@ -2455,11 +2675,16 @@ export function guidanceDelivered(events: readonly AgentRunEvent[]): Readonly<Re
   const counts: Record<AgentGuidanceNotice, number> = {
     "report-reminder": 0,
     "plan-statement": 0,
+    "turn-cut-off": 0,
     "report-reserve": 0,
+    "plan-bar": 0,
+    "usage-bar": 0,
     "unread-stop": 0,
     "present-before-report": 0,
     "cite-what-you-read": 0,
     "compare-before-report": 0,
+    "tool-call-unreadable": 0,
+    "tool-call-as-text": 0,
   };
   for (const event of events) {
     if (event.kind === "guidance-issued") counts[event.notice] += 1;
@@ -2488,11 +2713,18 @@ export async function runInvestigation(
   // behind. A queued run is one nothing has driven yet; a running one is a resume.
   const resumed = await service.resume(runId);
 
+  // A run already paused before its drive is not driven: it has no turn to take,
+  // and every ledger write below is gated on RUNNING. Stopping here leaves it
+  // paused, exactly as the rail asked, instead of throwing at `recordDriver`.
+  if (resumed.record.status === "paused") {
+    return { runId, status: "paused", stopReason: null, turns: 0, text: "" };
+  }
+
   // One drive per run in this process: two would both pass `runStep`'s
   // read-then-append check and execute the same step twice (`docs/BACKLOG.md` B5).
   // Released in the `finally` at the foot of this function, so a drive that throws
   // still leaves the run claimable by the next one.
-  service.claimDrive(runId);
+  await service.claimDrive(runId);
   try {
     // WHERE a run acts is as much the record's to decide as WHO it acts as. Driving a
     // run with another connection's resources would execute against that connection
@@ -2543,11 +2775,9 @@ export async function runInvestigation(
       modelId: model.modelId,
       mode: record.mode,
       workflowType: record.workflowType,
+      ...(record.statementLanguage === undefined ? {} : { statementLanguage: record.statementLanguage }),
       actor: record.actor,
     };
-    // Read once, from the provider's own declarations, and spent by every sentence that
-    // has to name what this engine holds. See `PlanningEngine`.
-    const engine = planningEngine(context);
     /*
       How this model is asked for a call, decided by the capability gate when the run opened
       and read here rather than re-derived: a resumed drive must ask the way the drive that
@@ -2574,6 +2804,14 @@ export async function runInvestigation(
     const heldToolNames = new Set(selectAgentTools(record).map((definition) => definition.name));
     const holdsTool = (name: string): boolean =>
       prompted ? heldToolNames.has(name as AgentToolName) : tools?.[name] !== undefined;
+    // Read once, from the provider's own declarations, and spent by every sentence that
+    // has to name what this engine holds. See `PlanningEngine`. Read after the tool
+    // selection, so a run whose persisted language this server does not know fails
+    // first where `selectAgentTools` names it, as it did before the engine read a pack.
+    const engine = planningEngine(context);
+    // The server pack this run reads its grounding from: its family's, with its engine's
+    // overlay where the engine speaks that family.
+    const runServer = runServerPack(record.statementLanguage, context.connection.type);
     /**
      * A server notice, in the register this run can act on.
      *
@@ -2634,6 +2872,35 @@ export async function runInvestigation(
     let narrowedAtEvent = Number.POSITIVE_INFINITY;
     /** Whether this drive has already re-asked an empty turn; see `retryEmptyTurn`. */
     let emptyTurnRetried = false;
+    /**
+     * Whether this drive has already given back a turn the per-call ceiling cut; once per DRIVE,
+     * which is what this local declares — a resumed run opens a new drive and is granted one
+     * again, deliberately, because a resume is a second decision to spend on this run.
+     *
+     * The ceiling is documented as bounding one call and it ended the run. Measured on
+     * `qwen3.6:35b`, query-optimization: nine losses, all `model-timeout` with `no-report`, all
+     * ending near 100s of a 450s deadline with 34 of 36 turns unspent — while the same cell's
+     * longest PASSING run took 183s. Those calls were coming back; the loop stopped waiting and
+     * threw away the run instead of the call.
+     *
+     * Every other failed turn in this loop has a recovery path and this one had none. Granted only
+     * where the run has already lost anyway — it filed no report, so it has earned `no-report` and
+     * the turn cannot cost a pass — and once, so a genuinely hung endpoint still fails fast.
+     */
+    let turnCutOffRetried = false;
+    /**
+     * Turns re-asked because the STREAM broke rather than the model.
+     *
+     * `isRetryableError` is this repository's own reading of an `LLMStreamError`, and
+     * `base-provider.ts` already acts on it three times over on the chat surface against the same
+     * endpoints. This loop held that judgement and spent runs anyway: measured on `gpt-oss:20b`,
+     * database-assessment, runs died on a broken frame a median of 17s into a 630s budget having
+     * called a median of four tools — indistinguishable, up to the break, from the runs that
+     * answered.
+     *
+     * Bounded, so a provider that is genuinely down still ends the run rather than looping.
+     */
+    let transportRetries = 0;
     /*
     Every notice this run has already been delivered, read once (B51). The counters it
     seeds are declared in two places — this one and the block before the turn loop — and
@@ -2641,18 +2908,35 @@ export async function runInvestigation(
     reading them back.
     */
     const delivered = guidanceDelivered(record.events);
-    /** Whether this RUN has already answered a stop that read nothing; see `retryUnreadStop`. */
-    let unreadStopRetried = delivered["unread-stop"] > 0;
+    /**
+     * How many times this RUN has answered a stop that read nothing; see `unreadStopAsks`.
+     *
+     * A count rather than a flag: one ask is a bound, not an answer. `devstral-small-2:24b` says
+     * what it needs, hears this sentence, says the same thing again and the run ends - three of
+     * five runs on its one unlocked surface. Read off the ledger like every other bound here,
+     * because it is a property of the RUN and a second drive has already spent what it spent.
+     */
+    let unreadStopAsked = delivered["unread-stop"];
+    /**
+     * Whether this RUN has already been told a tool call of its own could not be parsed.
+     *
+     * Read off the ledger like every other bound here (B51), because it is a property of the RUN
+     * and a second drive of the same run has already spent what it spent.
+     *
+     * A COUNT rather than a flag, and that is a correction this repository measured on itself.
+     * See `AGENT_UNREADABLE_TOOL_CALL_ANSWERS`: the fault recurs within a single run, in different
+     * turns and over different arguments, and the runs that met it twice were ended by the bound
+     * rather than by the model.
+     */
+    let unreadableToolCallAnswers = delivered["tool-call-unreadable"];
+    /** The call written into the text channel; see `stoppedWithAToolCall`. */
+    let toolCallAsTextAnswers = delivered["tool-call-as-text"];
     const priorProgress = describePriorProgress(record);
     if (priorProgress !== null) messages.push({ role: "user", content: priorProgress });
 
     // Step ids the ledger already knows, so a draft is recorded once per step and a
     // resumed run does not narrate work the dead process already narrated.
     const known = new Set<string>([...resumed.settledStepIds, ...resumed.indeterminateStepIds]);
-    // Steps this drive refused before reaching a database. Deliberately NOT seeded from
-    // the ledger: a step inherited as unsettled is genuinely indeterminate, because the
-    // dead process never recorded which of the two it was.
-    const notAttempted = new Set<string>();
 
     let contextEstablished = false;
     /**
@@ -2682,10 +2966,13 @@ export async function runInvestigation(
      *
      * `null` is a load-bearing value rather than an empty default: a run on an engine
      * this server cannot ground checked nothing, and an empty inventory would report
-     * every table the model named as one this database does not have. It is the
-     * SNAPSHOT's tables and not the grounding flag, because the check needs the names.
+     * every table the model named as one this database does not have. It is the SNAPSHOT
+     * itself and not the grounding flag, because the check needs the names - and, since
+     * the object model landed, the KINDS beside them: the inventory carries the schema's
+     * views, sequences and functions too, and only what a statement can name may answer
+     * for a name a statement used (#789).
      */
-    let planningInventory: readonly TableSchema[] | null = null;
+    let planningInventory: AgentContextSnapshot | null = null;
 
     /**
      * A planning run's grounding: the inventory, its relations, and what the engine
@@ -2740,6 +3027,10 @@ export async function runInvestigation(
         reasonCode: capture.reasonCode,
         detail: capture.detail,
         ...(capture.rowBudget === undefined ? {} : { rowBudget: capture.rowBudget }),
+        // The profile's own code, where the profile is what refused: the direction of the
+        // repair (narrow the user, grant it one privilege, turn the server's authorization
+        // on) in the closed vocabulary rather than only in the sentence.
+        ...(capture.profileRefusal === undefined ? {} : { profileReasonCode: capture.profileRefusal.reasonCode }),
         // What the refused reading cost anyway (B13). Spread rather than defaulted: a
         // capture that carries no measurement records none, because a zero here would
         // say the refusal was free.
@@ -2775,7 +3066,7 @@ export async function runInvestigation(
         await service.recordEvent(runId, {
           kind: "context-reused",
           fingerprint: held.fingerprint,
-          tableCount: held.tables.length,
+          tableCount: held.objects.length,
           ageMs: Math.max(0, (context.clock?.() ?? Date.now()) - held.capturedAtMs),
           // The same noun the capture entry records, and from the same source: what this
           // engine calls these rows is part of what the run was shown.
@@ -2799,7 +3090,7 @@ export async function runInvestigation(
         await service.recordEvent(runId, {
           kind: "context-captured",
           fingerprint: snapshot.fingerprint,
-          tableCount: snapshot.tables.length,
+          tableCount: snapshot.objects.length,
           snapshot,
           // The same noun this run's own prompt blocks are written with, recorded
           // where the timeline can read it: the rail has no provider to ask.
@@ -2829,7 +3120,13 @@ export async function runInvestigation(
       } else {
         messages.push({
           role: "user",
-          content: packPlanningSnapshotMessage(snapshot, record.objective, readBy, engine.noun),
+          content: packPlanningSnapshotMessage(
+            snapshot,
+            record.objective,
+            readBy,
+            engine.noun,
+            runServer.grounding.sampledFields === true,
+          ),
         });
         messages.push({
           role: "user",
@@ -2848,7 +3145,7 @@ export async function runInvestigation(
       // #411.
       messages.push({
         role: "user",
-        content: packSchemaStatistics(snapshot.tables, statistics, operations ? { detail: "rows" } : {}),
+        content: packSchemaStatistics(snapshot, statistics, operations ? { detail: "rows" } : {}),
       });
       grounding = {
         schemaKnown: true,
@@ -2862,7 +3159,7 @@ export async function runInvestigation(
       // What the closing statement will be checked against, taken from the same reading
       // the model was shown: a statement validated against an inventory the model never
       // saw would be checked against a database and blamed on a model.
-      planningInventory = snapshot.tables;
+      planningInventory = snapshot;
     };
 
     /**
@@ -2908,6 +3205,8 @@ export async function runInvestigation(
         await establishPlanningContext();
         return;
       }
+      // The words this run is grounded in are its language's: a kubectl run holds no `inspect_schema` to name.
+      const languageGrounding = runServer.grounding;
 
       /**
        * The inventory, as THIS workflow is shown it.
@@ -2930,7 +3229,11 @@ export async function runInvestigation(
           });
           return;
         }
-        messages.push({ role: "user", content: packSnapshotMessage(snapshot, record.objective, engine.noun) });
+        messages.push({
+          role: "user",
+          content: packSnapshotMessage(snapshot, record.objective, engine.noun, languageGrounding),
+        });
+        if (!languageGrounding.relations) return;
         messages.push({
           role: "user",
           content: packRelations(snapshot, record.workflowType, record.mode, context.capabilities, engine.noun),
@@ -2950,12 +3253,25 @@ export async function runInvestigation(
       const capture = await captureContextSnapshot(context);
       if (capture.kind === "unavailable") {
         await recordRefusedCapture(capture);
+        // A run that sends statements ends here, before its first model turn, when the
+        // execution profile is what refused its grounding: every database tool it holds
+        // acquires the read-only profile, which grants nothing the grounding's profile was
+        // refused, so a turn would buy nothing but a drafted statement that never runs.
+        // Rethrown as itself, so the run's failure is classified on its own code
+        // (`classifyDriveFailure`), on every engine alike. The operations workflow sends no
+        // statement of the model's and goes on ungrounded, as plan mode does (B48).
+        if (capture.profileRefusal !== undefined && AGENT_WORKFLOW_SENDS_STATEMENTS[record.workflowType]) {
+          throw capture.profileRefusal.error;
+        }
         // The capture's own words send a model to `inspect_schema`, which an operations
         // run does not hold: naming a tool the run has not got is the #350 failure, and
         // this workflow is the one that reaches engines where the capture always fails.
+        // A kubectl run holds no `inspect_schema` either, so its language words the advice.
         messages.push({
           role: "user",
-          content: operations ? operationsUngroundedNote(capture.detail, engine.noun) : capture.modelText,
+          content: operations
+            ? operationsUngroundedNote(capture.detail, engine.noun)
+            : (languageGrounding.ungrounded?.(capture.detail, engine.noun) ?? capture.modelText),
         });
         return;
       }
@@ -2963,7 +3279,7 @@ export async function runInvestigation(
       await service.recordEvent(runId, {
         kind: "context-captured",
         fingerprint: snapshot.fingerprint,
-        tableCount: snapshot.tables.length,
+        tableCount: snapshot.objects.length,
         snapshot,
         // As on the planning path: what the engine calls these rows is part of what was
         // read, so it is written down with the reading rather than guessed at later.
@@ -2997,6 +3313,23 @@ export async function runInvestigation(
     */
     /** The reserve notice is a one-shot: a run is told once that it is out of room. */
     let reserveAnnounced = delivered["report-reserve"] > 0;
+    // Read from the ledger for the reason the line above is: a resumed run has already heard it.
+    let planBarAnnounced = delivered["plan-bar"] > 0;
+    // The usage bar, seeded the same way.
+    let usageBarAnnounced = delivered["usage-bar"] > 0;
+    /** Whether THIS turn read usage, so the usage bar is announced after the turn's results, as the plan bar is. */
+    let usageBarDue = false;
+    /*
+      Whether THIS turn read a plan, so the bar can be announced once the turn's results are all in.
+      It cannot be announced where the plan is read: every tool call in one assistant message must
+      be answered by its own tool result with nothing between them, and a `user` message pushed
+      between two results leaves the second call unanswered - `Tool result is missing for tool call
+      <id>`, the run dead as `model-unavailable`. Measured in production 2026-09-30, where the
+      measurement harness read that as a transport fault and threw two whole cells away.
+    */
+    let planBarDue = false;
+    /** Tool calls this run has completed on a plan-judged workflow without inspecting a plan. */
+    let planlessCalls = 0;
     /** Whether a tool this run HOLDS has been called; see `remindToReport`. */
     let anyToolCalled = false;
     /**
@@ -3023,7 +3356,7 @@ export async function runInvestigation(
     let planStatementAsks = delivered["plan-statement"];
     /**
      * Whether the run has been narrowed to what would finish it; see
-     * `AGENT_NARROWED_EXTRA_TOOLS`. Set once and never cleared — a run narrowed for
+     * each variant's `narrowedExtras`. Set once and never cleared: a run narrowed for
      * looping or for silence stays narrowed, or it spends its remaining turns the same way
      * it spent the ones that got it here.
      */
@@ -3063,6 +3396,35 @@ export async function runInvestigation(
       reserveAnnounced = true;
       messages.push({ role: "user", content: notice(AGENT_REPORT_RESERVE_NOTICE) });
       await issueGuidance("report-reserve");
+    };
+
+    /**
+     * Tells an optimization run, once, what its report is judged on - at the moment it reads a
+     * plan, which is the moment it can still act on the answer.
+     *
+     * Safe for the same three reasons `announceReserve` is: it rides on a turn already being
+     * taken, it spends no statement and consults no deadline, and it touches neither the policy
+     * version nor the verifier. `holdsTool("compare_plans")` is the workflow test, the same
+     * proxy the compose-time hold uses - a run whose verdict does not want a comparison is not
+     * handed the tool, so it is never told about one.
+     */
+    const announcePlanBar = async (): Promise<void> => {
+      if (!planBarDue || planBarAnnounced) return;
+      planBarAnnounced = true;
+      messages.push({ role: "user", content: notice(AGENT_PLAN_BAR_NOTICE) });
+      await issueGuidance("plan-bar");
+    };
+
+    /**
+     * Tells a resource-efficiency run, once, what its report is judged on, at the moment it holds a usage reading.
+     * Safe for the reasons `announcePlanBar` is. Due only on a reading that landed: a cluster with no usage metrics
+     * gave the run nothing to cite, and telling it that it holds a reading would be false.
+     */
+    const announceUsageBar = async (): Promise<void> => {
+      if (!usageBarDue || usageBarAnnounced) return;
+      usageBarAnnounced = true;
+      messages.push({ role: "user", content: notice(LANGUAGE_USAGE_BAR_NOTICE) });
+      await issueGuidance("usage-bar");
     };
 
     /**
@@ -3118,7 +3480,7 @@ export async function runInvestigation(
       if (turns >= maxTurns || resources.deadline.remainingMs() <= 0) return false;
       reportReminders += 1;
       // Narrowed as well as told. Reminded runs that kept the whole set went back to
-      // reading; see `AGENT_NARROWED_EXTRA_TOOLS`.
+      // reading; see each variant's `narrowedExtras`.
       narrowed = true;
       messages.push(...assistant);
       messages.push({ role: "user", content: notice(BASELINE_NOTICES.reportReminder) });
@@ -3129,19 +3491,45 @@ export async function runInvestigation(
     /**
      * Gives a PLAN run one more turn when its prose named neither statement nor refusal.
      *
-     * Bounded by the model's own `planStatementRetries`, which is 0 for every model but the one
-     * whose ledgers earned it. The other bounds are the same three `remindToReport` applies and
-     * load-bearing for the same reasons: an agent run has no plan deliverable to miss, an
-     * operations plan is prose by decision (`verifyPlanningGoal` exempts it), and a run with no
-     * turn left cannot act on what it is told.
+     * The other bounds are the same three `remindToReport` applies and load-bearing for the same
+     * reasons: an agent run has no plan deliverable to miss, an operations plan is prose by
+     * decision (`verifyPlanningGoal` exempts it), and a run with no turn left cannot act on what
+     * it is told.
      *
      * The reading is `readPlanStatement`, the same reader `recordPlanStatement` and the verifier
      * use, so this cannot ask for a statement the run already wrote — a disagreement between the
      * notice and the verdict would spend a turn telling a passing run it had failed.
+     *
+     * THE FIRST ASK IS THE SERVER'S OWN, NOT A PER-MODEL FAVOUR.
+     *
+     * It was gated behind `planStatementRetries`, which defaults to 0, so a model with no row in
+     * `measured-profiles.json` was told nothing at all: the server read the closing prose, learned
+     * it held neither a fenced statement nor the refusal marker, held the sentence written for
+     * exactly that shape — and returned false on the line above, because of who the model was
+     * rather than what the run did.
+     *
+     * The order was the whole defect. The reader below decides whether the run FELL SHORT, and it
+     * is the same reader, with the same dialect, that `verifyPlanningGoal` is about to score
+     * `no-statement` on. So this branch is reachable only on a run already earning that verdict,
+     * and a run that clears the bar returns non-absent and is never touched. The turn provably
+     * cannot cost a pass, which is the standard the unread-stop retry is already granted under.
+     *
+     * Measured: `cogito:32b` and `qwen2.5:32b` each lost their plan cell 4/5 with every single
+     * loss `no-statement` / `model-stopped`, prose describing the schema correctly and no
+     * statement. `ornith:9b` and `qwen3:14b` lost the same cell the same way and BOTH were won by
+     * this very sentence, filed as a number in a document. The mechanism was discovered three
+     * times; the third and fourth models got nothing.
+     *
+     * `Math.max` rather than a raised default: the two models measured with this mechanism live
+     * keep exactly one ask and see byte-identical drives, and a profile may still RAISE the bound.
+     * It may no longer silence a sentence the server is holding for a run it has already failed.
      */
     const askForPlanStatement = async (assistant: readonly ModelMessage[]): Promise<boolean> => {
       if (record.mode === "agent" || record.workflowType === "operations") return false;
-      if (planStatementAsks >= planStatementRetriesFor(model.modelId)) return false;
+      if (planStatementAsks >= planStatementAsksFor(model.modelId)) return false;
+      // Grounded runs only. A run shown no inventory has nothing to write a statement FROM,
+      // and asking it for one is the impossible ask this file records having paid for before.
+      if (planningInventory === null || planningInventory.objects.length === 0) return false;
       if (turns >= maxTurns || resources.deadline.remainingMs() <= 0) return false;
       if (text.length === 0 || readPlanStatement(text, context.connection.type).kind !== "absent") return false;
       planStatementAsks += 1;
@@ -3205,13 +3593,23 @@ export async function runInvestigation(
         // The engine this drive was given, not one read off the record: a statement is
         // written for the connection it would actually be run against.
         dialect: context.connection.type,
+        // The language its editor renders it in, from the capabilities this drive holds, because the
+        // rail's answer card has none to read it from and tinted every etcd draft "unknown" (#1089).
+        language: editorLanguageForTabType(resolveTabType(context.capabilities)),
         // The engine's own query language goes in beside the inventory (#414): both
         // halves of this validation are SQL readers, and on an engine that speaks no SQL
         // both were wrong at once — the guard marking every correct draft as not
         // classified as a read, and the identifier check affirming an inventory it never
         // consulted. It declines to judge instead, and the rail says which check could
         // not reach this draft rather than what it found.
-        ...validatePlanStatement(draft.sql, planningInventory, context.capabilities.queryLanguage),
+        ...validatePlanStatement(
+          draft.sql,
+          planningInventory,
+          context.capabilities.queryLanguage,
+          context.statementLanguage === undefined
+            ? undefined
+            : languageServer(context.statementLanguage).planDraftIdentifiers,
+        ),
       });
     };
 
@@ -3219,6 +3617,13 @@ export async function runInvestigation(
       status: AgentRunTerminalStatus,
       stopReason: AgentRunStopReason,
     ): Promise<AgentInvestigationResult> => {
+      // A pause that landed while the model was composing its closing work wins: the
+      // drive stops and leaves the run paused, and whatever the model already wrote
+      // stays on the ledger instead of being finished over.
+      const live = await service.status(runId);
+      if (live?.record.status === "paused") {
+        return { runId, status: "paused", stopReason: null, turns, text };
+      }
       if (text.length > 0) {
         await service.recordEvent(runId, { kind: "closing-statement", text });
         // After the prose, in the order a reader folds them: the statement is a fact
@@ -3264,25 +3669,106 @@ export async function runInvestigation(
       // Built after the context, because in planning mode the rules depend on whether
       // there WAS one: a run told to plan against an inventory it was not given is the
       // same defect as a run given one and never told to use it (#350).
-      const turn = await takeTurn(
-        model,
-        // The engine is the fence tag a plan run is told to write, so the prompt reads
-        // it from the connection this drive was given rather than from the record: the
-        // resources are what a statement would actually be run against.
-        systemPrompt(record, grounding, engine),
-        messages,
-        // Narrowed once the run has been told to finish; see `AGENT_NARROWED_EXTRA_TOOLS`.
-        narrowed && !prompted ? narrowedTools(ledger, narrowedAtEvent) : tools,
-        turnBudgetMs,
-        // Constraint measured and REVERTED; see the commit that removes it. Left unset here
-        // rather than deleted from `takeTurn`, because the seam is correct and the cost was in
-        // the model, not the wiring.
-        undefined,
-        record.workflowType,
-        record.mode,
-      );
+      let turn: ModelTurn;
+      try {
+        turn = await takeTurn(
+          model,
+          // The engine is the fence tag a plan run is told to write, so the prompt reads
+          // it from the connection this drive was given rather than from the record: the
+          // resources are what a statement would actually be run against.
+          systemPrompt(record, grounding, engine),
+          messages,
+          // Narrowed once the run has been told to finish; see each variant's `narrowedExtras`.
+          narrowed && !prompted ? narrowedTools(ledger, narrowedAtEvent) : tools,
+          turnBudgetMs,
+          // Constraint measured and REVERTED; see the commit that removes it. Left unset here
+          // rather than deleted from `takeTurn`, because the seam is correct and the cost was in
+          // the model, not the wiring.
+          undefined,
+          record.workflowType,
+          record.mode,
+        );
+      } catch (error) {
+        /*
+          A turn that broke in TRANSPORT is not a turn the model failed, and this loop's other
+          re-asks all cover the model.
+
+          Re-asked rather than ended because nothing was written: `takeTurn` copies the transcript
+          (`messages: [...messages]`) and never mutates the caller's array, and every ledger write
+          for a call happens downstream in `handleCall`. So the re-ask sends byte-identical bytes —
+          no second result for a `tool_call_id`, none of the wedging hazards the comments around
+          `toolResultMessage` guard.
+
+          Bounded by the run's own clock and by a small count, so a provider that is genuinely down
+          still ends the run — with its own error, finally meaning it.
+        */
+        /*
+          A tool call the ENDPOINT could not parse, which the re-ask above cannot reach.
+
+          Both arrive here as `LLMStreamError` and only one of them is an accident. A broken frame
+          is worth the identical bytes a second time; arguments the provider failed to read are
+          not, and sending them again asks the model to repeat itself. Measured on `gpt-oss:20b`,
+          database-assessment: three runs, six re-asks between them, six identical failures, every
+          run dead seventeen seconds into a 630-second budget with four tools already called.
+
+          The endpoint hands back what it could not read, so the fault is known and specific — a
+          reasoning model writing its thinking into the argument field with valid JSON after it —
+          and Studio was throwing that away and ending the run without saying anything.
+
+          Free, because the alternative is the throw below: the run is over either way, so the turn
+          cannot cost a pass. Once per run, and the second one ends it.
+        */
+        if (
+          isToolCallParseError(error) &&
+          unreadableToolCallAnswers < AGENT_UNREADABLE_TOOL_CALL_ANSWERS &&
+          turns < maxTurns &&
+          resources.deadline.remainingMs() > 0
+        ) {
+          unreadableToolCallAnswers += 1;
+          messages.push({ role: "user", content: notice(BASELINE_NOTICES.unreadableToolCall) });
+          await issueGuidance("tool-call-unreadable");
+          return null;
+        }
+        if (
+          !isRetryableError(error) ||
+          isToolCallParseError(error) ||
+          transportRetries >= AGENT_TRANSPORT_TURN_RETRIES ||
+          resources.deadline.remainingMs() <= 0
+        ) {
+          throw error;
+        }
+        transportRetries += 1;
+        logger.warn(`agent run ${runId} re-asking a turn whose stream failed`, {
+          runId,
+          attempt: transportRetries,
+          modelId: model.modelId,
+        });
+        return null;
+      }
       text = turn.text;
-      if (turn.aborted) return conclude("failed", turnBudgetMs < remainingMs ? "model-timeout" : "deadline-exceeded");
+      if (turn.aborted) {
+        /*
+          See the note above `turnCutOffRetried`. `turnBudgetMs < remainingMs` is not only the word
+          this ending gets — it is a FACT about the run: the run's own clock is untouched, so what
+          ended is one call, which is exactly what this ceiling says it bounds.
+        */
+        const cutByTurnCeiling = turnBudgetMs < remainingMs;
+        if (
+          cutByTurnCeiling &&
+          !turnCutOffRetried &&
+          record.mode === "agent" &&
+          turns < maxTurns &&
+          resources.deadline.remainingMs() > AGENT_REPORT_RESERVE_MS
+        ) {
+          turnCutOffRetried = true;
+          // No assistant message is pushed: `takeTurn` returns none on abort, and a cut-off
+          // partial must not enter the transcript as a completed turn.
+          messages.push({ role: "user", content: notice(BASELINE_NOTICES.turnCutOff) });
+          await issueGuidance("turn-cut-off");
+          return null;
+        }
+        return conclude("failed", cutByTurnCeiling ? "model-timeout" : "deadline-exceeded");
+      }
       /*
         On the prompted path the call arrives as a JSON object inside ordinary text, so it is
         read out here and from here on the turn is indistinguishable from a native one.
@@ -3337,6 +3823,34 @@ export async function runInvestigation(
       if (calls.length === 0) {
         // A run that used its tools and then narrated is one call short of a report;
         // one that established nothing has nothing to be reminded about.
+        /*
+          The stop whose TEXT is a tool call, which is a transport mistake wearing the shape of a
+          model that gave up. `stoppedWithAToolCall` carries the measurement; what matters here is
+          that nothing is executed - the model is told the channel it used and given the turn to
+          use the other one.
+
+          Free on the same argument as its neighbours: the run is about to conclude on
+          `model-stopped`, so it has already earned `no-report` and this turn cannot cost a pass.
+          Once, because a model that writes its calls out twice is not going to stop.
+
+          BEFORE `remindToReport`, and that ordering is the point. The reminder would fire here too
+          - the run has called tools - and what it says is "file your report", which is the wrong
+          sentence for a turn that was not narrating at all. The specific reading goes first; the
+          general one keeps every turn it had.
+        */
+        if (
+          record.mode === "agent" &&
+          toolCallAsTextAnswers < 1 &&
+          turns < maxTurns &&
+          resources.deadline.remainingMs() > 0 &&
+          stoppedWithAToolCall(turn.text, holdsTool)
+        ) {
+          toolCallAsTextAnswers += 1;
+          messages.push(...turn.assistantMessages);
+          messages.push({ role: "user", content: notice(BASELINE_NOTICES.toolCallAsText) });
+          await issueGuidance("tool-call-as-text");
+          return null;
+        }
         if (await remindToReport(turn.assistantMessages)) return null;
         // A plan that answered the question and skipped the deliverable, where this model was
         // measured needing the reminder. Before `conclude`, because conclude is where the prose
@@ -3395,34 +3909,49 @@ export async function runInvestigation(
           was sent to diagnose — holding, at that moment, the two instruments that would have
           found it. There is no user on the other end of a run, so the question is a stop.
 
-          `remindToReport` above cannot serve it: it is gated on `anyToolCalled`, correctly,
-          because a run that read nothing has nothing to file. This sentence is the other half
-          — not "file what you found" but "go and find it", naming the instruments.
+          `remindToReport` above cannot serve it. That one fires here too — it is gated the
+          other way, on `anyToolCalled` — and what it asks for is a report. This sentence is the
+          other half: not "file what you found" but "go and find it", naming the instruments.
 
-          Granted only where the run has lost anyway. `compose_report` is one of the tools
-          `anyToolCalled` counts, so a run reaching here with it false composed no report and
-          has already earned `no-report`; the turn cannot cost a pass. Once, and only for a
-          model whose ledger asked twice.
+          Not gated on having read nothing, which is the shape the question takes only the first
+          time a model meets a surface. Measured on `glm-4.7-flash`, a query-optimization cell
+          that read 4/5 across ten rolls: it called `inspect_schema`, was reminded to report,
+          answered the reminder by asking the user to paste the very statement it had been sent
+          to diagnose, and stopped. Ten of eighteen losses across forty-three runs were that one
+          shape. A run that read first is not better off for having read — it is stopped on a
+          question nobody will answer, having already spent a call proving it was willing.
+
+          Granted only where the run has lost anyway, and that is what makes the width safe:
+          `compose_report` ENDS a run, so a run reaching this branch composed no report whatever
+          else it called, and has already earned `no-report`; the turn cannot cost a pass. Once,
+          and — because a bound that cannot protect a passing run protects nothing — offered to
+          whoever needs it: `answersUnreadStop` reads a stated `false` as the measurement it is
+          and an absent profile as the absence it is, so a model nobody has measured is told to
+          read.
         */
         if (
           record.mode === "agent" &&
           !anyToolCalled &&
-          !unreadStopRetried &&
+          unreadStopAsked < unreadStopAsksFor(model.modelId) &&
           turns < maxTurns &&
           resources.deadline.remainingMs() > 0 &&
           // The sentence NAMES `inspect_schema` AND `inspect_plan`, so it may only reach a run
-          // that holds BOTH. Every set but one is `AGENT_MODE_TOOLS` today, which makes the two
-          // checks equivalent - and that equivalence is the thing a future set would break
-          // silently, so it is asserted rather than relied on.
+          // that holds BOTH. Every variant's `tools` but the operations one starts with the
+          // read-class four today, which makes the two checks equivalent - and that
+          // equivalence is the thing a future set would break silently, so it is asserted
+          // rather than relied on.
           // `operations` is the one agent set built on a different four, because the
-          // read-class tools need `queryReadOnly`, which only two providers implement. Told to
+          // read-class tools need `queryReadOnly`, which only the engines
+          // `AGENT_EXECUTION_ENGINES` (`src/lib/agent/engine-support.ts`) names implement -
+          // named rather than counted here, because the count is what went stale: the rule
+          // that decides is the factory's probe of that method, not a number. Told to
           // call a tool it has not got, a run calls it, is answered "there is no such tool",
           // and spends the very turn this retry bought: the #350/#356 defect, paid for once.
           holdsTool("inspect_schema") &&
           holdsTool("inspect_plan") &&
-          retriesUnreadStop(model.modelId)
+          answersUnreadStop(model.modelId)
         ) {
-          unreadStopRetried = true;
+          unreadStopAsked += 1;
           messages.push(...turn.assistantMessages);
           messages.push({ role: "user", content: notice(BASELINE_NOTICES.unreadStop) });
           await issueGuidance("unread-stop");
@@ -3462,8 +3991,18 @@ export async function runInvestigation(
 
           Read once and applied to all three holds, because the reasoning does not distinguish
           between them and a gate on one site would be a difference nothing justifies.
+
+          Both halves of the reserve, because "no turn left" is the literal reading of the
+          sentence above and for a long while only the clock half was written here. A run can
+          be minutes from its deadline and one turn from its ceiling, and it is the ceiling
+          that ends most runs: `announceReserve` spends the last turns telling the model to
+          report, the model finally does, and the hold then asks for a step there is no turn
+          to take. Measured on an optimize cell where three of five runs died exactly that
+          way — eleven reads, two reserve notices, a report held on the last turn, verdict
+          `unanswered` — while using a hundred seconds of a four-hundred-fifty-second budget.
         */
-        const noTimeToHold = resources.deadline.remainingMs() <= AGENT_REPORT_RESERVE_MS;
+        const noTimeToHold =
+          resources.deadline.remainingMs() <= AGENT_REPORT_RESERVE_MS || maxTurns - turns <= AGENT_REPORT_RESERVE_TURNS;
         // A run whose workflow answers by presenting, which read something and is about
         // to report without presenting it, is one call short of an answer. Checked here
         // and not after the call, because `compose_report` ends the run.
@@ -3486,7 +4025,7 @@ export async function runInvestigation(
           const hasReading = sofar.events.some(
             (event) =>
               event.kind === "tool-completed" &&
-              event.artifact.operationId === "sql.query.read" &&
+              isStatementReadOperation(event.artifact.operationId) &&
               drafted.has(event.stepId),
           );
           /*
@@ -3544,19 +4083,20 @@ export async function runInvestigation(
           // table instead of asking the model to pick one. The snapshot is optional on the
           // event, and a run without one is told the generic form rather than nothing.
           const inventory = sofar.events.flatMap((event) =>
-            event.kind === "context-captured" && event.snapshot !== undefined ? event.snapshot.tables : [],
+            event.kind === "context-captured" && event.snapshot !== undefined ? event.snapshot.objects : [],
           );
           const spoken = would.flatMap((shortfall) => {
-            const advice = shortfallNotice(
-              shortfall,
-              tableToProfile(inventory, previewClaims(call.input)),
+            const advice = shortfallNotice(shortfall, tableToProfile(inventory, previewClaims(call.input)), {
               // Counted the way `compareBeforeReportNotice` counts them below: a plan is a
-              // completed step under the estimate operation, not an event kind of its own.
-              sofar.events.filter(
-                (event) => event.kind === "tool-completed" && event.artifact.operationId === "sql.explain.estimate",
-              ).length,
-              sofar.events.filter((event) => event.kind === "tool-completed").length,
-            );
+              // completed step under a plan-estimate operation, not an event kind of its own.
+              plans: inspectedPlans(sofar.events),
+              readingsHeld: sofar.events.filter((event) => event.kind === "tool-completed").length,
+              // Asked of the same function `present_answer` asks, so "presentable" cannot
+              // drift between the notice and the tool it points at.
+              holdsPresentable: presentableArtifact(sofar.events) !== undefined,
+              holdsCompare: holdsTool("compare_plans"),
+              noun: AGENT_LANGUAGE_COPY[statementFamilyOf(record.statementLanguage)].noun,
+            });
             return advice === null ? [] : [{ shortfall, advice }];
           })[0];
           if (spoken !== undefined) {
@@ -3571,7 +4111,7 @@ export async function runInvestigation(
               `run_read_query` three, `qwen3:8b` went back to `inspect_schema`. So the notice
               is not the missing part; the wandering after it is.
 
-              `AGENT_NARROWED_EXTRA_TOOLS` already holds the answer per workflow, because it is
+              Each variant's `narrowedExtras` already holds the answer per workflow, because it is
               keyed on what each verdict accepts — on this one exactly `profile_table` and
               `compose_report`. A held run can therefore fix the thing it was asked to fix, or
               say nothing. It cannot go looking.
@@ -3630,13 +4170,19 @@ export async function runInvestigation(
         // A run whose verdict wants a comparison, holding the two plans that would make
         // one, is one call short of it. Checked here for the same reason the present
         // notice is: `compose_report` ends the run.
-        if (call.toolName === "compose_report" && !noTimeToHold && compareReminders < 1 && holdsTool("compare_plans")) {
+        // The bound was the literal `1` until 2026-10-09, which left this the only reminder hold
+        // with no per-model setting behind it. `laguna-xs-2.1:latest` optimize is why it has one:
+        // five rolls of its best document read 4/5, 4/5, 1/5, 4/5, 4/5, and the loss that recurred
+        // was this exact shortfall on runs holding four plans, with the sentence delivered in every
+        // run. It hears it once, reports without comparing, and the cell loses by one run.
+        if (
+          call.toolName === "compose_report" &&
+          !noTimeToHold &&
+          compareReminders < compareHoldLimitFor(model.modelId) &&
+          holdsTool("compare_plans")
+        ) {
           const { record: sofar } = await service.resume(context.runId);
-          const plans = sofar.events.flatMap((event) =>
-            event.kind === "tool-completed" && event.artifact.operationId === "sql.explain.estimate"
-              ? [event.artifact.correlationId]
-              : [],
-          );
+          const plans = inspectedPlans(sofar.events);
           // Either route the verdict accepts counts as satisfied, and the index one has to
           // be read as carefully as the verifier reads it: an index recommendation whose
           // evidence cites a plan this run inspected IS the answer for a case that cannot be
@@ -3647,8 +4193,7 @@ export async function runInvestigation(
             sofar.events.some((event) => event.kind === "plan-comparison") ||
             sofar.events.some(
               (event) =>
-                event.kind === "recommendation" &&
-                event.change === "index" &&
+                recommendsIndex(event) &&
                 event.evidence.some(
                   (reference) => reference.source === "artifact" && planIds.has(reference.correlationId),
                 ),
@@ -3679,7 +4224,6 @@ export async function runInvestigation(
           record: ledger,
           call,
           known,
-          notAttempted,
           narrowed,
           narrowedAtEvent,
         });
@@ -3688,9 +4232,40 @@ export async function runInvestigation(
           // refuse, and rightly.
           return { runId, status: "cancelled", stopReason: "cancelled", turns, text };
         }
+        if (outcome.kind === "paused") {
+          // `runStep` left the run paused at its checkpoint; the drive stops without
+          // finishing it, and a paused run has no stop reason to record.
+          return { runId, status: "paused", stopReason: null, turns, text };
+        }
         if (outcome.kind === "reported") return conclude("succeeded", "report-composed");
         messages.push(prompted ? promptedResultMessage(call, outcome.text) : toolResultMessage(call, outcome.text));
+        /*
+          Due on a plan, and due on READING INSTEAD of one.
+
+          The first version fired only after `inspect_plan`, which left the shape that actually
+          loses this cell untouched: `laguna-xs-2.1` passes every run that reads a plan (43-47s,
+          three of five) and loses every run that does not - `inspect_schema` five times, or three
+          reads plus two queries, 127 and 222 seconds, zero plans. The sentence that would redirect
+          those two is delivered by holding `compose_report`, and both had already tripped
+          `report-reserve`, which suppresses every hold. So the run that most needed the bar was the
+          one guaranteed never to hear it.
+
+          Two tool calls is the threshold: one read is orientation, and a workflow judged on plans
+          that has made two moves without looking at one has chosen a different approach. It still
+          rides on the turn and spends none of its own.
+        */
+        if (holdsTool("compare_plans")) {
+          if (call.toolName === "inspect_plan") planBarDue = true;
+          else if (++planlessCalls >= 2) planBarDue = true;
+        }
+        if (call.toolName === "inspect_usage" && holdsTool("inspect_usage") && !usageBarAnnounced) {
+          const { record: sofar } = await service.resume(context.runId);
+          if (sofar.events.some((event) => event.kind === "usage-read")) usageBarDue = true;
+        }
       }
+      // After every result this turn owes, never between two of them.
+      await announcePlanBar();
+      await announceUsageBar();
       return null;
     };
 
@@ -3706,15 +4281,22 @@ export async function runInvestigation(
     let result: AgentInvestigationResult | null = null;
     while (result === null) {
       const remainingMs = resources.deadline.remainingMs();
-      if ((await service.status(runId))?.cancellationRequested === true) {
+      const status = await service.status(runId);
+      if (status?.cancellationRequested === true) {
         result = await conclude("cancelled", "cancelled");
+      } else if (status?.record.status === "paused") {
+        // A pause that arrived while the model was thinking, between tool calls: stop
+        // driving and leave the run paused. Read here for the same reason the
+        // cancellation check is — a planning run reaches no tool, so runStep's
+        // checkpoint would never be called.
+        result = { runId, status: "paused", stopReason: null, turns, text };
       } else if (remainingMs <= 0) result = await conclude("failed", "deadline-exceeded");
       else if (turns >= maxTurns) result = await conclude("failed", "turn-limit");
       else result = await driveTurn(remainingMs);
     }
     return result;
   } finally {
-    service.releaseDrive(runId);
+    await service.releaseDrive(runId);
   }
 }
 
@@ -3724,8 +4306,6 @@ async function handleCall(input: {
   readonly record: AgentRunRecord;
   readonly call: { readonly toolCallId: string; readonly toolName: string; readonly input: unknown };
   readonly known: Set<string>;
-  /** Steps THIS drive refused before any database reach; see `refusedBeforeDatabaseText`. */
-  readonly notAttempted: Set<string>;
   /**
    * Whether the run has been narrowed. Declaration and dispatch are ONE decision, and
    * this is the half a review caught missing: narrowing only what the model was told
@@ -3737,7 +4317,7 @@ async function handleCall(input: {
   /** Where the ledger stood at the narrowing; see `AGENT_NARROWED_INSTRUMENT_USES`. */
   readonly narrowedAtEvent: number;
 }): Promise<CallResult> {
-  const { service, context, record, call, known, notAttempted, narrowed, narrowedAtEvent } = input;
+  const { service, context, record, call, known, narrowed, narrowedAtEvent } = input;
   const offered = narrowed
     ? narrowedToolNames(record, narrowedAtEvent)
     : new Set(selectAgentTools(record).map((definition) => definition.name));
@@ -3754,25 +4334,39 @@ async function handleCall(input: {
   // Profiling DOES reach a database, but its statement is composed from the run's
   // own inventory rather than from the model's arguments, so its step identity is
   // the table and depth it names. Handled here, where the run record is in hand.
-  if (call.toolName === "profile_table") return profileTable(service, context, call, known, notAttempted);
+  if (call.toolName === "profile_table") return profileTable(service, context, call, known);
+  // An evidence reading reaches the cluster as a database tool does, and writes its own event beside the step.
+  if (Object.hasOwn(AGENT_EVIDENCE_TOOLS, call.toolName)) {
+    return readEvidence(service, context, call, known, call.toolName as EvidenceToolName);
+  }
 
   const name = call.toolName as DatabaseToolName;
-  const stepId = deriveStepId(name, call.input);
-  const draft = draftedSql(call.input);
+  const language = statementFamilyOf(context.statementLanguage);
+  const stepId = deriveStepId(name, identifyingInput(call.input, language));
+  const draft = draftedStatement(call.input, language);
+  // The run as its ledger stands NOW. `record` was read before this drive captured its
+  // inventory, so the snapshot a catalog arm resolves a spelling against is read here,
+  // and the same read answers whether the run was paused meanwhile.
+  const live = await service.status(record.runId);
   // The draft is narrated before the invocation it describes, and only for a step
   // the ledger has not seen: a resumed run that replays a call must not write a
   // second draft for it.
   if (draft !== null && !known.has(stepId)) {
+    // Not a safety gate anymore, since `recordEvent` accepts a paused run, but still
+    // worth the read: a pause means "take no new step", and narrating a draft the
+    // user will never see run would record a step the drive then refuses to perform.
+    if (live?.record.status === "paused") return { kind: "paused" };
     await service.recordEvent(record.runId, { kind: "statement-drafted", stepId, ...draft });
   }
   known.add(stepId);
+  // A run that vanished has no snapshot, and `runStep` below refuses it by name.
+  const snapshot = live === null ? null : capturedSnapshot(live.record.events);
 
+  const { operationId } = agentToolDefinition(context.statementLanguage, context.workflowType, name);
   const invocation: AgentRunInvocation = {
     stepId,
     tool: name,
-    ...(AGENT_TOOL_DEFINITIONS[name].operationId === undefined
-      ? {}
-      : { operationId: AGENT_TOOL_DEFINITIONS[name].operationId }),
+    ...(operationId === undefined ? {} : { operationId }),
   };
 
   // The tool's model-facing text is the tool's to write; it escapes through the
@@ -3780,14 +4374,13 @@ async function handleCall(input: {
   // prose.
   let modelText = "";
   const result = await service.runStep(record.runId, invocation, async () => {
-    const outcome = await invokeDatabaseTool(context, name, call.input);
+    const outcome = await invokeDatabaseTool(context, name, call.input, snapshot);
     modelText = outcome.modelText;
-    const settlement = settlementOf(outcome);
-    if (settlement.kind === "not-attempted") notAttempted.add(stepId);
-    return settlement;
+    return settlementOf(outcome);
   });
 
   if (result.kind === "cancelled") return { kind: "cancelled" };
+  if (result.kind === "paused") return { kind: "paused" };
   if (result.kind === "performed") return { kind: "answered", text: modelText };
   if (result.kind === "replayed") {
     return {
@@ -3795,57 +4388,36 @@ async function handleCall(input: {
       text: `This exact call was already made in this run. ${describeSettled(result.event, name)}`,
     };
   }
-  return {
-    kind: "answered",
-    text: notAttempted.has(result.stepId)
-      ? refusedBeforeDatabaseText(result.stepId, name)
-      : indeterminateText(result.stepId, name),
-  };
+  return { kind: "answered", text: indeterminateText(result.stepId, name) };
 }
 
 /**
- * The report tool, which reaches no database and therefore no ledger step: its
- * whole job is to check the model's citations against the run's OWN event log, so
- * there is no effect to write ahead of.
+ * One table profiled, recorded and NOT terminal, on the arm of whichever language the run speaks
+ * (`agentLanguagePack`): a SQL table's catalog-composed aggregates, or a MongoDB collection's `$group`.
  *
- * The VERIFICATION is idempotent — re-checking the same claims against the same log
- * answers the same thing. Composing is not: a second composition appends a second
- * `report-composed` entry, so a death between that append and `finish` leaves a
- * resumed run able to add another. Harmless (the entries are claims with their
- * evidence, and every claim was still checked against the ledger) but not the same
- * property, so it is not claimed as one.
- *
- * The record is re-read here rather than reused: the log has grown since the run
- * started, and the artifacts a claim may cite are exactly the entries that were
- * added while the loop was running.
+ * It reaches the database through `executeAgentOperation`, like every other reach, and so through the run's deadline,
+ * its repair ledger, its budgets and the audit trail; and it settles a step through `runStep`, like every database
+ * tool, so a replay is answered from the ledger and a cancellation requested after the model's turn stops the read
+ * (found by review on #345, when a version routed around `runStep`). It is handled apart from the other database tools
+ * only because its statement is composed from the run's own inventory: the step is identified by what the request
+ * RESOLVED to - the target, the depth and the batch - so two requests naming one object settle as one step rather than
+ * executing twice. The `table-profiled` event is written inside the settled step, so a reader never sees a profile
+ * whose read was not also recorded.
  */
-/**
- * One table profiled, recorded and NOT terminal.
- *
- * Unlike the other two handled here, this one reaches the database — through
- * `executeAgentOperation` like every other reach, and therefore through the run's
- * deadline, its repair ledger, its budgets and the audit trail. What it does NOT go
- * through is `runStep`: the tool composes its own statement from the inventory, so
- * there is no model-supplied argument for a step id to be derived from, and the
- * repair ledger's statement fingerprint already refuses the same profile twice.
- *
- * The honest consequence, stated rather than glossed: a drive that dies between the
- * database reach and this append loses the profile and a resumed run re-reads it.
- * That costs a statement out of twenty; it cannot double-count anything, because
- * the profile changes no state.
- */
-async function profileTable(
+export async function profileTable(
   service: AgentRunService,
   context: AgentToolContext,
   call: { readonly input: unknown },
   known: Set<string>,
-  notAttempted: Set<string>,
 ): Promise<CallResult> {
   const { record } = await service.resume(context.runId);
+  const arm =
+    agentLanguagePack(statementFamilyOf(context.statementLanguage)).execution.arms.profile_table ??
+    missingArm(context, "profile_table");
   // Resolution and composition first, and they reach nothing: the step's identity
   // has to come from what the profile RESOLVED to, so that two requests naming the
   // same table settle as one step rather than executing twice.
-  const planned = planTableProfile(context, record, call.input);
+  const planned = arm.plan(context, record, call.input);
   if (planned.kind !== "planned") return { kind: "answered", text: planned.modelText };
 
   const { plan } = planned;
@@ -3857,18 +4429,16 @@ async function profileTable(
   });
   known.add(stepId);
 
+  // Recorded under the operation the run's own definition of the tool names, as every database tool's step is.
+  const { operationId } = agentToolDefinition(context.statementLanguage, context.workflowType, "profile_table");
   let modelText = "";
   const result = await service.runStep(
     record.runId,
-    { stepId, tool: "profile_table", operationId: "sql.table.profile" },
+    { stepId, tool: "profile_table", ...(operationId === undefined ? {} : { operationId }) },
     async () => {
-      const outcome = await profileTableTool(context, plan);
+      const outcome = await arm.run(context, plan);
       modelText = outcome.modelText;
-      if (outcome.kind !== "profiled") {
-        if (outcome.kind === "refused") return { kind: "refused", refusal: outcome.refusal };
-        notAttempted.add(stepId);
-        return { kind: "not-attempted" };
-      }
+      if (outcome.kind !== "profiled") return settlementOf(outcome);
       // Written inside the settled step, so a reader never sees a profile whose
       // read was not also recorded.
       await service.recordEvent(record.runId, {
@@ -3881,6 +4451,7 @@ async function profileTable(
   );
 
   if (result.kind === "cancelled") return { kind: "cancelled" };
+  if (result.kind === "paused") return { kind: "paused" };
   if (result.kind === "performed") return { kind: "answered", text: modelText };
   if (result.kind === "replayed") {
     // The profile is already on this run's ledger; re-reading the table would spend
@@ -3890,12 +4461,70 @@ async function profileTable(
       text: `That exact profile was already taken in this run. ${describeSettled(result.event, "profile_table")}`,
     };
   }
-  return {
-    kind: "answered",
-    text: notAttempted.has(result.stepId)
-      ? refusedBeforeDatabaseText(result.stepId, "profile_table")
-      : indeterminateText(result.stepId, "profile_table"),
-  };
+  return { kind: "answered", text: indeterminateText(result.stepId, "profile_table") };
+}
+
+/**
+ * One evidence reading, settled as a step and recorded as the event its verdict reads.
+ *
+ * Modelled on `profileTable`: the step settles through `service.runStep`, so a replay, a cancellation and the audit
+ * trail treat it as every other reach, and the event is written inside the settled step, so a reader never sees
+ * evidence whose read was not also recorded. A completed reading writes `AGENT_EVIDENCE_TOOLS[tool].event` with its
+ * artifact and what it covered. A cluster that serves no usage metrics writes `usage-unavailable`: the refusal alone
+ * cannot tell the verdict that the cluster, not the run, is why usage was never measured.
+ *
+ * The step id is derived from the PARSED arguments where they parse, so two calls that differ only in key order are
+ * one step; arguments that do not parse keep their raw form and the tool answers them as invalid.
+ */
+async function readEvidence(
+  service: AgentRunService,
+  context: AgentToolContext,
+  call: { readonly input: unknown },
+  known: Set<string>,
+  tool: EvidenceToolName,
+): Promise<CallResult> {
+  const parsed = AGENT_EVIDENCE_TOOLS[tool].input.safeParse(call.input);
+  const covered = parsed.success ? parsed.data : undefined;
+  const stepId = deriveStepId(tool, covered ?? call.input);
+  known.add(stepId);
+
+  const { operationId } = agentToolDefinition(context.statementLanguage, context.workflowType, tool);
+  let modelText = "";
+  const result = await service.runStep(
+    context.runId,
+    { stepId, tool, ...(operationId === undefined ? {} : { operationId }) },
+    async () => {
+      const outcome = await AGENT_EVIDENCE_TOOLS[tool].run(context, call.input);
+      modelText = outcome.modelText;
+      if (outcome.kind === "completed" && covered !== undefined) {
+        await service.recordEvent(context.runId, {
+          kind: AGENT_EVIDENCE_TOOLS[tool].event,
+          artifact: outcome.artifact,
+          namespace: covered.namespace,
+          ...(covered.selector === undefined ? {} : { selector: covered.selector }),
+        });
+      } else if (
+        outcome.kind === "refused" &&
+        covered !== undefined &&
+        outcome.refusal.class === "reading-refused" &&
+        outcome.refusal.reasonCode === "METRICS_UNAVAILABLE"
+      ) {
+        await service.recordEvent(context.runId, { kind: "usage-unavailable", namespace: covered.namespace });
+      }
+      return settlementOf(outcome);
+    },
+  );
+
+  if (result.kind === "cancelled") return { kind: "cancelled" };
+  if (result.kind === "paused") return { kind: "paused" };
+  if (result.kind === "performed") return { kind: "answered", text: modelText };
+  if (result.kind === "replayed") {
+    return {
+      kind: "answered",
+      text: `This exact call was already made in this run. ${describeSettled(result.event, tool)}`,
+    };
+  }
+  return { kind: "answered", text: indeterminateText(result.stepId, tool) };
 }
 
 /**
@@ -3990,6 +4619,22 @@ async function presentAnswer(service: AgentRunService, context: AgentToolContext
   return { kind: "answered", text: outcome.modelText };
 }
 
+/**
+ * The report tool, which reaches no database and therefore no ledger step: its
+ * whole job is to check the model's citations against the run's OWN event log, so
+ * there is no effect to write ahead of.
+ *
+ * The VERIFICATION is idempotent: re-checking the same claims against the same log
+ * answers the same thing. Composing is not: a second composition appends a second
+ * `report-composed` entry, so a death between that append and `finish` leaves a
+ * resumed run able to add another. Harmless (the entries are claims with their
+ * evidence, and every claim was still checked against the ledger) but not the same
+ * property, so it is not claimed as one.
+ *
+ * The record is re-read here rather than reused: the log has grown since the run
+ * started, and the artifacts a claim may cite are exactly the entries that were
+ * added while the loop was running.
+ */
 async function composeReport(service: AgentRunService, context: AgentToolContext, input: unknown): Promise<CallResult> {
   // `resume` rather than `status`: it is the read that REFUSES a run which has
   // ended or vanished, so the report is verified against a live run's own log

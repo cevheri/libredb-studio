@@ -8,18 +8,22 @@ import { cleanup, render, renderHook, fireEvent, waitFor, act, type RenderResult
 import { AgentRail } from "@/components/agent/AgentRail";
 import { useConnectionManager } from "@/hooks/use-connection-manager";
 import {
+  NO_SERVED_SEEDS,
   resolveAgentRunConnectionId,
   SEED_CONFIG_UNREADABLE_REASON,
   type ManagedConnectionPayload,
 } from "@/hooks/use-connection-payload";
 import { applyStatementName } from "@/components/agent/rail-parts";
 import { useAgentRun } from "@/components/agent/use-agent-run";
+import * as manifest from "@/lib/agent/agent-manifest";
 import { AGENT_WORKFLOW_BUDGETS } from "@/lib/agent/execution-policy";
-import { agentPosture } from "@/lib/agent/posture";
+import { agentPosture, autoExecuteTerms } from "@/lib/agent/posture";
 import type { AgentRunWorkflowType, AgentThreadContext } from "@/lib/agent/types";
 import { getDBConfig } from "@/lib/db-ui-config";
 import type { DatabaseConnection } from "@/lib/types";
 import { mockGlobalFetch, restoreGlobalFetch } from "../../helpers/mock-fetch";
+import { holdWorkspaceOwner } from "@/lib/config/base-path";
+import { WORKSPACE_OWNER_KEY } from "@/lib/storage/local-storage";
 
 /**
  * The standalone agent rail (#329 T10a): the gated surface, its two modes and the
@@ -81,6 +85,8 @@ const openedFor = (workflowType: AgentRunWorkflowType): string =>
   })}\n`;
 
 const STARTED_LINE = `${JSON.stringify({ kind: "event", event: { kind: "run-started", atMs: 1_001, mode: "planning" } })}\n`;
+
+const PAUSED_LINE = `${JSON.stringify({ kind: "event", event: { kind: "run-paused", atMs: 1_002 } })}\n`;
 
 /**
  * The same event for a run the server opened in AGENT mode.
@@ -683,6 +689,39 @@ describe("AgentRail", () => {
     expect(localStorage.getItem("libredb_agent_thread")).toBeNull();
   });
 
+  test("a start neither records nor forgets a conversation once the copy is a different account's", async () => {
+    // Server storage mode: this tab claimed the copy for ana, and another tab has since
+    // recorded bob as its owner. The copy is bob's, so this tab writes nothing more to it.
+    const stored = JSON.stringify({ threadId: "arun_bob", steps: 2 });
+    holdWorkspaceOwner("ana@libredb.org");
+    localStorage.setItem(WORKSPACE_OWNER_KEY, "bob@libredb.org");
+    localStorage.setItem("libredb_agent_thread", stored);
+    try {
+      for (const thread of [
+        { threadId: "arun_a", steps: [{ runId: "arun_a", objective: "count by department" }], text: "Step 1" },
+        null,
+      ]) {
+        mockAgentFetch([OPENED_LINE, STARTED_LINE, FINISHED_LINE], {
+          runId: "arun_b",
+          status: "queued",
+          mode: "planning",
+          thread,
+        });
+        const view = render(<AgentRail {...DEFAULT_PROPS} />);
+        fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "chart those" } });
+        await act(async () => {
+          fireEvent.click(view.getByTestId("agent-start"));
+        });
+        await view.findByTestId("agent-run-id");
+        cleanup();
+
+        expect(localStorage.getItem("libredb_agent_thread")).toBe(stored);
+      }
+    } finally {
+      holdWorkspaceOwner(null);
+    }
+  });
+
   test("a store that refuses the write costs the notice, never the run", async () => {
     // Safari private mode and a full quota both land here. The bookkeeping is a nudge; the
     // run is the work, and the same policy is written into `star-prompt.ts`.
@@ -1166,6 +1205,32 @@ describe("AgentRail", () => {
   });
 
   /**
+   * A reasoning effort the model refuses is the configuration's fault, not the model's: the
+   * route answers it as a configuration error (503), never as the capability gate's 422. The
+   * rail shows the sentence, names no missing capability and offers no Plan mode, because
+   * Plan mode sends the same effort and would fail the same way.
+   */
+  test("a refused reasoning effort is a configuration error, with no capability chips and no Plan mode offer", async () => {
+    const said =
+      'LLM_MODEL_EFFORT "none" was refused for the model "gpt-6.1-sol" (openai): gpt-6.1-sol only supports the following reasoning efforts: low, medium, high, xhigh, max. Change LLM_MODEL_EFFORT or unset it.';
+    globalThis.fetch = mock(async () =>
+      jsonResponse({ error: said, code: "LLM_CONFIG", statusCode: 503 }, 503),
+    ) as unknown as typeof fetch;
+    const { getByTestId, findByTestId, queryByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.click(getByTestId("agent-mode-agent"));
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    expect((await findByTestId("agent-error")).textContent).toContain(said);
+    expect(queryByTestId("agent-model-refusal")).toBeNull();
+    expect(queryByTestId("agent-model-refusal-missing")).toBeNull();
+    expect(queryByTestId("agent-model-refusal-use-planning")).toBeNull();
+  });
+
+  /**
    * The refused model (#331 T4).
    *
    * A `422` is the one start failure that is a verdict about the MODEL: the capability
@@ -1324,7 +1389,7 @@ describe("AgentRail", () => {
 
   /**
    * Small print is print (#100). `text-fg-muted` — zinc-500 in the dark palette — on
-   * this rail's `bg-surface` (#0a0a0a), under the alert's own `bg-red-500/5`, computes
+   * this rail's `bg-surface` (#0a0a0a), under the alert's own `bg-danger-tint/5`, computes
    * to 3.98:1 against WCAG AA's 4.5:1 — measured from the installed Tailwind 4 palette,
    * not estimated — and this text is 10px, so the large-text allowance does not apply.
    * `text-fg-tertiary` (zinc-400) is 7.33:1.
@@ -1680,6 +1745,35 @@ describe("AgentRail", () => {
     );
   });
 
+  test("a run refused for the connection's own user turns the strip to that refusal, on that connection only", async () => {
+    // Measured 2026-10-17 on an admin MongoDB seed: before Start the strip said "Reads only, enforced by the server",
+    // and Start then refused the run. After a refusal of the connection itself, its strip says so.
+    const refusedLine = `${JSON.stringify({
+      kind: "event",
+      event: { kind: "run-finished", atMs: 1_002, status: "failed", reason: "agent-principal-refused" },
+    })}\n`;
+    mockAgentFetch([OPENED_LINE, refusedLine], { runId: "arun_1", status: "queued", mode: "agent" });
+    const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="mongodb" />);
+    fireEvent.click(view.getByTestId("agent-mode-agent"));
+    expect(view.getByTestId("agent-safety-headline").textContent).toBe("Reads only");
+
+    fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "how many orders" } });
+    await act(async () => {
+      fireEvent.click(view.getByTestId("agent-start"));
+    });
+    expect((await view.findByTestId("agent-run-status")).textContent).toBe("failed");
+
+    expect(view.getByTestId("agent-safety-strip").getAttribute("data-tone")).toBe("blocked");
+    expect(view.getByTestId("agent-safety-headline").textContent).toBe("Refused on this connection");
+    expect(view.getByTestId("agent-safety-claim").textContent).toContain(
+      "holds privileges the read-only boundary cannot contain",
+    );
+
+    // Another connection has not been refused, so its strip says what its engine does.
+    view.rerender(<AgentRail {...DEFAULT_PROPS} connectionId={{ id: "seed:other" }} connectionType="mongodb" />);
+    expect(view.getByTestId("agent-safety-headline").textContent).toBe("Reads only");
+  });
+
   /**
    * The failure this state must NOT swallow (#331 T4). A quota is not a verdict about
    * what the model can do: the run opened, the drive classified it, and the ledger says
@@ -1703,6 +1797,59 @@ describe("AgentRail", () => {
       "The model provider is limiting this key's requests. Waiting a minute usually clears it.",
     );
     expect(queryByTestId("agent-model-refusal")).toBeNull();
+  });
+
+  test("a run the loop ended on a model timeout reads the same sentence as the card (#1461)", async () => {
+    const failedLine = `${JSON.stringify({
+      kind: "event",
+      event: { kind: "run-finished", atMs: 1_002, status: "failed", stopReason: "model-timeout" },
+    })}\n`;
+    mockAgentFetch([OPENED_LINE, failedLine]);
+    const { getByTestId, findByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    expect((await findByTestId("agent-failure-reason")).textContent).toBe(
+      "The model did not answer in time. Starting the run again is reasonable.",
+    );
+  });
+
+  test("a run that reached its step limit says so on the status line, without pointing above it", async () => {
+    const failedLine = `${JSON.stringify({
+      kind: "event",
+      event: { kind: "run-finished", atMs: 1_002, status: "failed", stopReason: "turn-limit" },
+    })}\n`;
+    mockAgentFetch([OPENED_LINE, failedLine]);
+    const { getByTestId, findByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    expect((await findByTestId("agent-failure-reason")).textContent).toBe(
+      "The run reached its step limit before it finished.",
+    );
+  });
+
+  test("an answered run gets no failure line from its stop reason", async () => {
+    const finishedLine = `${JSON.stringify({
+      kind: "event",
+      event: { kind: "run-finished", atMs: 1_002, status: "succeeded", stopReason: "model-stopped" },
+    })}\n`;
+    mockAgentFetch([OPENED_LINE, finishedLine]);
+    const { getByTestId, findByTestId, queryByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
+
+    fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+    await act(async () => {
+      fireEvent.click(getByTestId("agent-start"));
+    });
+
+    expect((await findByTestId("agent-run-status")).textContent).toBe("succeeded");
+    expect(queryByTestId("agent-failure-reason")).toBeNull();
   });
 
   test("an ending the server gave no reason for claims none", async () => {
@@ -2260,20 +2407,82 @@ describe("AgentRail", () => {
     });
 
     /**
-     * Pausing and resuming are not offered, and that is the bar rather than an
-     * omission: `AgentRunService` has no pause at all, and the resume path
-     * (`POST /api/agent/drive`) is authenticated by a server-minted machine
-     * credential a browser never holds. A control the service cannot honour is not
-     * rendered — not even disabled, which would read as a capability that is merely
-     * unavailable right now.
+     * Pause and resume are offered only where the service can honour them:
+     * pause on a live running run, resume on a paused one. A control the service
+     * cannot honour is not rendered — not even disabled, which would read as a
+     * capability that is merely unavailable right now.
      */
-    test("no pause or resume control is offered, because the service can honour neither", async () => {
+    test("pause is offered while a run is running, and resume is not", async () => {
       const view = await startRun([OPENED_LINE, STARTED_LINE]);
-      const { queryByTestId } = view;
 
       await findAllEntries(view);
-      expect(queryByTestId("agent-pause")).toBeNull();
-      expect(queryByTestId("agent-resume")).toBeNull();
+      expect(view.queryByTestId("agent-pause")).not.toBeNull();
+      expect(view.queryByTestId("agent-resume")).toBeNull();
+    });
+
+    test("resume is offered while a run is paused, and pause is not", async () => {
+      const view = await startRun([OPENED_LINE, STARTED_LINE, PAUSED_LINE]);
+
+      await findAllEntries(view);
+      expect(view.queryByTestId("agent-resume")).not.toBeNull();
+      expect(view.queryByTestId("agent-pause")).toBeNull();
+    });
+
+    test("a paused run can still be asked to stop", async () => {
+      const view = await startRun([OPENED_LINE, STARTED_LINE, PAUSED_LINE]);
+
+      await findAllEntries(view);
+      expect(view.queryByTestId("agent-stop")).not.toBeNull();
+    });
+
+    test("a paused run still offers its stored result, because its rows are still held", async () => {
+      const onShowArtifact = mock(() => {});
+      mockAgentFetch([OPENED_LINE, STARTED_LINE, DRAFTED_LINE, COMPLETED_LINE, PAUSED_LINE]);
+      const view = render(<AgentRail {...DEFAULT_PROPS} onShowArtifact={onShowArtifact} />);
+      fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+      await act(async () => {
+        fireEvent.click(view.getByTestId("agent-start"));
+      });
+
+      await findAllEntries(view);
+      expect(view.queryAllByTestId("agent-show-result")).toHaveLength(1);
+    });
+
+    test("a paused run is not rendered as a finished answer", async () => {
+      const view = await startRun([OPENED_LINE, STARTED_LINE, DRAFTED_LINE, COMPLETED_LINE, REPORT_LINE, PAUSED_LINE]);
+
+      await findAllEntries(view);
+      expect(view.queryByTestId("agent-answer-report")).toBeNull();
+      expect((await view.findByTestId("agent-answer-status")).textContent).toBe("paused");
+    });
+
+    test("a paused run is not treated as ended, so it is not offered as the run to continue from", async () => {
+      const fetchMock = mockAgentFetch([OPENED_LINE, STARTED_LINE, PAUSED_LINE]);
+      const view = render(<AgentRail {...DEFAULT_PROPS} />);
+      fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
+      await act(async () => {
+        fireEvent.click(view.getByTestId("agent-start"));
+      });
+      await waitFor(() => {
+        expect(view.getByTestId("agent-run-status").textContent).toBe("paused");
+      });
+
+      // A paused run is OPEN, so the box is a one-line summary; editing it is the way
+      // back to a box the user can ask a new question from.
+      fireEvent.click(view.getByTestId("agent-objective-edit"));
+      fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "and what else is slow" } });
+      await act(async () => {
+        fireEvent.click(view.getByTestId("agent-start"));
+      });
+
+      const runCalls = (fetchMock.mock.calls as [RequestInfo | URL, RequestInit?][]).filter(
+        ([url]) => String(url) === "/api/agent/runs",
+      );
+      // Non-vacuous: the second start DID fire, so the absence below is about the
+      // paused run not being a continue target, not about nothing having happened.
+      expect(runCalls).toHaveLength(2);
+      const lastBody = JSON.parse(String(runCalls.at(-1)?.[1]?.body)) as Record<string, unknown>;
+      expect(lastBody.previousRunId).toBeUndefined();
     });
   });
 
@@ -2335,26 +2544,25 @@ describe("AgentRail", () => {
     });
 
     /**
-     * `docs/BACKLOG.md` A1: SQLite has no interrupt, so its statement timeout is
-     * checked after the statement returns. A meter that showed a timeout without
-     * saying so would imply a preemption the runtime cannot perform.
+     * An on-disk SQLite statement runs in a killable child process, so the timeout
+     * preempts it. A meter that said "refused once it returns" would understate what
+     * the path now performs.
      */
-    test("the meter says plainly that a SQLite statement is reported rather than interrupted", () => {
+    test("the meter says plainly that a SQLite statement is killed at its timeout", () => {
       const { getByTestId } = render(<AgentRail {...DEFAULT_PROPS} />);
 
       const caveats = getByTestId("agent-budget-caveats").textContent ?? "";
       expect(caveats).toContain("SQLite");
-      expect(caveats).toContain("not interrupted");
+      expect(caveats).toContain("killed mid-flight");
     });
 
     /**
-     * A ceiling is per drive while the ledger spans every drive, so a resumed run
-     * can fold to more than one drive's allowance. The numeral says what the run
-     * actually spent — hiding that would be the misleading direction — while the
-     * bar is clamped, because a bar past its own track reads as a larger allowance
-     * than exists.
+     * What the tracker enforces and what the ledger records are measured differently,
+     * so a fold can read past a ceiling. The numeral says what the run actually spent
+     * — hiding that would be the misleading direction — while the bar is clamped,
+     * because a bar past its own track reads as a larger allowance than exists.
      */
-    test("a run past a per-drive ceiling shows the real figure and a bar that does not overflow", async () => {
+    test("a run whose ledger reads past a ceiling shows the real figure and a bar that does not overflow", async () => {
       mockAgentFetch([OPENED_LINE, STARTED_LINE, OVERSPENT_LINE]);
       const { getByTestId, findByText } = render(<AgentRail {...DEFAULT_PROPS} />);
       fireEvent.change(getByTestId("agent-objective"), { target: { value: "why is checkout slow" } });
@@ -2436,10 +2644,11 @@ describe("AgentRail", () => {
       expect(getByTestId("agent-budget-caveats").textContent ?? "").not.toContain("holds no duration for");
     });
 
-    // Every ceiling is per drive (`docs/BACKLOG.md` B6), so a resumed run starts
-    // each of them again. A meter that read as a per-run total would understate
-    // what a run can cost.
-    test("the meter states the limits it cannot measure, and that they are per drive", () => {
+    // A resumed run CONTINUES its spend: `deriveDriveCeilings` folds the ledger's
+    // completed reads into the statement and database-time ceilings (#999), and the
+    // deadline is wall clock from the run's opening. A meter that said "per drive"
+    // would promise a resumed run a fresh allowance it does not get.
+    test("the meter states the limits it cannot measure, and that a resume continues the spend", () => {
       const view = render(<AgentRail {...DEFAULT_PROPS} />);
       const { getByTestId } = view;
       // Stated for a workflow the user NAMED: under Automatic there is no workflow yet
@@ -2454,7 +2663,12 @@ describe("AgentRail", () => {
       expect(limits).toContain("10.0 s");
       expect(limits).toContain("7.5 min");
       expect(limits).toContain("36 model turns");
-      expect(getByTestId("agent-budget-caveats").textContent).toContain("per drive");
+      const caveats = getByTestId("agent-budget-caveats").textContent ?? "";
+      expect(caveats).toContain("continues its spend");
+      expect(caveats).toContain("wall clock");
+      // The one ceiling that really is per drive, named rather than implied.
+      expect(caveats).toContain("Repair attempts");
+      expect(caveats).not.toContain("starts each of them again");
     });
 
     /**
@@ -2669,6 +2883,47 @@ describe("AgentRail", () => {
 
       fireEvent.click(controls[0]);
       expect(onApplyStatement).toHaveBeenCalledWith("SELECT count(*) FROM orders");
+    });
+
+    /*
+      A resources recommendation changes a workload's manifest, which nothing here writes and no editor holds, so its
+      entry quotes the change and offers no hand-off, even to a host that takes statements.
+    */
+    test("a resources recommendation quotes the change and offers nothing to apply", async () => {
+      mockAgentFetch([
+        OPENED_LINE,
+        STARTED_LINE,
+        `${JSON.stringify({
+          kind: "event",
+          event: {
+            kind: "recommendation",
+            atMs: 1_002,
+            change: "resources",
+            namespace: "shop",
+            ownerKind: "Deployment",
+            ownerName: "web",
+            container: "web",
+            current: { requests: { cpu: "500m", memory: "256Mi" }, limits: {} },
+            proposed: { requests: { cpu: "150m", memory: "128Mi" }, limits: {} },
+            rationale: "The container uses a third of its request.",
+            evidence: [{ source: "artifact", correlationId: "corr_9" }],
+          },
+        })}\n`,
+      ]);
+      const onApplyStatement = mock(() => {});
+      const { findAllByText, findByText, queryAllByTestId } = await runWith({ onApplyStatement });
+
+      // The headline is said twice while the run is open: by the entry, and by the answer card naming the newest step.
+      expect((await findAllByText("Resources recommended")).length).toBeGreaterThan(0);
+      expect(
+        (
+          await findByText(
+            "Deployment/web, container web: requests cpu 500m, memory 256Mi to cpu 150m, memory 128Mi; limits unset to unset",
+          )
+        ).tagName,
+      ).toBe("PRE");
+      expect(queryAllByTestId("agent-apply-statement")).toHaveLength(0);
+      expect(onApplyStatement).not.toHaveBeenCalled();
     });
 
     test("a host that offers neither gets no controls, rather than disabled ones", async () => {
@@ -3453,6 +3708,28 @@ describe("AgentRail", () => {
         expect(view.scroller.firstElementChild?.getAttribute("data-testid")).toBe("agent-answer");
       });
 
+      test("a pause does not spend the once-per-run answer reveal", async () => {
+        const view = await startRun();
+        await act(async () => {
+          view.stream.push(OPENED_LINE);
+          view.stream.push(STARTED_LINE);
+        });
+        await waitFor(() => {
+          expect(view.scroller.scrollTop).toBe(BOTTOM);
+        });
+
+        // A paused run is OPEN, not ended: it is still following its own end, so the
+        // reveal stays unspent for the ending that will actually come.
+        await act(async () => {
+          view.stream.push(DRAFT_LINE);
+          view.stream.push(PAUSED_LINE);
+        });
+
+        await waitFor(() => {
+          expect(view.scroller.scrollTop).toBe(BOTTOM);
+        });
+      });
+
       test("a reader who scrolled away is not yanked to the answer either", async () => {
         const { stream, scroller } = await startRun();
         await act(async () => {
@@ -3498,8 +3775,9 @@ describe("AgentRail", () => {
   });
 
   /**
-   * Auto-execute (§2.1, §2.5, §2.6 of `docs/AGENT_ANALYST_DESIGN.md`), which is now
-   * asked for in the consent step rather than beside the objective.
+   * Auto-execute (see the "Auto-execute: when the run runs the answer in your editor"
+   * section of `docs/AGENT_GUIDE.md`), which is now asked for in the consent step
+   * rather than beside the objective.
    *
    * The control names the bound it gives up and the one it keeps, because "auto-mode"
    * transfers no responsibility: a checkbox that names no bound cannot be consented
@@ -3705,7 +3983,7 @@ describe("AgentRail", () => {
     test("a SQLite connection is told what a long read there costs; another engine is not", async () => {
       const sqlite = await consentOf({ connectionType: "sqlite" });
       expect(sqlite.getByTestId("agent-auto-execute-sqlite").textContent).toBe(
-        "On SQLite a read is not interrupted when it runs long: it blocks other writers and this application until it finishes.",
+        "On SQLite a read that runs past its timeout is now killed mid-flight; the in-memory database is the exception and still blocks this application until the read finishes.",
       );
       cleanup();
 
@@ -3810,6 +4088,103 @@ describe("AgentRail", () => {
      * to claim it is not to promise it: `onRunStatement` is an optional public prop,
      * so any embedding host can be in this state.
      */
+    /*
+      The hand-over is the variant's `canAutoExecute`, read for the connection's own language. An engine with no
+      statement language has no variant to hand anything over from, so it is not offered the promise; a host that
+      names no engine at all keeps the SQL reading, which is what every host passing no type has always seen.
+    */
+    describe("the hand-over follows the connection's statement language", () => {
+      test("an engine with no statement language reaches no consent step", async () => {
+        const fetchMock = mockAgentFetch([OPENED_LINE, STARTED_LINE]);
+        const view = analyze({ connectionType: "cassandra" });
+        fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "sales by region" } });
+        await act(async () => {
+          fireEvent.click(view.getByTestId("agent-start"));
+        });
+
+        expect(view.queryByTestId("agent-consent")).toBeNull();
+        expect(startBodyOf(fetchMock).autoExecute).toBe(false);
+      });
+
+      test("a Kubernetes data-analysis run reaches no consent step: its variant cannot auto-execute", async () => {
+        const fetchMock = mockAgentFetch([OPENED_LINE, STARTED_LINE]);
+        const view = analyze({ connectionType: "kubernetes" });
+        fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "pods by status" } });
+        await act(async () => {
+          fireEvent.click(view.getByTestId("agent-start"));
+        });
+
+        expect(view.queryByTestId("agent-consent")).toBeNull();
+        expect(view.queryByTestId("agent-auto-execute")).toBeNull();
+        expect(startBodyOf(fetchMock).autoExecute).toBe(false);
+      });
+
+      // No plan of a MongoDB answer can be weighed, so a tick could only ever be declined: the setting is not offered,
+      // as on a cluster, and the run opens with it off.
+      test("a MongoDB data-analysis run reaches no consent step: its variant cannot auto-execute", async () => {
+        const fetchMock = mockAgentFetch([OPENED_LINE, STARTED_LINE]);
+        const view = analyze({ connectionType: "mongodb" });
+        fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "orders by status" } });
+        await act(async () => {
+          fireEvent.click(view.getByTestId("agent-start"));
+        });
+
+        expect(view.queryByTestId("agent-consent")).toBeNull();
+        expect(view.queryByTestId("agent-auto-execute")).toBeNull();
+        expect(startBodyOf(fetchMock).autoExecute).toBe(false);
+      });
+
+      test.each([undefined, null, "postgres"])("a connection type of %p is offered it", async (connectionType) => {
+        mockAgentFetch([OPENED_LINE, STARTED_LINE]);
+        const view = analyze({ connectionType });
+        fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "sales by region" } });
+        await act(async () => {
+          fireEvent.click(view.getByTestId("agent-start"));
+        });
+
+        expect(view.getByTestId("agent-consent")).toBeTruthy();
+      });
+
+      test.each([undefined, null, "postgres", "sqlite"])(
+        "a connection type of %p is stated the terms of SQL, the language the rail resolved for it",
+        async (connectionType) => {
+          const view = await consentOf({ connectionType });
+
+          expect(view.getByTestId("agent-auto-execute-terms").textContent).toBe(
+            autoExecuteTerms("data-analysis", "sql"),
+          );
+        },
+      );
+
+      /*
+        SQL is the only language whose variants offer the hand-over today, so a real manifest can only show the step
+        stating SQL's terms. This one test substitutes a kubectl data-analysis variant that may auto-execute, to show
+        the step states the terms of whichever language the rail resolved rather than SQL's by assumption. Restored
+        in `finally`: `mock.module` reaches every importer in this process.
+      */
+      test("the step states the terms of the language the rail resolved, not SQL's by assumption", async () => {
+        const real = { ...manifest };
+        // Built before the substitution: the manifest's own functions read the substitute once it is in place.
+        const handingOver = { ...real.requiredVariant("kubectl", "data-analysis"), canAutoExecute: true };
+        try {
+          mock.module("@/lib/agent/agent-manifest", () => ({
+            ...real,
+            agentVariant: (language: manifest.AgentStatementLanguageId | undefined, workflow: AgentRunWorkflowType) =>
+              language === "kubectl" && workflow === "data-analysis"
+                ? handingOver
+                : real.agentVariant(language, workflow),
+          }));
+          const view = await consentOf({ connectionType: "kubernetes" });
+
+          expect(view.getByTestId("agent-auto-execute-terms").textContent).toBe(
+            autoExecuteTerms("data-analysis", "kubectl"),
+          );
+        } finally {
+          mock.module("@/lib/agent/agent-manifest", () => real);
+        }
+      });
+    });
+
     describe("a host with no runner is not offered the promise", () => {
       test("no consent step is reached at all on the workflow that otherwise has one", async () => {
         const fetchMock = mockAgentFetch([OPENED_LINE, STARTED_LINE]);
@@ -4672,8 +5047,10 @@ describe("AgentRail", () => {
       await startWith(view, "why is checkout slow");
 
       expect(classifyCalls(fetchMock)).toHaveLength(1);
+      // The connection the run is opened on goes with the objective, so it is classified in that engine's language.
       expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
         objective: "why is checkout slow",
+        connectionId: "seed:sales",
       });
       expect(openRequests(fetchMock)[0]).toEqual({
         mode: "planning",
@@ -5106,8 +5483,12 @@ describe("AgentRail", () => {
         // The same answer every other classification failure reaches, and the rail is
         // idle again rather than stuck behind a request nobody will answer.
         expect(openRequests(fetchMock)[0]).toMatchObject({ workflowType: "investigation" });
+        // `=== null` rather than `toBeNull()` on the node: a FAILING poll would hand bun the live
+        // happy-dom element, and bun walks its whole object graph to build the diff, measured at
+        // 301 ms for a 260-node subtree. A few of those spend waitFor's 5 s budget and a briefly
+        // busy machine reds a healthy test. The boolean costs 0 ms and asserts the same absence.
         await waitFor(() => {
-          expect(view.queryByTestId("agent-classifying")).toBeNull();
+          expect(view.queryByTestId("agent-classifying") === null).toBe(true);
         });
       } finally {
         AbortSignal.timeout = realTimeout;
@@ -5530,11 +5911,11 @@ describe("AgentRail", () => {
       });
 
       test("agent mode on an engine it cannot execute on says so, and plan mode is offered", () => {
-        const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="mongodb" />);
+        const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="cassandra" />);
         fireEvent.click(view.getByTestId("agent-mode-agent"));
 
         expect(view.getByTestId("agent-safety-strip").getAttribute("data-tone")).toBe("blocked");
-        expect(view.getByTestId("agent-safety-headline").textContent).toContain("MongoDB");
+        expect(view.getByTestId("agent-safety-headline").textContent).toContain("Cassandra");
         expect(view.getByTestId("agent-safety-qualifier").textContent).toContain("plan mode drafts here");
       });
 
@@ -5792,11 +6173,11 @@ describe("AgentRail", () => {
 
     describe("the engine notice", () => {
       test("agent mode on an engine with no read-only statement path is told, before Start", () => {
-        const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="mongodb" />);
+        const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="cassandra" />);
         fireEvent.click(view.getByTestId("agent-mode-agent"));
 
         const notice = view.getByTestId("agent-engine-unsupported-notice").textContent ?? "";
-        expect(notice).toContain("MongoDB");
+        expect(notice).toContain("Cassandra");
         expect(notice).toContain("no read-only statement path");
         // The two things that ARE open here, because a dead end is not what this is:
         // the operations workflow sends no statement at all, and plan mode drafts.
@@ -5805,7 +6186,7 @@ describe("AgentRail", () => {
       });
 
       test("it does not gate Start, because the refusal is the server's and one workflow is unaffected", () => {
-        const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="mongodb" />);
+        const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="cassandra" />);
         fireEvent.click(view.getByTestId("agent-mode-agent"));
         fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "what is blocked right now" } });
 
@@ -5816,7 +6197,7 @@ describe("AgentRail", () => {
       test("its way out selects plan mode and starts nothing", () => {
         const fetchMock = mock(async () => jsonResponse({}, 202));
         globalThis.fetch = fetchMock as unknown as typeof fetch;
-        const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="mongodb" />);
+        const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="cassandra" />);
         fireEvent.click(view.getByTestId("agent-mode-agent"));
 
         fireEvent.click(view.getByTestId("agent-engine-unsupported-plan"));
@@ -5851,7 +6232,7 @@ describe("AgentRail", () => {
       */
       test("its facts are the selection's, even while another run is describing the strip", async () => {
         mockAgentFetch([OPENED_LINE, STARTED_LINE]);
-        const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="mongodb" />);
+        const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="cassandra" />);
         fireEvent.change(view.getByTestId("agent-objective"), { target: { value: "what is slow" } });
         await act(async () => {
           fireEvent.click(view.getByTestId("agent-start"));
@@ -5862,13 +6243,13 @@ describe("AgentRail", () => {
 
         const notice = view.getByTestId("agent-engine-unsupported-notice").textContent ?? "";
         expect(notice).toContain("no read-only statement path");
-        expect(view.getByTestId("agent-engine-unsupported-reason").textContent).toContain("On MongoDB");
+        expect(view.getByTestId("agent-engine-unsupported-reason").textContent).toContain("On Apache Cassandra");
         // The open plan run is still what the strip describes.
         expect(view.getByTestId("agent-safety-strip").getAttribute("data-tone")).toBe("safe");
       });
 
       test("plan mode is warned about nothing, on any engine", () => {
-        const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="mongodb" />);
+        const view = render(<AgentRail {...DEFAULT_PROPS} connectionType="cassandra" />);
 
         expect(view.queryByTestId("agent-engine-unsupported-notice")).toBeNull();
       });
@@ -6627,8 +7008,22 @@ describe("a seed configuration the server could not read (B37)", () => {
       "/api/agent/config": { json: { enabled: true } },
     });
     const hook = renderHook(() => useConnectionManager(true));
+    // Wait for the answer to have been APPLIED, not for the field to exist. `servedSeeds`
+    // starts life holding `NO_SERVED_SEEDS`, so `toBeDefined()` was already true on the
+    // first render and this helper read the state the hook held before it had asked the
+    // server anything. That is green on an idle machine and a coin toss on a busy one:
+    // measured 2026-09-15 at 24 concurrent `bun test` processes on a 20-core box, the read
+    // landed on the untouched constant in 19 runs out of 24 (by identity, so nothing had
+    // written it), and the file itself failed 6 of those 24 runs on this test alone.
+    //
+    // The wait has to compare by identity, because the value cannot carry the difference:
+    // the control arm below settles on `{loaded: true, seeds: []}`, which is deep-equal to
+    // the constant it started from. "The server answered, with no seeds" and "nobody has
+    // answered yet" are the same value, so `!== NO_SERVED_SEEDS` is the only thing that
+    // separates them, and it is what makes the control arm a control at all rather than a
+    // test of the initial state. That conflation is B37's own, one level up: see B81.
     await waitFor(() => {
-      expect(hook.result.current.servedSeeds).toBeDefined();
+      expect(hook.result.current.servedSeeds).not.toBe(NO_SERVED_SEEDS);
     });
     const seeds = hook.result.current.servedSeeds;
     hook.unmount();

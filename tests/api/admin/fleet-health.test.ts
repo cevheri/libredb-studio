@@ -22,6 +22,10 @@ import {
 // ─── Mock provider ──────────────────────────────────────────────────────────
 const mockProvider = createMockProvider();
 const mockGetOrCreateProvider = mock(async () => mockProvider);
+// The unconnected provider the route reads capabilities from, the provider-meta pattern.
+const mockCreateDatabaseProvider = mock<(conn: { id: string }) => Promise<typeof mockProvider>>(
+  async () => mockProvider,
+);
 const mockGetSession = mock(
   async (): Promise<{ role: string; username: string } | null> => ({ role: "admin", username: "admin" }),
 );
@@ -29,6 +33,10 @@ const mockGetSession = mock(
 // ─── Mock @/lib/auth BEFORE importing the route ─────────────────────────────
 mock.module("@/lib/auth", () => ({
   getSession: mockGetSession,
+  readSession: mock(async () => {
+    const s = await mockGetSession();
+    return s ? { kind: "authenticated", session: s } : { kind: "anonymous" };
+  }),
   signJWT: mock(async () => "mock-token"),
   verifyJWT: mock(async () => null),
   login: mock(async () => {}),
@@ -38,7 +46,7 @@ mock.module("@/lib/auth", () => ({
 // ─── Mock @/lib/db BEFORE importing the route ───────────────────────────────
 mock.module("@/lib/db", () => ({
   getOrCreateProvider: mockGetOrCreateProvider,
-  createDatabaseProvider: mock(),
+  createDatabaseProvider: mockCreateDatabaseProvider,
   removeProvider: mock(),
   clearProviderCache: mock(),
   getProviderCacheStats: mock(),
@@ -94,6 +102,8 @@ describe("POST /api/admin/fleet-health", () => {
       async (): Promise<{ role: string; username: string } | null> => ({ role: "admin", username: "admin" }),
     );
     mockGetOrCreateProvider.mockImplementation(async () => mockProvider);
+    mockCreateDatabaseProvider.mockClear();
+    mockCreateDatabaseProvider.mockImplementation(async () => mockProvider);
     (mockProvider.getHealth as ReturnType<typeof mock>).mockClear();
   });
 
@@ -115,6 +125,70 @@ describe("POST /api/admin/fleet-health", () => {
     expect(data.results[0].connectionName).toBe("Production DB");
     expect(data.results[0].status).toBe("healthy");
     expect(data.results[0].latencyMs).toBeDefined();
+  });
+
+  // Issue #540: the fleet total used to re-parse `databaseSize`'s display string, which had no
+  // "tb" branch and counted a 1 TB database as 1 byte. The route now projects the provider's own
+  // byte figure from getOverview() instead, so the dashboard never has to parse a string at all.
+  test("carries the provider's byte figure from getOverview alongside the display string", async () => {
+    const req = createMockRequest("/api/admin/fleet-health", {
+      method: "POST",
+      body: { connections },
+    });
+
+    const res = await POST(req);
+    const data = await parseResponseJSON<{
+      results: { connectionId: string; databaseSize?: string; databaseSizeBytes?: number }[];
+    }>(res);
+
+    expect(res.status).toBe(200);
+    expect(data.results[0].databaseSize).toBe("256 MB");
+    expect(data.results[0].databaseSizeBytes).toBe(268435456);
+  });
+
+  test("omits databaseSizeBytes, not a fabricated 0, when the provider publishes no byte figure", async () => {
+    const noByteProvider = createMockProvider({
+      overview: {
+        version: "Cassandra 4.1",
+        uptime: "10 days",
+        maxConnections: 100,
+        databaseSize: "1 MiB",
+        tableCount: 5,
+        indexCount: 2,
+      },
+    });
+    mockGetOrCreateProvider.mockImplementation(async () => noByteProvider);
+
+    const req = createMockRequest("/api/admin/fleet-health", {
+      method: "POST",
+      body: { connections: [connections[0]] },
+    });
+
+    const res = await POST(req);
+    const data = await parseResponseJSON<{ results: { databaseSizeBytes?: number }[] }>(res);
+
+    expect(res.status).toBe(200);
+    expect(data.results[0].databaseSizeBytes).toBeUndefined();
+  });
+
+  test("a getOverview failure omits the byte figure without turning a healthy connection into an error", async () => {
+    const throwingProvider = createMockProvider();
+    (throwingProvider.getOverview as ReturnType<typeof mock>).mockImplementation(async () => {
+      throw new Error("overview query timed out");
+    });
+    mockGetOrCreateProvider.mockImplementation(async () => throwingProvider);
+
+    const req = createMockRequest("/api/admin/fleet-health", {
+      method: "POST",
+      body: { connections: [connections[0]] },
+    });
+
+    const res = await POST(req);
+    const data = await parseResponseJSON<{ results: { status: string; databaseSizeBytes?: number }[] }>(res);
+
+    expect(res.status).toBe(200);
+    expect(data.results[0].status).toBe("healthy");
+    expect(data.results[0].databaseSizeBytes).toBeUndefined();
   });
 
   test("returns 403 for non-admin user", async () => {
@@ -204,6 +278,35 @@ describe("POST /api/admin/fleet-health", () => {
     expect(data.code).toBe("INTERNAL_ERROR");
   });
 
+  // ALLOW_CUSTOM_CONNECTIONS off: a connection the caller supplied is refused by resolveConnection
+  // before the factory is reached, and the refusal is reported as that item's error.
+  test("reports a connection of the caller's own as refused, and builds nothing, while custom connections are off", async () => {
+    process.env.ALLOW_CUSTOM_CONNECTIONS = "false";
+    try {
+      const req = createMockRequest("/api/admin/fleet-health", {
+        method: "POST",
+        body: { connections: [connections[0]] },
+      });
+
+      const res = await POST(req);
+      const data = await parseResponseJSON<{
+        results: { connectionId: string; status: string; error?: string }[];
+      }>(res);
+
+      expect(res.status).toBe(200);
+      expect(data.results).toEqual([
+        expect.objectContaining({
+          connectionId: "conn-1",
+          status: "error",
+          error: "Custom connections are disabled on this server",
+        }),
+      ]);
+      expect(mockGetOrCreateProvider).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.ALLOW_CUSTOM_CONNECTIONS;
+    }
+  });
+
   test("empty connections array returns empty results", async () => {
     const req = createMockRequest("/api/admin/fleet-health", {
       method: "POST",
@@ -218,6 +321,90 @@ describe("POST /api/admin/fleet-health", () => {
     expect(res.status).toBe(200);
     expect(data.results).toBeArray();
     expect(data.results.length).toBe(0);
+  });
+});
+
+// ─── Billed compute ─────────────────────────────────────────────────────────
+// A connection whose provider declares `resumesBilledCompute` (a Databend Cloud warehouse) wakes
+// on any statement and is charged until it suspends again, so a fleet check every 60 s would keep
+// it awake for as long as the dashboard is open. The route reads the declaration off an unconnected
+// provider and answers that row `not-checked`, building no cached provider and sending nothing.
+describe("POST /api/admin/fleet-health billed compute", () => {
+  const billed = {
+    id: "conn-billed",
+    name: "Cloud Warehouse",
+    type: "postgres",
+    host: "warehouse.example.com",
+    port: 443,
+    database: "default",
+    environment: "production",
+    createdAt: new Date(),
+  };
+
+  beforeEach(() => {
+    clearRateLimitState();
+    mockGetOrCreateProvider.mockClear();
+    mockCreateDatabaseProvider.mockClear();
+    mockGetSession.mockImplementation(
+      async (): Promise<{ role: string; username: string } | null> => ({ role: "admin", username: "admin" }),
+    );
+    mockGetOrCreateProvider.mockImplementation(async () => mockProvider);
+  });
+
+  test("a resumesBilledCompute connection is answered not-checked, with no cached provider and no statement", async () => {
+    const billedProvider = createMockProvider({ capabilities: { resumesBilledCompute: true } });
+    const controlProvider = createMockProvider();
+    mockCreateDatabaseProvider.mockImplementation(async (conn) =>
+      conn.id === billed.id ? billedProvider : createMockProvider(),
+    );
+    mockGetOrCreateProvider.mockImplementation(async () => controlProvider);
+
+    const req = createMockRequest("/api/admin/fleet-health", {
+      method: "POST",
+      body: { connections: [billed, connections[0]] },
+    });
+
+    const res = await POST(req);
+    const data = await parseResponseJSON<{
+      results: Record<string, unknown>[];
+    }>(res);
+
+    expect(res.status).toBe(200);
+    expect(data.results[0]).toEqual({
+      connectionId: "conn-billed",
+      connectionName: "Cloud Warehouse",
+      type: "postgres",
+      environment: "production",
+      status: "not-checked",
+      latencyMs: 0,
+    });
+    // Nothing was opened, cached or sent for the billed connection.
+    expect(billedProvider.connect).not.toHaveBeenCalled();
+    expect(billedProvider.query).not.toHaveBeenCalled();
+    expect(billedProvider.getHealth).not.toHaveBeenCalled();
+    expect(billedProvider.getOverview).not.toHaveBeenCalled();
+    expect(mockGetOrCreateProvider).toHaveBeenCalledTimes(1);
+    expect((mockGetOrCreateProvider.mock.calls[0] as unknown as [{ id: string }])[0].id).toBe("conn-1");
+
+    // The control connection beside it is checked as before.
+    expect(data.results[1].connectionId).toBe("conn-1");
+    expect(data.results[1].status).toBe("healthy");
+    expect(controlProvider.getHealth).toHaveBeenCalledTimes(1);
+  });
+
+  test("other connections are checked as before", async () => {
+    const req = createMockRequest("/api/admin/fleet-health", {
+      method: "POST",
+      body: { connections },
+    });
+
+    const res = await POST(req);
+    const data = await parseResponseJSON<{ results: { status: string }[] }>(res);
+
+    expect(res.status).toBe(200);
+    expect(data.results.map((r) => r.status)).toEqual(["healthy", "healthy"]);
+    expect(mockCreateDatabaseProvider).toHaveBeenCalledTimes(2);
+    expect(mockGetOrCreateProvider).toHaveBeenCalledTimes(2);
   });
 });
 

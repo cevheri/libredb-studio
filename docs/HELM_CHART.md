@@ -35,6 +35,7 @@ charts/libredb-studio/
     ├── pdb.yaml               # PodDisruptionBudget
     ├── pvc.yaml               # PersistentVolumeClaim (SQLite mode)
     ├── networkpolicy.yaml     # Ingress/egress rules (DB ports, DNS, HTTPS)
+    ├── extra-objects.yaml     # extraObjects: user manifests rendered through tpl (default none)
     └── NOTES.txt              # Post-install usage instructions
 ```
 
@@ -65,6 +66,11 @@ securityContext:
 - `/tmp` — emptyDir; temporary files
 - `/app/data` — data directory (`auth-bootstrap.json`, sample database): emptyDir by default, the PVC when persistence is enabled
 
+**No API token in the pod by default**: `serviceAccount.automountServiceAccountToken` defaults to `false` and is written on the pod spec as well as on the ServiceAccount the chart creates.
+The pod field wins over the account's, so `serviceAccount.create=false` with the namespace's `default` account mounts no token either; only an explicit `true` mounts one.
+Studio reads the pod's token only for Vault Kubernetes auth (`VAULT_ROLE`, `docs/SEED_CONNECTIONS.md`); such an install sets the value to `true`, or projects a token through `extraVolumes` and points `VAULT_K8S_TOKEN_PATH` at it.
+`tests/unit/helm-chart-service-account-token.test.ts` renders both `serviceAccount.create` values.
+
 **OpenShift adaptation**: OpenShift's `restricted-v2` SCC assigns
 `runAsUser`/`fsGroup` from a per-namespace range and rejects pods that
 hard-code IDs outside it. `global.compatibility.openshift.adaptSecurityContext`
@@ -86,6 +92,12 @@ The chart is tightly coupled to the Dockerfile:
 | `WORKDIR /app` | Volume mounts under `/app/` |
 | `mkdir -p data` | `/app/data` volume: PVC when persistence is enabled, emptyDir otherwise |
 | `GET /api/db/health` | Startup/readiness/liveness probes |
+| `GET /api/ready` | Readiness endpoint: `200` without governance, the governance freshness state under governance |
+
+Liveness stays on `GET /api/db/health`, which depends on nothing, so a governance source that is down never gets a healthy pod restarted.
+`GET /api/ready` is the readiness endpoint ([API_DOCS.md](./API_DOCS.md#get-apiready), [GOVERNANCE.md](./GOVERNANCE.md#freshness-and-readiness)): it answers `200` with `status` `ready` without governance, and under governance `503` while the snapshot is loading, misconfigured or incompatible, so a pod receives traffic only once it can serve data routes.
+It reads only in-process state and opens no user database, so it is as cheap to probe as the liveness path.
+Under `governance.enabled` the chart moves the shipped readiness path to `/api/ready` itself (section 11), and a readiness probe the operator wrote with another path is kept as it is.
 
 ### 3. Storage Modes
 
@@ -176,9 +188,13 @@ Most non-sensitive configuration flows through a ConfigMap (the seed-connection 
 | `AUTH_BOOTSTRAP` | `config.authBootstrap` | When non-empty (chart default: `""` — omitted) |
 | `STORAGE_PROVIDER` | Auto-wired (see above) | Always |
 | `STORAGE_SQLITE_PATH` | `config.storageSqlitePath` | When sqlite |
+| `PASSKEY_ORIGIN` | `config.passkeyOrigin` | When non-empty (chart default: `""`, omitted) |
 | `SEED_CONFIG_PATH` / `SEED_CACHE_TTL_MS` | `seedConnections.*` — set **directly on the Deployment** (not via the ConfigMap) | When `seedConnections.enabled` |
 | `LLM_PROVIDER/MODEL/API_URL` | `config.llm*` | When set |
-| `OIDC_*` | `config.oidc*` | When `authProvider=oidc` |
+| `OIDC_*` | `config.oidc*` | When `authProvider=oidc`; `OIDC_USER_ROLES`, `OIDC_PROMPT`, `OIDC_AUTO_REDIRECT` and `OIDC_LOGOUT_HINT` only when set |
+| `AUTH_SESSION_TTL_SECONDS` | `config.sessionTtlSeconds` | When set |
+| `STORAGE_POSTGRES_SCHEMA` | `config.storagePostgresSchema` | When non-empty |
+| `GOVERNANCE_*` | `governance.*` (section 11) | When `governance.enabled` |
 
 "Fixed" above describes what the ConfigMap writes, not what the container ends up with: the ConfigMap arrives through `envFrom`, `extraEnv` renders into the container's `env:` list, and an explicit `env` entry always wins over an `envFrom` key of the same name. Any row above can therefore be overridden through `extraEnv`, though only some are safe to: `PORT` is rendered from `service.targetPort` and also drives the container's named `http` port and all three probes, so overriding it through `extraEnv` alone moves the app off the port the probes still target and the pod never becomes Ready. `HOSTNAME` is the one row whose ConfigMap value is deliberately **empty**. Empty is a sentinel, not an omission: it means "nobody chose", and the container's entrypoint then resolves its own bind address, preferring `::` — which it proves is dual-stack by connecting an IPv4 client to a throwaway `::` listener, rather than inferring it from a sysctl. It falls back to `0.0.0.0` when the namespace has no IPv6, or when `::` really is IPv6-only while a non-loopback IPv4 address exists. The key is written rather than omitted so that a pod name injected as `HOSTNAME` by the runtime can never reach the server; `config.bindAddress` overrules the resolver:
 
@@ -220,9 +236,42 @@ When `seedConnections.enabled=true`, the chart provisions a set of pre-defined d
 The agent has no on-switch: the app derives whether it can run from a configured model plus a writable ledger (`docs/AGENT.md`), so the chart's job is to write **less**, not more.
 
 - `agent.enabled` unset — the default — writes no `LIBREDB_AGENT_ENABLED` at all, leaving the derivation intact; `false` writes the off-switch (quoted, because `EnvVar.value` is a string); `true` is accepted and explicit.
-- The chart **does** write one `WORKFLOW_*` variable: `WORKFLOW_LOCAL_DATA_DIR=/app/data/workflow`, inside the volume mounted on `/app/data` in every render. The reason is release topology, not preference. `image.tag` defaults to `.Chart.AppVersion`, and the Dockerfile's own default for that variable landed **after** the `0.11.0` tag this chart's `appVersion` names — so on the image a default install pulls, an unset variable resolves to `.workflow-data` under `WORKDIR /app`, `readOnlyRootFilesystem: true` makes it unwritable, and `resolveAgentLedgerDirectory`'s probe answers `LEDGER_UNAVAILABLE`. The chart reaches users before the image does. Both copies name the same path and `tests/unit/helm-chart-agent.test.ts` asserts they stay equal, so the duplication cannot drift; it is written before `extraEnv`, so an operator can still move the ledger.
+- The chart **does** write one `WORKFLOW_*` variable: `WORKFLOW_LOCAL_DATA_DIR=/app/data/workflow`, inside the volume mounted on `/app/data` in every render. The reason is release topology, not preference. `image.tag` defaults to `.Chart.AppVersion`, which now names an image whose Dockerfile carries the same default, but that default landed in the Dockerfile only after the `0.11.0` tag, so an install pinned to an older `image.tag` still resolves an unset variable to `.workflow-data` under `WORKDIR /app`, where `readOnlyRootFilesystem: true` makes it unwritable and `resolveAgentLedgerDirectory`'s probe answers `LEDGER_UNAVAILABLE`. The chart therefore keeps writing the path itself. Both copies name the same path and `tests/unit/helm-chart-agent.test.ts` asserts they stay equal, so the duplication cannot drift; it is written before `extraEnv`, so an operator can still move the ledger.
 - A release where an agent could run **and** more than one replica is asked for **fails the render** (a template guard in `deployment.yaml`, same shape as the seed guard above). The zero-config ledger takes file locks and each pod mounts its own `/app/data`, so a run started on one pod is invisible to the next request; the only backend that lifts the constraint (`@workflow/world-postgres`) is not loadable in the published image (`B16` in `docs/BACKLOG.md`), which the message says rather than selling an opt-in that does not exist yet. "Could run" is read conservatively from these values: an inline `secrets.llmApiKey`, `config.llmProvider` set to one of the key-optional providers (`ollama`, `custom` — the app's `validateConfig` demands a key only for `gemini` and `openai`), or an explicit `agent.enabled=true`. So an existing multi-replica install that configures no AI keeps rendering. The guard's blind spots are `secrets.existingSecret`, `extraEnvFrom` **and** `extraEnv`, none of which a template can read a model out of; all three are listed in the chart README and in the helper's own comment.
 - Run history lives in that ledger, so `persistence.enabled=false` means an `emptyDir` and a history that goes with the pod. `values.yaml`, the chart README and `NOTES.txt` all say so.
+
+### 10. MCP Server
+
+The MCP server is off by default, and the chart's job is to write nothing until the operator asks (docs/MCP.md).
+
+- `mcp.enabled: false`, the default, writes no `LIBREDB_MCP_*` variable, so an install that never mentions MCP renders exactly as before, and the endpoint answers an authenticated request with 404.
+- `mcp.enabled: true` writes `LIBREDB_MCP_ENABLED`, `LIBREDB_MCP_URL`, `LIBREDB_MCP_TOKEN_LABEL` and `LIBREDB_MCP_TOKEN_TTL_DAYS`, each quoted, because `EnvVar.value` is a string; they are written before `extraEnv`, so an operator can still override one.
+- An enabled block without `mcp.url` or `mcp.tokenLabel` fails the render and names the value, because the app accepts no token without either, and only the operator knows the public address, its TLS termination and its `basePath`.
+- The block is read through `default dict`, so a values set that predates it, as an upgrade with `--reuse-values` carries, keeps rendering; `tests/unit/helm-chart-mcp.test.ts` pins all four rules.
+
+### 11. Governance
+
+Governance is off by default, and the chart writes no `GOVERNANCE_*` variable, mounts no keyring and keeps readiness on `/api/db/health` until `governance.enabled` is true ([GOVERNANCE.md](./GOVERNANCE.md)).
+Enabled, the chart wires the environment that [Studio configuration](./GOVERNANCE.md#studio-configuration) describes:
+
+- The ConfigMap carries `GOVERNANCE_SOURCE=postgres`, `GOVERNANCE_POSTGRES_SCHEMA` (default `bridge`), `GOVERNANCE_PRIVATE_KEYS_FILE` and, only when set, `GOVERNANCE_REFRESH_MS`, `GOVERNANCE_MAX_STALENESS_MS` and `GOVERNANCE_ALLOWED_ENGINES`.
+- `GOVERNANCE_POSTGRES_URL` is a mandatory `secretKeyRef` to the chart's Secret or to `secrets.existingSecret`, under the mapped key `governancePostgresUrl` (default `governance-postgres-url`).
+- The keyring comes from the same Secret, under the mapped key `governancePrivateKeys` (default `governance-private-keys`), as one file at `/etc/libredb/governance/keyring.json` in a read-only volume with `defaultMode` 0400, never as an environment variable.
+  The file is root-owned, and the kubelet adds group read for `podSecurityContext.fsGroup`, which is how uid 1001 reads it, so the render fails without an `fsGroup` unless the OpenShift adaptation assigns one.
+- The readiness probe moves to `/api/ready`, and liveness and startup stay on `/api/db/health`, so a governance source that is down never gets a healthy pod restarted.
+
+An installer therefore writes two Secret keys beyond the usual ones, `governance-postgres-url` and `governance-private-keys`.
+
+**Instance id.** `GOVERNANCE_INSTANCE_ID` is `governance.instanceId`, or the chart's fullname when it is empty, so a rollout or a recreated pod updates the same heartbeat row.
+With more than one replica each pod reports its own name through the downward API, because one shared id would merge the heartbeats of different pods, and a set `governance.instanceId` then fails the render.
+
+**Render guards.** A values set the boot preflight would refuse fails the render instead, naming the value: `authProvider` other than `oidc`, an empty `config.oidcRoleClaim`, `config.oidcUserRoles` or `config.storagePostgresSchema`, a governance URL or keyring with neither an inline value nor `secrets.existingSecret`, `seedConnections.enabled`, `mcp.enabled` or `agent.enabled=true`, a set `secrets.adminPassword` or `secrets.userPassword`, or an `extraEnv` entry whose name starts with `GOVERNANCE_`.
+Under governance the chart also takes no `ADMIN_PASSWORD`, `USER_EMAIL` or `USER_PASSWORD` from `secrets.existingSecret`.
+
+**Replicas.** Studio keeps interactive transactions, rate limits and per-user providers in process memory, so `replicaCount` above 1 or `autoscaling.enabled` renders only with `stickySessions.enabled=true`.
+That value only records that the operator configured cookie affinity at the ingress or load balancer: the chart renders no affinity annotation and has no cookie name value, because the affinity belongs to the ingress controller.
+
+`tests/unit/helm-chart-governance.test.ts` pins these rules, and the block is read through `default dict`, so a values set that predates it keeps rendering.
 
 ## Release Pipeline
 
@@ -348,6 +397,22 @@ everywhere it matters: the `APP VERSION` column in `helm search repo`, ArtifactH
 the `artifacthub.io/images` annotation. Revisit lockstep if the chart reaches 1.0 and
 chart-only churn drops.
 
+**Two tag series means some third-party catalogs read the wrong version, and that is their
+bug rather than ours.** `helm-release.yml` publishes every chart release with
+`gh release edit --latest=false`, so GitHub's own answer stays correct: the repository page,
+the REST `releases/latest` endpoint and the GraphQL `latestRelease` field all name the
+application release. A consumer that instead takes the first element of the unordered
+releases list gets whichever release was published most recently, which is a chart release
+about half the time. Measured on 2026-09-19: `releases(first: 1)` returned
+`libredb-studio-0.1.65` while `latestRelease` returned `0.16.0`, which is why
+awesome-selfhosted listed our current release as `0.1.65`. Reported upstream as
+[nodiscc/hecat#163](https://github.com/nodiscc/hecat/issues/163), with the measurement that
+51 of 435 sampled entries in that data set are wrong for the same reason, mostly
+prereleases and nightlies rather than second tag series. **When a catalog shows a chart
+version as the application version, send the catalog's maintainer to `latestRelease`;
+do not "fix" it by marking chart releases as prereleases, which would be false and would
+hide them from `helm search` consumers.**
+
 ## Deployment Examples
 
 ### Minimal (port-forward)
@@ -373,6 +438,7 @@ helm install libredb libredb/libredb-studio \
   --set "ingress.hosts[0].paths[0].pathType=Prefix" \
   --set "ingress.tls[0].secretName=libredb-tls" \
   --set "ingress.tls[0].hosts[0]=libredb.example.com" \
+  --set config.passkeyOrigin=https://libredb.example.com \
   --set autoscaling.enabled=true \
   --set podDisruptionBudget.enabled=true
 ```

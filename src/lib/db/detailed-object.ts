@@ -1,0 +1,254 @@
+/**
+ * One object as a CONSUMER reads it: its identity from `DatabaseObject` and its content
+ * from `ObjectDetail`, in one record (#789).
+ *
+ * The components that draw columns need both halves at once. `DatabaseObject` names an
+ * object and says what KIND it is; `ObjectDetail` carries the columns, indexes and foreign
+ * keys of one object. A diagram, a documentation page and a code generator all need the
+ * two together, so this is the shape they take rather than a pair of props a caller could
+ * mismatch.
+ *
+ * `kind` and `path` are FACTS on every entry, which they were not while the flat schema
+ * reading still existed: an entry that reached a consumer through that reading had a
+ * qualified name and no segments, and no reader was allowed to split the name to invent
+ * them. The flat reading is gone, every entry now comes from the object surface, and a
+ * consumer filter that had to keep an unlabelled object rather than hide it has nothing
+ * left to keep. `StoredObject` below is the one shape that still has the absences, and it
+ * is persisted data rather than a reading.
+ */
+import { declaredKinds, findKind, kindAcceptsRowWrites } from "@/lib/db/object-kinds";
+import { pathKey } from "@/lib/db/object-path";
+import type { DatabaseObject, ObjectDetail, ObjectReadRange, ProviderCapabilities } from "@/lib/db/types";
+import { formatBytes } from "@/lib/db/utils/pool-manager";
+import type { ColumnSchema, ExclusionConstraintSchema, ForeignKeySchema, IndexSchema } from "@/lib/types";
+
+export interface DetailedObject {
+  /** The display label, which is NOT required to equal the last path segment. */
+  readonly name: string;
+  /** The declared kind id this object was listed under. */
+  readonly kind: string;
+  /** The object's segments, as the object surface addressed it. Never split from `name`. */
+  readonly path: readonly string[];
+  readonly columns: readonly ColumnSchema[];
+  readonly indexes: readonly IndexSchema[] | { readonly unavailable: string };
+  readonly foreignKeys?: readonly ForeignKeySchema[];
+  readonly exclusionConstraints?: readonly ExclusionConstraintSchema[];
+  /** Only where the engine counts. */
+  readonly rowCount?: number;
+  /** The engine's own rendering of the object's size, where it publishes one. */
+  readonly size?: string;
+  /**
+   * `DatabaseObject.readRanges`, carried for the two generators, which read it off this entry.
+   * It can name a key, so `schemaContextOf` below leaves it out of what the AI panels are handed.
+   */
+  readonly readRanges?: readonly ObjectReadRange[];
+}
+
+/**
+ * What a PERSISTED object record may hold, which is not the same as what a reading holds.
+ *
+ * `SchemaSnapshot.schema` is written to the user's own storage and read back months later,
+ * and a record written before the object model landed carries neither `kind` nor `path`.
+ * Those records are not migrated and do not need to be: `diffSchemas` compares a reading
+ * without paths BY NAME, so an old snapshot diffs against a current reading with nothing
+ * reported as removed and re-added, which is the measured reason Task 25c kept the comparison
+ * on the name for them; two readings with paths are compared by path (SF-047).
+ *
+ * Declaring the stored array as `DetailedObject` would be the drift that field has already
+ * had once, where the declaration said `TableSchema` while the stored JSON carried two more
+ * fields and a later reader trusted the type instead of the data. So the live shape states
+ * what a reading always has, and this one states what storage may lack.
+ */
+export type StoredObject = Omit<DetailedObject, "kind" | "path"> & {
+  readonly kind?: string;
+  readonly path?: readonly string[];
+};
+
+/**
+ * The objects a relation-shaped consumer may render.
+ *
+ * The gate is the declared ROLE and never the kind id, which is the whole of this rule: a
+ * consumer that lists rows, diagrams foreign keys or documents columns wants anything the
+ * provider declared `role: "relation"`, on every engine, including kinds this repo has
+ * never heard of. A routine, a trigger and a ClickHouse dictionary are refused by the same
+ * one line, so a new engine needs no change here.
+ *
+ * Capabilities that have not loaded yet is the one absence kept rather than refused: a
+ * consumer can render before `useProviderMetadata` has answered, nothing has said these
+ * objects are not relations, and hiding an object because a declaration had not arrived is
+ * a worse failure than showing one, because it looks like the database does not hold it.
+ *
+ * An object carrying a kind the provider does NOT declare is refused, because a kind with
+ * no declaration is exactly what the tree draws no folder for (standing ruling 4).
+ */
+export function relationObjects(
+  objects: readonly DetailedObject[],
+  capabilities: ProviderCapabilities | undefined,
+): readonly DetailedObject[] {
+  if (capabilities === undefined) return objects;
+  return objects.filter((object) => findKind(capabilities, object.kind)?.role === "relation");
+}
+
+/**
+ * How many relations a header names, counted BY KIND in the provider's own words (#1466).
+ *
+ * A view, a materialized view and a collection share the `relation` role with a table, so a
+ * bare `N tables` called a view a table. Each declared kind is counted under its own `label` /
+ * `labelPlural`, in declaration order, so "4 tables, 1 view" needs no kind id here and a new
+ * engine's relation kinds are named without a change.
+ *
+ * Capabilities that have not loaded yet name no kind, and an empty list has nothing to group,
+ * so both keep the old wording rather than inventing a noun.
+ */
+export function relationCountLabel(
+  relations: readonly DetailedObject[],
+  capabilities: ProviderCapabilities | undefined,
+): string {
+  const parts =
+    capabilities === undefined
+      ? []
+      : declaredKinds(capabilities).flatMap((kind) => {
+          const count = relations.filter((object) => object.kind === kind.id).length;
+          if (count === 0) return [];
+          return [`${count} ${(count === 1 ? kind.label : kind.labelPlural).toLowerCase()}`];
+        });
+  return parts.length > 0 ? parts.join(", ") : `${relations.length} tables`;
+}
+
+/**
+ * The objects an import or a row write may target.
+ *
+ * `kindAcceptsRowWrites` and nothing else, which standing ruling 4 is explicit about: the
+ * engine-wide `supportsInlineRowEdit` is a SEPARATE fact about the results grid's inline
+ * editor, and MongoDB, Couchbase and Cassandra declare it false while declaring a kind
+ * that genuinely takes row writes. Conjoining the two here would refuse an import all
+ * three engines support today. The two row menus ask a different conjunction for
+ * Generate Test Data, `offersTestDataGeneration` in `src/lib/db/object-kinds.ts`, which
+ * combines `acceptsRowWrites` with `supportsTestDataGeneration`, not with
+ * `supportsInlineRowEdit` (#1468).
+ *
+ * A view is the case this exists for: it has columns, it is a relation, and on most
+ * engines an insert into it is meaningless, so only the provider's own
+ * `acceptsRowWrites` can tell it apart from a table.
+ */
+export function rowWritableObjects(
+  objects: readonly DetailedObject[],
+  capabilities: ProviderCapabilities | undefined,
+): readonly DetailedObject[] {
+  if (capabilities === undefined) return objects;
+  return objects.filter((object) => kindAcceptsRowWrites(capabilities, object.kind));
+}
+
+/**
+ * The objects an inventory read named, joined to the columns it described (#789).
+ *
+ * THE JOIN KEY IS THE PATH, segment by segment, and that is the whole point of this function
+ * existing rather than a name comparison: both halves come from the same provider call for the
+ * same container and kind, so the address is exact on both sides and no reader has to split a
+ * name to find it. Every dot-splitting defect this epic fixed came from a name standing in for
+ * an address, and this is the join where that used to happen.
+ *
+ * An object with no matching detail keeps EMPTY columns rather than being dropped. Two states
+ * reach that arm and both are true readings: a kind that legitimately has no columns, and a read
+ * the inventory bounded before it could describe that folder. Dropping the object would turn
+ * either into "this database does not hold it", which is the absence #414 measured.
+ */
+export function detailedObjects(
+  objects: readonly DatabaseObject[],
+  details: readonly ObjectDetail[],
+): readonly DetailedObject[] {
+  const byPath = new Map(details.map((detail) => [pathKey(detail.path), detail]));
+  return objects.map((object) => {
+    const detail = byPath.get(pathKey(object.path));
+    return {
+      name: object.name,
+      kind: object.kind,
+      path: object.path,
+      columns: detail?.columns ?? [],
+      indexes: detail?.indexes ?? [],
+      foreignKeys: detail?.foreignKeys ?? [],
+      ...(detail?.exclusionConstraints?.length ? { exclusionConstraints: detail.exclusionConstraints } : {}),
+      ...(object.rowCount === undefined ? {} : { rowCount: object.rowCount }),
+      ...(object.sizeBytes === undefined ? {} : { size: formatBytes(object.sizeBytes) }),
+      ...(object.readRanges === undefined ? {} : { readRanges: object.readRanges }),
+    };
+  });
+}
+
+/**
+ * The columns a machine-facing surface may receive: every column but the ones a provider only inferred from
+ * sampled data, whose names were read out of the data.
+ *
+ * It runs before any slice, cap or count, at exactly three places: MCP `inspect_schema`, the agent's inventory
+ * walk, and `schemaContextOf` below, which every AI panel and an embedding host's `onAnalyzeSafety` and
+ * `onDescribeSchema` read. It answers the same array when no column is marked, so every engine that marks nothing
+ * is unchanged. Human views (the tree, the mobile list, the Source, the documentation table, Schema Diff) read the
+ * unprojected schema.
+ */
+export function machineColumns(columns: readonly ColumnSchema[]): readonly ColumnSchema[] {
+  return columns.some((column) => column.provenance === "sampled")
+    ? columns.filter((column) => column.provenance !== "sampled")
+    : columns;
+}
+
+/** What a human view adds to a column's type text: " (sampled)" for a sampled column, nothing for a declared one. */
+export function sampledMark(column: Pick<ColumnSchema, "provenance">): string {
+  return column.provenance === "sampled" ? " (sampled)" : "";
+}
+
+/**
+ * The type text a person is shown for one column.
+ *
+ * `declaredType` is the engine's own declaration, modifier included. `type` stays
+ * the base name where a provider records the two apart, so a reader that compares
+ * types is unchanged. An engine that already puts the modifier in `type` leaves
+ * `declaredType` absent, and this answers `type`.
+ */
+export function displayedColumnType(column: Pick<ColumnSchema, "type" | "declaredType">): string {
+  return column.declaredType ?? column.type;
+}
+
+/**
+ * The schema as the AI panels are handed it, which is `schemaContext` on both shells: its JSON,
+ * with every `readRanges` left out (etcd spec 3.4, E13).
+ *
+ * The ranges are the connection's own grants, and a piece can be a single key, so they are the
+ * one part of a schema entry that may name a key. They travel with the entry for the two
+ * generators alone, and this string is what the query editor's completions, the docs, the safety
+ * review and the explain view read, the explain view posting it to the model whole. The profiler
+ * posts only the object it profiled, run through this function on its own.
+ *
+ * A REPLACER rather than a projection, and the choice is what keeps every other engine's context
+ * byte for byte the `JSON.stringify(schema)` it has always been: the replacer answers every other
+ * key's value unchanged, so the output differs only where a range was.
+ * A column `machineColumns` withholds is left out the same way, and only where one is marked.
+ */
+export function schemaContextOf(objects: readonly DetailedObject[]): string {
+  // An object with no sampled column is handed on as it is, so an engine that marks nothing keeps its bytes.
+  const projected = objects.map((object) => {
+    const columns = machineColumns(object.columns);
+    return columns === object.columns ? object : { ...object, columns };
+  });
+  return JSON.stringify(projected, (key: string, value: unknown) => (key === "readRanges" ? undefined : value));
+}
+
+/**
+ * The object at an ADDRESS, out of the list the shell holds (#789, Task 35).
+ *
+ * This replaces `schema.find((t) => t.name === label)` at every consumer that opens a modal
+ * on an object. `name` is a label and is not unique: the live SQL Server holds a `customers`
+ * in `libredb_objects.app` and another in `shop.dbo`, so the name lookup profiled the first
+ * one whichever the operator clicked - no error, wrong answer. The join key is `pathKey`,
+ * the same one `detailedObjects` above joins an inventory to its details on, so the shell and
+ * the provider agree about what addresses an object.
+ *
+ * A null path is the closed modal, and a path nothing holds is null rather than a near miss.
+ */
+export function objectAtPath(
+  objects: readonly DetailedObject[],
+  path: readonly string[] | null,
+): DetailedObject | null {
+  if (path === null) return null;
+  const key = pathKey(path);
+  return objects.find((object) => pathKey(object.path) === key) ?? null;
+}
